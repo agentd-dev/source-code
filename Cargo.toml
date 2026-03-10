@@ -1,0 +1,18 @@
+# agentd workspace.
+#
+# `crates/agentd` is the runtime. Future members (conformance suite,
+# benchmarks) join here — keeping a workspace from day one means
+# their arrival never reshuffles paths.
+[workspace]
+resolver = "3"
+members = ["crates/agentd"]
+
+# Release profile tuned for a distributable single binary: size-
+# optimized, LTO'd, stripped, abort-on-panic (no unwinding machinery
+# — a workflow runtime has no recoverable-panic story; failures are
+# engine outcomes, not panics).
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

@@ -145,6 +145,28 @@ pub struct Node {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeKind {
+    // --- Input / context ---
+    ReadMcpResource {
+        resource_from: String,
+    },
+
+    // --- Intelligence ---
+    LlmInfer {
+        backend: String,
+        prompt: String,
+        #[serde(default)]
+        input_from: Option<String>,
+        #[serde(default)]
+        output_schema: Option<String>,
+    },
+
+    // --- Action ---
+    CallMcpTool {
+        tool: String,
+        #[serde(default)]
+        args_from: Option<String>,
+    },
+
     // --- Control ---
     Condition {
         expr: String,
@@ -165,6 +187,9 @@ impl NodeKind {
     /// discriminator used in config files).
     pub fn name(&self) -> &'static str {
         match self {
+            NodeKind::ReadMcpResource { .. } => "read_mcp_resource",
+            NodeKind::LlmInfer { .. } => "llm_infer",
+            NodeKind::CallMcpTool { .. } => "call_mcp_tool",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
             NodeKind::Merge => "merge",
@@ -176,9 +201,7 @@ impl NodeKind {
     /// Whether this node category is pure (no side effects) — useful
     /// for dry-run mode, which never calls impure node handlers.
     pub fn is_side_effect(&self) -> bool {
-        // Control nodes never touch the world; side-effecting kinds
-        // arrive with their tool families.
-        false
+        matches!(self, NodeKind::CallMcpTool { .. })
     }
 }
 

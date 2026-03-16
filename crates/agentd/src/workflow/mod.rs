@@ -10,4 +10,4 @@
 
 pub mod model;
 
-pub use model::{Edge, Node, NodeKind, StartNode, StartSource, Trigger, WorkflowDoc};
+pub use model::{Edge, HttpRoute, Node, NodeKind, StartNode, StartSource, Trigger, WorkflowDoc};

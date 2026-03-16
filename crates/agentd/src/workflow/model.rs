@@ -48,6 +48,9 @@ pub struct WorkflowDoc {
     pub triggers: Vec<Trigger>,
 
     #[serde(default)]
+    pub http_routes: Vec<HttpRoute>,
+
+    #[serde(default)]
     pub nodes: Vec<Node>,
 
     #[serde(default)]
@@ -158,6 +161,23 @@ impl Trigger {
             | Trigger::InternalEvent { start_node, .. } => start_node,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP routes
+// ---------------------------------------------------------------------------
+
+/// An HTTP route — a structured description of the listener side.
+/// The runtime does not mount a server unless the `trigger-http`
+/// feature is enabled and an HTTP transport is configured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRoute {
+    pub method: String,
+    pub path: String,
+    pub start_node: String,
+    #[serde(default)]
+    pub input_schema: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

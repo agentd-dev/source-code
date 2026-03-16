@@ -9,5 +9,6 @@
 //! workspace root.
 
 pub mod error;
+pub mod workflow;
 
 pub use error::{Error, Result};

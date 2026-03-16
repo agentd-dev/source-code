@@ -45,6 +45,9 @@ pub struct WorkflowDoc {
     pub start_nodes: Vec<StartNode>,
 
     #[serde(default)]
+    pub triggers: Vec<Trigger>,
+
+    #[serde(default)]
     pub nodes: Vec<Node>,
 
     #[serde(default)]
@@ -116,6 +119,45 @@ pub enum StartSource {
     Event,
     Http,
     Manual,
+}
+
+// ---------------------------------------------------------------------------
+// Triggers
+// ---------------------------------------------------------------------------
+
+/// A trigger binds an external signal to a start node.
+///
+/// Internally tagged by `type` — the RFC's TOML examples use a dotted
+/// form (`mcp.resource.updated`) which serde accepts verbatim as a
+/// rename.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum Trigger {
+    #[serde(rename = "mcp.resource.updated")]
+    McpResourceUpdated {
+        server: String,
+        resource: String,
+        start_node: String,
+    },
+    #[serde(rename = "mcp.resource.created")]
+    McpResourceCreated {
+        server: String,
+        resource: String,
+        start_node: String,
+    },
+    #[serde(rename = "internal.event")]
+    InternalEvent { name: String, start_node: String },
+}
+
+impl Trigger {
+    /// The start-node name this trigger fires.
+    pub fn start_node(&self) -> &str {
+        match self {
+            Trigger::McpResourceUpdated { start_node, .. }
+            | Trigger::McpResourceCreated { start_node, .. }
+            | Trigger::InternalEvent { start_node, .. } => start_node,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

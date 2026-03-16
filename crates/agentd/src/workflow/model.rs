@@ -290,10 +290,160 @@ pub struct Edge {
 mod tests {
     use super::*;
 
+    /// The RFC §17.2 worked example, trimmed to the workflow body.
+    const RFC_EXAMPLE: &str = r#"
+        name = "document_review"
+
+        [[start_nodes]]
+        name = "on_resource_update"
+        source = "event"
+
+        [[start_nodes]]
+        name = "on_http_request"
+        source = "http"
+
+        [[start_nodes]]
+        name = "manual_review"
+        source = "manual"
+
+        [[triggers]]
+        type = "mcp.resource.updated"
+        server = "docs"
+        resource = "docs://pages/*"
+        start_node = "on_resource_update"
+
+        [[http_routes]]
+        method = "POST"
+        path = "/workflows/document-review"
+        start_node = "on_http_request"
+        input_schema = "schemas/review_request.json"
+
+        [[nodes]]
+        id = "load_resource"
+        type = "read_mcp_resource"
+        resource_from = "trigger.resource_uri"
+
+        [[nodes]]
+        id = "analyze"
+        type = "llm_infer"
+        backend = "default"
+        input_from = "load_resource"
+        prompt = "Analyze the updated document."
+        output_schema = "schemas/review_decision.json"
+
+        [[nodes]]
+        id = "decision"
+        type = "switch"
+        expr = "analyze.decision"
+
+        [[nodes]]
+        id = "post_comment"
+        type = "call_mcp_tool"
+        tool = "comment_on_page"
+        args_from = "analyze.comment_payload"
+
+        [[nodes]]
+        id = "done"
+        type = "terminate"
+
+        [[edges]]
+        from = "load_resource"
+        to = "analyze"
+
+        [[edges]]
+        from = "analyze"
+        to = "decision"
+
+        [[edges]]
+        from = "decision"
+        when = "comment"
+        to = "post_comment"
+
+        [[edges]]
+        from = "decision"
+        when = "ignore"
+        to = "done"
+
+        [[edges]]
+        from = "post_comment"
+        to = "done"
+    "#;
+
+    #[test]
+    fn parses_rfc_example() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        assert_eq!(doc.name, "document_review");
+        assert_eq!(doc.start_nodes.len(), 3);
+        assert_eq!(doc.triggers.len(), 1);
+        assert_eq!(doc.http_routes.len(), 1);
+        assert_eq!(doc.nodes.len(), 5);
+        assert_eq!(doc.edges.len(), 5);
+    }
+
+    #[test]
+    fn start_node_sources() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        let sources: Vec<_> = doc.start_nodes.iter().map(|s| s.source).collect();
+        assert_eq!(
+            sources,
+            vec![StartSource::Event, StartSource::Http, StartSource::Manual]
+        );
+    }
+
+    #[test]
+    fn trigger_start_node_accessor() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        assert_eq!(doc.triggers[0].start_node(), "on_resource_update");
+    }
+
+    #[test]
+    fn node_kinds_round_trip() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        let kinds: Vec<_> = doc.nodes.iter().map(|n| n.kind.name()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "read_mcp_resource",
+                "llm_infer",
+                "switch",
+                "call_mcp_tool",
+                "terminate",
+            ]
+        );
+    }
+
+    #[test]
+    fn side_effect_flag() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        let side_effects: Vec<_> = doc
+            .nodes
+            .iter()
+            .filter(|n| n.kind.is_side_effect())
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(side_effects, vec!["post_comment"]);
+    }
+
+    #[test]
+    fn edge_when_selectors() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        let whens: Vec<_> = doc.edges.iter().filter_map(|e| e.when.as_deref()).collect();
+        assert_eq!(whens, vec!["comment", "ignore"]);
+    }
+
     #[test]
     fn wrapped_form_parses() {
-        let doc = WorkflowDoc::from_toml("[[workflows]]\nname = \"x\"").unwrap();
-        assert_eq!(doc.name, "x");
+        let wrapped = format!("[[workflows]]\n{}", RFC_EXAMPLE);
+        let doc = WorkflowDoc::from_toml(&wrapped).unwrap();
+        assert_eq!(doc.name, "document_review");
+    }
+
+    #[test]
+    fn node_lookup_helpers() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        assert!(doc.node("analyze").is_some());
+        assert!(doc.node("no-such-id").is_none());
+        assert!(doc.start_node("manual_review").is_some());
     }
 
     #[test]

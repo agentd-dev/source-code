@@ -9,5 +9,7 @@
 //! implementations are stubbed until Phase 1a / 1b.
 
 pub mod model;
+pub mod validator;
 
 pub use model::{Edge, HttpRoute, Node, NodeKind, StartNode, StartSource, Trigger, WorkflowDoc};
+pub use validator::{ValidationIssue, ValidationReport, validate};

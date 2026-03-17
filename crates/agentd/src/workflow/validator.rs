@@ -14,12 +14,13 @@
 //! 1. Duplicate node ids, start-node names, HTTP route (method, path).
 //! 2. Dangling edge targets (`from` / `to` reference missing nodes).
 //! 3. Trigger / HTTP route / start-node cross-references resolve.
+//! 4. Acyclicity (Kahn's algorithm).
 //!
 //! `when` selectors on edges are *not* validated against the source
 //! node's kind here — that lands in Phase 2 when the engine grows
 //! a dispatch for switch / condition outputs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::workflow::WorkflowDoc;
 
@@ -75,6 +76,13 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     check_triggers(doc, &start_names, &mut r);
     check_start_node_entries(doc, &node_ids, &mut r);
     check_edges(doc, &node_ids, &mut r);
+
+    // Graph-level checks only make sense once every edge references a
+    // known node. Skip them if dangling edges were detected so the
+    // topo-sort doesn't panic on a missing key.
+    if r.issues.iter().all(|i| i.code != "dangling_edge") {
+        check_acyclic(doc, &mut r);
+    }
 
     r
 }
@@ -199,6 +207,63 @@ fn check_edges(doc: &WorkflowDoc, node_ids: &HashSet<String>, r: &mut Validation
 }
 
 // ---------------------------------------------------------------------------
+// Step 3: acyclicity (Kahn's algorithm)
+// ---------------------------------------------------------------------------
+
+fn check_acyclic(doc: &WorkflowDoc, r: &mut ValidationReport) {
+    // Build in-degree and adjacency. Use the node-id strings as keys so
+    // the report lists human-readable names if a cycle is found.
+    let mut in_degree: HashMap<&str, usize> =
+        doc.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
+    let mut adj: HashMap<&str, Vec<&str>> =
+        doc.nodes.iter().map(|n| (n.id.as_str(), vec![])).collect();
+
+    for edge in &doc.edges {
+        *in_degree.entry(edge.to.as_str()).or_insert(0) += 1;
+        adj.entry(edge.from.as_str())
+            .or_default()
+            .push(edge.to.as_str());
+    }
+
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter_map(|(id, deg)| if *deg == 0 { Some(*id) } else { None })
+        .collect();
+    let mut visited = 0usize;
+
+    while let Some(id) = queue.pop_front() {
+        visited += 1;
+        if let Some(nexts) = adj.get(id) {
+            for &next in nexts {
+                if let Some(deg) = in_degree.get_mut(next) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+
+    if visited != doc.nodes.len() {
+        // The remaining non-zero in-degree nodes are all inside at
+        // least one cycle.
+        let mut cyclic: Vec<&str> = in_degree
+            .iter()
+            .filter_map(|(id, deg)| if *deg > 0 { Some(*id) } else { None })
+            .collect();
+        cyclic.sort_unstable();
+        r.issues.push(ValidationIssue::new(
+            "cycle",
+            format!(
+                "workflow contains a cycle; nodes involved or downstream: {}",
+                cyclic.join(", ")
+            ),
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -292,6 +357,36 @@ mod tests {
         };
         let r = validate(&doc);
         assert!(r.codes().contains(&"dangling_edge"));
+        // When edges dangle we skip graph-level checks — no cycle
+        // report should ride along even though removing the missing
+        // tail leaves "a" unreferenced.
+        assert!(!r.codes().contains(&"cycle"));
+    }
+
+    #[test]
+    fn self_loop_is_a_cycle() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("a"))],
+            nodes: vec![merge("a")],
+            edges: vec![edge("a", "a")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"cycle"));
+    }
+
+    #[test]
+    fn three_node_cycle_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("a"))],
+            nodes: vec![merge("a"), merge("b"), merge("c")],
+            edges: vec![edge("a", "b"), edge("b", "c"), edge("c", "a")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"cycle"));
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! 2. Dangling edge targets (`from` / `to` reference missing nodes).
 //! 3. Trigger / HTTP route / start-node cross-references resolve.
 //! 4. Acyclicity (Kahn's algorithm).
+//! 5. Reachability from each start node's entry (BFS).
 //!
 //! `when` selectors on edges are *not* validated against the source
 //! node's kind here — that lands in Phase 2 when the engine grows
@@ -22,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::workflow::WorkflowDoc;
+use crate::workflow::{Node, StartNode, WorkflowDoc};
 
 // ---------------------------------------------------------------------------
 // Report types
@@ -82,6 +83,7 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     // topo-sort doesn't panic on a missing key.
     if r.issues.iter().all(|i| i.code != "dangling_edge") {
         check_acyclic(doc, &mut r);
+        check_reachability(doc, &node_ids, &mut r);
     }
 
     r
@@ -264,6 +266,100 @@ fn check_acyclic(doc: &WorkflowDoc, r: &mut ValidationReport) {
 }
 
 // ---------------------------------------------------------------------------
+// Step 4: reachability
+// ---------------------------------------------------------------------------
+
+/// Resolve a start node's entry — either `entry_node` or fall back to
+/// the first node in `doc.nodes` with no incoming edges. Returns
+/// `None` if no unambiguous entry can be derived.
+fn resolve_entry<'a>(
+    start: &'a StartNode,
+    doc: &'a WorkflowDoc,
+    incoming: &HashMap<&'a str, usize>,
+) -> Option<&'a str> {
+    if let Some(entry) = &start.entry_node {
+        return Some(entry.as_str());
+    }
+    // Fall-back default: the one node that has zero in-edges. If
+    // there are several (or none), the engine needs `entry_node` to
+    // disambiguate, so we don't guess.
+    let roots: Vec<&str> = doc
+        .nodes
+        .iter()
+        .map(|n| n.id.as_str())
+        .filter(|id| incoming.get(id).copied().unwrap_or(0) == 0)
+        .collect();
+    if roots.len() == 1 {
+        Some(roots[0])
+    } else {
+        None
+    }
+}
+
+fn check_reachability(doc: &WorkflowDoc, node_ids: &HashSet<String>, r: &mut ValidationReport) {
+    if doc.nodes.is_empty() || doc.start_nodes.is_empty() {
+        return;
+    }
+
+    // Precompute in-degrees for root detection.
+    let mut incoming: HashMap<&str, usize> = doc.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
+    for edge in &doc.edges {
+        *incoming.entry(edge.to.as_str()).or_insert(0) += 1;
+    }
+
+    // Build adjacency for BFS.
+    let mut adj: HashMap<&str, Vec<&str>> =
+        doc.nodes.iter().map(|n| (n.id.as_str(), vec![])).collect();
+    for edge in &doc.edges {
+        adj.entry(edge.from.as_str())
+            .or_default()
+            .push(edge.to.as_str());
+    }
+
+    let mut reached: HashSet<&str> = HashSet::new();
+
+    for start in &doc.start_nodes {
+        let Some(entry) = resolve_entry(start, doc, &incoming) else {
+            r.issues.push(ValidationIssue::new(
+                "ambiguous_start_entry",
+                format!(
+                    "start node `{}` has no `entry_node` and the workflow has !=1 root nodes; \
+                     specify `entry_node` explicitly",
+                    start.name
+                ),
+            ));
+            continue;
+        };
+
+        // BFS from the entry.
+        let mut queue: VecDeque<&str> = VecDeque::from([entry]);
+        while let Some(id) = queue.pop_front() {
+            if !reached.insert(id) {
+                continue;
+            }
+            if let Some(nexts) = adj.get(id) {
+                for &next in nexts {
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+
+    for Node { id, .. } in &doc.nodes {
+        if !reached.contains(id.as_str()) {
+            r.issues.push(ValidationIssue::new(
+                "unreachable_node",
+                format!("node `{id}` is not reachable from any start node"),
+            ));
+        }
+    }
+
+    // Silence clippy: node_ids is intentionally unused at this layer
+    // but kept in the signature for symmetry with the other helpers.
+    let _ = node_ids;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -374,6 +470,42 @@ mod tests {
         };
         let r = validate(&doc);
         assert!(r.codes().contains(&"cycle"));
+    }
+
+    #[test]
+    fn unreachable_node_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("a"))],
+            nodes: vec![merge("a"), merge("b"), merge("island")],
+            edges: vec![edge("a", "b")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        let reasons: Vec<_> = r
+            .issues
+            .iter()
+            .filter(|i| i.code == "unreachable_node")
+            .map(|i| i.message.as_str())
+            .collect();
+        assert!(
+            reasons.iter().any(|m| m.contains("island")),
+            "got: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_root_flagged_when_no_entry() {
+        // Two root nodes (in-degree zero) and no explicit `entry_node`:
+        // the validator must refuse to guess.
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, None)],
+            nodes: vec![merge("a"), merge("b")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"ambiguous_start_entry"));
     }
 
     #[test]

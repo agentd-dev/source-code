@@ -12,6 +12,8 @@
 //! Checks performed:
 //!
 //! 1. Duplicate node ids, start-node names, HTTP route (method, path).
+//! 2. Dangling edge targets (`from` / `to` reference missing nodes).
+//! 3. Trigger / HTTP route / start-node cross-references resolve.
 //!
 //! `when` selectors on edges are *not* validated against the source
 //! node's kind here — that lands in Phase 2 when the engine grows
@@ -68,7 +70,11 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
 
     let node_ids = collect_node_ids(doc, &mut r);
     let start_names = collect_start_names(doc, &mut r);
-    let _ = (node_ids, start_names);
+
+    check_http_routes(doc, &start_names, &mut r);
+    check_triggers(doc, &start_names, &mut r);
+    check_start_node_entries(doc, &node_ids, &mut r);
+    check_edges(doc, &node_ids, &mut r);
 
     r
 }
@@ -112,13 +118,94 @@ fn collect_start_names(doc: &WorkflowDoc, r: &mut ValidationReport) -> HashSet<S
 }
 
 // ---------------------------------------------------------------------------
+// Step 2: cross-references
+// ---------------------------------------------------------------------------
+
+fn check_http_routes(doc: &WorkflowDoc, start_names: &HashSet<String>, r: &mut ValidationReport) {
+    let mut seen = HashSet::new();
+    for route in &doc.http_routes {
+        let key = (route.method.to_ascii_uppercase(), route.path.clone());
+        if !seen.insert(key.clone()) {
+            r.issues.push(ValidationIssue::new(
+                "dup_http_route",
+                format!("duplicate HTTP route `{} {}`", route.method, route.path),
+            ));
+        }
+        if !start_names.contains(&route.start_node) {
+            r.issues.push(ValidationIssue::new(
+                "unknown_http_start_node",
+                format!(
+                    "HTTP route `{} {}` points at unknown start node `{}`",
+                    route.method, route.path, route.start_node
+                ),
+            ));
+        }
+    }
+}
+
+fn check_triggers(doc: &WorkflowDoc, start_names: &HashSet<String>, r: &mut ValidationReport) {
+    for trig in &doc.triggers {
+        let sn = trig.start_node();
+        if !start_names.contains(sn) {
+            r.issues.push(ValidationIssue::new(
+                "unknown_trigger_start_node",
+                format!("trigger points at unknown start node `{sn}`"),
+            ));
+        }
+    }
+}
+
+fn check_start_node_entries(
+    doc: &WorkflowDoc,
+    node_ids: &HashSet<String>,
+    r: &mut ValidationReport,
+) {
+    for start in &doc.start_nodes {
+        if let Some(entry) = &start.entry_node {
+            if !node_ids.contains(entry) {
+                r.issues.push(ValidationIssue::new(
+                    "unknown_start_entry_node",
+                    format!(
+                        "start node `{}` references unknown entry node `{entry}`",
+                        start.name
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn check_edges(doc: &WorkflowDoc, node_ids: &HashSet<String>, r: &mut ValidationReport) {
+    for (idx, edge) in doc.edges.iter().enumerate() {
+        if !node_ids.contains(&edge.from) {
+            r.issues.push(ValidationIssue::new(
+                "dangling_edge",
+                format!(
+                    "edge #{idx} `{}` → `{}`: source node `{}` is not declared",
+                    edge.from, edge.to, edge.from
+                ),
+            ));
+        }
+        if !node_ids.contains(&edge.to) {
+            r.issues.push(ValidationIssue::new(
+                "dangling_edge",
+                format!(
+                    "edge #{idx} `{}` → `{}`: target node `{}` is not declared",
+                    edge.from, edge.to, edge.to
+                ),
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::model::{Edge, Node, NodeKind, StartNode, StartSource};
+    use crate::workflow::model::{Edge, HttpRoute, Node, NodeKind, StartNode, StartSource, Trigger};
 
     fn n(id: &str, kind: NodeKind) -> Node {
         Node {
@@ -193,5 +280,84 @@ mod tests {
         };
         let r = validate(&doc);
         assert!(r.codes().contains(&"dup_start_name"));
+    }
+
+    #[test]
+    fn dangling_edge_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            nodes: vec![merge("a")],
+            edges: vec![edge("a", "missing")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"dangling_edge"));
+    }
+
+    #[test]
+    fn trigger_unknown_start_node_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            triggers: vec![Trigger::InternalEvent {
+                name: "e".into(),
+                start_node: "nope".into(),
+            }],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"unknown_trigger_start_node"));
+    }
+
+    #[test]
+    fn http_route_unknown_start_node_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            http_routes: vec![HttpRoute {
+                method: "POST".into(),
+                path: "/x".into(),
+                start_node: "nope".into(),
+                input_schema: None,
+            }],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"unknown_http_start_node"));
+    }
+
+    #[test]
+    fn start_node_entry_must_exist() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("no_such"))],
+            nodes: vec![merge("a")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"unknown_start_entry_node"));
+    }
+
+    #[test]
+    fn duplicate_http_route_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Http, None)],
+            http_routes: vec![
+                HttpRoute {
+                    method: "POST".into(),
+                    path: "/x".into(),
+                    start_node: "main".into(),
+                    input_schema: None,
+                },
+                HttpRoute {
+                    method: "post".into(), // case-insensitive match
+                    path: "/x".into(),
+                    start_node: "main".into(),
+                    input_schema: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"dup_http_route"));
     }
 }

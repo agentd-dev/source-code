@@ -564,6 +564,87 @@ mod tests {
     }
 
     #[test]
+    fn rfc_example_validates_with_explicit_entry() {
+        use crate::workflow::model::*;
+
+        // Same shape as the model's RFC_EXAMPLE but with start nodes
+        // pinned to `load_resource` so reachability is unambiguous.
+        let doc = WorkflowDoc {
+            name: "document_review".into(),
+            start_nodes: vec![
+                start(
+                    "on_resource_update",
+                    StartSource::Event,
+                    Some("load_resource"),
+                ),
+                start("on_http_request", StartSource::Http, Some("load_resource")),
+                start("manual_review", StartSource::Manual, Some("load_resource")),
+            ],
+            triggers: vec![Trigger::McpResourceUpdated {
+                server: "docs".into(),
+                resource: "docs://pages/*".into(),
+                start_node: "on_resource_update".into(),
+            }],
+            http_routes: vec![HttpRoute {
+                method: "POST".into(),
+                path: "/workflows/document-review".into(),
+                start_node: "on_http_request".into(),
+                input_schema: None,
+            }],
+            nodes: vec![
+                n(
+                    "load_resource",
+                    NodeKind::ReadMcpResource {
+                        resource_from: "trigger.resource_uri".into(),
+                    },
+                ),
+                n(
+                    "analyze",
+                    NodeKind::LlmInfer {
+                        backend: "default".into(),
+                        prompt: "…".into(),
+                        input_from: Some("load_resource".into()),
+                        output_schema: None,
+                    },
+                ),
+                n(
+                    "decision",
+                    NodeKind::Switch {
+                        expr: "analyze.decision".into(),
+                    },
+                ),
+                n(
+                    "post_comment",
+                    NodeKind::CallMcpTool {
+                        tool: "comment_on_page".into(),
+                        args_from: Some("analyze.comment_payload".into()),
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![
+                edge("load_resource", "analyze"),
+                edge("analyze", "decision"),
+                Edge {
+                    from: "decision".into(),
+                    to: "post_comment".into(),
+                    when: Some("comment".into()),
+                },
+                Edge {
+                    from: "decision".into(),
+                    to: "done".into(),
+                    when: Some("ignore".into()),
+                },
+                edge("post_comment", "done"),
+            ],
+            ..Default::default()
+        };
+
+        let r = validate(&doc);
+        assert!(r.ok(), "issues: {:?}", r.issues);
+    }
+
+    #[test]
     fn duplicate_http_route_flagged() {
         let doc = WorkflowDoc {
             name: "x".into(),

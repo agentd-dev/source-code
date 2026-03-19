@@ -14,6 +14,7 @@
 pub mod context;
 pub mod handler;
 pub mod outcome;
+pub mod runner;
 
 pub use context::{ExecutionContext, RunOptions, TriggerKind, TriggerMeta};
 pub use handler::{
@@ -21,3 +22,4 @@ pub use handler::{
     SwitchHandler, TerminateHandler,
 };
 pub use outcome::{ExecutionOutcome, NodeOutcome};
+pub use runner::Engine;

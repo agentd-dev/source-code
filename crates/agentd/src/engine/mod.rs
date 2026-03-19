@@ -12,7 +12,12 @@
 //! fs / env / data / intelligence / MCP.
 
 pub mod context;
+pub mod handler;
 pub mod outcome;
 
 pub use context::{ExecutionContext, RunOptions, TriggerKind, TriggerMeta};
+pub use handler::{
+    ConditionHandler, FailHandler, HandlerRegistry, MergeHandler, NodeHandler, StubHandler,
+    SwitchHandler, TerminateHandler,
+};
 pub use outcome::{ExecutionOutcome, NodeOutcome};

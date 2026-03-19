@@ -12,5 +12,7 @@
 //! fs / env / data / intelligence / MCP.
 
 pub mod context;
+pub mod outcome;
 
 pub use context::{ExecutionContext, RunOptions, TriggerKind, TriggerMeta};
+pub use outcome::{ExecutionOutcome, NodeOutcome};

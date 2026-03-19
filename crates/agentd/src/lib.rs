@@ -8,6 +8,7 @@
 //! Full design: [`rfcs/0001-bounded-workflow-runtime.md`] at the
 //! workspace root.
 
+pub mod engine;
 pub mod error;
 pub mod workflow;
 

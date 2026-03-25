@@ -272,3 +272,313 @@ fn pick_next(
         }),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::context::RunOptions;
+    use crate::engine::handler::{HandlerRegistry, NodeHandler, StubHandler};
+    use crate::workflow::model::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn n(id: &str, kind: NodeKind) -> Node {
+        Node {
+            id: id.into(),
+            kind,
+        }
+    }
+
+    fn e(from: &str, to: &str, when: Option<&str>) -> Edge {
+        Edge {
+            from: from.into(),
+            to: to.into(),
+            when: when.map(Into::into),
+        }
+    }
+
+    fn start(name: &str, entry: &str) -> StartNode {
+        StartNode {
+            name: name.into(),
+            source: StartSource::Manual,
+            entry_node: Some(entry.into()),
+        }
+    }
+
+    fn engine_with_stub() -> Engine {
+        let mut r = HandlerRegistry::with_builtin_controls();
+        r.set_fallback(Box::new(StubHandler));
+        Engine::new(r)
+    }
+
+    #[test]
+    fn linear_workflow_terminates() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![n("a", NodeKind::Merge), n("b", NodeKind::Terminate)],
+            edges: vec![e("a", "b", None)],
+            ..Default::default()
+        };
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+    }
+
+    #[test]
+    fn switch_picks_matching_branch() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "set")],
+            nodes: vec![
+                n(
+                    "set",
+                    NodeKind::ReadMcpResource {
+                        resource_from: "ignored".into(),
+                    },
+                ),
+                n(
+                    "sw",
+                    NodeKind::Switch {
+                        expr: "set.stub".into(),
+                    },
+                ),
+                n("comment", NodeKind::Terminate),
+                n("ignore", NodeKind::Fail { reason: None }),
+            ],
+            edges: vec![
+                e("set", "sw", None),
+                e("sw", "comment", Some("read_mcp_resource")),
+                e("sw", "ignore", Some("other")),
+            ],
+            ..Default::default()
+        };
+
+        // StubHandler writes `{"stub": "<kind>"}` for every non-control
+        // node — so `set.stub` resolves to the kind name, which
+        // matches the `when = "read_mcp_resource"` branch.
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                &out,
+                ExecutionOutcome::Completed { last_node: Some(id), .. } if id == "comment"
+            ),
+            "got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fail_node_returns_failed_outcome() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "boom")],
+            nodes: vec![n(
+                "boom",
+                NodeKind::Fail {
+                    reason: Some("kaboom".into()),
+                },
+            )],
+            ..Default::default()
+        };
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            ExecutionOutcome::Failed {
+                reason: "kaboom".into(),
+                last_node: Some("boom".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn dead_end_without_outgoing_edge_completes() {
+        // Merge node with no out-edge — engine should treat it as a
+        // successful end.
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![n("a", NodeKind::Merge)],
+            ..Default::default()
+        };
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+    }
+
+    #[test]
+    fn unknown_start_node_errors() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![],
+            nodes: vec![n("a", NodeKind::Terminate)],
+            ..Default::default()
+        };
+        let err = engine_with_stub()
+            .run(
+                &wf,
+                "nope",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("unknown start node"));
+    }
+
+    #[test]
+    fn ambiguous_unconditional_edge_errors() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![
+                n("a", NodeKind::Merge),
+                n("b", NodeKind::Terminate),
+                n("c", NodeKind::Terminate),
+            ],
+            edges: vec![e("a", "b", None), e("a", "c", None)],
+            ..Default::default()
+        };
+        let err = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("matching out-edges"));
+    }
+
+    #[test]
+    fn timeout_is_reported() {
+        // Handler that stalls long enough to trip a tiny deadline.
+        struct SlowHandler;
+        impl NodeHandler for SlowHandler {
+            fn handle(&self, _node: &Node, _ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
+                std::thread::sleep(Duration::from_millis(15));
+                Ok(NodeOutcome::ok_null())
+            }
+        }
+
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![
+                n("a", NodeKind::Merge),
+                n("b", NodeKind::Merge),
+                n("c", NodeKind::Terminate),
+            ],
+            edges: vec![e("a", "b", None), e("b", "c", None)],
+            ..Default::default()
+        };
+
+        let mut registry = HandlerRegistry::new();
+        registry.register("merge", Box::new(SlowHandler));
+        registry.register(
+            "terminate",
+            Box::new(super::super::handler::TerminateHandler),
+        );
+        let engine = Engine::new(registry);
+
+        let out = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions {
+                    timeout: Duration::from_millis(5),
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::TimedOut { .. }));
+    }
+
+    #[test]
+    fn condition_true_false_routes() {
+        // Condition reads trigger.flag; routes to t_done or f_done.
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "c")],
+            nodes: vec![
+                n(
+                    "c",
+                    NodeKind::Condition {
+                        expr: "trigger.flag".into(),
+                    },
+                ),
+                n("t_done", NodeKind::Terminate),
+                n(
+                    "f_done",
+                    NodeKind::Fail {
+                        reason: Some("flag was false".into()),
+                    },
+                ),
+            ],
+            edges: vec![
+                e("c", "t_done", Some("true")),
+                e("c", "f_done", Some("false")),
+            ],
+            ..Default::default()
+        };
+
+        let engine = Engine::new(HandlerRegistry::with_builtin_controls());
+
+        // true branch
+        let out_true = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({ "flag": true })),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out_true, ExecutionOutcome::Completed { .. }));
+
+        // false branch
+        let out_false = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({ "flag": false })),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            out_false,
+            ExecutionOutcome::Failed {
+                reason: "flag was false".into(),
+                last_node: Some("f_done".into()),
+            }
+        );
+    }
+}

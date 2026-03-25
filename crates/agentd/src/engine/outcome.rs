@@ -94,6 +94,36 @@ where
     s.serialize_u64(d.as_millis() as u64)
 }
 
+// ---------------------------------------------------------------------------
+// Execution trace — what the engine actually walked during a run.
+// ---------------------------------------------------------------------------
+
+/// One entry in an [`ExecutionTrace`] — records a single node visit.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TraceEntry {
+    pub node_id: String,
+    pub kind: String,
+    /// `"continue"` / `"terminate"` / `"fail"` — the flavour of the
+    /// outcome the handler returned.
+    pub outcome: &'static str,
+    /// Branch label the handler emitted, if any (for Switch /
+    /// Condition branching).
+    pub branch: Option<String>,
+}
+
+/// Ordered list of [`TraceEntry`]s across a single workflow run.
+/// Fixture-driven tests diff these against their `expected.path`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ExecutionTrace {
+    pub entries: Vec<TraceEntry>,
+}
+
+impl ExecutionTrace {
+    pub fn node_ids(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.node_id.clone()).collect()
+    }
+}
+
 impl ExecutionOutcome {
     pub fn is_success(&self) -> bool {
         matches!(self, ExecutionOutcome::Completed { .. })

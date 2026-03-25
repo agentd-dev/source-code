@@ -21,5 +21,5 @@ pub use handler::{
     ConditionHandler, FailHandler, HandlerRegistry, MergeHandler, NodeHandler, StubHandler,
     SwitchHandler, TerminateHandler,
 };
-pub use outcome::{ExecutionOutcome, NodeOutcome};
+pub use outcome::{ExecutionOutcome, ExecutionTrace, NodeOutcome, TraceEntry};
 pub use runner::Engine;

@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::engine::context::{ExecutionContext, RunOptions, TriggerMeta};
 use crate::engine::handler::HandlerRegistry;
-use crate::engine::outcome::{ExecutionOutcome, NodeOutcome};
+use crate::engine::outcome::{ExecutionOutcome, ExecutionTrace, NodeOutcome, TraceEntry};
 use crate::error::{Error, Result};
 use crate::workflow::{Edge, WorkflowDoc};
 
@@ -53,6 +53,23 @@ impl Engine {
         trigger: TriggerMeta,
         options: RunOptions,
     ) -> Result<ExecutionOutcome> {
+        self.run_with_trace(workflow, start_name, trigger, options)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Same as [`run`] but also returns the [`ExecutionTrace`] — the
+    /// ordered list of nodes the engine walked, with their outcome
+    /// flavour and any branch label. Fixture-driven tests use this
+    /// to assert the expected graph path.
+    pub fn run_with_trace(
+        &self,
+        workflow: &WorkflowDoc,
+        start_name: &str,
+        trigger: TriggerMeta,
+        options: RunOptions,
+    ) -> Result<(ExecutionOutcome, ExecutionTrace)> {
+        let mut trace = ExecutionTrace::default();
+
         // 1) Resolve the start node + its entry node id.
         let start = workflow
             .start_node(start_name)
@@ -80,10 +97,13 @@ impl Engine {
             // Deadline check.
             if Instant::now() >= ctx.deadline {
                 let elapsed = Instant::now().duration_since(started_at);
-                return Ok(ExecutionOutcome::TimedOut {
-                    elapsed,
-                    last_node: ctx.current_node_id,
-                });
+                return Ok((
+                    ExecutionOutcome::TimedOut {
+                        elapsed,
+                        last_node: ctx.current_node_id,
+                    },
+                    trace,
+                ));
             }
 
             // Look up the node.
@@ -97,19 +117,43 @@ impl Engine {
 
             match outcome {
                 NodeOutcome::Terminate { value } => {
-                    ctx.node_outputs.insert(current_id.clone(), value.clone());
-                    return Ok(ExecutionOutcome::Completed {
-                        final_value: value,
-                        last_node: Some(current_id),
+                    trace.entries.push(TraceEntry {
+                        node_id: current_id.clone(),
+                        kind: node.kind.name().to_string(),
+                        outcome: "terminate",
+                        branch: None,
                     });
+                    ctx.node_outputs.insert(current_id.clone(), value.clone());
+                    return Ok((
+                        ExecutionOutcome::Completed {
+                            final_value: value,
+                            last_node: Some(current_id),
+                        },
+                        trace,
+                    ));
                 }
                 NodeOutcome::Fail { reason } => {
-                    return Ok(ExecutionOutcome::Failed {
-                        reason,
-                        last_node: Some(current_id),
+                    trace.entries.push(TraceEntry {
+                        node_id: current_id.clone(),
+                        kind: node.kind.name().to_string(),
+                        outcome: "fail",
+                        branch: None,
                     });
+                    return Ok((
+                        ExecutionOutcome::Failed {
+                            reason,
+                            last_node: Some(current_id),
+                        },
+                        trace,
+                    ));
                 }
                 NodeOutcome::Continue { value, branch } => {
+                    trace.entries.push(TraceEntry {
+                        node_id: current_id.clone(),
+                        kind: node.kind.name().to_string(),
+                        outcome: "continue",
+                        branch: branch.clone(),
+                    });
                     ctx.node_outputs.insert(current_id.clone(), value);
                     let next_id = pick_next(workflow, &current_id, branch.as_deref())?;
                     match next_id {
@@ -121,10 +165,13 @@ impl Engine {
                                 .get(&current_id)
                                 .cloned()
                                 .unwrap_or(Value::Null);
-                            return Ok(ExecutionOutcome::Completed {
-                                final_value,
-                                last_node: Some(current_id),
-                            });
+                            return Ok((
+                                ExecutionOutcome::Completed {
+                                    final_value,
+                                    last_node: Some(current_id),
+                                },
+                                trace,
+                            ));
                         }
                     }
                 }

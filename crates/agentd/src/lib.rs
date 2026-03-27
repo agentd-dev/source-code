@@ -10,6 +10,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod tools;
 pub mod workflow;
 
 pub use error::{Error, Result};

@@ -343,8 +343,8 @@ mod tests {
             nodes: vec![
                 n(
                     "set",
-                    NodeKind::ReadMcpResource {
-                        resource_from: "ignored".into(),
+                    NodeKind::ReadFile {
+                        path_from: "ignored".into(),
                     },
                 ),
                 n(
@@ -358,15 +358,15 @@ mod tests {
             ],
             edges: vec![
                 e("set", "sw", None),
-                e("sw", "comment", Some("read_mcp_resource")),
+                e("sw", "comment", Some("read_file")),
                 e("sw", "ignore", Some("other")),
             ],
             ..Default::default()
         };
 
         // StubHandler writes `{"stub": "<kind>"}` for every non-control
-        // node — so `set.stub` resolves to the kind name, which
-        // matches the `when = "read_mcp_resource"` branch.
+        // node — so `set.stub` resolves to the kind name "read_file",
+        // which matches the `when = "read_file"` branch.
         let out = engine_with_stub()
             .run(
                 &wf,

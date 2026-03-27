@@ -208,8 +208,32 @@ pub struct Node {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeKind {
     // --- Input / context ---
+    ReadFile {
+        path_from: String,
+    },
+    ReadEnv {
+        key: String,
+    },
     ReadMcpResource {
         resource_from: String,
+    },
+    ParseJson {
+        input_from: String,
+    },
+
+    // --- Transformation ---
+    TemplateRender {
+        template: String,
+        #[serde(default)]
+        input_from: Option<String>,
+    },
+    DiffCompute {
+        left_from: String,
+        right_from: String,
+    },
+    JsonSelect {
+        input_from: String,
+        path: String,
     },
 
     // --- Intelligence ---
@@ -223,6 +247,13 @@ pub enum NodeKind {
     },
 
     // --- Action ---
+    WriteFile {
+        path_from: String,
+        content_from: String,
+    },
+    CreateDir {
+        path_from: String,
+    },
     CallMcpTool {
         tool: String,
         #[serde(default)]
@@ -249,8 +280,16 @@ impl NodeKind {
     /// discriminator used in config files).
     pub fn name(&self) -> &'static str {
         match self {
+            NodeKind::ReadFile { .. } => "read_file",
+            NodeKind::ReadEnv { .. } => "read_env",
             NodeKind::ReadMcpResource { .. } => "read_mcp_resource",
+            NodeKind::ParseJson { .. } => "parse_json",
+            NodeKind::TemplateRender { .. } => "template_render",
+            NodeKind::DiffCompute { .. } => "diff_compute",
+            NodeKind::JsonSelect { .. } => "json_select",
             NodeKind::LlmInfer { .. } => "llm_infer",
+            NodeKind::WriteFile { .. } => "write_file",
+            NodeKind::CreateDir { .. } => "create_dir",
             NodeKind::CallMcpTool { .. } => "call_mcp_tool",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
@@ -263,7 +302,12 @@ impl NodeKind {
     /// Whether this node category is pure (no side effects) — useful
     /// for dry-run mode, which never calls impure node handlers.
     pub fn is_side_effect(&self) -> bool {
-        matches!(self, NodeKind::CallMcpTool { .. })
+        matches!(
+            self,
+            NodeKind::WriteFile { .. }
+                | NodeKind::CreateDir { .. }
+                | NodeKind::CallMcpTool { .. }
+        )
     }
 }
 

@@ -381,8 +381,8 @@ mod tests {
             .dispatch(
                 &node(
                     "rf",
-                    NodeKind::ReadMcpResource {
-                        resource_from: "x".into(),
+                    NodeKind::ReadFile {
+                        path_from: "x".into(),
                     },
                 ),
                 &mut c,
@@ -400,8 +400,8 @@ mod tests {
             .dispatch(
                 &node(
                     "rf",
-                    NodeKind::ReadMcpResource {
-                        resource_from: "x".into(),
+                    NodeKind::ReadFile {
+                        path_from: "x".into(),
                     },
                 ),
                 &mut c,

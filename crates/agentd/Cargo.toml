@@ -18,8 +18,9 @@ path = "src/main.rs"
 
 [features]
 # Tool families (compile-time capability pruning, RFC §10.4).
-default = ["tools-fs"]
+default = ["tools-fs", "tools-env"]
 tools-fs = []
+tools-env = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

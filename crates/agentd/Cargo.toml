@@ -16,8 +16,16 @@ path = "src/lib.rs"
 name = "agentd"
 path = "src/main.rs"
 
+[features]
+# Tool families (compile-time capability pruning, RFC §10.4).
+default = ["tools-fs"]
+tools-fs = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[dev-dependencies]
+tempfile = "3"

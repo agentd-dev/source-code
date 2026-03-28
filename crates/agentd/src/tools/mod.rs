@@ -16,6 +16,9 @@ pub mod policy;
 #[cfg(feature = "tools-fs")]
 pub mod fs;
 
+#[cfg(feature = "tools-env")]
+pub mod env;
+
 use crate::engine::HandlerRegistry;
 use crate::tools::policy::PolicyRef;
 
@@ -82,4 +85,7 @@ pub(crate) use resolve::{resolve_string, resolve_value, value_type_name};
 pub fn register_default_tools(_registry: &mut HandlerRegistry, _policy: PolicyRef) {
     #[cfg(feature = "tools-fs")]
     fs::register(_registry, _policy.clone());
+
+    #[cfg(feature = "tools-env")]
+    env::register(_registry, _policy.clone());
 }

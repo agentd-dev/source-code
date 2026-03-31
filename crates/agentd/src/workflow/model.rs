@@ -310,9 +310,7 @@ impl NodeKind {
     pub fn is_side_effect(&self) -> bool {
         matches!(
             self,
-            NodeKind::WriteFile { .. }
-                | NodeKind::CreateDir { .. }
-                | NodeKind::CallMcpTool { .. }
+            NodeKind::WriteFile { .. } | NodeKind::CreateDir { .. } | NodeKind::CallMcpTool { .. }
         )
     }
 }

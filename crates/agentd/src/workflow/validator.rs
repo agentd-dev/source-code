@@ -366,7 +366,9 @@ fn check_reachability(doc: &WorkflowDoc, node_ids: &HashSet<String>, r: &mut Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::model::{Edge, HttpRoute, Node, NodeKind, StartNode, StartSource, Trigger};
+    use crate::workflow::model::{
+        Edge, HttpRoute, Node, NodeKind, StartNode, StartSource, Trigger,
+    };
 
     fn n(id: &str, kind: NodeKind) -> Node {
         Node {

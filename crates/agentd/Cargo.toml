@@ -29,5 +29,11 @@ serde_json = "1"
 thiserror = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
+# libc — Unix-only. Used for sigaction (signals.rs). Every call
+# site is `#[cfg(unix)]` gated, so scoping the dep to Unix targets
+# lets the crate compile elsewhere without carrying the unused dep.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

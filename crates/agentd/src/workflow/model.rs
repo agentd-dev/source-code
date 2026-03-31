@@ -55,6 +55,12 @@ pub struct WorkflowDoc {
 
     #[serde(default)]
     pub edges: Vec<Edge>,
+
+    /// Inline policy manifest (RFC §16). Omitting the block keeps
+    /// the permissive `AllowAll` default; adding it switches to
+    /// fail-closed allowlist enforcement.
+    #[serde(default)]
+    pub policy: Option<crate::policy::PolicyManifest>,
 }
 
 impl WorkflowDoc {

@@ -18,10 +18,16 @@ path = "src/main.rs"
 
 [features]
 # Tool families (compile-time capability pruning, RFC §10.4).
-default = ["tools-fs", "tools-env", "tools-data"]
+# `trigger-http` is on by default so serve mode Just Works; the
+# sealed-appliance build recipe turns it off so zero-egress
+# deployments stay egress-free by construction.
+default = ["tools-fs", "tools-env", "tools-data", "trigger-http"]
 tools-fs = []
 tools-env = []
 tools-data = []
+
+# Trigger adapters.
+trigger-http = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

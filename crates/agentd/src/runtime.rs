@@ -1,15 +1,16 @@
 //! Single-entry-point driver.
 //!
 //! The binary has no subcommands. It resolves the workflow once,
-//! validates it, then runs it one-shot from a chosen start node and
-//! prints the outcome as JSON. Overrides flow through CLI flags
-//! (hand-parsed; no `clap`) and environment variables, with the
-//! former winning.
+//! infers its operating mode from the workflow's declarations, then
+//! runs. Overrides flow through CLI flags (hand-parsed; no `clap`)
+//! and environment variables, with the former winning.
 //!
 //! ```text
 //! agentd [--config FILE]
-//!        [--input FILE]           (trigger payload)
+//!        [--input FILE]           (one-shot mode; trigger payload)
 //!        [--start NAME]           (default: only manual start node)
+//!        [--mode once|serve]
+//!        [--bind HOST:PORT]       (server mode override)
 //!        [--timeout-secs N]
 //!        [--dry-run]
 //!        [--validate-only]
@@ -18,6 +19,11 @@
 //!
 //! All CLI flags have `AGENTD_*` env-var twins. Every workflow that
 //! compiles today still runs; new knobs are optional.
+//!
+//! **Mode inference.** A workflow with at least one `[[http_routes]]`
+//! entry switches the binary into server mode; otherwise the binary
+//! runs once and exits. Override with `--mode serve|once` if the
+//! default is wrong.
 
 use std::fs;
 use std::path::PathBuf;
@@ -90,7 +96,28 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         dry_run: args.dry_run,
     };
 
-    run_once_mode(doc, engine, options, &args)
+    match resolve_mode(&doc, args.mode.as_deref()) {
+        Mode::Serve => run_serve_mode(doc, engine, options, &args),
+        Mode::Once => run_once_mode(doc, engine, options, &args),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mode resolution
+// ---------------------------------------------------------------------------
+
+enum Mode {
+    Serve,
+    Once,
+}
+
+fn resolve_mode(doc: &WorkflowDoc, override_: Option<&str>) -> Mode {
+    match override_ {
+        Some("serve") => Mode::Serve,
+        Some("once") => Mode::Once,
+        _ if !doc.http_routes.is_empty() => Mode::Serve,
+        _ => Mode::Once,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +129,12 @@ struct Args {
     config: Option<PathBuf>,
     input_file: Option<PathBuf>,
     start: Option<String>,
+    mode: Option<String>,
+    bind: Option<String>,
     timeout_secs: u64,
     dry_run: bool,
     validate_only: bool,
+    drain_timeout_secs: u64,
 }
 
 #[derive(Debug)]
@@ -117,9 +147,12 @@ enum ArgErr {
 fn parse_args(argv: &[String]) -> Result<Args, ArgErr> {
     let mut a = Args {
         timeout_secs: env_u64("AGENTD_TIMEOUT_SECS", 120),
+        drain_timeout_secs: env_u64("AGENTD_DRAIN_TIMEOUT_SECS", 30),
         config: env_opt_path("AGENTD_CONFIG"),
         input_file: env_opt_path("AGENTD_INPUT"),
         start: std::env::var("AGENTD_START").ok(),
+        mode: std::env::var("AGENTD_MODE").ok(),
+        bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         dry_run: env_bool("AGENTD_DRY_RUN"),
         validate_only: env_bool("AGENTD_VALIDATE_ONLY"),
     };
@@ -139,10 +172,24 @@ fn parse_args(argv: &[String]) -> Result<Args, ArgErr> {
             "--start" | "-s" => {
                 a.start = Some(require_value(argv, &mut i, arg)?.to_string());
             }
+            "--mode" => {
+                a.mode = Some(require_value(argv, &mut i, arg)?.to_string());
+            }
+            "--bind" | "-b" => {
+                a.bind = Some(require_value(argv, &mut i, arg)?.to_string());
+            }
             "--timeout-secs" => {
                 let v = require_value(argv, &mut i, arg)?;
                 a.timeout_secs = v.parse::<u64>().map_err(|_| {
                     ArgErr::Usage(format!("--timeout-secs expects an integer; got `{v}`"))
+                })?;
+            }
+            "--drain-timeout-secs" => {
+                let v = require_value(argv, &mut i, arg)?;
+                a.drain_timeout_secs = v.parse::<u64>().map_err(|_| {
+                    ArgErr::Usage(format!(
+                        "--drain-timeout-secs expects an integer; got `{v}`"
+                    ))
                 })?;
             }
             "--dry-run" => a.dry_run = true,
@@ -285,6 +332,100 @@ fn pick_once_start(doc: &WorkflowDoc, override_: Option<&str>) -> Result<String,
 }
 
 // ---------------------------------------------------------------------------
+// Serve mode
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "trigger-http")]
+fn run_serve_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &Args) -> ExitCode {
+    use std::net::SocketAddr;
+
+    if doc.http_routes.is_empty() {
+        eprintln!("agentd: serve mode requires at least one [[http_routes]] entry");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let bind = args
+        .bind
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let addr: SocketAddr = match bind.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("agentd: invalid bind address `{bind}`: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+
+    let doc_arc = Arc::new(doc.clone());
+    let server = crate::triggers::http::HttpServer::new(
+        addr,
+        doc_arc,
+        Arc::new(engine),
+        options,
+    )
+    .with_drain_timeout(Duration::from_secs(args.drain_timeout_secs.max(1)));
+    let handle = match server.spawn() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("agentd: {e}");
+            return ExitCode::from(EXIT_SEMANTIC);
+        }
+    };
+    eprintln!(
+        "agentd: workflow `{}` listening on http://{}/ ({} routes; drain_timeout={}s)",
+        doc.name,
+        handle.local_addr(),
+        doc.http_routes.len(),
+        args.drain_timeout_secs,
+    );
+    for r in &doc.http_routes {
+        eprintln!("       {} {} → {}", r.method, r.path, r.start_node);
+    }
+
+    // Install SIGTERM/SIGINT handlers and block until a shutdown
+    // signal flips the flag.
+    crate::signals::install_shutdown_handlers();
+    while !crate::signals::shutdown_requested() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("agentd: shutdown signal received; draining…");
+
+    let clean = handle.shutdown_and_drain();
+    eprintln!(
+        "agentd: drain {}",
+        if clean {
+            "complete"
+        } else {
+            "timed out (forced exit)"
+        }
+    );
+    if clean {
+        ExitCode::from(EXIT_OK)
+    } else {
+        ExitCode::from(EXIT_SEMANTIC)
+    }
+}
+
+/// Serve-mode stub for builds without the HTTP trigger. The mode
+/// resolver can still pick Serve (workflow declares routes); the
+/// binary refuses with a rebuild hint instead of silently running
+/// once.
+#[cfg(not(feature = "trigger-http"))]
+fn run_serve_mode(
+    doc: WorkflowDoc,
+    _engine: Engine,
+    _options: RunOptions,
+    _args: &Args,
+) -> ExitCode {
+    eprintln!(
+        "agentd: workflow `{}` wants serve mode but this build lacks the \
+         `trigger-http` Cargo feature; rebuild with --features trigger-http",
+        doc.name
+    );
+    ExitCode::from(EXIT_SEMANTIC)
+}
+
+// ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
 
@@ -310,7 +451,10 @@ usage:
   agentd [--config FILE]            AGENTD_CONFIG          (required)
          [--input FILE]             AGENTD_INPUT           one-shot trigger payload
          [--start NAME]             AGENTD_START           explicit start node
+         [--mode once|serve]        AGENTD_MODE            override auto-inferred mode
+         [--bind HOST:PORT]         AGENTD_HTTP_BIND       server-mode bind (default 127.0.0.1:8080)
          [--timeout-secs N]         AGENTD_TIMEOUT_SECS    per-run deadline (default 120)
+         [--drain-timeout-secs N]   AGENTD_DRAIN_TIMEOUT_SECS  graceful shutdown grace (default 30)
          [--dry-run]                AGENTD_DRY_RUN=1
          [--validate-only]          AGENTD_VALIDATE_ONLY=1
          [--version] [--help]
@@ -381,6 +525,26 @@ mod tests {
         let doc = wf_with(vec![manual("a"), manual("b")]);
         let err = pick_once_start(&doc, None).unwrap_err();
         assert!(err.contains("cannot pick a start node"));
+    }
+
+    #[test]
+    fn mode_inferred_from_http_routes() {
+        let mut doc = wf_with(vec![http_start("on_http")]);
+        assert!(matches!(resolve_mode(&doc, None), Mode::Once));
+        doc.http_routes.push(crate::workflow::model::HttpRoute {
+            method: "POST".into(),
+            path: "/x".into(),
+            start_node: "on_http".into(),
+            input_schema: None,
+        });
+        assert!(matches!(resolve_mode(&doc, None), Mode::Serve));
+    }
+
+    #[test]
+    fn mode_override_wins() {
+        let doc = wf_with(vec![manual("a")]);
+        assert!(matches!(resolve_mode(&doc, Some("serve")), Mode::Serve));
+        assert!(matches!(resolve_mode(&doc, Some("once")), Mode::Once));
     }
 
     #[test]

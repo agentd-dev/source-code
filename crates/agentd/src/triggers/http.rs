@@ -455,3 +455,212 @@ fn write_response<S: Write, B: serde::Serialize>(
     stream.flush()?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{HandlerRegistry, StubHandler};
+    use crate::tools::{policy::allow_all, register_default_tools};
+    use crate::workflow::model::{Edge, HttpRoute, Node, NodeKind, StartNode, StartSource};
+    use std::io::{BufReader, Read, Write};
+    use std::net::TcpStream;
+
+    fn minimal_wf() -> WorkflowDoc {
+        WorkflowDoc {
+            name: "t".into(),
+            start_nodes: vec![StartNode {
+                name: "on_http".into(),
+                source: StartSource::Http,
+                entry_node: Some("a".into()),
+            }],
+            http_routes: vec![HttpRoute {
+                method: "POST".into(),
+                path: "/run".into(),
+                start_node: "on_http".into(),
+                input_schema: None,
+            }],
+            nodes: vec![
+                Node {
+                    id: "a".into(),
+                    kind: NodeKind::Merge,
+                },
+                Node {
+                    id: "b".into(),
+                    kind: NodeKind::Terminate,
+                },
+            ],
+            edges: vec![Edge {
+                from: "a".into(),
+                to: "b".into(),
+                when: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn start_server(wf: WorkflowDoc) -> ServerHandle {
+        let mut registry = HandlerRegistry::with_builtin_controls();
+        register_default_tools(&mut registry, allow_all());
+        registry.set_fallback(Box::new(StubHandler));
+        let engine = Arc::new(Engine::new(registry));
+        let server = HttpServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(wf),
+            engine,
+            RunOptions::default(),
+        );
+        server.spawn().expect("spawn http server")
+    }
+
+    fn send(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+        send_with_headers(addr, method, path, &std::collections::HashMap::new(), body)
+    }
+
+    fn send_with_headers(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = String::new();
+        let mut reader = BufReader::new(stream);
+        reader.read_to_string(&mut buf).unwrap();
+        let (status_line, rest) = buf.split_once("\r\n").unwrap_or((&buf, ""));
+        let code = status_line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        // Body starts after the empty line separating headers + body.
+        let body = rest.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        (code, body.to_string())
+    }
+
+    #[test]
+    fn routes_to_declared_path() {
+        let handle = start_server(minimal_wf());
+        let (code, body) = send(handle.local_addr(), "POST", "/run", b"{}");
+        assert_eq!(code, 200);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "completed");
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn unknown_path_returns_404() {
+        let handle = start_server(minimal_wf());
+        let (code, _body) = send(handle.local_addr(), "POST", "/nope", b"{}");
+        assert_eq!(code, 404);
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn wrong_method_on_known_path_returns_405() {
+        let handle = start_server(minimal_wf());
+        let (code, _body) = send(handle.local_addr(), "GET", "/run", b"");
+        assert_eq!(code, 405);
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn invalid_json_returns_400() {
+        let handle = start_server(minimal_wf());
+        let (code, body) = send(handle.local_addr(), "POST", "/run", b"not json");
+        assert_eq!(code, 400);
+        assert!(body.contains("invalid JSON"));
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn empty_body_treated_as_null_input() {
+        // A workflow that reads trigger and terminates — verifies the
+        // empty body doesn't break the pipeline.
+        let mut wf = minimal_wf();
+        wf.nodes[0] = Node {
+            id: "a".into(),
+            kind: NodeKind::Condition {
+                expr: "trigger.kind".into(),
+            },
+        };
+        wf.edges = vec![
+            Edge {
+                from: "a".into(),
+                to: "b".into(),
+                when: Some("true".into()),
+            },
+            Edge {
+                from: "a".into(),
+                to: "b".into(),
+                when: Some("false".into()),
+            },
+        ];
+        let handle = start_server(wf);
+        let (code, _body) = send(handle.local_addr(), "POST", "/run", b"");
+        assert_eq!(code, 200);
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn failed_workflow_maps_to_422() {
+        let mut wf = minimal_wf();
+        wf.nodes[0] = Node {
+            id: "a".into(),
+            kind: NodeKind::Fail {
+                reason: Some("boom".into()),
+            },
+        };
+        wf.edges.clear();
+        let handle = start_server(wf);
+        let (code, body) = send(handle.local_addr(), "POST", "/run", b"{}");
+        assert_eq!(code, 422);
+        assert!(body.contains("\"status\":\"failed\""));
+        assert!(body.contains("boom"));
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn oversized_body_returns_413() {
+        // Claim 32 MiB without actually writing it; the server should
+        // 413 on the Content-Length check before reading the body.
+        let handle = start_server(minimal_wf());
+        let addr = handle.local_addr();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                b"POST /run HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Content-Length: 33554432\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+
+        let mut buf = String::new();
+        let mut reader = BufReader::new(stream);
+        reader.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains("413"));
+        handle.shutdown_and_drain();
+    }
+}

@@ -546,6 +546,7 @@ mod tests {
                 path: "/x".into(),
                 start_node: "nope".into(),
                 input_schema: None,
+                auth: None,
             }],
             ..Default::default()
         };
@@ -592,6 +593,7 @@ mod tests {
                 path: "/workflows/document-review".into(),
                 start_node: "on_http_request".into(),
                 input_schema: None,
+                auth: None,
             }],
             nodes: vec![
                 n(
@@ -657,12 +659,14 @@ mod tests {
                     path: "/x".into(),
                     start_node: "main".into(),
                     input_schema: None,
+                    auth: None,
                 },
                 HttpRoute {
                     method: "post".into(), // case-insensitive match
                     path: "/x".into(),
                     start_node: "main".into(),
                     input_schema: None,
+                    auth: None,
                 },
             ],
             ..Default::default()

@@ -8,6 +8,8 @@
 //! Full design: [`rfcs/0001-bounded-workflow-runtime.md`] at the
 //! workspace root.
 
+#[cfg(feature = "auth")]
+pub mod auth;
 pub mod engine;
 pub mod error;
 pub mod policy;

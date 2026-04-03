@@ -21,7 +21,7 @@ path = "src/main.rs"
 # `trigger-http` is on by default so serve mode Just Works; the
 # sealed-appliance build recipe turns it off so zero-egress
 # deployments stay egress-free by construction.
-default = ["tools-fs", "tools-env", "tools-data", "trigger-http"]
+default = ["tools-fs", "tools-env", "tools-data", "trigger-http", "auth"]
 tools-fs = []
 tools-env = []
 tools-data = []
@@ -29,11 +29,18 @@ tools-data = []
 # Trigger adapters.
 trigger-http = []
 
+# HTTP auth (bearer + HMAC webhook verification). `auth` ships in
+# default builds — HMAC-SHA256 is a basic need for any production
+# HTTP surface.
+auth = ["dep:sha2", "dep:hmac"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+sha2 = { version = "0.10", default-features = false, optional = true }
+hmac = { version = "0.12", default-features = false, optional = true }
 
 # libc — Unix-only. Used for sigaction (signals.rs). Every call
 # site is `#[cfg(unix)]` gated, so scoping the dep to Unix targets

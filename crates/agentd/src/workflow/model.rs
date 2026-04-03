@@ -61,6 +61,13 @@ pub struct WorkflowDoc {
     /// fail-closed allowlist enforcement.
     #[serde(default)]
     pub policy: Option<crate::policy::PolicyManifest>,
+
+    /// Optional `[auth]` block defining bearer / HMAC bindings.
+    /// Route-level `auth = "bearer:..."` / `"hmac:..."` refs
+    /// resolve against this at startup.
+    #[cfg(feature = "auth")]
+    #[serde(default)]
+    pub auth: Option<crate::auth::AuthConfig>,
 }
 
 impl WorkflowDoc {
@@ -184,6 +191,8 @@ pub struct HttpRoute {
     pub start_node: String,
     #[serde(default)]
     pub input_schema: Option<String>,
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

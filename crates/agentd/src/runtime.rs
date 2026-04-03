@@ -536,6 +536,7 @@ mod tests {
             path: "/x".into(),
             start_node: "on_http".into(),
             input_schema: None,
+            auth: None,
         });
         assert!(matches!(resolve_mode(&doc, None), Mode::Serve));
     }

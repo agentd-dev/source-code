@@ -68,6 +68,22 @@ impl HttpServer {
     /// Spawn the listener on its own thread. Returns a
     /// [`ServerHandle`] for orderly shutdown.
     pub fn spawn(self) -> Result<ServerHandle> {
+        // Startup validation — auth refs resolve to configured
+        // bindings. Expensive to debug at first-request time.
+        #[cfg(feature = "auth")]
+        let auth_config: AuthArc = {
+            let mut refs = Vec::with_capacity(self.workflow.http_routes.len());
+            for route in &self.workflow.http_routes {
+                refs.push(crate::auth::AuthRef::parse(route.auth.as_deref())?);
+            }
+            let empty = crate::auth::AuthConfig::default();
+            let cfg = self.workflow.auth.as_ref().unwrap_or(&empty);
+            cfg.validate(&refs)?;
+            Arc::new(cfg.clone())
+        };
+        #[cfg(not(feature = "auth"))]
+        let auth_config: AuthArc = Arc::new(());
+
         let listener = TcpListener::bind(self.bind).map_err(|e| Error::Workflow {
             workflow: self.workflow.name.clone(),
             reason: format!("bind {}: {e}", self.bind),
@@ -94,10 +110,11 @@ impl HttpServer {
                         let wf = workflow.clone();
                         let eng = engine.clone();
                         let opts = options.clone();
+                        let auth = auth_config.clone();
                         let guard = InFlightGuard::acquire(in_flight_accept.clone());
                         thread::spawn(move || {
                             let _g = guard; // drop decrements counter
-                            let _ = handle_connection(stream, &wf, &eng, &opts);
+                            let _ = handle_connection(stream, &wf, &eng, &opts, &auth);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -119,6 +136,14 @@ impl HttpServer {
         })
     }
 }
+
+/// Auth container shared across request-handling threads. Uniform
+/// type regardless of the `auth` feature so the dispatch signature
+/// stays identical on both sides.
+#[cfg(feature = "auth")]
+type AuthArc = std::sync::Arc<crate::auth::AuthConfig>;
+#[cfg(not(feature = "auth"))]
+type AuthArc = std::sync::Arc<()>;
 
 /// RAII counter decrement for in-flight request tracking.
 struct InFlightGuard {
@@ -206,6 +231,7 @@ fn handle_connection<S: std::io::Read + Write>(
     workflow: &WorkflowDoc,
     engine: &Engine,
     options: &RunOptions,
+    auth_config: &AuthArc,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let parse_result = parse_request(&mut reader);
@@ -246,6 +272,40 @@ fn handle_connection<S: std::io::Read + Write>(
         return Ok(());
     };
 
+    // Auth check happens before we parse the body as JSON so we
+    // don't burn cycles on unauthenticated requests.
+    #[cfg(feature = "auth")]
+    let principal = {
+        let auth_ref = match crate::auth::AuthRef::parse(route.auth.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                // spawn() validated this; a mid-flight parse error
+                // is an internal bug, surface as 500.
+                write_response(
+                    stream,
+                    Status::new(500, "Internal Server Error"),
+                    &json!({ "error": format!("auth config error: {e}") }),
+                )?;
+                return Ok(());
+            }
+        };
+        let auth_req = crate::auth::AuthRequest {
+            headers: &request.headers,
+            body: &request.body,
+        };
+        match crate::auth::evaluate(auth_config, &auth_ref, &auth_req) {
+            crate::auth::AuthDecision::Allow { principal } => principal,
+            crate::auth::AuthDecision::Deny { reason } => {
+                write_response(
+                    stream,
+                    Status::new(401, "Unauthorized"),
+                    &json!({ "error": "unauthorized", "detail": reason }),
+                )?;
+                return Ok(());
+            }
+        }
+    };
+
     // Parse body as JSON (or accept an empty body as `null`).
     let input = if request.body.is_empty() {
         Value::Null
@@ -261,6 +321,24 @@ fn handle_connection<S: std::io::Read + Write>(
                 return Ok(());
             }
         }
+    };
+
+    // When auth is compiled in, attach the principal to the trigger
+    // payload so `trigger.principal.kind` / `trigger.principal.name`
+    // are reachable from condition / switch nodes.
+    #[cfg(feature = "auth")]
+    let input = {
+        let mut input = input;
+        let principal_json = json!({
+            "kind": principal.kind,
+            "name": principal.name,
+        });
+        if let Value::Object(obj) = &mut input {
+            obj.insert("principal".to_string(), principal_json);
+        } else if input.is_null() {
+            input = json!({ "principal": principal_json });
+        }
+        input
     };
 
     // Run.
@@ -482,6 +560,7 @@ mod tests {
                 path: "/run".into(),
                 start_node: "on_http".into(),
                 input_schema: None,
+                auth: None,
             }],
             nodes: vec![
                 Node {

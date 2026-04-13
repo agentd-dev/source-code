@@ -149,10 +149,7 @@ mod tests {
         let body = br#"{"event":"push"}"#;
         let sig = sign_hex(b"s3cret", body);
         let hs = headers(&[("X-Agent-Signature", &format!("sha256={sig}"))]);
-        let r = AuthRequest {
-            headers: &hs,
-            body,
-        };
+        let r = AuthRequest { headers: &hs, body };
         match verify(&c, "gh", &r) {
             AuthDecision::Allow { principal } => {
                 assert_eq!(principal.kind, "hmac");
@@ -198,10 +195,7 @@ mod tests {
         let body = b"payload";
         let sig = sign_hex(b"k", body);
         let hs = headers(&[("X-Hub-Signature-256", &format!("sha256={sig}"))]);
-        let r = AuthRequest {
-            headers: &hs,
-            body,
-        };
+        let r = AuthRequest { headers: &hs, body };
         assert!(matches!(verify(&c, "hub", &r), AuthDecision::Allow { .. }));
     }
 
@@ -273,10 +267,7 @@ mod tests {
         let body = b"x";
         let sig = sign_hex(b"k", body);
         let hs = headers(&[("X-Agent-Signature", &sig)]);
-        let r = AuthRequest {
-            headers: &hs,
-            body,
-        };
+        let r = AuthRequest { headers: &hs, body };
         assert!(matches!(verify(&c, "gh", &r), AuthDecision::Allow { .. }));
     }
 

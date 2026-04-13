@@ -48,12 +48,8 @@ pub use config::AuthConfig;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthRef {
     None,
-    Bearer {
-        name: String,
-    },
-    Hmac {
-        name: String,
-    },
+    Bearer { name: String },
+    Hmac { name: String },
     MTls,
 }
 

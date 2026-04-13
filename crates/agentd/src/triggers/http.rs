@@ -84,6 +84,26 @@ impl HttpServer {
         #[cfg(not(feature = "auth"))]
         let auth_config: AuthArc = Arc::new(());
 
+        // Startup validation — rate-limit numbers are sensible, and
+        // one bucket per configured route is built up-front.
+        let mut buckets: std::collections::HashMap<
+            (String, String),
+            Arc<crate::ratelimit::TokenBucket>,
+        > = std::collections::HashMap::new();
+        for r in &self.workflow.http_routes {
+            if let Some(cfg) = &r.rate_limit {
+                cfg.validate().map_err(|reason| Error::Workflow {
+                    workflow: self.workflow.name.clone(),
+                    reason,
+                })?;
+                buckets.insert(
+                    (r.method.to_ascii_uppercase(), r.path.clone()),
+                    Arc::new(crate::ratelimit::TokenBucket::new(cfg)),
+                );
+            }
+        }
+        let buckets = Arc::new(buckets);
+
         let listener = TcpListener::bind(self.bind).map_err(|e| Error::Workflow {
             workflow: self.workflow.name.clone(),
             reason: format!("bind {}: {e}", self.bind),
@@ -111,10 +131,11 @@ impl HttpServer {
                         let eng = engine.clone();
                         let opts = options.clone();
                         let auth = auth_config.clone();
+                        let bks = buckets.clone();
                         let guard = InFlightGuard::acquire(in_flight_accept.clone());
                         thread::spawn(move || {
                             let _g = guard; // drop decrements counter
-                            let _ = handle_connection(stream, &wf, &eng, &opts, &auth);
+                            let _ = handle_connection(stream, &wf, &eng, &opts, &bks, &auth);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -226,11 +247,14 @@ impl Drop for ServerHandle {
 
 /// Drive one accepted connection: parse a single request, route it,
 /// run the workflow, write the response, close.
+type Buckets = std::collections::HashMap<(String, String), Arc<crate::ratelimit::TokenBucket>>;
+
 fn handle_connection<S: std::io::Read + Write>(
     stream: S,
     workflow: &WorkflowDoc,
     engine: &Engine,
     options: &RunOptions,
+    buckets: &Buckets,
     auth_config: &AuthArc,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
@@ -271,6 +295,26 @@ fn handle_connection<S: std::io::Read + Write>(
         )?;
         return Ok(());
     };
+
+    // Rate limit check — per-route token bucket. Cheapest
+    // per-request gate, runs before auth so a flood of invalid
+    // tokens also gets 429'd.
+    let rate_key = (request.method.to_ascii_uppercase(), route.path.clone());
+    if let Some(bucket) = buckets.get(&rate_key) {
+        if let Err(retry_after) = bucket.try_take() {
+            let retry_secs = format!("{}", retry_after.as_secs().max(1));
+            write_response_with_header(
+                stream,
+                Status::new(429, "Too Many Requests"),
+                &json!({
+                    "error": "rate limited",
+                    "retry_after_ms": retry_after.as_millis() as u64,
+                }),
+                &[("Retry-After".into(), retry_secs)],
+            )?;
+            return Ok(());
+        }
+    }
 
     // Auth check happens before we parse the body as JSON so we
     // don't burn cycles on unauthenticated requests.
@@ -518,16 +562,29 @@ fn write_response<S: Write, B: serde::Serialize>(
     status: Status,
     body: &B,
 ) -> std::io::Result<()> {
+    write_response_with_header(stream, status, body, &[])
+}
+
+fn write_response_with_header<S: Write, B: serde::Serialize>(
+    stream: &mut S,
+    status: Status,
+    body: &B,
+    extra_headers: &[(String, String)],
+) -> std::io::Result<()> {
     let body = serde_json::to_vec(body)?;
-    let header = format!(
+    let mut header = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
+         Connection: close\r\n",
         status.code,
         status.reason,
         body.len()
     );
+    for (k, v) in extra_headers {
+        header.push_str(&format!("{k}: {v}\r\n"));
+    }
+    header.push_str("\r\n");
     stream.write_all(header.as_bytes())?;
     stream.write_all(&body)?;
     stream.flush()?;
@@ -561,6 +618,7 @@ mod tests {
                 start_node: "on_http".into(),
                 input_schema: None,
                 auth: None,
+                rate_limit: None,
             }],
             nodes: vec![
                 Node {

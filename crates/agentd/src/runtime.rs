@@ -357,13 +357,8 @@ fn run_serve_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &
     };
 
     let doc_arc = Arc::new(doc.clone());
-    let server = crate::triggers::http::HttpServer::new(
-        addr,
-        doc_arc,
-        Arc::new(engine),
-        options,
-    )
-    .with_drain_timeout(Duration::from_secs(args.drain_timeout_secs.max(1)));
+    let server = crate::triggers::http::HttpServer::new(addr, doc_arc, Arc::new(engine), options)
+        .with_drain_timeout(Duration::from_secs(args.drain_timeout_secs.max(1)));
     let handle = match server.spawn() {
         Ok(h) => h,
         Err(e) => {
@@ -537,6 +532,7 @@ mod tests {
             start_node: "on_http".into(),
             input_schema: None,
             auth: None,
+            rate_limit: None,
         });
         assert!(matches!(resolve_mode(&doc, None), Mode::Serve));
     }

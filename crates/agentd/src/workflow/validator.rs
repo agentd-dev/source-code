@@ -547,6 +547,7 @@ mod tests {
                 start_node: "nope".into(),
                 input_schema: None,
                 auth: None,
+                rate_limit: None,
             }],
             ..Default::default()
         };
@@ -594,6 +595,7 @@ mod tests {
                 start_node: "on_http_request".into(),
                 input_schema: None,
                 auth: None,
+                rate_limit: None,
             }],
             nodes: vec![
                 n(
@@ -660,6 +662,7 @@ mod tests {
                     start_node: "main".into(),
                     input_schema: None,
                     auth: None,
+                    rate_limit: None,
                 },
                 HttpRoute {
                     method: "post".into(), // case-insensitive match
@@ -667,6 +670,7 @@ mod tests {
                     start_node: "main".into(),
                     input_schema: None,
                     auth: None,
+                    rate_limit: None,
                 },
             ],
             ..Default::default()

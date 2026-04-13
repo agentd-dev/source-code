@@ -193,6 +193,10 @@ pub struct HttpRoute {
     pub input_schema: Option<String>,
     #[serde(default)]
     pub auth: Option<String>,
+    /// Optional token-bucket limit. Denied requests return 429 with
+    /// a `Retry-After` header.
+    #[serde(default)]
+    pub rate_limit: Option<crate::ratelimit::RateLimitConfig>,
 }
 
 // ---------------------------------------------------------------------------

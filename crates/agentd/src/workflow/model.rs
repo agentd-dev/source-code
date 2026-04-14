@@ -68,6 +68,13 @@ pub struct WorkflowDoc {
     #[cfg(feature = "auth")]
     #[serde(default)]
     pub auth: Option<crate::auth::AuthConfig>,
+
+    /// Optional `[server]` block. TLS + mTLS termination. The full
+    /// rustls wiring is behind the `server-tls` Cargo feature;
+    /// absence of the feature turns a present `[server.tls]` block
+    /// into a clean startup error pointing at the rebuild path.
+    #[serde(default)]
+    pub server: Option<crate::server_config::ServerConfig>,
 }
 
 impl WorkflowDoc {

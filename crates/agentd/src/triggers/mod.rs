@@ -17,3 +17,6 @@
 
 #[cfg(feature = "trigger-http")]
 pub mod http;
+
+#[cfg(all(feature = "trigger-http", feature = "server-tls"))]
+pub mod http_tls;

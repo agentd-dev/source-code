@@ -97,6 +97,7 @@ mod tests {
                 &*(&headers as *const HashMap<String, String>)
             },
             body,
+            peer_cert_fingerprint: None,
         };
         (headers, r)
     }
@@ -120,6 +121,7 @@ mod tests {
         let r = AuthRequest {
             headers: &hs,
             body: r.body,
+            peer_cert_fingerprint: None,
         };
         match verify(&cfg, "ops", &r) {
             AuthDecision::Allow { principal } => {
@@ -137,6 +139,7 @@ mod tests {
         let r = AuthRequest {
             headers: &hs,
             body: b"",
+            peer_cert_fingerprint: None,
         };
         match verify(&cfg, "ops", &r) {
             AuthDecision::Deny { reason } => {
@@ -153,6 +156,7 @@ mod tests {
         let r = AuthRequest {
             headers: &hs,
             body: b"",
+            peer_cert_fingerprint: None,
         };
         match verify(&cfg, "ops", &r) {
             AuthDecision::Deny { reason } => {
@@ -169,6 +173,7 @@ mod tests {
         let r = AuthRequest {
             headers: &hs,
             body: b"",
+            peer_cert_fingerprint: None,
         };
         match verify(&cfg, "ops", &r) {
             AuthDecision::Deny { reason } => {
@@ -185,6 +190,7 @@ mod tests {
         let r = AuthRequest {
             headers: &hs,
             body: b"",
+            peer_cert_fingerprint: None,
         };
         match verify(&cfg, "missing", &r) {
             AuthDecision::Deny { reason } => {

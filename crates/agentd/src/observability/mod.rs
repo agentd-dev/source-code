@@ -18,10 +18,6 @@
 //!    a specific target (`agentd::audit`). A dedicated sink (JSONL
 //!    file with per-event redaction) is Phase-10 scope.
 
-pub mod metrics;
-
-pub use metrics::{Metrics, MetricsSnapshot};
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};

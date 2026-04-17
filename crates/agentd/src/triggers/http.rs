@@ -14,7 +14,7 @@
 //! everything else returns 404 / 405.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -24,6 +24,18 @@ use serde_json::{Value, json};
 use crate::engine::{Engine, ExecutionOutcome, RunOptions, TriggerMeta};
 use crate::error::{Error, Result};
 use crate::workflow::WorkflowDoc;
+
+/// Identity extracted from a client cert after a successful mTLS
+/// handshake. Always-defined so the non-TLS path can
+/// thread `Option<PeerIdentity>` through uniformly; populated only
+/// when the `server-tls` feature is on AND the peer presented a
+/// client cert.
+#[derive(Debug, Clone)]
+pub struct PeerIdentity {
+    /// `sha256:<64-hex>` of the leaf cert's DER bytes. Stable
+    /// identifier operators pin.
+    pub fingerprint: String,
+}
 
 /// Max body size accepted on an HTTP request. Declines larger
 /// requests with 413 Payload Too Large.
@@ -104,6 +116,11 @@ impl HttpServer {
         }
         let buckets = Arc::new(buckets);
 
+        // Startup validation — if `[server.tls]` is declared, load
+        // the cert/key + (optional) client-auth CA so a misconfigured
+        // cert path fails the bind rather than the first request.
+        let tls_config = self.build_tls_arc()?;
+
         let listener = TcpListener::bind(self.bind).map_err(|e| Error::Workflow {
             workflow: self.workflow.name.clone(),
             reason: format!("bind {}: {e}", self.bind),
@@ -132,10 +149,11 @@ impl HttpServer {
                         let opts = options.clone();
                         let auth = auth_config.clone();
                         let bks = buckets.clone();
+                        let tls_snapshot: TlsArc = tls_config.clone();
                         let guard = InFlightGuard::acquire(in_flight_accept.clone());
                         thread::spawn(move || {
                             let _g = guard; // drop decrements counter
-                            let _ = handle_connection(stream, &wf, &eng, &opts, &bks, &auth);
+                            dispatch_accepted(stream, tls_snapshot, &wf, &eng, &opts, &bks, &auth);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -155,6 +173,92 @@ impl HttpServer {
             drain_timeout: self.drain_timeout,
             thread: Some(handle),
         })
+    }
+}
+
+/// Opaque handle for the TLS config — `Some` iff `[server.tls]` is
+/// set AND `server-tls` is compiled. Without the feature the type
+/// is a `()` marker so the rest of the module stays uniform.
+#[cfg(feature = "server-tls")]
+type TlsArc = Option<std::sync::Arc<rustls::ServerConfig>>;
+#[cfg(not(feature = "server-tls"))]
+type TlsArc = Option<()>;
+
+impl HttpServer {
+    /// Build the optional TLS config. Fails the bind early if the
+    /// workflow asks for TLS but the build doesn't carry rustls.
+    fn build_tls_arc(&self) -> Result<TlsArc> {
+        let Some(server) = &self.workflow.server else {
+            return Ok(None);
+        };
+        let Some(tls) = &server.tls else {
+            return Ok(None);
+        };
+
+        #[cfg(feature = "server-tls")]
+        {
+            let cfg = crate::triggers::http_tls::build_server_config(tls)?;
+            Ok(Some(cfg))
+        }
+
+        #[cfg(not(feature = "server-tls"))]
+        {
+            let _ = tls;
+            Err(Error::Workflow {
+                workflow: self.workflow.name.clone(),
+                reason: "workflow declares [server.tls] but this build lacks \
+                         the `server-tls` Cargo feature; rebuild with \
+                         --features server-tls"
+                    .into(),
+            })
+        }
+    }
+}
+
+/// Per-connection dispatch. Decides between plain TCP and TLS-wrapped
+/// streams and hands each through the same [`handle_connection`]
+/// pipeline.
+fn dispatch_accepted(
+    stream: TcpStream,
+    tls: TlsArc,
+    workflow: &WorkflowDoc,
+    engine: &Engine,
+    options: &RunOptions,
+    buckets: &Buckets,
+    auth_config: &AuthArc,
+) {
+    match tls {
+        None => {
+            let _ = handle_connection(
+                stream,
+                workflow,
+                engine,
+                options,
+                buckets,
+                None,
+                auth_config,
+            );
+        }
+        #[cfg(feature = "server-tls")]
+        Some(cfg) => match crate::triggers::http_tls::accept_tls(stream, cfg) {
+            Ok((tls_stream, identity)) => {
+                let _ = handle_connection(
+                    tls_stream,
+                    workflow,
+                    engine,
+                    options,
+                    buckets,
+                    identity,
+                    auth_config,
+                );
+            }
+            Err(_) => {
+                // TLS handshake failed — no way to reply at the
+                // HTTP layer; drop the connection.
+            }
+        },
+        #[cfg(not(feature = "server-tls"))]
+        Some(_) => unreachable!("build_tls_arc errors when TLS feature is off"),
     }
 }
 
@@ -249,19 +353,21 @@ impl Drop for ServerHandle {
 /// run the workflow, write the response, close.
 type Buckets = std::collections::HashMap<(String, String), Arc<crate::ratelimit::TokenBucket>>;
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection<S: std::io::Read + Write>(
     stream: S,
     workflow: &WorkflowDoc,
     engine: &Engine,
     options: &RunOptions,
     buckets: &Buckets,
+    peer_identity: Option<PeerIdentity>,
     auth_config: &AuthArc,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let parse_result = parse_request(&mut reader);
     let stream = reader.get_mut();
 
-    let request = match parse_result {
+    let mut request = match parse_result {
         Ok(r) => r,
         Err(e) if e.silent_close => {
             // Peer went away before sending a request. No bytes to
@@ -273,6 +379,7 @@ fn handle_connection<S: std::io::Read + Write>(
             return Ok(());
         }
     };
+    request.peer_identity = peer_identity;
 
     // Route.
     let route = workflow
@@ -336,6 +443,10 @@ fn handle_connection<S: std::io::Read + Write>(
         let auth_req = crate::auth::AuthRequest {
             headers: &request.headers,
             body: &request.body,
+            peer_cert_fingerprint: request
+                .peer_identity
+                .as_ref()
+                .map(|p| p.fingerprint.as_str()),
         };
         match crate::auth::evaluate(auth_config, &auth_ref, &auth_req) {
             crate::auth::AuthDecision::Allow { principal } => principal,
@@ -422,6 +533,10 @@ struct Request {
     path: String,
     headers: std::collections::HashMap<String, String>,
     body: Vec<u8>,
+    /// Populated when the connection arrived over mTLS and a client
+    /// cert was presented. Format: `sha256:<64-hex>`. `None` on
+    /// plain HTTP and on HTTPS without client auth.
+    peer_identity: Option<PeerIdentity>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -532,6 +647,7 @@ fn parse_request<R: BufRead>(reader: &mut R) -> std::result::Result<Request, Par
         path,
         headers,
         body,
+        peer_identity: None,
     })
 }
 

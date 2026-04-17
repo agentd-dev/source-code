@@ -35,6 +35,7 @@
 pub mod bearer;
 pub mod config;
 pub mod hmac;
+pub mod mtls;
 
 use std::collections::HashMap;
 
@@ -127,6 +128,10 @@ impl Principal {
 pub struct AuthRequest<'a> {
     pub headers: &'a HashMap<String, String>,
     pub body: &'a [u8],
+    /// SHA-256 hex digest of the peer's client cert DER (if any).
+    /// Only populated when the server is configured for mTLS
+    /// (`server-tls` feature + `[server.tls.client_auth]`).
+    pub peer_cert_fingerprint: Option<&'a str>,
 }
 
 /// Evaluate a route's auth requirement against an incoming request.
@@ -137,11 +142,7 @@ pub fn evaluate(config: &AuthConfig, auth_ref: &AuthRef, req: &AuthRequest<'_>) 
         },
         AuthRef::Bearer { name } => bearer::verify(config, name, req),
         AuthRef::Hmac { name } => hmac::verify(config, name, req),
-        AuthRef::MTls => AuthDecision::Deny {
-            reason: "mtls auth requires the in-process TLS listener; wire \
-                     [server.tls.client_auth] first (R3b)"
-                .into(),
-        },
+        AuthRef::MTls => mtls::verify(req),
     }
 }
 
@@ -204,12 +205,48 @@ mod tests {
     }
 
     #[test]
+    fn mtls_denies_when_no_client_cert() {
+        let cfg = AuthConfig::default();
+        let headers = HashMap::new();
+        let req = AuthRequest {
+            headers: &headers,
+            body: b"",
+            peer_cert_fingerprint: None,
+        };
+        match evaluate(&cfg, &AuthRef::MTls, &req) {
+            AuthDecision::Deny { reason } => {
+                assert!(reason.contains("mtls"), "reason: {reason}");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mtls_allows_when_client_cert_fingerprint_present() {
+        let cfg = AuthConfig::default();
+        let headers = HashMap::new();
+        let req = AuthRequest {
+            headers: &headers,
+            body: b"",
+            peer_cert_fingerprint: Some("sha256:deadbeef"),
+        };
+        match evaluate(&cfg, &AuthRef::MTls, &req) {
+            AuthDecision::Allow { principal } => {
+                assert_eq!(principal.kind, "mtls");
+                assert_eq!(principal.name, "sha256:deadbeef");
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn none_always_allows() {
         let cfg = AuthConfig::default();
         let headers = HashMap::new();
         let req = AuthRequest {
             headers: &headers,
             body: b"",
+            peer_cert_fingerprint: None,
         };
         let decision = evaluate(&cfg, &AuthRef::None, &req);
         assert!(matches!(decision, AuthDecision::Allow { .. }));

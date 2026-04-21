@@ -10,6 +10,7 @@
 //! number of `when`-labelled out-edges (for Switch / Condition).
 //! Parallel fan-out is tracked as a later-tier extension (RFC §9.1).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -18,6 +19,7 @@ use crate::engine::context::{ExecutionContext, RunOptions, TriggerMeta};
 use crate::engine::handler::HandlerRegistry;
 use crate::engine::outcome::{ExecutionOutcome, ExecutionTrace, NodeOutcome, TraceEntry};
 use crate::error::{Error, Result};
+use crate::observability::Metrics;
 use crate::workflow::{Edge, WorkflowDoc};
 
 /// Hard safety bound on the number of node steps per run. Well above
@@ -37,11 +39,26 @@ fn next_execution_id() -> String {
 
 pub struct Engine {
     pub registry: HandlerRegistry,
+    pub metrics: Arc<Metrics>,
 }
 
 impl Engine {
     pub fn new(registry: HandlerRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            metrics: Metrics::new(),
+        }
+    }
+
+    /// Construct an engine that shares metrics with other engines —
+    /// useful for serve mode where a single `Metrics` aggregates
+    /// counters across every request.
+    pub fn with_metrics(registry: HandlerRegistry, metrics: Arc<Metrics>) -> Self {
+        Self { registry, metrics }
+    }
+
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
     }
 
     /// Run one workflow, starting from the given start-node name and
@@ -68,6 +85,7 @@ impl Engine {
         trigger: TriggerMeta,
         options: RunOptions,
     ) -> Result<(ExecutionOutcome, ExecutionTrace)> {
+        self.metrics.inc_workflow_started();
         let mut trace = ExecutionTrace::default();
 
         // 1) Resolve the start node + its entry node id.
@@ -97,6 +115,7 @@ impl Engine {
             // Deadline check.
             if Instant::now() >= ctx.deadline {
                 let elapsed = Instant::now().duration_since(started_at);
+                self.metrics.inc_workflow_timed_out();
                 return Ok((
                     ExecutionOutcome::TimedOut {
                         elapsed,
@@ -112,8 +131,19 @@ impl Engine {
                 reason: format!("node `{current_id}` referenced in traversal is not declared"),
             })?;
             ctx.current_node_id = Some(current_id.clone());
+            self.metrics.inc_node_executed();
 
-            let outcome = self.registry.dispatch(node, &mut ctx)?;
+            let outcome = match self.registry.dispatch(node, &mut ctx) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.metrics.inc_node_failed();
+                    if matches!(&e, Error::Policy(_)) {
+                        self.metrics.inc_policy_denied();
+                    }
+                    self.metrics.inc_workflow_errored();
+                    return Err(e);
+                }
+            };
 
             match outcome {
                 NodeOutcome::Terminate { value } => {
@@ -124,6 +154,7 @@ impl Engine {
                         branch: None,
                     });
                     ctx.node_outputs.insert(current_id.clone(), value.clone());
+                    self.metrics.inc_workflow_completed();
                     return Ok((
                         ExecutionOutcome::Completed {
                             final_value: value,
@@ -139,6 +170,7 @@ impl Engine {
                         outcome: "fail",
                         branch: None,
                     });
+                    self.metrics.inc_workflow_failed();
                     return Ok((
                         ExecutionOutcome::Failed {
                             reason,
@@ -165,6 +197,7 @@ impl Engine {
                                 .get(&current_id)
                                 .cloned()
                                 .unwrap_or(Value::Null);
+                            self.metrics.inc_workflow_completed();
                             return Ok((
                                 ExecutionOutcome::Completed {
                                     final_value,
@@ -178,6 +211,7 @@ impl Engine {
             }
         }
 
+        self.metrics.inc_workflow_errored();
         Err(Error::Workflow {
             workflow: workflow.name.clone(),
             reason: format!(

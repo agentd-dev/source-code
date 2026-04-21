@@ -381,6 +381,27 @@ fn handle_connection<S: std::io::Read + Write>(
     };
     request.peer_identity = peer_identity;
 
+    // Health / metrics endpoints are always live so operators can
+    // monitor the listener without touching a workflow.
+    if request.method == "GET" && request.path == "/healthz" {
+        write_response(
+            stream,
+            Status::new(200, "OK"),
+            &json!({ "status": "ok", "workflow": workflow.name }),
+        )?;
+        return Ok(());
+    }
+    if request.method == "GET" && request.path == "/metrics" {
+        let body = engine.metrics().snapshot().to_prometheus(&workflow.name);
+        write_text_response(
+            stream,
+            Status::new(200, "OK"),
+            "text/plain; version=0.0.4; charset=utf-8",
+            body.as_bytes(),
+        )?;
+        return Ok(());
+    }
+
     // Route.
     let route = workflow
         .http_routes
@@ -681,6 +702,31 @@ fn write_response<S: Write, B: serde::Serialize>(
     write_response_with_header(stream, status, body, &[])
 }
 
+/// Write a raw-body response (non-JSON). Used for the Prometheus
+/// text-exposition endpoint, which cannot share the JSON helper's
+/// `Content-Type`.
+fn write_text_response<S: Write>(
+    stream: &mut S,
+    status: Status,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        status.code,
+        status.reason,
+        content_type,
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
+}
+
 fn write_response_with_header<S: Write, B: serde::Serialize>(
     stream: &mut S,
     status: Status,
@@ -842,6 +888,39 @@ mod tests {
         let (code, body) = send(handle.local_addr(), "POST", "/run", b"not json");
         assert_eq!(code, 400);
         assert!(body.contains("invalid JSON"));
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn healthz_is_always_live() {
+        let handle = start_server(minimal_wf());
+        let (code, body) = send(handle.local_addr(), "GET", "/healthz", b"");
+        assert_eq!(code, 200);
+        assert!(body.contains("\"status\":\"ok\""));
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn metrics_endpoint_returns_prometheus_text() {
+        let handle = start_server(minimal_wf());
+        // Drive one workflow run so counters move.
+        let (code, _) = send(handle.local_addr(), "POST", "/run", b"{}");
+        assert_eq!(code, 200);
+        let (code, body) = send(handle.local_addr(), "GET", "/metrics", b"");
+        assert_eq!(code, 200);
+        assert!(body.contains("agentd_workflow_starts_total{workflow=\"t\"} "));
+        assert!(body.contains("agentd_build_info{"));
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn metrics_endpoint_requires_get() {
+        // POST /metrics is an unknown route (not a 405) because the
+        // always-live handler only matches GET — we want declared
+        // workflow routes to be independently addressable.
+        let handle = start_server(minimal_wf());
+        let (code, _body) = send(handle.local_addr(), "POST", "/metrics", b"");
+        assert_eq!(code, 404);
         handle.shutdown_and_drain();
     }
 

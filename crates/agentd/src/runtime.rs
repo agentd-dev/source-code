@@ -14,6 +14,7 @@
 //!        [--timeout-secs N]
 //!        [--dry-run]
 //!        [--validate-only]
+//!        [--log-level LEVEL] [--log-format text|json] [--quiet]
 //!        [--version] [--help]
 //! ```
 //!
@@ -45,8 +46,8 @@ pub const EXIT_SEMANTIC: u8 = 5;
 // ---------------------------------------------------------------------------
 
 pub fn run(argv: Vec<String>) -> ExitCode {
-    let args = match parse_args(&argv[1..]) {
-        Ok(a) => a,
+    let (args, tracing_overrides) = match parse_args(&argv[1..]) {
+        Ok((a, t)) => (a, t),
         Err(ArgErr::Usage(msg)) => {
             eprintln!("agentd: {msg}");
             print_help();
@@ -62,7 +63,9 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         }
     };
 
-    // Resolve the workflow.
+    // Resolve the workflow. No tracing yet — pre-init errors go to
+    // stderr as plain text so the log target declared in the
+    // workflow takes effect from the first emitted event.
     let doc = match load_workflow(&args) {
         Ok(d) => d,
         Err(msg) => {
@@ -70,6 +73,14 @@ pub fn run(argv: Vec<String>) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+
+    // Merge logging config: workflow `[logging]` → env → CLI → default.
+    // Now we know the full spec, install the subscriber.
+    let resolved = resolve_logging(&doc, &tracing_overrides);
+    if let Err(e) = crate::observability::apply(&resolved) {
+        eprintln!("agentd: failed to install log subscriber: {e}");
+        return ExitCode::from(EXIT_SEMANTIC);
+    }
 
     // Pre-validate — saves the operator a confusing engine error.
     let report = workflow::validate(&doc);
@@ -137,6 +148,18 @@ struct Args {
     drain_timeout_secs: u64,
 }
 
+/// CLI / env overrides for logging. `None` means "defer to workflow
+/// `[logging]` or the built-in default". `Some(false)` on
+/// `--quiet` wins over every other `enabled` source.
+#[derive(Debug, Default)]
+struct TracingOverrides {
+    level: Option<String>,
+    format: Option<crate::observability::Format>,
+    target: Option<crate::observability::LogTarget>,
+    /// `Some(false)` iff `--quiet` or the env equivalent set it.
+    enabled_false: bool,
+}
+
 #[derive(Debug)]
 enum ArgErr {
     Usage(String),
@@ -144,7 +167,7 @@ enum ArgErr {
     ShowVersion,
 }
 
-fn parse_args(argv: &[String]) -> Result<Args, ArgErr> {
+fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
     let mut a = Args {
         timeout_secs: env_u64("AGENTD_TIMEOUT_SECS", 120),
         drain_timeout_secs: env_u64("AGENTD_DRAIN_TIMEOUT_SECS", 30),
@@ -155,6 +178,20 @@ fn parse_args(argv: &[String]) -> Result<Args, ArgErr> {
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         dry_run: env_bool("AGENTD_DRY_RUN"),
         validate_only: env_bool("AGENTD_VALIDATE_ONLY"),
+    };
+    let mut t = TracingOverrides {
+        level: std::env::var("AGENTD_LOG")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        format: std::env::var("AGENTD_LOG_FORMAT")
+            .ok()
+            .as_deref()
+            .and_then(crate::observability::Format::parse),
+        target: std::env::var("AGENTD_LOG_TARGET")
+            .ok()
+            .as_deref()
+            .and_then(crate::observability::LogTarget::parse),
+        enabled_false: env_bool("AGENTD_QUIET"),
     };
 
     let mut i = 0;
@@ -194,13 +231,33 @@ fn parse_args(argv: &[String]) -> Result<Args, ArgErr> {
             }
             "--dry-run" => a.dry_run = true,
             "--validate-only" => a.validate_only = true,
+            "--log-level" => {
+                t.level = Some(require_value(argv, &mut i, arg)?.to_string());
+            }
+            "--log-format" => {
+                let raw = require_value(argv, &mut i, arg)?;
+                t.format = Some(crate::observability::Format::parse(raw).ok_or_else(|| {
+                    ArgErr::Usage(format!(
+                        "--log-format expects `text` or `json`; got `{raw}`"
+                    ))
+                })?);
+            }
+            "--log-target" => {
+                let raw = require_value(argv, &mut i, arg)?;
+                t.target = Some(crate::observability::LogTarget::parse(raw).ok_or_else(|| {
+                    ArgErr::Usage(format!(
+                        "--log-target expects `stderr`, `stdout`, or `file:PATH`; got `{raw}`"
+                    ))
+                })?);
+            }
+            "--quiet" => t.enabled_false = true,
             other => {
                 return Err(ArgErr::Usage(format!("unknown argument `{other}`")));
             }
         }
         i += 1;
     }
-    Ok(a)
+    Ok((a, t))
 }
 
 fn require_value<'a>(argv: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, ArgErr> {
@@ -229,6 +286,41 @@ fn env_bool(key: &str) -> bool {
         std::env::var(key).ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
+}
+
+fn resolve_logging(
+    doc: &WorkflowDoc,
+    overrides: &TracingOverrides,
+) -> crate::observability::ResolvedLogging {
+    let default = crate::observability::ResolvedLogging::default();
+    let from_wf = doc.logging.clone().unwrap_or_default();
+
+    let level = overrides
+        .level
+        .clone()
+        .or(from_wf.level)
+        .unwrap_or(default.level);
+    let format = overrides
+        .format
+        .or(from_wf.format)
+        .unwrap_or(default.format);
+    let target = overrides
+        .target
+        .clone()
+        .or(from_wf.target)
+        .unwrap_or(default.target);
+    let enabled = if overrides.enabled_false {
+        false
+    } else {
+        from_wf.enabled.unwrap_or(default.enabled)
+    };
+
+    crate::observability::ResolvedLogging {
+        level,
+        format,
+        target,
+        enabled,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +544,10 @@ usage:
          [--drain-timeout-secs N]   AGENTD_DRAIN_TIMEOUT_SECS  graceful shutdown grace (default 30)
          [--dry-run]                AGENTD_DRY_RUN=1
          [--validate-only]          AGENTD_VALIDATE_ONLY=1
+         [--log-level LEVEL]        AGENTD_LOG             (default warn)
+         [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)
+         [--log-target TARGET]      AGENTD_LOG_TARGET      stderr | stdout | file:PATH
+         [--quiet]                  AGENTD_QUIET=1
          [--version] [--help]
 
 Design: rfcs/0001-bounded-workflow-runtime.md\
@@ -546,17 +642,92 @@ mod tests {
 
     #[test]
     fn parse_args_flag_values() {
-        let a = parse_args(&[
+        let (a, t) = parse_args(&[
             "--config".into(),
             "/tmp/wf.toml".into(),
             "--start".into(),
             "main".into(),
             "--dry-run".into(),
+            "--log-level".into(),
+            "debug".into(),
+            "--log-format".into(),
+            "json".into(),
         ])
         .unwrap();
         assert_eq!(a.config, Some(PathBuf::from("/tmp/wf.toml")));
         assert_eq!(a.start.as_deref(), Some("main"));
         assert!(a.dry_run);
+        assert_eq!(t.level.as_deref(), Some("debug"));
+        assert_eq!(t.format, Some(crate::observability::Format::Json));
+    }
+
+    #[test]
+    fn resolve_logging_merges_by_precedence() {
+        use crate::observability::{Format, LogTarget, LoggingConfig};
+
+        // 1. Workflow provides level + target.
+        let mut doc = wf_with(vec![manual("m")]);
+        doc.logging = Some(LoggingConfig {
+            level: Some("info".into()),
+            format: Some(Format::Text),
+            target: Some(LogTarget::File("/tmp/a.log".into())),
+            enabled: Some(true),
+        });
+        let overrides = TracingOverrides::default();
+        let resolved = resolve_logging(&doc, &overrides);
+        assert_eq!(resolved.level, "info");
+        assert_eq!(resolved.format, Format::Text);
+        assert_eq!(resolved.target, LogTarget::File("/tmp/a.log".into()));
+        assert!(resolved.enabled);
+
+        // 2. CLI override beats workflow.
+        let overrides = TracingOverrides {
+            level: Some("debug".into()),
+            format: Some(Format::Json),
+            target: Some(LogTarget::Stdout),
+            enabled_false: false,
+        };
+        let resolved = resolve_logging(&doc, &overrides);
+        assert_eq!(resolved.level, "debug");
+        assert_eq!(resolved.format, Format::Json);
+        assert_eq!(resolved.target, LogTarget::Stdout);
+
+        // 3. --quiet forces enabled=false regardless of workflow.
+        let overrides = TracingOverrides {
+            enabled_false: true,
+            ..TracingOverrides::default()
+        };
+        let resolved = resolve_logging(&doc, &overrides);
+        assert!(!resolved.enabled);
+
+        // 4. No sources → built-in defaults.
+        let bare = wf_with(vec![manual("m")]);
+        let resolved = resolve_logging(&bare, &TracingOverrides::default());
+        assert_eq!(resolved.level, "warn");
+        assert_eq!(resolved.format, Format::Text);
+        assert_eq!(resolved.target, LogTarget::Stderr);
+        assert!(resolved.enabled);
+    }
+
+    #[test]
+    fn parse_args_rejects_bad_log_format() {
+        let err = parse_args(&["--log-format".into(), "xml".into()]).unwrap_err();
+        assert!(matches!(err, ArgErr::Usage(ref m) if m.contains("text") && m.contains("json")));
+    }
+
+    #[test]
+    fn parse_args_rejects_bad_log_target() {
+        let err = parse_args(&["--log-target".into(), "telegram".into()]).unwrap_err();
+        assert!(matches!(err, ArgErr::Usage(ref m) if m.contains("file:")));
+    }
+
+    #[test]
+    fn parse_args_accepts_file_log_target() {
+        let (_, t) = parse_args(&["--log-target".into(), "file:/tmp/x.log".into()]).unwrap();
+        assert_eq!(
+            t.target,
+            Some(crate::observability::LogTarget::File("/tmp/x.log".into()))
+        );
     }
 
     #[test]

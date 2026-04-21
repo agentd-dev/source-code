@@ -69,6 +69,11 @@ pub struct WorkflowDoc {
     #[serde(default)]
     pub auth: Option<crate::auth::AuthConfig>,
 
+    /// Optional `[logging]` block. Provides base logging config;
+    /// CLI flags + `AGENTD_LOG_*` env vars override these fields.
+    #[serde(default)]
+    pub logging: Option<crate::observability::LoggingConfig>,
+
     /// Optional `[server]` block. TLS + mTLS termination. The full
     /// rustls wiring is behind the `server-tls` Cargo feature;
     /// absence of the feature turns a present `[server.tls]` block

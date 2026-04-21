@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
+use tracing::{debug, error, info, info_span, warn};
 
 use crate::engine::context::{ExecutionContext, RunOptions, TriggerMeta};
 use crate::engine::handler::HandlerRegistry;
@@ -88,6 +89,7 @@ impl Engine {
         self.metrics.inc_workflow_started();
         let mut trace = ExecutionTrace::default();
 
+
         // 1) Resolve the start node + its entry node id.
         let start = workflow
             .start_node(start_name)
@@ -107,6 +109,19 @@ impl Engine {
             &options,
         );
 
+        // Root span for the whole run. Every per-node span and
+        // event nests under this so log aggregators can group by
+        // execution_id.
+        let workflow_span = info_span!(
+            "workflow.run",
+            execution_id = %execution_id,
+            workflow_id = %workflow.name,
+            start_node = %start_name,
+            dry_run = options.dry_run,
+        );
+        let _run_guard = workflow_span.enter();
+        info!(target: "agentd::audit", event = "workflow.started");
+
         // 3) Walk the DAG.
         let mut current_id = entry_id.to_string();
         let started_at = Instant::now();
@@ -116,6 +131,11 @@ impl Engine {
             if Instant::now() >= ctx.deadline {
                 let elapsed = Instant::now().duration_since(started_at);
                 self.metrics.inc_workflow_timed_out();
+                warn!(
+                    event = "workflow.timed_out",
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    last_node = ctx.current_node_id.as_deref().unwrap_or(""),
+                );
                 return Ok((
                     ExecutionOutcome::TimedOut {
                         elapsed,
@@ -131,19 +151,48 @@ impl Engine {
                 reason: format!("node `{current_id}` referenced in traversal is not declared"),
             })?;
             ctx.current_node_id = Some(current_id.clone());
+
+            // Per-node span. Everything the handler emits nests.
+            let node_span = info_span!(
+                "node.execute",
+                node_id = %current_id,
+                kind = %node.kind.name(),
+            );
+            let node_enter = node_span.enter();
+            let node_started = Instant::now();
             self.metrics.inc_node_executed();
 
-            let outcome = match self.registry.dispatch(node, &mut ctx) {
-                Ok(o) => o,
+            let dispatch = self.registry.dispatch(node, &mut ctx);
+            let latency_ms = node_started.elapsed().as_millis() as u64;
+
+            let outcome = match dispatch {
+                Ok(o) => {
+                    debug!(event = "node.completed", latency_ms);
+                    o
+                }
                 Err(e) => {
                     self.metrics.inc_node_failed();
                     if matches!(&e, Error::Policy(_)) {
                         self.metrics.inc_policy_denied();
+                        warn!(
+                            target: "agentd::audit",
+                            event = "policy.denied",
+                            reason = %e,
+                            latency_ms,
+                        );
+                    } else {
+                        error!(
+                            event = "node.failed",
+                            reason = %e,
+                            latency_ms,
+                        );
                     }
+                    drop(node_enter);
                     self.metrics.inc_workflow_errored();
                     return Err(e);
                 }
             };
+            drop(node_enter);
 
             match outcome {
                 NodeOutcome::Terminate { value } => {
@@ -155,6 +204,12 @@ impl Engine {
                     });
                     ctx.node_outputs.insert(current_id.clone(), value.clone());
                     self.metrics.inc_workflow_completed();
+                    info!(
+                        target: "agentd::audit",
+                        event = "workflow.completed",
+                        last_node = %current_id,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    );
                     return Ok((
                         ExecutionOutcome::Completed {
                             final_value: value,
@@ -171,6 +226,13 @@ impl Engine {
                         branch: None,
                     });
                     self.metrics.inc_workflow_failed();
+                    warn!(
+                        target: "agentd::audit",
+                        event = "workflow.failed",
+                        last_node = %current_id,
+                        reason = %reason,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    );
                     return Ok((
                         ExecutionOutcome::Failed {
                             reason,
@@ -180,6 +242,9 @@ impl Engine {
                     ));
                 }
                 NodeOutcome::Continue { value, branch } => {
+                    if let Some(label) = &branch {
+                        debug!(event = "node.branch", label = %label);
+                    }
                     trace.entries.push(TraceEntry {
                         node_id: current_id.clone(),
                         kind: node.kind.name().to_string(),
@@ -198,6 +263,13 @@ impl Engine {
                                 .cloned()
                                 .unwrap_or(Value::Null);
                             self.metrics.inc_workflow_completed();
+                            info!(
+                                target: "agentd::audit",
+                                event = "workflow.completed",
+                                last_node = %current_id,
+                                reason = "dead_end",
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                            );
                             return Ok((
                                 ExecutionOutcome::Completed {
                                     final_value,

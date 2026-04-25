@@ -31,6 +31,19 @@ pub struct ExecutionContext {
     pub dry_run: bool,
     /// Most recently entered node id, for diagnostics.
     pub current_node_id: Option<String>,
+    /// W3C trace-context the run was kicked off with (inbound
+    /// `traceparent`), if any. Populated by the HTTP trigger when
+    /// the request carried a valid header; absent for cron /
+    /// fs_watch / manual runs. Propagated verbatim to outbound
+    /// tool calls (`http_request`) as the parent trace.
+    pub trace_context: Option<crate::observability::TraceParent>,
+    /// Fresh 8-byte span id that represents THIS workflow run in
+    /// W3C traceparent propagation. Set at construction so every
+    /// outbound call uses the same id — downstream services see a
+    /// single "agent span" per run, not a sequence of
+    /// disconnected IDs. Only meaningful when `trace_context` is
+    /// `Some` (no inbound trace → nothing to propagate).
+    pub outbound_span_id: String,
 }
 
 impl ExecutionContext {
@@ -41,6 +54,7 @@ impl ExecutionContext {
         trigger: TriggerMeta,
         options: &RunOptions,
     ) -> Self {
+        let trace_context = trigger.trace_context.clone();
         let mut node_outputs = HashMap::new();
         node_outputs.insert("trigger".to_string(), trigger.to_value());
         Self {
@@ -53,7 +67,19 @@ impl ExecutionContext {
             deadline: Instant::now() + options.timeout,
             dry_run: options.dry_run,
             current_node_id: None,
+            trace_context,
+            outbound_span_id: crate::observability::fresh_span_id(),
         }
+    }
+
+    /// Render the outbound `traceparent` header value, if an
+    /// inbound context was captured. Returns `None` for runs that
+    /// weren't started by an HTTP request (cron, fs_watch, manual)
+    /// — those don't originate traces.
+    pub fn outbound_traceparent(&self) -> Option<String> {
+        self.trace_context
+            .as_ref()
+            .map(|tp| tp.with_parent_id(&self.outbound_span_id).format())
     }
 
     /// Resolve a dotted path against `node_outputs`, e.g.
@@ -81,6 +107,11 @@ pub struct TriggerMeta {
     /// The operator-facing input JSON (HTTP body, manual invoke
     /// payload, or MCP resource URI bundle).
     pub input: Value,
+    /// Inbound W3C `traceparent`. Only set by
+    /// the HTTP trigger when the request carried a valid header;
+    /// propagated verbatim to outbound `http_request` calls so the
+    /// trace chain continues across agent → downstream hops.
+    pub trace_context: Option<crate::observability::TraceParent>,
 }
 
 impl TriggerMeta {
@@ -88,6 +119,7 @@ impl TriggerMeta {
         Self {
             kind: TriggerKind::Manual,
             input,
+            trace_context: None,
         }
     }
 
@@ -95,6 +127,18 @@ impl TriggerMeta {
         Self {
             kind: TriggerKind::Http,
             input,
+            trace_context: None,
+        }
+    }
+
+    /// HTTP trigger with an inbound W3C `traceparent`. Used by
+    /// `triggers::http` when the request had a valid header — the
+    /// agent continues that trace across any outbound tool calls.
+    pub fn http_with_trace(input: Value, trace_context: crate::observability::TraceParent) -> Self {
+        Self {
+            kind: TriggerKind::Http,
+            input,
+            trace_context: Some(trace_context),
         }
     }
 
@@ -102,6 +146,7 @@ impl TriggerMeta {
         Self {
             kind: TriggerKind::Event,
             input,
+            trace_context: None,
         }
     }
 

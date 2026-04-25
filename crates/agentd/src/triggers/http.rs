@@ -517,13 +517,30 @@ fn handle_connection<S: std::io::Read + Write>(
         input
     };
 
-    // Run.
-    match engine.run(
-        workflow,
-        &route.start_node,
-        TriggerMeta::http(input),
-        options.clone(),
-    ) {
+    // Run. Propagate W3C trace-context if the caller supplied a
+    // `traceparent` header — fields land on a span that parents the
+    // engine's `workflow.run`, so JSON-format log consumers see
+    // trace_id / parent_id on every nested event without needing a
+    // full OTLP exporter in-process.
+    let trace_ctx = request
+        .headers
+        .get("traceparent")
+        .and_then(|raw| crate::observability::parse_traceparent(raw));
+    let trigger = match &trace_ctx {
+        Some(tp) => TriggerMeta::http_with_trace(input, tp.clone()),
+        None => TriggerMeta::http(input),
+    };
+    let request_span = tracing::info_span!(
+        "http.request",
+        method = %request.method,
+        path = %request.path,
+        trace_id = trace_ctx.as_ref().map(|t| t.trace_id.as_str()).unwrap_or(""),
+        parent_id = trace_ctx.as_ref().map(|t| t.parent_id.as_str()).unwrap_or(""),
+        trace_flags = trace_ctx.as_ref().map(|t| t.trace_flags.as_str()).unwrap_or(""),
+        sampled = trace_ctx.as_ref().map(|t| t.sampled()).unwrap_or(false),
+    );
+    let _span_guard = request_span.enter();
+    match engine.run(workflow, &route.start_node, trigger, options.clone()) {
         Ok(outcome) => {
             let status = match &outcome {
                 ExecutionOutcome::Completed { .. } => Status::new(200, "OK"),

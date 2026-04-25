@@ -19,8 +19,10 @@
 //!    file with per-event redaction) is Phase-10 scope.
 
 pub mod metrics;
+pub mod traceparent;
 
 pub use metrics::{Metrics, MetricsSnapshot};
+pub use traceparent::{TraceParent, fresh_span_id, parse_traceparent};
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;

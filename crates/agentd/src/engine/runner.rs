@@ -89,7 +89,6 @@ impl Engine {
         self.metrics.inc_workflow_started();
         let mut trace = ExecutionTrace::default();
 
-
         // 1) Resolve the start node + its entry node id.
         let start = workflow
             .start_node(start_name)

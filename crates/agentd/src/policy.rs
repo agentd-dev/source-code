@@ -31,6 +31,8 @@ pub struct PolicyManifest {
     pub fs: FsPolicy,
     #[serde(default)]
     pub env: EnvPolicy,
+    #[serde(default)]
+    pub http: HttpPolicy,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,22 @@ pub struct FsPolicy {
 pub struct EnvPolicy {
     #[serde(default)]
     pub read_keys: Vec<String>,
+}
+
+/// Outbound HTTP policy (RFC §10.5, §16.2). The handler looks up the
+/// request URL's host + scheme here before opening a socket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpPolicy {
+    /// URL pattern allowlist. `http://host.example/*`,
+    /// `https://*.internal/**`, or bare domain prefixes. Matched
+    /// against the request URL string.
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// Allowed methods (case-insensitive). Empty = inherit the
+    /// handler's default (GET + POST).
+    #[serde(default)]
+    pub methods: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +126,26 @@ impl Policy for ManifestPolicy {
                 self.manifest.env.read_keys.len()
             ))
         }
+    }
+
+    fn check_http_request(&self, method: &str, url: &str) -> Decision {
+        check_http_static(&self.manifest.http, method, url)
+    }
+}
+
+fn check_http_static(http: &HttpPolicy, method: &str, url: &str) -> Decision {
+    if http.urls.is_empty() {
+        return Decision::Deny("http_request denied: no `http.urls` allowlist configured".into());
+    }
+    if !http.methods.is_empty() && !http.methods.iter().any(|m| m.eq_ignore_ascii_case(method)) {
+        return Decision::Deny(format!("http_request method `{method}` not in allowlist"));
+    }
+    if http.urls.iter().any(|p| path_matches(p, url)) {
+        Decision::Allow
+    } else {
+        Decision::Deny(format!(
+            "http_request URL `{url}` not covered by any allowlist pattern"
+        ))
     }
 }
 

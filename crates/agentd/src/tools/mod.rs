@@ -22,12 +22,15 @@ pub mod env;
 #[cfg(feature = "tools-data")]
 pub mod data;
 
+#[cfg(feature = "tools-http")]
+pub mod http;
+
 use crate::engine::HandlerRegistry;
 use crate::tools::policy::PolicyRef;
 
 // Helper functions used by fs / data handlers. Gated to avoid
 // unused-warnings when no tool families are compiled in.
-#[cfg(any(feature = "tools-fs", feature = "tools-data"))]
+#[cfg(any(feature = "tools-fs", feature = "tools-data", feature = "tools-http"))]
 mod resolve {
     use serde_json::Value;
 
@@ -77,7 +80,7 @@ mod resolve {
     }
 }
 
-#[cfg(any(feature = "tools-fs", feature = "tools-data"))]
+#[cfg(any(feature = "tools-fs", feature = "tools-data", feature = "tools-http"))]
 pub(crate) use resolve::{resolve_string, resolve_value, value_type_name};
 
 /// Register every compiled-in foundational tool handler onto
@@ -94,4 +97,7 @@ pub fn register_default_tools(_registry: &mut HandlerRegistry, _policy: PolicyRe
 
     #[cfg(feature = "tools-data")]
     data::register(_registry);
+
+    #[cfg(feature = "tools-http")]
+    http::register(_registry, _policy.clone());
 }

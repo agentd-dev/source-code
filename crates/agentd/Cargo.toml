@@ -25,6 +25,7 @@ default = ["tools-fs", "tools-env", "tools-data", "trigger-http", "auth"]
 tools-fs = []
 tools-env = []
 tools-data = []
+tools-http = []
 
 # Trigger adapters.
 trigger-http = []

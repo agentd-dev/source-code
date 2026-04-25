@@ -285,6 +285,12 @@ pub enum NodeKind {
     CreateDir {
         path_from: String,
     },
+    HttpRequest {
+        method: String,
+        url_from: String,
+        #[serde(default)]
+        body_from: Option<String>,
+    },
     CallMcpTool {
         tool: String,
         #[serde(default)]
@@ -321,6 +327,7 @@ impl NodeKind {
             NodeKind::LlmInfer { .. } => "llm_infer",
             NodeKind::WriteFile { .. } => "write_file",
             NodeKind::CreateDir { .. } => "create_dir",
+            NodeKind::HttpRequest { .. } => "http_request",
             NodeKind::CallMcpTool { .. } => "call_mcp_tool",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
@@ -335,7 +342,10 @@ impl NodeKind {
     pub fn is_side_effect(&self) -> bool {
         matches!(
             self,
-            NodeKind::WriteFile { .. } | NodeKind::CreateDir { .. } | NodeKind::CallMcpTool { .. }
+            NodeKind::WriteFile { .. }
+                | NodeKind::CreateDir { .. }
+                | NodeKind::HttpRequest { .. }
+                | NodeKind::CallMcpTool { .. }
         )
     }
 }

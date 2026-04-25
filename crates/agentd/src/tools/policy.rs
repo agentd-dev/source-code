@@ -42,6 +42,11 @@ pub trait Policy: Send + Sync {
     fn check_env_read(&self, _key: &str) -> Decision {
         Decision::Allow
     }
+    /// Outbound HTTP request. `url` is the fully-formed request
+    /// target; the policy gets to inspect method + scheme + host.
+    fn check_http_request(&self, _method: &str, _url: &str) -> Decision {
+        Decision::Allow
+    }
 }
 
 /// Policy that grants every request. Phase 3 default; replaced by the

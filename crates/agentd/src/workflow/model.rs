@@ -296,6 +296,16 @@ pub enum NodeKind {
         #[serde(default)]
         args_from: Option<String>,
     },
+    /// Invoke a local binary with argv-style arguments. No shell
+    /// interpolation, no PATH lookup — `command` is a literal path.
+    /// The optional `args_from` resolves to a JSON array of strings.
+    ShellRun {
+        command: String,
+        #[serde(default)]
+        args_from: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 
     // --- Control ---
     Condition {
@@ -329,6 +339,7 @@ impl NodeKind {
             NodeKind::CreateDir { .. } => "create_dir",
             NodeKind::HttpRequest { .. } => "http_request",
             NodeKind::CallMcpTool { .. } => "call_mcp_tool",
+            NodeKind::ShellRun { .. } => "shell_run",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
             NodeKind::Merge => "merge",
@@ -346,6 +357,7 @@ impl NodeKind {
                 | NodeKind::CreateDir { .. }
                 | NodeKind::HttpRequest { .. }
                 | NodeKind::CallMcpTool { .. }
+                | NodeKind::ShellRun { .. }
         )
     }
 }

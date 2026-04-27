@@ -26,6 +26,7 @@ tools-fs = []
 tools-env = []
 tools-data = []
 tools-http = []
+tools-shell = []
 
 # Trigger adapters.
 trigger-http = []

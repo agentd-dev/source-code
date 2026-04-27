@@ -27,9 +27,11 @@ tools-env = []
 tools-data = []
 tools-http = []
 tools-shell = []
+tools-mcp = []
 
 # Trigger adapters.
 trigger-http = []
+trigger-mcp = []
 
 # HTTP auth (bearer + HMAC webhook verification). `auth` ships in
 # default builds — HMAC-SHA256 is a basic need for any production
@@ -48,6 +50,10 @@ thiserror = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi", "json"] }
+# Atomic swap for hot-reload state (SIGHUP). Pure-Rust, no deps.
+# Readers see a consistent snapshot with no mutex contention;
+# writers replace the current value atomically.
+arc-swap = "1"
 sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "logging", "aws-lc-rs", "tls12"] }

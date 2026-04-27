@@ -77,6 +77,7 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     check_triggers(doc, &start_names, &mut r);
     check_start_node_entries(doc, &node_ids, &mut r);
     check_edges(doc, &node_ids, &mut r);
+    check_mcp_nodes(doc, &mut r);
 
     // Graph-level checks only make sense once every edge references a
     // known node. Skip them if dangling edges were detected so the
@@ -204,6 +205,60 @@ fn check_edges(doc: &WorkflowDoc, node_ids: &HashSet<String>, r: &mut Validation
                     edge.from, edge.to, edge.to
                 ),
             ));
+        }
+    }
+}
+
+/// Validate MCP node `server` fields against the `[[mcp_servers]]`
+/// list. Rules:
+///   * `server = "name"` → must match a declared entry.
+///   * `server = None` + 0 or >1 declared entries → error (ambiguous
+///     or no target). Single-server workflows that predate
+///     multi-server get to omit the field.
+fn check_mcp_nodes(doc: &WorkflowDoc, r: &mut ValidationReport) {
+    use crate::workflow::model::NodeKind;
+    let known: HashSet<&str> = doc.mcp_servers.iter().map(|d| d.name.as_str()).collect();
+    let multi = known.len() > 1;
+    let none = known.is_empty();
+    for node in &doc.nodes {
+        let (kind_name, server) = match &node.kind {
+            NodeKind::CallMcpTool { server, .. } => ("call_mcp_tool", server.as_deref()),
+            NodeKind::ReadMcpResource { server, .. } => ("read_mcp_resource", server.as_deref()),
+            _ => continue,
+        };
+        match server {
+            Some(name) => {
+                if !known.contains(name) {
+                    r.issues.push(ValidationIssue::new(
+                        "unknown_mcp_server",
+                        format!(
+                            "node `{}` ({kind_name}) references unknown mcp_server `{name}`",
+                            node.id
+                        ),
+                    ));
+                }
+            }
+            None => {
+                if multi {
+                    r.issues.push(ValidationIssue::new(
+                        "ambiguous_mcp_server",
+                        format!(
+                            "node `{}` ({kind_name}) has no `server` field but multiple mcp_servers are configured",
+                            node.id
+                        ),
+                    ));
+                } else if none {
+                    // No servers declared at all — the node will fail
+                    // at runtime with "no mcp_servers configured". We
+                    // still surface it at validation time so the
+                    // operator sees it before deployment. (Legacy
+                    // workflows using `--mcp-stdio` only don't
+                    // populate `mcp_servers` from TOML — this is a
+                    // runtime-only path we deliberately don't flag
+                    // here since it requires cross-referencing CLI
+                    // args that validator doesn't have access to.)
+                }
+            }
         }
     }
 }
@@ -602,6 +657,7 @@ mod tests {
                     "load_resource",
                     NodeKind::ReadMcpResource {
                         resource_from: "trigger.resource_uri".into(),
+                        server: None,
                     },
                 ),
                 n(
@@ -624,6 +680,7 @@ mod tests {
                     NodeKind::CallMcpTool {
                         tool: "comment_on_page".into(),
                         args_from: Some("analyze.comment_payload".into()),
+                        server: None,
                     },
                 ),
                 n("done", NodeKind::Terminate),

@@ -15,6 +15,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mcp::allowlist::McpAllowlist;
 use crate::tools::policy::{Decision, Policy};
 
 // ---------------------------------------------------------------------------
@@ -31,6 +32,8 @@ pub struct PolicyManifest {
     pub fs: FsPolicy,
     #[serde(default)]
     pub env: EnvPolicy,
+    #[serde(default)]
+    pub mcp: McpPolicy,
     #[serde(default)]
     pub http: HttpPolicy,
     #[serde(default)]
@@ -59,6 +62,17 @@ pub struct EnvPolicy {
     pub read_keys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpPolicy {
+    #[serde(default)]
+    pub servers: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub resources: Vec<String>,
+}
+
 /// Outbound HTTP policy (RFC §10.5, §16.2). The handler looks up the
 /// request URL's host + scheme here before opening a socket.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +97,16 @@ pub struct ShellPolicy {
     /// Matched against the canonicalised command path.
     #[serde(default)]
     pub commands: Vec<String>,
+}
+
+impl PolicyManifest {
+    /// Build an [`McpAllowlist`] from this manifest.
+    pub fn mcp_allowlist(&self) -> McpAllowlist {
+        McpAllowlist {
+            allowed_tools: self.mcp.tools.clone(),
+            allowed_resource_patterns: self.mcp.resources.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -371,10 +395,31 @@ mod tests {
 
             [env]
             read_keys = ["DOCS_ROOT"]
+
+            [mcp]
+            tools = ["comment_on_page"]
+            resources = ["docs://pages/*"]
         "#;
         let manifest: PolicyManifest = toml::from_str(toml_src).unwrap();
         assert_eq!(manifest.fs.read, vec!["/workspace/**"]);
         assert_eq!(manifest.env.read_keys, vec!["DOCS_ROOT"]);
+        assert_eq!(manifest.mcp.tools, vec!["comment_on_page"]);
+    }
+
+    #[test]
+    fn mcp_allowlist_from_manifest() {
+        let m = PolicyManifest {
+            mcp: McpPolicy {
+                tools: vec!["t1".into()],
+                resources: vec!["docs://pages/*".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let allow = m.mcp_allowlist();
+        assert!(allow.tool_allowed("t1"));
+        assert!(!allow.tool_allowed("t2"));
+        assert!(allow.resource_allowed("docs://pages/42"));
     }
 
     #[test]

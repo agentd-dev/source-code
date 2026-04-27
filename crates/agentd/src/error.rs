@@ -27,6 +27,9 @@ pub enum Error {
     #[error("tool `{tool}` failed: {reason}")]
     Tool { tool: String, reason: String },
 
+    #[error("mcp: {0}")]
+    Mcp(String),
+
     #[error("schema validation failed: {0}")]
     Schema(String),
 

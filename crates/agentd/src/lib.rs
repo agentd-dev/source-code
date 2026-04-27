@@ -12,6 +12,7 @@
 pub mod auth;
 pub mod engine;
 pub mod error;
+pub mod mcp;
 pub mod observability;
 pub mod policy;
 pub mod ratelimit;

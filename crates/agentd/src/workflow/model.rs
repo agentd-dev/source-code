@@ -74,6 +74,15 @@ pub struct WorkflowDoc {
     #[serde(default)]
     pub logging: Option<crate::observability::LoggingConfig>,
 
+    /// Optional `[[mcp_servers]]` entries. Each spawns an MCP stdio
+    /// child; `call_mcp_tool` / `read_mcp_resource` nodes route to
+    /// them by name. Empty or absent leaves the process with no MCP
+    /// plane — workflows that use MCP nodes will fail validation.
+    /// Entries here compose with `--mcp-stdio` (the CLI path is kept
+    /// for back-compat as the default-named server).
+    #[serde(default, rename = "mcp_servers")]
+    pub mcp_servers: Vec<crate::mcp::config::McpServerDef>,
+
     /// Optional `[server]` block. TLS + mTLS termination. The full
     /// rustls wiring is behind the `server-tls` Cargo feature;
     /// absence of the feature turns a present `[server.tls]` block
@@ -247,6 +256,12 @@ pub enum NodeKind {
     },
     ReadMcpResource {
         resource_from: String,
+        /// Which configured MCP server to read from. Optional when
+        /// exactly one server is registered; required when more than
+        /// one exists (validator enforces). Matches the `name`
+        /// in `[[mcp_servers]]`.
+        #[serde(default)]
+        server: Option<String>,
     },
     ParseJson {
         input_from: String,
@@ -295,6 +310,12 @@ pub enum NodeKind {
         tool: String,
         #[serde(default)]
         args_from: Option<String>,
+        /// Which configured MCP server to route this call to.
+        /// Optional when exactly one server is registered; required
+        /// when more than one exists. Matches the `name` in
+        /// `[[mcp_servers]]`.
+        #[serde(default)]
+        server: Option<String>,
     },
     /// Invoke a local binary with argv-style arguments. No shell
     /// interpolation, no PATH lookup — `command` is a literal path.

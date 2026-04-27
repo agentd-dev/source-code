@@ -101,7 +101,10 @@ pub fn run(argv: Vec<String>) -> ExitCode {
     }
 
     // Build the engine.
-    let engine = build_engine(&doc);
+    let engine = match build_engine(&doc, &args) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
     let options = RunOptions {
         timeout: Duration::from_secs(args.timeout_secs.max(1)),
         dry_run: args.dry_run,
@@ -143,6 +146,7 @@ struct Args {
     mode: Option<String>,
     bind: Option<String>,
     timeout_secs: u64,
+    mcp_stdio: Option<Vec<String>>,
     dry_run: bool,
     validate_only: bool,
     drain_timeout_secs: u64,
@@ -176,6 +180,10 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         start: std::env::var("AGENTD_START").ok(),
         mode: std::env::var("AGENTD_MODE").ok(),
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
+        mcp_stdio: std::env::var("AGENTD_MCP_STDIO").ok().and_then(|raw| {
+            let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+            if parts.is_empty() { None } else { Some(parts) }
+        }),
         dry_run: env_bool("AGENTD_DRY_RUN"),
         validate_only: env_bool("AGENTD_VALIDATE_ONLY"),
     };
@@ -228,6 +236,16 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                         "--drain-timeout-secs expects an integer; got `{v}`"
                     ))
                 })?;
+            }
+            "--mcp-stdio" => {
+                let raw = require_value(argv, &mut i, arg)?;
+                let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
+                if parts.is_empty() {
+                    return Err(ArgErr::Usage(
+                        "--mcp-stdio requires a non-empty command".into(),
+                    ));
+                }
+                a.mcp_stdio = Some(parts);
             }
             "--dry-run" => a.dry_run = true,
             "--validate-only" => a.validate_only = true,
@@ -342,19 +360,125 @@ fn load_workflow(args: &Args) -> Result<WorkflowDoc, String> {
 // Engine construction
 // ---------------------------------------------------------------------------
 
-fn build_engine(doc: &WorkflowDoc) -> Engine {
+fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
+    let (policy, mcp_allowlist) = build_policy(doc);
     let mut registry = HandlerRegistry::with_builtin_controls();
-
-    // Policy: the workflow's [policy] block when present, AllowAll
-    // otherwise. Fail-closed enforcement is the manifest's job;
-    // absence of the block is an explicit operator choice.
-    let policy: crate::tools::policy::PolicyRef = match &doc.policy {
-        Some(manifest) => Arc::new(crate::policy::ManifestPolicy::new(manifest.clone())),
-        None => crate::tools::policy::allow_all(),
-    };
-
     crate::tools::register_default_tools(&mut registry, policy);
-    Engine::new(registry)
+
+    // MCP server registry. Composes every `[[mcp_servers]]` entry
+    // plus (when set) the legacy `--mcp-stdio CMD ARG` as an
+    // implicit `{name = "default", ..}` server.
+    let mcp_registry = build_mcp_registry(doc, args, &mcp_allowlist)?;
+    if !mcp_registry.is_empty() {
+        crate::mcp::handler::register(&mut registry, mcp_registry.clone());
+    }
+
+    Ok(Engine::new(registry))
+}
+
+/// Build the process-wide MCP server registry. Sources:
+///   * every `[[mcp_servers]]` entry in the workflow TOML — each
+///     with its own name, spawn command, and allowlist.
+///   * `--mcp-stdio CMD ARG...` — legacy single-server path, mapped
+///     to a `{name = "default"}` entry with the global `[policy.mcp]`
+///     allowlist. Rejected when TOML also declares a `default`
+///     entry (name collision).
+fn build_mcp_registry(
+    doc: &WorkflowDoc,
+    args: &Args,
+    fallback_allowlist: &crate::mcp::allowlist::McpAllowlist,
+) -> std::result::Result<Arc<crate::mcp::McpRegistry>, ExitCode> {
+    if let Err(e) = crate::mcp::config::McpServerDef::validate_list(&doc.mcp_servers) {
+        eprintln!("agentd: {e}");
+        return Err(ExitCode::from(EXIT_USAGE));
+    }
+
+    let mut handles: Vec<Arc<crate::mcp::McpServerHandle>> = Vec::new();
+    for def in &doc.mcp_servers {
+        let handle = spawn_mcp_handle(def)?;
+        handles.push(handle);
+    }
+
+    if let Some(cmd) = &args.mcp_stdio {
+        if doc.mcp_servers.iter().any(|d| d.name == "default") {
+            eprintln!(
+                "agentd: --mcp-stdio conflicts with an `[[mcp_servers]]` entry named `default`; \
+                 use the TOML list or remove the CLI flag (not both)"
+            );
+            return Err(ExitCode::from(EXIT_USAGE));
+        }
+        // Legacy path: map CLI argv to a default-named server. Use
+        // the global `[policy.mcp]` allowlist from the policy block
+        // to preserve the pre-registry semantic (that allowlist was
+        // the only one).
+        let def = crate::mcp::config::from_cli_stdio(cmd.clone());
+        let mut handle = spawn_mcp_handle(&def)?;
+        // Override the allowlist with the existing `[policy.mcp]`
+        // one so workflows that haven't migrated keep the same
+        // tool-allow list they had before.
+        Arc::get_mut(&mut handle)
+            .expect("freshly-created Arc has no other clones")
+            .allowlist = Arc::new(crate::mcp::allowlist::ReloadableMcpAllowlist::new(
+            fallback_allowlist.clone(),
+        ));
+        handles.push(handle);
+    }
+
+    Ok(Arc::new(crate::mcp::McpRegistry::new(handles)))
+}
+
+/// Spawn one MCP stdio child and wrap it in the reloadable handles.
+/// Failure to spawn is fatal at startup — operators should see it
+/// immediately rather than discover it on the first request.
+fn spawn_mcp_handle(
+    def: &crate::mcp::config::McpServerDef,
+) -> std::result::Result<Arc<crate::mcp::McpServerHandle>, ExitCode> {
+    let (head, tail) = def
+        .command
+        .split_first()
+        .expect("validate_list enforces non-empty command");
+    match crate::mcp::client::StdioMcpClient::spawn(head.clone(), tail) {
+        Ok(client) => {
+            let initial: Box<dyn crate::mcp::client::McpClient> = Box::new(client);
+            let allowlist = crate::mcp::allowlist::McpAllowlist {
+                allowed_tools: def.allow_tools.clone(),
+                allowed_resource_patterns: def.allow_resources.clone(),
+            };
+            Ok(Arc::new(crate::mcp::McpServerHandle {
+                name: def.name.clone(),
+                client: Arc::new(crate::mcp::client::ReloadableMcpClient::new(initial)),
+                allowlist: Arc::new(crate::mcp::allowlist::ReloadableMcpAllowlist::new(
+                    allowlist,
+                )),
+            }))
+        }
+        Err(e) => {
+            eprintln!("agentd: failed to start MCP server `{}`: {e}", def.name);
+            Err(ExitCode::from(EXIT_USAGE))
+        }
+    }
+}
+
+/// Extract the policy + MCP allowlist from the workflow's `[policy]`
+/// block. AllowAll / allow-everything when the block is absent —
+/// fail-closed enforcement is the manifest's job; absence of the
+/// block is an explicit operator choice.
+fn build_policy(
+    doc: &WorkflowDoc,
+) -> (
+    crate::tools::policy::PolicyRef,
+    crate::mcp::allowlist::McpAllowlist,
+) {
+    match &doc.policy {
+        Some(m) => (
+            Arc::new(crate::policy::ManifestPolicy::new(m.clone())),
+            m.mcp_allowlist(),
+        ),
+        None => (
+            crate::tools::policy::allow_all(),
+            crate::mcp::allowlist::McpAllowlist::allow_all(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +666,7 @@ usage:
          [--bind HOST:PORT]         AGENTD_HTTP_BIND       server-mode bind (default 127.0.0.1:8080)
          [--timeout-secs N]         AGENTD_TIMEOUT_SECS    per-run deadline (default 120)
          [--drain-timeout-secs N]   AGENTD_DRAIN_TIMEOUT_SECS  graceful shutdown grace (default 30)
+         [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
          [--dry-run]                AGENTD_DRY_RUN=1
          [--validate-only]          AGENTD_VALIDATE_ONLY=1
          [--log-level LEVEL]        AGENTD_LOG             (default warn)

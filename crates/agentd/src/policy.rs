@@ -229,6 +229,7 @@ mod tests {
             env: EnvPolicy {
                 read_keys: env.iter().map(|s| s.to_string()).collect(),
             },
+            ..Default::default()
         })
     }
 

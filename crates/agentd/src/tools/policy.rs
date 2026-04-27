@@ -47,6 +47,12 @@ pub trait Policy: Send + Sync {
     fn check_http_request(&self, _method: &str, _url: &str) -> Decision {
         Decision::Allow
     }
+    /// Shell / sub-process invocation. `command` has been
+    /// canonicalised to an absolute path before the handler reaches
+    /// the policy.
+    fn check_shell_run(&self, _command: &Path) -> Decision {
+        Decision::Allow
+    }
 }
 
 /// Policy that grants every request. Phase 3 default; replaced by the

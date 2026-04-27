@@ -33,6 +33,8 @@ pub struct PolicyManifest {
     pub env: EnvPolicy,
     #[serde(default)]
     pub http: HttpPolicy,
+    #[serde(default)]
+    pub shell: ShellPolicy,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,6 +73,16 @@ pub struct HttpPolicy {
     /// handler's default (GET + POST).
     #[serde(default)]
     pub methods: Vec<String>,
+}
+
+/// Shell / sub-process policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShellPolicy {
+    /// Absolute paths or prefix patterns (e.g. `/usr/local/bin/*`).
+    /// Matched against the canonicalised command path.
+    #[serde(default)]
+    pub commands: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +142,19 @@ impl Policy for ManifestPolicy {
 
     fn check_http_request(&self, method: &str, url: &str) -> Decision {
         check_http_static(&self.manifest.http, method, url)
+    }
+
+    fn check_shell_run(&self, command: &Path) -> Decision {
+        if self.manifest.shell.commands.is_empty() {
+            Decision::Deny("shell_run denied: no `shell.commands` allowlist configured".into())
+        } else if path_matches_any(&self.manifest.shell.commands, command) {
+            Decision::Allow
+        } else {
+            Decision::Deny(format!(
+                "shell_run command `{}` not covered by any allowlist pattern",
+                command.display()
+            ))
+        }
     }
 }
 

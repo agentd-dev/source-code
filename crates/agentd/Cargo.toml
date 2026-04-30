@@ -33,6 +33,10 @@ tools-mcp = []
 trigger-http = []
 trigger-mcp = []
 
+# Intelligence transports.
+intel-unix = []
+intel-http = []
+
 # HTTP auth (bearer + HMAC webhook verification). `auth` ships in
 # default builds — HMAC-SHA256 is a basic need for any production
 # HTTP surface.

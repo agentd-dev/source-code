@@ -27,6 +27,9 @@ pub enum Error {
     #[error("tool `{tool}` failed: {reason}")]
     Tool { tool: String, reason: String },
 
+    #[error("intelligence call failed: {0}")]
+    Intelligence(String),
+
     #[error("mcp: {0}")]
     Mcp(String),
 

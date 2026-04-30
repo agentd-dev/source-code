@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, HandlerRegistry, RunOptions, TriggerMeta};
+use crate::engine::{Engine, HandlerRegistry, RunOptions, StubHandler, TriggerMeta};
 use crate::workflow::{self, WorkflowDoc};
 
 pub const EXIT_OK: u8 = 0;
@@ -146,6 +146,9 @@ struct Args {
     mode: Option<String>,
     bind: Option<String>,
     timeout_secs: u64,
+    intel_unix: Option<PathBuf>,
+    intel_http: Option<String>,
+    intel_http_bearer_file: Option<PathBuf>,
     mcp_stdio: Option<Vec<String>>,
     dry_run: bool,
     validate_only: bool,
@@ -180,6 +183,11 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         start: std::env::var("AGENTD_START").ok(),
         mode: std::env::var("AGENTD_MODE").ok(),
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
+        intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
+        intel_http: std::env::var("AGENTD_INTEL_HTTP")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        intel_http_bearer_file: env_opt_path("AGENTD_INTEL_HTTP_BEARER_FILE"),
         mcp_stdio: std::env::var("AGENTD_MCP_STDIO").ok().and_then(|raw| {
             let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
             if parts.is_empty() { None } else { Some(parts) }
@@ -236,6 +244,15 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                         "--drain-timeout-secs expects an integer; got `{v}`"
                     ))
                 })?;
+            }
+            "--intel-unix" => {
+                a.intel_unix = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--intel-http" => {
+                a.intel_http = Some(require_value(argv, &mut i, arg)?.to_string());
+            }
+            "--intel-http-bearer-file" => {
+                a.intel_http_bearer_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
             }
             "--mcp-stdio" => {
                 let raw = require_value(argv, &mut i, arg)?;
@@ -365,6 +382,65 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     let mut registry = HandlerRegistry::with_builtin_controls();
     crate::tools::register_default_tools(&mut registry, policy);
 
+    // Intelligence adapter (Unix or HTTP). Wrap whichever client
+    // the operator selected in a `ReloadableIntelClient` so a
+    // future reload path can swap its inner (e.g. rotate the bearer
+    // token from a Vault side-car).
+    if let Some(path) = &args.intel_unix {
+        #[cfg(unix)]
+        {
+            let initial: Box<dyn crate::intelligence::client::IntelligenceClient> =
+                Box::new(crate::intelligence::client::UnixClient::new(
+                    path.clone(),
+                    Duration::from_secs(args.timeout_secs.max(1)),
+                ));
+            let reloadable = Arc::new(crate::intelligence::client::ReloadableIntelClient::new(
+                initial,
+            ));
+            crate::intelligence::handler::register(&mut registry, reloadable.clone());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            eprintln!(
+                "agentd: --intel-unix is Unix-only; use --intel-http on Windows \
+                 (rebuild with --features intel-http if needed)"
+            );
+            return Err(ExitCode::from(EXIT_USAGE));
+        }
+    } else {
+        #[cfg(feature = "intel-http")]
+        if let Some(url) = &args.intel_http {
+            let bearer = read_intel_http_bearer(args)?;
+            match crate::intelligence::client::HttpClient::with_bearer(
+                url,
+                Duration::from_secs(args.timeout_secs.max(1)),
+                bearer,
+            ) {
+                Ok(client) => {
+                    let initial: Box<dyn crate::intelligence::client::IntelligenceClient> =
+                        Box::new(client);
+                    let reloadable = Arc::new(
+                        crate::intelligence::client::ReloadableIntelClient::new(initial),
+                    );
+                    crate::intelligence::handler::register(&mut registry, reloadable.clone());
+                }
+                Err(e) => {
+                    eprintln!("agentd: bad --intel-http URL: {e}");
+                    return Err(ExitCode::from(EXIT_USAGE));
+                }
+            }
+        }
+        #[cfg(not(feature = "intel-http"))]
+        if args.intel_http.is_some() {
+            eprintln!(
+                "agentd: --intel-http requires the `intel-http` Cargo feature; \
+                 rebuild with --features intel-http"
+            );
+            return Err(ExitCode::from(EXIT_USAGE));
+        }
+    }
+
     // MCP server registry. Composes every `[[mcp_servers]]` entry
     // plus (when set) the legacy `--mcp-stdio CMD ARG` as an
     // implicit `{name = "default", ..}` server.
@@ -373,7 +449,30 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
         crate::mcp::handler::register(&mut registry, mcp_registry.clone());
     }
 
+    registry.set_fallback(Box::new(StubHandler));
     Ok(Engine::new(registry))
+}
+
+/// Resolve the intel bearer token from `--intel-http-bearer-file` or
+/// the `AGENTD_INTEL_HTTP_BEARER` env var. Extracted so the reload
+/// path can share the exact same source-of-truth.
+#[cfg(feature = "intel-http")]
+fn read_intel_http_bearer(args: &Args) -> std::result::Result<Option<String>, ExitCode> {
+    match &args.intel_http_bearer_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => Ok(Some(s.trim().to_string())),
+            Err(e) => {
+                eprintln!(
+                    "agentd: failed to read intel bearer from {}: {e}",
+                    path.display()
+                );
+                Err(ExitCode::from(EXIT_USAGE))
+            }
+        },
+        None => Ok(std::env::var("AGENTD_INTEL_HTTP_BEARER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())),
+    }
 }
 
 /// Build the process-wide MCP server registry. Sources:
@@ -666,6 +765,9 @@ usage:
          [--bind HOST:PORT]         AGENTD_HTTP_BIND       server-mode bind (default 127.0.0.1:8080)
          [--timeout-secs N]         AGENTD_TIMEOUT_SECS    per-run deadline (default 120)
          [--drain-timeout-secs N]   AGENTD_DRAIN_TIMEOUT_SECS  graceful shutdown grace (default 30)
+         [--intel-unix PATH]        AGENTD_INTEL_UNIX
+         [--intel-http URL]         AGENTD_INTEL_HTTP              http://host:port/path
+         [--intel-http-bearer-file P] AGENTD_INTEL_HTTP_BEARER_FILE  or AGENTD_INTEL_HTTP_BEARER
          [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
          [--dry-run]                AGENTD_DRY_RUN=1
          [--validate-only]          AGENTD_VALIDATE_ONLY=1

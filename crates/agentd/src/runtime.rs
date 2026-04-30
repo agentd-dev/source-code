@@ -370,7 +370,16 @@ fn load_workflow(args: &Args) -> Result<WorkflowDoc, String> {
             .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
         return Ok(doc);
     }
-    Err("no workflow configured. Pass --config FILE or set AGENTD_CONFIG.".into())
+    if let Some(src) = crate::embedded::EMBEDDED_CONFIG {
+        let doc = WorkflowDoc::from_toml(src)
+            .map_err(|e| format!("embedded workflow is malformed: {e}"))?;
+        return Ok(doc);
+    }
+    Err(
+        "no workflow configured. Pass --config FILE / AGENTD_CONFIG, or rebuild \
+         with `AGENTD_EMBED_CONFIG=path/to/wf.toml cargo build` to bake one in."
+            .into(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +767,7 @@ fn print_help() {
 agentd {version} — bounded workflow runtime
 
 usage:
-  agentd [--config FILE]            AGENTD_CONFIG          (required)
+  agentd [--config FILE]            AGENTD_CONFIG          (required unless embedded)
          [--input FILE]             AGENTD_INPUT           one-shot trigger payload
          [--start NAME]             AGENTD_START           explicit start node
          [--mode once|serve]        AGENTD_MODE            override auto-inferred mode

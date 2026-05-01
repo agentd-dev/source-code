@@ -69,6 +69,9 @@ rustls-pemfile = { version = "2", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[build-dependencies]
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
 [dev-dependencies]
 tempfile = "3"
 # Generates self-signed server + client certs at test time so the

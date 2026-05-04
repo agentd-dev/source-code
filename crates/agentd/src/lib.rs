@@ -21,6 +21,7 @@ pub mod ratelimit;
 pub mod runtime;
 pub mod server_config;
 pub mod signals;
+pub mod testing;
 pub mod tools;
 pub mod triggers;
 pub mod workflow;

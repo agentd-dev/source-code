@@ -92,7 +92,6 @@ fn main() {
         abs.display()
     );
     println!("cargo:rustc-cfg=embed_config");
-
 }
 
 /// Minimal base64 decoder — build-time only, avoids a dep.

@@ -21,6 +21,12 @@ pub mod ratelimit;
 pub mod runtime;
 pub mod server_config;
 pub mod signals;
+
+// Re-export for integration tests + external consumers that want to
+// build a client against our TLS server without pulling rustls
+// directly.
+#[cfg(feature = "server-tls")]
+pub use rustls;
 pub mod testing;
 pub mod tools;
 pub mod triggers;

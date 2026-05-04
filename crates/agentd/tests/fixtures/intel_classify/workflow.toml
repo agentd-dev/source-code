@@ -1,0 +1,21 @@
+name = "intel_classify"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "classify"
+
+[[nodes]]
+id = "classify"
+type = "llm_infer"
+backend = "default"
+prompt = "Classify: {{text}}"
+input_from = "trigger"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "classify"
+to = "done"

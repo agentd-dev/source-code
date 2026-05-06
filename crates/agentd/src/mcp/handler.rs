@@ -229,6 +229,7 @@ mod tests {
     fn call_node_on(tool: &str, args_from: Option<&str>, server: Option<&str>) -> Node {
         Node {
             id: "call".into(),
+            retry: None,
             kind: NodeKind::CallMcpTool {
                 tool: tool.into(),
                 args_from: args_from.map(Into::into),
@@ -240,6 +241,7 @@ mod tests {
     fn read_node(resource_from: &str) -> Node {
         Node {
             id: "read".into(),
+            retry: None,
             kind: NodeKind::ReadMcpResource {
                 resource_from: resource_from.into(),
                 server: None,

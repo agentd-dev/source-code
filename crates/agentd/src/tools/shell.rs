@@ -304,6 +304,7 @@ mod tests {
     fn node(command: &str, args_from: Option<&str>, timeout_secs: Option<u64>) -> Node {
         Node {
             id: "n".into(),
+            retry: None,
             kind: NodeKind::ShellRun {
                 command: command.into(),
                 args_from: args_from.map(Into::into),

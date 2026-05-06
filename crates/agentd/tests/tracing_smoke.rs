@@ -49,10 +49,12 @@ fn linear_workflow() -> WorkflowDoc {
         nodes: vec![
             Node {
                 id: "a".into(),
+                retry: None,
                 kind: NodeKind::Merge,
             },
             Node {
                 id: "b".into(),
+                retry: None,
                 kind: NodeKind::Terminate,
             },
         ],
@@ -149,6 +151,7 @@ fn failed_workflow_increments_failure_counter() {
         }],
         nodes: vec![Node {
             id: "f".into(),
+            retry: None,
             kind: NodeKind::Fail {
                 reason: Some("nope".into()),
             },

@@ -807,6 +807,7 @@ mod tests {
             start_nodes: starts,
             nodes: vec![Node {
                 id: "a".into(),
+                retry: None,
                 kind: NodeKind::Terminate,
             }],
             edges: vec![] as Vec<Edge>,

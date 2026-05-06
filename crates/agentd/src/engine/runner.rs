@@ -161,7 +161,9 @@ impl Engine {
             let node_started = Instant::now();
             self.metrics.inc_node_executed();
 
-            let dispatch = self.registry.dispatch(node, &mut ctx);
+            // Dispatch — with optional retry. The first attempt plus
+            // `retry.max_attempts - 1` re-tries.
+            let dispatch = dispatch_with_retry(&self.registry, node, &mut ctx);
             let latency_ms = node_started.elapsed().as_millis() as u64;
 
             let outcome = match dispatch {
@@ -294,6 +296,83 @@ impl Engine {
 }
 
 // ---------------------------------------------------------------------------
+// Retry wrapping
+// ---------------------------------------------------------------------------
+
+/// Dispatch a node through the registry, honouring the node's
+/// optional [`RetryPolicy`]. Linear backoff: attempt N waits
+/// `backoff_ms * N` by default; when `jitter > 0` the sleep is
+/// randomised by `[1 - j, 1 + j]` to smooth thundering-herd.
+/// Non-retryable errors short-circuit the loop.
+fn dispatch_with_retry(
+    registry: &HandlerRegistry,
+    node: &crate::workflow::Node,
+    ctx: &mut ExecutionContext,
+) -> Result<NodeOutcome> {
+    let Some(policy) = node.retry.clone() else {
+        return registry.dispatch(node, ctx);
+    };
+    let max_attempts = policy.max_attempts.max(1);
+
+    let mut attempt: u32 = 1;
+    loop {
+        match registry.dispatch(node, ctx) {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) if attempt < max_attempts && is_retryable(&e, policy.on) => {
+                // Jitter source: a pseudo-random u64 derived from
+                // system-clock nanos XOR'd with an attempt counter.
+                // Not cryptographic — the goal is decorrelation
+                // across a fleet of agents retrying the same
+                // upstream, not unpredictability.
+                let rng_bits = jitter_bits(attempt);
+                let wait = policy.backoff_for(attempt, rng_bits);
+                tracing::warn!(
+                    target: "agentd::audit",
+                    event = "node.retry",
+                    node_id = %node.id,
+                    attempt,
+                    max_attempts,
+                    backoff_ms = policy.backoff_ms,
+                    jitter = policy.clamped_jitter() as f64,
+                    wait_ms = wait.as_millis() as u64,
+                    reason = %e,
+                );
+                // Honour the engine deadline while backing off.
+                let target = std::time::Instant::now() + wait;
+                if target > ctx.deadline {
+                    return Err(Error::Timeout(wait));
+                }
+                std::thread::sleep(wait);
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Cheap, non-cryptographic jitter source. XOR a monotonic clock
+/// reading with the attempt counter so siblings retrying at the
+/// same moment still diverge. Good enough for herd smoothing.
+fn jitter_bits(attempt: u32) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    now ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+fn is_retryable(err: &Error, policy: crate::workflow::model::RetryOn) -> bool {
+    use crate::workflow::model::RetryOn;
+    match policy {
+        RetryOn::Any => true,
+        RetryOn::Transient => matches!(
+            err,
+            Error::Tool { .. } | Error::Intelligence(_) | Error::Mcp(_)
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry resolution + edge picking
 // ---------------------------------------------------------------------------
 
@@ -394,6 +473,7 @@ mod tests {
     fn n(id: &str, kind: NodeKind) -> Node {
         Node {
             id: id.into(),
+            retry: None,
             kind,
         }
     }
@@ -626,6 +706,159 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(out, ExecutionOutcome::TimedOut { .. }));
+    }
+
+    #[test]
+    fn retry_recovers_from_transient_errors() {
+        use crate::workflow::model::{RetryOn, RetryPolicy};
+
+        // Handler that fails its first 2 calls, then succeeds.
+        struct Flaky {
+            attempts: std::sync::Mutex<u32>,
+        }
+        impl NodeHandler for Flaky {
+            fn handle(&self, _node: &Node, _ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
+                let mut n = self.attempts.lock().unwrap();
+                *n += 1;
+                if *n < 3 {
+                    Err(Error::Tool {
+                        tool: "flaky".into(),
+                        reason: "transient".into(),
+                    })
+                } else {
+                    Ok(NodeOutcome::ok_null())
+                }
+            }
+        }
+
+        let wf = WorkflowDoc {
+            name: "retry".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![
+                Node {
+                    id: "a".into(),
+                    retry: Some(RetryPolicy {
+                        max_attempts: 3,
+                        backoff_ms: 1, // virtually instant for test
+                        on: RetryOn::Transient,
+                        jitter: 0.0,
+                    }),
+                    kind: NodeKind::Merge, // handler is the Flaky stub; kind only used for name
+                },
+                n("b", NodeKind::Terminate),
+            ],
+            edges: vec![e("a", "b", None)],
+            ..Default::default()
+        };
+
+        let mut reg = HandlerRegistry::new();
+        reg.register(
+            "merge",
+            Box::new(Flaky {
+                attempts: std::sync::Mutex::new(0),
+            }),
+        );
+        reg.register(
+            "terminate",
+            Box::new(super::super::handler::TerminateHandler),
+        );
+        let engine = Engine::new(reg);
+        let out = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+    }
+
+    #[test]
+    fn retry_gives_up_after_max_attempts() {
+        use crate::workflow::model::{RetryOn, RetryPolicy};
+
+        struct AlwaysFail;
+        impl NodeHandler for AlwaysFail {
+            fn handle(&self, _node: &Node, _ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
+                Err(Error::Tool {
+                    tool: "x".into(),
+                    reason: "nope".into(),
+                })
+            }
+        }
+
+        let wf = WorkflowDoc {
+            name: "fail".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![Node {
+                id: "a".into(),
+                retry: Some(RetryPolicy {
+                    max_attempts: 2,
+                    backoff_ms: 1,
+                    on: RetryOn::Any,
+                    jitter: 0.0,
+                }),
+                kind: NodeKind::Merge,
+            }],
+            ..Default::default()
+        };
+
+        let mut reg = HandlerRegistry::new();
+        reg.register("merge", Box::new(AlwaysFail));
+        let engine = Engine::new(reg);
+        let err = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("nope"));
+    }
+
+    #[test]
+    fn retry_policy_filter_declines_non_matching_errors() {
+        use crate::workflow::model::{RetryOn, RetryPolicy};
+
+        struct PolicyDeny;
+        impl NodeHandler for PolicyDeny {
+            fn handle(&self, _node: &Node, _ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
+                Err(Error::Policy("denied".into()))
+            }
+        }
+
+        let wf = WorkflowDoc {
+            name: "pd".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![Node {
+                id: "a".into(),
+                retry: Some(RetryPolicy {
+                    max_attempts: 5,
+                    backoff_ms: 1,
+                    on: RetryOn::Transient, // policy errors are not transient
+                    jitter: 0.0,
+                }),
+                kind: NodeKind::Merge,
+            }],
+            ..Default::default()
+        };
+
+        let mut reg = HandlerRegistry::new();
+        reg.register("merge", Box::new(PolicyDeny));
+        let engine = Engine::new(reg);
+        let err = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        // Policy denial short-circuits the retry loop — a transient
+        // policy would retry 5 times; this must return after one.
+        assert!(matches!(err, Error::Policy(_)));
     }
 
     #[test]

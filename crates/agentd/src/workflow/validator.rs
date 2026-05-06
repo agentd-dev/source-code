@@ -428,6 +428,7 @@ mod tests {
     fn n(id: &str, kind: NodeKind) -> Node {
         Node {
             id: id.into(),
+            retry: None,
             kind,
         }
     }

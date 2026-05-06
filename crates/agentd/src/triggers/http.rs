@@ -802,10 +802,12 @@ mod tests {
             nodes: vec![
                 Node {
                     id: "a".into(),
+                    retry: None,
                     kind: NodeKind::Merge,
                 },
                 Node {
                     id: "b".into(),
+                    retry: None,
                     kind: NodeKind::Terminate,
                 },
             ],
@@ -948,6 +950,7 @@ mod tests {
         let mut wf = minimal_wf();
         wf.nodes[0] = Node {
             id: "a".into(),
+            retry: None,
             kind: NodeKind::Condition {
                 expr: "trigger.kind".into(),
             },
@@ -975,6 +978,7 @@ mod tests {
         let mut wf = minimal_wf();
         wf.nodes[0] = Node {
             id: "a".into(),
+            retry: None,
             kind: NodeKind::Fail {
                 reason: Some("boom".into()),
             },

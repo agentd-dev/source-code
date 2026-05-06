@@ -398,6 +398,7 @@ mod tests {
     fn node(id: &str, method: &str, url_path: &str, body_from: Option<&str>) -> Node {
         Node {
             id: id.into(),
+            retry: None,
             kind: NodeKind::HttpRequest {
                 method: method.into(),
                 url_from: url_path.into(),

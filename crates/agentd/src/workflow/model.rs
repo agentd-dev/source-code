@@ -235,8 +235,83 @@ pub struct HttpRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Node {
     pub id: String,
+    /// Optional retry policy applied when the node handler returns
+    /// an error. Terminal outcomes (Fail / Terminate) are not
+    /// retried; only dispatch-level errors are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
     #[serde(flatten)]
     pub kind: NodeKind,
+}
+
+/// Node-level retry policy. Applied to handler-returned `Err` only;
+/// `NodeOutcome::Fail` is a declared terminal state and never retried.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetryPolicy {
+    /// Total attempts (including the first). Must be ≥ 1.
+    pub max_attempts: u32,
+    /// Base backoff between attempts, in milliseconds. Attempt N
+    /// waits `backoff_ms * N` (linear ramp).
+    #[serde(default = "default_backoff_ms")]
+    pub backoff_ms: u64,
+    /// Which error categories are retryable. Default: any error.
+    #[serde(default)]
+    pub on: RetryOn,
+    /// Randomised jitter — each retry's sleep is multiplied by a
+    /// random factor in `[1 - jitter, 1 + jitter]`, capped to
+    /// `[0.0, 0.5]`. Default 0.0 (deterministic). Recommended
+    /// 0.2–0.3 for thundering-herd mitigation.
+    #[serde(default)]
+    pub jitter: f32,
+}
+
+fn default_backoff_ms() -> u64 {
+    100
+}
+
+impl RetryPolicy {
+    /// Effective jitter factor, clamped to `[0.0, 0.5]`. A value
+    /// above 0.5 would let a retry sleep more than 1.5× the base
+    /// backoff, which is past the point of diminishing returns
+    /// for thundering-herd smoothing.
+    pub fn clamped_jitter(&self) -> f32 {
+        self.jitter.clamp(0.0, 0.5)
+    }
+
+    /// Compute the sleep before attempt `n` (1-indexed; `n=1` is
+    /// the first retry, so the ramp starts at `backoff_ms * 1`).
+    /// When `jitter > 0`, the result is multiplied by a
+    /// `[1 - j, 1 + j]` random factor sourced from `rng_bits` —
+    /// the engine provides a u64 (e.g. `rand::random::<u64>()`)
+    /// so this function stays pure and deterministic under test.
+    pub fn backoff_for(&self, n: u32, rng_bits: u64) -> std::time::Duration {
+        let base = self.backoff_ms.saturating_mul(n.max(1) as u64);
+        let j = self.clamped_jitter();
+        if j == 0.0 {
+            return std::time::Duration::from_millis(base);
+        }
+        // Derive a [-1.0, 1.0] value from the lower 32 bits of
+        // rng_bits — cheap, avoids a float dep.
+        let normalised = (rng_bits as u32) as f64 / u32::MAX as f64; // [0, 1]
+        let signed = 2.0 * normalised - 1.0; // [-1, 1]
+        let factor = 1.0 + (j as f64) * signed;
+        let scaled = (base as f64 * factor).max(0.0);
+        std::time::Duration::from_millis(scaled as u64)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryOn {
+    /// Any `Error` variant. Default — matches operator expectation
+    /// of "retry on transient failure".
+    #[default]
+    Any,
+    /// Only tool-dispatch errors (`Error::Tool { .. }`) and
+    /// intelligence / MCP transport errors. Policy violations,
+    /// schema-validation failures, and timeouts stay non-retryable.
+    Transient,
 }
 
 /// Node-kind discriminator (RFC §9.4).
@@ -590,5 +665,83 @@ mod tests {
     fn bare_missing_name_rejected() {
         let err = WorkflowDoc::from_toml("").unwrap_err();
         assert!(format!("{err}").contains("missing field `name`"));
+    }
+
+    // -----------------------------------------------------------------
+    // RetryPolicy jitter
+    // -----------------------------------------------------------------
+    #[test]
+    fn retry_backoff_linear_without_jitter() {
+        let p = RetryPolicy {
+            max_attempts: 3,
+            backoff_ms: 100,
+            on: RetryOn::Any,
+            jitter: 0.0,
+        };
+        assert_eq!(p.backoff_for(1, 0).as_millis(), 100);
+        assert_eq!(p.backoff_for(2, 0).as_millis(), 200);
+        assert_eq!(p.backoff_for(3, 0).as_millis(), 300);
+    }
+
+    #[test]
+    fn retry_jitter_clamps_to_half() {
+        let p = RetryPolicy {
+            max_attempts: 1,
+            backoff_ms: 100,
+            on: RetryOn::Any,
+            jitter: 2.0, // would add ±200ms uncapped
+        };
+        assert_eq!(p.clamped_jitter(), 0.5);
+        // With rng_bits = u64::MAX the normalised factor is +1.0;
+        // factor = 1 + 0.5 * 1 = 1.5; 100 * 1.5 = 150ms.
+        assert_eq!(p.backoff_for(1, u64::MAX).as_millis(), 150);
+    }
+
+    #[test]
+    fn retry_jitter_symmetric_bounds() {
+        let p = RetryPolicy {
+            max_attempts: 1,
+            backoff_ms: 1000,
+            on: RetryOn::Any,
+            jitter: 0.2,
+        };
+        // rng_bits = 0 → factor ≈ 0.8 → ~800ms. Allow ±1ms for f64
+        // rounding (800 * 0.8 intermediate).
+        let lo = p.backoff_for(1, 0).as_millis();
+        assert!((799..=801).contains(&lo), "lo = {lo}");
+        // rng_bits with lower-32 = u32::MAX/2 ≈ 0.5 → signed ~ 0 → 1000ms.
+        let mid = (u32::MAX / 2) as u64;
+        let ms = p.backoff_for(1, mid).as_millis();
+        assert!((998..=1002).contains(&ms), "mid = {ms}");
+        // rng_bits with lower-32 = u32::MAX → factor = 1.2 → 1200ms.
+        let hi = p.backoff_for(1, u32::MAX as u64).as_millis();
+        assert!((1198..=1200).contains(&hi), "hi = {hi}");
+    }
+
+    #[test]
+    fn retry_jitter_zero_is_deterministic() {
+        let p = RetryPolicy {
+            max_attempts: 1,
+            backoff_ms: 500,
+            on: RetryOn::Any,
+            jitter: 0.0,
+        };
+        // Every rng value produces the same result.
+        assert_eq!(p.backoff_for(1, 0).as_millis(), 500);
+        assert_eq!(p.backoff_for(1, u64::MAX).as_millis(), 500);
+        assert_eq!(p.backoff_for(1, 12345).as_millis(), 500);
+    }
+
+    #[test]
+    fn retry_attempt_floor_is_one() {
+        let p = RetryPolicy {
+            max_attempts: 1,
+            backoff_ms: 100,
+            on: RetryOn::Any,
+            jitter: 0.0,
+        };
+        // n=0 is meaningless but shouldn't panic / underflow;
+        // backoff_for clamps the attempt to ≥ 1.
+        assert_eq!(p.backoff_for(0, 0).as_millis(), 100);
     }
 }

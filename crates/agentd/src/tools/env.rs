@@ -80,6 +80,7 @@ mod tests {
     fn node(id: &str, key: &str) -> Node {
         Node {
             id: id.into(),
+            retry: None,
             kind: NodeKind::ReadEnv { key: key.into() },
         }
     }

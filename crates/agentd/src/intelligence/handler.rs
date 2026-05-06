@@ -224,6 +224,7 @@ mod tests {
     fn node_with(prompt: &str, input_from: Option<&str>, output_schema: Option<&str>) -> Node {
         Node {
             id: "infer".into(),
+            retry: None,
             kind: NodeKind::LlmInfer {
                 backend: "default".into(),
                 prompt: prompt.into(),
@@ -323,6 +324,7 @@ mod tests {
             .handle(
                 &Node {
                     id: "i".into(),
+                    retry: None,
                     kind: NodeKind::LlmInfer {
                         backend: "enterprise-gateway".into(),
                         prompt: "hi".into(),

@@ -101,9 +101,13 @@ pub(crate) use resolve::{resolve_string, resolve_value, value_type_name};
 ///
 /// When no tool features are enabled the arguments go unused — the
 /// underscore prefixes silence the lint.
-pub fn register_default_tools(_registry: &mut HandlerRegistry, _policy: PolicyRef) {
+pub fn register_default_tools(
+    _registry: &mut HandlerRegistry,
+    _policy: PolicyRef,
+    _budget: crate::budget::BudgetRef,
+) {
     #[cfg(feature = "tools-fs")]
-    fs::register(_registry, _policy.clone());
+    fs::register(_registry, _policy.clone(), _budget.clone());
 
     #[cfg(feature = "tools-env")]
     env::register(_registry, _policy.clone());

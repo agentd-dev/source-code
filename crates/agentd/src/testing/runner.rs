@@ -98,7 +98,11 @@ impl FixtureRunner {
         // family, AllowAll for the Phase-3 policy. Intelligence +
         // MCP are wired only if the fixture provided mocks for them.
         let mut registry = HandlerRegistry::with_builtin_controls();
-        crate::tools::register_default_tools(&mut registry, allow_all());
+        crate::tools::register_default_tools(
+            &mut registry,
+            allow_all(),
+            crate::budget::unbounded(),
+        );
 
         if !fixture.mocks.intel.is_empty() {
             let client = Arc::new(MockClient::new());

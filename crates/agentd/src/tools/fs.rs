@@ -23,7 +23,11 @@ use crate::workflow::{Node, NodeKind};
 // Registration
 // ---------------------------------------------------------------------------
 
-pub(crate) fn register(registry: &mut HandlerRegistry, policy: PolicyRef) {
+pub(crate) fn register(
+    registry: &mut HandlerRegistry,
+    policy: PolicyRef,
+    budget: crate::budget::BudgetRef,
+) {
     registry.register(
         "read_file",
         Box::new(ReadFileHandler {
@@ -34,9 +38,11 @@ pub(crate) fn register(registry: &mut HandlerRegistry, policy: PolicyRef) {
         "write_file",
         Box::new(WriteFileHandler {
             policy: policy.clone(),
+            budget: budget.clone(),
         }),
     );
     registry.register("create_dir", Box::new(CreateDirHandler { policy }));
+    let _ = budget;
     // list_dir / stat / delete_path land once their NodeKind variants
     // are declared (out of Phase 3 scope per RFC §10.2 — same family,
     // follow-up ticket).
@@ -86,6 +92,7 @@ impl NodeHandler for ReadFileHandler {
 
 pub struct WriteFileHandler {
     policy: PolicyRef,
+    budget: crate::budget::BudgetRef,
 }
 
 impl NodeHandler for WriteFileHandler {
@@ -115,6 +122,22 @@ impl NodeHandler for WriteFileHandler {
                     "dry_run": true,
                 }),
                 branch: None,
+            });
+        }
+
+        // Budget: reserve bytes BEFORE writing so a deny short-circuits
+        // without leaving partial state on disk.
+        if let Err(reason) = self.budget.check_fs_write(content.len() as u64) {
+            tracing::warn!(
+                target: "agentd::audit",
+                event = "budget.fs_write_denied",
+                path = %path.display(),
+                bytes = content.len() as u64,
+                reason = %reason,
+            );
+            return Err(Error::Tool {
+                tool: "write_file".into(),
+                reason,
             });
         }
 
@@ -307,6 +330,7 @@ mod tests {
         }));
         let h = WriteFileHandler {
             policy: allow_all(),
+            budget: crate::budget::unbounded(),
         };
         h.handle(
             &node(
@@ -334,6 +358,7 @@ mod tests {
 
         let h = WriteFileHandler {
             policy: allow_all(),
+            budget: crate::budget::unbounded(),
         };
         let out = h
             .handle(
@@ -366,6 +391,7 @@ mod tests {
         }));
         let h = WriteFileHandler {
             policy: allow_all(),
+            budget: crate::budget::unbounded(),
         };
         h.handle(
             &node(

@@ -77,6 +77,22 @@ base64 = { version = "0.22", optional = true, default-features = false, features
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `windows-sys` provides the Job Objects bindings that replace
+# `setrlimit` for memory + CPU-time budgets (see `src/budget.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# Unix-only dev dep mirroring the runtime one — tests that poke
+# signal handlers directly need libc even when the crate lib is
+# compiling on Windows.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [build-dependencies]
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 

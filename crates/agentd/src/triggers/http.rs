@@ -822,7 +822,7 @@ mod tests {
 
     fn start_server(wf: WorkflowDoc) -> ServerHandle {
         let mut registry = HandlerRegistry::with_builtin_controls();
-        register_default_tools(&mut registry, allow_all());
+        register_default_tools(&mut registry, allow_all(), crate::budget::unbounded());
         registry.set_fallback(Box::new(StubHandler));
         let engine = Arc::new(Engine::new(registry));
         let server = HttpServer::new(

@@ -10,6 +10,7 @@
 
 #[cfg(feature = "auth")]
 pub mod auth;
+pub mod budget;
 pub mod embedded;
 pub mod engine;
 pub mod error;

@@ -95,6 +95,13 @@ pub struct WorkflowDoc {
     /// Cargo feature is compiled in.
     #[serde(default)]
     pub signing: Option<crate::signing::SigningConfig>,
+
+    /// Optional `[budget]` block. Process-wide resource
+    /// caps — memory (RLIMIT_AS), CPU time (RLIMIT_CPU), wall-clock
+    /// per run, and cumulative fs-write bytes. Scoped per-process
+    /// because agent is a micro-agent (1 workflow / process).
+    #[serde(default)]
+    pub budget: Option<crate::budget::BudgetConfig>,
 }
 
 impl WorkflowDoc {

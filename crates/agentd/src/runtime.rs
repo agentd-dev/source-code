@@ -134,13 +134,21 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         return ExitCode::from(EXIT_OK);
     }
 
+    // Apply process-wide resource budgets (RLIMIT_AS /
+    // RLIMIT_CPU) before the engine builds — any subsequent
+    // allocation or CPU burn is subject to the cap. `setrlimit`
+    // failures emit a warn audit event but don't abort.
+    let budget_cfg = doc.budget.clone().unwrap_or_default();
+    crate::budget::apply_rlimits(&budget_cfg);
+
     // Build the engine.
     let engine = match build_engine(&doc, &args) {
         Ok(e) => e,
         Err(code) => return code,
     };
+    let effective_timeout = budget_cfg.clamp_run_time(args.timeout_secs.max(1));
     let options = RunOptions {
-        timeout: Duration::from_secs(args.timeout_secs.max(1)),
+        timeout: Duration::from_secs(effective_timeout),
         dry_run: args.dry_run,
     };
 
@@ -483,8 +491,15 @@ fn resolve_signature_source(
 
 fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     let (policy, mcp_allowlist) = build_policy(doc);
+
+    let budget = Arc::new(crate::budget::BudgetTracker::new(
+        doc.budget
+            .as_ref()
+            .unwrap_or(&crate::budget::BudgetConfig::default()),
+    ));
+
     let mut registry = HandlerRegistry::with_builtin_controls();
-    crate::tools::register_default_tools(&mut registry, policy);
+    crate::tools::register_default_tools(&mut registry, policy, budget);
 
     // Intelligence adapter (Unix or HTTP). Wrap whichever client
     // the operator selected in a `ReloadableIntelClient` so a

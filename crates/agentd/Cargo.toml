@@ -32,6 +32,9 @@ tools-mcp = []
 # Trigger adapters.
 trigger-http = []
 trigger-mcp = []
+# Cron / interval trigger. Pulls `cron` (pure-Rust parser) only;
+# the scheduler thread is native std::thread + sleep.
+trigger-cron = ["dep:cron", "dep:chrono"]
 
 # Intelligence transports.
 intel-unix = []
@@ -64,6 +67,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 # Readers see a consistent snapshot with no mutex contention;
 # writers replace the current value atomically.
 arc-swap = "1"
+# Pure-Rust cron expression parser + schedule iterator.
+cron = { version = "0.12", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false, features = ["std", "clock"] }
 sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "logging", "aws-lc-rs", "tls12"] }

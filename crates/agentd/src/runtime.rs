@@ -172,8 +172,20 @@ fn resolve_mode(doc: &WorkflowDoc, override_: Option<&str>) -> Mode {
         Some("serve") => Mode::Serve,
         Some("once") => Mode::Once,
         _ if !doc.http_routes.is_empty() => Mode::Serve,
+        _ if has_long_lived_trigger(doc) => Mode::Serve,
         _ => Mode::Once,
     }
+}
+
+/// True when the workflow declares any trigger type that requires
+/// a long-running process — cron, interval, or fs_watch. Without
+/// these the binary runs once and exits; with them it needs to
+/// stay alive to fire the scheduled work.
+fn has_long_lived_trigger(doc: &WorkflowDoc) -> bool {
+    use crate::workflow::model::Trigger;
+    doc.triggers
+        .iter()
+        .any(|t| matches!(t, Trigger::Cron { .. } | Trigger::Interval { .. }))
 }
 
 // ---------------------------------------------------------------------------

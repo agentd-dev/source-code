@@ -28,9 +28,11 @@ fn main() {
     // Validate cfg flag names so Rust 1.80+'s unexpected-cfg lint
     // doesn't fire inside src/embedded.rs.
     println!("cargo:rustc-check-cfg=cfg(embed_config)");
+    println!("cargo:rustc-check-cfg=cfg(embed_config_sig)");
 
     // Always rerun when the env var toggles.
     println!("cargo:rerun-if-env-changed=AGENTD_EMBED_CONFIG");
+    println!("cargo:rerun-if-env-changed=AGENTD_EMBED_CONFIG_SIG");
 
     let Ok(raw_path) = std::env::var("AGENTD_EMBED_CONFIG") else {
         // No embedded config. Generic runtime build.
@@ -92,6 +94,48 @@ fn main() {
         abs.display()
     );
     println!("cargo:rustc-cfg=embed_config");
+
+    // Optional: bake in the detached signature when the operator
+    // ships one. `AGENTD_EMBED_CONFIG_SIG=/path/to/workflow.toml.sig`
+    // points at a base64-encoded Ed25519 sig file; we decode it
+    // here and write raw bytes to OUT_DIR so `include_bytes!` in
+    // the runtime gets decoded content (skipping base64 at start).
+    if let Ok(sig_raw) = std::env::var("AGENTD_EMBED_CONFIG_SIG")
+        && !sig_raw.trim().is_empty()
+    {
+        let sig_path = PathBuf::from(&sig_raw);
+        let sig_abs = match sig_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => fail(format!("AGENTD_EMBED_CONFIG_SIG={sig_raw}: {e}")),
+        };
+        println!("cargo:rerun-if-changed={}", sig_abs.display());
+        let sig_b64 = match std::fs::read_to_string(&sig_abs) {
+            Ok(s) => s,
+            Err(e) => fail(format!(
+                "AGENTD_EMBED_CONFIG_SIG={}: read failed: {e}",
+                sig_abs.display()
+            )),
+        };
+        // Hand-roll base64 decoding here rather than pulling a crate
+        // — build-deps stay tight; the sig file is small.
+        let decoded = match decode_base64(sig_b64.trim()) {
+            Ok(d) => d,
+            Err(e) => fail(format!(
+                "AGENTD_EMBED_CONFIG_SIG={}: invalid base64: {e}",
+                sig_abs.display()
+            )),
+        };
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+        let out_path = PathBuf::from(out_dir).join("embedded_config.sig.bin");
+        if let Err(e) = std::fs::write(&out_path, &decoded) {
+            fail(format!("write decoded sig to {}: {e}", out_path.display()));
+        }
+        println!(
+            "cargo:rustc-env=AGENTD_EMBEDDED_CONFIG_SIG_PATH={}",
+            out_path.display()
+        );
+        println!("cargo:rustc-cfg=embed_config_sig");
+    }
 }
 
 /// Minimal base64 decoder — build-time only, avoids a dep.

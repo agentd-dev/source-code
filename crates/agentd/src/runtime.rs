@@ -63,16 +63,34 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         }
     };
 
-    // Resolve the workflow. No tracing yet — pre-init errors go to
-    // stderr as plain text so the log target declared in the
-    // workflow takes effect from the first emitted event.
-    let doc = match load_workflow(&args) {
-        Ok(d) => d,
+    // Resolve the workflow. CLI / env --config wins; then an embedded
+    // config if the build baked one in; then nothing (usage error).
+    // No tracing yet — pre-init errors go to stderr as plain text so
+    // the log target declared in the workflow takes effect from the
+    // first emitted event.
+    let loaded = match load_workflow(&args) {
+        Ok(l) => l,
         Err(msg) => {
             eprintln!("agentd: {msg}");
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    let LoadedWorkflow {
+        mut doc,
+        raw_bytes,
+        sig_path,
+    } = loaded;
+
+    // CLI / env overrides on the signing config. These win over the
+    // TOML block so operators can harden a deploy without editing
+    // the workflow file. `--signing-key-file` replaces whatever key
+    // the TOML pinned, useful for key rotation without redeploying
+    // the manifest.
+    if let Some(path) = &args.signing_key_file {
+        let cfg = doc.signing.get_or_insert_with(Default::default);
+        cfg.public_key_file = Some(path.clone());
+        cfg.public_key_pem = None;
+    }
 
     // Merge logging config: workflow `[logging]` → env → CLI → default.
     // Now we know the full spec, install the subscriber.
@@ -80,6 +98,22 @@ pub fn run(argv: Vec<String>) -> ExitCode {
     if let Err(e) = crate::observability::apply(&resolved) {
         eprintln!("agentd: failed to install log subscriber: {e}");
         return ExitCode::from(EXIT_SEMANTIC);
+    }
+
+    // Signature verification (RFC 0002). Runs BEFORE validate() so a
+    // tampered manifest with otherwise-valid DAG shape still fails.
+    let sig_source = resolve_signature_source(&sig_path);
+    match crate::signing::verify_or_skip(
+        doc.signing.as_ref(),
+        &raw_bytes,
+        sig_source,
+        args.signing_required,
+    ) {
+        crate::signing::Outcome::Ok => {}
+        crate::signing::Outcome::Refused(reason) => {
+            eprintln!("agentd: workflow signature verification failed: {reason}");
+            return ExitCode::from(EXIT_SEMANTIC);
+        }
     }
 
     // Pre-validate — saves the operator a confusing engine error.
@@ -147,6 +181,13 @@ struct Args {
     bind: Option<String>,
     timeout_secs: u64,
     intel_unix: Option<PathBuf>,
+    /// `--signing-required` — hardens every deploy by refusing to
+    /// start on an unsigned workflow, even if the TOML's
+    /// `[signing].required` is false (or the block is absent).
+    signing_required: bool,
+    /// `--signing-key-file PATH` — overrides the TOML's pinned key.
+    /// Lets operators rotate keys without editing the manifest.
+    signing_key_file: Option<PathBuf>,
     intel_http: Option<String>,
     intel_http_bearer_file: Option<PathBuf>,
     mcp_stdio: Option<Vec<String>>,
@@ -184,6 +225,8 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         mode: std::env::var("AGENTD_MODE").ok(),
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
+        signing_required: env_bool("AGENTD_SIGNING_REQUIRED"),
+        signing_key_file: env_opt_path("AGENTD_SIGNING_KEY_FILE"),
         intel_http: std::env::var("AGENTD_INTEL_HTTP")
             .ok()
             .filter(|s| !s.trim().is_empty()),
@@ -244,6 +287,10 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                         "--drain-timeout-secs expects an integer; got `{v}`"
                     ))
                 })?;
+            }
+            "--signing-required" => a.signing_required = true,
+            "--signing-key-file" => {
+                a.signing_key_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
             }
             "--intel-unix" => {
                 a.intel_unix = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
@@ -362,24 +409,72 @@ fn resolve_logging(
 // Workflow loading
 // ---------------------------------------------------------------------------
 
-fn load_workflow(args: &Args) -> Result<WorkflowDoc, String> {
+/// What `load_workflow` returns — the parsed doc plus everything
+/// [`crate::signing::verify_or_skip`] needs to run against it.
+struct LoadedWorkflow {
+    doc: WorkflowDoc,
+    /// Raw TOML bytes exactly as they sit on disk (or in the baked-in
+    /// blob). Signature verification needs these unmodified; TOML
+    /// parsing is lossy with respect to whitespace and comments.
+    raw_bytes: Vec<u8>,
+    /// Where to look for a detached signature — alongside the external
+    /// file when `--config` is used, or the embedded blob when Mode B.
+    sig_path: Option<PathBuf>,
+}
+
+fn load_workflow(args: &Args) -> Result<LoadedWorkflow, String> {
     if let Some(path) = &args.config {
         let src = fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         let doc = WorkflowDoc::from_toml(&src)
             .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-        return Ok(doc);
+        // External signature convention: `<config>.toml.sig` next to
+        // the TOML. Absent file is handled by the verifier based on
+        // the `required` flag.
+        let mut sig_path = path.clone();
+        let mut ext = sig_path
+            .extension()
+            .map(|e| e.to_owned())
+            .unwrap_or_default();
+        ext.push(".sig");
+        sig_path.set_extension(ext);
+        return Ok(LoadedWorkflow {
+            doc,
+            raw_bytes: src.into_bytes(),
+            sig_path: Some(sig_path),
+        });
     }
     if let Some(src) = crate::embedded::EMBEDDED_CONFIG {
         let doc = WorkflowDoc::from_toml(src)
             .map_err(|e| format!("embedded workflow is malformed: {e}"))?;
-        return Ok(doc);
+        return Ok(LoadedWorkflow {
+            doc,
+            raw_bytes: src.as_bytes().to_vec(),
+            sig_path: None,
+        });
     }
     Err(
         "no workflow configured. Pass --config FILE / AGENTD_CONFIG, or rebuild \
          with `AGENTD_EMBED_CONFIG=path/to/wf.toml cargo build` to bake one in."
             .into(),
     )
+}
+
+/// Pick the right [`crate::signing::SignatureSource`] for the current
+/// workflow source. External `--config` path → sibling `.sig` file.
+/// Embedded mode → build-baked `EMBEDDED_CONFIG_SIG` bytes when
+/// present; otherwise `None` and the verifier decides based on
+/// `required`.
+fn resolve_signature_source(
+    sig_path: &Option<PathBuf>,
+) -> crate::signing::SignatureSource<'static> {
+    if let Some(path) = sig_path {
+        return crate::signing::SignatureSource::FilePath(path.clone());
+    }
+    if let Some(bytes) = crate::embedded::EMBEDDED_CONFIG_SIG {
+        return crate::signing::SignatureSource::RawBytes(bytes);
+    }
+    crate::signing::SignatureSource::None
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +879,8 @@ usage:
          [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)
          [--log-target TARGET]      AGENTD_LOG_TARGET      stderr | stdout | file:PATH
          [--quiet]                  AGENTD_QUIET=1
+         [--signing-required]       AGENTD_SIGNING_REQUIRED=1  fail-closed on unsigned
+         [--signing-key-file PATH]  AGENTD_SIGNING_KEY_FILE    override pinned pubkey
          [--version] [--help]
 
 Design: rfcs/0001-bounded-workflow-runtime.md\

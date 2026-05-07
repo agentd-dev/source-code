@@ -89,6 +89,12 @@ pub struct WorkflowDoc {
     /// into a clean startup error pointing at the rebuild path.
     #[serde(default)]
     pub server: Option<crate::server_config::ServerConfig>,
+
+    /// Optional workflow-signing configuration (RFC 0002). Parsed
+    /// unconditionally; verification is a no-op unless the `signing`
+    /// Cargo feature is compiled in.
+    #[serde(default)]
+    pub signing: Option<crate::signing::SigningConfig>,
 }
 
 impl WorkflowDoc {

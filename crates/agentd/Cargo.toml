@@ -47,6 +47,12 @@ auth = ["dep:sha2", "dep:hmac"]
 # the mTLS verifier is always reachable.
 server-tls = ["auth", "dep:rustls", "dep:rustls-pemfile"]
 
+# Signed workflow verification (RFC 0002). Ed25519 detached
+# signatures verified before the DAG validator runs. Pure-Rust
+# crypto; no native C. Off by default — opt-in for hardened
+# deployments.
+signing = ["dep:ed25519-dalek", "dep:base64"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,6 +68,8 @@ sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "logging", "aws-lc-rs", "tls12"] }
 rustls-pemfile = { version = "2", optional = true }
+ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "pkcs8", "pem"] }
+base64 = { version = "0.22", optional = true, default-features = false, features = ["std"] }
 
 # libc — Unix-only. Used for sigaction (signals.rs). Every call
 # site is `#[cfg(unix)]` gated, so scoping the dep to Unix targets

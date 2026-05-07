@@ -19,6 +19,18 @@ pub const EMBEDDED_CONFIG: Option<&str> = Some(include_str!(env!("AGENTD_EMBEDDE
 #[cfg(not(embed_config))]
 pub const EMBEDDED_CONFIG: Option<&str> = None;
 
+/// Embedded workflow signature bytes, if the build was performed with
+/// `AGENTD_EMBED_CONFIG_SIG` set alongside `AGENTD_EMBED_CONFIG`. The
+/// content is the raw decoded signature (NOT base64) — `build.rs`
+/// decodes the base64 `.sig` file at build time so the runtime can
+/// verify without touching base64.
+#[cfg(embed_config_sig)]
+pub const EMBEDDED_CONFIG_SIG: Option<&[u8]> =
+    Some(include_bytes!(env!("AGENTD_EMBEDDED_CONFIG_SIG_PATH")));
+
+#[cfg(not(embed_config_sig))]
+pub const EMBEDDED_CONFIG_SIG: Option<&[u8]> = None;
+
 /// Convenience: `true` iff the build embedded a workflow.
 pub const fn has_embedded_config() -> bool {
     EMBEDDED_CONFIG.is_some()

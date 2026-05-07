@@ -20,3 +20,6 @@ pub mod http;
 
 #[cfg(all(feature = "trigger-http", feature = "server-tls"))]
 pub mod http_tls;
+
+#[cfg(feature = "trigger-cron")]
+pub mod cron;

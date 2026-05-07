@@ -197,6 +197,21 @@ pub enum Trigger {
     },
     #[serde(rename = "internal.event")]
     InternalEvent { name: String, start_node: String },
+    /// Fire on a cron schedule. `schedule` is a 5-field cron
+    /// expression (`m h dom mon dow`) in the runtime's local TZ —
+    /// operators who need a specific TZ set `TZ=...` on the
+    /// process. Feature-gated on `trigger-cron`.
+    #[serde(rename = "cron")]
+    Cron {
+        schedule: String,
+        start_node: String,
+    },
+    /// Fire on a fixed interval. `every` is a human duration
+    /// ("30s", "5m", "1h"). Equivalent to a cron expression but
+    /// cheaper to parse and more intuitive for "poll this every N"
+    /// workflows. Feature-gated on `trigger-cron`.
+    #[serde(rename = "interval")]
+    Interval { every: String, start_node: String },
 }
 
 impl Trigger {
@@ -205,7 +220,9 @@ impl Trigger {
         match self {
             Trigger::McpResourceUpdated { start_node, .. }
             | Trigger::McpResourceCreated { start_node, .. }
-            | Trigger::InternalEvent { start_node, .. } => start_node,
+            | Trigger::InternalEvent { start_node, .. }
+            | Trigger::Cron { start_node, .. }
+            | Trigger::Interval { start_node, .. } => start_node,
         }
     }
 }

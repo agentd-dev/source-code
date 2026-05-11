@@ -81,9 +81,10 @@ impl HttpServer {
     /// [`ServerHandle`] for orderly shutdown.
     pub fn spawn(self) -> Result<ServerHandle> {
         // Startup validation — auth refs resolve to configured
-        // bindings. Expensive to debug at first-request time.
+        // bindings + OIDC JWKS parses cleanly. Expensive to debug
+        // at first-request time.
         #[cfg(feature = "auth")]
-        let auth_config: AuthArc = {
+        let auth_config: PreparedAuthArc = {
             let mut refs = Vec::with_capacity(self.workflow.http_routes.len());
             for route in &self.workflow.http_routes {
                 refs.push(crate::auth::AuthRef::parse(route.auth.as_deref())?);
@@ -91,10 +92,13 @@ impl HttpServer {
             let empty = crate::auth::AuthConfig::default();
             let cfg = self.workflow.auth.as_ref().unwrap_or(&empty);
             cfg.validate(&refs)?;
-            Arc::new(cfg.clone())
+            // Parsing the JWKS happens here, at spawn. A bad file
+            // / malformed JWK / disallowed algorithm surfaces as
+            // a bind error instead of an opaque per-request 401.
+            Arc::new(crate::auth::PreparedAuth::from_config(cfg)?)
         };
         #[cfg(not(feature = "auth"))]
-        let auth_config: AuthArc = Arc::new(());
+        let auth_config: PreparedAuthArc = Arc::new(());
 
         // Startup validation — rate-limit numbers are sensible, and
         // one bucket per configured route is built up-front.
@@ -225,7 +229,7 @@ fn dispatch_accepted(
     engine: &Engine,
     options: &RunOptions,
     buckets: &Buckets,
-    auth_config: &AuthArc,
+    auth_config: &PreparedAuthArc,
 ) {
     match tls {
         None => {
@@ -266,9 +270,9 @@ fn dispatch_accepted(
 /// type regardless of the `auth` feature so the dispatch signature
 /// stays identical on both sides.
 #[cfg(feature = "auth")]
-type AuthArc = std::sync::Arc<crate::auth::AuthConfig>;
+type PreparedAuthArc = std::sync::Arc<crate::auth::PreparedAuth>;
 #[cfg(not(feature = "auth"))]
-type AuthArc = std::sync::Arc<()>;
+type PreparedAuthArc = std::sync::Arc<()>;
 
 /// RAII counter decrement for in-flight request tracking.
 struct InFlightGuard {
@@ -361,7 +365,7 @@ fn handle_connection<S: std::io::Read + Write>(
     options: &RunOptions,
     buckets: &Buckets,
     peer_identity: Option<PeerIdentity>,
-    auth_config: &AuthArc,
+    auth_config: &PreparedAuthArc,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let parse_result = parse_request(&mut reader);
@@ -469,7 +473,7 @@ fn handle_connection<S: std::io::Read + Write>(
                 .as_ref()
                 .map(|p| p.fingerprint.as_str()),
         };
-        match crate::auth::evaluate(auth_config, &auth_ref, &auth_req) {
+        match crate::auth::evaluate(&auth_ref, auth_config, &auth_req) {
             crate::auth::AuthDecision::Allow { principal } => principal,
             crate::auth::AuthDecision::Deny { reason } => {
                 write_response(

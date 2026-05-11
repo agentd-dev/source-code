@@ -212,6 +212,26 @@ pub enum Trigger {
     /// workflows. Feature-gated on `trigger-cron`.
     #[serde(rename = "interval")]
     Interval { every: String, start_node: String },
+    /// Fire on a filesystem change under `path`. `events` is the
+    /// filter list (`create`, `modify`, `remove`, `rename`);
+    /// defaults to all four. `recursive` defaults to false.
+    /// `debounce_ms` coalesces rapid events into one trigger fire
+    /// (default 250ms). Feature-gated on `trigger-fs-watch`.
+    #[serde(rename = "fs_watch")]
+    FsWatch {
+        path: std::path::PathBuf,
+        start_node: String,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        events: Vec<String>,
+        #[serde(default = "default_debounce")]
+        debounce_ms: u64,
+    },
+}
+
+fn default_debounce() -> u64 {
+    250
 }
 
 impl Trigger {
@@ -222,7 +242,8 @@ impl Trigger {
             | Trigger::McpResourceCreated { start_node, .. }
             | Trigger::InternalEvent { start_node, .. }
             | Trigger::Cron { start_node, .. }
-            | Trigger::Interval { start_node, .. } => start_node,
+            | Trigger::Interval { start_node, .. }
+            | Trigger::FsWatch { start_node, .. } => start_node,
         }
     }
 }

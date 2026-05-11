@@ -183,9 +183,12 @@ fn resolve_mode(doc: &WorkflowDoc, override_: Option<&str>) -> Mode {
 /// stay alive to fire the scheduled work.
 fn has_long_lived_trigger(doc: &WorkflowDoc) -> bool {
     use crate::workflow::model::Trigger;
-    doc.triggers
-        .iter()
-        .any(|t| matches!(t, Trigger::Cron { .. } | Trigger::Interval { .. }))
+    doc.triggers.iter().any(|t| {
+        matches!(
+            t,
+            Trigger::Cron { .. } | Trigger::Interval { .. } | Trigger::FsWatch { .. }
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

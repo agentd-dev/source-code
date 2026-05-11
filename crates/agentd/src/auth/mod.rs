@@ -36,6 +36,7 @@ pub mod bearer;
 pub mod config;
 pub mod hmac;
 pub mod mtls;
+pub mod oidc;
 
 use std::collections::HashMap;
 
@@ -43,15 +44,52 @@ use crate::error::{Error, Result};
 
 pub use config::AuthConfig;
 
+/// Spawn-time-prepared auth state. Holds the parsed
+/// [`AuthConfig`] plus per-binding state that requires up-front
+/// work — today that's the OIDC bindings' JWKS parse. Built once
+/// via [`AuthConfig::prepare`]; shared across request handlers
+/// via `Arc`.
+#[derive(Debug)]
+pub struct PreparedAuth {
+    pub config: AuthConfig,
+    /// OIDC binding name → prepared JWKS + validation settings.
+    pub oidc: HashMap<String, oidc::PreparedOidc>,
+}
+
+impl PreparedAuth {
+    /// Prepare from a config, surfacing JWKS / algorithm errors at
+    /// spawn time rather than the first request that needs them.
+    pub fn from_config(cfg: &AuthConfig) -> Result<Self> {
+        let mut oidc_map = HashMap::with_capacity(cfg.oidc.len());
+        for (name, def) in &cfg.oidc {
+            let prepared =
+                oidc::prepare(def).map_err(|e| Error::Config(format!("auth.oidc.{name}: {e}")))?;
+            oidc_map.insert(name.clone(), prepared);
+        }
+        Ok(Self {
+            config: cfg.clone(),
+            oidc: oidc_map,
+        })
+    }
+}
+
 /// The parsed reference on a route's `auth` field. Independently
 /// of whether the named binding is configured — that gets checked at
 /// startup by [`AuthConfig::validate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthRef {
     None,
-    Bearer { name: String },
-    Hmac { name: String },
+    Bearer {
+        name: String,
+    },
+    Hmac {
+        name: String,
+    },
     MTls,
+    /// OIDC / JWT bearer — validated against `[auth.oidc.<name>]`.
+    Oidc {
+        name: String,
+    },
 }
 
 impl AuthRef {
@@ -82,6 +120,7 @@ impl AuthRef {
         match kind {
             "bearer" => Ok(AuthRef::Bearer { name }),
             "hmac" => Ok(AuthRef::Hmac { name }),
+            "oidc" => Ok(AuthRef::Oidc { name }),
             "mtls" => {
                 if !name.is_empty() && name != "default" {
                     return Err(Error::Config(format!(
@@ -91,7 +130,7 @@ impl AuthRef {
                 Ok(AuthRef::MTls)
             }
             other => Err(Error::Config(format!(
-                "unknown auth kind `{other}` (expected bearer / hmac / mtls / none)"
+                "unknown auth kind `{other}` (expected bearer / hmac / oidc / mtls / none)"
             ))),
         }
     }
@@ -135,14 +174,29 @@ pub struct AuthRequest<'a> {
 }
 
 /// Evaluate a route's auth requirement against an incoming request.
-pub fn evaluate(config: &AuthConfig, auth_ref: &AuthRef, req: &AuthRequest<'_>) -> AuthDecision {
+pub fn evaluate(
+    auth_ref: &AuthRef,
+    prepared: &PreparedAuth,
+    req: &AuthRequest<'_>,
+) -> AuthDecision {
     match auth_ref {
         AuthRef::None => AuthDecision::Allow {
             principal: Principal::anonymous(),
         },
-        AuthRef::Bearer { name } => bearer::verify(config, name, req),
-        AuthRef::Hmac { name } => hmac::verify(config, name, req),
+        AuthRef::Bearer { name } => bearer::verify(&prepared.config, name, req),
+        AuthRef::Hmac { name } => hmac::verify(&prepared.config, name, req),
         AuthRef::MTls => mtls::verify(req),
+        AuthRef::Oidc { name } => match prepared.oidc.get(name) {
+            Some(prep) => match oidc::extract_bearer(req) {
+                Some(token) => oidc::verify(prep, token),
+                None => AuthDecision::Deny {
+                    reason: "oidc.missing-bearer".into(),
+                },
+            },
+            None => AuthDecision::Deny {
+                reason: format!("oidc.unknown-binding:{name}"),
+            },
+        },
     }
 }
 
@@ -207,13 +261,14 @@ mod tests {
     #[test]
     fn mtls_denies_when_no_client_cert() {
         let cfg = AuthConfig::default();
+        let prepared = PreparedAuth::from_config(&cfg).unwrap();
         let headers = HashMap::new();
         let req = AuthRequest {
             headers: &headers,
             body: b"",
             peer_cert_fingerprint: None,
         };
-        match evaluate(&cfg, &AuthRef::MTls, &req) {
+        match evaluate(&AuthRef::MTls, &prepared, &req) {
             AuthDecision::Deny { reason } => {
                 assert!(reason.contains("mtls"), "reason: {reason}");
             }
@@ -224,13 +279,14 @@ mod tests {
     #[test]
     fn mtls_allows_when_client_cert_fingerprint_present() {
         let cfg = AuthConfig::default();
+        let prepared = PreparedAuth::from_config(&cfg).unwrap();
         let headers = HashMap::new();
         let req = AuthRequest {
             headers: &headers,
             body: b"",
             peer_cert_fingerprint: Some("sha256:deadbeef"),
         };
-        match evaluate(&cfg, &AuthRef::MTls, &req) {
+        match evaluate(&AuthRef::MTls, &prepared, &req) {
             AuthDecision::Allow { principal } => {
                 assert_eq!(principal.kind, "mtls");
                 assert_eq!(principal.name, "sha256:deadbeef");
@@ -242,13 +298,14 @@ mod tests {
     #[test]
     fn none_always_allows() {
         let cfg = AuthConfig::default();
+        let prepared = PreparedAuth::from_config(&cfg).unwrap();
         let headers = HashMap::new();
         let req = AuthRequest {
             headers: &headers,
             body: b"",
             peer_cert_fingerprint: None,
         };
-        let decision = evaluate(&cfg, &AuthRef::None, &req);
+        let decision = evaluate(&AuthRef::None, &prepared, &req);
         assert!(matches!(decision, AuthDecision::Allow { .. }));
     }
 }

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthRef;
 use crate::error::{Error, Result};
 
-/// Complete auth configuration — bearer and HMAC definitions keyed
-/// by operator-facing name.
+/// Complete auth configuration — bearer, HMAC, and OIDC definitions
+/// keyed by operator-facing name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
@@ -16,6 +16,11 @@ pub struct AuthConfig {
     pub bearer: HashMap<String, BearerDef>,
     #[serde(default)]
     pub hmac: HashMap<String, HmacDef>,
+    /// OIDC / JWT bindings. Empty unless the workflow declares
+    /// `[auth.oidc.<name>]` sections. Feature-gated verification
+    /// lives in [`crate::auth::oidc`].
+    #[serde(default)]
+    pub oidc: HashMap<String, crate::auth::oidc::OidcDef>,
 }
 
 impl AuthConfig {
@@ -37,6 +42,13 @@ impl AuthConfig {
                     if !self.hmac.contains_key(name) {
                         return Err(Error::Config(format!(
                             "auth ref `hmac:{name}` is not defined in [auth.hmac]"
+                        )));
+                    }
+                }
+                AuthRef::Oidc { name } => {
+                    if !self.oidc.contains_key(name) {
+                        return Err(Error::Config(format!(
+                            "auth ref `oidc:{name}` is not defined in [auth.oidc]"
                         )));
                     }
                 }

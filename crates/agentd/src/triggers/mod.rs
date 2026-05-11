@@ -23,3 +23,6 @@ pub mod http_tls;
 
 #[cfg(feature = "trigger-cron")]
 pub mod cron;
+
+#[cfg(feature = "trigger-fs-watch")]
+pub mod fs_watch;

@@ -68,3 +68,112 @@ pub type PolicyRef = Arc<dyn Policy>;
 pub fn allow_all() -> PolicyRef {
     Arc::new(AllowAll)
 }
+
+// ---------------------------------------------------------------------------
+// Hot-reloadable policy wrapper
+// ---------------------------------------------------------------------------
+
+/// [`Policy`] implementation that holds its inner `Arc<dyn Policy>`
+/// behind an [`arc_swap::ArcSwap`] so the runtime can replace the
+/// whole policy atomically on SIGHUP.
+///
+/// Handlers keep holding the exact same `Arc<dyn Policy>` they
+/// captured at registration — there's no signature change. Every
+/// check-method defers to the currently-stored inner policy via
+/// `load()`; in-flight checks that have already dereferenced the
+/// snapshot complete against the old policy, matching the rest of
+/// the hot-reload surface (TLS, auth, routes) which also works on
+/// per-snapshot semantics.
+///
+/// The `regorus::Engine` thread-locals inside `ManifestPolicy`
+/// self-invalidate through `RegoSpec.id`: a new `ManifestPolicy`
+/// built from a reloaded `[policy.rego]` block has a fresh id,
+/// which triggers per-thread recompilation on first use.
+pub struct ReloadablePolicy {
+    inner: arc_swap::ArcSwap<PolicyArc>,
+}
+
+/// Inner type the `ArcSwap` stores. `Box<dyn Policy>` rather than
+/// `Arc<dyn Policy>` avoids double-Arc indirection — ArcSwap adds
+/// its own `Arc` layer around whatever it wraps.
+type PolicyArc = Box<dyn Policy>;
+
+impl ReloadablePolicy {
+    /// Wrap an initial policy. The returned value implements
+    /// [`Policy`]; callers put it in an `Arc` and pass it to
+    /// handler registration exactly like any other `PolicyRef`.
+    pub fn new(initial: Box<dyn Policy>) -> Self {
+        Self {
+            inner: arc_swap::ArcSwap::from_pointee(initial),
+        }
+    }
+
+    /// Atomically replace the inner policy. Next check on any
+    /// thread sees the new rules; in-flight checks that already
+    /// hold a `Guard` complete against the old policy.
+    pub fn swap(&self, next: Box<dyn Policy>) {
+        self.inner.store(Arc::new(next));
+    }
+}
+
+impl Policy for ReloadablePolicy {
+    fn check_fs_read(&self, path: &Path) -> Decision {
+        self.inner.load().check_fs_read(path)
+    }
+    fn check_fs_write(&self, path: &Path) -> Decision {
+        self.inner.load().check_fs_write(path)
+    }
+    fn check_fs_delete(&self, path: &Path) -> Decision {
+        self.inner.load().check_fs_delete(path)
+    }
+    fn check_fs_list(&self, path: &Path) -> Decision {
+        self.inner.load().check_fs_list(path)
+    }
+    fn check_env_read(&self, key: &str) -> Decision {
+        self.inner.load().check_env_read(key)
+    }
+    fn check_http_request(&self, method: &str, url: &str) -> Decision {
+        self.inner.load().check_http_request(method, url)
+    }
+    fn check_shell_run(&self, command: &Path) -> Decision {
+        self.inner.load().check_shell_run(command)
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct DenyAll;
+    impl Policy for DenyAll {
+        fn check_fs_read(&self, _: &Path) -> Decision {
+            Decision::Deny("nope".into())
+        }
+    }
+
+    #[test]
+    fn swap_changes_check_result() {
+        let reloadable = ReloadablePolicy::new(Box::new(AllowAll));
+        let path = PathBuf::from("/etc/hosts");
+        assert!(matches!(reloadable.check_fs_read(&path), Decision::Allow));
+
+        reloadable.swap(Box::new(DenyAll));
+        assert!(matches!(reloadable.check_fs_read(&path), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn swap_is_visible_through_arc_dyn_policy_boundary() {
+        // Mirror the engine-side plumbing: handlers hold
+        // `Arc<dyn Policy>`, reload swaps the inner via a separate
+        // handle. Verify the handlers' captured `Arc` sees the new
+        // inner after a swap.
+        let reloadable = Arc::new(ReloadablePolicy::new(Box::new(AllowAll)));
+        let as_policy: PolicyRef = reloadable.clone();
+        let p = PathBuf::from("/x");
+        assert!(matches!(as_policy.check_fs_read(&p), Decision::Allow));
+
+        reloadable.swap(Box::new(DenyAll));
+        assert!(matches!(as_policy.check_fs_read(&p), Decision::Deny(_)));
+    }
+}

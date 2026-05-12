@@ -211,6 +211,16 @@ struct Args {
     /// `--signing-key-file PATH` — overrides the TOML's pinned key.
     /// Lets operators rotate keys without editing the manifest.
     signing_key_file: Option<PathBuf>,
+    /// `--reload-file PATH` / `AGENTD_RELOAD_FILE` — cross-platform
+    /// reload trigger. Background thread polls the file's mtime
+    /// every 250 ms; on any change, flips the same
+    /// `RELOAD_REQUESTED` flag `SIGHUP` does. Acts as the Windows
+    /// SIGHUP replacement (no console-signal equivalent there) and
+    /// an additional reload channel on Unix (e.g. a k8s downward-
+    /// API projection whose content changes when a ConfigMap
+    /// rotates). The file's content is ignored — any mtime bump
+    /// triggers a reload.
+    reload_file: Option<PathBuf>,
     intel_http: Option<String>,
     intel_http_bearer_file: Option<PathBuf>,
     mcp_stdio: Option<Vec<String>>,
@@ -250,6 +260,7 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
         signing_required: env_bool("AGENTD_SIGNING_REQUIRED"),
         signing_key_file: env_opt_path("AGENTD_SIGNING_KEY_FILE"),
+        reload_file: env_opt_path("AGENTD_RELOAD_FILE"),
         intel_http: std::env::var("AGENTD_INTEL_HTTP")
             .ok()
             .filter(|s| !s.trim().is_empty()),
@@ -314,6 +325,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
             "--signing-required" => a.signing_required = true,
             "--signing-key-file" => {
                 a.signing_key_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--reload-file" => {
+                a.reload_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
             }
             "--intel-unix" => {
                 a.intel_unix = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
@@ -505,7 +519,12 @@ fn resolve_signature_source(
 // ---------------------------------------------------------------------------
 
 fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
-    let (policy, mcp_allowlist) = build_policy(doc);
+    let (reloadable_policy, mcp_allowlist) = build_policy(doc);
+    // `Arc<ReloadablePolicy>` coerces to `Arc<dyn Policy>` at the
+    // handler-registration boundary. Keep the typed handle around so
+    // SIGHUP can reach back through `engine.reload.policy` to swap
+    // the inner manifest without touching the registry.
+    let policy_for_tools: crate::tools::policy::PolicyRef = reloadable_policy.clone();
 
     let budget = Arc::new(crate::budget::BudgetTracker::new(
         doc.budget
@@ -514,66 +533,79 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     ));
 
     let mut registry = HandlerRegistry::with_builtin_controls();
-    crate::tools::register_default_tools(&mut registry, policy, budget);
+    crate::tools::register_default_tools(&mut registry, policy_for_tools, budget);
 
     // Intelligence adapter (Unix or HTTP). Wrap whichever client
     // the operator selected in a `ReloadableIntelClient` so a
     // future reload path can swap its inner (e.g. rotate the bearer
     // token from a Vault side-car).
-    if let Some(path) = &args.intel_unix {
-        #[cfg(unix)]
-        {
-            let initial: Box<dyn crate::intelligence::client::IntelligenceClient> =
-                Box::new(crate::intelligence::client::UnixClient::new(
-                    path.clone(),
-                    Duration::from_secs(args.timeout_secs.max(1)),
+    let intel_reload: Option<Arc<crate::intelligence::client::ReloadableIntelClient>> =
+        if let Some(path) = &args.intel_unix {
+            #[cfg(unix)]
+            {
+                let initial: Box<dyn crate::intelligence::client::IntelligenceClient> =
+                    Box::new(crate::intelligence::client::UnixClient::new(
+                        path.clone(),
+                        Duration::from_secs(args.timeout_secs.max(1)),
+                    ));
+                let reloadable = Arc::new(crate::intelligence::client::ReloadableIntelClient::new(
+                    initial,
                 ));
-            let reloadable = Arc::new(crate::intelligence::client::ReloadableIntelClient::new(
-                initial,
-            ));
-            crate::intelligence::handler::register(&mut registry, reloadable.clone());
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            eprintln!(
-                "agentd: --intel-unix is Unix-only; use --intel-http on Windows \
-                 (rebuild with --features intel-http if needed)"
-            );
-            return Err(ExitCode::from(EXIT_USAGE));
-        }
-    } else {
-        #[cfg(feature = "intel-http")]
-        if let Some(url) = &args.intel_http {
-            let bearer = read_intel_http_bearer(args)?;
-            match crate::intelligence::client::HttpClient::with_bearer(
-                url,
-                Duration::from_secs(args.timeout_secs.max(1)),
-                bearer,
-            ) {
-                Ok(client) => {
-                    let initial: Box<dyn crate::intelligence::client::IntelligenceClient> =
-                        Box::new(client);
-                    let reloadable = Arc::new(
-                        crate::intelligence::client::ReloadableIntelClient::new(initial),
-                    );
-                    crate::intelligence::handler::register(&mut registry, reloadable.clone());
+                crate::intelligence::handler::register(&mut registry, reloadable.clone());
+                Some(reloadable)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                eprintln!(
+                    "agentd: --intel-unix is Unix-only; use --intel-http on Windows \
+                     (rebuild with --features intel-http if needed)"
+                );
+                return Err(ExitCode::from(EXIT_USAGE));
+            }
+        } else {
+            #[cfg(feature = "intel-http")]
+            let h = match &args.intel_http {
+                Some(url) => {
+                    let bearer = read_intel_http_bearer(args)?;
+                    match crate::intelligence::client::HttpClient::with_bearer(
+                        url,
+                        Duration::from_secs(args.timeout_secs.max(1)),
+                        bearer,
+                    ) {
+                        Ok(client) => {
+                            let initial: Box<dyn crate::intelligence::client::IntelligenceClient> =
+                                Box::new(client);
+                            let reloadable = Arc::new(
+                                crate::intelligence::client::ReloadableIntelClient::new(initial),
+                            );
+                            crate::intelligence::handler::register(
+                                &mut registry,
+                                reloadable.clone(),
+                            );
+                            Some(reloadable)
+                        }
+                        Err(e) => {
+                            eprintln!("agentd: bad --intel-http URL: {e}");
+                            return Err(ExitCode::from(EXIT_USAGE));
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("agentd: bad --intel-http URL: {e}");
+                None => None,
+            };
+            #[cfg(not(feature = "intel-http"))]
+            let h: Option<Arc<crate::intelligence::client::ReloadableIntelClient>> = {
+                if args.intel_http.is_some() {
+                    eprintln!(
+                        "agentd: --intel-http requires the `intel-http` Cargo feature; \
+                     rebuild with --features intel-http"
+                    );
                     return Err(ExitCode::from(EXIT_USAGE));
                 }
-            }
-        }
-        #[cfg(not(feature = "intel-http"))]
-        if args.intel_http.is_some() {
-            eprintln!(
-                "agentd: --intel-http requires the `intel-http` Cargo feature; \
-                 rebuild with --features intel-http"
-            );
-            return Err(ExitCode::from(EXIT_USAGE));
-        }
-    }
+                None
+            };
+            h
+        };
 
     // MCP server registry. Composes every `[[mcp_servers]]` entry
     // plus (when set) the legacy `--mcp-stdio CMD ARG` as an
@@ -584,7 +616,13 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     }
 
     registry.set_fallback(Box::new(StubHandler));
-    Ok(Engine::new(registry))
+    Ok(
+        Engine::new(registry).with_reload_handles(crate::engine::ReloadHandles {
+            policy: Some(reloadable_policy),
+            intel: intel_reload,
+            mcp: Some(mcp_registry),
+        }),
+    )
 }
 
 /// Resolve the intel bearer token from `--intel-http-bearer-file` or
@@ -692,26 +730,60 @@ fn spawn_mcp_handle(
     }
 }
 
-/// Extract the policy + MCP allowlist from the workflow's `[policy]`
-/// block. AllowAll / allow-everything when the block is absent —
-/// fail-closed enforcement is the manifest's job; absence of the
-/// block is an explicit operator choice.
+/// Build a [`ReloadablePolicy`] from the workflow's `[policy]` block
+/// and extract the MCP allowlist. The returned `Arc<ReloadablePolicy>`
+/// is both handed to the tool handlers (via `Arc<dyn Policy>`
+/// coercion) AND kept as the reload handle in `engine.reload.policy`.
 fn build_policy(
     doc: &WorkflowDoc,
 ) -> (
-    crate::tools::policy::PolicyRef,
+    Arc<crate::tools::policy::ReloadablePolicy>,
+    crate::mcp::allowlist::McpAllowlist,
+) {
+    let (inner, allowlist) = build_inner_policy(doc);
+    (
+        Arc::new(crate::tools::policy::ReloadablePolicy::new(inner)),
+        allowlist,
+    )
+}
+
+/// Construct the concrete `Box<dyn Policy>` that backs the reloadable
+/// wrapper. Called once at startup and again on every SIGHUP.
+fn build_inner_policy(
+    doc: &WorkflowDoc,
+) -> (
+    Box<dyn crate::tools::policy::Policy>,
     crate::mcp::allowlist::McpAllowlist,
 ) {
     match &doc.policy {
         Some(m) => (
-            Arc::new(crate::policy::ManifestPolicy::new(m.clone())),
+            Box::new(crate::policy::ManifestPolicy::new(m.clone()))
+                as Box<dyn crate::tools::policy::Policy>,
             m.mcp_allowlist(),
         ),
         None => (
-            crate::tools::policy::allow_all(),
+            Box::new(crate::tools::policy::AllowAll),
             crate::mcp::allowlist::McpAllowlist::allow_all(),
         ),
     }
+}
+
+/// Try to build a new `Box<dyn Policy>` from a fresh workflow doc,
+/// reporting failures as `Err(String)` instead of exiting. Used by
+/// the SIGHUP reload path so a bad policy block keeps the old
+/// policy live (fail-forward semantics) rather than killing the
+/// process mid-reload.
+#[cfg(feature = "trigger-http")]
+fn try_build_inner_policy(
+    doc: &WorkflowDoc,
+) -> std::result::Result<
+    (
+        Box<dyn crate::tools::policy::Policy>,
+        crate::mcp::allowlist::McpAllowlist,
+    ),
+    String,
+> {
+    Ok(build_inner_policy(doc))
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +941,294 @@ fn run_serve_mode(
     ExitCode::from(EXIT_SEMANTIC)
 }
 
+#[cfg(feature = "trigger-http")]
+fn run_reload(
+    config_path: &Option<PathBuf>,
+    handle: &crate::triggers::http::ServerHandle,
+    engine: &Arc<Engine>,
+    args: &Args,
+) {
+    let Some(path) = config_path else {
+        tracing::warn!(
+            target: "agentd::audit",
+            event = "reload.skipped",
+            reason = "embedded workflow has no source path to re-read",
+        );
+        return;
+    };
+
+    tracing::info!(target: "agentd::audit", event = "reload.started", path = %path.display());
+
+    let src = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                target: "agentd::audit",
+                event = "reload.failed",
+                stage = "read",
+                reason = %format!("{e}"),
+            );
+            return;
+        }
+    };
+    let doc = match WorkflowDoc::from_toml(&src) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(
+                target: "agentd::audit",
+                event = "reload.failed",
+                stage = "parse",
+                reason = %format!("{e}"),
+            );
+            return;
+        }
+    };
+    let report = workflow::validate(&doc);
+    if !report.ok() {
+        tracing::error!(
+            target: "agentd::audit",
+            event = "reload.failed",
+            stage = "validate",
+            issues = report.issues.len() as u64,
+        );
+        return;
+    }
+
+    // Reload TLS — pulls cert/key off disk fresh, rebuilds the
+    // rustls::ServerConfig, swaps atomically.
+    let tls_cfg = doc.server.as_ref().and_then(|s| s.tls.as_ref());
+    if let Err(e) = handle.reload_tls(tls_cfg) {
+        tracing::error!(
+            target: "agentd::audit",
+            event = "reload.failed",
+            stage = "tls",
+            reason = %format!("{e}"),
+        );
+        return;
+    }
+
+    // Reload prepared auth — re-parses every JWKS in [auth.oidc.*]
+    // alongside bearer/HMAC bindings.
+    #[cfg(feature = "auth")]
+    {
+        let empty = crate::auth::AuthConfig::default();
+        let cfg = doc.auth.as_ref().unwrap_or(&empty);
+        if let Err(e) = handle.reload_auth(cfg) {
+            tracing::error!(
+                target: "agentd::audit",
+                event = "reload.failed",
+                stage = "auth",
+                reason = %format!("{e}"),
+            );
+            return;
+        }
+    }
+
+    // Reload policy — rebuild `ManifestPolicy` (re-compiles Rego,
+    // re-reads inline data) and swap the inner of the process-wide
+    // `ReloadablePolicy`. Tool handlers (fs/env/http/shell) keep the
+    // same `Arc<dyn Policy>` they captured at startup — this just
+    // updates what that Arc dereferences to. Rego thread-local
+    // engines self-invalidate via the new `RegoSpec.id` fingerprint
+    // on first use after the swap.
+    //
+    // Fail-forward: a bad policy (Rego syntax error, missing data
+    // file, feature-gated block on a feature-off build) keeps the
+    // old policy live rather than leaving the process unprotected.
+    if let Some(policy_handle) = &engine.reload.policy {
+        match try_build_inner_policy(&doc) {
+            Ok((new_inner, _new_mcp_allowlist)) => {
+                policy_handle.swap(new_inner);
+                tracing::info!(
+                    target: "agentd::audit",
+                    event = "reload.policy",
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "agentd::audit",
+                    event = "reload.failed",
+                    stage = "policy",
+                    reason = %e,
+                );
+                return;
+            }
+        }
+    }
+
+    // Reload MCP servers — for every registered server, rotate its
+    // allowlist from the new config AND respawn the stdio child.
+    // Fail-forward per server: a spawn failure for one server
+    // keeps that server's old child running and logs the
+    // `reload.mcp_respawn_failed` event; the rest of the reload
+    // continues.
+    if let Some(mcp_registry) = &engine.reload.mcp {
+        let global_mcp_allowlist = doc
+            .policy
+            .as_ref()
+            .map(|m| m.mcp_allowlist())
+            .unwrap_or_else(crate::mcp::allowlist::McpAllowlist::allow_all);
+        for handle in mcp_registry.iter() {
+            // Look up the new server def (if any) so we can rotate
+            // the allowlist + respawn with the new command.
+            let def = doc.mcp_servers.iter().find(|d| d.name == handle.name);
+            let (cmd, allowlist) = match def {
+                Some(d) => (
+                    d.command.as_slice(),
+                    crate::mcp::allowlist::McpAllowlist {
+                        allowed_tools: d.allow_tools.clone(),
+                        allowed_resource_patterns: d.allow_resources.clone(),
+                    },
+                ),
+                None if handle.name == "default" => {
+                    // Legacy `--mcp-stdio` default server — command
+                    // comes from CLI, allowlist comes from `[policy.mcp]`.
+                    match args.mcp_stdio.as_deref() {
+                        Some(c) => (c, global_mcp_allowlist.clone()),
+                        None => {
+                            // Server was registered at startup but the
+                            // CLI arg vanished — can't respawn. Skip.
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        target: "agentd::audit",
+                        event = "reload.mcp_dropped_from_config",
+                        server = %handle.name,
+                    );
+                    continue;
+                }
+            };
+
+            handle.allowlist.swap(allowlist);
+            tracing::info!(
+                target: "agentd::audit",
+                event = "reload.mcp_allowlist",
+                server = %handle.name,
+            );
+
+            let (head, tail) = cmd
+                .split_first()
+                .expect("config validator enforces non-empty command");
+            match crate::mcp::client::StdioMcpClient::spawn(head.clone(), tail) {
+                Ok(new_client) => {
+                    let boxed: Box<dyn crate::mcp::client::McpClient> = Box::new(new_client);
+                    handle.client.swap(boxed);
+                    tracing::info!(
+                        target: "agentd::audit",
+                        event = "reload.mcp_respawn",
+                        server = %handle.name,
+                        command = %head,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agentd::audit",
+                        event = "reload.mcp_respawn_failed",
+                        server = %handle.name,
+                        command = %head,
+                        reason = %format!("{e}"),
+                    );
+                }
+            }
+        }
+    }
+
+    // Reload intelligence client — rebuild from the current CLI
+    // args (same endpoint; bearer-file and env are re-read so
+    // rotation picks up). Endpoint changes still need a restart,
+    // noted in operations.md.
+    if let Some(intel_handle) = &engine.reload.intel {
+        match rebuild_intel_client(args) {
+            Ok(Some(new_inner)) => {
+                intel_handle.swap(new_inner);
+                tracing::info!(
+                    target: "agentd::audit",
+                    event = "reload.intel",
+                );
+            }
+            Ok(None) => {
+                // Operator changed CLI args between runs? Shouldn't
+                // happen — args are captured at process start and
+                // the reload sees the same set. No-op.
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "agentd::audit",
+                    event = "reload.failed",
+                    stage = "intel",
+                    reason = %e,
+                );
+                return;
+            }
+        }
+    }
+
+    // Reload routes + rate-limit buckets — rebuild the whole slice
+    // from the new `[[http_routes]]` list and swap atomically.
+    // Rate-limit counters reset to full capacity on the swap, by
+    // design (see `HttpReloadable::build` doc-comment).
+    if let Err(e) = handle.reload_http_state(&doc.http_routes) {
+        tracing::error!(
+            target: "agentd::audit",
+            event = "reload.failed",
+            stage = "routes",
+            reason = %format!("{e}"),
+        );
+        return;
+    }
+
+    tracing::info!(target: "agentd::audit", event = "reload.succeeded");
+}
+
+/// Rebuild the intelligence client's inner implementation from the
+/// current CLI args. Called from `run_reload` to refresh bearer
+/// tokens / re-dial the endpoint. Returns `Ok(None)` only when the
+/// CLI args no longer describe an intel client — rare, since args
+/// don't actually change during a run; mostly a safety-net shape.
+#[cfg(feature = "trigger-http")]
+fn rebuild_intel_client(
+    args: &Args,
+) -> std::result::Result<Option<Box<dyn crate::intelligence::client::IntelligenceClient>>, String> {
+    #[cfg(unix)]
+    if let Some(path) = &args.intel_unix {
+        return Ok(Some(Box::new(
+            crate::intelligence::client::UnixClient::new(
+                path.clone(),
+                Duration::from_secs(args.timeout_secs.max(1)),
+            ),
+        )));
+    }
+    #[cfg(not(unix))]
+    if args.intel_unix.is_some() {
+        return Err("--intel-unix is Unix-only".into());
+    }
+    #[cfg(feature = "intel-http")]
+    if let Some(url) = &args.intel_http {
+        let bearer = match &args.intel_http_bearer_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("read intel bearer {}: {e}", path.display()))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => std::env::var("AGENTD_INTEL_HTTP_BEARER")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        };
+        let client = crate::intelligence::client::HttpClient::with_bearer(
+            url,
+            Duration::from_secs(args.timeout_secs.max(1)),
+            bearer,
+        )
+        .map_err(|e| format!("--intel-http URL: {e}"))?;
+        return Ok(Some(Box::new(client)));
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
@@ -911,6 +1271,7 @@ usage:
          [--quiet]                  AGENTD_QUIET=1
          [--signing-required]       AGENTD_SIGNING_REQUIRED=1  fail-closed on unsigned
          [--signing-key-file PATH]  AGENTD_SIGNING_KEY_FILE    override pinned pubkey
+         [--reload-file PATH]       AGENTD_RELOAD_FILE         touch-to-reload (Windows SIGHUP replacement)
          [--version] [--help]
 
 Design: rfcs/0001-bounded-workflow-runtime.md\

@@ -41,6 +41,42 @@ fn next_execution_id() -> String {
 pub struct Engine {
     pub registry: HandlerRegistry,
     pub metrics: Arc<Metrics>,
+    /// Hot-reload handles for SIGHUP-replaceable engine components
+    ///. Each handler already holds an `Arc` clone of the
+    /// corresponding reloadable wrapper; updating the inner state
+    /// through these handles takes effect on the next check without
+    /// rebuilding the registry.
+    pub reload: ReloadHandles,
+}
+
+/// Handles for components the runtime can hot-swap on SIGHUP. Each
+/// field is optional because a given workflow may not use that
+/// component at all (no intelligence adapter, no MCP child, no
+/// policy block ...).
+#[derive(Default)]
+pub struct ReloadHandles {
+    /// The `ReloadablePolicy` wrapper the tool handlers reach
+    /// through when checking fs/env/http/shell side effects.
+    /// `None` only when no tool feature is compiled in — policy
+    /// handlers exist even when the underlying workflow declares
+    /// no `[policy]` block (fallback is `AllowAll` wrapped in the
+    /// reloadable).
+    pub policy: Option<Arc<crate::tools::policy::ReloadablePolicy>>,
+    /// The `ReloadableIntelClient` wrapper the intelligence node
+    /// handler reaches through. `Some` iff `--intel-unix` or
+    /// `--intel-http` was passed at startup (there's no way to
+    /// turn intelligence on *during* a reload — the registration
+    /// requires a handler registry change, which is out of scope
+    /// for the reload pass).
+    pub intel: Option<Arc<crate::intelligence::client::ReloadableIntelClient>>,
+    /// Process-wide MCP server registry. Each handle inside owns
+    /// its own `ReloadableMcpClient` + `ReloadableMcpAllowlist` so
+    /// SIGHUP can respawn individual servers / rotate per-server
+    /// allowlists without rebuilding the registry. `None` iff no
+    /// `[[mcp_servers]]` entries + no `--mcp-stdio` CLI arg. Adding
+    /// or removing whole servers across reloads is out of scope
+    /// for the hot-reload pass.
+    pub mcp: Option<Arc<crate::mcp::McpRegistry>>,
 }
 
 impl Engine {
@@ -48,14 +84,27 @@ impl Engine {
         Self {
             registry,
             metrics: Metrics::new(),
+            reload: ReloadHandles::default(),
         }
     }
 
     /// Construct an engine that shares metrics with other engines —
-    /// useful for serve mode where a single `Metrics` aggregates
+    /// useful for `agent serve` where a single `Metrics` aggregates
     /// counters across every request.
     pub fn with_metrics(registry: HandlerRegistry, metrics: Arc<Metrics>) -> Self {
-        Self { registry, metrics }
+        Self {
+            registry,
+            metrics,
+            reload: ReloadHandles::default(),
+        }
+    }
+
+    /// Attach hot-reload handles after construction. Returned by
+    /// value to chain with `.new()` / `.with_metrics()` at the call
+    /// site (`build_engine` in `runtime.rs`).
+    pub fn with_reload_handles(mut self, reload: ReloadHandles) -> Self {
+        self.reload = reload;
+        self
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {

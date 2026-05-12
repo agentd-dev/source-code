@@ -22,4 +22,4 @@ pub use handler::{
     SwitchHandler, TerminateHandler,
 };
 pub use outcome::{ExecutionOutcome, ExecutionTrace, NodeOutcome, TraceEntry};
-pub use runner::Engine;
+pub use runner::{Engine, ReloadHandles};

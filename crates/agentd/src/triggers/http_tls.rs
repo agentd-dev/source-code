@@ -157,8 +157,15 @@ pub fn accept_tls(
     }
 
     let identity = stream.conn.peer_certificates().and_then(|certs| {
-        certs.first().map(|c| PeerIdentity {
-            fingerprint: sha256_hex(c.as_ref()),
+        certs.first().map(|c| {
+            let der = c.as_ref();
+            let fingerprint = sha256_hex(der);
+            let (cn, sans) = parse_subject(der);
+            PeerIdentity {
+                fingerprint,
+                cn,
+                sans,
+            }
         })
     });
 
@@ -166,6 +173,31 @@ pub fn accept_tls(
 }
 
 pub use crate::triggers::http::PeerIdentity;
+
+/// Parse CN + DNS SANs from a DER-encoded x509 certificate.
+/// Errors in the parser surface as `(None, vec![])` — the
+/// fingerprint stays the authoritative identity; CN/SAN are
+/// advisory surfaces for workflow-level routing.
+fn parse_subject(der: &[u8]) -> (Option<String>, Vec<String>) {
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+    let Ok((_, cert)) = X509Certificate::from_der(der) else {
+        return (None, vec![]);
+    };
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok().map(|s| s.to_string()));
+    let mut sans = Vec::new();
+    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
+        for name in &san_ext.value.general_names {
+            if let GeneralName::DNSName(dns) = name {
+                sans.push(dns.to_ascii_lowercase());
+            }
+        }
+    }
+    (cn, sans)
+}
 
 /// SHA-256 of a DER-encoded cert, formatted as `sha256:<64-hex>`.
 /// Stable identifier operators can pre-compute for pinning.
@@ -200,6 +232,40 @@ mod tests {
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
         (cert_path, key_path)
+    }
+
+    #[test]
+    fn parse_subject_extracts_cn_and_sans() {
+        // Generate a cert with CN + multiple DNS SANs via rcgen
+        // (dev-dep only). Then feed the DER bytes through our
+        // parser to verify round-trip extraction.
+        let mut params = rcgen::CertificateParams::new(vec![
+            "svc-a.internal".into(),
+            "SVC-A.PROD.INTERNAL".into(),
+            "svc-a.local".into(),
+        ])
+        .unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "svc-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().to_vec();
+
+        let (cn, sans) = parse_subject(&der);
+        assert_eq!(cn.as_deref(), Some("svc-a"));
+        // SANs should be lowercased.
+        assert!(sans.contains(&"svc-a.internal".to_string()));
+        assert!(sans.contains(&"svc-a.prod.internal".to_string()));
+        assert!(sans.contains(&"svc-a.local".to_string()));
+    }
+
+    #[test]
+    fn parse_subject_handles_garbage() {
+        let (cn, sans) = parse_subject(b"not a cert");
+        assert!(cn.is_none());
+        assert!(sans.is_empty());
     }
 
     #[test]

@@ -52,7 +52,7 @@ auth = ["dep:sha2", "dep:hmac"]
 # In-process TLS termination + optional mTLS client-cert
 # verification. Pulls rustls and rustls-pemfile; implies `auth` so
 # the mTLS verifier is always reachable.
-server-tls = ["auth", "dep:rustls", "dep:rustls-pemfile"]
+server-tls = ["auth", "dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]
 
 # Signed workflow verification (RFC 0002). Ed25519 detached
 # signatures verified before the DAG validator runs. Pure-Rust
@@ -88,6 +88,7 @@ sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "logging", "aws-lc-rs", "tls12"] }
 rustls-pemfile = { version = "2", optional = true }
+x509-parser = { version = "0.16", optional = true, default-features = false }
 ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "pkcs8", "pem"] }
 base64 = { version = "0.22", optional = true, default-features = false, features = ["std"] }
 jsonwebtoken = { version = "9", optional = true, default-features = false, features = ["use_pem"] }

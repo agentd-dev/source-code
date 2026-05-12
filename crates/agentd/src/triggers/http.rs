@@ -35,6 +35,12 @@ pub struct PeerIdentity {
     /// `sha256:<64-hex>` of the leaf cert's DER bytes. Stable
     /// identifier operators pin.
     pub fingerprint: String,
+    /// Common Name from the subject DN, if present. Many modern
+    /// PKIs leave CN empty and rely entirely on SANs — don't
+    /// default to CN for identity.
+    pub cn: Option<String>,
+    /// DNS SAN entries, lowercase, in order of appearance.
+    pub sans: Vec<String>,
 }
 
 /// Max body size accepted on an HTTP request. Declines larger
@@ -769,14 +775,30 @@ fn handle_one_request<S: std::io::Read + Write>(
 
     // When auth is compiled in, attach the principal to the trigger
     // payload so `trigger.principal.kind` / `trigger.principal.name`
-    // are reachable from condition / switch nodes.
+    // are reachable from condition / switch nodes. For mTLS also
+    // attach `cn` and `sans` when x509 parsing extracted them
+    // so workflows can branch on logical service names
+    // rather than opaque fingerprints.
     #[cfg(feature = "auth")]
     let input = {
         let mut input = input;
-        let principal_json = json!({
+        let mut principal_json = json!({
             "kind": principal.kind,
             "name": principal.name,
         });
+        if let Some(identity) = &request.peer_identity {
+            if let Value::Object(pobj) = &mut principal_json {
+                if let Some(cn) = &identity.cn {
+                    pobj.insert("cn".into(), Value::String(cn.clone()));
+                }
+                if !identity.sans.is_empty() {
+                    pobj.insert(
+                        "sans".into(),
+                        Value::Array(identity.sans.iter().cloned().map(Value::String).collect()),
+                    );
+                }
+            }
+        }
         if let Value::Object(obj) = &mut input {
             obj.insert("principal".to_string(), principal_json);
         } else if input.is_null() {

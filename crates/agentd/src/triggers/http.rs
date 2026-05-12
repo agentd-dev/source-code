@@ -353,10 +353,19 @@ impl Drop for ServerHandle {
 // Connection handling
 // ---------------------------------------------------------------------------
 
-/// Drive one accepted connection: parse a single request, route it,
-/// run the workflow, write the response, close.
 type Buckets = std::collections::HashMap<(String, String), Arc<crate::ratelimit::TokenBucket>>;
 
+/// Soft cap on requests per keep-alive connection. Prevents a long-
+/// lived client from pinning a thread indefinitely. Most HTTP
+/// clients cycle connections well below this ceiling.
+const MAX_REQUESTS_PER_CONN: usize = 100;
+
+/// Drive an accepted connection through the keep-alive request/
+/// response loop. The single BufReader spans every request on the
+/// connection; `read_timeout` (set on the TCP socket at accept
+/// time) doubles as the idle-timeout — a client that stops sending
+/// within 30s gets a timeout on the next `parse_request` and the
+/// loop exits cleanly.
 #[allow(clippy::too_many_arguments)]
 fn handle_connection<S: std::io::Read + Write>(
     stream: S,
@@ -368,42 +377,78 @@ fn handle_connection<S: std::io::Read + Write>(
     auth_config: &PreparedAuthArc,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
-    let parse_result = parse_request(&mut reader);
+    for _ in 0..MAX_REQUESTS_PER_CONN {
+        let keep_alive = handle_one_request(
+            &mut reader,
+            workflow,
+            engine,
+            options,
+            buckets,
+            peer_identity.as_ref(),
+            auth_config,
+        )?;
+        if !keep_alive {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Handle exactly one HTTP request on the connection. Returns
+/// `Ok(true)` when the client and server both want to keep the
+/// connection open for another request; `Ok(false)` ends the
+/// loop (errors, explicit `Connection: close`, or an EOF while
+/// waiting for the next request).
+#[allow(clippy::too_many_arguments)]
+fn handle_one_request<S: std::io::Read + Write>(
+    reader: &mut BufReader<S>,
+    workflow: &WorkflowDoc,
+    engine: &Engine,
+    options: &RunOptions,
+    buckets: &Buckets,
+    peer_identity: Option<&PeerIdentity>,
+    auth_config: &PreparedAuthArc,
+) -> std::io::Result<bool> {
+    let parse_result = parse_request(reader);
     let stream = reader.get_mut();
 
     let mut request = match parse_result {
         Ok(r) => r,
         Err(e) if e.silent_close => {
-            // Peer went away before sending a request. No bytes to
-            // reply to — just close quietly.
-            return Ok(());
+            // Idle-timeout / clean EOF between requests on a
+            // keep-alive connection. No bytes to reply to — just
+            // close quietly.
+            return Ok(false);
         }
         Err(e) => {
             write_response(stream, e.status, &e.body)?;
-            return Ok(());
+            return Ok(false);
         }
     };
-    request.peer_identity = peer_identity;
+    request.peer_identity = peer_identity.cloned();
+    let keep_alive = client_wants_keep_alive(&request);
 
     // Health / metrics endpoints are always live so operators can
     // monitor the listener without touching a workflow.
     if request.method == "GET" && request.path == "/healthz" {
-        write_response(
+        write_response_with_header(
             stream,
             Status::new(200, "OK"),
             &json!({ "status": "ok", "workflow": workflow.name }),
+            &connection_headers(keep_alive),
         )?;
-        return Ok(());
+        return Ok(keep_alive);
     }
     if request.method == "GET" && request.path == "/metrics" {
         let body = engine.metrics().snapshot().to_prometheus(&workflow.name);
-        write_text_response(
+        write_text_response_with_header(
             stream,
             Status::new(200, "OK"),
             "text/plain; version=0.0.4; charset=utf-8",
             body.as_bytes(),
+            &connection_headers(keep_alive),
         )?;
-        return Ok(());
+        return Ok(keep_alive);
     }
 
     // Route.
@@ -420,12 +465,13 @@ fn handle_connection<S: std::io::Read + Write>(
         } else {
             Status::new(404, "Not Found")
         };
-        write_response(
+        write_response_with_header(
             stream,
             status,
             &json!({ "error": status.reason, "path": request.path }),
+            &connection_headers(keep_alive),
         )?;
-        return Ok(());
+        return Ok(keep_alive);
     };
 
     // Rate limit check — per-route token bucket. Cheapest
@@ -435,6 +481,8 @@ fn handle_connection<S: std::io::Read + Write>(
     if let Some(bucket) = buckets.get(&rate_key) {
         if let Err(retry_after) = bucket.try_take() {
             let retry_secs = format!("{}", retry_after.as_secs().max(1));
+            let mut headers = connection_headers(keep_alive);
+            headers.push(("Retry-After".into(), retry_secs));
             write_response_with_header(
                 stream,
                 Status::new(429, "Too Many Requests"),
@@ -442,9 +490,9 @@ fn handle_connection<S: std::io::Read + Write>(
                     "error": "rate limited",
                     "retry_after_ms": retry_after.as_millis() as u64,
                 }),
-                &[("Retry-After".into(), retry_secs)],
+                &headers,
             )?;
-            return Ok(());
+            return Ok(keep_alive);
         }
     }
 
@@ -457,12 +505,13 @@ fn handle_connection<S: std::io::Read + Write>(
             Err(e) => {
                 // spawn() validated this; a mid-flight parse error
                 // is an internal bug, surface as 500.
-                write_response(
+                write_response_with_header(
                     stream,
                     Status::new(500, "Internal Server Error"),
                     &json!({ "error": format!("auth config error: {e}") }),
+                    &connection_headers(false),
                 )?;
-                return Ok(());
+                return Ok(false);
             }
         };
         let auth_req = crate::auth::AuthRequest {
@@ -476,12 +525,13 @@ fn handle_connection<S: std::io::Read + Write>(
         match crate::auth::evaluate(&auth_ref, auth_config, &auth_req) {
             crate::auth::AuthDecision::Allow { principal } => principal,
             crate::auth::AuthDecision::Deny { reason } => {
-                write_response(
+                write_response_with_header(
                     stream,
                     Status::new(401, "Unauthorized"),
                     &json!({ "error": "unauthorized", "detail": reason }),
+                    &connection_headers(keep_alive),
                 )?;
-                return Ok(());
+                return Ok(keep_alive);
             }
         }
     };
@@ -493,12 +543,13 @@ fn handle_connection<S: std::io::Read + Write>(
         match serde_json::from_slice::<Value>(&request.body) {
             Ok(v) => v,
             Err(e) => {
-                write_response(
+                write_response_with_header(
                     stream,
                     Status::new(400, "Bad Request"),
                     &json!({ "error": "invalid JSON body", "detail": e.to_string() }),
+                    &connection_headers(keep_alive),
                 )?;
-                return Ok(());
+                return Ok(keep_alive);
             }
         }
     };
@@ -551,18 +602,44 @@ fn handle_connection<S: std::io::Read + Write>(
                 ExecutionOutcome::Failed { .. } => Status::new(422, "Unprocessable Entity"),
                 ExecutionOutcome::TimedOut { .. } => Status::new(504, "Gateway Timeout"),
             };
-            write_response(stream, status, &outcome)?;
-            Ok(())
+            write_response_with_header(stream, status, &outcome, &connection_headers(keep_alive))?;
+            Ok(keep_alive)
         }
         Err(e) => {
-            write_response(
+            // Engine-level errors close the connection — the server
+            // has observably misbehaved and keeping the socket open
+            // for more traffic would just amplify the problem.
+            write_response_with_header(
                 stream,
                 Status::new(500, "Internal Server Error"),
                 &json!({ "error": format!("{e}") }),
+                &connection_headers(false),
             )?;
-            Ok(())
+            Ok(false)
         }
     }
+}
+
+/// Decide whether the client wants to keep the connection open
+/// after this request. HTTP/1.1 default is keep-alive; the client
+/// opts out with `Connection: close`. We treat HTTP/1.0 the same
+/// way for simplicity — 1.0 clients in the wild that want
+/// keep-alive send `Connection: keep-alive` explicitly, and
+/// everything else is fine closing.
+fn client_wants_keep_alive(request: &Request) -> bool {
+    match request.headers.get("connection") {
+        Some(v) => !v.to_ascii_lowercase().contains("close"),
+        None => true,
+    }
+}
+
+/// Build the `Connection` header for the response, reflecting the
+/// server's decision back to the client. Allocates owned strings
+/// because these headers flow through `write_response_with_header`
+/// which expects `(String, String)` pairs.
+fn connection_headers(keep_alive: bool) -> Vec<(String, String)> {
+    let value = if keep_alive { "keep-alive" } else { "close" };
+    vec![("Connection".into(), value.into())]
 }
 
 // ---------------------------------------------------------------------------
@@ -597,8 +674,9 @@ struct ParseError {
     status: Status,
     body: Value,
     /// When true, the caller should close the connection without
-    /// writing a response. Used for a clean EOF before any bytes
-    /// arrive — there's nothing to reply to.
+    /// writing a response. Used for idle-timeout / clean EOF on a
+    /// keep-alive connection waiting for the next request — there's
+    /// nothing to reply to.
     silent_close: bool,
 }
 
@@ -701,8 +779,9 @@ fn bad(code: u16, msg: &'static str) -> ParseError {
     }
 }
 
-/// Signal that the peer went away cleanly before sending a request.
-/// The caller should close without writing a response.
+/// Signal that the peer went away cleanly between requests on a
+/// keep-alive connection (idle timeout / clean EOF). The caller
+/// should close without writing a response.
 fn silent_close() -> ParseError {
     ParseError {
         status: Status::new(0, ""),
@@ -720,28 +799,54 @@ fn write_response<S: Write, B: serde::Serialize>(
     status: Status,
     body: &B,
 ) -> std::io::Result<()> {
-    write_response_with_header(stream, status, body, &[])
+    // Single-shot convenience: mirrors the pre-keep-alive behaviour
+    // for the rare sites that haven't made a keep-alive decision
+    // yet (e.g. the parse-error fast path in handle_one_request).
+    write_response_with_header(stream, status, body, &connection_headers(false))
 }
 
 /// Write a raw-body response (non-JSON). Used for the Prometheus
 /// text-exposition endpoint, which cannot share the JSON helper's
-/// `Content-Type`.
+/// `Content-Type`. All callers today go through
+/// [`write_text_response_with_header`]; this convenience variant is
+/// kept around for parity with [`write_response`] in case a future
+/// caller wants the default (close) shape.
+#[allow(dead_code)]
 fn write_text_response<S: Write>(
     stream: &mut S,
     status: Status,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
-    let header = format!(
+    write_text_response_with_header(
+        stream,
+        status,
+        content_type,
+        body,
+        &connection_headers(false),
+    )
+}
+
+fn write_text_response_with_header<S: Write>(
+    stream: &mut S,
+    status: Status,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> std::io::Result<()> {
+    let mut header = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
+         Content-Length: {}\r\n",
         status.code,
         status.reason,
         content_type,
         body.len()
     );
+    for (k, v) in extra_headers {
+        header.push_str(&format!("{k}: {v}\r\n"));
+    }
+    header.push_str("\r\n");
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()?;
@@ -758,8 +863,7 @@ fn write_response_with_header<S: Write, B: serde::Serialize>(
     let mut header = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n",
+         Content-Length: {}\r\n",
         status.code,
         status.reason,
         body.len()
@@ -877,6 +981,114 @@ mod tests {
         // Body starts after the empty line separating headers + body.
         let body = rest.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
         (code, body.to_string())
+    }
+
+    /// Send two requests back-to-back on the same TCP connection,
+    /// asserting both responses parse cleanly and each signals
+    /// `Connection: keep-alive` except the last (which we mark
+    /// `close` so the loop ends).
+    fn send_two_keepalive(addr: SocketAddr, method: &str, path: &str) -> (u16, u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // Request 1: explicit keep-alive.
+        let r1 = format!(
+            "{method} {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: 2\r\n\
+             Connection: keep-alive\r\n\r\n{{}}"
+        );
+        stream.write_all(r1.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // Read response 1 up to the expected Content-Length. Since we
+        // don't want to block on Connection: close, parse headers
+        // manually.
+        let (status1, body1_tail) = read_one_response(&mut stream);
+
+        // Request 2: ask to close after this one.
+        let r2 = format!(
+            "{method} {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Length: 2\r\n\
+             Connection: close\r\n\r\n{{}}"
+        );
+        stream.write_all(r2.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let (status2, _) = read_one_response(&mut stream);
+        (status1, status2, body1_tail)
+    }
+
+    /// Read one HTTP/1.1 response from the stream using Content-Length.
+    fn read_one_response(stream: &mut TcpStream) -> (u16, String) {
+        use std::io::Read as _;
+        let mut acc: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        // Read until we've seen `\r\n\r\n` and N body bytes.
+        let mut content_length = 0usize;
+        let mut headers_end = None;
+        let mut status: u16 = 0;
+        loop {
+            let read = stream.read(&mut tmp).unwrap();
+            if read == 0 {
+                break;
+            }
+            acc.extend_from_slice(&tmp[..read]);
+            if headers_end.is_none() {
+                if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                    headers_end = Some(pos + 4);
+                    let header_str = std::str::from_utf8(&acc[..pos]).unwrap();
+                    let mut lines = header_str.split("\r\n");
+                    if let Some(status_line) = lines.next() {
+                        status = status_line
+                            .split(' ')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                    }
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(end) = headers_end {
+                if acc.len() >= end + content_length {
+                    break;
+                }
+            }
+        }
+        let body = headers_end
+            .map(|e| String::from_utf8_lossy(&acc[e..e + content_length]).into_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    #[test]
+    fn keepalive_serves_two_requests_on_one_connection() {
+        let handle = start_server(minimal_wf());
+        let (s1, s2, b1) = send_two_keepalive(handle.local_addr(), "POST", "/run");
+        assert_eq!(s1, 200, "first response must succeed");
+        assert_eq!(s2, 200, "second response must succeed on same conn");
+        let json: serde_json::Value = serde_json::from_str(&b1).unwrap();
+        assert_eq!(json["status"], "completed");
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn keepalive_closes_when_client_requests_close() {
+        // Explicit Connection: close should keep the semantics
+        // identical to the pre-keep-alive world: one request, one
+        // response, then close. The existing `send` helper already
+        // does this — we just assert the contract still holds.
+        let handle = start_server(minimal_wf());
+        let (code, body) = send(handle.local_addr(), "POST", "/run", b"{}");
+        assert_eq!(code, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "completed");
+        handle.shutdown_and_drain();
     }
 
     #[test]

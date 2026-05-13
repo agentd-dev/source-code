@@ -132,9 +132,17 @@ jsonwebtoken = { version = "9", optional = true, default-features = false, featu
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows ctrl-C / ctrl-break handler for the shutdown path. On
+# Unix we use raw `sigaction` via `libc`; Windows goes through
+# the small `ctrlc` crate (no signal concept on Windows, so this
+# wraps `SetConsoleCtrlHandler`).
+#
 # `windows-sys` provides the Job Objects bindings that replace
 # `setrlimit` for memory + CPU-time budgets (see `src/budget.rs`).
+# ctrlc already pulls it transitively; we pin the minimum feature
+# set we need explicitly so the dep tree stays audit-friendly.
 [target.'cfg(windows)'.dependencies]
+ctrlc = { version = "3", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

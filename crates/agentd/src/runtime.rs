@@ -439,6 +439,9 @@ fn resolve_logging(
         format,
         target,
         enabled,
+        audit: from_wf.audit,
+        rotation: from_wf.rotation.unwrap_or_default(),
+        otel: from_wf.otel,
     }
 }
 
@@ -1421,6 +1424,9 @@ mod tests {
             format: Some(Format::Text),
             target: Some(LogTarget::File("/tmp/a.log".into())),
             enabled: Some(true),
+            audit: None,
+            rotation: None,
+            otel: None,
         });
         let overrides = TracingOverrides::default();
         let resolved = resolve_logging(&doc, &overrides);

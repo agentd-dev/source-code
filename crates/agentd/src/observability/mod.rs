@@ -18,10 +18,14 @@
 //!    a specific target (`agentd::audit`). A dedicated sink (JSONL
 //!    file with per-event redaction) is Phase-10 scope.
 
+pub mod audit;
 pub mod metrics;
+pub mod otel;
 pub mod traceparent;
 
+pub use audit::{AuditConfig, AuditLayer};
 pub use metrics::{Metrics, MetricsSnapshot};
+pub use otel::OtelConfig;
 pub use traceparent::{TraceParent, fresh_span_id, parse_traceparent};
 
 use std::fs::{File, OpenOptions};
@@ -136,6 +140,45 @@ pub struct LoggingConfig {
     pub target: Option<LogTarget>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Optional `[logging.audit]` sub-block. When set,
+    /// audit events (target `"agentd::audit"`) also emit to this
+    /// dedicated JSONL sink with field-level redaction applied.
+    /// Absent → audit events only flow through the main stream.
+    #[serde(default)]
+    pub audit: Option<audit::AuditConfig>,
+    /// Rotation policy for `file:` targets. Default
+    /// `never` keeps the current "single file, rely on external
+    /// logrotate" posture. `daily` / `hourly` / `minutely` use
+    /// `tracing-appender`'s rolling writer to open a new file at
+    /// each boundary (suffix `YYYY-MM-DD[-HH[-MM]]`).
+    #[serde(default)]
+    pub rotation: Option<LogRotation>,
+    /// Optional `[otel]` sub-block. When set AND the
+    /// `otel` Cargo feature is compiled in, every span is also
+    /// exported over OTLP gRPC to the configured collector.
+    /// Feature-off builds reject the block with a rebuild hint.
+    #[serde(default)]
+    pub otel: Option<otel::OtelConfig>,
+}
+
+/// How often the file writer should roll over to a new file. Only
+/// meaningful when `target = "file:PATH"`. Stdout / stderr targets
+/// ignore the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogRotation {
+    /// Single file, no rotation. External tooling (`logrotate`,
+    /// k8s volume mounts, container log drivers) handles
+    /// retention. This is the pre-rotation default behaviour.
+    #[default]
+    Never,
+    /// Roll at UTC midnight. Filename suffix `YYYY-MM-DD`.
+    Daily,
+    /// Roll on the hour. Filename suffix `YYYY-MM-DD-HH`.
+    Hourly,
+    /// Roll every minute — for integration tests that need to
+    /// observe the rotation path without waiting an hour.
+    Minutely,
 }
 
 /// The merged, fully-resolved config the runtime applies at startup.
@@ -145,6 +188,17 @@ pub struct ResolvedLogging {
     pub format: Format,
     pub target: LogTarget,
     pub enabled: bool,
+    /// Optional audit-sink config flowing through from the workflow
+    /// TOML's `[logging.audit]` block. CLI / env overrides don't
+    /// touch this — the sink is workflow-authored-only.
+    pub audit: Option<audit::AuditConfig>,
+    /// File-rotation policy. Only consulted when `target` is a
+    /// `File`. Default `Never`.
+    pub rotation: LogRotation,
+    /// Optional OTLP exporter. Installed as a
+    /// `tracing-opentelemetry` layer alongside the main fmt + audit
+    /// layers when the `otel` Cargo feature is compiled in.
+    pub otel: Option<otel::OtelConfig>,
 }
 
 impl Default for ResolvedLogging {
@@ -154,6 +208,9 @@ impl Default for ResolvedLogging {
             format: Format::Text,
             target: LogTarget::Stderr,
             enabled: true,
+            audit: None,
+            rotation: LogRotation::Never,
+            otel: None,
         }
     }
 }
@@ -171,17 +228,102 @@ pub fn init(level: &str, format: Format) -> Result<(), InitError> {
 }
 
 /// Apply a fully-resolved logging config. Returns `Ok(())` and does
-/// nothing when `enabled = false`.
+/// nothing when `enabled = false`. When [`ResolvedLogging::audit`]
+/// is present, an additional [`AuditLayer`] attaches alongside the
+/// main fmt layer — audit events flow to both streams, and the
+/// dedicated sink applies field-level redaction.
 pub fn apply(cfg: &ResolvedLogging) -> Result<(), InitError> {
     if !cfg.enabled {
         return Ok(());
     }
+    // Reject OTel config on a feature-off build up-front — the
+    // install_with_audit_otel path below is a no-op when the
+    // feature is off, so operators would silently lose exports.
+    #[cfg(not(feature = "otel"))]
+    if cfg.otel.is_some() {
+        return Err(InitError::Install(
+            "workflow declares [otel] but this build lacks the `otel` \
+             Cargo feature; rebuild with --features otel"
+                .into(),
+        ));
+    }
+
     match &cfg.target {
-        LogTarget::Stderr => install(&cfg.level, cfg.format, StderrWriter),
-        LogTarget::Stdout => install(&cfg.level, cfg.format, StdoutWriter),
+        LogTarget::Stderr => install_with_audit_otel(
+            &cfg.level,
+            cfg.format,
+            StderrWriter,
+            cfg.audit.as_ref(),
+            cfg.otel.as_ref(),
+        ),
+        LogTarget::Stdout => install_with_audit_otel(
+            &cfg.level,
+            cfg.format,
+            StdoutWriter,
+            cfg.audit.as_ref(),
+            cfg.otel.as_ref(),
+        ),
         LogTarget::File(path) => {
-            let writer = FileWriter::open(path)?;
-            install(&cfg.level, cfg.format, writer)
+            if cfg.rotation == LogRotation::Never {
+                // Hand-rolled FileWriter — the pre-rotation path.
+                // Operators who want external rotation via `logrotate`
+                // get the file-is-just-a-file behaviour.
+                let writer = FileWriter::open(path)?;
+                install_with_audit_otel(
+                    &cfg.level,
+                    cfg.format,
+                    writer,
+                    cfg.audit.as_ref(),
+                    cfg.otel.as_ref(),
+                )
+            } else {
+                // Time-based rotation via `tracing-appender`. The
+                // appender takes (dir, filename_prefix); we split
+                // the operator's path so `/var/log/agent.log` with
+                // daily rotation yields `/var/log/agent.log.2026-04-23`.
+                let writer = RotatingFileWriter::new(path, cfg.rotation)?;
+                install_with_audit_otel(
+                    &cfg.level,
+                    cfg.format,
+                    writer,
+                    cfg.audit.as_ref(),
+                    cfg.otel.as_ref(),
+                )
+            }
+        }
+    }
+}
+
+/// Build an optional [`AuditLayer`] from the config's sink target.
+/// Returns `Ok(None)` when no audit block is configured.
+fn build_audit_layer(
+    cfg: Option<&audit::AuditConfig>,
+) -> Result<Option<audit::AuditLayer>, InitError> {
+    let Some(audit_cfg) = cfg else {
+        return Ok(None);
+    };
+    match audit_cfg.effective_target() {
+        LogTarget::Stderr => Ok(Some(audit::AuditLayer::new(std::io::stderr(), audit_cfg))),
+        LogTarget::Stdout => Ok(Some(audit::AuditLayer::new(std::io::stdout(), audit_cfg))),
+        LogTarget::File(path) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        InitError::Install(format!(
+                            "mkdir_p {} for audit target: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| {
+                    InitError::Install(format!("open audit target {}: {e}", path.display()))
+                })?;
+            Ok(Some(audit::AuditLayer::new(file, audit_cfg)))
         }
     }
 }
@@ -192,28 +334,102 @@ pub fn install<W>(level: &str, format: Format, writer: W) -> Result<(), InitErro
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
-    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    install_with_audit(level, format, writer, None)
+}
 
+/// Install a global subscriber with the main fmt layer and an
+/// optional audit layer. The caller-supplied `audit` config creates
+/// a dedicated sink when present; `None` means audit events only
+/// flow through the main layer (same behaviour as before the audit sink existed).
+pub fn install_with_audit<W>(
+    level: &str,
+    format: Format,
+    writer: W,
+    audit: Option<&audit::AuditConfig>,
+) -> Result<(), InitError>
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    install_with_audit_otel(level, format, writer, audit, None)
+}
+
+/// Full subscriber install — main fmt + optional audit layer +
+/// optional OTLP exporter. Composes all three into one
+/// global `tracing` subscriber. The OTel layer is only built when
+/// the Cargo feature is on AND the config declares `[otel]`;
+/// feature-off builds with `[otel]` declared return an error from
+/// `apply` before reaching here.
+pub fn install_with_audit_otel<W>(
+    level: &str,
+    format: Format,
+    writer: W,
+    audit: Option<&audit::AuditConfig>,
+    otel_cfg: Option<&otel::OtelConfig>,
+) -> Result<(), InitError>
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let audit_layer = build_audit_layer(audit)?;
+
+    // Compose the subscriber branch-by-branch. The OTel layer is
+    // attached in an inner cfg-block so its generic `S` is the
+    // fully-accumulated subscriber type at that call site, which
+    // is what `tracing-opentelemetry`'s `Layer<S>` bound demands.
     match format {
         Format::Text => {
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_writer(writer)
                 .with_target(true)
                 .with_ansi(false);
-            let subscriber = Registry::default().with(filter).with(fmt_layer);
-            tracing::subscriber::set_global_default(subscriber)
-                .map_err(|e| InitError::Install(e.to_string()))
+            let subscriber = Registry::default()
+                .with(filter)
+                .with(fmt_layer)
+                .with(audit_layer);
+            install_with_optional_otel(subscriber, otel_cfg)
         }
         Format::Json => {
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .json()
                 .with_writer(writer)
                 .with_target(true);
-            let subscriber = Registry::default().with(filter).with(fmt_layer);
-            tracing::subscriber::set_global_default(subscriber)
-                .map_err(|e| InitError::Install(e.to_string()))
+            let subscriber = Registry::default()
+                .with(filter)
+                .with(fmt_layer)
+                .with(audit_layer);
+            install_with_optional_otel(subscriber, otel_cfg)
         }
     }
+}
+
+/// Attach the OTel layer when configured + feature is on, then
+/// install the subscriber globally. The `where S + …` bound is
+/// identical to what `set_global_default` requires, so the helper
+/// is just "accept any fully-composed subscriber."
+fn install_with_optional_otel<S>(
+    subscriber: S,
+    otel_cfg: Option<&otel::OtelConfig>,
+) -> Result<(), InitError>
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+    S: for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    #[cfg(feature = "otel")]
+    {
+        if let Some(cfg) = otel_cfg {
+            let otel_layer = otel::init_otel_layer::<S>(cfg)
+                .map_err(|e| InitError::Install(format!("otel init: {e}")))?;
+            let composed = subscriber.with(otel_layer);
+            return tracing::subscriber::set_global_default(composed)
+                .map_err(|e| InitError::Install(e.to_string()));
+        }
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = otel_cfg;
+    }
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| InitError::Install(e.to_string()))
 }
 
 /// Thin writer newtype so callers don't have to import
@@ -300,6 +516,106 @@ impl<'a> MakeWriter<'a> for FileWriter {
             inner: self.inner.clone(),
         }
     }
+}
+
+/// Time-based rotating file writer. Wraps
+/// `tracing_appender::rolling::RollingFileAppender` behind the
+/// `MakeWriter` shape so it composes with the same install path the
+/// stderr / stdout / non-rotating file cases use.
+///
+/// Filename layout: the operator's `file:PATH` is split into
+/// `(dir, filename)`. After rotation each boundary produces a new
+/// file named `<filename>.<suffix>` where the suffix is `YYYY-MM-DD`
+/// (daily), `YYYY-MM-DD-HH` (hourly), or `YYYY-MM-DD-HH-MM`
+/// (minutely). This matches what tracing-appender produces by
+/// default.
+pub struct RotatingFileWriter {
+    appender: std::sync::Arc<std::sync::Mutex<tracing_appender::rolling::RollingFileAppender>>,
+}
+
+impl std::fmt::Debug for RotatingFileWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotatingFileWriter").finish_non_exhaustive()
+    }
+}
+
+impl RotatingFileWriter {
+    pub fn new(path: &Path, rotation: LogRotation) -> Result<Self, InitError> {
+        let (dir, filename) = split_path(path).ok_or_else(|| {
+            InitError::Install(format!(
+                "logging rotation: target path {} must include a filename",
+                path.display()
+            ))
+        })?;
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                InitError::Install(format!(
+                    "mkdir_p {} for rotating log target: {e}",
+                    dir.display()
+                ))
+            })?;
+        }
+        use tracing_appender::rolling::Rotation;
+        let rot = match rotation {
+            LogRotation::Never => {
+                return Err(InitError::Install(
+                    "RotatingFileWriter was built with rotation=Never — caller should use FileWriter instead"
+                        .into(),
+                ));
+            }
+            LogRotation::Daily => Rotation::DAILY,
+            LogRotation::Hourly => Rotation::HOURLY,
+            LogRotation::Minutely => Rotation::MINUTELY,
+        };
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(rot)
+            .filename_prefix(filename.to_string_lossy().into_owned())
+            .build(&dir)
+            .map_err(|e| InitError::Install(format!("rolling appender build: {e}")))?;
+        Ok(Self {
+            appender: std::sync::Arc::new(std::sync::Mutex::new(appender)),
+        })
+    }
+}
+
+/// Per-event handle into the rolling appender. Takes the appender
+/// mutex for one `write` call, same lock pattern as `FileWriter`.
+pub struct RotatingFileWriterHandle {
+    inner: std::sync::Arc<std::sync::Mutex<tracing_appender::rolling::RollingFileAppender>>,
+}
+
+impl Write for RotatingFileWriterHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut appender = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("rolling-appender mutex poisoned"))?;
+        appender.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut appender = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("rolling-appender mutex poisoned"))?;
+        appender.flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for RotatingFileWriter {
+    type Writer = RotatingFileWriterHandle;
+    fn make_writer(&'a self) -> Self::Writer {
+        RotatingFileWriterHandle {
+            inner: self.appender.clone(),
+        }
+    }
+}
+
+/// Split a full path into `(dir, filename)`. Returns `None` when
+/// the path has no filename component (bare `/`, `..`).
+fn split_path(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let filename = path.file_name()?.to_owned();
+    let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+    Some((dir, PathBuf::from(filename)))
 }
 
 /// Capturing writer — for tests. All emitted bytes land in a shared
@@ -421,6 +737,9 @@ mod tests {
             format: Some(Format::Json),
             target: Some(LogTarget::File("/tmp/x.log".into())),
             enabled: Some(true),
+            audit: None,
+            rotation: None,
+            otel: None,
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: LoggingConfig = serde_json::from_str(&s).unwrap();
@@ -447,12 +766,60 @@ mod tests {
     }
 
     #[test]
+    fn rotating_writer_writes_and_rotates() {
+        use std::io::Write as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("app.log");
+        let w = RotatingFileWriter::new(&path, LogRotation::Minutely).unwrap();
+        {
+            let mut h = w.make_writer();
+            h.write_all(b"hello from rotation\n").unwrap();
+            h.flush().unwrap();
+        }
+        // Exactly one file should exist with our prefix.
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("app.log"))
+            .collect();
+        assert_eq!(files.len(), 1, "got files: {files:?}");
+        // Filename pattern: app.log.YYYY-MM-DD-HH-MM (minutely).
+        let name = &files[0];
+        assert!(
+            name.starts_with("app.log.") && name.len() == "app.log.YYYY-MM-DD-HH-MM".len(),
+            "unexpected filename: {name}"
+        );
+    }
+
+    #[test]
+    fn rotation_never_is_not_accepted_by_rotating_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.log");
+        let err = RotatingFileWriter::new(&path, LogRotation::Never).unwrap_err();
+        assert!(matches!(err, InitError::Install(_)));
+    }
+
+    #[test]
+    fn logrotation_parses_from_toml() {
+        let src = r#"
+            level = "info"
+            rotation = "daily"
+        "#;
+        let cfg: LoggingConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.rotation, Some(LogRotation::Daily));
+    }
+
+    #[test]
     fn apply_disabled_is_noop() {
         let cfg = ResolvedLogging {
             level: "trace".into(),
             format: Format::Json,
             target: LogTarget::Stderr,
             enabled: false,
+            audit: None,
+            rotation: LogRotation::Never,
+            otel: None,
         };
         // Should not error and should not install a subscriber.
         apply(&cfg).unwrap();

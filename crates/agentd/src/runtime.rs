@@ -748,7 +748,11 @@ fn build_policy(
 }
 
 /// Construct the concrete `Box<dyn Policy>` that backs the reloadable
-/// wrapper. Called once at startup and again on every SIGHUP.
+/// wrapper. Called once at startup and again on every SIGHUP, so the
+/// same error-handling contract applies both times: a Rego compile
+/// failure / feature gate / file read error exits the process on
+/// startup and surfaces as a reload-failed audit event on reload
+/// (the process stays alive on the old policy — see `run_reload`).
 fn build_inner_policy(
     doc: &WorkflowDoc,
 ) -> (
@@ -756,11 +760,19 @@ fn build_inner_policy(
     crate::mcp::allowlist::McpAllowlist,
 ) {
     match &doc.policy {
-        Some(m) => (
-            Box::new(crate::policy::ManifestPolicy::new(m.clone()))
-                as Box<dyn crate::tools::policy::Policy>,
-            m.mcp_allowlist(),
-        ),
+        Some(m) => {
+            let policy = match crate::policy::ManifestPolicy::new(m.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("agentd: policy load failed: {e}");
+                    std::process::exit(EXIT_SEMANTIC as i32);
+                }
+            };
+            (
+                Box::new(policy) as Box<dyn crate::tools::policy::Policy>,
+                m.mcp_allowlist(),
+            )
+        }
         None => (
             Box::new(crate::tools::policy::AllowAll),
             crate::mcp::allowlist::McpAllowlist::allow_all(),
@@ -783,7 +795,19 @@ fn try_build_inner_policy(
     ),
     String,
 > {
-    Ok(build_inner_policy(doc))
+    match &doc.policy {
+        Some(m) => {
+            let policy = crate::policy::ManifestPolicy::new(m.clone())?;
+            Ok((
+                Box::new(policy) as Box<dyn crate::tools::policy::Policy>,
+                m.mcp_allowlist(),
+            ))
+        }
+        None => Ok((
+            Box::new(crate::tools::policy::AllowAll),
+            crate::mcp::allowlist::McpAllowlist::allow_all(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

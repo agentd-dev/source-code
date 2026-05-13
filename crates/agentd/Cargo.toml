@@ -40,6 +40,13 @@ trigger-cron = ["dep:cron", "dep:chrono"]
 # the engine; debounce coalesces bursts.
 trigger-fs-watch = ["dep:notify"]
 
+# Policy-as-code (Rego) via regorus. Pure-Rust OPA evaluator.
+# Layered on top of the existing static allowlist — Rego is an
+# additional AND condition. Workflows that want Rego-only
+# evaluation leave static allowlists empty (defaults deny, so
+# Rego's `allow` decision becomes authoritative).
+policy-rego = ["dep:regorus"]
+
 # Intelligence transports.
 intel-unix = []
 intel-http = []
@@ -84,6 +91,9 @@ cron = { version = "0.12", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["std", "clock"] }
 # Cross-platform filesystem event source (inotify on Linux).
 notify = { version = "6", optional = true }
+# Pure-Rust OPA/Rego evaluator. ~500KB of source; no transitive
+# runtime deps that fight the dep-light posture.
+regorus = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "logging", "aws-lc-rs", "tls12"] }

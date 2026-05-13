@@ -75,6 +75,20 @@ signing = ["dep:ed25519-dalek", "dep:base64"]
 # reachable alongside bearer/HMAC/mTLS.
 auth-oidc = ["auth", "dep:jsonwebtoken", "dep:base64"]
 
+# Direct OTLP exporter for spans. Pulls tokio +
+# opentelemetry_sdk + opentelemetry-otlp + tracing-opentelemetry.
+# Substantial dep expansion (~50 crates) — accepted cost for
+# first-class OTLP export rather than the filelog-receiver
+# indirection (which still works and stays available via the
+# existing JSON log format + `[logging.audit]` sink).
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tokio",
+]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -82,6 +96,7 @@ thiserror = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi", "json"] }
+tracing-appender = { version = "0.2", default-features = false }
 # Atomic swap for hot-reload state (SIGHUP). Pure-Rust, no deps.
 # Readers see a consistent snapshot with no mutex contention;
 # writers replace the current value atomically.
@@ -93,6 +108,14 @@ chrono = { version = "0.4", optional = true, default-features = false, features 
 notify = { version = "6", optional = true }
 # Pure-Rust OPA/Rego evaluator. ~500KB of source; no transitive
 # runtime deps that fight the dep-light posture.
+# OpenTelemetry stack (feature `otel`). Pinned to the 0.27
+# generation — matches the ecosystem's stable contract for
+# tracing-opentelemetry 0.28.
+opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt-multi-thread", "macros"] }
 regorus = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }

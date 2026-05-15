@@ -531,6 +531,19 @@ mod tests {
     }
 
     #[test]
+    fn three_node_cycle_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("a"))],
+            nodes: vec![merge("a"), merge("b"), merge("c")],
+            edges: vec![edge("a", "b"), edge("b", "c"), edge("c", "a")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"cycle"));
+    }
+
+    #[test]
     fn unreachable_node_flagged() {
         let doc = WorkflowDoc {
             name: "x".into(),
@@ -550,33 +563,6 @@ mod tests {
             reasons.iter().any(|m| m.contains("island")),
             "got: {reasons:?}"
         );
-    }
-
-    #[test]
-    fn ambiguous_root_flagged_when_no_entry() {
-        // Two root nodes (in-degree zero) and no explicit `entry_node`:
-        // the validator must refuse to guess.
-        let doc = WorkflowDoc {
-            name: "x".into(),
-            start_nodes: vec![start("main", StartSource::Manual, None)],
-            nodes: vec![merge("a"), merge("b")],
-            ..Default::default()
-        };
-        let r = validate(&doc);
-        assert!(r.codes().contains(&"ambiguous_start_entry"));
-    }
-
-    #[test]
-    fn three_node_cycle_flagged() {
-        let doc = WorkflowDoc {
-            name: "x".into(),
-            start_nodes: vec![start("main", StartSource::Manual, Some("a"))],
-            nodes: vec![merge("a"), merge("b"), merge("c")],
-            edges: vec![edge("a", "b"), edge("b", "c"), edge("c", "a")],
-            ..Default::default()
-        };
-        let r = validate(&doc);
-        assert!(r.codes().contains(&"cycle"));
     }
 
     #[test]
@@ -621,6 +607,49 @@ mod tests {
         };
         let r = validate(&doc);
         assert!(r.codes().contains(&"unknown_start_entry_node"));
+    }
+
+    #[test]
+    fn ambiguous_root_flagged_when_no_entry() {
+        // Two root nodes (in-degree zero) and no explicit `entry_node`:
+        // the validator must refuse to guess.
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, None)],
+            nodes: vec![merge("a"), merge("b")],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"ambiguous_start_entry"));
+    }
+
+    #[test]
+    fn duplicate_http_route_flagged() {
+        let doc = WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Http, None)],
+            http_routes: vec![
+                HttpRoute {
+                    method: "POST".into(),
+                    path: "/x".into(),
+                    start_node: "main".into(),
+                    input_schema: None,
+                    auth: None,
+                    rate_limit: None,
+                },
+                HttpRoute {
+                    method: "post".into(), // case-insensitive match
+                    path: "/x".into(),
+                    start_node: "main".into(),
+                    input_schema: None,
+                    auth: None,
+                    rate_limit: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let r = validate(&doc);
+        assert!(r.codes().contains(&"dup_http_route"));
     }
 
     #[test]
@@ -706,34 +735,5 @@ mod tests {
 
         let r = validate(&doc);
         assert!(r.ok(), "issues: {:?}", r.issues);
-    }
-
-    #[test]
-    fn duplicate_http_route_flagged() {
-        let doc = WorkflowDoc {
-            name: "x".into(),
-            start_nodes: vec![start("main", StartSource::Http, None)],
-            http_routes: vec![
-                HttpRoute {
-                    method: "POST".into(),
-                    path: "/x".into(),
-                    start_node: "main".into(),
-                    input_schema: None,
-                    auth: None,
-                    rate_limit: None,
-                },
-                HttpRoute {
-                    method: "post".into(), // case-insensitive match
-                    path: "/x".into(),
-                    start_node: "main".into(),
-                    input_schema: None,
-                    auth: None,
-                    rate_limit: None,
-                },
-            ],
-            ..Default::default()
-        };
-        let r = validate(&doc);
-        assert!(r.codes().contains(&"dup_http_route"));
     }
 }

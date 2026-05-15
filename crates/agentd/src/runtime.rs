@@ -6,12 +6,13 @@
 //! and environment variables, with the former winning.
 //!
 //! ```text
-//! agentd [--config FILE]
+//! agentd [--config FILE]         (default: embedded, if built in)
 //!        [--input FILE]           (one-shot mode; trigger payload)
 //!        [--start NAME]           (default: only manual start node)
-//!        [--mode once|serve]
 //!        [--bind HOST:PORT]       (server mode override)
 //!        [--timeout-secs N]
+//!        [--intel-unix PATH]
+//!        [--mcp-stdio "CMD ARGS"]
 //!        [--dry-run]
 //!        [--validate-only]
 //!        [--log-level LEVEL] [--log-format text|json] [--quiet]
@@ -159,43 +160,11 @@ pub fn run(argv: Vec<String>) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// Mode resolution
-// ---------------------------------------------------------------------------
-
-enum Mode {
-    Serve,
-    Once,
-}
-
-fn resolve_mode(doc: &WorkflowDoc, override_: Option<&str>) -> Mode {
-    match override_ {
-        Some("serve") => Mode::Serve,
-        Some("once") => Mode::Once,
-        _ if !doc.http_routes.is_empty() => Mode::Serve,
-        _ if has_long_lived_trigger(doc) => Mode::Serve,
-        _ => Mode::Once,
-    }
-}
-
-/// True when the workflow declares any trigger type that requires
-/// a long-running process — cron, interval, or fs_watch. Without
-/// these the binary runs once and exits; with them it needs to
-/// stay alive to fire the scheduled work.
-fn has_long_lived_trigger(doc: &WorkflowDoc) -> bool {
-    use crate::workflow::model::Trigger;
-    doc.triggers.iter().any(|t| {
-        matches!(
-            t,
-            Trigger::Cron { .. } | Trigger::Interval { .. } | Trigger::FsWatch { .. }
-        )
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Arg parsing
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
+#[allow(dead_code)] // every field is read via a flag parser path
 struct Args {
     config: Option<PathBuf>,
     input_file: Option<PathBuf>,
@@ -204,6 +173,12 @@ struct Args {
     bind: Option<String>,
     timeout_secs: u64,
     intel_unix: Option<PathBuf>,
+    intel_http: Option<String>,
+    intel_http_bearer_file: Option<PathBuf>,
+    mcp_stdio: Option<Vec<String>>,
+    dry_run: bool,
+    validate_only: bool,
+    drain_timeout_secs: u64,
     /// `--signing-required` — hardens every deploy by refusing to
     /// start on an unsigned workflow, even if the TOML's
     /// `[signing].required` is false (or the block is absent).
@@ -221,12 +196,6 @@ struct Args {
     /// rotates). The file's content is ignored — any mtime bump
     /// triggers a reload.
     reload_file: Option<PathBuf>,
-    intel_http: Option<String>,
-    intel_http_bearer_file: Option<PathBuf>,
-    mcp_stdio: Option<Vec<String>>,
-    dry_run: bool,
-    validate_only: bool,
-    drain_timeout_secs: u64,
 }
 
 /// CLI / env overrides for logging. `None` means "defer to workflow
@@ -258,9 +227,6 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         mode: std::env::var("AGENTD_MODE").ok(),
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
-        signing_required: env_bool("AGENTD_SIGNING_REQUIRED"),
-        signing_key_file: env_opt_path("AGENTD_SIGNING_KEY_FILE"),
-        reload_file: env_opt_path("AGENTD_RELOAD_FILE"),
         intel_http: std::env::var("AGENTD_INTEL_HTTP")
             .ok()
             .filter(|s| !s.trim().is_empty()),
@@ -271,6 +237,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         }),
         dry_run: env_bool("AGENTD_DRY_RUN"),
         validate_only: env_bool("AGENTD_VALIDATE_ONLY"),
+        signing_required: env_bool("AGENTD_SIGNING_REQUIRED"),
+        signing_key_file: env_opt_path("AGENTD_SIGNING_KEY_FILE"),
+        reload_file: env_opt_path("AGENTD_RELOAD_FILE"),
     };
     let mut t = TracingOverrides {
         level: std::env::var("AGENTD_LOG")
@@ -322,13 +291,6 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                     ))
                 })?;
             }
-            "--signing-required" => a.signing_required = true,
-            "--signing-key-file" => {
-                a.signing_key_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
-            }
-            "--reload-file" => {
-                a.reload_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
-            }
             "--intel-unix" => {
                 a.intel_unix = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
             }
@@ -350,6 +312,13 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
             }
             "--dry-run" => a.dry_run = true,
             "--validate-only" => a.validate_only = true,
+            "--signing-required" => a.signing_required = true,
+            "--signing-key-file" => {
+                a.signing_key_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--reload-file" => {
+                a.reload_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
             "--log-level" => {
                 t.level = Some(require_value(argv, &mut i, arg)?.to_string());
             }
@@ -389,7 +358,8 @@ fn require_value<'a>(argv: &'a [String], idx: &mut usize, flag: &str) -> Result<
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
         .unwrap_or(default)
 }
 
@@ -403,10 +373,14 @@ fn env_opt_path(key: &str) -> Option<PathBuf> {
 fn env_bool(key: &str) -> bool {
     matches!(
         std::env::var(key).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("1" | "true" | "TRUE" | "True")
     )
 }
 
+/// Merge the three config sources into one [`ResolvedLogging`].
+///
+/// Precedence per field: **CLI override → env → workflow → default**.
+/// `--quiet` is special: if set, `enabled = false` unconditionally.
 fn resolve_logging(
     doc: &WorkflowDoc,
     overrides: &TracingOverrides,
@@ -518,6 +492,39 @@ fn resolve_signature_source(
 }
 
 // ---------------------------------------------------------------------------
+// Mode resolution
+// ---------------------------------------------------------------------------
+
+enum Mode {
+    Serve,
+    Once,
+}
+
+fn resolve_mode(doc: &WorkflowDoc, override_: Option<&str>) -> Mode {
+    match override_ {
+        Some("serve") => Mode::Serve,
+        Some("once") => Mode::Once,
+        _ if !doc.http_routes.is_empty() => Mode::Serve,
+        _ if has_long_lived_trigger(doc) => Mode::Serve,
+        _ => Mode::Once,
+    }
+}
+
+/// True when the workflow declares any trigger type that requires
+/// a long-running process — cron, interval, or fs_watch. Without
+/// these the binary runs once and exits; with them it needs to
+/// stay alive to fire the scheduled work.
+fn has_long_lived_trigger(doc: &WorkflowDoc) -> bool {
+    use crate::workflow::model::Trigger;
+    doc.triggers.iter().any(|t| {
+        matches!(
+            t,
+            Trigger::Cron { .. } | Trigger::Interval { .. } | Trigger::FsWatch { .. }
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Engine construction
 // ---------------------------------------------------------------------------
 
@@ -539,9 +546,9 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     crate::tools::register_default_tools(&mut registry, policy_for_tools, budget);
 
     // Intelligence adapter (Unix or HTTP). Wrap whichever client
-    // the operator selected in a `ReloadableIntelClient` so a
-    // future reload path can swap its inner (e.g. rotate the bearer
-    // token from a Vault side-car).
+    // the operator selected in a `ReloadableIntelClient` so the
+    // SIGHUP path can swap its inner (e.g. rotate the bearer token
+    // from a Vault side-car).
     let intel_reload: Option<Arc<crate::intelligence::client::ReloadableIntelClient>> =
         if let Some(path) = &args.intel_unix {
             #[cfg(unix)]
@@ -612,7 +619,11 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
 
     // MCP server registry. Composes every `[[mcp_servers]]` entry
     // plus (when set) the legacy `--mcp-stdio CMD ARG` as an
-    // implicit `{name = "default", ..}` server.
+    // implicit `{name = "default", ..}` server. Each entry's child
+    // process is wrapped in a `ReloadableMcpClient` and its
+    // allowlist in a `ReloadableMcpAllowlist` so the SIGHUP reload path can
+    // respawn or swap policy per-server without rebuilding the
+    // handler registry.
     let mcp_registry = build_mcp_registry(doc, args, &mcp_allowlist)?;
     if !mcp_registry.is_empty() {
         crate::mcp::handler::register(&mut registry, mcp_registry.clone());
@@ -626,28 +637,6 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
             mcp: Some(mcp_registry),
         }),
     )
-}
-
-/// Resolve the intel bearer token from `--intel-http-bearer-file` or
-/// the `AGENTD_INTEL_HTTP_BEARER` env var. Extracted so the reload
-/// path can share the exact same source-of-truth.
-#[cfg(feature = "intel-http")]
-fn read_intel_http_bearer(args: &Args) -> std::result::Result<Option<String>, ExitCode> {
-    match &args.intel_http_bearer_file {
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(s.trim().to_string())),
-            Err(e) => {
-                eprintln!(
-                    "agentd: failed to read intel bearer from {}: {e}",
-                    path.display()
-                );
-                Err(ExitCode::from(EXIT_USAGE))
-            }
-        },
-        None => Ok(std::env::var("AGENTD_INTEL_HTTP_BEARER")
-            .ok()
-            .filter(|s| !s.trim().is_empty())),
-    }
 }
 
 /// Build the process-wide MCP server registry. Sources:
@@ -733,6 +722,28 @@ fn spawn_mcp_handle(
     }
 }
 
+/// Resolve the intel bearer token from `--intel-http-bearer-file` or
+/// the `AGENTD_INTEL_HTTP_BEARER` env var. Extracted so the reload
+/// path can share the exact same source-of-truth.
+#[cfg(feature = "intel-http")]
+fn read_intel_http_bearer(args: &Args) -> std::result::Result<Option<String>, ExitCode> {
+    match &args.intel_http_bearer_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => Ok(Some(s.trim().to_string())),
+            Err(e) => {
+                eprintln!(
+                    "agentd: failed to read intel bearer from {}: {e}",
+                    path.display()
+                );
+                Err(ExitCode::from(EXIT_USAGE))
+            }
+        },
+        None => Ok(std::env::var("AGENTD_INTEL_HTTP_BEARER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())),
+    }
+}
+
 /// Build a [`ReloadablePolicy`] from the workflow's `[policy]` block
 /// and extract the MCP allowlist. The returned `Arc<ReloadablePolicy>`
 /// is both handed to the tool handlers (via `Arc<dyn Policy>`
@@ -814,7 +825,7 @@ fn try_build_inner_policy(
 }
 
 // ---------------------------------------------------------------------------
-// One-shot mode
+// Once mode — run a manual start node, emit outcome JSON, exit
 // ---------------------------------------------------------------------------
 
 fn run_once_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &Args) -> ExitCode {
@@ -880,60 +891,139 @@ fn pick_once_start(doc: &WorkflowDoc, override_: Option<&str>) -> Result<String,
 }
 
 // ---------------------------------------------------------------------------
-// Serve mode
+// Serve mode — bind HTTP, block on SIGTERM
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "trigger-http")]
 fn run_serve_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &Args) -> ExitCode {
     use std::net::SocketAddr;
 
-    if doc.http_routes.is_empty() {
-        eprintln!("agentd: serve mode requires at least one [[http_routes]] entry");
+    // Serve mode accepts any long-lived trigger: HTTP, cron,
+    // interval, fs_watch. Reject only when the workflow declared
+    // none of them.
+    if doc.http_routes.is_empty() && !has_long_lived_trigger(&doc) {
+        eprintln!(
+            "agentd: serve mode requires at least one [[http_routes]] \
+             entry or a long-lived trigger (cron / interval / fs_watch)"
+        );
         return ExitCode::from(EXIT_USAGE);
     }
 
-    let bind = args
-        .bind
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let addr: SocketAddr = match bind.parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("agentd: invalid bind address `{bind}`: {e}");
-            return ExitCode::from(EXIT_USAGE);
+    let doc_arc = Arc::new(doc.clone());
+    let engine_arc = Arc::new(engine);
+
+    // Spawn the HTTP server when routes are configured. Shutdown +
+    // hot reload still flow through its handle. Cron / fs_watch
+    // triggers run independently on their own threads.
+    let http_handle = if !doc.http_routes.is_empty() {
+        let bind = args
+            .bind
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        let addr: SocketAddr = match bind.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("agentd: invalid bind address `{bind}`: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+        let server = crate::triggers::http::HttpServer::new(
+            addr,
+            doc_arc.clone(),
+            engine_arc.clone(),
+            options.clone(),
+        )
+        .with_drain_timeout(Duration::from_secs(args.drain_timeout_secs.max(1)));
+        let handle = match server.spawn() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("agentd: {e}");
+                return ExitCode::from(EXIT_SEMANTIC);
+            }
+        };
+        eprintln!(
+            "agentd: workflow `{}` listening on http://{}/ ({} routes; drain_timeout={}s)",
+            doc.name,
+            handle.local_addr(),
+            doc.http_routes.len(),
+            args.drain_timeout_secs,
+        );
+        for r in &doc.http_routes {
+            eprintln!("       {} {} → {}", r.method, r.path, r.start_node);
         }
+        eprintln!("       GET /healthz is always live");
+        Some(handle)
+    } else {
+        None
     };
 
-    let doc_arc = Arc::new(doc.clone());
-    let server = crate::triggers::http::HttpServer::new(addr, doc_arc, Arc::new(engine), options)
-        .with_drain_timeout(Duration::from_secs(args.drain_timeout_secs.max(1)));
-    let handle = match server.spawn() {
-        Ok(h) => h,
+    // Spawn cron / interval / fs_watch trigger threads. All share
+    // the same shutdown flag as the main serve loop; they return
+    // their `JoinHandle`s so the shutdown path can park until each
+    // loop actually exits.
+    let trigger_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trigger_threads = match spawn_scheduled_triggers(
+        &doc,
+        doc_arc.clone(),
+        engine_arc.clone(),
+        options.clone(),
+        trigger_shutdown.clone(),
+    ) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("agentd: {e}");
             return ExitCode::from(EXIT_SEMANTIC);
         }
     };
-    eprintln!(
-        "agentd: workflow `{}` listening on http://{}/ ({} routes; drain_timeout={}s)",
-        doc.name,
-        handle.local_addr(),
-        doc.http_routes.len(),
-        args.drain_timeout_secs,
-    );
-    for r in &doc.http_routes {
-        eprintln!("       {} {} → {}", r.method, r.path, r.start_node);
-    }
 
-    // Install SIGTERM/SIGINT handlers and block until a shutdown
-    // signal flips the flag.
+    // Install SIGTERM/SIGINT/SIGHUP handlers and block until a
+    // shutdown signal flips the flag. `SIGHUP` triggers an
+    // in-place reload of TLS + auth (JWKS) state from the original
+    // `--config` file; embedded-config builds refuse the reload
+    // with an audit event since the baked-in TOML isn't rereadable.
     crate::signals::install_shutdown_handlers();
+
+    // Optional cross-platform file-based reload trigger. Primary
+    // SIGHUP replacement on Windows (no console-signal equivalent)
+    // and an additional reload channel on Unix. The watcher thread
+    // joins the same shutdown flag as the scheduled triggers.
+    let reload_watcher = args
+        .reload_file
+        .clone()
+        .map(|p| crate::signals::spawn_reload_file_watcher(p, trigger_shutdown.clone()));
+
     while !crate::signals::shutdown_requested() {
+        if crate::signals::reload_requested() {
+            if let Some(h) = &http_handle {
+                run_reload(&args.config, h, &engine_arc, args);
+            }
+            crate::signals::clear_reload();
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     eprintln!("agentd: shutdown signal received; draining…");
 
-    let clean = handle.shutdown_and_drain();
+    // Signal trigger threads to stop. We don't bound-wait on them
+    // here; each checks the flag at its own poll cadence (<= 200ms)
+    // so join completes quickly under normal loads.
+    trigger_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    for t in trigger_threads {
+        let _ = t.join();
+    }
+    if let Some(w) = reload_watcher {
+        let _ = w.join();
+    }
+
+    let clean = match http_handle {
+        Some(h) => h.shutdown_and_drain(),
+        None => true,
+    };
+
+    // Flush any pending OTLP spans and shut down the exporter
+    // runtime. No-op when `otel` is disabled or `[otel]` wasn't
+    // declared. Runs AFTER the HTTP drain so any spans emitted
+    // during drain still get exported.
+    crate::observability::otel::shutdown_otel();
     eprintln!(
         "agentd: drain {}",
         if clean {
@@ -949,23 +1039,94 @@ fn run_serve_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &
     }
 }
 
-/// Serve-mode stub for builds without the HTTP trigger. The mode
-/// resolver can still pick Serve (workflow declares routes); the
-/// binary refuses with a rebuild hint instead of silently running
-/// once.
-#[cfg(not(feature = "trigger-http"))]
-fn run_serve_mode(
-    doc: WorkflowDoc,
-    _engine: Engine,
-    _options: RunOptions,
-    _args: &Args,
-) -> ExitCode {
-    eprintln!(
-        "agentd: workflow `{}` wants serve mode but this build lacks the \
-         `trigger-http` Cargo feature; rebuild with --features trigger-http",
-        doc.name
-    );
-    ExitCode::from(EXIT_SEMANTIC)
+/// Handle a `SIGHUP`-driven reload in serve mode. Re-reads the
+/// workflow from `--config`, re-validates it, and asks the server
+/// handle to swap TLS + prepared auth atomically. Failures keep
+/// the old state running and surface as audit events — SIGHUP is a
+/// "try this" not a "commit" operation.
+///
+/// Scope: TLS cert rotation + JWKS rotation. What is
+/// NOT reloaded today: route table, rate-limit buckets, workflow
+/// policy / tools, engine handler registry, intelligence / MCP
+/// clients. Workflow-structural changes still require a restart.
+/// See `docs/operations.md §5.4` for the full scope matrix.
+#[cfg(feature = "trigger-http")]
+/// Instantiate and spawn every cron / interval / fs_watch trigger
+/// declared in the workflow. Returns the thread handles so the
+/// serve loop can join them during shutdown. Feature-gated trigger
+/// variants fail here with a rebuild hint if the workflow declares
+/// a shape the binary wasn't compiled for.
+fn spawn_scheduled_triggers(
+    doc: &WorkflowDoc,
+    workflow: Arc<WorkflowDoc>,
+    engine: Arc<crate::engine::Engine>,
+    options: RunOptions,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> std::result::Result<Vec<std::thread::JoinHandle<()>>, String> {
+    use crate::workflow::model::Trigger;
+    // `mut` is used under `trigger-cron` / `trigger-fs-watch`; the
+    // feature-off build falls through every arm without pushing,
+    // so rustc would warn without the allow.
+    #[allow(unused_mut)]
+    let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    for trig in &doc.triggers {
+        match trig {
+            Trigger::Cron { .. } | Trigger::Interval { .. } => {
+                #[cfg(feature = "trigger-cron")]
+                {
+                    if let Some(prepped) = crate::triggers::cron::CronTrigger::from_trigger(trig)
+                        .map_err(|e| format!("{e}"))?
+                    {
+                        threads.push(prepped.spawn(
+                            workflow.clone(),
+                            engine.clone(),
+                            options.clone(),
+                            shutdown.clone(),
+                        ));
+                    }
+                }
+                #[cfg(not(feature = "trigger-cron"))]
+                {
+                    let _ = (&workflow, &engine, &options, &shutdown);
+                    return Err("workflow declares a cron/interval trigger but this build \
+                         lacks the `trigger-cron` Cargo feature; rebuild with \
+                         --features trigger-cron"
+                        .into());
+                }
+            }
+            Trigger::FsWatch { .. } => {
+                #[cfg(feature = "trigger-fs-watch")]
+                {
+                    if let Some(prepped) =
+                        crate::triggers::fs_watch::FsWatchTrigger::from_trigger(trig)
+                            .map_err(|e| format!("{e}"))?
+                    {
+                        threads.push(prepped.spawn(
+                            workflow.clone(),
+                            engine.clone(),
+                            options.clone(),
+                            shutdown.clone(),
+                        ));
+                    }
+                }
+                #[cfg(not(feature = "trigger-fs-watch"))]
+                {
+                    let _ = (&workflow, &engine, &options, &shutdown);
+                    return Err("workflow declares an fs_watch trigger but this build \
+                         lacks the `trigger-fs-watch` Cargo feature; rebuild with \
+                         --features trigger-fs-watch"
+                        .into());
+                }
+            }
+            // MCP-subscription triggers route through the MCP client;
+            // internal.event triggers are fired from inside workflow
+            // nodes, not scheduled externally. Neither needs a thread.
+            Trigger::McpResourceUpdated { .. }
+            | Trigger::McpResourceCreated { .. }
+            | Trigger::InternalEvent { .. } => {}
+        }
+    }
+    Ok(threads)
 }
 
 #[cfg(feature = "trigger-http")]
@@ -1256,6 +1417,21 @@ fn rebuild_intel_client(
     Ok(None)
 }
 
+#[cfg(not(feature = "trigger-http"))]
+fn run_serve_mode(
+    _doc: WorkflowDoc,
+    _engine: Engine,
+    _options: RunOptions,
+    _args: &Args,
+) -> ExitCode {
+    eprintln!(
+        "agentd: this build was compiled without the `trigger-http` feature; \
+         rebuild with `--features trigger-http` to serve HTTP, or mark the \
+         workflow as `--mode once`."
+    );
+    ExitCode::from(EXIT_USAGE)
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
@@ -1280,28 +1456,29 @@ agentd {version} — bounded workflow runtime
 
 usage:
   agentd [--config FILE]            AGENTD_CONFIG          (required unless embedded)
-         [--input FILE]             AGENTD_INPUT           one-shot trigger payload
-         [--start NAME]             AGENTD_START           explicit start node
-         [--mode once|serve]        AGENTD_MODE            override auto-inferred mode
-         [--bind HOST:PORT]         AGENTD_HTTP_BIND       server-mode bind (default 127.0.0.1:8080)
-         [--timeout-secs N]         AGENTD_TIMEOUT_SECS    per-run deadline (default 120)
-         [--drain-timeout-secs N]   AGENTD_DRAIN_TIMEOUT_SECS  graceful shutdown grace (default 30)
-         [--intel-unix PATH]        AGENTD_INTEL_UNIX
-         [--intel-http URL]         AGENTD_INTEL_HTTP              http://host:port/path
-         [--intel-http-bearer-file P] AGENTD_INTEL_HTTP_BEARER_FILE  or AGENTD_INTEL_HTTP_BEARER
-         [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
-         [--dry-run]                AGENTD_DRY_RUN=1
-         [--validate-only]          AGENTD_VALIDATE_ONLY=1
-         [--log-level LEVEL]        AGENTD_LOG             (default warn)
-         [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)
-         [--log-target TARGET]      AGENTD_LOG_TARGET      stderr | stdout | file:PATH
-         [--quiet]                  AGENTD_QUIET=1
-         [--signing-required]       AGENTD_SIGNING_REQUIRED=1  fail-closed on unsigned
-         [--signing-key-file PATH]  AGENTD_SIGNING_KEY_FILE    override pinned pubkey
-         [--reload-file PATH]       AGENTD_RELOAD_FILE         touch-to-reload (Windows SIGHUP replacement)
-         [--version] [--help]
+        [--input FILE]             AGENTD_INPUT           one-shot trigger payload
+        [--start NAME]             AGENTD_START           explicit start node
+        [--mode once|serve]        AGENTD_MODE            override auto-inferred mode
+        [--bind HOST:PORT]         AGENTD_HTTP_BIND       server-mode bind (default 127.0.0.1:8080)
+        [--timeout-secs N]         AGENTD_TIMEOUT_SECS    per-run deadline (default 120)
+        [--drain-timeout-secs N]   AGENTD_DRAIN_TIMEOUT_SECS  graceful shutdown grace (default 30)
+        [--intel-unix PATH]        AGENTD_INTEL_UNIX
+        [--intel-http URL]         AGENTD_INTEL_HTTP              http://host:port/path
+        [--intel-http-bearer-file P] AGENTD_INTEL_HTTP_BEARER_FILE  or AGENTD_INTEL_HTTP_BEARER
+        [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
+        [--dry-run]                AGENTD_DRY_RUN=1
+        [--validate-only]          AGENTD_VALIDATE_ONLY=1
+        [--log-level LEVEL]        AGENTD_LOG             (default warn)
+        [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)
+        [--log-target TARGET]      AGENTD_LOG_TARGET      stderr | stdout | file:PATH
+        [--quiet]                  AGENTD_QUIET=1
+        [--signing-required]       AGENTD_SIGNING_REQUIRED=1  fail-closed on unsigned
+        [--signing-key-file PATH]  AGENTD_SIGNING_KEY_FILE    override pinned pubkey
+        [--reload-file PATH]       AGENTD_RELOAD_FILE         touch-to-reload (Windows SIGHUP replacement)
+        [--version] [--help]
 
-Design: rfcs/0001-bounded-workflow-runtime.md\
+Design: rfcs/0001-bounded-workflow-runtime.md
+Docs:   docs/README.md\
 ",
         version = env!("CARGO_PKG_VERSION")
     );

@@ -74,15 +74,6 @@ pub struct WorkflowDoc {
     #[serde(default)]
     pub logging: Option<crate::observability::LoggingConfig>,
 
-    /// Optional `[[mcp_servers]]` entries. Each spawns an MCP stdio
-    /// child; `call_mcp_tool` / `read_mcp_resource` nodes route to
-    /// them by name. Empty or absent leaves the process with no MCP
-    /// plane — workflows that use MCP nodes will fail validation.
-    /// Entries here compose with `--mcp-stdio` (the CLI path is kept
-    /// for back-compat as the default-named server).
-    #[serde(default, rename = "mcp_servers")]
-    pub mcp_servers: Vec<crate::mcp::config::McpServerDef>,
-
     /// Optional `[server]` block. TLS + mTLS termination. The full
     /// rustls wiring is behind the `server-tls` Cargo feature;
     /// absence of the feature turns a present `[server.tls]` block
@@ -102,6 +93,15 @@ pub struct WorkflowDoc {
     /// because agent is a micro-agent (1 workflow / process).
     #[serde(default)]
     pub budget: Option<crate::budget::BudgetConfig>,
+
+    /// Optional `[[mcp_servers]]` entries. Each spawns an MCP stdio
+    /// child; `call_mcp_tool` / `read_mcp_resource` nodes route to
+    /// them by name. Empty or absent leaves the process with no MCP
+    /// plane — workflows that use MCP nodes will fail validation.
+    /// Entries here compose with `--mcp-stdio` (the CLI path is kept
+    /// for back-compat as the default-named server).
+    #[serde(default, rename = "mcp_servers")]
+    pub mcp_servers: Vec<crate::mcp::config::McpServerDef>,
 }
 
 impl WorkflowDoc {
@@ -681,14 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn node_lookup_helpers() {
-        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
-        assert!(doc.node("analyze").is_some());
-        assert!(doc.node("no-such-id").is_none());
-        assert!(doc.start_node("manual_review").is_some());
-    }
-
-    #[test]
     fn multiple_workflows_rejected_in_bare_parse() {
         // Two workflows under [[workflows]] — from_toml expects one.
         let toml = r#"
@@ -710,6 +702,14 @@ mod tests {
             totally_unexpected = 42
         "#;
         assert!(WorkflowDoc::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn node_lookup_helpers() {
+        let doc = WorkflowDoc::from_toml(RFC_EXAMPLE).unwrap();
+        assert!(doc.node("analyze").is_some());
+        assert!(doc.node("no-such-id").is_none());
+        assert!(doc.start_node("manual_review").is_some());
     }
 
     #[test]

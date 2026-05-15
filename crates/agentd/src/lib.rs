@@ -7,6 +7,23 @@
 //!
 //! Full design: [`rfcs/0001-bounded-workflow-runtime.md`] at the
 //! workspace root.
+//!
+//! # Module map
+//!
+//! | Module            | Role                                                   |
+//! |-------------------|--------------------------------------------------------|
+//! | [`embedded`]      | Optional build-time-baked workflow                     |
+//! | [`engine`]        | Execution engine + context + traversal                 |
+//! | [`error`]         | Runtime error type shared across subsystems            |
+//! | [`intelligence`]  | `IntelligenceClient` + Unix / mock transports          |
+//! | [`mcp`]           | `McpClient` + stdio transport + allowlist              |
+//! | [`observability`] | Tracing init + metrics counters                        |
+//! | [`policy`]        | `ManifestPolicy` and glob matchers                     |
+//! | [`runtime`]       | Single-entry-point driver used by `main.rs`            |
+//! | [`testing`]       | Fixture-driven test harness                            |
+//! | [`tools`]         | Foundational tool families (feature-gated)             |
+//! | [`triggers`]      | HTTP trigger server (feature-gated)                    |
+//! | [`workflow`]      | Workflow doc model + TOML parse + DAG validator        |
 
 #[cfg(feature = "auth")]
 pub mod auth;

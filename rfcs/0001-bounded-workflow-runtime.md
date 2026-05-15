@@ -1,11 +1,94 @@
 # RFC 0001: `agentd`
 ## A bounded, workflow-driven micro-agent runtime with compile-time constrained capabilities
 
-**Status:** Accepted — implementation in progress.
+**Status:** Implemented through R5 + R3b — see §0 below.
 **Authors:** Andrii Tsok
 **Intended audience:** Runtime engineers, platform engineers, security reviewers, SDK/infra implementers
 **Implementation language:** Rust
 **Tracked implementation:** `crates/agentd/`.
+
+---
+
+## 0. Implementation Status
+
+This RFC is now a design record, not a planning document. The runtime
+described below shipped over Phases 0–11 plus hardening rounds R1–R5
+and R3b. This section maps the original RFC to the state of
+`crates/agentd/` at HEAD so future readers can tell which parts
+are history and which are current.
+
+**What stayed the same**
+
+- The mental model (bounded workflow, DAG, no runtime authority
+  expansion, compile-time capability pruning).
+- The node taxonomy (17 `NodeKind` variants — see §8).
+- The execution model (topological dispatch, typed per-node output,
+  retry, condition / switch / merge / fail / terminate control flow).
+- The security posture (fail-closed allowlist policy, per-build
+  feature gating, no shell by default).
+- The build modes (generic runtime, workflow-bundled binary via
+  `AGENTD_EMBED_CONFIG` env var).
+
+**What changed in delivery**
+
+- **Single entry point (R1).** The RFC originally anticipated
+  subcommands (`agentd run`, `agentd serve`, `agentd validate`). The
+  shipping binary has **none** — a single driver in `src/runtime.rs`
+  parses flags, infers mode from `[[http_routes]]`, and dispatches.
+  Override with `--mode once|serve`. `agentd --help` is the
+  authoritative flag list.
+- **Standalone-only (R1).** `agentd` talks plain Linux, speaks
+  plain HTTP/1.1, and does not require an outer daemon or
+  supervisor beyond systemd.
+- **HTTP + shell + data tools (R2).** `http_request`, `shell_run`
+  (allowlisted), `parse_json`, `template_render`, `json_select`
+  shipped as first-class tools with their own feature flags.
+- **HTTP trigger hardening (R3 / R3b).** Bearer + HMAC-SHA256 webhook
+  auth (`auth` feature), in-process TLS + mTLS (`server-tls`
+  feature), per-route token-bucket rate limits, input-schema
+  validation, startup validation of auth refs / rate-limit numbers /
+  TLS cert paths. See §13 of this RFC for the original design; the
+  implementation additionally injects `trigger.principal = { kind,
+  name }` into the execution context (mTLS principal is the SHA-256
+  fingerprint of the peer leaf cert — x509 CN/SAN extraction is a
+  known gap, see [maturity.md](../docs/maturity.md)).
+- **Graceful shutdown (R4).** SIGTERM / SIGINT install via
+  `libc::sigaction` flip a process-global `AtomicBool`; the accept
+  loop drains in-flight requests under a bounded
+  `--drain-timeout-secs` (default 30). Exit `0` on clean drain, `5`
+  on timeout. Per-node `retry: { max_attempts, backoff_ms, on }`
+  also landed in R4.
+- **Config-driven logging (R5).** Workflows declare `[logging]`;
+  CLI / env overrides merge over it (CLI > env > workflow >
+  default). Log target parse grammar: `stderr | stdout | file:PATH`.
+  Audit events flow through `tracing` target `agentd::audit` — a
+  dedicated redaction-capable sink is a known gap (maturity.md).
+- **Cleanup.** Early plan-act stubs are gone. Every module in the
+  current tree is live code.
+
+**What the RFC called for and was deferred**
+
+See [maturity.md](../docs/maturity.md) for the named-gap
+list: dedicated audit sink, Prometheus `/metrics` endpoint, TLS hot
+reload, fleet-wide rate limiting, HTTP keep-alive, x509 CN/SAN
+extraction, workflow hot reload, log rotation for `file:` target,
+distributed tracing, retry jitter. Each is deliberately deferred with
+an effort estimate; none block the current "pre-production with
+caveats" bar.
+
+**Where the authoritative description lives now**
+
+- Mental model + module layout + invariants: `docs/architecture.md`.
+- Every node + auth + policy + rate-limit + retry + trigger: `docs/capabilities.md`.
+- Every TOML field + CLI flag + env var + Cargo feature: `docs/configuration.md`.
+- Deploy shapes, runbook, exit codes: `docs/operations.md`.
+- Production-readiness snapshot + named gaps: `docs/maturity.md`.
+
+The body of this RFC (§1–§23) remains intact as the design narrative.
+Where it describes interfaces, read it alongside the docs above — the
+docs track code as it stands; the RFC tracks intent.
+
+---
 
 ---
 

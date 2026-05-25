@@ -174,4 +174,49 @@ libc = "0.2"
 [build-dependencies]
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 
+# ---------------------------------------------------------------------------
+# Distribution metadata — consumed by `cargo deb` and
+# `cargo generate-rpm`. Both are dev-only; they're invoked from CI
+# on tagged releases and attach the resulting .deb / .rpm to the
+# GitHub Release page. See packaging/README.md.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "agentd"
+maintainer = "Andrii Tsok <andrii@tsok.org>"
+copyright = "2026, Andrii Tsok"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Bounded workflow-driven runtime with compile-time constrained \
+capabilities. Executes a predeclared DAG of typed nodes authored in \
+TOML; never invents new tools or workflow paths at run time. \
+Docs: https://github.com/agentd-dev/source-code/tree/main/docs"""
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/agentd", "usr/bin/", "755"],
+    ["../../packaging/systemd/agentd.service", "lib/systemd/system/", "644"],
+    ["../../packaging/systemd/agentd.env", "etc/default/agent", "644"],
+    ["../../packaging/README.md", "usr/share/doc/agentd/", "644"],
+    ["../../docs/README.md", "usr/share/doc/agentd/docs/", "644"],
+]
+# Create /etc/agentd/ (empty; operator drops workflow.toml here).
+maintainer-scripts = "../../packaging/debian/"
+systemd-units = { enable = false, start = false }
 
+[package.metadata.generate-rpm]
+# `name` defaults to the crate name. Paths are resolved relative to
+# the cwd when `cargo generate-rpm` is invoked, not the Cargo.toml —
+# the CI job runs it from the workspace root, so paths are
+# workspace-relative.
+summary = "Bounded workflow-driven runtime"
+license = "MIT"
+url = "https://github.com/agentd-dev/source-code"
+assets = [
+    { source = "target/release/agentd", dest = "/usr/bin/agentd", mode = "0755" },
+    { source = "packaging/systemd/agentd.service", dest = "/usr/lib/systemd/system/agentd.service", mode = "0644", config = false, doc = false },
+    { source = "packaging/systemd/agentd.env", dest = "/etc/default/agentd", mode = "0644", config = true, doc = false },
+    { source = "packaging/README.md", dest = "/usr/share/doc/agentd/README.md", mode = "0644", doc = true },
+]
+# /etc/agentd/ — operator drops workflow.toml here post-install. RPM
+# scriptlet ensures the directory exists before file placement.
+post_install_script = "install -d -m 0755 /etc/agentd"

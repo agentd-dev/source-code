@@ -10,7 +10,11 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,3 +24,25 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # The capability-pruning story, proven in CI: every feature
+  # combination an operator is likely to ship must build and test
+  # clean on its own.
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features tools-fs,tools-data,trigger-http,auth,server-tls"
+          - "--features tools-http,tools-shell"
+          - "--features trigger-cron,trigger-fs-watch"
+          - "--features signing,auth-oidc,policy-rego"
+          - "--features intel-unix,intel-http"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p agentd ${{ matrix.features }}

@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p agentd --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          bin=agentd
+          [[ "${{ matrix.target }}" == *windows* ]] && bin=agentd.exe
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/$bin" dist/
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "agentd-${{ github.ref_name }}-${{ matrix.target }}.zip" "$bin"
+          else
+            tar czf "agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" "$bin"
+          fi
+          rm "$bin"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  linux-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-deb cargo-generate-rpm
+      - run: cargo build --release -p agentd
+      - run: cargo deb -p agentd --no-build
+      - run: cargo generate-rpm -p crates/agentd
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm

@@ -1,0 +1,21 @@
+# Keep the build context narrow — only what Cargo + build.rs need.
+**/target/
+**/node_modules/
+**/.nx/
+**/.git/
+**/.DS_Store
+
+# Tests and fixtures are included only during CI test runs, not
+# during image builds. Adding them here slows the build and
+# doesn't affect the release binary.
+apps/agent/harness/tests/
+
+# Docs + RFCs never belong in the image.
+docs/
+rfcs/
+*.md
+!apps/agent/harness/README.md
+
+# Editor / local state.
+.vscode/
+.idea/

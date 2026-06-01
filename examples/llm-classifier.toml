@@ -1,0 +1,99 @@
+# Bounded LLM step: classify an inbound document and route on the
+# model's structured answer. The LLM cannot pick tools or edges —
+# it fills exactly one node; the switch routes on what it returned.
+#
+#   agentd --config examples/llm-classifier.toml \
+#          --intel-unix /run/intel.sock \
+#          --input doc.json
+
+name = "doc_classifier"
+
+[policy.fs]
+write = ["/tmp/agentd-classified/**"]
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "classify"
+
+[[nodes]]
+id = "classify"
+type = "llm_infer"
+backend = "default"
+prompt = """
+Classify this document as exactly one of: invoice, contract, spam.
+Respond as JSON: {"label": "...", "confidence": 0.0}
+Document: {{body}}
+"""
+input_from = "trigger"
+output_schema = "schemas/classification.json"
+
+[[nodes]]
+id = "route"
+type = "switch"
+expr = "classify.parsed.label"
+
+[[nodes]]
+id = "invoice_path"
+type = "template_render"
+template = "/tmp/agentd-classified/invoice.json"
+
+[[nodes]]
+id = "file_invoice"
+type = "write_file"
+path_from = "invoice_path.rendered"
+content_from = "classify.content"
+
+[[nodes]]
+id = "contract_path"
+type = "template_render"
+template = "/tmp/agentd-classified/contract.json"
+
+[[nodes]]
+id = "file_contract"
+type = "write_file"
+path_from = "contract_path.rendered"
+content_from = "classify.content"
+
+[[nodes]]
+id = "drop"
+type = "terminate"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "classify"
+to = "route"
+
+[[edges]]
+from = "route"
+when = "invoice"
+to = "invoice_path"
+
+[[edges]]
+from = "route"
+when = "contract"
+to = "contract_path"
+
+[[edges]]
+from = "route"
+when = "spam"
+to = "drop"
+
+[[edges]]
+from = "invoice_path"
+to = "file_invoice"
+
+[[edges]]
+from = "contract_path"
+to = "file_contract"
+
+[[edges]]
+from = "file_invoice"
+to = "done"
+
+[[edges]]
+from = "file_contract"
+to = "done"

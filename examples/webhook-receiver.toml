@@ -1,0 +1,66 @@
+# HMAC-verified webhook receiver: GitHub-style signature on the raw
+# body, payload fields extracted, a summary written to disk.
+#
+#   GITHUB_WEBHOOK_SECRET=s3cret agentd --config examples/webhook-receiver.toml
+#
+# Then:
+#   body='{"action":"opened","number":7}'
+#   sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac s3cret | cut -d' ' -f2)
+#   curl -s -X POST localhost:8080/hooks/github \
+#        -H "X-Hub-Signature-256: sha256=$sig" -d "$body"
+
+name = "webhook_receiver"
+
+[auth.hmac.github]
+secret_env = "GITHUB_WEBHOOK_SECRET"
+header = "X-Hub-Signature-256"
+prefix = "sha256="
+
+[policy.fs]
+write = ["/tmp/agentd-hooks/**"]
+
+[[start_nodes]]
+name = "on_hook"
+source = "http"
+entry_node = "render"
+
+[[http_routes]]
+method = "POST"
+path = "/hooks/github"
+start_node = "on_hook"
+auth = "hmac:github"
+rate_limit = { capacity = 20, per_second = 5.0 }
+
+[[nodes]]
+id = "render"
+type = "template_render"
+template = "event={{action}} number={{number}} from={{principal.kind}}"
+input_from = "trigger"
+
+[[nodes]]
+id = "path"
+type = "template_render"
+template = "/tmp/agentd-hooks/event-{{number}}.txt"
+input_from = "trigger"
+
+[[nodes]]
+id = "save"
+type = "write_file"
+path_from = "path.rendered"
+content_from = "render.rendered"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "render"
+to = "path"
+
+[[edges]]
+from = "path"
+to = "save"
+
+[[edges]]
+from = "save"
+to = "done"

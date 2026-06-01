@@ -62,7 +62,7 @@ agentd --config my.toml --bind 127.0.0.1:8080
 agentd --config my.toml --start main --dry-run
 
 # Use a baked-in config (build with AGENTD_EMBED_CONFIG set) — no
-# --config needed at runtime; `agent` just works.
+# --config needed at runtime; `agentd` just works.
 agentd --start main
 ```
 

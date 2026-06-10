@@ -27,7 +27,6 @@
 //! step). Every turn emits `agentd::audit` events.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -138,7 +137,7 @@ impl NodeHandler for AgentLoopHandler {
             (None, None) => unreachable!("validator enforces instructions presence"),
         };
 
-        let cap = (*max_steps).min(MAX_STEPS_CEILING).max(1);
+        let cap = (*max_steps).clamp(1, MAX_STEPS_CEILING);
         let mut messages = vec![Message {
             role: "system".into(),
             content: system_prompt(self.system.as_deref(), tools),
@@ -548,6 +547,7 @@ mod tests {
     use crate::engine::context::{RunOptions, TriggerMeta};
     use crate::intelligence::backends::single_backend;
     use crate::intelligence::client::MockClient;
+    use std::sync::Arc;
 
     fn ctx() -> ExecutionContext {
         ExecutionContext::new(
@@ -591,7 +591,7 @@ mod tests {
         let key = "AGENTD_LOOP_TEST_VALUE";
         unsafe { std::env::set_var(key, "42") };
         let mock = Arc::new(MockClient::new());
-        mock.enqueue_text(&format!(
+        mock.enqueue_text(format!(
             r#"{{"action":"tool","tool":"read_env","args":{{"key":"{key}"}}}}"#
         ));
         mock.enqueue_text(r#"{"action":"final","result":{"answer":42}}"#);

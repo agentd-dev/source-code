@@ -1,0 +1,55 @@
+name = "fault-schema-drift-deadends"
+description = "When the model returns a valid but unrouted answer (schema/vocabulary drift), the switch dead-ends at itself — the run completes bounded at the unroutable node rather than crashing or looping."
+capabilities = ["llm_infer", "switch", "fault_tolerance"]
+
+[workflow]
+inline = """
+name = "drift_guard"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "classify"
+
+[[nodes]]
+id = "classify"
+type = "llm_infer"
+backend = "default"
+prompt = "decide"
+input_from = "trigger"
+output_schema = "inline"
+
+[[nodes]]
+id = "route"
+type = "switch"
+expr = "classify.parsed.decision"
+
+[[nodes]]
+id = "done_alpha"
+type = "terminate"
+
+[[edges]]
+from = "classify"
+to = "route"
+
+[[edges]]
+from = "route"
+when = "alpha"
+to = "done_alpha"
+"""
+
+[trigger]
+payload = { body = "anything" }
+
+# Valid JSON, but `zeta` is not a routed decision — the graph has no
+# edge for it.
+[[intel.turns]]
+content = '{"decision": "zeta"}'
+prompt_tokens = 80
+completion_tokens = 5
+
+[expected]
+status = "completed"
+last_node = "route"
+path = ["classify", "route"]
+path_exact = true

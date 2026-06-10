@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "0.1.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Bounded workflow-driven agent runtime (RFC: rfcs/0001-bounded-workflow-runtime.md)"

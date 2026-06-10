@@ -39,7 +39,7 @@ jobs:
           - "--features tools-http,tools-shell"
           - "--features trigger-cron,trigger-fs-watch"
           - "--features signing,auth-oidc,policy-rego"
-          - "--features intel-unix,intel-http"
+          - "--features intel-unix,intel-http,intel-remote"
           - "--all-features"
     steps:
       - uses: actions/checkout@v4

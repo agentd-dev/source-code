@@ -49,11 +49,14 @@ export default function Home() {
         <h1 className="text-4xl font-bold text-[var(--accent)] sm:text-5xl">
           agentd
         </h1>
+        <p className="mt-3 text-2xl font-bold text-[var(--accent)] sm:text-3xl">
+          Spin up an AI agent that works on its own.
+        </p>
         <p className="mt-4 max-w-2xl text-lg">
-          The bounded agent runtime: a single binary that runs signed,
-          policy-bound AI workflows —{" "}
+          Give it a task, a goal, or a whole workflow — agentd runs as a daemon
+          (or a one-shot), calls tools, and self-corrects until the job is done.{" "}
           <span className="text-[var(--accent)]">
-            one LLM step exactly where you put it.
+            Every step is governed, observable, and audited.
           </span>
         </p>
         <div className="frame mt-8">

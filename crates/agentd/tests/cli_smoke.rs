@@ -4,6 +4,7 @@
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -479,6 +480,7 @@ fn version_prints_cargo_version() {
 // Intelligence round-trip (mock Unix server)
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn spawn_fake_intel(
     sock_path: &std::path::Path,
     response_content: &'static str,
@@ -508,6 +510,7 @@ fn spawn_fake_intel(
     })
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_routes_llm_infer_through_intel_unix() {
     let dir = TempDir::new().unwrap();

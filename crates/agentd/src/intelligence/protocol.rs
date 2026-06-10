@@ -124,11 +124,13 @@ pub(crate) fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, any(unix, feature = "intel-http")))]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Cursor;
 
+    #[cfg(unix)]
     #[test]
     fn frame_round_trip() {
         let payload = br#"{"hello":"world"}"#;
@@ -141,6 +143,7 @@ mod tests {
         assert_eq!(read, payload);
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversize_frame_rejected() {
         // Hand-craft a frame header claiming 32 MiB of body.

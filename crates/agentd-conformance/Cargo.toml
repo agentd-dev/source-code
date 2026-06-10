@@ -17,9 +17,13 @@ name = "agentd-conformance"
 path = "src/main.rs"
 
 [dependencies]
-# The runtime under test. Extra tool families on so the corpus can
-# exercise http/shell/mcp node kinds, not just the default set.
-agentd = { path = "../agentd", features = ["tools-http", "tools-shell", "tools-mcp"] }
+# The runtime under test. `tools-http` is enabled so the corpus can
+# exercise the http_request node (the exfil-denial scenario). We do NOT
+# pull tools-shell / tools-mcp: workspace feature unification would then
+# run agentd's Unix-only shell tests under `cargo test --workspace` on
+# macOS / Windows, where they don't apply. Those families are exercised
+# by the agentd feature-matrix job instead.
+agentd = { path = "../agentd", features = ["tools-http"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"] }

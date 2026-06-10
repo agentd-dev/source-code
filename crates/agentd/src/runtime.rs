@@ -672,6 +672,9 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     if let Some(default) = &intel_reload {
         backend_map.insert("default".to_string(), default.clone());
     }
+    // `named_backends` is only mutated under `intel-remote`; the
+    // feature-off build leaves it empty.
+    #[allow(unused_mut)]
     let mut named_backends: std::collections::HashMap<
         String,
         Arc<crate::intelligence::client::ReloadableIntelClient>,

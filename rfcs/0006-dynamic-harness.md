@@ -69,35 +69,72 @@ Its containment guarantees: author-declared tool subset,
 author-declared step cap (hard ceiling 64), token budget, run
 deadline still binding, dry-run executes zero tool calls.
 
-### Mode 3 — Goal mode: the agent defines its own workflow
+### Mode 3 — Instruction mode: the agent compiles its own workflow
+
+The agent's entry point is a natural-language **instruction**, given
+three interchangeable ways — a string, a file, or a standing `task`
+baked into the agent spec:
 
 ```bash
-agentd --goal "Audit the access logs under /var/log/app and write a summary" \
-       --instructions agent.toml --plan-only          # inspect the plan
-agentd --goal @goal.txt --instructions agent.toml --auto-approve
+agentd --config prod.toml \
+       --instruction "Audit the access logs under /var/log/app and write a summary" \
+       --plan-only                              # inspect the compiled workflow
+agentd --config prod.toml --instruction @task.md --auto-approve
+agentd --config prod.toml --instructions agent.toml --auto-approve   # task lives in agent.toml
 ```
 
-A planner prompt (instructions + the build's *actual* node-kind
-vocabulary + the active policy summary) asks the configured backend
-to emit a workflow TOML. The plan is then treated exactly like a
-human-authored one:
+`--instruction-file PATH` is sugar for `--instruction @PATH`; the
+legacy `--goal` is kept as an alias. Resolution precedence is
+`--instruction` → `--goal` → the instructions file's `task`.
+
+**Capability injection.** Before planning, the runtime assembles a
+*capability catalogue* and injects it verbatim into the planner
+prompt. It is the agent's actual, build- and config-specific surface:
+
+- the node kinds **this binary** can execute — feature-gated families
+  the build lacks (`http_request` on a no-`tools-http` build) are
+  omitted, so the planner never proposes a node that would be rejected;
+- the configured intelligence backends, addressable by name;
+- the MCP servers and the specific tools/resources each exposes;
+- the active policy allowlists — the boundary every emitted tool call
+  must stay inside.
+
+The catalogue is descriptive only: it grants nothing. The same
+validator and policy gates bind whatever the planner emits. This is
+the inverse of model-initiated capability acquisition (§6) — the model
+is *told* its limits up front rather than discovering them by rejection.
+
+The plan is then treated exactly like a human-authored workflow:
 
 1. **Validated** by the standard validator. Validation errors are fed
    back to the model for a bounded number of repair rounds.
-2. **Approval-gated.** The materialized plan prints in full.
-   Headless runs refuse to execute without `--auto-approve`
-   (fail-closed governance); `--plan-only` stops after printing.
-3. **Executed** on the normal engine, under the normal policy,
+2. **Grafted onto the environment.** The generated graph supplies only
+   *shape* — `name`, `start_nodes`, `triggers`, `http_routes`, `nodes`,
+   `edges`. Everything that confers authority — policy, intelligence
+   backends, MCP servers, budgets, auth, logging, signing — is taken
+   from the `--config` base environment, not from the model. The agent
+   cannot widen its own policy by emitting a different one.
+3. **Approval-gated.** The materialized plan prints in full. Headless
+   runs refuse to execute without `--auto-approve` (or `auto_approve =
+   true` in the instructions file the operator authored); `--plan-only`
+   stops after printing. Fail-closed.
+4. **Executed** on the normal engine, under the normal policy,
    budgets, and audit.
-4. **Bounded self-improvement.** On a failed outcome, the planner
+5. **Bounded self-improvement.** On a failed outcome, the planner
    may revise the plan with the failure trace in context — at most
    `--max-replans` times (default 2). Every generation, approval,
    execution, and replan is an audit event with the plan content
    hashed into it.
 
-The plan is a file. It can be saved, diffed, signed, and promoted
-into a Mode-1 workflow — the intended lifecycle for anything that
-proves itself.
+The planner's own model resolves the same way the workflow's does:
+the backend named by the instructions file's `default_backend` against
+`--config`'s `[[intelligence.backends]]`, else an explicit
+`--intel-unix` / `--intel-http` transport, else
+`AGENTD_GOAL_BACKEND=provider:model` for a zero-TOML run.
+
+The plan is a file. It can be saved (`--plan-out`), diffed, signed, and
+promoted into a Mode-1 workflow — the intended lifecycle for anything
+that proves itself.
 
 ## 3. Provider layer
 
@@ -140,11 +177,22 @@ name = "log-auditor"
 system = """You are a careful operations assistant..."""
 default_backend = "claude"
 loop_tools = ["read_file", "json_select"]   # default agent_loop subset
+task = "Audit the access logs under /var/log/app and write a summary"
+auto_approve = false                         # opt-in unattended execution
 ```
 
 Instructions feed the planner (Mode 3) and any `agent_loop` that
-doesn't override them. They are config, not code: signable,
-diffable, reloadable.
+doesn't override them. Two fields make a spec self-contained:
+
+- `task` — a standing instruction. With it set, `agentd --config env.toml
+  --instructions agent.toml` is a complete agent: identity + the work to
+  do. It is the lowest-precedence instruction source (a `--instruction`
+  or `--goal` on the command line overrides it).
+- `auto_approve` — lets the operator who authored and signed the spec
+  waive the interactive `--auto-approve` gate for *this* agent. Defaults
+  `false`: autonomy is never ambient.
+
+They are config, not code: signable, diffable, reloadable.
 
 ## 5. Governance & observability additions
 

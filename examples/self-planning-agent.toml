@@ -1,0 +1,48 @@
+# A self-contained agent spec for instruction mode (RFC 0006 §3, §4).
+#
+# This is an *instructions* file (`[agent]`), not a workflow. Paired
+# with a `--config` environment that supplies the policy + backends,
+# it is everything the agent needs: who it is, which model it plans
+# with, and the standing task to accomplish. The agent compiles its
+# own workflow from `task`, then runs it.
+#
+#   # inspect the workflow the agent compiles for itself:
+#   ANTHROPIC_API_KEY=... agentd \
+#       --config examples/agent-loop.toml \
+#       --instructions examples/self-planning-agent.toml --plan-only
+#
+#   # looks right? let it run (this spec keeps auto_approve = false,
+#   # so add --auto-approve, or flip the field below for an unattended
+#   # appliance):
+#   ANTHROPIC_API_KEY=... agentd \
+#       --config examples/agent-loop.toml \
+#       --instructions examples/self-planning-agent.toml --auto-approve
+
+[agent]
+name = "log-auditor"
+system = """
+You are a careful operations assistant. Prefer the narrowest set of
+steps that accomplishes the task. Never read or write outside the
+paths the policy allows.
+"""
+
+# The planner talks to the backend named here, resolved against the
+# --config environment's [[intelligence.backends]]. `examples/agent-loop.toml`
+# defines a backend called `claude`.
+default_backend = "claude"
+
+# Default tool subset for any agent_loop node the planner emits that
+# does not name its own `tools`.
+loop_tools = ["read_file", "json_select"]
+
+# The standing instruction. With this set, no --instruction flag is
+# needed — `--instructions self-planning-agent.toml` is a complete agent.
+task = """
+Find the newest file under /var/log/app, summarise the notable events
+in it (errors, warnings, repeated failures), and write the summary to
+/tmp/agentd-reports/audit.md.
+"""
+
+# Fail-closed: the compiled plan still needs explicit approval. Set to
+# true only for a spec you have reviewed and trust to run unattended.
+auto_approve = false

@@ -2,6 +2,13 @@
 //! side-effect, not merely record it. This test drives the injection
 //! end-to-end against a real temp directory and asserts the escaping
 //! write never reached the disk.
+//!
+//! Unix-only: it embeds absolute filesystem paths into a TOML policy,
+//! and the `[policy.fs]` matcher is `/`-separated. The cross-platform
+//! security guarantee (denial + bounded errored stop) is covered by the
+//! string-based corpus scenarios under `corpus/security/`, which run on
+//! every platform.
+#![cfg(unix)]
 
 use std::fs;
 

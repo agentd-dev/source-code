@@ -2,9 +2,9 @@
 //! binary. No subcommands — behaviour derives from the loaded
 //! workflow, with flag + env-var overrides.
 
-use std::io::{Read, Write};
 #[cfg(unix)]
 use std::io::{BufReader, BufWriter};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;

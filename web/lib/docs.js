@@ -23,6 +23,21 @@ export const DOCS = [
     file: "rfcs/0002-signed-workflows.md",
     title: "rfc 0002 · signed workflows",
   },
+  {
+    slug: "rfc-0003",
+    file: "rfcs/0003-execution-model.md",
+    title: "rfc 0003 · the agent loop",
+  },
+  {
+    slug: "rfc-0004",
+    file: "rfcs/0004-multi-server-mcp.md",
+    title: "rfc 0004 · multi-server mcp",
+  },
+  {
+    slug: "rfc-0005",
+    file: "rfcs/0005-hot-reload.md",
+    title: "rfc 0005 · hot reload",
+  },
 ];
 
 export function readDoc(slug) {

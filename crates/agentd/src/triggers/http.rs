@@ -153,6 +153,12 @@ impl HttpServer {
             while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
+                        // BSD-family kernels (macOS) hand accepted
+                        // sockets the listener's O_NONBLOCK flag;
+                        // Linux does not. Force blocking explicitly
+                        // so reads honour the timeouts below instead
+                        // of returning WouldBlock between requests.
+                        let _ = stream.set_nonblocking(false);
                         // Apply I/O timeouts on the raw TCP side —
                         // TLS-wrapped reads inherit them.
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));

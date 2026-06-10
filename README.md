@@ -32,11 +32,11 @@ ceiling. Autonomy is opt-in per invocation, never ambient.
 
 ```mermaid
 flowchart LR
-    WF["workflow.toml<br/>(typed DAG, signed)"] --> V["validate<br/>build-time + load-time"]
-    T["triggers<br/>HTTP · cron · fs-watch · manual"] --> E
+    WF["workflow.toml<br/>typed DAG, signed"] --> V["validate<br/>build-time and load-time"]
+    T["triggers:<br/>HTTP / cron / fs-watch / manual"] --> E
     V --> E["engine<br/>walks the declared graph"]
-    E --> N["nodes<br/>fs · data · http · mcp · shell<br/>llm_infer = one bounded reasoning step"]
-    N -. "every side effect" .-> P["policy allowlists<br/>+ budgets + deadline"]
+    E --> N["nodes:<br/>fs / data / http / mcp / shell<br/>llm_infer = bounded reasoning step"]
+    N -->|every side effect| P["policy allowlists<br/>+ budgets + deadline"]
     E --> O["outcome JSON<br/>+ execution trace<br/>+ metrics + audit events"]
 ```
 
@@ -201,17 +201,17 @@ structural:
 
 ```mermaid
 flowchart TD
-    A["trigger fires<br/>(payload → context as 'trigger')"] --> B["resolve start node → entry"]
-    B --> C{"deadline<br/>reached?"}
-    C -- yes --> T1(["timed_out"])
-    C -- no --> D["dispatch node handler<br/>(retry w/ backoff if declared)"]
+    A["trigger fires<br/>payload becomes the trigger context"] --> B["resolve start node, then entry"]
+    B --> C{"deadline reached?"}
+    C -->|yes| T1(["timed_out"])
+    C -->|no| D["dispatch node handler<br/>retry with backoff if declared"]
     D --> E["record output under node id"]
-    E --> F{"node outcome"}
-    F -- "terminate" --> T2(["completed"])
-    F -- "fail" --> T3(["failed (declared)"])
-    F -- "continue + branch label" --> G["engine picks the matching edge<br/>(handlers never choose successors)"]
-    G -- "edge found" --> C
-    G -- "dead end" --> T4(["completed<br/>(last value)"])
+    E --> F{"node outcome?"}
+    F -->|terminate| T2(["completed"])
+    F -->|fail| T3(["failed"])
+    F -->|"continue + branch"| G["engine picks the matching edge<br/>handlers never choose successors"]
+    G -->|edge found| C
+    G -->|dead end| T4(["completed: last value"])
     style D stroke-width:2px
 ```
 

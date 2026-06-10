@@ -21,6 +21,8 @@ pub struct Metrics {
     node_executions: AtomicU64,
     node_failures: AtomicU64,
     policy_denials: AtomicU64,
+    llm_calls: AtomicU64,
+    llm_tokens: AtomicU64,
 }
 
 impl Metrics {
@@ -52,6 +54,11 @@ impl Metrics {
     pub fn inc_policy_denied(&self) {
         self.policy_denials.fetch_add(1, Ordering::Relaxed);
     }
+    /// Record one LLM call and the tokens it consumed (RFC 0006 §5).
+    pub fn add_llm(&self, tokens: u64) {
+        self.llm_calls.fetch_add(1, Ordering::Relaxed);
+        self.llm_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -63,6 +70,8 @@ impl Metrics {
             node_executions: self.node_executions.load(Ordering::Relaxed),
             node_failures: self.node_failures.load(Ordering::Relaxed),
             policy_denials: self.policy_denials.load(Ordering::Relaxed),
+            llm_calls: self.llm_calls.load(Ordering::Relaxed),
+            llm_tokens: self.llm_tokens.load(Ordering::Relaxed),
         }
     }
 }
@@ -78,6 +87,8 @@ pub struct MetricsSnapshot {
     pub node_executions: u64,
     pub node_failures: u64,
     pub policy_denials: u64,
+    pub llm_calls: u64,
+    pub llm_tokens: u64,
 }
 
 impl MetricsSnapshot {
@@ -166,6 +177,16 @@ const PROM_METRICS: &[PromMetric] = &[
         name: "agentd_policy_denials_total",
         help: "Tool invocations refused by the manifest policy.",
         read: |s| s.policy_denials,
+    },
+    PromMetric {
+        name: "agentd_llm_calls_total",
+        help: "Intelligence backend calls (llm_infer + agent_loop turns).",
+        read: |s| s.llm_calls,
+    },
+    PromMetric {
+        name: "agentd_llm_tokens_total",
+        help: "Cumulative LLM tokens consumed (prompt + completion).",
+        read: |s| s.llm_tokens,
     },
 ];
 

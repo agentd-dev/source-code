@@ -55,6 +55,13 @@ pub struct BudgetConfig {
     /// in the fs-write handler.
     #[serde(default)]
     pub max_fs_write_mb: Option<u64>,
+
+    /// Cumulative LLM token ceiling (prompt + completion) across the
+    /// whole run — counts every `llm_infer` node and every
+    /// `agent_loop` turn (RFC 0006 §5). On breach the next model
+    /// call is refused with a budget error.
+    #[serde(default)]
+    pub max_llm_tokens: Option<u64>,
 }
 
 impl BudgetConfig {
@@ -288,6 +295,8 @@ fn set_rlimit(resource: RlimitResource, value: u64, label: &str, display_val: u6
 pub struct BudgetTracker {
     bytes_written: AtomicU64,
     cap_bytes: Option<u64>,
+    tokens_used: AtomicU64,
+    token_cap: Option<u64>,
 }
 
 impl BudgetTracker {
@@ -295,7 +304,37 @@ impl BudgetTracker {
         Self {
             bytes_written: AtomicU64::new(0),
             cap_bytes: cfg.fs_write_cap_bytes(),
+            tokens_used: AtomicU64::new(0),
+            token_cap: cfg.max_llm_tokens,
         }
+    }
+
+    /// Check the cumulative LLM token budget BEFORE a model call.
+    /// Returns `Err(msg)` when a cap is set and already reached.
+    /// Caps are checked, not reserved, because token counts are only
+    /// known after the call — [`Self::add_llm_tokens`] records actuals.
+    pub fn check_llm_budget(&self) -> std::result::Result<(), String> {
+        let Some(cap) = self.token_cap else {
+            return Ok(());
+        };
+        let used = self.tokens_used.load(Ordering::Relaxed);
+        if used >= cap {
+            return Err(format!(
+                "budget.max_llm_tokens exceeded: {used} / {cap} tokens consumed"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record actual token usage after a model call. Returns the new
+    /// cumulative total.
+    pub fn add_llm_tokens(&self, n: u64) -> u64 {
+        self.tokens_used.fetch_add(n, Ordering::Relaxed) + n
+    }
+
+    /// Current cumulative LLM token usage.
+    pub fn llm_tokens_used(&self) -> u64 {
+        self.tokens_used.load(Ordering::Relaxed)
     }
 
     /// Reserve `n` bytes of fs-write budget. Atomically bumps the
@@ -351,6 +390,8 @@ pub fn unbounded() -> BudgetRef {
     Arc::new(BudgetTracker {
         bytes_written: AtomicU64::new(0),
         cap_bytes: None,
+        tokens_used: AtomicU64::new(0),
+        token_cap: None,
     })
 }
 
@@ -462,5 +503,26 @@ mod tests {
         // counter should just reflect the total accepted writes).
         assert!(t.bytes_written() <= 1024 * 1024);
         assert!(t.bytes_written() >= 800 * 1024);
+    }
+    #[test]
+    fn llm_token_budget_caps_cumulatively() {
+        let cfg = BudgetConfig {
+            max_llm_tokens: Some(100),
+            ..Default::default()
+        };
+        let tr = BudgetTracker::new(&cfg);
+        assert!(tr.check_llm_budget().is_ok());
+        tr.add_llm_tokens(60);
+        assert!(tr.check_llm_budget().is_ok());
+        tr.add_llm_tokens(45); // now 105 >= 100
+        assert!(tr.check_llm_budget().is_err());
+        assert_eq!(tr.llm_tokens_used(), 105);
+    }
+
+    #[test]
+    fn llm_budget_unset_never_caps() {
+        let tr = BudgetTracker::new(&BudgetConfig::default());
+        tr.add_llm_tokens(1_000_000);
+        assert!(tr.check_llm_budget().is_ok());
     }
 }

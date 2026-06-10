@@ -113,6 +113,8 @@ impl FixtureRunner {
             intel_handler::register(
                 &mut registry,
                 crate::intelligence::backends::single_backend(arc),
+                crate::budget::unbounded(),
+                crate::observability::Metrics::new(),
             );
         }
 

@@ -18,12 +18,15 @@
 
 use serde_json::{Value, json};
 
+use crate::budget::BudgetRef;
 use crate::engine::{ExecutionContext, HandlerRegistry, NodeHandler, NodeOutcome};
 use crate::error::{Error, Result};
 use crate::intelligence::backends::BackendMap;
 use crate::intelligence::client::IntelligenceClient;
 use crate::intelligence::protocol::{Message, Request};
+use crate::observability::Metrics;
 use crate::workflow::{Node, NodeKind};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -31,9 +34,18 @@ use crate::workflow::{Node, NodeKind};
 
 /// Register the `llm_infer` handler on a registry. `backends` maps
 /// names to transports; `"default"` is the CLI-configured socket
-/// transport when present (RFC 0006 §3).
-pub fn register(registry: &mut HandlerRegistry, backends: BackendMap) {
-    registry.register("llm_infer", Box::new(LlmInferHandler::new(backends)));
+/// transport when present (RFC 0006 §3). `budget` enforces the
+/// cumulative token cap; `metrics` records calls + tokens.
+pub fn register(
+    registry: &mut HandlerRegistry,
+    backends: BackendMap,
+    budget: BudgetRef,
+    metrics: Arc<Metrics>,
+) {
+    registry.register(
+        "llm_infer",
+        Box::new(LlmInferHandler::new(backends).with_budget(budget, metrics)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -44,6 +56,8 @@ pub struct LlmInferHandler {
     backends: BackendMap,
     /// Max tokens applied when a node doesn't override it.
     default_max_tokens: u32,
+    budget: Option<BudgetRef>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl LlmInferHandler {
@@ -51,7 +65,15 @@ impl LlmInferHandler {
         Self {
             backends,
             default_max_tokens: 1024,
+            budget: None,
+            metrics: None,
         }
+    }
+
+    pub fn with_budget(mut self, budget: BudgetRef, metrics: Arc<Metrics>) -> Self {
+        self.budget = Some(budget);
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn with_default_max_tokens(mut self, max_tokens: u32) -> Self {
@@ -128,7 +150,23 @@ impl NodeHandler for LlmInferHandler {
             max_tokens: Some(self.default_max_tokens),
             temperature: None,
         };
+        // Token budget gate (RFC 0006 §5) — checked before the call.
+        if let Some(budget) = &self.budget {
+            if let Err(reason) = budget.check_llm_budget() {
+                return Err(Error::Tool {
+                    tool: "llm_infer".into(),
+                    reason,
+                });
+            }
+        }
         let response = client.complete(&request)?;
+        let tokens = u64::from(response.usage.prompt_tokens + response.usage.completion_tokens);
+        if let Some(budget) = &self.budget {
+            budget.add_llm_tokens(tokens);
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.add_llm(tokens);
+        }
 
         // Optional parse. If a schema is declared, the model must
         // return JSON; otherwise the raw content becomes the output.
@@ -320,6 +358,39 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn token_budget_blocks_when_exhausted() {
+        let mock = Arc::new(MockClient::new());
+        mock.enqueue(Response {
+            content: "ok".into(),
+            usage: crate::intelligence::protocol::Usage {
+                prompt_tokens: 80,
+                completion_tokens: 30,
+            },
+        });
+        mock.enqueue_text("should never be reached");
+        let cfg = crate::budget::BudgetConfig {
+            max_llm_tokens: Some(100),
+            ..Default::default()
+        };
+        let budget = Arc::new(crate::budget::BudgetTracker::new(&cfg));
+        let metrics = crate::observability::Metrics::new();
+        let h =
+            LlmInferHandler::new(single_backend(mock.clone())).with_budget(budget, metrics.clone());
+
+        let mut c = ctx(json!({}));
+        // First call succeeds and records 110 tokens.
+        h.handle(&node_with("a", None, None), &mut c).unwrap();
+        assert_eq!(metrics.snapshot().llm_tokens, 110);
+        assert_eq!(metrics.snapshot().llm_calls, 1);
+        // Second call is refused — budget already over cap.
+        let mut c2 = ctx(json!({}));
+        let err = h.handle(&node_with("b", None, None), &mut c2).unwrap_err();
+        assert!(format!("{err}").contains("max_llm_tokens"));
+        // The blocked call never reached the client.
+        assert_eq!(mock.received().len(), 1);
     }
 
     #[test]

@@ -7,7 +7,10 @@ use agentd_conformance::{discover_scenarios, run_corpus, run_scenario_file};
 
 #[test]
 fn conformance_corpus_all_pass() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/conformance");
+    // The whole corpus is the gate — conformance, fault, and security
+    // scenarios alike. A fault scenario "passes" when the runtime
+    // degrades exactly as its expectations declare.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
     let files = discover_scenarios(&root).expect("read corpus dir");
     assert!(!files.is_empty(), "no conformance scenarios discovered");
 

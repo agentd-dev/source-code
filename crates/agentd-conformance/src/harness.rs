@@ -8,14 +8,15 @@
 //! given its trial index.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use agentd::engine::{
     Engine, ExecutionOutcome, ExecutionTrace, HandlerRegistry, RunOptions, StubHandler, TriggerMeta,
 };
 use agentd::intelligence::MockClient;
-use agentd::intelligence::client::IntelligenceRef;
-use agentd::intelligence::protocol::{Response, Usage};
+use agentd::intelligence::client::{IntelligenceClient, IntelligenceRef};
+use agentd::intelligence::protocol::{Request, Response, Usage};
 use agentd::observability::Metrics;
 use agentd::tools::policy::{AllowAll, PolicyRef};
 use agentd::workflow::WorkflowDoc;
@@ -87,10 +88,14 @@ pub fn run_trial(
                 },
             });
         }
-        let arc: IntelligenceRef = mock;
+        // Inject a transport fault on a chosen call, if asked.
+        let client: IntelligenceRef = match scenario.faults.intel_error_on_call {
+            Some(n) => Arc::new(FaultIntelClient::new(mock, n)),
+            None => mock,
+        };
         agentd::intelligence::handler::register(
             &mut registry,
-            agentd::intelligence::backends::single_backend(arc),
+            agentd::intelligence::backends::single_backend(client),
             budget.clone(),
             metrics.clone(),
         );
@@ -110,9 +115,15 @@ pub fn run_trial(
     };
 
     let t0 = Instant::now();
-    let (outcome, trace) = engine
-        .run_with_trace(doc, start, trigger, options)
-        .map_err(|e| format!("engine error: {e}"))?;
+    // A handler error (invalid JSON, policy denial, injected transport
+    // fault, …) propagates as a run-level Err — distinct from a
+    // declared `failed` outcome. Both are captured here so a fault
+    // scenario can assert exactly which kind of bounded stop happened.
+    // Cost is read regardless: counters accrued up to the stop point.
+    let run = match engine.run_with_trace(doc, start, trigger, options) {
+        Ok((outcome, trace)) => RunResult::Ran(outcome, trace),
+        Err(e) => RunResult::Errored(e.to_string()),
+    };
     let latency = t0.elapsed();
 
     let snap = metrics.snapshot();
@@ -123,14 +134,60 @@ pub fn run_trial(
         policy_denials: snap.policy_denials,
     };
 
-    let failures = diff_expected(&scenario.expected, &outcome, &trace, &cost);
+    let failures = diff_expected(&scenario.expected, &run, &cost);
     Ok(TrialOutcome {
         passed: failures.is_empty(),
         failures,
-        status: outcome.status_label().to_string(),
+        status: run.status().to_string(),
         cost,
         latency,
     })
+}
+
+/// The terminal state of a run: a real engine outcome, or a run-level
+/// error (a handler refused / the backend faulted). `errored` is its
+/// own status so scenarios can distinguish a *declared* `failed` from
+/// an *errored* abort.
+enum RunResult {
+    Ran(ExecutionOutcome, ExecutionTrace),
+    Errored(String),
+}
+
+impl RunResult {
+    fn status(&self) -> &str {
+        match self {
+            RunResult::Ran(o, _) => o.status_label(),
+            RunResult::Errored(_) => "errored",
+        }
+    }
+
+    fn last_node(&self) -> Option<String> {
+        match self {
+            RunResult::Ran(o, _) => match o {
+                ExecutionOutcome::Completed { last_node, .. }
+                | ExecutionOutcome::Failed { last_node, .. }
+                | ExecutionOutcome::TimedOut { last_node, .. } => last_node.clone(),
+            },
+            RunResult::Errored(_) => None,
+        }
+    }
+
+    /// The explanatory string for a `failed` outcome or an `errored`
+    /// abort; `None` for a clean completion.
+    fn reason(&self) -> Option<&str> {
+        match self {
+            RunResult::Ran(ExecutionOutcome::Failed { reason, .. }, _) => Some(reason),
+            RunResult::Errored(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    fn node_ids(&self) -> Vec<String> {
+        match self {
+            RunResult::Ran(_, trace) => trace.node_ids(),
+            RunResult::Errored(_) => Vec::new(),
+        }
+    }
 }
 
 /// Deterministic per-trial variant selection. Single-variant turns are
@@ -146,26 +203,17 @@ fn pick_variant(trial: u32, turn: usize, n: usize) -> usize {
     (h % n as u64) as usize
 }
 
-fn diff_expected(
-    expected: &Expected,
-    outcome: &ExecutionOutcome,
-    trace: &ExecutionTrace,
-    cost: &Cost,
-) -> Vec<String> {
+fn diff_expected(expected: &Expected, run: &RunResult, cost: &Cost) -> Vec<String> {
     let mut out = Vec::new();
 
     if let Some(want) = &expected.status {
-        let got = outcome.status_label();
+        let got = run.status();
         if want != got {
             out.push(format!("status: expected `{want}`, got `{got}`"));
         }
     }
 
-    let last_node = match outcome {
-        ExecutionOutcome::Completed { last_node, .. }
-        | ExecutionOutcome::Failed { last_node, .. }
-        | ExecutionOutcome::TimedOut { last_node, .. } => last_node.clone(),
-    };
+    let last_node = run.last_node();
     if let Some(want) = &expected.last_node {
         if last_node.as_deref() != Some(want.as_str()) {
             out.push(format!("last_node: expected `{want}`, got `{last_node:?}`"));
@@ -173,17 +221,15 @@ fn diff_expected(
     }
 
     if let Some(needle) = &expected.reason_contains {
-        match outcome {
-            ExecutionOutcome::Failed { reason, .. } if reason.contains(needle) => {}
-            ExecutionOutcome::Failed { reason, .. } => {
-                out.push(format!("reason_contains `{needle}` not in `{reason}`"))
-            }
-            _ => out.push("reason_contains set but outcome is not `failed`".to_string()),
+        match run.reason() {
+            Some(r) if r.contains(needle) => {}
+            Some(r) => out.push(format!("reason_contains `{needle}` not in `{r}`")),
+            None => out.push("reason_contains set but the run completed cleanly".to_string()),
         }
     }
 
     if !expected.path.is_empty() {
-        let got = trace.node_ids();
+        let got = run.node_ids();
         if expected.path_exact {
             if got != expected.path {
                 out.push(format!(
@@ -222,6 +268,38 @@ fn diff_expected(
     }
 
     out
+}
+
+/// A mock backend that fails its Nth `complete` call with a transport
+/// error — the backend "goes down" mid-run. Distinct from a bad-content
+/// response (which the `output_schema` parse rejects); this is the
+/// request itself failing, exercising the engine's error propagation.
+struct FaultIntelClient {
+    inner: Arc<MockClient>,
+    error_on: u32,
+    calls: AtomicU32,
+}
+
+impl FaultIntelClient {
+    fn new(inner: Arc<MockClient>, error_on: u32) -> Self {
+        Self {
+            inner,
+            error_on,
+            calls: AtomicU32::new(0),
+        }
+    }
+}
+
+impl IntelligenceClient for FaultIntelClient {
+    fn complete(&self, request: &Request) -> agentd::Result<Response> {
+        let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == self.error_on {
+            return Err(agentd::Error::Intelligence(format!(
+                "injected transport fault on call {n}"
+            )));
+        }
+        self.inner.complete(request)
+    }
 }
 
 #[cfg(test)]

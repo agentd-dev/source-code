@@ -1,0 +1,47 @@
+name = "fault-intel-backend-down"
+description = "When the intelligence backend fails the request itself (5xx / timeout), the run stops with a bounded `errored` outcome — no hang, and zero tokens billed for the failed call."
+capabilities = ["llm_infer", "fault_tolerance"]
+
+[workflow]
+inline = """
+name = "backend_outage"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "ask"
+
+[[nodes]]
+id = "ask"
+type = "llm_infer"
+backend = "default"
+prompt = "summarise"
+input_from = "trigger"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "ask"
+to = "done"
+"""
+
+[trigger]
+payload = { body = "anything" }
+
+# The response that would have come back — never reached, the fault
+# fires first.
+[[intel.turns]]
+content = "a summary"
+prompt_tokens = 200
+completion_tokens = 40
+
+[faults]
+intel_error_on_call = 1
+
+[expected]
+status = "errored"
+reason_contains = "transport fault"
+# A failed call bills nothing — the bound holds at zero.
+max_total_tokens = 0

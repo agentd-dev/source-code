@@ -52,12 +52,35 @@ pub struct Scenario {
     /// AllowAll.
     #[serde(default)]
     pub policy: Option<PolicyManifest>,
+    /// Optional fault injection (robustness battery).
+    #[serde(default)]
+    pub faults: Faults,
     #[serde(default)]
     pub expected: Expected,
     /// Not part of the file format — populated by [`Scenario::load`] so
     /// a `workflow.path` reference resolves relative to the scenario.
     #[serde(skip)]
     pub base_dir: Option<std::path::PathBuf>,
+}
+
+/// Faults to inject during a run. A robust bounded workflow degrades
+/// predictably under these (a declared `failed` outcome, bounded cost),
+/// never a hang or an unbounded retry storm.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Faults {
+    /// 1-based `llm_infer` call index that fails with a transport
+    /// error (the backend is "down" on that call), simulating a 5xx /
+    /// timeout rather than a bad-content response.
+    #[serde(default)]
+    pub intel_error_on_call: Option<u32>,
+}
+
+impl Faults {
+    /// True if any fault is configured.
+    pub fn any(&self) -> bool {
+        self.intel_error_on_call.is_some()
+    }
 }
 
 fn default_trials() -> u32 {

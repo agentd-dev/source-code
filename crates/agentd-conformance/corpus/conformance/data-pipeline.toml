@@ -1,6 +1,6 @@
 name = "data-pipeline"
 description = "Pure data plane: parse a JSON string from the trigger, select a field, render it into a string."
-capabilities = ["parse_json", "json_select", "template_render", "terminate"]
+capabilities = ["parse_json", "json_select", "template_render", "terminate", "trigger_manual"]
 
 [workflow]
 inline = """

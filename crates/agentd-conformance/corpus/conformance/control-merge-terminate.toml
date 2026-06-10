@@ -1,6 +1,6 @@
 name = "control-merge-terminate"
 description = "The control plane walks a linear merge → terminate path."
-capabilities = ["merge", "terminate"]
+capabilities = ["merge", "terminate", "trigger_manual"]
 
 [workflow]
 inline = """

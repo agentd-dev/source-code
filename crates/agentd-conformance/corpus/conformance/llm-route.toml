@@ -1,6 +1,6 @@
 name = "llm-route"
 description = "An llm_infer node's structured answer drives a switch; the model fills one node, the graph routes."
-capabilities = ["llm_infer", "switch", "terminate"]
+capabilities = ["llm_infer", "switch", "terminate", "trigger_manual"]
 
 [workflow]
 inline = """

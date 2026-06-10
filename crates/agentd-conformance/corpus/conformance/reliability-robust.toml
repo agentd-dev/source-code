@@ -1,0 +1,78 @@
+name = "reliability-robust"
+description = "Under model nondeterminism (8 trials, 3 response variants) a bounded workflow that routes every possible answer holds pass^8 = 1.0."
+capabilities = ["llm_infer", "switch", "terminate"]
+trials = 8
+
+[workflow]
+inline = """
+name = "robust_router"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "classify"
+
+[[nodes]]
+id = "classify"
+type = "llm_infer"
+backend = "default"
+prompt = "Return a routing decision."
+input_from = "trigger"
+output_schema = "inline"
+
+[[nodes]]
+id = "route"
+type = "switch"
+expr = "classify.parsed.decision"
+
+[[nodes]]
+id = "done_alpha"
+type = "terminate"
+
+[[nodes]]
+id = "done_beta"
+type = "terminate"
+
+[[nodes]]
+id = "done_gamma"
+type = "terminate"
+
+[[edges]]
+from = "classify"
+to = "route"
+
+[[edges]]
+from = "route"
+when = "alpha"
+to = "done_alpha"
+
+[[edges]]
+from = "route"
+when = "beta"
+to = "done_beta"
+
+[[edges]]
+from = "route"
+when = "gamma"
+to = "done_gamma"
+"""
+
+[trigger]
+kind = "manual"
+payload = { body = "classify me" }
+
+# The model is nondeterministic: each trial picks one of these three
+# answers (seeded by trial index). The graph routes all three, so the
+# run completes no matter which one comes back.
+[[intel.turns]]
+variants = [
+    { content = '{"decision": "alpha"}', prompt_tokens = 100, completion_tokens = 6 },
+    { content = '{"decision": "beta"}', prompt_tokens = 100, completion_tokens = 6 },
+    { content = '{"decision": "gamma"}', prompt_tokens = 100, completion_tokens = 6 },
+]
+
+# Only the invariant is asserted — whatever the model says, the bounded
+# workflow completes. (last_node varies per trial, so it is not pinned.)
+[expected]
+status = "completed"
+max_llm_calls = 1

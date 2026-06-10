@@ -40,6 +40,16 @@ pub struct AgentInstructions {
     /// Default tool subset for `agent_loop` nodes that omit `tools`.
     #[serde(default)]
     pub loop_tools: Vec<String>,
+    /// Standing instruction — what the agent should accomplish. When
+    /// present, starting with just `--instructions FILE` compiles a
+    /// workflow for this task and runs it (RFC 0006 §3).
+    #[serde(default)]
+    pub task: Option<String>,
+    /// Operator opt-in: a self-contained agent spec may run its
+    /// compiled plan unattended without the interactive `--auto-approve`
+    /// gate. Defaults false (fail-closed).
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 impl AgentInstructions {
@@ -68,11 +78,18 @@ mod tests {
             system = "be careful"
             default_backend = "claude"
             loop_tools = ["read_file"]
+            task = "summarise the newest log file"
+            auto_approve = true
         "#;
         let doc: InstructionsDoc = toml::from_str(src).unwrap();
         assert_eq!(doc.agent.name.as_deref(), Some("auditor"));
         assert_eq!(doc.agent.effective_backend(), "claude");
         assert_eq!(doc.agent.loop_tools, vec!["read_file"]);
+        assert_eq!(
+            doc.agent.task.as_deref(),
+            Some("summarise the newest log file")
+        );
+        assert!(doc.agent.auto_approve);
     }
 
     #[test]

@@ -1,5 +1,10 @@
 # `agentd` — capabilities reference
 
+> **v0.8 (RFC 0006):** adds the `agent_loop` node (bounded ReAct
+> inside a node), goal mode (`--goal`, the agent plans its own
+> workflow under an approval gate), and named multi-provider
+> intelligence backends. See [RFC 0006](../rfcs/0006-dynamic-harness.md).
+
 Every node kind, every tool, every trigger, every policy knob.
 Workflow authors read this to know what they can put in a TOML;
 operators read it to know what the binary will actually do.

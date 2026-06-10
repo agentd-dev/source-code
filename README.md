@@ -2,36 +2,31 @@
 
 # agentd
 
-**`systemd` for AI workflows — a single binary that runs signed, policy-bound automation with one LLM step exactly where you put it.**
+**A dynamic AI agent that runs as a daemon — `systemd` for autonomous work. Hand it a workflow, a goal, or a single instruction; it plans, acts, and self-corrects, with every step governed, observable, and audited.**
 
 [![ci](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml/badge.svg)](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](crates/agentd/Cargo.toml)
 
-[Install](#install) · [Quick start](#quick-start) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
+[Install](#install) · [Quick start](#quick-start) · [Three modes](#three-execution-modes) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
 
 </div>
 
 ---
 
-`agentd` is a single-binary runtime for **bounded intelligence workflows**.
-You author a directed acyclic graph of typed nodes in TOML. The runtime
-validates it (at compile time if you bake it in, always at load time), then
-executes it — one-shot from the CLI, or as a daemon reacting to HTTP
-webhooks, cron schedules, and filesystem events.
+`agentd` is a single-binary harness for **governed autonomous agents**. It
+runs as a daemon handling tasks, tool calls, and workflows independently —
+or as a one-shot that completes a goal by planning its own steps and
+improving on failure. Three execution modes share one substrate; every mode
+is bound by the same validator, capability policy, budgets, signing, and
+audit trail.
 
-The industry calls systems like this *workflows* — "LLMs and tools
-orchestrated through predefined code paths" — as opposed to *agents*, where
-the model directs its own process. agentd is deliberately, structurally on
-the workflow side of that line: the LLM is **one node type** (`llm_infer`),
-a bounded reasoning step with a templated prompt and an optional JSON
-output contract. It cannot add nodes, choose edges, or invent tool calls.
-Routing on its output is the `switch` node's job, declared by you.
-
-That inversion is the whole point. Production experience across the
-industry has converged on explicit control flow with the model doing local
-reasoning — because the graph boundary is also the audit boundary, the
-security boundary, and the cost ceiling.
+The thing that makes that safe is an inversion the industry converged on:
+the **control flow is structure, not vibes**. Whether you wrote the graph,
+or the agent planned it, or a model is looping inside a node — what can
+happen is always a validated, enumerable artifact before anything runs. The
+graph boundary is the audit boundary, the security boundary, and the cost
+ceiling. Autonomy is opt-in per invocation, never ambient.
 
 ```mermaid
 flowchart LR
@@ -147,10 +142,42 @@ from = "record"
 to = "halt"
 ```
 
+## Three execution modes
+
+One substrate (validation · policy · budgets · signing · audit), three ways
+to put work on it — pick the least dynamic one that does the job:
+
+| Mode | You provide | The agent does | Use when |
+|---|---|---|---|
+| **Workflow** | a TOML DAG | executes it | the steps are known and repeatable |
+| **`agent_loop` node** | a node with a goal + tool subset + `max_steps` | runs a bounded ReAct loop *inside that node* | one step needs open-ended investigation, the rest is fixed |
+| **Goal** | `--goal "…"` + instructions | plans its own workflow → validates it → (on approval) runs it → re-plans on failure | authoring the graph is the hard part |
+
+```bash
+# Mode 3 — the agent writes and runs its own workflow
+ANTHROPIC_API_KEY=… agentd \
+  --goal "Audit access logs under /var/log/app and write a summary" \
+  --instructions agent.toml --plan-only        # inspect first
+# ...looks right? add --auto-approve to execute (headless refuses without it)
+```
+
+Goal mode's plan is a normal workflow file — print it, diff it, sign it,
+promote it into Mode 1 once it's proven. The `agent_loop` node's model sees
+only the tools you listed and runs every call through the same policy gates
+a declared node would; `max_steps` (hard ceiling 64) and a token budget
+bound it. **No dynamic pathway escapes the substrate** — they all
+materialize into the same validated, policy-bound artifact.
+
+**Models, your choice.** `[[intelligence.backends]]` names backends across
+Anthropic, OpenAI, Gemini, any OpenAI-compatible endpoint (vLLM, Ollama,
+gateways), or the local vsock/Unix-socket and HTTP JSON-RPC transports.
+Keys live in env vars, never the TOML. Nodes pick a backend by name.
+
 ## The agent loop
 
-The engine is a sequential interpreter over your graph. There is exactly
-one loop in the system, and you wrote it:
+The engine is a sequential interpreter over the graph — whether you wrote
+it or the agent planned it. There is exactly one outer loop, and it is
+structural:
 
 1. **Trigger** — an HTTP request (bearer / HMAC / mTLS / OIDC verified,
    rate-limited), a cron tick, a filesystem event, or `--input` from the
@@ -198,13 +225,16 @@ and `MAX_STEPS`.
 
 | Surface | What ships |
 |---|---|
-| **Node kinds** | `read_file` `read_env` `read_mcp_resource` `parse_json` · `template_render` `json_select` `diff_compute` · `llm_infer` · `write_file` `create_dir` `http_request` `call_mcp_tool` `shell_run` · `condition` `switch` `merge` `fail` `terminate` |
+| **Execution modes** | declared workflows · `agent_loop` bounded-ReAct nodes · goal mode (agent plans its own workflow, approval-gated, bounded re-planning) |
+| **Node kinds** | `read_file` `read_env` `read_mcp_resource` `parse_json` · `template_render` `json_select` `diff_compute` · `llm_infer` `agent_loop` · `write_file` `create_dir` `http_request` `call_mcp_tool` `shell_run` · `condition` `switch` `merge` `fail` `terminate` |
+| **Models** | named backends: Anthropic · OpenAI · Gemini · OpenAI-compatible (vLLM/Ollama/gateways) · Unix-socket & HTTP JSON-RPC; keys via env only; hot-reloadable |
 | **Triggers** | HTTP/1.1 server (hand-rolled, keep-alive, drain-on-SIGTERM), cron + interval, fs-watch (debounced), manual |
 | **Auth** | Bearer (constant-time), HMAC-SHA256 webhooks (GitHub/Stripe pattern), mTLS (fingerprint + CN/SAN principals), OIDC/JWT against a pinned JWKS |
 | **Policy** | Fail-closed allowlists per family (fs paths, env keys, HTTP URLs+methods, shell commands, MCP tools/resources) + optional Rego layered as a logical AND |
-| **Budgets** | Memory (RLIMIT_AS / Job Objects), CPU time, wall-clock per run (clamps the CLI flag), cumulative fs-write bytes |
+| **Budgets** | Memory (RLIMIT_AS / Job Objects), CPU time, wall-clock per run (clamps the CLI flag), cumulative fs-write bytes, cumulative LLM tokens |
 | **Reliability** | Per-node retry (linear backoff, jitter, transient-only filters), per-run deadlines, graceful drain, SIGHUP / touch-file hot reload of TLS·auth·policy·routes·MCP·intel |
-| **Observability** | Structured spans (`workflow.run` → `node.execute`), Prometheus `/metrics`, `/healthz`, dedicated audit JSONL sink with redaction, W3C traceparent propagation in and out, optional OTLP gRPC export |
+| **Observability** | Structured spans (`workflow.run` → `node.execute`), Prometheus `/metrics` (incl. llm calls + tokens), `/healthz`, dedicated audit JSONL sink with redaction, W3C traceparent propagation in and out, optional OTLP gRPC export |
+| **Governance** | plan-approval gate (generated plans refuse to run headless without `--auto-approve`), per-step policy on loop tool calls, audit events for plan/loop lifecycle |
 | **Supply chain** | ed25519-signed workflows (verified before parsing trust begins), embedded configs validated at compile time |
 
 Every row above that touches the outside world is a **Cargo feature**.
@@ -250,22 +280,22 @@ architectural, not prompt-engineered:
 
 Honesty section. A frozen graph is the wrong tool when:
 
-- **The step count is genuinely unpredictable** — open-ended research,
-  exploratory debugging, "keep going until it works". That's the
-  documented domain of model-driven agents; use one (ideally sandboxed),
-  not this.
-- **The workflow must restructure itself from observations at runtime.**
-  agentd's switch nodes select among *declared* paths; they cannot invent
-  a new branch. Distribution shift that invalidates your graph means
-  editing the TOML — by design, that edit is reviewable and signable.
+- **You need fully open-ended, unbounded autonomy** — an agent that runs
+  for hours redirecting itself with no ceiling. `agent_loop` and goal mode
+  are deliberately *bounded* (step caps, token budgets, approval gates);
+  if you want an agent with no governor, that's a different tool.
 - **You need durable, resumable multi-day executions.** Runs are
-  in-memory and bounded; a crash re-runs the workflow rather than
-  resuming mid-graph. (Checkpoint/resume is on the roadmap; Temporal-class
-  durability is not the target.)
+  in-memory and bounded; a crash re-runs rather than resuming mid-graph.
+  (Checkpoint/resume is on the [roadmap](docs/ROADMAP.md); Temporal-class
+  durability is not the near-term target.)
+- **You need a coordinated fleet today.** agentd is one excellent process;
+  clustering, work distribution, and a coordination layer are designed
+  but not built (see the [roadmap](docs/ROADMAP.md)).
 
-The hybrid pattern the ecosystem converged on — a deterministic outer
-process with bounded model-driven inner steps — is exactly what `llm_infer`
-+ `switch` give you today, and where the roadmap deepens next.
+What agentd deliberately keeps even in its most dynamic mode: the agent's
+plan is always a validated, inspectable artifact before it runs, every tool
+call is policy-gated, and autonomy is opt-in per invocation. That's the
+trade — bounded dynamism for governance you can actually audit.
 
 ## Project layout
 

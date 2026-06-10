@@ -1,0 +1,81 @@
+# Named backends across providers (RFC 0006 §3). A fast local model
+# triages; a frontier model handles the hard case. Switch routes on
+# the triage label — the models never see the graph.
+#
+#   OPENAI_API_KEY=... ANTHROPIC_API_KEY=... \
+#   agentd --config examples/multi-provider.toml --input ticket.json
+
+name = "tiered_triage"
+
+[[intelligence.backends]]
+name = "local"
+provider = "openai-compatible"
+model = "qwen3"
+base_url = "http://127.0.0.1:8000/v1"
+
+[[intelligence.backends]]
+name = "frontier"
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 60000
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "triage"
+
+[[nodes]]
+id = "triage"
+type = "llm_infer"
+backend = "local"
+prompt = "Classify this ticket as 'simple' or 'complex'. Reply JSON {\"tier\":\"...\"}. Ticket: {{body}}"
+input_from = "trigger"
+output_schema = "schemas/tier.json"
+
+[[nodes]]
+id = "route"
+type = "switch"
+expr = "triage.parsed.tier"
+
+[[nodes]]
+id = "answer_simple"
+type = "llm_infer"
+backend = "local"
+prompt = "Draft a short reply to: {{body}}"
+input_from = "trigger"
+
+[[nodes]]
+id = "answer_complex"
+type = "llm_infer"
+backend = "frontier"
+prompt = "Draft a careful, detailed reply to: {{body}}"
+input_from = "trigger"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "triage"
+to = "route"
+
+[[edges]]
+from = "route"
+when = "simple"
+to = "answer_simple"
+
+[[edges]]
+from = "route"
+when = "complex"
+to = "answer_complex"
+
+[[edges]]
+from = "answer_simple"
+to = "done"
+
+[[edges]]
+from = "answer_complex"
+to = "done"

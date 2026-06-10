@@ -102,7 +102,10 @@ pub fn run_trial(
     }
 
     registry.set_fallback(Box::new(StubHandler));
-    let engine = Engine::new(registry);
+    // Share the metrics arc so the engine's own counters
+    // (node_executions, policy_denials, …) land in the same snapshot
+    // as the intel handler's llm counters — one unified cost view.
+    let engine = Engine::with_metrics(registry, metrics.clone());
 
     let trigger = match scenario.trigger.kind {
         TriggerKind::Manual => TriggerMeta::manual(scenario.trigger.payload.clone()),

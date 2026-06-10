@@ -349,6 +349,35 @@ fn parse_response_headers<R: BufRead>(reader: &mut R) -> Result<(HashMap<String,
     Ok((headers, content_length))
 }
 
+/// Loop-broker entry (RFC 0006): same parse + size caps + client as
+/// the node handler, policy already checked by the caller.
+pub(crate) fn perform_for_loop(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    traceparent: Option<&str>,
+) -> Result<serde_json::Value> {
+    if let Some(b) = body {
+        if b.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(Error::Tool {
+                tool: "http_request".into(),
+                reason: format!(
+                    "request body {} bytes exceeds cap ({MAX_REQUEST_BODY_BYTES})",
+                    b.len()
+                ),
+            });
+        }
+    }
+    let parsed = parse_url(url)?;
+    let response = perform_request(method, &parsed, body, traceparent)?;
+    Ok(json!({
+        "status": response.status,
+        "headers": response.headers,
+        "body": response.body_string,
+        "bytes": response.body_bytes_len,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

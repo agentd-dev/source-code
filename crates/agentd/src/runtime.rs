@@ -173,6 +173,7 @@ struct Args {
     bind: Option<String>,
     timeout_secs: u64,
     intel_unix: Option<PathBuf>,
+    instructions: Option<PathBuf>,
     intel_http: Option<String>,
     intel_http_bearer_file: Option<PathBuf>,
     mcp_stdio: Option<Vec<String>>,
@@ -227,6 +228,7 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         mode: std::env::var("AGENTD_MODE").ok(),
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
+        instructions: env_opt_path("AGENTD_INSTRUCTIONS"),
         intel_http: std::env::var("AGENTD_INTEL_HTTP")
             .ok()
             .filter(|s| !s.trim().is_empty()),
@@ -290,6 +292,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                         "--drain-timeout-secs expects an integer; got `{v}`"
                     ))
                 })?;
+            }
+            "--instructions" => {
+                a.instructions = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
             }
             "--intel-unix" => {
                 a.intel_unix = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
@@ -543,7 +548,7 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     ));
 
     let mut registry = HandlerRegistry::with_builtin_controls();
-    crate::tools::register_default_tools(&mut registry, policy_for_tools, budget);
+    crate::tools::register_default_tools(&mut registry, policy_for_tools.clone(), budget.clone());
 
     // Intelligence adapter (Unix or HTTP). Wrap whichever client
     // the operator selected in a `ReloadableIntelClient` so the
@@ -662,8 +667,9 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
         );
         return Err(ExitCode::from(EXIT_USAGE));
     }
+    let backend_arc = Arc::new(backend_map.clone());
     if !backend_map.is_empty() {
-        crate::intelligence::handler::register(&mut registry, Arc::new(backend_map.clone()));
+        crate::intelligence::handler::register(&mut registry, backend_arc.clone());
     }
 
     // MCP server registry. Composes every `[[mcp_servers]]` entry
@@ -676,6 +682,29 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     let mcp_registry = build_mcp_registry(doc, args, &mcp_allowlist)?;
     if !mcp_registry.is_empty() {
         crate::mcp::handler::register(&mut registry, mcp_registry.clone());
+    }
+
+    // agent_loop node (RFC 0006 §2) — bounded ReAct inside a node.
+    // Registered only when at least one backend exists; its tool
+    // broker reuses the same policy/budget/MCP gates as declared
+    // node kinds. The system prompt comes from --instructions.
+    if !backend_map.is_empty() {
+        let mcp_opt = if mcp_registry.is_empty() {
+            None
+        } else {
+            Some(mcp_registry.clone())
+        };
+        crate::agent::loop_node::register(
+            &mut registry,
+            backend_arc.clone(),
+            policy_for_tools.clone(),
+            budget.clone(),
+            mcp_opt,
+            args.instructions
+                .as_ref()
+                .and_then(|p| crate::agent::AgentInstructions::load(p).ok())
+                .and_then(|i| i.system),
+        );
     }
 
     registry.set_fallback(Box::new(StubHandler));

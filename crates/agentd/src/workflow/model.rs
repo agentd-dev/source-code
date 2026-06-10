@@ -450,6 +450,22 @@ pub enum NodeKind {
         #[serde(default)]
         server: Option<String>,
     },
+    /// A bounded agentic loop as a single node (RFC 0006 §2). The
+    /// model proposes tool calls from the declared subset; the
+    /// runtime executes them through the same policy/budget gates as
+    /// regular nodes; `max_steps` (hard ceiling 64) bounds the loop.
+    AgentLoop {
+        backend: String,
+        #[serde(default)]
+        instructions: Option<String>,
+        #[serde(default)]
+        instructions_from: Option<String>,
+        #[serde(default)]
+        tools: Vec<String>,
+        max_steps: u32,
+        #[serde(default)]
+        max_tokens: Option<u32>,
+    },
     /// Invoke a local binary with argv-style arguments. No shell
     /// interpolation, no PATH lookup — `command` is a literal path.
     /// The optional `args_from` resolves to a JSON array of strings.
@@ -489,6 +505,7 @@ impl NodeKind {
             NodeKind::DiffCompute { .. } => "diff_compute",
             NodeKind::JsonSelect { .. } => "json_select",
             NodeKind::LlmInfer { .. } => "llm_infer",
+            NodeKind::AgentLoop { .. } => "agent_loop",
             NodeKind::WriteFile { .. } => "write_file",
             NodeKind::CreateDir { .. } => "create_dir",
             NodeKind::HttpRequest { .. } => "http_request",
@@ -512,6 +529,7 @@ impl NodeKind {
                 | NodeKind::HttpRequest { .. }
                 | NodeKind::CallMcpTool { .. }
                 | NodeKind::ShellRun { .. }
+                | NodeKind::AgentLoop { .. }
         )
     }
 }

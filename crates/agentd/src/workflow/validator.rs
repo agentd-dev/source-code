@@ -78,6 +78,7 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     check_start_node_entries(doc, &node_ids, &mut r);
     check_edges(doc, &node_ids, &mut r);
     check_mcp_nodes(doc, &mut r);
+    check_agent_loops(doc, &mut r);
 
     // Graph-level checks only make sense once every edge references a
     // known node. Skip them if dangling edges were detected so the
@@ -258,6 +259,65 @@ fn check_mcp_nodes(doc: &WorkflowDoc, r: &mut ValidationReport) {
                     // here since it requires cross-referencing CLI
                     // args that validator doesn't have access to.)
                 }
+            }
+        }
+    }
+}
+
+/// Validate `agent_loop` nodes: bounded steps, an instruction
+/// source, and a tool subset drawn from the known loop vocabulary.
+fn check_agent_loops(doc: &WorkflowDoc, r: &mut ValidationReport) {
+    use crate::workflow::model::NodeKind;
+    for node in &doc.nodes {
+        let NodeKind::AgentLoop {
+            instructions,
+            instructions_from,
+            tools,
+            max_steps,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        if *max_steps == 0 || *max_steps > crate::agent::loop_node::MAX_STEPS_CEILING {
+            r.issues.push(ValidationIssue::new(
+                "agent_loop_steps_out_of_range",
+                format!(
+                    "node `{}`: max_steps must be 1..={} (got {max_steps})",
+                    node.id,
+                    crate::agent::loop_node::MAX_STEPS_CEILING
+                ),
+            ));
+        }
+        if instructions.is_none() && instructions_from.is_none() {
+            r.issues.push(ValidationIssue::new(
+                "agent_loop_missing_instructions",
+                format!(
+                    "node `{}`: one of `instructions` / `instructions_from` is required",
+                    node.id
+                ),
+            ));
+        }
+        if tools.is_empty() {
+            r.issues.push(ValidationIssue::new(
+                "agent_loop_no_tools",
+                format!(
+                    "node `{}`: `tools` must list at least one of: {}",
+                    node.id,
+                    crate::agent::loop_node::LOOP_TOOLS.join(", ")
+                ),
+            ));
+        }
+        for t in tools {
+            if !crate::agent::loop_node::LOOP_TOOLS.contains(&t.as_str()) {
+                r.issues.push(ValidationIssue::new(
+                    "agent_loop_unknown_tool",
+                    format!(
+                        "node `{}`: `{t}` is not a loop tool (known: {})",
+                        node.id,
+                        crate::agent::loop_node::LOOP_TOOLS.join(", ")
+                    ),
+                ));
             }
         }
     }
@@ -735,5 +795,52 @@ mod tests {
 
         let r = validate(&doc);
         assert!(r.ok(), "issues: {:?}", r.issues);
+    }
+
+    #[test]
+    fn agent_loop_constraints_enforced() {
+        use crate::workflow::model::NodeKind;
+        let mk = |max_steps: u32, tools: Vec<&str>, instructions: Option<&str>| WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("a"))],
+            nodes: vec![n(
+                "a",
+                NodeKind::AgentLoop {
+                    backend: "default".into(),
+                    instructions: instructions.map(Into::into),
+                    instructions_from: None,
+                    tools: tools.into_iter().map(String::from).collect(),
+                    max_steps,
+                    max_tokens: None,
+                },
+            )],
+            ..Default::default()
+        };
+        assert!(validate(&mk(8, vec!["read_file"], Some("go"))).ok());
+        assert!(
+            validate(&mk(0, vec!["read_file"], Some("go")))
+                .codes()
+                .contains(&"agent_loop_steps_out_of_range")
+        );
+        assert!(
+            validate(&mk(999, vec!["read_file"], Some("go")))
+                .codes()
+                .contains(&"agent_loop_steps_out_of_range")
+        );
+        assert!(
+            validate(&mk(8, vec!["read_file"], None))
+                .codes()
+                .contains(&"agent_loop_missing_instructions")
+        );
+        assert!(
+            validate(&mk(8, vec![], Some("go")))
+                .codes()
+                .contains(&"agent_loop_no_tools")
+        );
+        assert!(
+            validate(&mk(8, vec!["format_disk"], Some("go")))
+                .codes()
+                .contains(&"agent_loop_unknown_tool")
+        );
     }
 }

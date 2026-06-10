@@ -25,6 +25,7 @@
 //! | [`triggers`]      | HTTP trigger server (feature-gated)                    |
 //! | [`workflow`]      | Workflow doc model + TOML parse + DAG validator        |
 
+pub mod agent;
 #[cfg(feature = "auth")]
 pub mod auth;
 pub mod budget;

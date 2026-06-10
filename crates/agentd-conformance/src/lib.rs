@@ -11,6 +11,7 @@
 //! Scenarios are tagged against a capability matrix, so corpus
 //! coverage doubles as goal tracking.
 
+pub mod capability;
 pub mod harness;
 pub mod report;
 pub mod scenario;
@@ -18,6 +19,7 @@ pub mod scenario;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use capability::Coverage;
 pub use harness::{Cost, TrialOutcome};
 pub use report::SuiteReport;
 pub use scenario::Scenario;

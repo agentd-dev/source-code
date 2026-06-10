@@ -6,6 +6,7 @@
 
 use serde_json::{Value, json};
 
+use crate::capability::Coverage;
 use crate::{Cost, ScenarioReport};
 
 /// The result of running a whole corpus.
@@ -39,6 +40,11 @@ impl SuiteReport {
             return 0.0;
         }
         self.scenarios.iter().map(|s| s.pass_k()).sum::<f64>() / self.scenarios.len() as f64
+    }
+
+    /// Capability-matrix coverage across the passing scenarios.
+    pub fn coverage(&self) -> Coverage {
+        Coverage::compute(&self.scenarios)
     }
 
     /// Sum of each scenario's representative per-run cost.
@@ -86,12 +92,29 @@ impl SuiteReport {
             cost.llm_calls,
             cost.llm_tokens,
         ));
+        let cov = self.coverage();
+        s.push_str(&format!(
+            "coverage: {}/{} capabilities ({:.0}%)\n",
+            cov.covered.len(),
+            crate::capability::matrix().len(),
+            cov.fraction() * 100.0,
+        ));
+        if !cov.uncovered.is_empty() {
+            s.push_str(&format!("  uncovered: {}\n", cov.uncovered.join(", ")));
+        }
+        if !cov.unknown_tags.is_empty() {
+            s.push_str(&format!(
+                "  WARNING unknown capability tags: {}\n",
+                cov.unknown_tags.join(", ")
+            ));
+        }
         s
     }
 
     /// Machine-readable form for CI dashboards and trend tracking.
     pub fn to_json(&self) -> Value {
         let cost = self.total_cost();
+        let cov = self.coverage();
         let scenarios: Vec<Value> = self
             .scenarios
             .iter()
@@ -123,6 +146,13 @@ impl SuiteReport {
                 "mean_pass_k": self.mean_pass_k(),
                 "total_llm_calls": cost.llm_calls,
                 "total_llm_tokens": cost.llm_tokens,
+                "coverage": {
+                    "covered": cov.covered.len(),
+                    "total": crate::capability::matrix().len(),
+                    "fraction": cov.fraction(),
+                    "uncovered": cov.uncovered,
+                    "unknown_tags": cov.unknown_tags,
+                },
             },
             "scenarios": scenarios,
         })

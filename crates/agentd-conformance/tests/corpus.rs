@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use agentd_conformance::{discover_scenarios, run_scenario_file};
+use agentd_conformance::{discover_scenarios, run_corpus, run_scenario_file};
 
 #[test]
 fn conformance_corpus_all_pass() {
@@ -26,5 +26,17 @@ fn conformance_corpus_all_pass() {
         "{} conformance scenario(s) failed:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+#[test]
+fn corpus_capability_tags_are_all_known() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let suite = run_corpus(&root).expect("run corpus");
+    let cov = suite.coverage();
+    assert!(
+        cov.unknown_tags.is_empty(),
+        "corpus uses capability tags not in the matrix: {:?}",
+        cov.unknown_tags
     );
 }

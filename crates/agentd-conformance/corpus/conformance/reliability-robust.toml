@@ -1,6 +1,6 @@
 name = "reliability-robust"
 description = "Under model nondeterminism (8 trials, 3 response variants) a bounded workflow that routes every possible answer holds pass^8 = 1.0."
-capabilities = ["llm_infer", "switch", "terminate"]
+capabilities = ["llm_infer", "switch", "terminate", "trigger_manual", "reliability_passk"]
 trials = 8
 
 [workflow]

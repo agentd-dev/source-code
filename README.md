@@ -153,17 +153,29 @@ to put work on it — pick the least dynamic one that does the job:
 |---|---|---|---|
 | **Workflow** | a TOML DAG | executes it | the steps are known and repeatable |
 | **`agent_loop` node** | a node with a goal + tool subset + `max_steps` | runs a bounded ReAct loop *inside that node* | one step needs open-ended investigation, the rest is fixed |
-| **Goal** | `--goal "…"` + instructions | plans its own workflow → validates it → (on approval) runs it → re-plans on failure | authoring the graph is the hard part |
+| **Instruction** | `--instruction "…"` (string or `@file`) + optional environment | compiles its own workflow from the instruction → validates it → (on approval) runs it → re-plans on failure | authoring the graph is the hard part |
 
 ```bash
-# Mode 3 — the agent writes and runs its own workflow
-ANTHROPIC_API_KEY=… agentd \
-  --goal "Audit access logs under /var/log/app and write a summary" \
-  --instructions agent.toml --plan-only        # inspect first
+# Mode 3 — hand the agent an instruction; it compiles a workflow and runs it
+ANTHROPIC_API_KEY=… agentd --config prod.toml \
+  --instruction "Audit access logs under /var/log/app and write a summary" \
+  --plan-only                                  # inspect the compiled workflow first
 # ...looks right? add --auto-approve to execute (headless refuses without it)
+
+# The instruction can come from a file, or stand permanently in the agent spec:
+agentd --config prod.toml --instruction @./task.md --auto-approve
+agentd --config prod.toml --instructions agent.toml --auto-approve   # task lives in agent.toml
 ```
 
-Goal mode's plan is a normal workflow file — print it, diff it, sign it,
+Before planning, the agent injects its **actual** capabilities into the
+planner prompt — only the node kinds this binary can execute, the configured
+intelligence backends, the MCP servers and their tools, and the active policy
+allowlists. It plans within that catalogue; it cannot reference a tool the
+build lacks or widen its own policy. The compiled plan is grafted onto the
+`--config` environment, so it inherits that file's policy, budgets, backends,
+and MCP servers verbatim — the generated graph supplies only shape.
+
+The compiled plan is a normal workflow file — print it, diff it, sign it,
 promote it into Mode 1 once it's proven. The `agent_loop` node's model sees
 only the tools you listed and runs every call through the same policy gates
 a declared node would; `max_steps` (hard ceiling 64) and a token budget
@@ -227,7 +239,7 @@ and `MAX_STEPS`.
 
 | Surface | What ships |
 |---|---|
-| **Execution modes** | declared workflows · `agent_loop` bounded-ReAct nodes · goal mode (agent plans its own workflow, approval-gated, bounded re-planning) |
+| **Execution modes** | declared workflows · `agent_loop` bounded-ReAct nodes · instruction mode (agent compiles its own workflow from a natural-language instruction, capability-injected, approval-gated, bounded re-planning) |
 | **Node kinds** | `read_file` `read_env` `read_mcp_resource` `parse_json` · `template_render` `json_select` `diff_compute` · `llm_infer` `agent_loop` · `write_file` `create_dir` `http_request` `call_mcp_tool` `shell_run` · `condition` `switch` `merge` `fail` `terminate` |
 | **Models** | named backends: Anthropic · OpenAI · Gemini · OpenAI-compatible (vLLM/Ollama/gateways) · Unix-socket & HTTP JSON-RPC; keys via env only; hot-reloadable |
 | **Triggers** | HTTP/1.1 server (hand-rolled, keep-alive, drain-on-SIGTERM), cron + interval, fs-watch (debounced), manual |
@@ -283,8 +295,8 @@ architectural, not prompt-engineered:
 Honesty section. A frozen graph is the wrong tool when:
 
 - **You need fully open-ended, unbounded autonomy** — an agent that runs
-  for hours redirecting itself with no ceiling. `agent_loop` and goal mode
-  are deliberately *bounded* (step caps, token budgets, approval gates);
+  for hours redirecting itself with no ceiling. `agent_loop` and instruction
+  mode are deliberately *bounded* (step caps, token budgets, approval gates);
   if you want an agent with no governor, that's a different tool.
 - **You need durable, resumable multi-day executions.** Runs are
   in-memory and bounded; a crash re-runs rather than resuming mid-graph.

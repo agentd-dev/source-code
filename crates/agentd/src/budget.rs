@@ -237,8 +237,16 @@ pub fn apply_rlimits(_cfg: &BudgetConfig) {
     // Exotic targets (wasm, etc.) — no process-wide budget primitive.
 }
 
+/// glibc spells the setrlimit resource type `__rlimit_resource_t`;
+/// macOS / BSD libc uses a plain `c_int`. Alias per-OS so the call
+/// compiles everywhere Unix.
+#[cfg(all(unix, target_os = "linux"))]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(target_os = "linux")))]
+type RlimitResource = libc::c_int;
+
 #[cfg(unix)]
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, label: &str, display_val: u64) {
+fn set_rlimit(resource: RlimitResource, value: u64, label: &str, display_val: u64) {
     // `rlim_t` is `u64` on Linux and `RLIM_INFINITY == u64::MAX`,
     // so no clamp is needed; an operator who passes `u64::MAX`
     // gets exactly the "no effective limit" they asked for.

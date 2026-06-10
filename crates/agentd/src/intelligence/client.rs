@@ -5,6 +5,7 @@
 //! JSON-RPC envelope and length framing live in `protocol.rs`.
 
 use std::sync::{Arc, Mutex};
+#[cfg(any(unix, feature = "intel-http"))]
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -624,6 +625,7 @@ mod tests {
     }
 
     // Silence the unused-imports warning if the Write import migrates.
+    #[cfg(unix)]
     fn _retain_write_import_for_future_use() {
         let _w: Option<Box<dyn Write>> = None;
         let _r: Option<Box<dyn Read>> = None;

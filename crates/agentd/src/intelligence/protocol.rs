@@ -55,6 +55,7 @@ pub struct Usage {
 // JSON-RPC 2.0 envelope types (used by the Unix transport)
 // ---------------------------------------------------------------------------
 
+#[cfg(any(unix, feature = "intel-http"))]
 #[derive(Debug, Serialize)]
 pub(crate) struct RpcRequest<'a> {
     pub jsonrpc: &'static str,
@@ -63,6 +64,7 @@ pub(crate) struct RpcRequest<'a> {
     pub params: &'a Request,
 }
 
+#[cfg(any(unix, feature = "intel-http"))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct RpcResponse {
     #[allow(dead_code)]
@@ -73,6 +75,7 @@ pub(crate) struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
+#[cfg(any(unix, feature = "intel-http"))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct RpcError {
     pub code: i32,
@@ -83,11 +86,12 @@ pub(crate) struct RpcError {
 // Length-framed I/O helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 use std::io::{self, Read, Write};
 
 /// Write one length-framed JSON frame: 4-byte little-endian byte
-/// count followed by the payload. Matches the ecosystem's
-/// `agentd::transport::framing` encoding.
+/// count followed by the payload.
+#[cfg(unix)]
 pub(crate) fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds u32::MAX bytes"))?;
@@ -99,6 +103,7 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()>
 
 /// Read one length-framed JSON frame. Hard cap at 16 MiB to avoid
 /// unbounded allocation on a misbehaving server.
+#[cfg(unix)]
 pub(crate) fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     const MAX_FRAME: usize = 16 * 1024 * 1024;
     let mut len_buf = [0u8; 4];

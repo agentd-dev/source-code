@@ -60,6 +60,10 @@ policy-rego = ["dep:regorus"]
 # Intelligence transports.
 intel-unix = []
 intel-http = []
+# Remote LLM providers (Anthropic / OpenAI / Gemini /
+# openai-compatible) for `[[intelligence.backends]]`. Pulls `ureq`
+# (blocking, rustls) — no async runtime enters the core.
+intel-remote = ["dep:ureq"]
 
 # HTTP auth (bearer + HMAC webhook verification).
 auth = ["dep:sha2", "dep:hmac"]
@@ -117,6 +121,8 @@ x509-parser = { version = "0.16", optional = true, default-features = false }
 ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "pkcs8", "pem"] }
 base64 = { version = "0.22", optional = true, default-features = false, features = ["std"] }
 jsonwebtoken = { version = "9", optional = true, default-features = false, features = ["use_pem"] }
+# Blocking HTTPS client for remote LLM providers (rustls-backed).
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 # Pure-Rust cron expression parser + schedule iterator.
 cron = { version = "0.12", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["std", "clock"] }

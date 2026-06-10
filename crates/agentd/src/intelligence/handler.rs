@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 
 use crate::engine::{ExecutionContext, HandlerRegistry, NodeHandler, NodeOutcome};
 use crate::error::{Error, Result};
-use crate::intelligence::client::IntelligenceRef;
+use crate::intelligence::backends::BackendMap;
+use crate::intelligence::client::IntelligenceClient;
 use crate::intelligence::protocol::{Message, Request};
 use crate::workflow::{Node, NodeKind};
 
@@ -28,11 +29,11 @@ use crate::workflow::{Node, NodeKind};
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register the `llm_infer` handler on a registry, using `client` as
-/// the default backend for any `LlmInfer { backend: "default", .. }`
-/// node. Additional backends can be layered later.
-pub fn register(registry: &mut HandlerRegistry, client: IntelligenceRef) {
-    registry.register("llm_infer", Box::new(LlmInferHandler::new(client)));
+/// Register the `llm_infer` handler on a registry. `backends` maps
+/// names to transports; `"default"` is the CLI-configured socket
+/// transport when present (RFC 0006 §3).
+pub fn register(registry: &mut HandlerRegistry, backends: BackendMap) {
+    registry.register("llm_infer", Box::new(LlmInferHandler::new(backends)));
 }
 
 // ---------------------------------------------------------------------------
@@ -40,15 +41,15 @@ pub fn register(registry: &mut HandlerRegistry, client: IntelligenceRef) {
 // ---------------------------------------------------------------------------
 
 pub struct LlmInferHandler {
-    default_client: IntelligenceRef,
+    backends: BackendMap,
     /// Max tokens applied when a node doesn't override it.
     default_max_tokens: u32,
 }
 
 impl LlmInferHandler {
-    pub fn new(default_client: IntelligenceRef) -> Self {
+    pub fn new(backends: BackendMap) -> Self {
         Self {
-            default_client,
+            backends,
             default_max_tokens: 1024,
         }
     }
@@ -78,15 +79,21 @@ impl NodeHandler for LlmInferHandler {
             });
         };
 
-        // Phase 4 supports a single default backend. Named backends
-        // land once the workflow config carries `[intelligence.*]`
-        // sections (Phase 6/7).
-        if backend != "default" {
-            return Err(Error::Intelligence(format!(
-                "backend `{backend}` is not configured on this runtime; \
-                 only `default` is currently supported"
-            )));
-        }
+        // Resolve the named backend (RFC 0006 §3). `"default"` is
+        // the CLI socket transport; everything else comes from
+        // `[[intelligence.backends]]`.
+        let client = self.backends.get(backend.as_str()).ok_or_else(|| {
+            let mut known: Vec<&str> = self.backends.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            Error::Intelligence(format!(
+                "backend `{backend}` is not configured on this runtime; known backends: {}",
+                if known.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))
+        })?;
 
         // Dry-run: skip the actual call so CI / preview runs don't
         // burn tokens (RFC §22.2). Emit a visible placeholder so
@@ -121,7 +128,7 @@ impl NodeHandler for LlmInferHandler {
             max_tokens: Some(self.default_max_tokens),
             temperature: None,
         };
-        let response = self.default_client.complete(&request)?;
+        let response = client.complete(&request)?;
 
         // Optional parse. If a schema is declared, the model must
         // return JSON; otherwise the raw content becomes the output.
@@ -207,6 +214,7 @@ fn walk<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
     use crate::engine::context::{RunOptions, TriggerMeta};
+    use crate::intelligence::backends::single_backend;
     use crate::intelligence::client::MockClient;
     use crate::intelligence::protocol::Response;
     use std::sync::Arc;
@@ -238,7 +246,7 @@ mod tests {
     fn handler_dispatches_rendered_prompt() {
         let mock = Arc::new(MockClient::new());
         mock.enqueue_text("summary line");
-        let h = LlmInferHandler::new(mock.clone());
+        let h = LlmInferHandler::new(single_backend(mock.clone()));
 
         let mut c = ctx(json!({ "author": "Ada", "doc": "v1" }));
         let out = h
@@ -266,7 +274,7 @@ mod tests {
     fn dry_run_short_circuits() {
         let mock = Arc::new(MockClient::new());
         // No response enqueued — proving the client is never called.
-        let h = LlmInferHandler::new(mock.clone());
+        let h = LlmInferHandler::new(single_backend(mock.clone()));
         let mut c = ctx(json!({}));
         c.dry_run = true;
         let out = h
@@ -286,7 +294,7 @@ mod tests {
     fn output_schema_requires_valid_json() {
         let mock = Arc::new(MockClient::new());
         mock.enqueue_text("not json");
-        let h = LlmInferHandler::new(mock);
+        let h = LlmInferHandler::new(single_backend(mock));
         let mut c = ctx(json!({}));
         let err = h
             .handle(&node_with("classify", None, Some("decision.json")), &mut c)
@@ -301,7 +309,7 @@ mod tests {
             content: r#"{"decision":"comment"}"#.into(),
             usage: Default::default(),
         });
-        let h = LlmInferHandler::new(mock);
+        let h = LlmInferHandler::new(single_backend(mock));
         let mut c = ctx(json!({}));
         let out = h
             .handle(&node_with("classify", None, Some("decision.json")), &mut c)
@@ -317,7 +325,7 @@ mod tests {
     #[test]
     fn unknown_backend_errors_cleanly() {
         let mock = Arc::new(MockClient::new());
-        let h = LlmInferHandler::new(mock);
+        let h = LlmInferHandler::new(single_backend(mock));
         let mut c = ctx(json!({}));
 
         let err = h

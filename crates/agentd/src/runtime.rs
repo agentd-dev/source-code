@@ -561,7 +561,6 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
                 let reloadable = Arc::new(crate::intelligence::client::ReloadableIntelClient::new(
                     initial,
                 ));
-                crate::intelligence::handler::register(&mut registry, reloadable.clone());
                 Some(reloadable)
             }
             #[cfg(not(unix))]
@@ -589,10 +588,6 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
                             let reloadable = Arc::new(
                                 crate::intelligence::client::ReloadableIntelClient::new(initial),
                             );
-                            crate::intelligence::handler::register(
-                                &mut registry,
-                                reloadable.clone(),
-                            );
                             Some(reloadable)
                         }
                         Err(e) => {
@@ -617,6 +612,60 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
             h
         };
 
+    // Named intelligence backends (RFC 0006 §3). Compose the CLI
+    // `default` transport (when present) with every
+    // `[[intelligence.backends]]` entry; the llm_infer handler
+    // resolves nodes' `backend` names against this map.
+    let named_defs: &[crate::intelligence::backends::BackendDef] = doc
+        .intelligence
+        .as_ref()
+        .map(|i| i.backends.as_slice())
+        .unwrap_or(&[]);
+    if let Err(e) = crate::intelligence::backends::BackendDef::validate_list(named_defs) {
+        eprintln!("agentd: {e}");
+        return Err(ExitCode::from(EXIT_USAGE));
+    }
+    let mut backend_map: std::collections::HashMap<
+        String,
+        Arc<crate::intelligence::client::ReloadableIntelClient>,
+    > = std::collections::HashMap::new();
+    if let Some(default) = &intel_reload {
+        backend_map.insert("default".to_string(), default.clone());
+    }
+    let mut named_backends: std::collections::HashMap<
+        String,
+        Arc<crate::intelligence::client::ReloadableIntelClient>,
+    > = std::collections::HashMap::new();
+    #[cfg(feature = "intel-remote")]
+    for def in named_defs {
+        let client = match crate::intelligence::providers::RemoteClient::from_def(
+            def,
+            Duration::from_secs(args.timeout_secs.max(1)),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("agentd: {e}");
+                return Err(ExitCode::from(EXIT_USAGE));
+            }
+        };
+        let reloadable = Arc::new(crate::intelligence::client::ReloadableIntelClient::new(
+            Box::new(client),
+        ));
+        named_backends.insert(def.name.clone(), reloadable.clone());
+        backend_map.insert(def.name.clone(), reloadable);
+    }
+    #[cfg(not(feature = "intel-remote"))]
+    if !named_defs.is_empty() {
+        eprintln!(
+            "agentd: workflow declares [[intelligence.backends]] but this build \
+             lacks the `intel-remote` Cargo feature; rebuild with --features intel-remote"
+        );
+        return Err(ExitCode::from(EXIT_USAGE));
+    }
+    if !backend_map.is_empty() {
+        crate::intelligence::handler::register(&mut registry, Arc::new(backend_map.clone()));
+    }
+
     // MCP server registry. Composes every `[[mcp_servers]]` entry
     // plus (when set) the legacy `--mcp-stdio CMD ARG` as an
     // implicit `{name = "default", ..}` server. Each entry's child
@@ -634,6 +683,7 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
         Engine::new(registry).with_reload_handles(crate::engine::ReloadHandles {
             policy: Some(reloadable_policy),
             intel: intel_reload,
+            intel_backends: named_backends,
             mcp: Some(mcp_registry),
         }),
     )
@@ -1350,6 +1400,60 @@ fn run_reload(
                     reason = %e,
                 );
                 return;
+            }
+        }
+    }
+
+    // Reload named intelligence backends — re-validate the new
+    // doc's defs and rebuild matching clients (re-reads api_key_env
+    // so key rotation lands). Unknown-to-the-process names are
+    // ignored with an audit note: adding whole backends still
+    // requires a restart (the handler map is registry-bound).
+    #[cfg(feature = "intel-remote")]
+    if !engine.reload.intel_backends.is_empty() {
+        let defs: &[crate::intelligence::backends::BackendDef] = doc
+            .intelligence
+            .as_ref()
+            .map(|i| i.backends.as_slice())
+            .unwrap_or(&[]);
+        if let Err(e) = crate::intelligence::backends::BackendDef::validate_list(defs) {
+            tracing::error!(
+                target: "agentd::audit",
+                event = "reload.failed",
+                stage = "intel_backends",
+                reason = %e,
+            );
+            return;
+        }
+        for (name, handle) in &engine.reload.intel_backends {
+            let Some(def) = defs.iter().find(|d| &d.name == name) else {
+                tracing::warn!(
+                    target: "agentd::audit",
+                    event = "reload.intel_backend_dropped_from_config",
+                    backend = %name,
+                );
+                continue;
+            };
+            match crate::intelligence::providers::RemoteClient::from_def(
+                def,
+                Duration::from_secs(args.timeout_secs.max(1)),
+            ) {
+                Ok(client) => {
+                    handle.swap(Box::new(client));
+                    tracing::info!(
+                        target: "agentd::audit",
+                        event = "reload.intel_backend",
+                        backend = %name,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agentd::audit",
+                        event = "reload.intel_backend_failed",
+                        backend = %name,
+                        reason = %format!("{e}"),
+                    );
+                }
             }
         }
     }

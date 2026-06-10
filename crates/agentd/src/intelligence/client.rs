@@ -443,7 +443,22 @@ pub struct ReloadableIntelClient {
     inner: arc_swap::ArcSwap<Box<dyn IntelligenceClient>>,
 }
 
+/// Forwarder so an already-shared `Arc<dyn IntelligenceClient>`
+/// (tests, embedders) can sit behind the reloadable wrapper.
+struct SharedClient(IntelligenceRef);
+impl IntelligenceClient for SharedClient {
+    fn complete(&self, request: &Request) -> Result<Response> {
+        self.0.complete(request)
+    }
+}
+
 impl ReloadableIntelClient {
+    /// Wrap a shared handle. Test + embedder convenience; the
+    /// runtime path constructs owned transports via [`Self::new`].
+    pub fn from_ref(inner: IntelligenceRef) -> Self {
+        Self::new(Box::new(SharedClient(inner)))
+    }
+
     /// Wrap an initial client. Returned value implements
     /// [`IntelligenceClient`]; put it in an `Arc` and pass it to
     /// `intelligence::handler::register` exactly like any other

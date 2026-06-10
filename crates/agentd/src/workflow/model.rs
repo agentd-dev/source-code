@@ -102,6 +102,13 @@ pub struct WorkflowDoc {
     /// for back-compat as the default-named server).
     #[serde(default, rename = "mcp_servers")]
     pub mcp_servers: Vec<crate::mcp::config::McpServerDef>,
+
+    /// Optional `[intelligence]` block — named LLM backends
+    /// (RFC 0006 §3). `llm_infer` / `agent_loop` nodes reference
+    /// entries by name; `"default"` stays reserved for the CLI
+    /// socket transports.
+    #[serde(default)]
+    pub intelligence: Option<crate::intelligence::backends::IntelligenceConfig>,
 }
 
 impl WorkflowDoc {

@@ -11,6 +11,7 @@
 //!   TOML, the standard validator judges it, an approval gate
 //!   decides whether it runs, and failures get bounded re-planning.
 
+pub mod catalog;
 pub mod instructions;
 pub mod loop_node;
 pub mod planner;

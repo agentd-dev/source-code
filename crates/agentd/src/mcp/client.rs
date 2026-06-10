@@ -361,7 +361,10 @@ impl McpClient for MockMcpClient {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Child-process transport tests drive real fds — Unix-only by
+// construction; the mock-path coverage rides along since CI runs
+// the suite on Linux + macOS.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};

@@ -219,6 +219,7 @@ to = "missing"
 // Dry-run
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "tools-fs", feature = "tools-data"))]
 #[test]
 fn dry_run_does_not_touch_disk() {
     let dir = TempDir::new().unwrap();
@@ -275,6 +276,7 @@ to = "done"
 // Write-file round trip
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "tools-fs", feature = "tools-data"))]
 #[test]
 fn end_to_end_write_file_through_cli() {
     let dir = TempDir::new().unwrap();
@@ -389,6 +391,7 @@ when = "false"
 // Policy
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "tools-fs", feature = "tools-data"))]
 #[test]
 fn workflow_policy_denies_writes_outside_allowlist() {
     let dir = TempDir::new().unwrap();
@@ -955,6 +958,7 @@ type = "terminate"
 // Rate limiting
 // ---------------------------------------------------------------------------
 
+#[cfg(all(feature = "trigger-http", feature = "auth"))]
 #[test]
 fn rate_limit_returns_429_after_burst() {
     let _lock = http_smoke_lock();
@@ -1429,7 +1433,7 @@ to = "b"
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "trigger-http"))]
 fn sigterm_triggers_clean_shutdown() {
     let _lock = http_smoke_lock();
     use std::time::Duration;
@@ -1515,6 +1519,7 @@ type = "terminate"
 // Serve mode — infer from http_routes, connect, shoot the binary
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "trigger-http")]
 #[test]
 fn serve_mode_inferred_from_http_routes() {
     let _lock = http_smoke_lock();

@@ -223,6 +223,7 @@ mod tests {
         reset();
     }
 
+    #[cfg(unix)]
     #[test]
     fn clear_reload_clears_only_reload() {
         reset();

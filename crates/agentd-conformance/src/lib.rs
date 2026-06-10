@@ -12,12 +12,14 @@
 //! coverage doubles as goal tracking.
 
 pub mod harness;
+pub mod report;
 pub mod scenario;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use harness::{Cost, TrialOutcome};
+pub use report::SuiteReport;
 pub use scenario::Scenario;
 
 /// Aggregate result of running every trial of one scenario.
@@ -131,6 +133,14 @@ pub fn run_scenario_file(path: &Path) -> ScenarioReport {
             load_error: Some(e),
         },
     }
+}
+
+/// Discover and run every scenario under `root`, aggregating into a
+/// [`SuiteReport`].
+pub fn run_corpus(root: &Path) -> std::io::Result<SuiteReport> {
+    let files = discover_scenarios(root)?;
+    let scenarios = files.iter().map(|p| run_scenario_file(p)).collect();
+    Ok(SuiteReport::new(scenarios))
 }
 
 /// Recursively collect scenario `*.toml` files under `root`, sorted.

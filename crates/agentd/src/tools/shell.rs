@@ -160,6 +160,18 @@ impl NodeHandler for ShellRunHandler {
     }
 }
 
+/// Loop-broker entry (RFC 0006): policy already checked by the
+/// caller; default timeout applies.
+pub(crate) fn run_for_loop(command: &Path, args: &[String]) -> Result<serde_json::Value> {
+    let outcome = run(command, args, Duration::from_secs(DEFAULT_TIMEOUT_SECS))?;
+    Ok(json!({
+        "exit_code": outcome.exit_code,
+        "stdout": outcome.stdout,
+        "stderr": outcome.stderr,
+        "timed_out": outcome.timed_out,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Spawn + capture + timeout
 // ---------------------------------------------------------------------------

@@ -2,13 +2,16 @@
 //! binary. No subcommands — behaviour derives from the loaded
 //! workflow, with flag + env-var overrides.
 
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::{BufReader, BufWriter};
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(unix)]
 use std::thread;
 
 use serde_json::Value;

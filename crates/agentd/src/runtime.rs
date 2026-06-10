@@ -64,6 +64,13 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         }
     };
 
+    // Goal mode (RFC 0006 §3): the agent plans its own workflow.
+    // Resolved before config loading — `--goal` and `--config` are
+    // mutually exclusive entry points.
+    if let Some(goal) = args.goal.clone() {
+        return run_goal_mode(&goal, &args, &tracing_overrides);
+    }
+
     // Resolve the workflow. CLI / env --config wins; then an embedded
     // config if the build baked one in; then nothing (usage error).
     // No tracing yet — pre-init errors go to stderr as plain text so
@@ -174,6 +181,12 @@ struct Args {
     timeout_secs: u64,
     intel_unix: Option<PathBuf>,
     instructions: Option<PathBuf>,
+    /// `--goal TEXT` / `--goal @file` — goal mode (RFC 0006 §3).
+    goal: Option<String>,
+    plan_only: bool,
+    auto_approve: bool,
+    plan_out: Option<PathBuf>,
+    max_replans: u32,
     intel_http: Option<String>,
     intel_http_bearer_file: Option<PathBuf>,
     mcp_stdio: Option<Vec<String>>,
@@ -229,6 +242,13 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
         instructions: env_opt_path("AGENTD_INSTRUCTIONS"),
+        goal: std::env::var("AGENTD_GOAL")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        plan_only: env_bool("AGENTD_PLAN_ONLY"),
+        auto_approve: env_bool("AGENTD_AUTO_APPROVE"),
+        plan_out: env_opt_path("AGENTD_PLAN_OUT"),
+        max_replans: env_u64("AGENTD_MAX_REPLANS", 2) as u32,
         intel_http: std::env::var("AGENTD_INTEL_HTTP")
             .ok()
             .filter(|s| !s.trim().is_empty()),
@@ -291,6 +311,20 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                     ArgErr::Usage(format!(
                         "--drain-timeout-secs expects an integer; got `{v}`"
                     ))
+                })?;
+            }
+            "--goal" => {
+                a.goal = Some(require_value(argv, &mut i, arg)?.to_string());
+            }
+            "--plan-only" => a.plan_only = true,
+            "--auto-approve" => a.auto_approve = true,
+            "--plan-out" => {
+                a.plan_out = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--max-replans" => {
+                let v = require_value(argv, &mut i, arg)?;
+                a.max_replans = v.parse::<u32>().map_err(|_| {
+                    ArgErr::Usage(format!("--max-replans expects an integer; got `{v}`"))
                 })?;
             }
             "--instructions" => {
@@ -1563,6 +1597,197 @@ fn run_serve_mode(
          workflow as `--mode once`."
     );
     ExitCode::from(EXIT_USAGE)
+}
+
+// ---------------------------------------------------------------------------
+// Goal mode (RFC 0006 §3)
+// ---------------------------------------------------------------------------
+
+fn run_goal_mode(goal_arg: &str, args: &Args, tracing_overrides: &TracingOverrides) -> ExitCode {
+    // Logging: goal mode has no workflow `[logging]`, so CLI/env
+    // overrides over defaults.
+    let bare = WorkflowDoc::default();
+    let resolved = resolve_logging(&bare, tracing_overrides);
+    let _ = crate::observability::apply(&resolved);
+
+    // `--goal @file` reads the goal from a file.
+    let goal = match goal_arg.strip_prefix('@') {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("agentd: failed to read goal file {path}: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => goal_arg.to_string(),
+    };
+
+    let instructions = match &args.instructions {
+        Some(p) => match crate::agent::AgentInstructions::load(p) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("agentd: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => crate::agent::AgentInstructions::default(),
+    };
+
+    // The planner needs a backend. Goal mode requires at least one
+    // configured intelligence transport.
+    let planner_client = match build_goal_planner_client(args, &instructions) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    let ctx = crate::agent::planner::PlanContext {
+        system: instructions.system.as_deref(),
+        policy_summary: "no policy block — goal mode plans run under                          AllowAll unless you pass a workflow with [policy].                          Prefer narrow tools."
+            .to_string(),
+        backends: Vec::new(),
+    };
+
+    let plan = match crate::agent::planner::generate(
+        planner_client.as_ref(),
+        &goal,
+        &ctx,
+        args.max_replans,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("agentd: {e}");
+            return ExitCode::from(EXIT_SEMANTIC);
+        }
+    };
+
+    eprintln!(
+        "agentd: planned workflow `{}` in {} attempt(s):
+",
+        plan.doc.name, plan.attempts
+    );
+    println!("{}", plan.source);
+
+    if let Some(out) = &args.plan_out {
+        if let Err(e) = fs::write(out, &plan.source) {
+            eprintln!("agentd: failed to write plan to {}: {e}", out.display());
+            return ExitCode::from(EXIT_SEMANTIC);
+        }
+        eprintln!("agentd: plan written to {}", out.display());
+    }
+
+    if args.plan_only {
+        return ExitCode::from(EXIT_OK);
+    }
+
+    // Governance gate (RFC 0006 §2): a generated plan does NOT run
+    // without approval. Headless runs must opt in explicitly.
+    if !args.auto_approve {
+        eprintln!(
+            "
+agentd: refusing to execute a generated plan without approval.              Re-run with --auto-approve to execute, or --plan-only to stop here."
+        );
+        tracing::warn!(target: "agentd::audit", event = "plan.rejected", reason = "no --auto-approve");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    tracing::info!(target: "agentd::audit", event = "plan.approved", workflow = %plan.doc.name);
+
+    // Execute the approved plan on the normal engine, under the
+    // normal policy / budgets / audit.
+    let engine = match build_engine(&plan.doc, args) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let options = RunOptions {
+        timeout: Duration::from_secs(args.timeout_secs.max(1)),
+        dry_run: args.dry_run,
+    };
+    run_once_mode(plan.doc, engine, options, args)
+}
+
+/// Build the single client goal mode plans with: a named
+/// `[[intelligence.backends]]` default is not available (no config
+/// yet), so goal mode uses `--intel-unix` / `--intel-http`, or the
+/// `default_backend` named in instructions resolved from a remote
+/// provider via env (intel-remote).
+fn build_goal_planner_client(
+    args: &Args,
+    instructions: &crate::agent::AgentInstructions,
+) -> std::result::Result<Box<dyn crate::intelligence::client::IntelligenceClient>, ExitCode> {
+    let timeout = Duration::from_secs(args.timeout_secs.max(1));
+
+    #[cfg(unix)]
+    if let Some(path) = &args.intel_unix {
+        return Ok(Box::new(crate::intelligence::client::UnixClient::new(
+            path.clone(),
+            timeout,
+        )));
+    }
+
+    #[cfg(feature = "intel-http")]
+    if let Some(url) = &args.intel_http {
+        let bearer = read_intel_http_bearer(args)?;
+        return match crate::intelligence::client::HttpClient::with_bearer(url, timeout, bearer) {
+            Ok(c) => Ok(Box::new(c)),
+            Err(e) => {
+                eprintln!("agentd: bad --intel-http URL: {e}");
+                Err(ExitCode::from(EXIT_USAGE))
+            }
+        };
+    }
+
+    // Fall back to a named remote provider via env-only config: goal
+    // mode reads `AGENTD_GOAL_BACKEND` (provider:model) so it can run
+    // with zero TOML. Keys come from the provider's standard env var.
+    #[cfg(feature = "intel-remote")]
+    if let Some(spec) = std::env::var("AGENTD_GOAL_BACKEND")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        match goal_backend_from_spec(&spec, instructions, timeout) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                eprintln!("agentd: AGENTD_GOAL_BACKEND: {e}");
+                return Err(ExitCode::from(EXIT_USAGE));
+            }
+        }
+    }
+    let _ = instructions;
+
+    eprintln!(
+        "agentd: goal mode needs a model. Pass --intel-unix PATH, --intel-http URL,          or (with --features intel-remote) set AGENTD_GOAL_BACKEND=provider:model          plus the provider's API-key env var."
+    );
+    Err(ExitCode::from(EXIT_USAGE))
+}
+
+/// Parse `provider:model` (e.g. `anthropic:claude-sonnet-4-6`) into a
+/// remote client, resolving the provider's conventional key env var.
+#[cfg(feature = "intel-remote")]
+fn goal_backend_from_spec(
+    spec: &str,
+    _instructions: &crate::agent::AgentInstructions,
+    timeout: Duration,
+) -> std::result::Result<Box<dyn crate::intelligence::client::IntelligenceClient>, String> {
+    use crate::intelligence::backends::{BackendDef, ProviderKind};
+    let (provider, model) = spec
+        .split_once(':')
+        .ok_or("expected provider:model, e.g. anthropic:claude-sonnet-4-6")?;
+    let (kind, key_env) = match provider {
+        "anthropic" => (ProviderKind::Anthropic, Some("ANTHROPIC_API_KEY")),
+        "openai" => (ProviderKind::Openai, Some("OPENAI_API_KEY")),
+        "gemini" => (ProviderKind::Gemini, Some("GEMINI_API_KEY")),
+        other => return Err(format!("unknown provider `{other}`")),
+    };
+    let def = BackendDef {
+        name: "goal".into(),
+        provider: kind,
+        model: Some(model.to_string()),
+        api_key_env: key_env.map(String::from),
+        base_url: None,
+        max_tokens: None,
+    };
+    let client = crate::intelligence::providers::RemoteClient::from_def(&def, timeout)
+        .map_err(|e| format!("{e}"))?;
+    Ok(Box::new(client))
 }
 
 // ---------------------------------------------------------------------------

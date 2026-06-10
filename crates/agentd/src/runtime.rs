@@ -64,11 +64,13 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         }
     };
 
-    // Goal mode (RFC 0006 §3): the agent plans its own workflow.
-    // Resolved before config loading — `--goal` and `--config` are
-    // mutually exclusive entry points.
-    if let Some(goal) = args.goal.clone() {
-        return run_goal_mode(&goal, &args, &tracing_overrides);
+    // Mode 3 (RFC 0006 §3): the agent compiles its own workflow from a
+    // natural-language instruction, then runs it. Resolved before the
+    // declared-workflow path below — here `--config` is the *base
+    // environment* (policy / backends / MCP / budgets) the compiled
+    // plan runs inside, loaded by run_instruction_mode itself.
+    if let Some(instruction) = resolve_instruction(&args) {
+        return run_instruction_mode(&instruction, &args, &tracing_overrides);
     }
 
     // Resolve the workflow. CLI / env --config wins; then an embedded
@@ -181,7 +183,14 @@ struct Args {
     timeout_secs: u64,
     intel_unix: Option<PathBuf>,
     instructions: Option<PathBuf>,
-    /// `--goal TEXT` / `--goal @file` — goal mode (RFC 0006 §3).
+    /// `--instruction TEXT` / `--instruction @file` /
+    /// `--instruction-file PATH` / `AGENTD_INSTRUCTION` — Mode 3
+    /// (RFC 0006 §3): compile a workflow from this natural-language
+    /// instruction and run it. `@file` (or `--instruction-file`)
+    /// reads the instruction from a file.
+    instruction: Option<String>,
+    /// `--goal TEXT` / `--goal @file` — the original name for Mode 3;
+    /// kept as an alias of `--instruction`.
     goal: Option<String>,
     plan_only: bool,
     auto_approve: bool,
@@ -242,6 +251,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         bind: std::env::var("AGENTD_HTTP_BIND").ok(),
         intel_unix: env_opt_path("AGENTD_INTEL_UNIX"),
         instructions: env_opt_path("AGENTD_INSTRUCTIONS"),
+        instruction: std::env::var("AGENTD_INSTRUCTION")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
         goal: std::env::var("AGENTD_GOAL")
             .ok()
             .filter(|s| !s.trim().is_empty()),
@@ -312,6 +324,15 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                         "--drain-timeout-secs expects an integer; got `{v}`"
                     ))
                 })?;
+            }
+            "--instruction" => {
+                a.instruction = Some(require_value(argv, &mut i, arg)?.to_string());
+            }
+            "--instruction-file" => {
+                // Sugar for `--instruction @PATH`; reuses the `@file`
+                // expansion in run_instruction_mode.
+                let p = require_value(argv, &mut i, arg)?;
+                a.instruction = Some(format!("@{p}"));
             }
             "--goal" => {
                 a.goal = Some(require_value(argv, &mut i, arg)?.to_string());
@@ -1610,26 +1631,76 @@ fn run_serve_mode(
 }
 
 // ---------------------------------------------------------------------------
-// Goal mode (RFC 0006 §3)
+// Instruction mode (Mode 3, RFC 0006 §3): compile a workflow from a
+// natural-language instruction, then run it.
 // ---------------------------------------------------------------------------
 
-fn run_goal_mode(goal_arg: &str, args: &Args, tracing_overrides: &TracingOverrides) -> ExitCode {
-    // Logging: goal mode has no workflow `[logging]`, so CLI/env
-    // overrides over defaults.
-    let bare = WorkflowDoc::default();
-    let resolved = resolve_logging(&bare, tracing_overrides);
-    let _ = crate::observability::apply(&resolved);
+/// The instruction that drives Mode 3, resolved in precedence order:
+/// `--instruction TEXT|@file` (or its `--instruction-file` sugar /
+/// `AGENTD_INSTRUCTION`), then the legacy `--goal`, then the `task`
+/// field of the `--instructions` file. Returns the raw argument — an
+/// `@file` reference is expanded later in [`run_instruction_mode`].
+/// `None` means no instruction was given and the agent runs a declared
+/// workflow instead.
+fn resolve_instruction(args: &Args) -> Option<String> {
+    if let Some(s) = args.instruction.clone().filter(|s| !s.trim().is_empty()) {
+        return Some(s);
+    }
+    if let Some(s) = args.goal.clone().filter(|s| !s.trim().is_empty()) {
+        return Some(s);
+    }
+    // A standing `task` in the instructions file makes `--instructions
+    // agent.toml` a complete, self-contained agent: identity + the work.
+    // Peeked here only to decide the mode; run_instruction_mode reloads
+    // the file for the rest of the identity.
+    if let Some(p) = &args.instructions {
+        if let Ok(ins) = crate::agent::AgentInstructions::load(p) {
+            if let Some(task) = ins.task.filter(|s| !s.trim().is_empty()) {
+                return Some(task);
+            }
+        }
+    }
+    None
+}
 
-    // `--goal @file` reads the goal from a file.
-    let goal = match goal_arg.strip_prefix('@') {
-        Some(path) => match fs::read_to_string(path) {
-            Ok(s) => s,
+fn run_instruction_mode(
+    instruction_arg: &str,
+    args: &Args,
+    tracing_overrides: &TracingOverrides,
+) -> ExitCode {
+    // Optional base config (`--config`): the *environment* the agent
+    // operates in — its policy, intelligence backends, MCP servers,
+    // budgets, auth, logging. The agent compiles a workflow that runs
+    // INSIDE this environment; it never widens its own policy.
+    let base: Option<WorkflowDoc> = match &args.config {
+        Some(path) => match fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))
+            .and_then(|s| WorkflowDoc::from_toml(&s).map_err(|e| format!("{e}")))
+        {
+            Ok(d) => Some(d),
             Err(e) => {
-                eprintln!("agentd: failed to read goal file {path}: {e}");
+                eprintln!("agentd: base config {e}");
                 return ExitCode::from(EXIT_USAGE);
             }
         },
-        None => goal_arg.to_string(),
+        None => None,
+    };
+
+    // Logging from the base config's `[logging]` (if any), under CLI/env.
+    let log_src = base.clone().unwrap_or_default();
+    let resolved = resolve_logging(&log_src, tracing_overrides);
+    let _ = crate::observability::apply(&resolved);
+
+    // `--instruction @file` reads the instruction from a file.
+    let instruction = match instruction_arg.strip_prefix('@') {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("agentd: failed to read instruction file {path}: {e}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        },
+        None => instruction_arg.to_string(),
     };
 
     let instructions = match &args.instructions {
@@ -1643,23 +1714,27 @@ fn run_goal_mode(goal_arg: &str, args: &Args, tracing_overrides: &TracingOverrid
         None => crate::agent::AgentInstructions::default(),
     };
 
-    // The planner needs a backend. Goal mode requires at least one
-    // configured intelligence transport.
-    let planner_client = match build_goal_planner_client(args, &instructions) {
+    // Resolve the backend names the planner may reference, and a
+    // planner client to talk to. Prefer the base config's named
+    // backends; fall back to CLI transports / AGENTD_GOAL_BACKEND.
+    let backend_names = resolve_backend_names(base.as_ref(), args);
+    let planner_client = match build_goal_planner_client(args, &instructions, base.as_ref()) {
         Ok(c) => c,
         Err(code) => return code,
     };
 
+    // Inject the agent's ACTUAL capabilities into the planner prompt:
+    // executable node kinds, configured backends, MCP servers+tools,
+    // and the active policy (RFC 0006 §3).
+    let catalog = crate::agent::catalog::CapabilityCatalog::from_base(base.as_ref(), backend_names);
     let ctx = crate::agent::planner::PlanContext {
         system: instructions.system.as_deref(),
-        policy_summary: "no policy block — goal mode plans run under                          AllowAll unless you pass a workflow with [policy].                          Prefer narrow tools."
-            .to_string(),
-        backends: Vec::new(),
+        capabilities: catalog.render(),
     };
 
     let plan = match crate::agent::planner::generate(
         planner_client.as_ref(),
-        &goal,
+        &instruction,
         &ctx,
         args.max_replans,
     ) {
@@ -1670,10 +1745,15 @@ fn run_goal_mode(goal_arg: &str, args: &Args, tracing_overrides: &TracingOverrid
         }
     };
 
+    // Graft the agent's plan onto the base environment: the generated
+    // graph (name / nodes / edges / start nodes / triggers / routes),
+    // everything else (policy, backends, MCP, budgets, auth, logging)
+    // from the base config. The agent cannot grant itself capabilities.
+    let doc = graft_environment(plan.doc, base);
+
     eprintln!(
-        "agentd: planned workflow `{}` in {} attempt(s):
-",
-        plan.doc.name, plan.attempts
+        "agentd: compiled workflow `{}` from the instruction in {} attempt(s):\n",
+        doc.name, plan.attempts
     );
     println!("{}", plan.source);
 
@@ -1689,21 +1769,25 @@ fn run_goal_mode(goal_arg: &str, args: &Args, tracing_overrides: &TracingOverrid
         return ExitCode::from(EXIT_OK);
     }
 
-    // Governance gate (RFC 0006 §2): a generated plan does NOT run
-    // without approval. Headless runs must opt in explicitly.
-    if !args.auto_approve {
+    // Governance gate (RFC 0006 §2): a compiled plan does NOT run
+    // without approval. The operator opts in per-invocation
+    // (`--auto-approve`) or once in the instructions file
+    // (`auto_approve = true` — they authored the spec).
+    let approved = args.auto_approve || instructions.auto_approve;
+    if !approved {
         eprintln!(
-            "
-agentd: refusing to execute a generated plan without approval.              Re-run with --auto-approve to execute, or --plan-only to stop here."
+            "\nagentd: refusing to run a compiled plan without approval. \
+             Re-run with --auto-approve (or set auto_approve = true in the \
+             instructions file), or --plan-only to stop here."
         );
-        tracing::warn!(target: "agentd::audit", event = "plan.rejected", reason = "no --auto-approve");
+        tracing::warn!(target: "agentd::audit", event = "plan.rejected", reason = "not approved");
         return ExitCode::from(EXIT_USAGE);
     }
-    tracing::info!(target: "agentd::audit", event = "plan.approved", workflow = %plan.doc.name);
+    tracing::info!(target: "agentd::audit", event = "plan.approved", workflow = %doc.name);
 
-    // Execute the approved plan on the normal engine, under the
-    // normal policy / budgets / audit.
-    let engine = match build_engine(&plan.doc, args) {
+    // Execute on the normal engine, under the base config's policy /
+    // budgets / backends / MCP — same validator, same gates, same audit.
+    let engine = match build_engine(&doc, args) {
         Ok(e) => e,
         Err(code) => return code,
     };
@@ -1711,17 +1795,58 @@ agentd: refusing to execute a generated plan without approval.              Re-r
         timeout: Duration::from_secs(args.timeout_secs.max(1)),
         dry_run: args.dry_run,
     };
-    run_once_mode(plan.doc, engine, options, args)
+    run_once_mode(doc, engine, options, args)
 }
 
-/// Build the single client goal mode plans with: a named
-/// `[[intelligence.backends]]` default is not available (no config
-/// yet), so goal mode uses `--intel-unix` / `--intel-http`, or the
-/// `default_backend` named in instructions resolved from a remote
-/// provider via env (intel-remote).
+/// Names the planner may reference for `llm_infer` / `agent_loop`:
+/// the base config's `[[intelligence.backends]]` plus `default` when a
+/// CLI socket transport is configured.
+fn resolve_backend_names(base: Option<&WorkflowDoc>, args: &Args) -> Vec<String> {
+    let mut names: Vec<String> = base
+        .and_then(|d| d.intelligence.as_ref())
+        .map(|i| i.backends.iter().map(|b| b.name.clone()).collect())
+        .unwrap_or_default();
+    let has_socket = args.intel_unix.is_some() || args.intel_http.is_some();
+    if (has_socket || std::env::var("AGENTD_GOAL_BACKEND").is_ok())
+        && !names.iter().any(|n| n == "default")
+    {
+        names.insert(0, "default".to_string());
+    }
+    names
+}
+
+/// Graft a compiled plan onto the base environment. Generated graph
+/// shape wins for `name`/`description`/start nodes/triggers/routes/
+/// nodes/edges; the operator-provided environment (policy, backends,
+/// MCP, budget, auth, logging, signing, server) is preserved so the
+/// agent runs inside it and cannot widen its own authority.
+fn graft_environment(generated: WorkflowDoc, base: Option<WorkflowDoc>) -> WorkflowDoc {
+    match base {
+        None => generated,
+        Some(mut merged) => {
+            merged.name = generated.name;
+            merged.description = generated.description;
+            merged.start_nodes = generated.start_nodes;
+            merged.triggers = generated.triggers;
+            merged.http_routes = generated.http_routes;
+            merged.nodes = generated.nodes;
+            merged.edges = generated.edges;
+            merged
+        }
+    }
+}
+
+/// Build the client the planner uses to compile the workflow.
+/// Precedence: explicit CLI transports (`--intel-unix` / `--intel-http`)
+/// win; otherwise the `--config` base environment supplies the brain —
+/// the backend named by the instructions file's `default_backend`
+/// (or `default`), resolved against `[[intelligence.backends]]` — so
+/// `agentd --config prod.toml --instruction "…"` needs no extra flags;
+/// finally `AGENTD_GOAL_BACKEND=provider:model` for a zero-TOML run.
 fn build_goal_planner_client(
     args: &Args,
     instructions: &crate::agent::AgentInstructions,
+    base: Option<&WorkflowDoc>,
 ) -> std::result::Result<Box<dyn crate::intelligence::client::IntelligenceClient>, ExitCode> {
     // `timeout` feeds the per-transport constructors below; each is
     // behind its own cfg, so on a build with none of them compiled
@@ -1749,9 +1874,28 @@ fn build_goal_planner_client(
         };
     }
 
-    // Fall back to a named remote provider via env-only config: goal
-    // mode reads `AGENTD_GOAL_BACKEND` (provider:model) so it can run
-    // with zero TOML. Keys come from the provider's standard env var.
+    // The `--config` base environment supplies the planner's brain when
+    // no CLI transport is given: resolve the backend named by the
+    // instructions file's `default_backend` (or `default`) against the
+    // base config's `[[intelligence.backends]]` and talk to it directly.
+    // This is the zero-flag path for `agentd --config … --instruction …`.
+    #[cfg(feature = "intel-remote")]
+    if let Some(def) = base.and_then(|d| d.intelligence.as_ref()).and_then(|i| {
+        let want = instructions.effective_backend();
+        i.backends.iter().find(|b| b.name == want)
+    }) {
+        return match crate::intelligence::providers::RemoteClient::from_def(def, timeout) {
+            Ok(c) => Ok(Box::new(c)),
+            Err(e) => {
+                eprintln!("agentd: planner backend `{}`: {e}", def.name);
+                Err(ExitCode::from(EXIT_USAGE))
+            }
+        };
+    }
+
+    // Last resort: a named remote provider via env-only config —
+    // `AGENTD_GOAL_BACKEND=provider:model` lets Mode 3 run with zero
+    // TOML. Keys come from the provider's standard env var.
     #[cfg(feature = "intel-remote")]
     if let Some(spec) = std::env::var("AGENTD_GOAL_BACKEND")
         .ok()
@@ -1765,10 +1909,14 @@ fn build_goal_planner_client(
             }
         }
     }
-    let _ = instructions;
+    let _ = (instructions, base);
 
     eprintln!(
-        "agentd: goal mode needs a model. Pass --intel-unix PATH, --intel-http URL,          or (with --features intel-remote) set AGENTD_GOAL_BACKEND=provider:model          plus the provider's API-key env var."
+        "agentd: instruction mode needs a model to plan with. Either pass \
+         --config CONFIG.toml whose [[intelligence.backends]] includes the \
+         instructions' default_backend, or --intel-unix PATH / --intel-http URL, \
+         or (with --features intel-remote) set AGENTD_GOAL_BACKEND=provider:model \
+         plus the provider's API-key env var."
     );
     Err(ExitCode::from(EXIT_USAGE))
 }
@@ -1848,6 +1996,19 @@ usage:
         [--signing-key-file PATH]  AGENTD_SIGNING_KEY_FILE    override pinned pubkey
         [--reload-file PATH]       AGENTD_RELOAD_FILE         touch-to-reload (Windows SIGHUP replacement)
         [--version] [--help]
+
+instruction mode (RFC 0006 §3) — compile a workflow from an instruction, then run it:
+        [--instruction TEXT|@FILE] AGENTD_INSTRUCTION    the task; `@FILE` reads it from a file
+        [--instruction-file PATH]                        sugar for --instruction @PATH
+        [--goal TEXT|@FILE]        AGENTD_GOAL           alias of --instruction
+        [--instructions FILE]      AGENTD_INSTRUCTIONS   agent identity (system, default_backend, task)
+        [--auto-approve]           AGENTD_AUTO_APPROVE=1 run the compiled plan (else stops, fail-closed)
+        [--plan-only]              AGENTD_PLAN_ONLY=1    print the compiled workflow and exit
+        [--plan-out PATH]          AGENTD_PLAN_OUT       also write the compiled workflow here
+        [--max-replans N]          AGENTD_MAX_REPLANS    bounded validation-repair rounds (default 2)
+  The planner's model comes from --config's [[intelligence.backends]] (by default_backend),
+  else --intel-unix / --intel-http, else AGENTD_GOAL_BACKEND=provider:model. The compiled plan
+  runs inside --config's policy / budgets / MCP — the agent never widens its own authority.
 
 Design: rfcs/0001-bounded-workflow-runtime.md
 Docs:   docs/README.md\
@@ -2050,5 +2211,143 @@ mod tests {
     fn parse_args_help_is_its_own_error() {
         let err = parse_args(&["--help".into()]).unwrap_err();
         assert!(matches!(err, ArgErr::ShowHelp));
+    }
+
+    #[test]
+    fn parse_args_instruction_forms() {
+        // `--instruction TEXT` lands verbatim.
+        let (a, _) = parse_args(&["--instruction".into(), "do the thing".into()]).unwrap();
+        assert_eq!(a.instruction.as_deref(), Some("do the thing"));
+
+        // `--instruction-file PATH` is sugar for `--instruction @PATH`.
+        let (a, _) = parse_args(&["--instruction-file".into(), "/etc/task.txt".into()]).unwrap();
+        assert_eq!(a.instruction.as_deref(), Some("@/etc/task.txt"));
+
+        // `--goal` is the legacy alias, stored separately.
+        let (a, _) = parse_args(&["--goal".into(), "legacy".into()]).unwrap();
+        assert_eq!(a.goal.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn resolve_instruction_precedence() {
+        // --instruction wins over --goal.
+        let a = Args {
+            instruction: Some("primary".into()),
+            goal: Some("secondary".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_instruction(&a).as_deref(), Some("primary"));
+
+        // --goal is used when --instruction is absent.
+        let a = Args {
+            goal: Some("from goal".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_instruction(&a).as_deref(), Some("from goal"));
+
+        // Blank values are ignored, not treated as an instruction.
+        let a = Args {
+            instruction: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_instruction(&a), None);
+
+        // Nothing set → no instruction mode.
+        assert_eq!(resolve_instruction(&Args::default()), None);
+    }
+
+    #[test]
+    fn resolve_instruction_reads_instructions_file_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("agent.toml");
+        std::fs::write(
+            &p,
+            "[agent]\nname = \"a\"\ntask = \"summarise the newest log\"\n",
+        )
+        .unwrap();
+        let a = Args {
+            instructions: Some(p),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_instruction(&a).as_deref(),
+            Some("summarise the newest log")
+        );
+    }
+
+    #[test]
+    fn graft_environment_keeps_base_authority_takes_generated_graph() {
+        use crate::intelligence::backends::{BackendDef, IntelligenceConfig, ProviderKind};
+        use crate::policy::{FsPolicy, PolicyManifest};
+
+        let mut base = wf_with(vec![manual("old")]);
+        base.name = "base-env".into();
+        base.policy = Some(PolicyManifest {
+            fs: FsPolicy {
+                write: vec!["/tmp/out/**".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        base.intelligence = Some(IntelligenceConfig {
+            backends: vec![BackendDef {
+                name: "claude".into(),
+                provider: ProviderKind::Anthropic,
+                model: Some("claude-sonnet-4-6".into()),
+                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                base_url: None,
+                max_tokens: None,
+            }],
+        });
+
+        let mut generated = wf_with(vec![manual("entry")]);
+        generated.name = "compiled-plan".into();
+
+        let out = graft_environment(generated.clone(), Some(base));
+        // Generated graph shape wins.
+        assert_eq!(out.name, "compiled-plan");
+        assert_eq!(out.start_nodes, generated.start_nodes);
+        assert_eq!(out.nodes, generated.nodes);
+        // Base authority is preserved — the agent can't widen it.
+        assert!(out.policy.is_some());
+        assert_eq!(
+            out.policy.unwrap().fs.write,
+            vec!["/tmp/out/**".to_string()]
+        );
+        assert_eq!(out.intelligence.unwrap().backends[0].name, "claude");
+
+        // No base → the generated doc passes through unchanged.
+        let passthrough = graft_environment(generated.clone(), None);
+        assert_eq!(passthrough.name, generated.name);
+    }
+
+    #[test]
+    fn resolve_backend_names_lists_base_and_default_socket() {
+        use crate::intelligence::backends::{BackendDef, IntelligenceConfig, ProviderKind};
+
+        let mut base = wf_with(vec![manual("m")]);
+        base.intelligence = Some(IntelligenceConfig {
+            backends: vec![BackendDef {
+                name: "claude".into(),
+                provider: ProviderKind::Anthropic,
+                model: Some("m".into()),
+                api_key_env: Some("K".into()),
+                base_url: None,
+                max_tokens: None,
+            }],
+        });
+
+        // Base backends are always offered to the planner.
+        let names = resolve_backend_names(Some(&base), &Args::default());
+        assert!(names.contains(&"claude".to_string()));
+
+        // A CLI socket transport adds the reserved `default` name, first.
+        let with_socket = Args {
+            intel_unix: Some(PathBuf::from("/run/intel.sock")),
+            ..Default::default()
+        };
+        let names = resolve_backend_names(Some(&base), &with_socket);
+        assert_eq!(names.first().map(String::as_str), Some("default"));
+        assert!(names.contains(&"claude".to_string()));
     }
 }

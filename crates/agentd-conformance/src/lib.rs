@@ -35,6 +35,9 @@ pub struct ScenarioReport {
     pub failures: Vec<String>,
     /// Representative per-run cost (trial 0).
     pub cost: Cost,
+    /// Cost summed across every trial — the denominator-aware figure
+    /// for cost-per-success.
+    pub total_cost: Cost,
     /// Wall-clock summed across all trials.
     pub total_latency: Duration,
     /// Set if the scenario could not be loaded / built / validated —
@@ -53,6 +56,24 @@ impl ScenarioReport {
     pub fn pass_k(&self) -> f64 {
         if self.passed() { 1.0 } else { 0.0 }
     }
+
+    /// Tokens spent per *passing* trial — the reliability-adjusted cost
+    /// the research calls for. A workflow that burns tokens on trials
+    /// that then fail has a higher cost-per-success than its raw
+    /// per-run cost suggests. `None` when no trial passed (cost bought
+    /// nothing).
+    pub fn cost_per_success(&self) -> Option<f64> {
+        if self.passed_trials == 0 {
+            return None;
+        }
+        Some(self.total_cost.llm_tokens as f64 / self.passed_trials as f64)
+    }
+
+    /// Mean wall-clock per trial.
+    pub fn mean_latency(&self) -> Duration {
+        let n = self.trials.max(1);
+        self.total_latency / n
+    }
 }
 
 /// Run every trial of an already-parsed scenario and aggregate.
@@ -64,6 +85,7 @@ pub fn run_scenario(scenario: &Scenario) -> ScenarioReport {
         passed_trials: 0,
         failures: Vec::new(),
         cost: Cost::default(),
+        total_cost: Cost::default(),
         total_latency: Duration::ZERO,
         load_error: None,
     };
@@ -102,6 +124,7 @@ pub fn run_scenario(scenario: &Scenario) -> ScenarioReport {
         match harness::run_trial(scenario, &doc, &start, trial) {
             Ok(o) => {
                 report.total_latency += o.latency;
+                report.total_cost.add(&o.cost);
                 if trial == 0 {
                     report.cost = o.cost;
                 }
@@ -131,6 +154,7 @@ pub fn run_scenario_file(path: &Path) -> ScenarioReport {
             passed_trials: 0,
             failures: Vec::new(),
             cost: Cost::default(),
+            total_cost: Cost::default(),
             total_latency: Duration::ZERO,
             load_error: Some(e),
         },

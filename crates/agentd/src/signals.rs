@@ -193,9 +193,21 @@ pub fn spawn_reload_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// All signal tests mutate the same two process-global
+    /// `AtomicBool`s; serialize them so parallel test threads don't
+    /// stomp each other's `reset()` / assertion windows.
+    fn serial() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn default_state_is_not_requested() {
+        let _g = serial();
         reset();
         assert!(!shutdown_requested());
         assert!(!reload_requested());
@@ -204,6 +216,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_handler_flips_flag() {
+        let _g = serial();
         reset();
         install_shutdown_handlers();
         shutdown_handler(libc::SIGTERM);
@@ -215,6 +228,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reload_handler_flips_flag() {
+        let _g = serial();
         reset();
         install_shutdown_handlers();
         reload_handler(libc::SIGHUP);
@@ -226,6 +240,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clear_reload_clears_only_reload() {
+        let _g = serial();
         reset();
         reload_handler(libc::SIGHUP);
         shutdown_handler(libc::SIGTERM);
@@ -239,6 +254,7 @@ mod tests {
 
     #[test]
     fn reset_returns_to_clear_state() {
+        let _g = serial();
         reset();
         assert!(!shutdown_requested());
         assert!(!reload_requested());
@@ -248,6 +264,7 @@ mod tests {
     fn reload_file_watcher_flips_flag_on_touch() {
         use std::sync::Arc;
         use std::time::Duration;
+        let _g = serial();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reload.trigger");
         // Pre-create with one mtime, then bump it after starting the

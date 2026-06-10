@@ -1,26 +1,14 @@
 <div align="center">
 
-```
-                                 █████     █████
-                                ░░███     ░░███
-  ██████    ███████  ██████  ████████   ███████   ██████████
- ░░░░░███  ███░░███ ███░░███░░███░░███ ░░░███░   ███░░███░░███
-  ███████ ░███ ░███░███████  ░███ ░███   ░███   ░███ ░███ ░███
- ███░░███ ░███ ░███░███░░░   ░███ ░███   ░███ ███░███ ░███ ░███
-░░████████░░███████░░██████  ████ █████  ░░█████ ░░████████████
- ░░░░░░░░  ░░░░░███ ░░░░░░  ░░░░ ░░░░░    ░░░░░   ░░░░░░░░░░░░
-           ███ ░███
-          ░░██████      the bounded agent runtime
-           ░░░░░░
-```
+# agentd
 
-**A predeclared DAG walks. An LLM fills one node. Nothing improvises.**
+**`systemd` for AI workflows — a single binary that runs signed, policy-bound automation with one LLM step exactly where you put it.**
 
 [![ci](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml/badge.svg)](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](crates/agentd/Cargo.toml)
 
-[Quick start](#quick-start) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
+[Install](#install) · [Quick start](#quick-start) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
 
 </div>
 
@@ -45,46 +33,57 @@ industry has converged on explicit control flow with the model doing local
 reasoning — because the graph boundary is also the audit boundary, the
 security boundary, and the cost ceiling.
 
+```mermaid
+flowchart LR
+    WF["workflow.toml<br/>(typed DAG, signed)"] --> V["validate<br/>build-time + load-time"]
+    T["triggers<br/>HTTP · cron · fs-watch · manual"] --> E
+    V --> E["engine<br/>walks the declared graph"]
+    E --> N["nodes<br/>fs · data · http · mcp · shell<br/>llm_infer = one bounded reasoning step"]
+    N -. "every side effect" .-> P["policy allowlists<br/>+ budgets + deadline"]
+    E --> O["outcome JSON<br/>+ execution trace<br/>+ metrics + audit events"]
 ```
-your workflow.toml ──► validate (build-time + load-time)
-                              │
-   trigger ───────────────────▼──────────────────────────────┐
-   (HTTP / cron / fs-watch /  │   ENGINE: walk the DAG        │
-    manual --input)           │   one node at a time          │
-                              │                               │
-        ┌─────────────────────┼───────────────────────┐      │
-        │ read_file  read_env │ parse_json  json_select│      │
-        │ template_render     │ diff_compute           │      │
-        │ llm_infer ◄─────────┤ bounded reasoning step │      │
-        │ write_file  http_request  call_mcp_tool      │      │
-        │ shell_run (allowlisted)                      │      │
-        │ switch / condition / merge / fail / terminate│      │
-        └─────────────────────┬───────────────────────┘      │
-                              │ every side effect gated by    │
-                              │ [policy] + budgets + deadline │
-                              ▼                               │
-                    outcome JSON + execution trace ◄──────────┘
-                    (what actually ran, node by node)
+
+## Install
+
+**One-liner** (Linux x86_64 · macOS Apple Silicon — detects your platform, installs the latest release):
+
+```bash
+curl -fsSL https://agentd.dev/install.sh | sh
+```
+
+**Straight from a GitHub release** (static musl build shown — runs on any Linux):
+
+```bash
+curl -fsSLO https://github.com/agentd-dev/source-code/releases/latest/download/agentd-v0.7.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf agentd-v0.7.0-x86_64-unknown-linux-musl.tar.gz
+sudo install -m 0755 agentd /usr/local/bin/agentd
+```
+
+**Native packages** — every release attaches a `.deb` and an `.rpm`
+(systemd unit included), plus macOS and Windows binaries.
+
+**From source:**
+
+```bash
+cargo build --release -p agentd
 ```
 
 ## Quick start
 
 ```bash
-cargo build --release -p agentd
-
 # Validate a workflow and exit
-./target/release/agentd --config examples/webhook-receiver.toml --validate-only
+agentd --config examples/webhook-receiver.toml --validate-only
 
 # Run one-shot with a payload
-./target/release/agentd --config examples/llm-classifier.toml \
+agentd --config examples/llm-classifier.toml \
     --intel-unix /run/intel.sock --input doc.json
 
 # Serve mode is inferred: [[http_routes]] in the TOML → HTTP daemon
 GITHUB_WEBHOOK_SECRET=s3cret \
-./target/release/agentd --config examples/webhook-receiver.toml --bind 127.0.0.1:8080
+agentd --config examples/webhook-receiver.toml --bind 127.0.0.1:8080
 
 # Walk the whole graph, skip every side effect
-./target/release/agentd --config examples/cron-poller.toml --start on_tick --dry-run
+agentd --config examples/cron-poller.toml --start on_tick --dry-run
 ```
 
 A complete workflow, 30 seconds of reading:
@@ -171,11 +170,29 @@ one loop in the system, and you wrote it:
    trace: the exact node path with outcomes and branch labels. Metrics
    counters and `agentd::audit` events stream alongside.
 
-`llm_infer` fits inside step 3 like any other node: render prompt →
-one request through the intelligence client (Unix socket or HTTP JSON-RPC)
-→ optionally require valid JSON → store `{content, parsed, usage}`.
-Whether the workflow continues, branches, or stops is encoded in edges the
-model never sees.
+```mermaid
+flowchart TD
+    A["trigger fires<br/>(payload → context as 'trigger')"] --> B["resolve start node → entry"]
+    B --> C{"deadline<br/>reached?"}
+    C -- yes --> T1(["timed_out"])
+    C -- no --> D["dispatch node handler<br/>(retry w/ backoff if declared)"]
+    D --> E["record output under node id"]
+    E --> F{"node outcome"}
+    F -- "terminate" --> T2(["completed"])
+    F -- "fail" --> T3(["failed (declared)"])
+    F -- "continue + branch label" --> G["engine picks the matching edge<br/>(handlers never choose successors)"]
+    G -- "edge found" --> C
+    G -- "dead end" --> T4(["completed<br/>(last value)"])
+    style D stroke-width:2px
+```
+
+`llm_infer` fits inside the dispatch box like any other node: render
+prompt → one request through the intelligence client (Unix socket or HTTP
+JSON-RPC) → optionally require valid JSON → store `{content, parsed,
+usage}`. Whether the workflow continues, branches, or stops is encoded in
+edges the model never sees. The loop-back edge above is the only loop in
+the system — bounded by the validator's acyclicity proof, the deadline,
+and `MAX_STEPS`.
 
 ## Capabilities
 

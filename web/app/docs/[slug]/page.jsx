@@ -28,8 +28,8 @@ export default function DocPage({ params }) {
                   href={`/docs/${d.slug}/`}
                   className={
                     d.slug === params.slug
-                      ? "text-[var(--green)]"
-                      : "text-[var(--dim)] hover:text-[var(--green)]"
+                      ? "text-[var(--accent)]"
+                      : "text-[var(--dim)] hover:text-[var(--accent)]"
                   }
                 >
                   {d.slug === params.slug ? "▸ " : "  "}

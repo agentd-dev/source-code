@@ -1,12 +1,5 @@
 import Link from "next/link";
 
-const BANNER = String.raw`                            _      _
-  __ _  __ _  ___ _ __  __| |  __| |
- / _' |/ _' |/ _ \ '_ \/ _' | / _' |
-| (_| | (_| |  __/ | | | (_| || (_| |
- \__,_|\__, |\___|_| |_|\__,_| \__,_|
-       |___/   the bounded agent runtime`;
-
 const LOOP = String.raw`your workflow.toml ──► validate (build-time + load-time)
                               │
    trigger ───────────────────▼────────────────────────────┐
@@ -53,12 +46,15 @@ export default function Home() {
   return (
     <main className="mx-auto max-w-5xl px-4">
       <section className="py-14">
-        <pre className="text-[var(--green)] text-[10px] leading-tight sm:text-xs overflow-x-auto">
-          {BANNER}
-        </pre>
-        <p className="mt-6 max-w-2xl text-lg">
-          A predeclared DAG walks. An LLM fills one node.{" "}
-          <span className="text-[var(--green)]">Nothing improvises.</span>
+        <h1 className="text-4xl font-bold text-[var(--accent)] sm:text-5xl">
+          agentd
+        </h1>
+        <p className="mt-4 max-w-2xl text-lg">
+          The bounded agent runtime: a single binary that runs signed,
+          policy-bound AI workflows —{" "}
+          <span className="text-[var(--accent)]">
+            one LLM step exactly where you put it.
+          </span>
         </p>
         <div className="frame mt-8">
           <div className="frame-title">
@@ -94,13 +90,13 @@ export default function Home() {
         <div className="mt-8 flex flex-wrap gap-4 text-sm">
           <Link
             href="/docs/overview/"
-            className="frame px-4 py-2 text-[var(--green)] hover:bg-[var(--line)]"
+            className="frame px-4 py-2 text-[var(--accent)] hover:bg-[var(--line)]"
           >
             $ man agentd
           </Link>
           <a
             href="https://github.com/agentd-dev/source-code"
-            className="frame px-4 py-2 text-[var(--dim)] hover:text-[var(--green)] hover:bg-[var(--line)]"
+            className="frame px-4 py-2 text-[var(--dim)] hover:text-[var(--accent)] hover:bg-[var(--line)]"
           >
             $ git clone agentd-dev/source-code
           </a>
@@ -108,7 +104,7 @@ export default function Home() {
       </section>
 
       <section className="py-10">
-        <h2 className="text-[var(--green)] text-sm tracking-widest">
+        <h2 className="text-[var(--accent)] text-sm tracking-widest">
           <span className="text-[var(--dim)]">##</span> THE LOOP — SINGULAR, AND YOU WROTE IT
         </h2>
         <div className="frame mt-4">
@@ -122,13 +118,13 @@ export default function Home() {
       </section>
 
       <section className="py-10">
-        <h2 className="text-[var(--green)] text-sm tracking-widest">
+        <h2 className="text-[var(--accent)] text-sm tracking-widest">
           <span className="text-[var(--dim)]">##</span> WHY BOUNDED
         </h2>
         <div className="mt-4 grid gap-px bg-[var(--line)] sm:grid-cols-2">
           {FEATURES.map((f) => (
             <div key={f.k} className="bg-[var(--panel)] p-5">
-              <div className="text-[var(--green)]">▸ {f.k}</div>
+              <div className="text-[var(--accent)]">▸ {f.k}</div>
               <p className="mt-2 text-sm text-[var(--dim)] leading-6">{f.v}</p>
             </div>
           ))}
@@ -136,15 +132,21 @@ export default function Home() {
       </section>
 
       <section className="py-10">
-        <h2 className="text-[var(--green)] text-sm tracking-widest">
+        <h2 className="text-[var(--accent)] text-sm tracking-widest">
           <span className="text-[var(--dim)]">##</span> INSTALL
         </h2>
         <div className="frame mt-4 p-4 text-sm leading-7 overflow-x-auto">
           <div>
-            <span className="text-[var(--dim)]"># build from source</span>
+            <span className="text-[var(--dim)]"># one-liner (linux x86_64 / macOS arm64)</span>
           </div>
           <div>
-            <span className="text-[var(--green)]">$</span> cargo build --release -p agentd
+            <span className="text-[var(--accent)]">$</span> curl -fsSL https://agentd.dev/install.sh | sh
+          </div>
+          <div className="mt-3">
+            <span className="text-[var(--dim)]"># or build from source</span>
+          </div>
+          <div>
+            <span className="text-[var(--accent)]">$</span> cargo build --release -p agentd
           </div>
           <div className="mt-3">
             <span className="text-[var(--dim)]">
@@ -153,7 +155,7 @@ export default function Home() {
             </span>
           </div>
           <div>
-            <span className="text-[var(--green)]">$</span> cargo build --release -p agentd
+            <span className="text-[var(--accent)]">$</span> cargo build --release -p agentd
             --no-default-features \
           </div>
           <div>

@@ -1723,6 +1723,10 @@ fn build_goal_planner_client(
     args: &Args,
     instructions: &crate::agent::AgentInstructions,
 ) -> std::result::Result<Box<dyn crate::intelligence::client::IntelligenceClient>, ExitCode> {
+    // `timeout` feeds the per-transport constructors below; each is
+    // behind its own cfg, so on a build with none of them compiled
+    // in (e.g. Windows without intel-remote) it goes unread.
+    #[allow(unused_variables)]
     let timeout = Duration::from_secs(args.timeout_secs.max(1));
 
     #[cfg(unix)]

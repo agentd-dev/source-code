@@ -581,6 +581,7 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
             .unwrap_or(&crate::budget::BudgetConfig::default()),
     ));
 
+    let metrics = crate::observability::Metrics::new();
     let mut registry = HandlerRegistry::with_builtin_controls();
     crate::tools::register_default_tools(&mut registry, policy_for_tools.clone(), budget.clone());
 
@@ -703,7 +704,12 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     }
     let backend_arc = Arc::new(backend_map.clone());
     if !backend_map.is_empty() {
-        crate::intelligence::handler::register(&mut registry, backend_arc.clone());
+        crate::intelligence::handler::register(
+            &mut registry,
+            backend_arc.clone(),
+            budget.clone(),
+            metrics.clone(),
+        );
     }
 
     // MCP server registry. Composes every `[[mcp_servers]]` entry
@@ -738,12 +744,13 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
                 .as_ref()
                 .and_then(|p| crate::agent::AgentInstructions::load(p).ok())
                 .and_then(|i| i.system),
+            metrics.clone(),
         );
     }
 
     registry.set_fallback(Box::new(StubHandler));
     Ok(
-        Engine::new(registry).with_reload_handles(crate::engine::ReloadHandles {
+        Engine::with_metrics(registry, metrics).with_reload_handles(crate::engine::ReloadHandles {
             policy: Some(reloadable_policy),
             intel: intel_reload,
             intel_backends: named_backends,

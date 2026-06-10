@@ -37,8 +37,10 @@ use crate::intelligence::backends::BackendMap;
 use crate::intelligence::client::IntelligenceClient;
 use crate::intelligence::protocol::{Message, Request};
 use crate::mcp::client::McpClient as _;
+use crate::observability::Metrics;
 use crate::tools::policy::{Decision, PolicyRef};
 use crate::workflow::{Node, NodeKind};
+use std::sync::Arc;
 
 /// Hard ceiling on `max_steps` regardless of what the node declares.
 pub const MAX_STEPS_CEILING: u32 = 64;
@@ -55,6 +57,7 @@ pub const LOOP_TOOLS: &[&str] = &[
     "call_mcp_tool",
 ];
 
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     registry: &mut HandlerRegistry,
     backends: BackendMap,
@@ -62,6 +65,7 @@ pub fn register(
     budget: BudgetRef,
     mcp: Option<crate::mcp::McpRegistryRef>,
     system: Option<String>,
+    metrics: Arc<Metrics>,
 ) {
     registry.register(
         "agent_loop",
@@ -69,9 +73,11 @@ pub fn register(
             backends,
             broker: ToolBroker {
                 policy,
-                budget,
+                budget: budget.clone(),
                 mcp,
             },
+            run_budget: budget,
+            metrics,
             system,
         }),
     );
@@ -80,6 +86,10 @@ pub fn register(
 pub struct AgentLoopHandler {
     backends: BackendMap,
     broker: ToolBroker,
+    /// Run-wide budget — the loop's per-turn token usage counts
+    /// against the same cumulative cap as llm_infer (RFC 0006 §5).
+    run_budget: BudgetRef,
+    metrics: Arc<Metrics>,
     /// Standing system prompt from `--instructions`, if any.
     system: Option<String>,
 }
@@ -174,6 +184,19 @@ impl NodeHandler for AgentLoopHandler {
                 }
             }
 
+            if let Err(reason) = self.run_budget.check_llm_budget() {
+                tracing::warn!(
+                    target: "agentd::audit",
+                    event = "loop.run_budget_exhausted",
+                    node_id = %node.id,
+                    reason = %reason,
+                );
+                return Ok(exhausted(
+                    transcript,
+                    step - 1,
+                    "run token budget exhausted",
+                ));
+            }
             let request = Request {
                 model: "fast".into(),
                 messages: messages.clone(),
@@ -181,8 +204,11 @@ impl NodeHandler for AgentLoopHandler {
                 temperature: None,
             };
             let response = client.complete(&request)?;
-            tokens_spent +=
+            let turn_tokens =
                 u64::from(response.usage.prompt_tokens + response.usage.completion_tokens);
+            tokens_spent += turn_tokens;
+            self.run_budget.add_llm_tokens(turn_tokens);
+            self.metrics.add_llm(turn_tokens);
             messages.push(Message {
                 role: "assistant".into(),
                 content: response.content.clone(),
@@ -567,6 +593,8 @@ mod tests {
                 budget: crate::budget::unbounded(),
                 mcp: None,
             },
+            run_budget: crate::budget::unbounded(),
+            metrics: crate::observability::Metrics::new(),
             system: Some("standing orders".into()),
         }
     }

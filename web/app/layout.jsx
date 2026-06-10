@@ -2,10 +2,11 @@ import "./globals.css";
 import Link from "next/link";
 
 export const metadata = {
-  title: "agentd — the bounded agent runtime",
+  title: "agentd — spin up an AI agent that works on its own",
   description:
-    "A predeclared DAG walks. An LLM fills one node. Nothing improvises. " +
-    "Single-binary workflow runtime with compile-time capability pruning.",
+    "Spin up an AI agent that works on its own. Give it a task, a goal, or a " +
+    "whole workflow — agentd runs as a daemon (or a one-shot), calls tools, " +
+    "and self-corrects, with every step governed, observable, and audited.",
 };
 
 export default function RootLayout({ children }) {

@@ -2,7 +2,9 @@
 
 # agentd
 
-**A dynamic AI agent that runs as a daemon — `systemd` for autonomous work. Hand it a workflow, a goal, or a single instruction; it plans, acts, and self-corrects, with every step governed, observable, and audited.**
+### Spin up an AI agent that works on its own.
+
+**Give it a task, a goal, or a whole workflow — agentd runs as a daemon (or a one-shot), calls tools, and self-corrects until the job is done. Every step is governed, observable, and audited.**
 
 [![ci](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml/badge.svg)](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -14,12 +16,12 @@
 
 ---
 
-`agentd` is a single-binary harness for **governed autonomous agents**. It
-runs as a daemon handling tasks, tool calls, and workflows independently —
-or as a one-shot that completes a goal by planning its own steps and
-improving on failure. Three execution modes share one substrate; every mode
-is bound by the same validator, capability policy, budgets, signing, and
-audit trail.
+`agentd` is a single-binary harness that spins up an AI agent to **work on
+its own**. It runs as a daemon handling tasks, tool calls, and workflows
+independently — or as a one-shot that completes a goal by planning its own
+steps and improving on failure. Three execution modes share one substrate;
+every mode is bound by the same validator, capability policy, budgets,
+signing, and audit trail.
 
 The thing that makes that safe is an inversion the industry converged on:
 the **control flow is structure, not vibes**. Whether you wrote the graph,

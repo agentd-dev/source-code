@@ -38,6 +38,12 @@ export const DOCS = [
     file: "rfcs/0005-hot-reload.md",
     title: "rfc 0005 · hot reload",
   },
+  {
+    slug: "rfc-0006",
+    file: "rfcs/0006-dynamic-harness.md",
+    title: "rfc 0006 · the dynamic harness",
+  },
+  { slug: "roadmap", file: "docs/ROADMAP.md", title: "roadmap" },
 ];
 
 export function readDoc(slug) {

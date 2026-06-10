@@ -110,7 +110,10 @@ impl FixtureRunner {
                 client.enqueue_text(text.clone());
             }
             let arc: IntelligenceRef = client;
-            intel_handler::register(&mut registry, arc);
+            intel_handler::register(
+                &mut registry,
+                crate::intelligence::backends::single_backend(arc),
+            );
         }
 
         if !fixture.mocks.mcp_tools.is_empty() || !fixture.mocks.mcp_resources.is_empty() {

@@ -69,6 +69,12 @@ pub struct ReloadHandles {
     /// requires a handler registry change, which is out of scope
     /// for the reload pass).
     pub intel: Option<Arc<crate::intelligence::client::ReloadableIntelClient>>,
+    /// Named intelligence backends (`[[intelligence.backends]]`,
+    /// RFC 0006). SIGHUP rebuilds each entry's inner client —
+    /// re-reading `api_key_env` — and swaps in place. Empty when no
+    /// named backends are configured.
+    pub intel_backends:
+        std::collections::HashMap<String, Arc<crate::intelligence::client::ReloadableIntelClient>>,
     /// Process-wide MCP server registry. Each handle inside owns
     /// its own `ReloadableMcpClient` + `ReloadableMcpAllowlist` so
     /// SIGHUP can respawn individual servers / rotate per-server

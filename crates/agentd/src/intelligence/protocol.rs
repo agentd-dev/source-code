@@ -1,10 +1,9 @@
 //! Intelligence wire protocol.
 //!
 //! The harness emits JSON-RPC 2.0 requests over a length-framed
-//! transport (4-byte little-endian length prefix + UTF-8 JSON),
-//! matching the ecosystem's `sandbox::intelligence_server` so an
-//! operator can run the existing host-side server and plug the agent
-//! at it without glue code.
+//! transport (4-byte little-endian length prefix + UTF-8 JSON) —
+//! any host-side server speaking the shape plugs in without glue
+//! code.
 //!
 //! Kept deliberately narrow — only the methods the workflow runtime
 //! exercises today. `reason`, `embed`, `generate`, `tokenize`,

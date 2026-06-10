@@ -14,6 +14,11 @@ export const DOCS = [
   { slug: "operations", file: "docs/operations.md", title: "operations" },
   { slug: "maturity", file: "docs/maturity.md", title: "maturity" },
   {
+    slug: "conformance",
+    file: "docs/CONFORMANCE.md",
+    title: "conformance & benchmarks",
+  },
+  {
     slug: "rfc-0001",
     file: "rfcs/0001-bounded-workflow-runtime.md",
     title: "rfc 0001 · bounded workflow runtime",

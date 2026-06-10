@@ -11,6 +11,11 @@ Direction, not promises. Items graduate from here into RFCs.
       approval gates, and bounded re-planning.
 - [x] Instruction files (`--instructions agent.toml`).
 - [x] Token budgets + LLM usage metrics.
+- [x] Conformance + benchmark suite (`crates/agentd-conformance`):
+      scenario corpus, capability-matrix coverage, pass^k reliability
+      scoring, fault-injection battery, injection-corpus security
+      conformance, cost-per-success reporting, criterion benchmarks.
+      See [docs/CONFORMANCE.md](CONFORMANCE.md).
 
 ## Next
 
@@ -23,10 +28,6 @@ Direction, not promises. Items graduate from here into RFCs.
 - [ ] Parallel fan-out / fan-in (RFC 0001 §9.1).
 - [ ] Plan library: promote approved goal-mode plans into versioned,
       signed Mode-1 workflows automatically.
-- [ ] Conformance + benchmark suite (`crates/agentd-conformance`):
-      scenario corpus, capability-matrix coverage, pass^k reliability
-      scoring, fault-injection battery, injection-corpus security
-      conformance, cost-per-success reporting.
 
 ## Later — scale-out (TODO: design RFCs required)
 

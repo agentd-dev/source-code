@@ -250,6 +250,7 @@ and `MAX_STEPS`.
 | **Observability** | Structured spans (`workflow.run` → `node.execute`), Prometheus `/metrics` (incl. llm calls + tokens), `/healthz`, dedicated audit JSONL sink with redaction, W3C traceparent propagation in and out, optional OTLP gRPC export |
 | **Governance** | plan-approval gate (generated plans refuse to run headless without `--auto-approve`), per-step policy on loop tool calls, audit events for plan/loop lifecycle |
 | **Supply chain** | ed25519-signed workflows (verified before parsing trust begins), embedded configs validated at compile time |
+| **Conformance** | `agentd-conformance` corpus drives the real engine: pass^k reliability under seeded model nondeterminism, capability-matrix coverage (goal tracking), a fault-injection battery (bounded degradation), an injection corpus (policy denials prevent the side-effect), cost-per-success, and criterion benchmarks — see [docs/CONFORMANCE.md](docs/CONFORMANCE.md) |
 
 Every row above that touches the outside world is a **Cargo feature**.
 The default build has no outbound HTTP and no shell. A sealed webhook

@@ -166,6 +166,7 @@ mod tests {
             passed_trials: if passed { 1 } else { 0 },
             failures: vec![],
             cost: Cost::default(),
+            total_cost: Cost::default(),
             total_latency: Duration::ZERO,
             load_error: None,
         }

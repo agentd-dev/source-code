@@ -32,6 +32,17 @@ pub struct Cost {
     pub policy_denials: u64,
 }
 
+impl Cost {
+    /// Fold another run's cost into this one (cost-per-success sums
+    /// across trials).
+    pub fn add(&mut self, o: &Cost) {
+        self.llm_calls += o.llm_calls;
+        self.llm_tokens += o.llm_tokens;
+        self.node_executions += o.node_executions;
+        self.policy_denials += o.policy_denials;
+    }
+}
+
 /// The result of one trial of a scenario.
 #[derive(Debug, Clone)]
 pub struct TrialOutcome {

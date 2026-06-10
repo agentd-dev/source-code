@@ -47,6 +47,28 @@ impl SuiteReport {
         Coverage::compute(&self.scenarios)
     }
 
+    /// Passing trials summed across the suite.
+    pub fn total_passed_trials(&self) -> u64 {
+        self.scenarios.iter().map(|s| s.passed_trials as u64).sum()
+    }
+
+    /// Tokens spent across *every* trial of *every* scenario.
+    pub fn total_trial_tokens(&self) -> u64 {
+        self.scenarios.iter().map(|s| s.total_cost.llm_tokens).sum()
+    }
+
+    /// Suite cost-per-success: tokens spent across all trials divided by
+    /// the number that actually passed. Reliability shows up here — a
+    /// suite that retries its way to green pays for it. `None` if
+    /// nothing passed.
+    pub fn cost_per_success(&self) -> Option<f64> {
+        let passed = self.total_passed_trials();
+        if passed == 0 {
+            return None;
+        }
+        Some(self.total_trial_tokens() as f64 / passed as f64)
+    }
+
     /// Sum of each scenario's representative per-run cost.
     pub fn total_cost(&self) -> Cost {
         self.scenarios.iter().fold(Cost::default(), |mut acc, s| {
@@ -92,6 +114,14 @@ impl SuiteReport {
             cost.llm_calls,
             cost.llm_tokens,
         ));
+        if let Some(cps) = self.cost_per_success() {
+            s.push_str(&format!(
+                "cost-per-success: {:.0} tokens/success ({} tokens over {} passing trials)\n",
+                cps,
+                self.total_trial_tokens(),
+                self.total_passed_trials(),
+            ));
+        }
         let cov = self.coverage();
         s.push_str(&format!(
             "coverage: {}/{} capabilities ({:.0}%)\n",
@@ -132,6 +162,7 @@ impl SuiteReport {
                         "node_executions": r.cost.node_executions,
                         "policy_denials": r.cost.policy_denials,
                     },
+                    "cost_per_success_tokens": r.cost_per_success(),
                     "total_latency_ms": r.total_latency.as_millis() as u64,
                     "load_error": r.load_error,
                     "failures": r.failures,
@@ -146,6 +177,9 @@ impl SuiteReport {
                 "mean_pass_k": self.mean_pass_k(),
                 "total_llm_calls": cost.llm_calls,
                 "total_llm_tokens": cost.llm_tokens,
+                "cost_per_success_tokens": self.cost_per_success(),
+                "total_trial_tokens": self.total_trial_tokens(),
+                "total_passed_trials": self.total_passed_trials(),
                 "coverage": {
                     "covered": cov.covered.len(),
                     "total": crate::capability::matrix().len(),
@@ -179,6 +213,12 @@ mod tests {
                 llm_calls: 1,
                 llm_tokens: 100,
                 node_executions: 2,
+                policy_denials: 0,
+            },
+            total_cost: Cost {
+                llm_calls: trials as u64,
+                llm_tokens: 100 * trials as u64,
+                node_executions: 2 * trials as u64,
                 policy_denials: 0,
             },
             total_latency: Duration::from_millis(3),

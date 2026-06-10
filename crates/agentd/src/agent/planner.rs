@@ -32,16 +32,15 @@ pub struct Plan {
     pub attempts: u32,
 }
 
-/// Inputs the planner needs beyond the goal text.
+/// Inputs the planner needs beyond the instruction text.
 pub struct PlanContext<'a> {
     /// System prompt from `--instructions`, if any.
     pub system: Option<&'a str>,
-    /// Human-readable policy summary so the plan stays inside the
-    /// allowlists (e.g. "fs.write: /tmp/out/**; http: <none>").
-    pub policy_summary: String,
-    /// Names of configured intelligence backends, so a planned
-    /// `llm_infer` references one that exists.
-    pub backends: Vec<String>,
+    /// Rendered capability catalogue (RFC 0006 §3): the node kinds
+    /// this build can run, the configured backends, the MCP servers
+    /// and tools, and the active policy — everything the planner is
+    /// allowed to reference, injected verbatim into the prompt.
+    pub capabilities: String,
 }
 
 /// Generate and validate a plan for `goal`, repairing validation
@@ -154,31 +153,20 @@ fn planner_system_prompt(ctx: &PlanContext<'_>) -> String {
          - `[[nodes]]` each with a unique `id` and a `type`\n\
          - `[[edges]]` from→to, optionally `when = \"<label>\"` for \
            switch/condition branches\n\n\
-         Node types you may use:\n\
-         - read_file{path_from} read_env{key} parse_json{input_from}\n\
-         - template_render{template,input_from?} json_select{input_from,path} \
-           diff_compute{left_from,right_from}\n\
-         - llm_infer{backend,prompt,input_from?,output_schema?}\n\
-         - write_file{path_from,content_from} create_dir{path_from}\n\
-         - http_request{method,url_from,body_from?} shell_run{command,args_from?}\n\
-         - condition{expr} switch{expr} merge fail{reason?} terminate\n\n\
          A node's output is read by later nodes as `<node_id>.<field>` \
          (e.g. `analyze.parsed.decision`). The reserved `trigger` holds \
-         the input payload.\n\n",
+         the input payload. The node types, intelligence backends, MCP \
+         servers, and policy you may use are listed below — this catalogue \
+         is the authoritative set of capabilities for THIS agent; use ONLY \
+         what it lists. Each node type shows its required fields in braces.\n\n",
     );
-    s.push_str("Active policy (stay inside it — anything else will be denied at runtime):\n");
-    s.push_str(&ctx.policy_summary);
-    s.push('\n');
-    if !ctx.backends.is_empty() {
-        s.push_str(&format!(
-            "Available llm_infer backends: {}.\n",
-            ctx.backends.join(", ")
-        ));
-    }
+    s.push_str("--- YOUR CAPABILITIES ---\n");
+    s.push_str(&ctx.capabilities);
     s.push_str(
-        "\nKeep it minimal and correct: every node reachable from a start \
-         node, no cycles, edges reference declared nodes, exactly one \
-         terminal path. Output ONLY the TOML.",
+        "\nKeep it minimal and correct: use only the node types and \
+         backends listed above, stay inside the policy, every node \
+         reachable from a start node, no cycles, edges reference \
+         declared nodes, exactly one terminal path. Output ONLY the TOML.",
     );
     s
 }
@@ -231,8 +219,8 @@ mod tests {
     fn ctx() -> PlanContext<'static> {
         PlanContext {
             system: Some("be terse"),
-            policy_summary: "fs.write: /tmp/**".into(),
-            backends: vec!["claude".into()],
+            capabilities: "node types: terminate\nbackends: claude\npolicy: fs.write [/tmp/**]"
+                .into(),
         }
     }
 
@@ -248,8 +236,7 @@ mod tests {
         // the standing instructions.
         let sent = &mock.received()[0].messages[0].content;
         assert!(sent.contains("be terse"));
-        assert!(sent.contains("fs.write: /tmp/**"));
-        assert!(sent.contains("llm_infer"));
+        assert!(sent.contains("fs.write [/tmp/**]"));
         assert!(sent.contains("claude"));
     }
 

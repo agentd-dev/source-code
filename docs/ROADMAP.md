@@ -83,7 +83,8 @@ first-class; neither is allowed to erode the other.
       evaluator–optimizer patterns without an inner loop (RFC 0003 §5).
 - [ ] Full JSON-Schema enforcement on `llm_infer` / loop outputs with
       schema-failure repair rounds.
-- [ ] Parallel fan-out / fan-in (RFC 0001 §9.1).
+- [x] Parallel fan-out / fan-in — a `parallel` node runs sub-workflows
+      concurrently (scoped threads) and joins (RFC 0003 §5).
 
 ## Later — scale-out (TODO: design RFCs required)
 

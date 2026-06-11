@@ -246,7 +246,7 @@ and `MAX_STEPS`.
 | Surface | What ships |
 |---|---|
 | **Execution modes** | declared workflows · `agent_loop` bounded-ReAct nodes · instruction mode (agent compiles its own workflow from a natural-language instruction, capability-injected, approval-gated, bounded re-planning) |
-| **Node kinds** | `read_file` `read_env` `read_mcp_resource` `parse_json` · `template_render` `json_select` `diff_compute` · `llm_infer` `agent_loop` · `write_file` `create_dir` `http_request` `call_mcp_tool` `shell_run` · `call` (sub-workflow) · `condition` `switch` `merge` `fail` `pause_for_approval` `terminate` |
+| **Node kinds** | `read_file` `read_env` `read_mcp_resource` `parse_json` · `template_render` `json_select` `diff_compute` · `llm_infer` `agent_loop` · `write_file` `create_dir` `http_request` `call_mcp_tool` `shell_run` · `call` (sub-workflow) · `parallel` (concurrent fan-out) · `condition` `switch` `merge` `fail` `pause_for_approval` `terminate` |
 | **Durable & HITL** | `pause_for_approval` node checkpoints under `--state-dir` and stops with a `paused` outcome (exit 7); `--resume RUN_ID` continues from the checkpoint with state restored — the line between automation and an agent that works alongside you |
 | **Models** | named backends: Anthropic · OpenAI · Gemini · OpenAI-compatible (vLLM/Ollama/gateways) · Unix-socket & HTTP JSON-RPC; keys via env only; hot-reloadable |
 | **Triggers** | HTTP/1.1 server (hand-rolled, keep-alive, drain-on-SIGTERM), cron + interval, fs-watch (debounced), manual |

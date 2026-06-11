@@ -499,6 +499,31 @@ start = "main"                       # optional; defaults to the child's first
 - The child is parsed and validated on each call. Compose the
   substrate — don't reach for an orchestrator-of-agents.
 
+#### `parallel`
+
+Run several sub-workflows **concurrently**, then join — declared
+fan-out/fan-in. Each branch is a sub-DAG (the same machinery as `call`);
+only scheduling is parallel, so the bounded substrate is unchanged.
+
+```toml
+[[nodes]]
+id = "split"
+type = "parallel"
+branches = [
+  { workflow = "workflows/enrich-a.toml", input_from = "trigger" },
+  { workflow = "workflows/enrich-b.toml", input_from = "trigger" },
+]
+```
+
+- Output: `{ "results": [ {"result": …} | {"error": …}, … ], "ok": bool }`
+  in branch-declaration order. Any branch failing sets `ok = false` and
+  routes the `error` branch.
+- Branches run on scoped OS threads (the engine is `Send + Sync` and
+  already serves concurrent runs); no async runtime enters the core.
+- Each branch shares the parent's *remaining* deadline and the depth
+  bound; branch inputs are resolved from the parent context before any
+  thread starts, so branches share nothing mutable.
+
 ### 1.5 Control
 
 Drive the traversal. No side effects. Always compiled.

@@ -13,6 +13,7 @@ in [docs/SAMPLES.md](../docs/SAMPLES.md); this is the index.
 | [`multi-provider.toml`](multi-provider.toml) | named backends across Anthropic / OpenAI / Gemini / local |
 | [`approval-gate.toml`](approval-gate.toml) | human-in-the-loop: `pause_for_approval` → checkpoint → `--resume` |
 | [`subworkflow-parent.toml`](subworkflow-parent.toml) + [`subworkflow-child.toml`](subworkflow-child.toml) | composition: a `call` node runs another workflow as a sub-DAG |
+| [`parallel-fanout.toml`](parallel-fanout.toml) | concurrent fan-out: a `parallel` node runs sub-workflows on threads, then joins |
 | [`self-planning-agent.toml`](self-planning-agent.toml) | an instructions file (`[agent]`) with a standing task — instruction mode + `--promote` |
 
 ```bash

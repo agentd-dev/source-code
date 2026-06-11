@@ -87,9 +87,13 @@ Both preserve the invariants and are explicitly
   This enables evaluator–optimizer patterns (generate → evaluate →
   retry) with a hard cap, without an open-ended agent loop. See
   `examples/evaluator-optimizer.toml`.
-- **Parallel fan-out / fan-in** (RFC 0001 §9.1, future). Changes
-  scheduling, not authority: the set of reachable actions is still the
-  declared graph.
+- **Parallel fan-out / fan-in** (shipped). A `parallel` node runs
+  several declared sub-workflows concurrently (scoped OS threads — the
+  engine is already `Send + Sync` and serves concurrent runs) and joins
+  their results in declaration order. Changes scheduling, not authority:
+  each branch is a bounded sub-DAG under the same policy/budget, and the
+  set of reachable actions is still the declared graph. See
+  `examples/parallel-fanout.toml`.
 
 A model-owned inner loop ("agentic sub-node") is the only relaxation
 that would weaken §2's guarantees; if it ever lands it will be a

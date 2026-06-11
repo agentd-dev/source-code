@@ -5,13 +5,15 @@
 //! returns an [`ExecutionOutcome`] once the run ends (terminate,
 //! fail, deadline, or dead-end).
 //!
-//! Phase 2 is deliberately **sequential-only** — no parallel
-//! branches. A node has at most one unconditional out-edge and any
-//! number of `when`-labelled out-edges (for Switch / Condition).
-//! Parallel fan-out is tracked as a later-tier extension (RFC §9.1).
+//! The main walk is **sequential** — a node has at most one
+//! unconditional out-edge and any number of `when`-labelled out-edges
+//! (for Switch / Condition). Concurrency is a *declared* exception: a
+//! `parallel` node fans out to several sub-workflows on scoped threads
+//! and joins them, and a `max_iterations` loop edge admits a bounded
+//! cycle. Both preserve the bounded substrate.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tracing::{debug, error, info, info_span, warn};
@@ -334,10 +336,12 @@ impl Engine {
 
             // Dispatch — with optional retry. The first attempt plus
             // `retry.max_attempts - 1` re-tries.
-            // `call` runs a sub-workflow on this same engine; every
-            // other node kind dispatches to its handler.
+            // `call` / `parallel` run sub-workflows on this same engine;
+            // every other node kind dispatches to its handler.
             let dispatch = if matches!(node.kind, crate::workflow::NodeKind::Call { .. }) {
                 self.run_call(node, &mut ctx, depth)
+            } else if matches!(node.kind, crate::workflow::NodeKind::Parallel { .. }) {
+                self.run_parallel(node, &mut ctx, depth)
             } else {
                 dispatch_with_retry(&self.registry, node, &mut ctx)
             };
@@ -571,8 +575,12 @@ impl Engine {
                 reason: format!("call depth exceeded {MAX_CALL_DEPTH} at node `{}`", node.id),
             });
         }
-
-        // Load + validate the child like any workflow.
+        // Load + validate the child like any workflow. Structural
+        // problems (read/parse/validate/depth/paused) are *hard* errors
+        // that propagate — a single delegation's failure is the parent's
+        // failure, and propagating keeps mutual recursion loud rather
+        // than silently dead-ending. A child that ran and reached a
+        // declared `failed` / `timed_out` routes the soft `error` branch.
         let src = std::fs::read_to_string(path).map_err(|e| Error::Workflow {
             workflow: ctx.workflow_id.clone(),
             reason: format!("call `{}`: read child workflow {path}: {e}", node.id),
@@ -588,8 +596,6 @@ impl Engine {
                 reason: format!("call `{}`: child {path} failed validation", node.id),
             });
         }
-
-        // Resolve the child's input + start node.
         let input = match input_from {
             Some(p) => ctx.resolve_path(p).cloned().unwrap_or(Value::Null),
             None => ctx.trigger.input.clone(),
@@ -609,7 +615,6 @@ impl Engine {
             })?;
         let entry = resolve_entry(&child, start_node)?.to_string();
 
-        // The child shares the parent's *remaining* deadline.
         let remaining = ctx.deadline.saturating_duration_since(Instant::now());
         let exec_id = next_execution_id();
         let child_ctx = ExecutionContext::new(
@@ -623,7 +628,8 @@ impl Engine {
             },
         );
         let child_trace = ExecutionTrace::new(exec_id);
-
+        // `?` propagates engine errors (incl. a nested call exceeding the
+        // depth bound) as hard failures.
         let (outcome, _child_trace) =
             self.walk_loop(&child, child_ctx, entry, child_trace, depth + 1)?;
         match outcome {
@@ -644,6 +650,149 @@ impl Engine {
                 reason: "sub-workflow paused; nested pause_for_approval is not supported"
                     .to_string(),
             }),
+        }
+    }
+
+    /// Run a `parallel` node's branches concurrently (each a sub-DAG,
+    /// same machinery as `call`), then join into
+    /// `{results: [{result|error}, …], ok}` in declaration order. Any
+    /// branch failure routes the `error` branch. The engine is `Sync`
+    /// (handlers are `Send + Sync`) and already runs concurrent
+    /// executions in serve mode, so scoped threads are sound — only
+    /// scheduling changes, never the bounded substrate.
+    fn run_parallel(
+        &self,
+        node: &crate::workflow::Node,
+        ctx: &mut ExecutionContext,
+        depth: u32,
+    ) -> Result<NodeOutcome> {
+        let crate::workflow::NodeKind::Parallel { branches } = &node.kind else {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!("node `{}` dispatched as parallel but is not one", node.id),
+            });
+        };
+        if depth + 1 > MAX_CALL_DEPTH {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!("call depth exceeded {MAX_CALL_DEPTH} at node `{}`", node.id),
+            });
+        }
+
+        // Resolve every branch's input from the parent context up front,
+        // so the spawned threads share nothing mutable.
+        let remaining = ctx.deadline.saturating_duration_since(Instant::now());
+        let dry = ctx.dry_run;
+        let child_depth = depth + 1;
+        let jobs: Vec<(String, Value, Option<String>)> = branches
+            .iter()
+            .map(|b| {
+                let input = match &b.input_from {
+                    Some(p) => ctx.resolve_path(p).cloned().unwrap_or(Value::Null),
+                    None => ctx.trigger.input.clone(),
+                };
+                (b.workflow.clone(), input, b.start.clone())
+            })
+            .collect();
+
+        let results: Vec<std::result::Result<Value, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|(path, input, start)| {
+                    s.spawn(move || {
+                        self.run_child_workflow(
+                            &path,
+                            input,
+                            start.as_deref(),
+                            remaining,
+                            dry,
+                            child_depth,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("branch panicked".to_string()))
+                })
+                .collect()
+        });
+
+        let any_err = results.iter().any(|r| r.is_err());
+        let arr: Vec<Value> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => serde_json::json!({ "result": v }),
+                Err(e) => serde_json::json!({ "error": e }),
+            })
+            .collect();
+        Ok(NodeOutcome::Continue {
+            value: serde_json::json!({ "results": arr, "ok": !any_err }),
+            branch: if any_err {
+                Some("error".to_string())
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Load, validate, and run one child workflow to completion, sharing
+    /// the parent's remaining deadline. Returns the child's final value
+    /// or a human-readable failure reason. Shared by `call` and
+    /// `parallel`. `depth` is the depth to run the child *at*.
+    fn run_child_workflow(
+        &self,
+        path: &str,
+        input: Value,
+        start: Option<&str>,
+        remaining: Duration,
+        dry_run: bool,
+        depth: u32,
+    ) -> std::result::Result<Value, String> {
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| format!("read child workflow {path}: {e}"))?;
+        let child = WorkflowDoc::from_toml(&src).map_err(|e| format!("parse child {path}: {e}"))?;
+        let report = crate::workflow::validate(&child);
+        if !report.ok() {
+            return Err(format!("child {path} failed validation"));
+        }
+        let start_name = start
+            .map(str::to_string)
+            .or_else(|| child.start_nodes.first().map(|s| s.name.clone()))
+            .ok_or_else(|| "child workflow declares no start nodes".to_string())?;
+        let start_node = child
+            .start_node(&start_name)
+            .ok_or_else(|| format!("child start node `{start_name}` not found"))?;
+        let entry = resolve_entry(&child, start_node)
+            .map_err(|e| format!("{e}"))?
+            .to_string();
+
+        let exec_id = next_execution_id();
+        let child_ctx = ExecutionContext::new(
+            exec_id.clone(),
+            child.name.clone(),
+            &start_name,
+            TriggerMeta::manual(input),
+            &RunOptions {
+                timeout: remaining,
+                dry_run,
+            },
+        );
+        let child_trace = ExecutionTrace::new(exec_id);
+        let (outcome, _trace) = self
+            .walk_loop(&child, child_ctx, entry, child_trace, depth)
+            .map_err(|e| format!("{e}"))?;
+        match outcome {
+            ExecutionOutcome::Completed { final_value, .. } => Ok(final_value),
+            ExecutionOutcome::Failed { reason, .. } => {
+                Err(format!("sub-workflow failed: {reason}"))
+            }
+            ExecutionOutcome::TimedOut { .. } => Err("sub-workflow timed out".to_string()),
+            ExecutionOutcome::Paused { .. } => {
+                Err("sub-workflow paused; nested pause_for_approval is not supported".to_string())
+            }
         }
     }
 }
@@ -1034,6 +1183,114 @@ mod tests {
         // The call node's output carries the child's result.
         let greet = &trace.entries[0];
         assert_eq!(greet.output["result"]["rendered"], "hi there");
+    }
+
+    #[test]
+    #[cfg(feature = "tools-data")] // branches use template_render
+    fn parallel_runs_branches_and_joins_in_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mk = |name: &str, tmpl: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(
+                &p,
+                format!(
+                    "name = \"{name}\"\n[[start_nodes]]\nname=\"main\"\nsource=\"manual\"\n\
+                     entry_node=\"r\"\n[[nodes]]\nid=\"r\"\ntype=\"template_render\"\n\
+                     template=\"{tmpl}\"\ninput_from=\"trigger\"\n"
+                ),
+            )
+            .unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let a = mk("a.toml", "A:{{x}}");
+        let b = mk("b.toml", "B:{{x}}");
+
+        let wf = WorkflowDoc {
+            name: "fan".into(),
+            start_nodes: vec![start("main", "split")],
+            nodes: vec![
+                n(
+                    "split",
+                    NodeKind::Parallel {
+                        branches: vec![
+                            ParallelBranch {
+                                workflow: a,
+                                input_from: Some("trigger".into()),
+                                start: None,
+                            },
+                            ParallelBranch {
+                                workflow: b,
+                                input_from: Some("trigger".into()),
+                                start: None,
+                            },
+                        ],
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("split", "done", None)],
+            ..Default::default()
+        };
+        let engine = {
+            let mut r = HandlerRegistry::with_builtin_controls();
+            crate::tools::register_default_tools(
+                &mut r,
+                crate::tools::policy::allow_all(),
+                crate::budget::unbounded(),
+            );
+            r.set_fallback(Box::new(StubHandler));
+            Engine::new(r)
+        };
+        let (out, trace) = engine
+            .run_with_trace(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({ "x": "go" })),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        let split = &trace.entries[0];
+        assert_eq!(split.output["ok"], true);
+        // Results are joined in branch-declaration order.
+        assert_eq!(split.output["results"][0]["result"]["rendered"], "A:go");
+        assert_eq!(split.output["results"][1]["result"]["rendered"], "B:go");
+    }
+
+    #[test]
+    fn parallel_failure_routes_error_branch() {
+        // One branch points at a missing file → that result is an error,
+        // ok=false, and the node emits the `error` branch.
+        let wf = WorkflowDoc {
+            name: "fan_err".into(),
+            start_nodes: vec![start("main", "split")],
+            nodes: vec![
+                n(
+                    "split",
+                    NodeKind::Parallel {
+                        branches: vec![ParallelBranch {
+                            workflow: "/no/such/child.toml".into(),
+                            input_from: None,
+                            start: None,
+                        }],
+                    },
+                ),
+                n("ok", NodeKind::Terminate),
+                n("bad", NodeKind::Fail { reason: None }),
+            ],
+            edges: vec![e("split", "ok", None), e("split", "bad", Some("error"))],
+            ..Default::default()
+        };
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        // The error branch leads to `bad` (a Fail node).
+        assert!(matches!(out, ExecutionOutcome::Failed { .. }));
     }
 
     #[test]

@@ -10,7 +10,17 @@ observability, policy) and the **autonomy dial** (compile-your-own
 workflows, agentic sub-loops, reliability-gated approval). Both stay
 first-class; neither is allowed to erode the other.
 
-## Now (v0.8 — the dynamic harness, RFC 0006)
+---
+
+## Shipped — the road to v1.0
+
+v1.0 (RFC 0006) freezes the substrate and the autonomy dial *together*.
+Everything in this section ships in the `v1.0.0` binary, covered by unit
+tests and the conformance suite. The public surface — TOML schema, CLI
+flags, outcome / record JSON, exit codes — is now stable under semver;
+breaking it requires a major bump.
+
+### The dynamic harness (v0.8 foundation, RFC 0006)
 
 - [x] Named intelligence backends: Anthropic / OpenAI / Gemini /
       openai-compatible (`intel-remote`), Unix socket, HTTP JSON-RPC.
@@ -26,15 +36,13 @@ first-class; neither is allowed to erode the other.
       conformance, cost-per-success reporting, criterion benchmarks.
       See [docs/CONFORMANCE.md](CONFORMANCE.md).
 
-## v0.9 — the autonomy dial and the bounds, both first-class
-
 ### Durable & composable execution (the bounds)
 
 - [x] **Run records** — the engine captures a structured record of a
       run (per-node input/output, cost, timing, policy decisions,
       outcome, trace). `--record run.json`; `agentd inspect run.json`
-      renders a human-readable timeline. The substrate a run inspector
-      (CLI today, UI later) consumes.
+      renders a human-readable timeline. The substrate the run inspector
+      (CLI + the `/inspect` UI) consumes.
 - [x] **Durable execution + `pause_for_approval`** — the engine writes a
       checkpoint at a `pause_for_approval` node and stops with a `Paused`
       outcome (exit 7); `--resume RUN_ID` continues with state restored.
@@ -45,6 +53,10 @@ first-class; neither is allowed to erode the other.
 - [x] **Sub-workflow `call` node** — invoke another workflow as a sub-DAG
       under the parent's policy/budget envelope, depth-bounded. Compose
       the substrate; never invent an orchestrator-of-agents.
+- [x] **Declared bounded cycles** (`max_iterations` edges) —
+      evaluator–optimizer patterns without an inner loop (RFC 0003 §5).
+- [x] **Parallel fan-out / fan-in** — a `parallel` node runs
+      sub-workflows concurrently (scoped threads) and joins (RFC 0003 §5).
 
 ### The autonomy dial (granted by evidence)
 
@@ -61,6 +73,10 @@ first-class; neither is allowed to erode the other.
       (`min_pass_rate` per scenario + a `--min-pass-rate` deploy gate).
       Autonomy you earn, measured — only possible because the substrate
       is deterministic and the harness exists.
+- [x] **Full JSON-Schema enforcement** on `llm_infer` outputs — with the
+      `schema` feature, an `output_schema` that names a JSON Schema file
+      is enforced against the model's output, with bounded
+      `output_repairs` re-prompt rounds on a schema failure (RFC 0003 §5).
 
 ### Conformance as a product
 
@@ -70,24 +86,22 @@ first-class; neither is allowed to erode the other.
       (`--save-baseline` / `--baseline`) and fail on a `pass_rate`
       regression (e.g. after a model update).
 
-### Authoring
+### Authoring & inspection
 
 - [x] **TypeScript authoring SDK** (`sdk/typescript`) — a typed builder
       that emits workflow TOML, so app engineers author in their stack
       and inherit the runtime's guarantees. TOML stays the compile
       target; the package round-trips its output through a real `agentd
       --validate-only` in CI.
+- [x] **Run inspector UI** (v1) — a browser surface over run records at
+      `/inspect`: paste/upload a record, see the node timeline with
+      per-node I/O, cost, and policy decisions, client-side.
 
-### Substrate depth (carried forward)
+---
 
-- [ ] Declared bounded cycles (`max_iterations` edges) —
-      evaluator–optimizer patterns without an inner loop (RFC 0003 §5).
-- [ ] Full JSON-Schema enforcement on `llm_infer` / loop outputs with
-      schema-failure repair rounds.
-- [x] Parallel fan-out / fan-in — a `parallel` node runs sub-workflows
-      concurrently (scoped threads) and joins (RFC 0003 §5).
+## After v1.0
 
-## Later — scale-out (TODO: design RFCs required)
+### Scale-out (design RFCs required)
 
 The single-process daemon stays the unit of correctness. Scale-out
 composes daemons rather than complicating one:
@@ -102,9 +116,44 @@ composes daemons rather than complicating one:
       and fleet-wide budget accounting.
 - [ ] **Fleet governance**: centrally-distributed signed policies and
       instruction files; per-tenant budget envelopes; audit shipping.
-- [x] **Run inspector UI** (v1) — a browser surface over run records at
-      `/inspect`: paste/upload a record, see the node timeline with
-      per-node I/O, cost, and policy decisions, client-side. Replay,
-      search, and run-diff are the next increments.
-- [ ] Windows path-pattern canonicalisation for `[policy.fs]`
+
+### Exactly-once & idempotency
+
+- [ ] **Idempotency keys** — a trigger-supplied key (or a content hash of
+      the input) dedupes retried deliveries to at-most-once *effect*,
+      collapsing the at-least-once recovery boundary (crash-recovery,
+      queue redelivery) into exactly-once for keyed runs. Persisted in
+      the run-state store; pairs with the queue-backed trigger above.
+
+### Substrate hardening (smaller, scoped)
+
+- [ ] **`tools-http-tls`** — an HTTPS client for the `http_request` node
+      (rustls), so outbound calls aren't plaintext-only. Feature-gated
+      like the rest of the capability surface.
+- [ ] **JWKS live fetch** — the OIDC verifier fetches and caches signing
+      keys from the issuer's JWKS endpoint in-process (keys are
+      configured statically today), with bounded refresh + rotation.
+- [ ] **Secrets-provider integration** — pluggable secret sources beyond
+      env / file (Vault, cloud secret managers) behind a feature,
+      resolved at load time into the same `*_env`-style indirection.
+      Secrets never enter the workflow TOML.
+- [ ] **Array-index context paths** — `resolve_path` indexes into arrays
+      (`items.0.id`), not just object keys, so nodes can address
+      fan-out / parallel results positionally.
+- [ ] **Windows path-pattern canonicalisation** for `[policy.fs]`
       (matcher is `/`-separated today; see maturity.md).
+
+### Control plane (product surface)
+
+The CLI inspector and the conformance suite are the substrate; a control
+plane turns them into a product:
+
+- [ ] **Persistent run history** — a queryable store of run records
+      (beyond the on-disk JSON), with retention windows + audit search.
+- [ ] **Conformance & drift dashboards** — suite results and
+      baseline-drift over time, alerting on a `pass_rate` regression.
+- [ ] **Inspector v2** — replay, cross-run search, and run-diff on top of
+      the `/inspect` surface shipped in v1.0.
+- [ ] **Plan review & approval queue** — a durable home for
+      `pause_for_approval` runs and promotion approvals, so the autonomy
+      dial has a human-facing surface, not just an exit code.

@@ -114,10 +114,13 @@ The plan is then treated exactly like a human-authored workflow:
    backends, MCP servers, budgets, auth, logging, signing — is taken
    from the `--config` base environment, not from the model. The agent
    cannot widen its own policy by emitting a different one.
-3. **Approval-gated.** The materialized plan prints in full. Headless
+3. **Approval-gated, at the right altitude.** The gate prints a
+   *capability summary* — what the plan reads, writes, reaches on the
+   network, and which models it calls, plus the policy it runs under —
+   not raw TOML, so a human approves what they can reason about. (The
+   full TOML is one flag away: `--plan-only` / `--plan-out`.) Headless
    runs refuse to execute without `--auto-approve` (or `auto_approve =
-   true` in the instructions file the operator authored); `--plan-only`
-   stops after printing. Fail-closed.
+   true` in the instructions file the operator authored). Fail-closed.
 4. **Executed** on the normal engine, under the normal policy,
    budgets, and audit.
 5. **Bounded self-improvement.** On a failed outcome, the planner
@@ -133,8 +136,12 @@ the backend named by the instructions file's `default_backend` against
 `AGENTD_GOAL_BACKEND=provider:model` for a zero-TOML run.
 
 The plan is a file. It can be saved (`--plan-out`), diffed, signed, and
-promoted into a Mode-1 workflow — the intended lifecycle for anything
-that proves itself.
+**promoted** (`--promote PATH`, which prepends provenance — the
+instruction it came from and the planner-attempt count) into a Mode-1
+workflow. This is the resolution of the dynamic-vs-bounded tension:
+instruction mode is the *design-time* fast path; the promoted, signed,
+versioned workflow is the *production* path. Dynamism collapses to a
+bound — the intended lifecycle for anything that proves itself.
 
 ## 3. Provider layer
 

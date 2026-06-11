@@ -152,6 +152,28 @@ the job done reliably. The suite sums cost across every trial and
 divides by the trials that passed, so a workflow that retries its way to
 green pays for it. Reported per scenario and across the suite.
 
+### Cost forecasting & drift detection
+
+Two products fall out of a deterministic substrate plus a cost/reliability
+harness:
+
+```bash
+# Project spend at a trigger rate (cost-per-success is a measured
+# constant, so spend scales linearly with volume).
+agentd-conformance run corpus/ --forecast-runs-per-day 5000 --price-per-mtok 5
+#   → forecast @ 5000 runs/day: 99 tokens/success → … tokens/month (~$74/month)
+
+# Save a baseline, then gate future runs against it.
+agentd-conformance run corpus/ --save-baseline baseline.json
+agentd-conformance run corpus/ --baseline baseline.json
+#   → drift vs baseline — REGRESSIONS:  classify  pass_rate 1.00 → 0.70
+```
+
+Drift detection compares each scenario's `pass_rate` against the
+baseline and fails on a regression — the "a model update silently broke
+my workflow" alarm. Run it on a schedule against the live model and a
+reliability drop pages you before users notice.
+
 ## Benchmarks
 
 `cargo bench` quantifies the appliance claim — a single native binary

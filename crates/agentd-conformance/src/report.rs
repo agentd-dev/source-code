@@ -23,6 +23,28 @@ pub struct ReliabilityViolation {
     pub required: f64,
 }
 
+/// Projected spend at a given trigger rate.
+#[derive(Debug, Clone)]
+pub struct Forecast {
+    pub runs_per_day: f64,
+    pub cost_per_success_tokens: f64,
+    pub tokens_per_day: f64,
+    pub tokens_per_month: f64,
+    pub usd_per_month: Option<f64>,
+}
+
+/// How one scenario moved relative to a saved baseline.
+#[derive(Debug, Clone)]
+pub struct Drift {
+    pub name: String,
+    pub old_pass_rate: f64,
+    pub new_pass_rate: f64,
+    pub old_tokens: u64,
+    pub new_tokens: u64,
+    /// `pass_rate` dropped — the regression a model update would cause.
+    pub regressed: bool,
+}
+
 impl SuiteReport {
     pub fn new(scenarios: Vec<ScenarioReport>) -> Self {
         Self { scenarios }
@@ -100,6 +122,64 @@ impl SuiteReport {
             return None;
         }
         Some(self.total_trial_tokens() as f64 / passed as f64)
+    }
+
+    /// Project spend from cost-per-success and a trigger rate. The
+    /// deterministic substrate makes this honest: cost-per-success is a
+    /// measured constant, so spend scales linearly with run volume.
+    pub fn forecast(&self, runs_per_day: f64, price_per_mtok: Option<f64>) -> Option<Forecast> {
+        let cps = self.cost_per_success()?;
+        let tokens_per_day = cps * runs_per_day;
+        let tokens_per_month = tokens_per_day * 30.0;
+        Some(Forecast {
+            runs_per_day,
+            cost_per_success_tokens: cps,
+            tokens_per_day,
+            tokens_per_month,
+            usd_per_month: price_per_mtok.map(|p| tokens_per_month * p / 1_000_000.0),
+        })
+    }
+
+    /// Compare this run against a saved baseline report (the JSON
+    /// [`to_json`](Self::to_json) emitted earlier). Drift is reported
+    /// per scenario present in both; a *regression* is a drop in
+    /// `pass_rate` — the "a model update broke it" signal.
+    pub fn drift_vs(&self, baseline: &Value) -> Vec<Drift> {
+        let base = baseline
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let lookup = |name: &str| -> Option<(f64, u64)> {
+            base.iter().find_map(|s| {
+                if s.get("name").and_then(Value::as_str) == Some(name) {
+                    let rate = s.get("pass_rate").and_then(Value::as_f64).unwrap_or(0.0);
+                    let toks = s
+                        .get("cost")
+                        .and_then(|c| c.get("llm_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    Some((rate, toks))
+                } else {
+                    None
+                }
+            })
+        };
+        self.scenarios
+            .iter()
+            .filter_map(|s| {
+                let (old_rate, old_tokens) = lookup(&s.name)?;
+                let new_rate = s.pass_rate();
+                Some(Drift {
+                    name: s.name.clone(),
+                    old_pass_rate: old_rate,
+                    new_pass_rate: new_rate,
+                    old_tokens,
+                    new_tokens: s.cost.llm_tokens,
+                    regressed: new_rate + 1e-9 < old_rate,
+                })
+            })
+            .collect()
     }
 
     /// Sum of each scenario's representative per-run cost.
@@ -280,5 +360,32 @@ mod tests {
         assert_eq!(v["summary"]["passed"], 1);
         assert_eq!(v["scenarios"][0]["pass_k"], 1.0);
         assert_eq!(v["scenarios"][0]["name"], "a");
+    }
+
+    #[test]
+    fn forecast_scales_cost_per_success_by_rate() {
+        // rep("a",4,4): 400 tokens over 4 passing trials → 100 / success.
+        let suite = SuiteReport::new(vec![rep("a", 4, 4)]);
+        let f = suite.forecast(1_000.0, Some(5.0)).unwrap();
+        assert!((f.cost_per_success_tokens - 100.0).abs() < 1e-9);
+        assert!((f.tokens_per_day - 100_000.0).abs() < 1e-6);
+        assert!((f.tokens_per_month - 3_000_000.0).abs() < 1e-6);
+        // 3M tokens/month at $5 / 1M = $15.
+        assert!((f.usd_per_month.unwrap() - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drift_flags_a_pass_rate_regression() {
+        let baseline = SuiteReport::new(vec![rep("a", 4, 4)]).to_json(); // rate 1.0
+        let now = SuiteReport::new(vec![rep("a", 4, 2)]); // rate 0.5
+        let drift = now.drift_vs(&baseline);
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].regressed);
+        assert!((drift[0].old_pass_rate - 1.0).abs() < 1e-9);
+        assert!((drift[0].new_pass_rate - 0.5).abs() < 1e-9);
+
+        // No regression when reliability holds.
+        let stable = SuiteReport::new(vec![rep("a", 4, 4)]);
+        assert!(!stable.drift_vs(&baseline)[0].regressed);
     }
 }

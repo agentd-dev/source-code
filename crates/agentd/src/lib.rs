@@ -38,6 +38,7 @@ pub mod observability;
 pub mod policy;
 pub mod ratelimit;
 pub mod runtime;
+pub mod secrets;
 pub mod server_config;
 pub mod signals;
 pub mod signing;

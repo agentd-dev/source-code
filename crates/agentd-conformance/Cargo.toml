@@ -1,6 +1,6 @@
 [package]
 name = "agentd-conformance"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Conformance, reliability, and benchmark suite for the agentd runtime"

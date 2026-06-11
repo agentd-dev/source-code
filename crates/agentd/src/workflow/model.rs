@@ -421,8 +421,17 @@ pub enum NodeKind {
         prompt: String,
         #[serde(default)]
         input_from: Option<String>,
+        /// Output contract. When it names a readable file, the parsed
+        /// output is validated against that JSON Schema (with the
+        /// `schema` feature); any other non-empty value (e.g. `inline`)
+        /// just requires the output to be valid JSON.
         #[serde(default)]
         output_schema: Option<String>,
+        /// Bounded re-prompt rounds on a parse / schema-validation
+        /// failure: the rejected output + the error are fed back and the
+        /// model is asked to correct it, up to this many times. Default 0.
+        #[serde(default)]
+        output_repairs: Option<u32>,
     },
 
     // --- Action ---

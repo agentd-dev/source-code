@@ -26,7 +26,11 @@ Respond as JSON: {"label": "...", "confidence": 0.0}
 Document: {{body}}
 """
 input_from = "trigger"
-output_schema = "schemas/classification.json"
+# With the `schema` feature, the output is validated against this JSON
+# Schema (path resolved from the working directory); output_repairs
+# re-prompts with the validation error up to N times before failing.
+output_schema = "examples/schemas/classification.json"
+output_repairs = 2
 
 [[nodes]]
 id = "route"

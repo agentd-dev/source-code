@@ -757,6 +757,7 @@ mod tests {
                         prompt: "…".into(),
                         input_from: Some("load_resource".into()),
                         output_schema: None,
+                        output_repairs: None,
                     },
                 ),
                 n(

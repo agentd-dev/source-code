@@ -301,7 +301,8 @@ type = "llm_infer"
 backend = "default"              # currently the only named backend
 prompt = "Classify sentiment of: {{text}}"
 input_from = "trigger"           # optional; default Null
-output_schema = "schemas/out.json"  # optional; current behaviour = "must be JSON"
+output_schema = "schemas/out.json"  # optional; see below
+output_repairs = 2               # optional; bounded re-prompt rounds on failure
 ```
 
 Produces:
@@ -325,8 +326,15 @@ Produces:
     upstreams terminate TLS at a sidecar and point at the localhost
     port. Same JSON-RPC 2.0 envelope as the Unix transport so one
     intel-server can front both.
-- `output_schema` today only enforces "must be valid JSON" — full
-  JSON-Schema validation is a future extension (see maturity).
+- `output_schema`: when it names a readable schema file and the
+  `schema` Cargo feature is compiled, the parsed output is validated
+  against that JSON Schema; any other non-empty value (e.g. `inline`),
+  or a build without the feature, enforces "must be valid JSON" only.
+- `output_repairs = N`: on a parse or schema-validation failure, the
+  rejected output + the error are fed back and the model is asked to
+  correct it, up to N times (default 0). Each round costs tokens and is
+  budget- and audit-tracked (`llm_infer.repair`). After the last
+  attempt, the node fails with `Error::Schema`.
 - Dry-run: returns `{ "content": "<dry-run>", "dry_run": true }`
   without calling the backend.
 - Unknown `backend` → `Error::Intelligence("backend ... is not
@@ -1113,8 +1121,7 @@ fixture's `[mocks]`, runs the engine, and diffs against `[expected]`.
 | Dynamic plugin loading | Compile-time-only capability surface |
 | LLM-invented tool calls | Intelligence is a bounded reasoning step; it can't add edges or capabilities |
 | Unrestricted network access | HTTP goes through `http_request` with policy; no raw sockets exposed |
-| Schema validation beyond "must be JSON" | `output_schema` currently only enforces validity — full JSON-Schema is a future feature |
-| Durable state across runs | Stateless by design — see maturity doc for the state-store roadmap |
+| Durable state across runs | `pause_for_approval` + `--resume` checkpoint a run; broader crash-recovery is on the roadmap |
 | HTTP/2 | HTTP/1.1 only |
 | HTTPS outbound in `http_request` | Plain HTTP only; `tools-http-tls` feature is a follow-up |
 | MCP subscription trigger (live listener) | Declarations parse; the listener side needs `resources/subscribe` on the client |

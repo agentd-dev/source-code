@@ -30,44 +30,44 @@ first-class; neither is allowed to erode the other.
 
 ### Durable & composable execution (the bounds)
 
-- [ ] **Run records** — the engine captures a structured record of a
+- [x] **Run records** — the engine captures a structured record of a
       run (per-node input/output, cost, timing, policy decisions,
       outcome, trace). `--record run.json`; `agentd inspect run.json`
       renders a human-readable timeline. The substrate a run inspector
       (CLI today, UI later) consumes.
-- [ ] **Durable execution** — persist `ExecutionContext` at node
-      boundaries; `--resume RUN_ID` continues a run from its last
-      checkpoint. The difference between in-memory automation and a
-      daemon that survives a restart.
-- [ ] **`pause_for_approval` node** — checkpoint, emit a `Paused`
-      outcome + a notification, and resume on a human's response. The
-      line between automation and an agent that works alongside you.
-- [ ] **Sub-workflow `call` node** — invoke another signed workflow as
-      a sub-DAG under the parent's policy/budget envelope, bounded
-      recursion depth. Compose the substrate; never invent an
-      orchestrator-of-agents.
+- [x] **Durable execution + `pause_for_approval`** — the engine writes a
+      checkpoint at a `pause_for_approval` node and stops with a `Paused`
+      outcome (exit 7); `--resume RUN_ID` continues from the checkpoint
+      with state restored. The line between automation and an agent that
+      works alongside you. (Crash-recovery at any node boundary is the
+      next increment.)
+- [x] **Sub-workflow `call` node** — invoke another workflow as a sub-DAG
+      under the parent's policy/budget envelope, depth-bounded. Compose
+      the substrate; never invent an orchestrator-of-agents.
 
 ### The autonomy dial (granted by evidence)
 
-- [ ] **Capability-altitude plan review** — render a compiled plan as
-      "reads X, calls model Y, writes Z, stays within policy, new tools
-      requested: none" for the approval step, not raw TOML. Approve at
-      the altitude a human reasons about.
-- [ ] **Plan promotion** — `--promote PATH` writes an approved compiled
-      plan as a versioned, signed Mode-1 workflow. Instruction mode
-      becomes the *design-time* fast path; the static signed artifact is
-      the *production* path. Dynamism that collapses to a bound.
-- [ ] **Reliability-gated autonomy** — auto-approve a workflow only when
-      its conformance `pass^k` clears a configured threshold. Autonomy
-      you earn, measured, per workflow — only possible because the
-      substrate is deterministic and the harness exists.
+- [x] **Capability-altitude plan review** — the approval gate renders a
+      compiled plan as what it reads / writes / reaches / calls, plus the
+      policy it runs under, not raw TOML. Approve at the altitude a human
+      reasons about.
+- [x] **Plan promotion** — `--promote PATH` writes an approved plan as a
+      durable workflow with a provenance header. Instruction mode is the
+      *design-time* fast path; the promoted, signed workflow is the
+      *production* path. Dynamism that collapses to a bound.
+- [x] **Reliability-gated autonomy** — a workflow earns the right to run
+      unattended by clearing a `pass_rate` bar in the conformance suite
+      (`min_pass_rate` per scenario + a `--min-pass-rate` deploy gate).
+      Autonomy you earn, measured — only possible because the substrate
+      is deterministic and the harness exists.
 
 ### Conformance as a product
 
-- [ ] **Cost forecasting** — project spend from cost-per-success ×
-      trigger rate.
-- [ ] **Drift detection** — compare a suite run against a saved baseline
-      and flag `pass^k` / cost regressions (e.g. after a model update).
+- [x] **Cost forecasting** — project spend from cost-per-success ×
+      trigger rate (`--forecast-runs-per-day` / `--price-per-mtok`).
+- [x] **Drift detection** — compare a suite run against a saved baseline
+      (`--save-baseline` / `--baseline`) and fail on a `pass_rate`
+      regression (e.g. after a model update).
 
 ### Authoring
 

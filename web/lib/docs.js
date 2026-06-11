@@ -13,6 +13,7 @@ export const DOCS = [
   { slug: "configuration", file: "docs/configuration.md", title: "configuration" },
   { slug: "operations", file: "docs/operations.md", title: "operations" },
   { slug: "maturity", file: "docs/maturity.md", title: "maturity" },
+  { slug: "samples", file: "docs/SAMPLES.md", title: "samples — a guided tour" },
   {
     slug: "conformance",
     file: "docs/CONFORMANCE.md",

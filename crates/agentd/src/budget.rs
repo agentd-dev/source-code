@@ -245,11 +245,12 @@ pub fn apply_rlimits(_cfg: &BudgetConfig) {
 }
 
 /// glibc spells the setrlimit resource type `__rlimit_resource_t`;
-/// macOS / BSD libc uses a plain `c_int`. Alias per-OS so the call
-/// compiles everywhere Unix.
-#[cfg(all(unix, target_os = "linux"))]
+/// musl and macOS / BSD libc use a plain `c_int`. Alias per-libc (not
+/// just per-OS — musl is Linux but has no `__rlimit_resource_t`) so the
+/// call compiles everywhere Unix, including `x86_64-unknown-linux-musl`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 type RlimitResource = libc::__rlimit_resource_t;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
 type RlimitResource = libc::c_int;
 
 #[cfg(unix)]

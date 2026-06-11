@@ -283,6 +283,10 @@ impl Engine {
         depth: u32,
     ) -> Result<(ExecutionOutcome, ExecutionTrace)> {
         let started_at = Instant::now();
+        // Per-run traversal counts for loop edges (declared
+        // `max_iterations`), keyed by edge index.
+        let mut loop_counts: std::collections::HashMap<usize, u32> =
+            std::collections::HashMap::new();
 
         for _step in 0..MAX_STEPS {
             // Deadline check.
@@ -432,7 +436,8 @@ impl Engine {
                         elapsed_ms: latency_ms,
                     });
                     ctx.node_outputs.insert(current_id.clone(), value);
-                    let next_id = pick_next(workflow, &current_id, branch.as_deref())?;
+                    let next_id =
+                        pick_next(workflow, &current_id, branch.as_deref(), &mut loop_counts)?;
                     match next_id {
                         Some(id) => current_id = id,
                         None => {
@@ -494,7 +499,13 @@ impl Engine {
                 ),
             });
         };
-        let resume_node = pick_next(workflow, node_id, None)?;
+        // A pause node's successor is a normal forward edge (not a loop).
+        let resume_node = pick_next(
+            workflow,
+            node_id,
+            None,
+            &mut std::collections::HashMap::new(),
+        )?;
         let checkpoint = crate::engine::checkpoint::Checkpoint {
             run_id: ctx.execution_id.clone(),
             workflow: workflow.name.clone(),
@@ -772,21 +783,35 @@ fn pick_next(
     workflow: &WorkflowDoc,
     current: &str,
     branch: Option<&str>,
+    loop_counts: &mut std::collections::HashMap<usize, u32>,
 ) -> Result<Option<String>> {
-    let matches: Vec<&Edge> = workflow
+    let matches: Vec<(usize, &Edge)> = workflow
         .edges
         .iter()
-        .filter(|e| e.from == current)
-        .filter(|e| match (branch, e.when.as_deref()) {
+        .enumerate()
+        .filter(|(_, e)| e.from == current)
+        .filter(|(_, e)| match (branch, e.when.as_deref()) {
             (Some(label), Some(edge_label)) => label == edge_label,
             (None, None) => true,
             _ => false,
+        })
+        // A loop edge whose budget is spent is no longer a candidate —
+        // the loop is forced to exit (dead-end, or another edge).
+        .filter(|(idx, e)| match e.max_iterations {
+            Some(max) => loop_counts.get(idx).copied().unwrap_or(0) < max,
+            None => true,
         })
         .collect();
 
     match matches.len() {
         0 => Ok(None),
-        1 => Ok(Some(matches[0].to.clone())),
+        1 => {
+            let (idx, edge) = matches[0];
+            if edge.max_iterations.is_some() {
+                *loop_counts.entry(idx).or_insert(0) += 1;
+            }
+            Ok(Some(edge.to.clone()))
+        }
         _ => Err(Error::Workflow {
             workflow: workflow.name.clone(),
             reason: format!(
@@ -825,6 +850,16 @@ mod tests {
             from: from.into(),
             to: to.into(),
             when: when.map(Into::into),
+            max_iterations: None,
+        }
+    }
+
+    fn loop_edge(from: &str, to: &str, when: Option<&str>, max: u32) -> Edge {
+        Edge {
+            from: from.into(),
+            to: to.into(),
+            when: when.map(Into::into),
+            max_iterations: Some(max),
         }
     }
 
@@ -1036,6 +1071,44 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("call depth"), "{err}");
+    }
+
+    #[test]
+    fn bounded_loop_edge_caps_iterations() {
+        // gen → eval; eval always routes "retry" back to gen via a loop
+        // edge with max_iterations = 3. The engine follows it 3 times,
+        // then the budget is spent and the run dead-ends at eval.
+        let wf = WorkflowDoc {
+            name: "optimizer".into(),
+            start_nodes: vec![start("main", "gen")],
+            nodes: vec![
+                n("gen", NodeKind::Merge),
+                n(
+                    "eval",
+                    NodeKind::Switch {
+                        expr: "trigger.verdict".into(),
+                    },
+                ),
+            ],
+            edges: vec![
+                e("gen", "eval", None),
+                loop_edge("eval", "gen", Some("retry"), 3),
+            ],
+            ..Default::default()
+        };
+        let (out, trace) = engine_with_stub()
+            .run_with_trace(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({ "verdict": "retry" })),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        // eval is visited max_iterations + 1 = 4 times (the last time the
+        // loop edge is exhausted, so the run stops there).
+        let evals = trace.node_ids().iter().filter(|id| *id == "eval").count();
+        assert_eq!(evals, 4, "loop ran {evals} times; expected 4");
     }
 
     #[test]

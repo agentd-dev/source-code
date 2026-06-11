@@ -1,0 +1,68 @@
+# Evaluator–optimizer (RFC 0003 §5): generate a draft, have a second
+# model critique it, and loop back to improve — at most N times — until
+# the evaluator accepts. The loop is a *declared bounded cycle*, not an
+# open-ended agent loop: the `max_iterations` back-edge is the only
+# cycle the validator permits, and the engine stops following it once
+# the budget is spent.
+#
+#   agentd --config examples/evaluator-optimizer.toml --validate-only
+#   ANTHROPIC_API_KEY=… agentd --config examples/evaluator-optimizer.toml \
+#       --input '{"topic":"the appliance thesis"}'
+
+name = "draft_refiner"
+
+[[intelligence.backends]]
+name = "claude"
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "generate"
+
+[[nodes]]
+id = "generate"
+type = "llm_infer"
+backend = "claude"
+prompt = "Write or improve a short draft about {{topic}}. Prior critique (if any): {{evaluate.parsed.critique}}"
+input_from = "trigger"
+
+[[nodes]]
+id = "evaluate"
+type = "llm_infer"
+backend = "claude"
+prompt = "Critique this draft and decide if it is good enough. Reply JSON {\"verdict\":\"accept|retry\",\"critique\":\"…\"}."
+input_from = "generate"
+output_schema = "inline"
+
+[[nodes]]
+id = "route"
+type = "switch"
+expr = "evaluate.parsed.verdict"
+
+[[nodes]]
+id = "accept"
+type = "terminate"
+
+[[edges]]
+from = "generate"
+to = "evaluate"
+
+[[edges]]
+from = "evaluate"
+to = "route"
+
+[[edges]]
+from = "route"
+when = "accept"
+to = "accept"
+
+# The bounded loop: route back to `generate` up to 3 times. When the
+# budget is spent the loop edge is no longer eligible, so the run exits.
+[[edges]]
+from = "route"
+when = "retry"
+to = "generate"
+max_iterations = 3

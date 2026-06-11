@@ -1173,6 +1173,7 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
                 when: None,
+                max_iterations: None,
             }],
             ..Default::default()
         }
@@ -1583,11 +1584,13 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
                 when: Some("true".into()),
+                max_iterations: None,
             },
             Edge {
                 from: "a".into(),
                 to: "b".into(),
                 when: Some("false".into()),
+                max_iterations: None,
             },
         ];
         let handle = start_server(wf);

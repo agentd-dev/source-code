@@ -336,6 +336,12 @@ fn check_acyclic(doc: &WorkflowDoc, r: &mut ValidationReport) {
         doc.nodes.iter().map(|n| (n.id.as_str(), vec![])).collect();
 
     for edge in &doc.edges {
+        // Loop edges (declared `max_iterations`) are allowed to form a
+        // cycle — they are excluded here so the *rest* of the graph
+        // must still be a DAG. The engine bounds their traversal.
+        if edge.max_iterations.is_some() {
+            continue;
+        }
         *in_degree.entry(edge.to.as_str()).or_insert(0) += 1;
         adj.entry(edge.from.as_str())
             .or_default()
@@ -502,6 +508,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             when: None,
+            max_iterations: None,
         }
     }
 
@@ -511,6 +518,43 @@ mod tests {
             source,
             entry_node: entry.map(Into::into),
         }
+    }
+
+    fn loop_edge(from: &str, to: &str, when: Option<&str>, max: u32) -> Edge {
+        Edge {
+            from: from.into(),
+            to: to.into(),
+            when: when.map(Into::into),
+            max_iterations: Some(max),
+        }
+    }
+
+    #[test]
+    fn loop_edge_permits_a_bounded_cycle() {
+        let nodes = vec![
+            merge("gen"),
+            n("eval", NodeKind::Switch { expr: "x".into() }),
+        ];
+        let bounded = WorkflowDoc {
+            name: "ok".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("gen"))],
+            nodes: nodes.clone(),
+            edges: vec![
+                edge("gen", "eval"),
+                loop_edge("eval", "gen", Some("retry"), 3),
+            ],
+            ..Default::default()
+        };
+        let r = validate(&bounded);
+        assert!(r.ok(), "bounded cycle should validate: {:?}", r.issues);
+
+        // The same back-edge without a budget is an ordinary cycle.
+        let unbounded = WorkflowDoc {
+            edges: vec![edge("gen", "eval"), edge("eval", "gen")],
+            ..bounded
+        };
+        let r = validate(&unbounded);
+        assert!(r.issues.iter().any(|i| i.code == "cycle"), "{:?}", r.issues);
     }
 
     #[test]
@@ -783,11 +827,13 @@ mod tests {
                     from: "decision".into(),
                     to: "post_comment".into(),
                     when: Some("comment".into()),
+                    max_iterations: None,
                 },
                 Edge {
                     from: "decision".into(),
                     to: "done".into(),
                     when: Some("ignore".into()),
+                    max_iterations: None,
                 },
                 edge("post_comment", "done"),
             ],

@@ -586,6 +586,12 @@ pub struct Edge {
     pub to: String,
     #[serde(default)]
     pub when: Option<String>,
+    /// A *loop edge*: this back-edge may be traversed at most this many
+    /// times per run (evaluator–optimizer patterns, RFC 0003 §5). The
+    /// validator permits the cycle it forms; the engine stops following
+    /// it once the budget is spent. Absent = an ordinary acyclic edge.
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------

@@ -609,6 +609,7 @@ String values match verbatim; bool / number match their JSON text
 from = "node_id"
 to   = "other_node_id"
 when = "label"        # optional; matches against the source's branch outcome
+max_iterations = 3    # optional; makes this a bounded *loop edge*
 ```
 
 Rules enforced by the engine:
@@ -622,6 +623,15 @@ Rules enforced by the engine:
 - A node with **zero matching out-edges** is a dead-end;
   traversal ends with the current node's output as the final value
   (`ExecutionOutcome::Completed`).
+
+**Bounded cycles (loop edges).** An edge with `max_iterations = N` is a
+declared back-edge: the validator permits the cycle it forms (the rest
+of the graph must still be acyclic), and the engine follows it at most
+N times per run, tracked per edge. When the budget is spent the loop
+edge is no longer eligible, so the loop exits (another matching edge, or
+a dead-end). This enables evaluator–optimizer patterns — generate →
+evaluate → loop back to improve — *without* an open-ended agent loop.
+See `examples/evaluator-optimizer.toml`. `MAX_STEPS` still backstops.
 
 The validator catches dangling `from` / `to`, cycles (Kahn's),
 and unreachable nodes. It does NOT verify `when` labels match the

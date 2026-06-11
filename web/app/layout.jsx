@@ -19,6 +19,9 @@ export default function RootLayout({ children }) {
               agentd<span className="text-[var(--dim)]">@~</span>
               <span className="cursor" />
             </Link>
+            <Link href="/use-cases/" className="text-[var(--dim)] hover:text-[var(--accent)]">
+              use cases
+            </Link>
             <Link href="/docs/overview/" className="text-[var(--dim)] hover:text-[var(--accent)]">
               docs
             </Link>

@@ -103,6 +103,14 @@ ANTHROPIC_API_KEY=… agentd --config examples/agent-loop.toml \
    --instructions examples/self-planning-agent.toml --auto-approve
 ```
 
+`--promote` writes a **self-contained** workflow — the generated graph
+plus the base config's policy, backends, and budgets carried over — so
+`workflows/log-auditor.toml` validates and runs on its own:
+
+```bash
+agentd --config workflows/log-auditor.toml --validate-only   # standalone
+```
+
 Instruction mode is the *design-time* fast path; the promoted workflow is
 the *production* path — dynamism that collapses to a bound.
 

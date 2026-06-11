@@ -894,11 +894,11 @@ unknown versions" requirement.
   `execution_id`, `workflow`, `start_node`, `node_id`, `kind`,
   `outcome`, `latency_ms`, `reason` (on failure). Same shape the RFC
   §20 specified.
-- **Metrics** (in-process counters): `workflow_started_total`,
-  `workflow_completed_total`, `workflow_failed_total`,
-  `workflow_timeout_total`, `node_exec_total`, `policy_deny_total`.
-  Not yet exported on a wire — read them from inside a test or add
-  a small `/metrics` handler if you need Prometheus scrape.
+- **Metrics**: in-process counters (workflow starts / completions /
+  failures / timeouts / errors, node executions + failures, policy
+  denials, llm calls + tokens) exported on `GET /metrics` in serve mode
+  as Prometheus text — see §3.5 for the full counter list. A one-shot
+  run's cost is also captured in its [run record](#36-run-records--inspection).
 
 ---
 

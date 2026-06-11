@@ -1,0 +1,18 @@
+# A reusable sub-workflow: classify a value and return the label.
+# Called by examples/subworkflow-parent.toml via a `call` node.
+#
+# It ends at a dead-end node (no `terminate`) so its final value — the
+# rendered label — flows back to the caller as `{result: …}`.
+
+name = "labeller"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "label"
+
+[[nodes]]
+id = "label"
+type = "template_render"
+template = "label:{{kind}}"
+input_from = "trigger"

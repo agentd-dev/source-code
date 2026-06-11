@@ -477,6 +477,24 @@ pub enum NodeKind {
         timeout_secs: Option<u64>,
     },
 
+    // --- Composition ---
+    /// Invoke another workflow as a sub-DAG, under this run's policy and
+    /// remaining deadline. The child's `Completed` value becomes this
+    /// node's `result` output; a child failure/timeout routes the
+    /// `error` branch. Recursion is depth-bounded.
+    Call {
+        /// Path to the child workflow TOML, author-declared (resolved
+        /// from the working directory) — never from runtime input.
+        workflow: String,
+        /// Context path whose value becomes the child's trigger input;
+        /// defaults to this run's trigger input.
+        #[serde(default)]
+        input_from: Option<String>,
+        /// Start-node name in the child; defaults to its first.
+        #[serde(default)]
+        start: Option<String>,
+    },
+
     // --- Control ---
     Condition {
         expr: String,
@@ -521,6 +539,7 @@ impl NodeKind {
             NodeKind::HttpRequest { .. } => "http_request",
             NodeKind::CallMcpTool { .. } => "call_mcp_tool",
             NodeKind::ShellRun { .. } => "shell_run",
+            NodeKind::Call { .. } => "call",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
             NodeKind::Merge => "merge",

@@ -1,0 +1,42 @@
+# Composition: a parent workflow that calls a reusable sub-workflow and
+# routes on whether it succeeded. Compose the substrate — the child runs
+# on the same engine under the same policy and budget, never as a
+# separate orchestrated agent.
+#
+#   agentd --config examples/subworkflow-parent.toml --input '{"kind":"invoice"}'
+#   # → the `classify` call returns {result:{rendered:"label:invoice"}}
+#
+# Paths are author-declared and resolved from the working directory.
+
+name = "router"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "classify"
+
+[[nodes]]
+id = "classify"
+type = "call"
+workflow = "examples/subworkflow-child.toml"
+input_from = "trigger"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "failed"
+type = "fail"
+reason = "sub-workflow could not classify the input"
+
+[[edges]]
+from = "classify"
+to = "done"
+
+# If the child fails or times out it emits the `error` branch; route it
+# to a declared failure instead of silently dead-ending.
+[[edges]]
+from = "classify"
+when = "error"
+to = "failed"

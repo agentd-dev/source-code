@@ -99,95 +99,82 @@ breaking it requires a major bump.
 
 ---
 
-## After v1.0
+## After v1.0 — shipped (v1.1.0 → v1.3.0)
 
-### Scale-out (design RFCs required)
+The business-automation use-case catalog (docs/use-cases/) was built
+against the real runtime as a stress test, and its
+[gap analysis](use-cases/GAP-ANALYSIS.md) drove three releases in its
+own recommended order. Every buildable gap it surfaced is closed:
+
+- [x] **`tools-http-tls`** — HTTPS for `http_request` (ureq + rustls,
+      the intel-remote stack); redirects never followed so the policy
+      decision stays exact. v1.1.0 (§1).
+- [x] **`respond` node** — an http-triggered workflow shapes its own
+      HTTP reply; TwiML / Slack shapes / challenge echoes answered
+      natively. v1.2.0 (§2).
+- [x] **`map` node + array-index context paths** — bounded fan-out over
+      data: one sub-workflow per array element, mandatory `max_items`,
+      `parallel`'s join contract. v1.2.0 (§3).
+- [x] **Form-encoded / multipart webhook bodies** — Twilio /
+      inbound-email callers need no JSON relay. v1.2.0 (§4).
+- [x] **Per-route idempotency keys** — redeliveries replay the recorded
+      response; exactly-once *effect* at the route boundary
+      (single-node). v1.2.0 (§5).
+- [x] **HTTP basic auth** — RFC 7617, constant-time, dependency-free
+      strict base64. v1.2.0 (§9).
+- [x] **Secrets-provider integration** — `[[secrets]]` pluggable
+      sources (env alias / file / command / OAuth2 client-credentials)
+      through one resolve front door with env fallback; per-request
+      re-resolution in LLM backends; `{{secret:NAME}}` headers + MCP
+      child env. Secret material in TOML is a parse error. v1.3.0 (§6).
+
+---
+
+## Deferred — parked until demand pulls
+
+**Status: deliberately not scheduled** (2026-06-11). With the
+gap-analysis catalog closed, the runtime covers the single-process
+deployment shape it targets end to end. Everything below is real,
+designed-enough-to-start work — and exactly because each item is an
+architecture commitment (a fleet story, a stateful product surface),
+none of it starts on spec alone. An item leaves this section when a
+concrete deployment hits its wall, the same way the catalog promoted
+idempotency keys and secrets.
+
+### Scale-out (design RFCs required first)
 
 The single-process daemon stays the unit of correctness. Scale-out
 composes daemons rather than complicating one:
 
-- [ ] **Clustering**: N agentd processes behind shared triggers;
-      leader-elected cron so schedules fire exactly once per fleet.
-- [ ] **Work distribution**: a queue-backed trigger (NATS/SQS-class)
-      so goals and workflow runs can be submitted to a pool;
-      at-least-once delivery with idempotency keys from run ids.
-- [ ] **Coordination layer**: shared run-state store (leases,
-      progress, outcomes) enabling hand-off, retries across nodes,
-      and fleet-wide budget accounting.
-- [ ] **Fleet governance**: centrally-distributed signed policies and
-      instruction files; per-tenant budget envelopes; audit shipping.
-
-### Exactly-once & idempotency
-
-- [x] **Idempotency keys** — a per-route key (`idempotency_key =
-      "trigger.order.id"` or `"body_sha256"`) dedupes retried webhook
-      deliveries to exactly-once *effect*: seen key → replay the
-      recorded response, don't re-execute. Persisted under
-      `--state-dir`; failures stay retryable; concurrent duplicates get
-      409. Shipped in v1.2.0 (single-node) — the queue-backed fleet
-      variant above still composes on top.
-
-### Demanded by the use-case catalog (gap analysis)
-
-The business-automation catalog (docs/use-cases/) was built against the
-real runtime as a stress test; these are the capability proposals it
-produced, in recommended order — see
-[docs/use-cases/GAP-ANALYSIS.md](use-cases/GAP-ANALYSIS.md) for designs
-and sizing:
-
-- [x] **`respond` node** — an http-triggered workflow shapes its own
-      HTTP reply (status / content-type / templated body); Twilio
-      TwiML, Slack slash commands, and challenge echoes are answered
-      natively (§2). Shipped in v1.2.0.
-- [x] **`map` node + array-index context paths** — one sub-workflow per
-      element of a context-resolved array, bounded by a mandatory
-      `max_items` + concurrency cap, joining like `parallel` (§3).
-      Shipped in v1.2.0.
-- [x] **Form-encoded / multipart webhook bodies** — content-type-aware
-      trigger parsing (urlencoded → flat JSON; multipart fields, with
-      attachments dropped + audited) so Twilio / inbound-email callers
-      don't need a JSON relay (§4). Shipped in v1.2.0.
-- [x] **HTTP basic auth scheme** — RFC 7617, constant-time, hand-rolled
-      strict base64 (the default `auth` build stays dependency-free);
-      removes the last auth friction for telephony-style webhook
-      callers (§9). Shipped in v1.2.0.
-
-### Substrate hardening (smaller, scoped)
-
-- [x] **`tools-http-tls`** — an HTTPS client for the `http_request` node
-      (ureq + rustls, the intel-remote stack), so outbound calls aren't
-      plaintext-only. Feature-gated like the rest of the capability
-      surface; redirects never followed so the policy decision stays
-      exact. Shipped in v1.1.0 — the gap every SaaS-facing business
-      automation hit first (see docs/use-cases/GAP-ANALYSIS.md).
-- [ ] **JWKS live fetch** — the OIDC verifier fetches and caches signing
-      keys from the issuer's JWKS endpoint in-process (keys are
-      configured statically today), with bounded refresh + rotation.
-- [x] **Secrets-provider integration** — `[[secrets]]` pluggable
-      sources (env alias / file / command / OAuth2 client-credentials)
-      resolved through one front door with env fallback, so every
-      `*_env` consumer upgraded at once; per-request re-resolution in
-      LLM backends; `{{secret:NAME}}` http_request headers + MCP child
-      env give tokens somewhere to go. Secret material in TOML is a
-      parse error. Shipped in v1.3.0 (GAP-ANALYSIS §6).
-- [x] **Array-index context paths** — `resolve_path` (and the
-      json_select / template walk) index into arrays (`items.0.id`),
-      not just object keys, so nodes address fan-out / parallel / map
-      results positionally. Shipped in v1.2.0.
-- [ ] **Windows path-pattern canonicalisation** for `[policy.fs]`
-      (matcher is `/`-separated today; see maturity.md).
+- **Clustering** — N agentd processes behind shared triggers;
+  leader-elected cron so schedules fire exactly once per fleet.
+- **Work distribution** — a queue-backed trigger (NATS/SQS-class) so
+  goals and runs submit to a pool; at-least-once delivery composing
+  with the shipped per-route idempotency keys.
+- **Coordination layer** — shared run-state store (leases, progress,
+  outcomes) enabling hand-off, cross-node retries, fleet-wide budget
+  accounting.
+- **Fleet governance** — centrally-distributed signed policies and
+  instruction files; per-tenant budget envelopes; audit shipping.
 
 ### Control plane (product surface)
 
-The CLI inspector and the conformance suite are the substrate; a control
-plane turns them into a product:
+The CLI inspector and the conformance suite are the substrate; a
+control plane would turn them into a product:
 
-- [ ] **Persistent run history** — a queryable store of run records
-      (beyond the on-disk JSON), with retention windows + audit search.
-- [ ] **Conformance & drift dashboards** — suite results and
-      baseline-drift over time, alerting on a `pass_rate` regression.
-- [ ] **Inspector v2** — replay, cross-run search, and run-diff on top of
-      the `/inspect` surface shipped in v1.0.
-- [ ] **Plan review & approval queue** — a durable home for
-      `pause_for_approval` runs and promotion approvals, so the autonomy
-      dial has a human-facing surface, not just an exit code.
+- **Persistent run history** — a queryable store of run records with
+  retention windows + audit search.
+- **Conformance & drift dashboards** — suite results and
+  baseline-drift over time, alerting on `pass_rate` regressions.
+- **Inspector v2** — replay, cross-run search, run-diff on top of
+  `/inspect`.
+- **Plan review & approval queue** — a durable human-facing surface
+  for `pause_for_approval` runs and promotion approvals.
+
+### Substrate odds and ends
+
+- **JWKS live fetch** — the OIDC verifier fetches + caches signing
+  keys from the issuer's endpoint in-process (statically configured
+  today; operators rotate externally and hot-reload).
+- **Windows path-pattern canonicalisation** for `[policy.fs]` (the
+  matcher is `/`-separated today; see maturity.md).

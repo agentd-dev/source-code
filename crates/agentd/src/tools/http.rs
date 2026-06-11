@@ -61,6 +61,7 @@ impl NodeHandler for HttpRequestHandler {
             method,
             url_from,
             body_from,
+            headers,
         } = &node.kind
         else {
             return Err(kind_mismatch(node, "http_request"));
@@ -114,12 +115,18 @@ impl NodeHandler for HttpRequestHandler {
             None => None,
         };
 
+        // Declared headers: literals + {{secret:NAME}} placeholders,
+        // resolved at request time. Rendered values never enter the
+        // node output, the trace, or the run record.
+        let rendered_headers = render_declared_headers(headers)?;
+
         let outbound_traceparent = ctx.outbound_traceparent();
         let response = dispatch_request(
             &method_upper,
             &url,
             body_bytes.as_deref(),
             outbound_traceparent.as_deref(),
+            &rendered_headers,
         )?;
 
         // Branch label on non-2xx so workflow authors can route
@@ -197,6 +204,80 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
 }
 
 // ---------------------------------------------------------------------------
+// Declared headers
+// ---------------------------------------------------------------------------
+
+/// Render a node's declared headers: validate names, substitute
+/// `{{secret:NAME}}` placeholders through the secrets registry, and
+/// reject CR/LF in the final value (header injection, fail closed).
+/// Values are NEVER context-interpolated — model output and trigger
+/// data cannot shape a header.
+fn render_declared_headers(
+    declared: &std::collections::HashMap<String, String>,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(declared.len());
+    // Deterministic order for stable wire output + tests.
+    let mut entries: Vec<_> = declared.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, template) in entries {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(Error::Tool {
+                tool: "http_request".into(),
+                reason: format!("header name `{name}` is not a valid HTTP token"),
+            });
+        }
+        let value = substitute_secret_placeholders(name, template)?;
+        if value.contains('\r') || value.contains('\n') {
+            return Err(Error::Tool {
+                tool: "http_request".into(),
+                reason: format!("header `{name}`: value contains CR/LF"),
+            });
+        }
+        out.push((name.clone(), value));
+    }
+    Ok(out)
+}
+
+/// Replace every `{{secret:NAME}}` in a header value via the secrets
+/// registry. Any other `{{…}}` marker is an error — headers carry
+/// literals and secrets only, never context data.
+fn substitute_secret_placeholders(header: &str, template: &str) -> Result<String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let (literal, after_open) = rest.split_at(open);
+        out.push_str(literal);
+        let Some(end_rel) = after_open[2..].find("}}") else {
+            return Err(Error::Tool {
+                tool: "http_request".into(),
+                reason: format!("header `{header}`: unclosed placeholder"),
+            });
+        };
+        let inner = after_open[2..2 + end_rel].trim();
+        let Some(secret_name) = inner.strip_prefix("secret:") else {
+            return Err(Error::Tool {
+                tool: "http_request".into(),
+                reason: format!(
+                    "header `{header}`: `{{{{{inner}}}}}` — headers interpolate                      {{{{secret:NAME}}}} only, never context data"
+                ),
+            });
+        };
+        let value = crate::secrets::resolve(secret_name.trim()).map_err(|e| Error::Tool {
+            tool: "http_request".into(),
+            reason: format!("header `{header}`: {e}"),
+        })?;
+        out.push_str(&value);
+        rest = &after_open[2 + end_rel + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Scheme dispatch
 // ---------------------------------------------------------------------------
 
@@ -209,13 +290,14 @@ fn dispatch_request(
     url: &str,
     body: Option<&[u8]>,
     traceparent: Option<&str>,
+    extra_headers: &[(String, String)],
 ) -> Result<HttpResponse> {
     #[cfg(feature = "tools-http-tls")]
     if url.starts_with("https://") {
-        return perform_request_tls(tls_agent(), method, url, body, traceparent);
+        return perform_request_tls(tls_agent(), method, url, body, traceparent, extra_headers);
     }
     let parsed = parse_url(url)?;
-    perform_request(method, &parsed, body, traceparent)
+    perform_request(method, &parsed, body, traceparent, extra_headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +345,7 @@ fn perform_request_tls(
     url: &str,
     body: Option<&[u8]>,
     traceparent: Option<&str>,
+    extra_headers: &[(String, String)],
 ) -> Result<HttpResponse> {
     let mut request = agent.request(method, url);
     if body.is_some() {
@@ -270,6 +353,9 @@ fn perform_request_tls(
     }
     if let Some(tp) = traceparent {
         request = request.set("traceparent", tp);
+    }
+    for (k, v) in extra_headers {
+        request = request.set(k, v);
     }
 
     let result = match body {
@@ -341,6 +427,7 @@ fn perform_request(
     url: &ParsedUrl,
     body: Option<&[u8]>,
     traceparent: Option<&str>,
+    extra_headers: &[(String, String)],
 ) -> Result<HttpResponse> {
     let sock_addr = (url.host.as_str(), url.port)
         .to_socket_addrs()
@@ -385,6 +472,9 @@ fn perform_request(
     // originate traces.
     if let Some(tp) = traceparent {
         request.push_str(&format!("traceparent: {tp}\r\n"));
+    }
+    for (k, v) in extra_headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
     }
     request.push_str("\r\n");
 
@@ -499,7 +589,10 @@ pub(crate) fn perform_for_loop(
             ),
         });
     }
-    let response = dispatch_request(method, url, body, traceparent)?;
+    // No headers parameter by design: loop-tool arguments come from
+    // the MODEL, and a model must not be able to set headers (or ask
+    // for secret injection). Declared nodes are the authored surface.
+    let response = dispatch_request(method, url, body, traceparent, &[])?;
     Ok(json!({
         "status": response.status,
         "headers": response.headers,
@@ -562,6 +655,7 @@ mod tests {
                 method: method.into(),
                 url_from: url_path.into(),
                 body_from: body_from.map(Into::into),
+                headers: Default::default(),
             },
         }
     }
@@ -724,6 +818,132 @@ mod tests {
             _ => panic!(),
         }
         let _ = server.join();
+    }
+
+    fn node_with_headers(
+        id: &str,
+        method: &str,
+        url_path: &str,
+        headers: Vec<(&str, &str)>,
+    ) -> Node {
+        Node {
+            id: id.into(),
+            retry: None,
+            kind: NodeKind::HttpRequest {
+                method: method.into(),
+                url_from: url_path.into(),
+                body_from: None,
+                headers: headers
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn declared_headers_reach_the_wire_with_secrets_resolved() {
+        let (prefix, server) = spawn_fake_http(200, b"ok");
+        // Secret resolves through the env fallback of the registry.
+        let key = "AGENTD_TEST_HEADER_TOKEN";
+        // SAFETY: test-scoped env mutation, unique var.
+        unsafe { std::env::set_var(key, "tok-xyz") };
+        let mut c = ctx(json!({ "url": format!("{prefix}/api") }));
+        let h = HttpRequestHandler {
+            policy: allow_all(),
+        };
+        let out = h
+            .handle(
+                &node_with_headers(
+                    "r",
+                    "GET",
+                    "trigger.url",
+                    vec![
+                        (
+                            "Authorization",
+                            "Bearer {{secret:AGENTD_TEST_HEADER_TOKEN}}",
+                        ),
+                        ("X-Api-Version", "58.0"),
+                    ],
+                ),
+                &mut c,
+            )
+            .unwrap();
+        let seen = String::from_utf8_lossy(&server.join().unwrap()).to_string();
+        assert!(seen.contains("Authorization: Bearer tok-xyz"), "{seen}");
+        assert!(seen.contains("X-Api-Version: 58.0"), "{seen}");
+        // The resolved secret must NOT echo into the node output (and
+        // therefore never into the trace or a run record).
+        match out {
+            NodeOutcome::Continue { value, .. } => {
+                let rendered = value.to_string();
+                assert!(!rendered.contains("tok-xyz"), "{rendered}");
+            }
+            _ => panic!(),
+        }
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn header_with_unknown_secret_or_context_marker_errors() {
+        let mut c = ctx(json!({ "url": "http://127.0.0.1:1/" }));
+        let h = HttpRequestHandler {
+            policy: allow_all(),
+        };
+        // Unknown secret name -> loud error before any socket opens.
+        let err = h
+            .handle(
+                &node_with_headers(
+                    "r",
+                    "GET",
+                    "trigger.url",
+                    vec![(
+                        "Authorization",
+                        "Bearer {{secret:AGENTD_TEST_DEFINITELY_UNSET}}",
+                    )],
+                ),
+                &mut c,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("AGENTD_TEST_DEFINITELY_UNSET"),
+            "{err}"
+        );
+        // Context-style marker -> rejected: headers carry secrets only.
+        let err = h
+            .handle(
+                &node_with_headers("r", "GET", "trigger.url", vec![("X-Id", "{{trigger.id}}")]),
+                &mut c,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("secret:NAME"), "{err}");
+    }
+
+    #[test]
+    fn header_injection_is_rejected() {
+        let mut c = ctx(json!({ "url": "http://127.0.0.1:1/" }));
+        let h = HttpRequestHandler {
+            policy: allow_all(),
+        };
+        let err = h
+            .handle(
+                &node_with_headers(
+                    "r",
+                    "GET",
+                    "trigger.url",
+                    vec![("X-Bad", "a\r\nHost: evil")],
+                ),
+                &mut c,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("CR/LF"), "{err}");
+        let err = h
+            .handle(
+                &node_with_headers("r", "GET", "trigger.url", vec![("Bad Name", "v")]),
+                &mut c,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("not a valid HTTP token"), "{err}");
     }
 
     #[test]
@@ -907,7 +1127,7 @@ mod tests {
             install_provider();
             let (url, cert) = spawn_tls_server("200 OK", b"secure hello");
             let agent = agent_trusting(&cert);
-            let resp = perform_request_tls(&agent, "GET", &url, None, None).unwrap();
+            let resp = perform_request_tls(&agent, "GET", &url, None, None, &[]).unwrap();
             assert_eq!(resp.status, 200);
             assert_eq!(resp.body_string, "secure hello");
             assert_eq!(resp.body_bytes_len, 12);
@@ -922,7 +1142,7 @@ mod tests {
             install_provider();
             let (url, cert) = spawn_tls_server("503 Service Unavailable", b"down");
             let agent = agent_trusting(&cert);
-            let resp = perform_request_tls(&agent, "GET", &url, None, None).unwrap();
+            let resp = perform_request_tls(&agent, "GET", &url, None, None, &[]).unwrap();
             assert_eq!(resp.status, 503);
             assert_eq!(resp.body_string, "down");
         }

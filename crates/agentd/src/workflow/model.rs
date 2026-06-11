@@ -472,6 +472,18 @@ pub enum NodeKind {
         url_from: String,
         #[serde(default)]
         body_from: Option<String>,
+        /// Declared request headers. Values are literals plus
+        /// `{{secret:NAME}}` placeholders resolved through the secrets
+        /// registry at request time — `Authorization = "Bearer
+        /// {{secret:SALESFORCE_TOKEN}}"`. Deliberately NOT
+        /// context-interpolated: header values never come from model
+        /// output or trigger data, and resolved secrets never echo
+        /// into node outputs or run records. CR/LF in a value is
+        /// rejected (fail closed). The agent_loop http tool does not
+        /// take headers at all — a model must not be able to ask for
+        /// secret injection.
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
     },
     CallMcpTool {
         tool: String,

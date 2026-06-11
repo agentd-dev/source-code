@@ -165,18 +165,18 @@ pub fn render(v: &Value) -> String {
                 branch,
                 ms,
             ));
-            if let Some(output) = e.get("output") {
-                if !output.is_null() {
-                    out.push_str(&format!("        output: {}\n", truncate(output, 160)));
-                }
+            if let Some(output) = e.get("output")
+                && !output.is_null()
+            {
+                out.push_str(&format!("        output: {}\n", truncate(output, 160)));
             }
         }
     }
 
-    if let Some(detail) = v.get("detail") {
-        if !detail.is_null() {
-            out.push_str(&format!("  outcome: {}\n", truncate(detail, 200)));
-        }
+    if let Some(detail) = v.get("detail")
+        && !detail.is_null()
+    {
+        out.push_str(&format!("  outcome: {}\n", truncate(detail, 200)));
     }
     out
 }

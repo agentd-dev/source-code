@@ -689,29 +689,29 @@ fn handle_one_request<S: std::io::Read + Write>(
     // per-request gate, runs before auth so a flood of invalid
     // tokens also gets 429'd.
     let rate_key = (request.method.to_ascii_uppercase(), route.path.clone());
-    if let Some(bucket) = reloadable.buckets.get(&rate_key) {
-        if let Err(retry_after) = bucket.try_take() {
-            tracing::warn!(
-                target: "agentd::audit",
-                event = "http.rate_limited",
-                method = %request.method,
-                path = %request.path,
-                retry_after_ms = retry_after.as_millis() as u64,
-            );
-            let retry_secs = format!("{}", retry_after.as_secs().max(1));
-            let mut headers = connection_headers(keep_alive);
-            headers.push(("Retry-After".into(), retry_secs));
-            write_response_with_header(
-                stream,
-                Status::new(429, "Too Many Requests"),
-                &json!({
-                    "error": "rate limited",
-                    "retry_after_ms": retry_after.as_millis() as u64,
-                }),
-                &headers,
-            )?;
-            return Ok(keep_alive);
-        }
+    if let Some(bucket) = reloadable.buckets.get(&rate_key)
+        && let Err(retry_after) = bucket.try_take()
+    {
+        tracing::warn!(
+            target: "agentd::audit",
+            event = "http.rate_limited",
+            method = %request.method,
+            path = %request.path,
+            retry_after_ms = retry_after.as_millis() as u64,
+        );
+        let retry_secs = format!("{}", retry_after.as_secs().max(1));
+        let mut headers = connection_headers(keep_alive);
+        headers.push(("Retry-After".into(), retry_secs));
+        write_response_with_header(
+            stream,
+            Status::new(429, "Too Many Requests"),
+            &json!({
+                "error": "rate limited",
+                "retry_after_ms": retry_after.as_millis() as u64,
+            }),
+            &headers,
+        )?;
+        return Ok(keep_alive);
     }
 
     // Auth check happens before we parse the body as JSON so we
@@ -792,17 +792,17 @@ fn handle_one_request<S: std::io::Read + Write>(
             "kind": principal.kind,
             "name": principal.name,
         });
-        if let Some(identity) = &request.peer_identity {
-            if let Value::Object(pobj) = &mut principal_json {
-                if let Some(cn) = &identity.cn {
-                    pobj.insert("cn".into(), Value::String(cn.clone()));
-                }
-                if !identity.sans.is_empty() {
-                    pobj.insert(
-                        "sans".into(),
-                        Value::Array(identity.sans.iter().cloned().map(Value::String).collect()),
-                    );
-                }
+        if let Some(identity) = &request.peer_identity
+            && let Value::Object(pobj) = &mut principal_json
+        {
+            if let Some(cn) = &identity.cn {
+                pobj.insert("cn".into(), Value::String(cn.clone()));
+            }
+            if !identity.sans.is_empty() {
+                pobj.insert(
+                    "sans".into(),
+                    Value::Array(identity.sans.iter().cloned().map(Value::String).collect()),
+                );
             }
         }
         if let Value::Object(obj) = &mut input {
@@ -1284,31 +1284,31 @@ mod tests {
                 break;
             }
             acc.extend_from_slice(&tmp[..read]);
-            if headers_end.is_none() {
-                if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
-                    headers_end = Some(pos + 4);
-                    let header_str = std::str::from_utf8(&acc[..pos]).unwrap();
-                    let mut lines = header_str.split("\r\n");
-                    if let Some(status_line) = lines.next() {
-                        status = status_line
-                            .split(' ')
-                            .nth(1)
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
-                    }
-                    for line in lines {
-                        if let Some((k, v)) = line.split_once(':') {
-                            if k.trim().eq_ignore_ascii_case("content-length") {
-                                content_length = v.trim().parse().unwrap_or(0);
-                            }
-                        }
+            if headers_end.is_none()
+                && let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                headers_end = Some(pos + 4);
+                let header_str = std::str::from_utf8(&acc[..pos]).unwrap();
+                let mut lines = header_str.split("\r\n");
+                if let Some(status_line) = lines.next() {
+                    status = status_line
+                        .split(' ')
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                }
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = v.trim().parse().unwrap_or(0);
                     }
                 }
             }
-            if let Some(end) = headers_end {
-                if acc.len() >= end + content_length {
-                    break;
-                }
+            if let Some(end) = headers_end
+                && acc.len() >= end + content_length
+            {
+                break;
             }
         }
         let body = headers_end

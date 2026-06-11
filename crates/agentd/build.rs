@@ -254,12 +254,12 @@ fn validate(doc: &toml::Value) -> Result<(), String> {
                     "workflow `{name}`: duplicate start_node name `{name_str}`"
                 ));
             }
-            if let Some(entry) = s.get("entry_node").and_then(|v| v.as_str()) {
-                if !ids.contains(entry) {
-                    return Err(format!(
-                        "workflow `{name}`: start_node `{name_str}` references unknown entry `{entry}`"
-                    ));
-                }
+            if let Some(entry) = s.get("entry_node").and_then(|v| v.as_str())
+                && !ids.contains(entry)
+            {
+                return Err(format!(
+                    "workflow `{name}`: start_node `{name_str}` references unknown entry `{entry}`"
+                ));
             }
         }
     }

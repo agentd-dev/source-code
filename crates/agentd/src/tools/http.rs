@@ -357,16 +357,16 @@ pub(crate) fn perform_for_loop(
     body: Option<&[u8]>,
     traceparent: Option<&str>,
 ) -> Result<serde_json::Value> {
-    if let Some(b) = body {
-        if b.len() > MAX_REQUEST_BODY_BYTES {
-            return Err(Error::Tool {
-                tool: "http_request".into(),
-                reason: format!(
-                    "request body {} bytes exceeds cap ({MAX_REQUEST_BODY_BYTES})",
-                    b.len()
-                ),
-            });
-        }
+    if let Some(b) = body
+        && b.len() > MAX_REQUEST_BODY_BYTES
+    {
+        return Err(Error::Tool {
+            tool: "http_request".into(),
+            reason: format!(
+                "request body {} bytes exceeds cap ({MAX_REQUEST_BODY_BYTES})",
+                b.len()
+            ),
+        });
     }
     let parsed = parse_url(url)?;
     let response = perform_request(method, &parsed, body, traceparent)?;

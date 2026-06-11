@@ -82,7 +82,7 @@ pub fn verify(config: &AuthConfig, name: &str, req: &AuthRequest<'_>) -> AuthDec
 /// per GitHub convention, and `.eq_ignore_ascii_case` in the
 /// matcher would weaken constant-time semantics.
 fn hex_decode(input: &str) -> std::result::Result<Vec<u8>, ()> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err(());
     }
     let mut out = Vec::with_capacity(input.len() / 2);

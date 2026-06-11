@@ -154,13 +154,13 @@ impl NodeHandler for LlmInferHandler {
         for attempt in 0..=max_repairs {
             // Token budget gate (RFC 0006 §5) — checked before each call;
             // repair rounds cost tokens too.
-            if let Some(budget) = &self.budget {
-                if let Err(reason) = budget.check_llm_budget() {
-                    return Err(Error::Tool {
-                        tool: "llm_infer".into(),
-                        reason,
-                    });
-                }
+            if let Some(budget) = &self.budget
+                && let Err(reason) = budget.check_llm_budget()
+            {
+                return Err(Error::Tool {
+                    tool: "llm_infer".into(),
+                    reason,
+                });
             }
             let request = Request {
                 model: "fast".into(),

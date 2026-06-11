@@ -172,16 +172,16 @@ impl NodeHandler for AgentLoopHandler {
             if std::time::Instant::now() >= ctx.deadline {
                 return Err(Error::Timeout(std::time::Duration::ZERO));
             }
-            if let Some(budget_cap) = max_tokens {
-                if tokens_spent >= u64::from(*budget_cap) {
-                    tracing::warn!(
-                        target: "agentd::audit",
-                        event = "loop.token_budget_exhausted",
-                        node_id = %node.id,
-                        tokens_spent,
-                    );
-                    return Ok(exhausted(transcript, step - 1, "token budget exhausted"));
-                }
+            if let Some(budget_cap) = max_tokens
+                && tokens_spent >= u64::from(*budget_cap)
+            {
+                tracing::warn!(
+                    target: "agentd::audit",
+                    event = "loop.token_budget_exhausted",
+                    node_id = %node.id,
+                    tokens_spent,
+                );
+                return Ok(exhausted(transcript, step - 1, "token budget exhausted"));
             }
 
             if let Err(reason) = self.run_budget.check_llm_budget() {

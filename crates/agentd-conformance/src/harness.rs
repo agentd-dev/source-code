@@ -229,10 +229,10 @@ fn diff_expected(expected: &Expected, run: &RunResult, cost: &Cost) -> Vec<Strin
     }
 
     let last_node = run.last_node();
-    if let Some(want) = &expected.last_node {
-        if last_node.as_deref() != Some(want.as_str()) {
-            out.push(format!("last_node: expected `{want}`, got `{last_node:?}`"));
-        }
+    if let Some(want) = &expected.last_node
+        && last_node.as_deref() != Some(want.as_str())
+    {
+        out.push(format!("last_node: expected `{want}`, got `{last_node:?}`"));
     }
 
     if let Some(needle) = &expected.reason_contains {
@@ -263,23 +263,23 @@ fn diff_expected(expected: &Expected, run: &RunResult, cost: &Cost) -> Vec<Strin
         }
     }
 
-    if let Some(max) = expected.max_llm_calls {
-        if cost.llm_calls > max {
-            out.push(format!("max_llm_calls: {} > {max}", cost.llm_calls));
-        }
+    if let Some(max) = expected.max_llm_calls
+        && cost.llm_calls > max
+    {
+        out.push(format!("max_llm_calls: {} > {max}", cost.llm_calls));
     }
-    if let Some(max) = expected.max_total_tokens {
-        if cost.llm_tokens > max {
-            out.push(format!("max_total_tokens: {} > {max}", cost.llm_tokens));
-        }
+    if let Some(max) = expected.max_total_tokens
+        && cost.llm_tokens > max
+    {
+        out.push(format!("max_total_tokens: {} > {max}", cost.llm_tokens));
     }
-    if let Some(min) = expected.min_policy_denials {
-        if cost.policy_denials < min {
-            out.push(format!(
-                "min_policy_denials: {} < {min}",
-                cost.policy_denials
-            ));
-        }
+    if let Some(min) = expected.min_policy_denials
+        && cost.policy_denials < min
+    {
+        out.push(format!(
+            "min_policy_denials: {} < {min}",
+            cost.policy_denials
+        ));
     }
 
     out

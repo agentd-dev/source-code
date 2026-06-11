@@ -1150,8 +1150,8 @@ fixture's `[mocks]`, runs the engine, and diffs against `[expected]`.
 
 | Not supported | Why |
 |---|---|
-| Cycles | Acyclicity is the termination guarantee |
-| Parallel branch execution | Sequential traversal keeps the model predictable; fork/join is a future extension |
+| Unbounded cycles | Acyclicity is the termination guarantee. A *bounded* cycle is allowed via a `max_iterations` loop edge — the only cycle the validator admits. |
+| Open-ended parallelism | The main walk is sequential. Concurrency is a *declared* exception: a `parallel` node fans out to sub-workflows and joins — no free-form fork/join. |
 | Arbitrary shell (`sh -c "..."`) | `shell_run` is argv-only — injection-safe by construction |
 | Dynamic plugin loading | Compile-time-only capability surface |
 | LLM-invented tool calls | Intelligence is a bounded reasoning step; it can't add edges or capabilities |

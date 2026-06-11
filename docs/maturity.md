@@ -73,7 +73,7 @@ surface is trimmed — see §1.5).
 | mTLS (required mode) | Green | rustls 0.23 + aws-lc-rs; peer cert fingerprint exposed as principal. |
 | TLS termination | Green | PEM loader handles chain + PKCS1/8/SEC1 keys; startup fails loudly on bad cert paths. |
 | Rate limit (per-route token bucket) | Green | Validated at spawn; counter drift under contention is acceptable. |
-| Input schema validation (JSON-shape-only) | Yellow | Accepts objects / arrays / scalars + required / properties; it is **not** a full JSON Schema implementation. Callers needing full JSON Schema should wire an external validator. |
+| `llm_infer` output schema validation | Green (with `schema`) | With the `schema` feature, an `output_schema` that names a file is validated against that JSON Schema, with bounded `output_repairs` re-prompts on failure. Without the feature, `output_schema` enforces valid-JSON only. |
 | Graceful drain on SIGTERM/SIGINT | Green | In-flight counter + bounded timeout; exits `0` on clean drain, `5` on timeout. |
 | HTTP/1.1 keep-alive | Green | Up to 100 requests per connection; idle-timeout = socket read_timeout (30s). Client opts out per-request via `Connection: close`. |
 | HTTP/2, HTTP/3 | Red | Not implemented. HTTP/1.1 keep-alive covers the common-case latency concern. |
@@ -120,7 +120,7 @@ surface is trimmed — see §1.5).
 | Graceful shutdown | Green | SIGTERM/SIGINT → drain → exit. Bounded. |
 | Embedded workflow (Mode B) | Green | Build-time validator + `include_str!` bake. |
 | External workflow reload (SIGHUP) | Green | SIGHUP rebuilds TLS, prepared auth (+JWKS), policy (incl. Rego), `[[http_routes]]` + rate-limit buckets, intelligence-client bearer, MCP stdio child, and `[policy.mcp]` allowlist — each swapped atomically via `ArcSwap`. Fail-forward: any single component's reload failing leaves the old value live. CLI-arg-shaped bits (bind addr, `--mcp-stdio` command, `--intel-unix` endpoint) still need a restart. See §2.8. |
-| Crash-recovery of in-flight requests | Red | In-flight work is lost on crash. Use a durable queue upstream for at-least-once semantics. |
+| Crash-recovery of in-flight requests | Red | Arbitrary in-flight work is lost on crash; use a durable queue upstream for at-least-once. **Declared** durability exists: a `pause_for_approval` node checkpoints to `--state-dir`, and `--resume RUN_ID` continues a suspended run after a restart. Crash-recovery at every node boundary is on the roadmap. |
 | Container / k8s friendliness | Green | `/healthz`, SIGTERM drain, JSON logs. |
 | Windows support | Green | Compiles (verified via `x86_64-pc-windows-gnu` cross-build). Shutdown: Ctrl+C / Ctrl+Break via `ctrlc`. Hot reload: `--reload-file PATH` (cross-platform SIGHUP replacement; also available on Unix as a second reload channel). Resource budgets: Job Object-backed memory + CPU caps with `KILL_ON_JOB_CLOSE`. `--intel-unix` is explicitly rejected on Windows (use `--intel-http`). No Windows release bin shipped from this repo — operators build from source; the release-binary CI job targets Linux only. |
 | macOS support | Yellow | Compiles and runs; no aarch64-apple-darwin release bin shipped from this repo. |

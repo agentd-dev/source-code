@@ -1,0 +1,21 @@
+name = "control-fail"
+description = "A fail node ends the run with a declared reason (status failed)."
+capabilities = ["fail", "trigger_manual"]
+
+[workflow]
+inline = """
+name = "failer"
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "reject"
+[[nodes]]
+id = "reject"
+type = "fail"
+reason = "input rejected by the workflow"
+"""
+
+[expected]
+status = "failed"
+reason_contains = "rejected"
+last_node = "reject"

@@ -1,0 +1,27 @@
+name = "io-read-env"
+description = "read_env reads an environment variable (PATH is set everywhere this runs)."
+capabilities = ["read_env", "terminate", "trigger_manual"]
+
+[workflow]
+inline = """
+name = "envreader"
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "read"
+[[nodes]]
+id = "read"
+type = "read_env"
+key = "PATH"
+[[nodes]]
+id = "done"
+type = "terminate"
+[[edges]]
+from = "read"
+to = "done"
+"""
+
+[expected]
+status = "completed"
+path = ["read", "done"]
+path_exact = true

@@ -35,12 +35,17 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, HandlerRegistry, RunOptions, StubHandler, TriggerMeta};
+use crate::engine::{
+    Engine, ExecutionOutcome, HandlerRegistry, RunOptions, StubHandler, TriggerMeta,
+};
 use crate::workflow::{self, WorkflowDoc};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_SEMANTIC: u8 = 5;
+/// A run suspended at a `pause_for_approval` node — resumable, neither
+/// success nor failure. Distinct so scripts can branch on it.
+pub const EXIT_PAUSED: u8 = 7;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -168,6 +173,12 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         dry_run: args.dry_run,
     };
 
+    // `--resume RUN_ID` continues a paused run from its checkpoint
+    // instead of starting fresh.
+    if args.resume.is_some() {
+        return run_resume_mode(doc, engine, options, &args);
+    }
+
     match resolve_mode(&doc, args.mode.as_deref()) {
         Mode::Serve => run_serve_mode(doc, engine, options, &args),
         Mode::Once => run_once_mode(doc, engine, options, &args),
@@ -229,6 +240,12 @@ struct Args {
     /// (per-node output + timing, cost, outcome) to PATH after a
     /// one-shot run. Render it with `agentd inspect PATH`.
     record: Option<PathBuf>,
+    /// `--state-dir DIR` / `AGENTD_STATE_DIR` — where `pause_for_approval`
+    /// writes checkpoints and `--resume` reads them.
+    state_dir: Option<PathBuf>,
+    /// `--resume RUN_ID` — continue a paused run from its checkpoint in
+    /// `--state-dir`, instead of starting fresh.
+    resume: Option<String>,
 }
 
 /// CLI / env overrides for logging. `None` means "defer to workflow
@@ -285,6 +302,10 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         signing_key_file: env_opt_path("AGENTD_SIGNING_KEY_FILE"),
         reload_file: env_opt_path("AGENTD_RELOAD_FILE"),
         record: env_opt_path("AGENTD_RECORD"),
+        state_dir: env_opt_path("AGENTD_STATE_DIR"),
+        resume: std::env::var("AGENTD_RESUME")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
     };
     let mut t = TracingOverrides {
         level: std::env::var("AGENTD_LOG")
@@ -392,6 +413,12 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
             }
             "--record" => {
                 a.record = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--state-dir" => {
+                a.state_dir = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--resume" => {
+                a.resume = Some(require_value(argv, &mut i, arg)?.to_string());
             }
             "--log-level" => {
                 t.level = Some(require_value(argv, &mut i, arg)?.to_string());
@@ -787,14 +814,14 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     }
 
     registry.set_fallback(Box::new(StubHandler));
-    Ok(
-        Engine::with_metrics(registry, metrics).with_reload_handles(crate::engine::ReloadHandles {
+    Ok(Engine::with_metrics(registry, metrics)
+        .with_state_dir(args.state_dir.clone())
+        .with_reload_handles(crate::engine::ReloadHandles {
             policy: Some(reloadable_policy),
             intel: intel_reload,
             intel_backends: named_backends,
             mcp: Some(mcp_registry),
-        }),
-    )
+        }))
 }
 
 /// Build the process-wide MCP server registry. Sources:
@@ -1009,28 +1036,54 @@ fn run_once_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &A
     let started = std::time::Instant::now();
     let result = engine.run_with_trace(&doc, &start, TriggerMeta::manual(input), options);
     let wall_ms = started.elapsed().as_millis() as u64;
+    emit_run_result(&doc.name, &start, &engine, result, wall_ms, args)
+}
 
-    // Optional run record (`--record PATH`) — the structured account a
-    // run inspector renders. Captured from the same run, written
-    // whether it completed, failed, timed out, or errored.
+/// `--resume RUN_ID`: load a paused run's checkpoint and continue it.
+fn run_resume_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &Args) -> ExitCode {
+    let run_id = args.resume.as_deref().unwrap_or_default();
+    let Some(dir) = &args.state_dir else {
+        eprintln!("agentd: --resume needs --state-dir (where the checkpoint lives)");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let checkpoint = match crate::engine::Checkpoint::load(dir, run_id) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("agentd: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let start = checkpoint.start_node.clone();
+    let started = std::time::Instant::now();
+    let result = engine.resume(&doc, checkpoint, options);
+    let wall_ms = started.elapsed().as_millis() as u64;
+    emit_run_result(&doc.name, &start, &engine, result, wall_ms, args)
+}
+
+/// Shared tail for a one-shot or resumed run: write the optional run
+/// record, print the outcome JSON, and map it to an exit code.
+fn emit_run_result(
+    workflow: &str,
+    start: &str,
+    engine: &Engine,
+    result: Result<(ExecutionOutcome, crate::engine::ExecutionTrace), crate::Error>,
+    wall_ms: u64,
+    args: &Args,
+) -> ExitCode {
     if let Some(path) = &args.record {
         let cost = engine.metrics().snapshot();
         let record = match &result {
             Ok((outcome, trace)) => crate::engine::RunRecord::from_outcome(
-                doc.name.clone(),
-                start.clone(),
+                workflow,
+                start,
                 wall_ms,
                 cost,
                 outcome,
                 trace.clone(),
             ),
-            Err(e) => crate::engine::RunRecord::errored(
-                doc.name.clone(),
-                start.clone(),
-                wall_ms,
-                cost,
-                e.to_string(),
-            ),
+            Err(e) => {
+                crate::engine::RunRecord::errored(workflow, start, wall_ms, cost, e.to_string())
+            }
         };
         match fs::write(path, record.to_json_pretty()) {
             Ok(()) => eprintln!("agentd: run record written to {}", path.display()),
@@ -1043,9 +1096,13 @@ fn run_once_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &A
 
     match result {
         Ok((outcome, _trace)) => {
-            let success = outcome.is_success();
+            let code = match &outcome {
+                ExecutionOutcome::Completed { .. } => EXIT_OK,
+                ExecutionOutcome::Paused { .. } => EXIT_PAUSED,
+                _ => EXIT_SEMANTIC,
+            };
             println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
-            ExitCode::from(if success { EXIT_OK } else { EXIT_SEMANTIC })
+            ExitCode::from(code)
         }
         Err(e) => {
             eprintln!("agentd: {e}");
@@ -2066,6 +2123,8 @@ usage:
         [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
         [--dry-run]                AGENTD_DRY_RUN=1
         [--record PATH]            AGENTD_RECORD          write a run record; inspect with `agentd inspect PATH`
+        [--state-dir DIR]          AGENTD_STATE_DIR       where pause_for_approval checkpoints live
+        [--resume RUN_ID]          AGENTD_RESUME          continue a paused run from its checkpoint
         [--validate-only]          AGENTD_VALIDATE_ONLY=1
         [--log-level LEVEL]        AGENTD_LOG             (default warn)
         [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)

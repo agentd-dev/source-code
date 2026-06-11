@@ -494,6 +494,24 @@ reason = "input failed schema check"    # optional; default "workflow failed"
 → `ExecutionOutcome::Failed { reason, last_node: "reject" }`.
 Exit code 5 in one-shot mode; HTTP 422 in serve mode.
 
+#### `pause_for_approval`
+
+Checkpoint and suspend the run for a human, then continue on
+`--resume RUN_ID`. The engine writes a checkpoint (accumulated node
+outputs + the resume node) under `--state-dir` and stops.
+
+```toml
+[[nodes]]
+id = "approve"
+type = "pause_for_approval"
+reason = "Review the prepared change, then resume to apply."   # optional
+```
+
+→ `ExecutionOutcome::Paused { run_id, last_node: "approve", reason }`.
+Exit code 7 in one-shot mode; HTTP 202 in serve mode. Requires
+`--state-dir`; resuming restores the node outputs and continues at this
+node's single successor. See operations.md §3.7.
+
 #### `merge`
 
 Pass-through. Multiple edges fan into a merge; one edge fans out.

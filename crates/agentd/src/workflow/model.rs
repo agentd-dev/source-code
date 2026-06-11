@@ -489,6 +489,16 @@ pub enum NodeKind {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// Checkpoint and suspend the run for human approval. The engine
+    /// writes a checkpoint and returns a `Paused` outcome; `--resume
+    /// RUN_ID` continues at this node's successor. Requires a state
+    /// directory (`--state-dir`).
+    PauseForApproval {
+        /// Operator-facing prompt recorded in the checkpoint and the
+        /// paused outcome.
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Terminate,
 }
 
@@ -515,6 +525,7 @@ impl NodeKind {
             NodeKind::Switch { .. } => "switch",
             NodeKind::Merge => "merge",
             NodeKind::Fail { .. } => "fail",
+            NodeKind::PauseForApproval { .. } => "pause_for_approval",
             NodeKind::Terminate => "terminate",
         }
     }

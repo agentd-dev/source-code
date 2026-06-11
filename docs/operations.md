@@ -228,6 +228,36 @@ hosted inspector reads the same file). Its `execution_id` matches the
 line up. Records may contain node outputs verbatim — treat a record file
 with the same care as the data it processed.
 
+### 3.7 Human-in-the-loop + durable execution
+
+A `pause_for_approval` node suspends a run for a person. When the engine
+reaches one it writes a **checkpoint** under `--state-dir` (or
+`AGENTD_STATE_DIR`) — the accumulated node outputs and where to resume —
+and stops with a `paused` outcome and exit code **7**. A human reviews
+(the record / audit trail), then continues the run by id:
+
+```bash
+# Runs until the approval gate, then checkpoints and pauses.
+agentd --config deploy.toml --state-dir /var/lib/agentd/state --input change.json
+#   → {"status":"paused","run_id":"exec-…","last_node":"approve"};  exit 7
+
+# Later, after review — continue from the node after the pause.
+agentd --config deploy.toml --state-dir /var/lib/agentd/state --resume exec-…
+#   → {"status":"completed", …};  the checkpoint is retired
+```
+
+The resume re-enters the same traversal at the pause node's successor
+with the checkpoint's node outputs restored; it gets a fresh deadline.
+Resuming the *same* workflow is enforced (a checkpoint records its
+workflow name). A `pause_for_approval` node without a `--state-dir` is a
+configuration error — there is nowhere to persist the run. Run ids are
+unique across processes, so concurrent paused runs never collide.
+
+Checkpoints contain node outputs verbatim: a state directory deserves
+the same protection as the data the workflow handles. Exit code 7 lets a
+supervisor (systemd, a queue worker) distinguish "awaiting approval"
+from success (0) or failure (5).
+
 ---
 
 ## 4. Security posture

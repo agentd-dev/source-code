@@ -40,6 +40,11 @@ static MATRIX: &[Capability] = &[
     c("switch", "control", "multi-way branch on a value"),
     c("merge", "control", "join converging paths"),
     c("fail", "control", "declared failure terminal"),
+    c(
+        "pause_for_approval",
+        "control",
+        "checkpoint + suspend for human approval",
+    ),
     c("terminate", "control", "success terminal"),
     // Data plane.
     c("parse_json", "data", "parse a JSON string"),

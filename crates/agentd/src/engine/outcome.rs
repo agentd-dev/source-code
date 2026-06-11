@@ -85,6 +85,15 @@ pub enum ExecutionOutcome {
         elapsed: Duration,
         last_node: Option<String>,
     },
+    /// Run reached a `pause_for_approval` node: a checkpoint was
+    /// written and the run stopped, awaiting `--resume RUN_ID`. Not a
+    /// success and not a failure — a deliberate, resumable suspension.
+    Paused {
+        run_id: String,
+        last_node: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 fn serialize_duration_ms<S>(d: &Duration, s: S) -> std::result::Result<S::Ok, S::Error>
@@ -158,6 +167,7 @@ impl ExecutionOutcome {
             ExecutionOutcome::Completed { .. } => "completed",
             ExecutionOutcome::Failed { .. } => "failed",
             ExecutionOutcome::TimedOut { .. } => "timed_out",
+            ExecutionOutcome::Paused { .. } => "paused",
         }
     }
 }

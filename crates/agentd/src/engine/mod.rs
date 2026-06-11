@@ -11,12 +11,14 @@
 //! `StubHandler` used in tests. Phase 3+ register real handlers for
 //! fs / env / data / intelligence / MCP.
 
+pub mod checkpoint;
 pub mod context;
 pub mod handler;
 pub mod outcome;
 pub mod record;
 pub mod runner;
 
+pub use checkpoint::Checkpoint;
 pub use context::{ExecutionContext, RunOptions, TriggerKind, TriggerMeta};
 pub use handler::{
     ConditionHandler, FailHandler, HandlerRegistry, MergeHandler, NodeHandler, StubHandler,

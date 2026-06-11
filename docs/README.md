@@ -82,7 +82,7 @@ final source of truth; these docs describe the code as it stands.
   free; crash loses only in-flight requests.
 - **Security defaults.** `[policy]` is fail-closed; default feature
   set ships `auth`. `server-tls` is opt-in.
-- **Test suite:** 276 tests across the crate + 4 integration test
+- **Test suite:** 471 tests across the crate + 4 integration test
   binaries; stable under the feature matrix documented in
   `configuration.md`.
 

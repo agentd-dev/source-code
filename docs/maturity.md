@@ -4,8 +4,8 @@
 pre-production-ready-with-caveats, and what's still aspirational. Read
 before deploying.
 
-**Date:** kept current with the release tags. Reassess quarterly or
-after any RFC-scale change.
+**Date:** as of **v1.0.0** (2026-06-11); kept current with the release
+tags. Reassess quarterly or after any RFC-scale change.
 
 **Scope:** `crates/agentd/` only.
 
@@ -52,7 +52,7 @@ surface is trimmed — see §1.5).
 |---|---|---|
 | TOML parse + structural validation | Green | `deny_unknown_fields` on every struct; 100+ parser tests. |
 | Full validator (acyclicity, reachability, start-node shape, fan-in/out, edge / route / trigger integrity) | Green | Kahn + BFS implementations; tests cover every error code. |
-| Node execution dispatch (17 kinds) | Green | All 17 kinds wired and tested. |
+| Node execution dispatch (22 kinds) | Green | All 22 kinds wired and tested. |
 | `ExecutionContext::resolve_path` (single dotted-path lookup) | Green | Every node input flows through it; property-like tests in `context.rs`. |
 | Condition / switch / merge / fail / terminate control flow | Green | Branch selection, merge barrier, fail propagation all covered by fixture tests. |
 | Retry (per-node, `max_attempts` + `backoff_ms` + `on: Any\|Transient`, optional `jitter`) | Green | Bounded; deterministic by default (`jitter = 0.0`). Operator opts in to bounded random jitter `∈ [1-j, 1+j]` (clamp `[0.0, 0.5]`) to avoid thundering-herd retries. See §2.11. |
@@ -372,15 +372,15 @@ Any shape. Defaults and default feature set are fine.
 
 Everything above, plus:
 
-- TLS termination: either in-process (`server-tls` feature + working
-  cert-rotation runbook, since there's no hot reload) or upstream at
-  a real LB.
+- TLS termination: either in-process (`server-tls` feature, with SIGHUP
+  hot reload of the cert / key — see §1.5) or upstream at a real LB.
 - mTLS for inter-service traffic when that's your posture.
 - Audit events piped to a retention-compliant sink (either a dedicated
   log collector with target filtering, or wait on gap §2.2).
 - Upstream fleet rate-limit when request volumes matter.
-- Durable queue in front if you need at-least-once (§1.5 "crash
-  recovery" is red).
+- Durable queue in front if you need at-least-once across a fleet.
+  Single-node crash recovery is opt-in (§1.5 — `--checkpoint-each-node`);
+  a queue boundary with idempotency is still upstream of the runtime.
 - `drain_timeout_secs` + orchestrator grace period set consistently.
 
 ### "NOT for production today"
@@ -388,8 +388,9 @@ Everything above, plus:
 - Browser-facing surfaces (no CORS, no cookies, no CSRF).
 - Workloads that need sub-millisecond tail latencies (no keep-alive,
   one thread per connection).
-- Workloads where the agent is the durability boundary (there is no
-  durability).
+- Workloads needing durability beyond single-node checkpoint/resume —
+  multi-day, queue-backed, or exactly-once execution (durability is
+  opt-in and single-node; see §1.5).
 - Multi-tenant shells where different workflows need different auth
   backends inside one process (bindings are shared across routes).
 
@@ -397,9 +398,9 @@ Everything above, plus:
 
 ## 4. Test coverage snapshot
 
-- **Main crate:** ~14.8k lines of Rust source.
+- **Main crate:** ~26.4k lines of Rust source.
 - **Integration tests:** ~2.1k lines across 4 test binaries.
-- **Total `#[test]` blocks:** 276.
+- **Total `#[test]` blocks:** 471.
 - **Stability:** the test suite has been run three times in a row
   without flake under default features and with every feature combo
   in §2 of `configuration.md`.
@@ -423,11 +424,17 @@ What the tests **don't** cover (deliberate):
 
 The runtime intentionally does **not**:
 
-- Persist state. Crash = lose in-flight work.
-- Schedule cron-style or interval-style workloads (use the host's
-  scheduler + one-shot mode).
-- Broker between multiple workflows in one process.
-- Provide a workflow-as-code SDK (authoring is TOML-only).
+- Persist state by default. A crash loses in-flight work unless
+  `--checkpoint-each-node` is enabled — opt-in checkpoint/resume gives
+  single-node recovery (§1.5), but it is not on by default.
+- Distribute work across a fleet, or guarantee exactly-once across a
+  queue boundary (single process is the unit of correctness; see the
+  roadmap's scale-out section).
+- Broker between multiple workflows in one process (one workflow per
+  process is the deployment shape).
+- Take a non-TOML input at run time — the TypeScript SDK authors
+  workflows, but it compiles to the TOML the runtime executes; TOML
+  stays the only thing the engine loads.
 - Act as an LLM orchestration framework — it runs inference via the
   intelligence adapter, but chaining / planning logic stays in the
   workflow graph.

@@ -17,13 +17,14 @@ pub mod handler;
 pub mod outcome;
 pub mod record;
 pub mod runner;
+pub(crate) mod template;
 
 pub use checkpoint::Checkpoint;
 pub use context::{ExecutionContext, RunOptions, TriggerKind, TriggerMeta};
 pub use handler::{
-    ConditionHandler, FailHandler, HandlerRegistry, MergeHandler, NodeHandler, StubHandler,
-    SwitchHandler, TerminateHandler,
+    ConditionHandler, FailHandler, HandlerRegistry, MergeHandler, NodeHandler, RespondHandler,
+    StubHandler, SwitchHandler, TerminateHandler,
 };
-pub use outcome::{ExecutionOutcome, ExecutionTrace, NodeOutcome, TraceEntry};
+pub use outcome::{ExecutionOutcome, ExecutionTrace, HttpResponseSpec, NodeOutcome, TraceEntry};
 pub use record::RunRecord;
 pub use runner::{Engine, ReloadHandles};

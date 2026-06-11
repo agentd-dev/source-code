@@ -576,6 +576,44 @@ Exit code 7 in one-shot mode; HTTP 202 in serve mode. Requires
 `--state-dir`; resuming restores the node outputs and continues at this
 node's single successor. See operations.md §3.7.
 
+#### `respond`
+
+Declare the HTTP reply of an http-triggered run — status, content
+type, and a templated body — so callers that *act on* the response
+body (Twilio TwiML, Slack slash-command shapes, webhook challenge
+echoes) are answered natively instead of receiving the outcome JSON.
+
+```toml
+[[nodes]]
+id = "answer"
+type = "respond"
+status = 200                          # optional, default 200 (100..=599)
+content_type = "text/xml"             # optional, default application/json
+body_template = """
+<Response><Say>{{reply}}</Say></Response>
+"""
+input_from = "classify.parsed"        # optional; default = trigger input
+```
+
+- `body_template` uses the same `{{dotted.path}}` grammar as
+  `template_render`, resolved against the `input_from` value.
+- The reply is written **when the run completes** (in place of the
+  outcome JSON) — `respond` sets the response's *shape*, not its
+  *timing*. Nodes after `respond` still execute before the caller sees
+  the reply; an early-ack/continue split is deliberately not v1.
+- A run that ends `Failed` / `TimedOut` / `Paused` ignores the declared
+  reply and returns the standard outcome JSON + status (422/504/202) —
+  a failure can't masquerade as a clean answer.
+- On non-HTTP runs (cron / fs-watch / manual) the declared reply is
+  inert but visible: it rides `ExecutionOutcome::Completed.http_response`
+  and the run record, so `agentd inspect` shows what a webhook caller
+  *would* have been told.
+- Inside `call` / `parallel` / `map` children, a `respond` is recorded
+  in the child's trace but does not shape the parent's HTTP reply.
+- Multiple `respond` nodes on one path: last one wins.
+- Always compiled (a control node); the validator checks the status
+  range and content type.
+
 #### `merge`
 
 Pass-through. Multiple edges fan into a merge; one edge fans out.

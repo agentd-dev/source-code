@@ -121,6 +121,7 @@ fn available_node_kinds(have_backend: bool) -> Vec<&'static str> {
     let mut v = vec![
         // control — always present
         "condition{expr}  switch{expr}  merge  fail{reason?}  terminate",
+        "respond{status?,content_type?,body_template,input_from?} — shape the HTTP reply of an http-triggered run",
     ];
     #[cfg(feature = "tools-fs")]
     v.push("read_file{path_from}  write_file{path_from,content_from}  create_dir{path_from}");

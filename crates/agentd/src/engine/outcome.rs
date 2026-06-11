@@ -56,6 +56,18 @@ impl NodeOutcome {
     }
 }
 
+/// The HTTP reply a `respond` node declared. Recorded on the context
+/// while the run walks, attached to [`ExecutionOutcome::Completed`] at
+/// the end; the HTTP trigger writes it verbatim instead of the outcome
+/// JSON. Carried in run records too, so `agentd inspect` shows exactly
+/// what a webhook caller was told.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HttpResponseSpec {
+    pub status: u16,
+    pub content_type: String,
+    pub body: String,
+}
+
 /// Why the engine stopped. Returned from `Engine::run`.
 ///
 /// Serialised JSON shape uses a `status` discriminator so CLI
@@ -69,10 +81,14 @@ impl NodeOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ExecutionOutcome {
-    /// Run reached a Terminate node or a dead-end successor.
+    /// Run reached a Terminate node or a dead-end successor. When a
+    /// `respond` node executed, `http_response` carries the declared
+    /// reply (HTTP-triggered runs answer with it verbatim).
     Completed {
         final_value: Value,
         last_node: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        http_response: Option<HttpResponseSpec>,
     },
     /// Run reached a Fail node or a handler explicitly rejected work.
     Failed {

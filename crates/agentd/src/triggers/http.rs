@@ -841,6 +841,24 @@ fn handle_one_request<S: std::io::Read + Write>(
     let _span_guard = request_span.enter();
     match engine.run(workflow, &route.start_node, trigger, options.clone()) {
         Ok(outcome) => {
+            // A `respond` node declared the reply: write it verbatim —
+            // status, content type, and templated body — instead of
+            // the outcome JSON. TwiML, Slack command shapes, webhook
+            // challenge echoes.
+            if let ExecutionOutcome::Completed {
+                http_response: Some(spec),
+                ..
+            } = &outcome
+            {
+                write_text_response_with_header(
+                    stream,
+                    Status::new(spec.status, respond_reason(spec.status)),
+                    &spec.content_type,
+                    spec.body.as_bytes(),
+                    &connection_headers(keep_alive),
+                )?;
+                return Ok(keep_alive);
+            }
             let status = match &outcome {
                 ExecutionOutcome::Completed { .. } => Status::new(200, "OK"),
                 ExecutionOutcome::Failed { .. } => Status::new(422, "Unprocessable Entity"),
@@ -1043,6 +1061,29 @@ fn silent_close() -> ParseError {
 // ---------------------------------------------------------------------------
 // Response writing
 // ---------------------------------------------------------------------------
+
+/// Minimal reason phrase for a `respond`-declared status. Clients
+/// ignore the phrase; this keeps the status line well-formed.
+fn respond_reason(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Response",
+    }
+}
 
 fn write_response<S: Write, B: serde::Serialize>(
     stream: &mut S,

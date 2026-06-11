@@ -45,6 +45,10 @@ pub struct ExecutionContext {
     /// disconnected IDs. Only meaningful when `trace_context` is
     /// `Some` (no inbound trace → nothing to propagate).
     pub outbound_span_id: String,
+    /// The HTTP reply declared by a `respond` node, if one executed.
+    /// Attached to `ExecutionOutcome::Completed` when the run ends;
+    /// the HTTP trigger writes it verbatim. Last `respond` wins.
+    pub http_response: Option<crate::engine::outcome::HttpResponseSpec>,
 }
 
 impl ExecutionContext {
@@ -70,6 +74,7 @@ impl ExecutionContext {
             current_node_id: None,
             trace_context,
             outbound_span_id: crate::observability::fresh_span_id(),
+            http_response: None,
         }
     }
 

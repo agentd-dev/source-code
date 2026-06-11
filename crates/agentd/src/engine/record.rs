@@ -47,7 +47,19 @@ impl RunRecord {
             ExecutionOutcome::Completed {
                 final_value,
                 last_node,
-            } => ("completed", last_node.clone(), final_value.clone()),
+                http_response,
+            } => {
+                let detail = match http_response {
+                    // Surface the declared reply in the record so
+                    // `agentd inspect` shows what the caller was told.
+                    Some(spec) => json!({
+                        "final_value": final_value,
+                        "http_response": spec,
+                    }),
+                    None => final_value.clone(),
+                };
+                ("completed", last_node.clone(), detail)
+            }
             ExecutionOutcome::Failed { reason, last_node } => {
                 ("failed", last_node.clone(), json!({ "reason": reason }))
             }
@@ -227,6 +239,7 @@ mod tests {
         let outcome = ExecutionOutcome::Completed {
             final_value: json!({"ok": true}),
             last_node: Some("done".into()),
+            http_response: None,
         };
         let rec = RunRecord::from_outcome(
             "wf",
@@ -246,6 +259,7 @@ mod tests {
         let outcome = ExecutionOutcome::Completed {
             final_value: json!(null),
             last_node: Some("done".into()),
+            http_response: None,
         };
         let rec = RunRecord::from_outcome(
             "wf",

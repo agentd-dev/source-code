@@ -18,6 +18,12 @@ final source of truth; these docs describe the code as it stands.
   running, inspectable agent. No API key for the first run. Start here if
   you've never run agentd.
 
+- **[use-cases/](use-cases/README.md)** — fourteen business-automation
+  patterns (voice, CRM, support, finance, incidents, hiring, …), each a
+  general-audience article + a validated sample workflow, with an honest
+  [capability gap analysis](use-cases/GAP-ANALYSIS.md). Start here if
+  you're deciding *whether* to use agentd.
+
 - **[architecture.md](architecture.md)** — mental model, module layout,
   execution lifecycle, data flow, invariants. Start here if you want to
   modify the runtime.

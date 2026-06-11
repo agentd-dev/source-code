@@ -10,7 +10,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](crates/agentd/Cargo.toml)
 
-[Install](#install) · [Quick start](#quick-start) · [Three modes](#three-execution-modes) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
+[Install](#install) · [Quick start](#quick-start) · [Use cases](docs/use-cases/README.md) · [Three modes](#three-execution-modes) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
 
 </div>
 

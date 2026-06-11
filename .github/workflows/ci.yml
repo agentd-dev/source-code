@@ -60,3 +60,21 @@ jobs:
       - run: cargo run -p agentd-conformance --release -- crates/agentd-conformance/corpus
       - name: Compile benchmarks
         run: cargo bench -p agentd-conformance --no-run
+
+  # The TypeScript authoring SDK: prove its emitted TOML is accepted by
+  # the real runtime, not just well-shaped.
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build -p agentd
+      - name: SDK tests (round-trip through agentd --validate-only)
+        run: node --test
+        working-directory: sdk/typescript
+        env:
+          AGENTD_BIN: ${{ github.workspace }}/target/debug/agentd

@@ -81,6 +81,7 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     check_agent_loops(doc, &mut r);
     check_respond_nodes(doc, &mut r);
     check_map_nodes(doc, &mut r);
+    check_http_request_headers(doc, &mut r);
 
     // Graph-level checks only make sense once every edge references a
     // known node. Skip them if dangling edges were detected so the
@@ -320,6 +321,65 @@ fn check_agent_loops(doc: &WorkflowDoc, r: &mut ValidationReport) {
                         crate::agent::loop_node::LOOP_TOOLS.join(", ")
                     ),
                 ));
+            }
+        }
+    }
+}
+
+fn check_http_request_headers(doc: &WorkflowDoc, r: &mut ValidationReport) {
+    use crate::workflow::model::NodeKind;
+    for node in &doc.nodes {
+        let NodeKind::HttpRequest { headers, .. } = &node.kind else {
+            continue;
+        };
+        for (name, value) in headers {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                r.issues.push(ValidationIssue::new(
+                    "http_header_bad_name",
+                    format!(
+                        "node `{}`: header name `{name}` is not a valid HTTP token",
+                        node.id
+                    ),
+                ));
+            }
+            if value.contains('\r') || value.contains('\n') {
+                r.issues.push(ValidationIssue::new(
+                    "http_header_crlf",
+                    format!("node `{}`: header `{name}` value contains CR/LF", node.id),
+                ));
+            }
+            // Placeholders: {{secret:NAME}} only — headers never carry
+            // context data, so a stray {{path}} is an authoring error
+            // caught here, not a confusing runtime miss.
+            let mut rest = value.as_str();
+            while let Some(open) = rest.find("{{") {
+                let after = &rest[open + 2..];
+                let Some(end) = after.find("}}") else {
+                    r.issues.push(ValidationIssue::new(
+                        "http_header_bad_placeholder",
+                        format!(
+                            "node `{}`: header `{name}` has an unclosed placeholder",
+                            node.id
+                        ),
+                    ));
+                    break;
+                };
+                let inner = after[..end].trim();
+                if !inner.starts_with("secret:") || inner.len() <= "secret:".len() {
+                    r.issues.push(ValidationIssue::new(
+                        "http_header_bad_placeholder",
+                        format!(
+                            "node `{}`: header `{name}`: `{{{{{inner}}}}}` — headers \
+                             interpolate {{{{secret:NAME}}}} only",
+                            node.id
+                        ),
+                    ));
+                }
+                rest = &after[end + 2..];
             }
         }
     }

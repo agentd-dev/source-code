@@ -1,0 +1,138 @@
+# Use case — compliance evidence on a schedule
+# =============================================
+# Article: docs/use-cases/compliance-evidence.md
+#
+# First of the month, 06:00: run the read-only posture checks, map the
+# output to the controls they evidence (one bounded LLM step), and file
+# a dated evidence bundle. The trick is that the COLLECTION MECHANISM is
+# itself the strongest evidence: a signed workflow (ed25519), a fail-
+# closed policy that names the only command it may run, an audit log of
+# every step, and a run record per bundle. The auditor doesn't take your
+# word — they read the graph.
+#
+#   ANTHROPIC_API_KEY=… agentd \
+#     --config examples/use-cases/compliance-evidence.toml \
+#     --record /var/lib/agentd/evidence/last-run.json
+#
+# Build: --features intel-remote,tools-shell,trigger-cron,signing
+
+name = "compliance_evidence"
+
+[[intelligence.backends]]
+name = "mapper"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 20000
+max_run_time_secs = 300
+max_fs_write_mb = 8
+
+# The ONLY command this process can ever exec, by canonical path.
+[policy.shell]
+commands = ["/usr/local/bin/posture-check"]
+
+[policy.fs]
+write = ["/var/lib/agentd/evidence/**"]
+
+[logging.audit]
+target = "file:/var/log/agentd/evidence-audit.jsonl"
+
+[[start_nodes]]
+name = "monthly"
+source = "event"
+entry_node = "collect"
+
+[[triggers]]
+type = "cron"
+schedule = "0 6 1 * *"
+start_node = "monthly"
+
+# 1. Run the read-only posture script (patch level, disk encryption,
+#    listening ports, user audit — whatever your script gathers).
+[[nodes]]
+id = "collect"
+type = "shell_run"
+command = "/usr/local/bin/posture-check"
+timeout_secs = 180
+
+# 2. Map raw output to controls — narrative for the auditor, with the
+#    raw stdout preserved alongside in the bundle.
+[[nodes]]
+id = "map_controls"
+type = "llm_infer"
+backend = "mapper"
+prompt = """
+Map this posture-check output to our control set (access control,
+patch management, encryption at rest, logging). For each control:
+state what the output evidences, or state plainly that evidence is
+missing. Auditors read this — be precise, never embellish.
+
+Output:
+{{stdout}}
+"""
+input_from = "collect"
+
+# 3. File the bundle: narrative + raw output, dated.
+[[nodes]]
+id = "bundle_path"
+type = "template_render"
+template = "/var/lib/agentd/evidence/bundle-{{fired_at_unix_ms}}.md"
+input_from = "trigger"
+
+[[nodes]]
+id = "write_bundle"
+type = "write_file"
+path_from = "bundle_path.rendered"
+content_from = "map_controls.content"
+
+[[nodes]]
+id = "raw_path"
+type = "template_render"
+template = "/var/lib/agentd/evidence/raw-{{fired_at_unix_ms}}.txt"
+input_from = "trigger"
+
+[[nodes]]
+id = "write_raw"
+type = "write_file"
+path_from = "raw_path.rendered"
+content_from = "collect.stdout"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "check_failed"
+type = "fail"
+reason = "posture-check exited non-zero — evidence run is invalid"
+
+[[edges]]
+from = "collect"
+to = "map_controls"
+
+[[edges]]
+from = "collect"
+when = "error"
+to = "check_failed"
+
+[[edges]]
+from = "map_controls"
+to = "bundle_path"
+
+[[edges]]
+from = "bundle_path"
+to = "write_bundle"
+
+[[edges]]
+from = "write_bundle"
+to = "raw_path"
+
+[[edges]]
+from = "raw_path"
+to = "write_raw"
+
+[[edges]]
+from = "write_raw"
+to = "done"

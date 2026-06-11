@@ -1,0 +1,213 @@
+# Use case — AI receptionist on Twilio (the call-control brain)
+# =============================================================
+# Article: docs/use-cases/voice-receptionist.md
+#
+# Twilio drives a phone call by POSTing call events to a webhook and
+# acting on the instructions it gets back. This workflow is the BRAIN of
+# that exchange: it receives the caller's transcribed speech (Twilio
+# <Gather input="speech">), classifies intent with one bounded llm_infer
+# step, routes on the answer, and hands the decision to a thin TwiML
+# bridge that renders the telephony XML. The model picks neither tools
+# nor edges — a hostile caller can change what the workflow KNOWS, not
+# what it CAN DO.
+#
+#   ANTHROPIC_API_KEY=… VOICE_BRIDGE_TOKENS=… \
+#     agentd --config examples/use-cases/voice-receptionist.toml \
+#            --bind 0.0.0.0:8080
+#
+# Today this terminates at an HTTPS POST to the bridge (tools-http-tls
+# build). The gap analysis proposes a `respond` node so the workflow can
+# answer Twilio with TwiML directly — see GAP-ANALYSIS.md §2.
+
+name = "voice_receptionist"
+
+[[intelligence.backends]]
+name = "frontdesk"
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+
+[budget]
+max_llm_tokens = 8000
+max_run_time_secs = 15        # a caller is waiting — fail fast
+max_memory_mb = 256
+
+[auth.bearer.bridge]
+tokens_env = "VOICE_BRIDGE_TOKENS"   # newline-separated set; rotate by adding then removing
+
+# Fail-closed: this run may reach the TwiML bridge and the CRM, nothing
+# else. No shell, no filesystem writes outside the call log.
+[policy.http]
+urls = ["https://voice-bridge.internal/**", "https://crm.example.com/api/**"]
+methods = ["POST"]
+
+[policy.fs]
+write = ["/var/lib/agentd/calls/**"]
+
+[logging.audit]
+target = "file:/var/log/agentd/voice-audit.jsonl"
+
+[[start_nodes]]
+name = "on_speech"
+source = "http"
+entry_node = "classify"
+
+[[http_routes]]
+method = "POST"
+path = "/voice/turn"
+start_node = "on_speech"
+auth = "bearer:bridge"
+rate_limit = { capacity = 30, per_second = 10.0 }
+
+# 1. One bounded reasoning step: caller speech in, intent + scripted
+#    reply out, schema-enforced. The model cannot transfer the call,
+#    cannot query the CRM, cannot end the call — it fills this node.
+[[nodes]]
+id = "classify"
+type = "llm_infer"
+backend = "frontdesk"
+prompt = """
+You are the front-desk agent for Acme. A caller said:
+
+"{{SpeechResult}}"
+
+Decide where this call goes and what to say next, as JSON only:
+{"intent": "sales|support|operator", "reply": "<one or two short sentences to speak back>"}
+Keep the reply warm, concrete, and under 40 words.
+"""
+input_from = "trigger"
+output_schema = "examples/use-cases/schemas/intent.json"
+output_repairs = 1
+
+# 2. The graph routes — declared edges, not model whim.
+[[nodes]]
+id = "route"
+type = "switch"
+expr = "classify.parsed.intent"
+
+# 3. Hand the decision to the TwiML bridge: it renders <Say>/<Dial> XML
+#    back to Twilio. One bridge URL per outcome keeps the bridge dumb.
+[[nodes]]
+id = "say_sales"
+type = "template_render"
+template = "https://voice-bridge.internal/twiml/sales"
+
+[[nodes]]
+id = "say_support"
+type = "template_render"
+template = "https://voice-bridge.internal/twiml/support"
+
+[[nodes]]
+id = "to_operator"
+type = "template_render"
+template = "https://voice-bridge.internal/twiml/operator"
+
+[[nodes]]
+id = "tell_bridge_sales"
+type = "http_request"
+method = "POST"
+url_from = "say_sales.rendered"
+body_from = "classify.parsed"
+
+[[nodes]]
+id = "tell_bridge_support"
+type = "http_request"
+method = "POST"
+url_from = "say_support.rendered"
+body_from = "classify.parsed"
+
+[[nodes]]
+id = "tell_bridge_operator"
+type = "http_request"
+method = "POST"
+url_from = "to_operator.rendered"
+body_from = "classify.parsed"
+
+# 4. Append the turn to the call log — the audit trail of what was
+#    heard and what was decided, per CallSid.
+[[nodes]]
+id = "log_path"
+type = "template_render"
+template = "/var/lib/agentd/calls/{{CallSid}}.jsonl"
+input_from = "trigger"
+
+[[nodes]]
+id = "log_turn"
+type = "write_file"
+path_from = "log_path.rendered"
+content_from = "classify.parsed"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "bridge_down"
+type = "fail"
+reason = "TwiML bridge unreachable — Twilio will play the static fallback"
+
+[[edges]]
+from = "classify"
+to = "route"
+
+[[edges]]
+from = "route"
+when = "sales"
+to = "say_sales"
+
+[[edges]]
+from = "route"
+when = "support"
+to = "say_support"
+
+[[edges]]
+from = "route"
+when = "operator"
+to = "to_operator"
+
+[[edges]]
+from = "say_sales"
+to = "tell_bridge_sales"
+
+[[edges]]
+from = "say_support"
+to = "tell_bridge_support"
+
+[[edges]]
+from = "to_operator"
+to = "tell_bridge_operator"
+
+[[edges]]
+from = "tell_bridge_sales"
+to = "log_path"
+
+[[edges]]
+from = "tell_bridge_support"
+to = "log_path"
+
+[[edges]]
+from = "tell_bridge_operator"
+to = "log_path"
+
+[[edges]]
+from = "tell_bridge_sales"
+when = "error"
+to = "bridge_down"
+
+[[edges]]
+from = "tell_bridge_support"
+when = "error"
+to = "bridge_down"
+
+[[edges]]
+from = "tell_bridge_operator"
+when = "error"
+to = "bridge_down"
+
+[[edges]]
+from = "log_path"
+to = "log_turn"
+
+[[edges]]
+from = "log_turn"
+to = "done"

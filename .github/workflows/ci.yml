@@ -98,7 +98,7 @@ jobs:
         run: |
           bin=target/debug/agentd
           fail=0
-          for f in examples/*.toml examples/reference/*.toml; do
+          for f in examples/*.toml examples/reference/*.toml examples/use-cases/*.toml; do
             case "$f" in
               # self-planning-agent.toml is an instruction file, not a
               # workflow — it has its own mode, not --validate-only.

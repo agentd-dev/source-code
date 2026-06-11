@@ -1,0 +1,127 @@
+# Use case — marketing content localization, fanned out
+# ======================================================
+# Article: docs/use-cases/content-localization.md
+#
+# Drop finished English copy into a folder; the agent translates it to
+# every target language CONCURRENTLY (a `parallel` node running one
+# sub-workflow per locale), joins the results, writes the bundle, and
+# pauses for a human before anything publishes. Each branch is a full
+# sub-DAG under the same policy and budget — only the scheduling is
+# parallel; the bounds are unchanged.
+#
+#   ANTHROPIC_API_KEY=… agentd \
+#     --config examples/use-cases/content-localization.toml \
+#     --state-dir /var/lib/agentd/state
+#
+# Build: --features intel-remote,trigger-fs-watch
+# Today the locale list is declared (one branch per language). A dynamic
+# "map over whatever list the data contains" node is proposed in the gap
+# analysis — see GAP-ANALYSIS.md §3.
+
+name = "content_localization"
+
+[[intelligence.backends]]
+name = "translator"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 60000        # shared by ALL branches — the envelope is one
+max_run_time_secs = 240
+max_fs_write_mb = 8
+
+[policy.fs]
+read = ["/var/lib/agentd/content/inbox/**"]
+write = ["/var/lib/agentd/content/out/**"]
+
+[[start_nodes]]
+name = "on_copy"
+source = "event"
+entry_node = "load"
+
+[[triggers]]
+type = "fs_watch"
+path = "/var/lib/agentd/content/inbox"
+start_node = "on_copy"
+events = ["create"]
+debounce_ms = 1000
+
+# 1. Read the new copy.
+[[nodes]]
+id = "load"
+type = "read_file"
+path_from = "trigger.path"
+
+# 2. Fan out: one translation sub-workflow per locale, concurrently.
+#    Output: {results: [...], ok} — any branch failure routes `error`.
+[[nodes]]
+id = "translate_all"
+type = "parallel"
+branches = [
+  { workflow = "examples/use-cases/localize-de.toml", input_from = "load" },
+  { workflow = "examples/use-cases/localize-fr.toml", input_from = "load" },
+]
+
+# 3. Persist the joined bundle (locale results in branch order).
+[[nodes]]
+id = "bundle_path"
+type = "template_render"
+template = "/var/lib/agentd/content/out/bundle-{{tick}}.json"
+input_from = "trigger"
+
+[[nodes]]
+id = "save_bundle"
+type = "write_file"
+path_from = "bundle_path.rendered"
+content_from = "translate_all"
+
+# 4. A human signs off before anything goes live.
+[[nodes]]
+id = "editor_review"
+type = "pause_for_approval"
+reason = "Localized bundle ready — editorial sign-off before publish."
+
+[[nodes]]
+id = "published"
+type = "terminate"
+
+[[nodes]]
+id = "unreadable"
+type = "fail"
+reason = "content file vanished or is unreadable"
+
+[[nodes]]
+id = "branch_failed"
+type = "fail"
+reason = "a localization branch failed — nothing was published"
+
+[[edges]]
+from = "load"
+to = "translate_all"
+
+[[edges]]
+from = "load"
+when = "error"
+to = "unreadable"
+
+[[edges]]
+from = "translate_all"
+to = "bundle_path"
+
+[[edges]]
+from = "translate_all"
+when = "error"
+to = "branch_failed"
+
+[[edges]]
+from = "bundle_path"
+to = "save_bundle"
+
+[[edges]]
+from = "save_bundle"
+to = "editor_review"
+
+[[edges]]
+from = "editor_review"
+to = "published"

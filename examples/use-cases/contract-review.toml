@@ -1,0 +1,147 @@
+# Use case — contract intake review against a playbook
+# =====================================================
+# Article: docs/use-cases/contract-review.md
+#
+# Sales drops inbound contracts (text exports) into a folder. The agent
+# extracts the clauses your playbook cares about — liability cap,
+# auto-renewal, governing law — and routes: standard terms file
+# automatically with a memo; ANY deviation checkpoints for counsel.
+# The playbook lives in the prompt; the gate lives in the graph; the
+# audit trail lives in the run record. Counsel reviews deviations, not
+# everything.
+#
+#   ANTHROPIC_API_KEY=… agentd \
+#     --config examples/use-cases/contract-review.toml \
+#     --state-dir /var/lib/agentd/state
+#
+# Build: --features intel-remote,schema,trigger-fs-watch
+
+name = "contract_review"
+
+[[intelligence.backends]]
+name = "reviewer"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 40000
+max_run_time_secs = 120
+max_fs_write_mb = 4
+
+[policy.fs]
+read = ["/var/lib/agentd/contracts/inbox/**"]
+write = ["/var/lib/agentd/contracts/memos/**"]
+
+[logging.audit]
+target = "file:/var/log/agentd/contracts-audit.jsonl"
+
+[[start_nodes]]
+name = "on_contract"
+source = "event"
+entry_node = "load"
+
+[[triggers]]
+type = "fs_watch"
+path = "/var/lib/agentd/contracts/inbox"
+start_node = "on_contract"
+events = ["create"]
+debounce_ms = 1000
+
+[[nodes]]
+id = "load"
+type = "read_file"
+path_from = "trigger.path"
+
+# Extract the playbook clauses. risk="review" on ANY deviation — the
+# enum forces the model to commit, and the schema rejects hedging.
+[[nodes]]
+id = "extract"
+type = "llm_infer"
+backend = "reviewer"
+prompt = """
+Extract these clauses from the contract below, against our playbook:
+- liability cap (playbook: 12 months of fees)
+- auto-renewal (playbook: none without 60-day notice)
+- governing law (playbook: Delaware)
+
+Set risk="review" if ANY clause deviates from the playbook or is
+missing; otherwise risk="standard".
+
+Contract:
+{{content}}
+
+JSON only:
+{"liability_cap": "...", "auto_renewal": false,
+ "governing_law": "...", "risk": "standard|review"}
+"""
+input_from = "load"
+output_schema = "examples/use-cases/schemas/clauses.json"
+output_repairs = 2
+
+[[nodes]]
+id = "gate"
+type = "switch"
+expr = "extract.parsed.risk"
+
+# Deviation → counsel reads the memo, then resumes (or kills the run).
+[[nodes]]
+id = "counsel_review"
+type = "pause_for_approval"
+reason = "Clause deviation from playbook — counsel sign-off required."
+
+[[nodes]]
+id = "memo_path"
+type = "template_render"
+template = "/var/lib/agentd/contracts/memos/memo-{{tick}}.json"
+input_from = "trigger"
+
+[[nodes]]
+id = "write_memo"
+type = "write_file"
+path_from = "memo_path.rendered"
+content_from = "extract.parsed"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "unreadable"
+type = "fail"
+reason = "contract file vanished or is unreadable"
+
+[[edges]]
+from = "load"
+to = "extract"
+
+[[edges]]
+from = "load"
+when = "error"
+to = "unreadable"
+
+[[edges]]
+from = "extract"
+to = "gate"
+
+[[edges]]
+from = "gate"
+when = "standard"
+to = "memo_path"
+
+[[edges]]
+from = "gate"
+when = "review"
+to = "counsel_review"
+
+[[edges]]
+from = "counsel_review"
+to = "memo_path"
+
+[[edges]]
+from = "memo_path"
+to = "write_memo"
+
+[[edges]]
+from = "write_memo"
+to = "done"

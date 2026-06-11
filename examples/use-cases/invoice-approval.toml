@@ -1,0 +1,182 @@
+# Use case — invoice intake and approval routing
+# ===============================================
+# Article: docs/use-cases/invoice-approval.md
+#
+# Finance drops invoices (text/JSON exports from the scanner or email
+# pipeline) into a watched folder. Each file is extracted into typed
+# fields by one schema-enforced LLM step, then ROUTED BY POLICY: clean
+# invoices under the threshold post to the accounting API automatically;
+# anything over threshold, missing a PO, or uncertain pauses for a human.
+# The threshold logic lives in the prompt + schema; the gate itself is a
+# declared edge — auditors read the workflow, not the code.
+#
+#   ANTHROPIC_API_KEY=… agentd \
+#     --config examples/use-cases/invoice-approval.toml \
+#     --state-dir /var/lib/agentd/state
+#
+# Build: --features intel-remote,schema,tools-http-tls,trigger-fs-watch
+
+name = "invoice_approval"
+
+[[intelligence.backends]]
+name = "extractor"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 15000
+max_run_time_secs = 90
+max_fs_write_mb = 4
+
+[policy.fs]
+read = ["/var/lib/agentd/invoices/inbox/**"]
+write = ["/var/lib/agentd/invoices/processed/**"]
+
+[policy.http]
+urls = ["https://accounting.example.com/api/**"]
+methods = ["POST"]
+
+[logging.audit]
+target = "file:/var/log/agentd/invoices-audit.jsonl"
+
+[[start_nodes]]
+name = "on_invoice"
+source = "event"
+entry_node = "load"
+
+[[triggers]]
+type = "fs_watch"
+path = "/var/lib/agentd/invoices/inbox"
+start_node = "on_invoice"
+events = ["create"]
+debounce_ms = 500
+
+# 1. Read the dropped file (trigger.path is the new invoice).
+[[nodes]]
+id = "load"
+type = "read_file"
+path_from = "trigger.path"
+
+# 2. Extract typed fields. The schema makes "requires_review" a hard
+#    boolean the model must commit to — over-threshold, missing PO, or
+#    uncertain extraction all flip it true per the prompt rules.
+[[nodes]]
+id = "extract"
+type = "llm_infer"
+backend = "extractor"
+prompt = """
+Extract this invoice into structured fields. Set requires_review=true
+if ANY of: amount exceeds 2500 USD, no PO number is present, or you are
+not certain about a field.
+
+Invoice text:
+{{content}}
+
+JSON only:
+{"vendor": "...", "amount": 0, "currency": "USD",
+ "po_number": "... or null", "requires_review": false}
+"""
+input_from = "load"
+output_schema = "examples/use-cases/schemas/invoice.json"
+output_repairs = 2
+
+# 3. The boolean routes the graph.
+[[nodes]]
+id = "gate"
+type = "condition"
+expr = "extract.parsed.requires_review"
+
+# 4a. Needs eyes → checkpoint and wait. Resume posts it.
+[[nodes]]
+id = "controller_review"
+type = "pause_for_approval"
+reason = "Invoice over threshold / missing PO — controller sign-off required."
+
+# 4b. Clean and under threshold → book it.
+[[nodes]]
+id = "post_invoice"
+type = "http_request"
+method = "POST"
+url_from = "ap_url.rendered"
+body_from = "extract.parsed"
+
+[[nodes]]
+id = "ap_url"
+type = "template_render"
+template = "https://accounting.example.com/api/ap/invoices"
+
+# 5. Archive the structured record next to the books.
+[[nodes]]
+id = "archive_path"
+type = "template_render"
+template = "/var/lib/agentd/invoices/processed/{{tick}}.json"
+input_from = "trigger"
+
+[[nodes]]
+id = "archive"
+type = "write_file"
+path_from = "archive_path.rendered"
+content_from = "extract.parsed"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "unreadable"
+type = "fail"
+reason = "invoice file vanished or is unreadable"
+
+[[nodes]]
+id = "ap_rejected"
+type = "fail"
+reason = "accounting API rejected the invoice"
+
+[[edges]]
+from = "load"
+to = "extract"
+
+[[edges]]
+from = "load"
+when = "error"
+to = "unreadable"
+
+[[edges]]
+from = "extract"
+to = "gate"
+
+[[edges]]
+from = "gate"
+when = "true"
+to = "controller_review"
+
+[[edges]]
+from = "gate"
+when = "false"
+to = "ap_url"
+
+[[edges]]
+from = "controller_review"
+to = "ap_url"
+
+[[edges]]
+from = "ap_url"
+to = "post_invoice"
+
+[[edges]]
+from = "post_invoice"
+to = "archive_path"
+
+[[edges]]
+from = "post_invoice"
+when = "error"
+to = "ap_rejected"
+
+[[edges]]
+from = "archive_path"
+to = "archive"
+
+[[edges]]
+from = "archive"
+to = "done"

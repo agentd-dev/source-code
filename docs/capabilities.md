@@ -757,6 +757,18 @@ Per-route auth and rate-limit settings are validated at server
 startup — misconfigured bindings fail the bind, not the first
 request.
 
+**Request bodies** parse by content type into the trigger payload:
+
+| Content type | Parsed as |
+|---|---|
+| `application/x-www-form-urlencoded` | Flat JSON object of string values (Twilio-style webhooks). Strict percent-decoding — malformed escapes and non-UTF-8 are a 400. Duplicate keys: last wins. |
+| `multipart/form-data` | Text fields as a flat JSON object. File parts (anything carrying a `filename`) are **dropped** with an `http.multipart_file_dropped` audit note — attachment handling stays upstream or behind an MCP document parser by design. |
+| anything else | Legacy contract: empty body → `null`; otherwise the body must parse as JSON or the request is a 400. |
+
+**Responses** are the outcome JSON (`200/422/504/202` by outcome) —
+unless the run executed a [`respond`](#respond) node, in which case its
+declared status / content type / templated body is written verbatim.
+
 ---
 
 ## 4. Policy

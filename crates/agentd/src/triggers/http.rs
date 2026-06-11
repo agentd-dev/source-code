@@ -761,21 +761,25 @@ fn handle_one_request<S: std::io::Read + Write>(
         }
     };
 
-    // Parse body as JSON (or accept an empty body as `null`).
-    let input = if request.body.is_empty() {
-        Value::Null
-    } else {
-        match serde_json::from_slice::<Value>(&request.body) {
-            Ok(v) => v,
-            Err(e) => {
-                write_response_with_header(
-                    stream,
-                    Status::new(400, "Bad Request"),
-                    &json!({ "error": "invalid JSON body", "detail": e.to_string() }),
-                    &connection_headers(keep_alive),
-                )?;
-                return Ok(keep_alive);
-            }
+    // Parse the body by content type: urlencoded forms and multipart
+    // field sets become flat JSON objects (Twilio, inbound-email
+    // relays); everything else keeps the legacy behaviour — try JSON,
+    // accept an empty body as `null`.
+    let content_type = request
+        .headers
+        .get("content-type")
+        .cloned()
+        .unwrap_or_default();
+    let input = match parse_body(&request.body, &content_type) {
+        Ok(v) => v,
+        Err(reason) => {
+            write_response_with_header(
+                stream,
+                Status::new(400, "Bad Request"),
+                &json!({ "error": reason }),
+                &connection_headers(keep_alive),
+            )?;
+            return Ok(keep_alive);
         }
     };
 
@@ -1061,6 +1065,164 @@ fn silent_close() -> ParseError {
 // ---------------------------------------------------------------------------
 // Response writing
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Body parsing — content-type aware
+// ---------------------------------------------------------------------------
+
+/// Turn a request body into the trigger input value.
+///
+/// - `application/x-www-form-urlencoded` → flat JSON object of string
+///   values (Twilio-style webhooks). Strict percent-decoding: a
+///   malformed escape or invalid UTF-8 is a 400, not a guess.
+/// - `multipart/form-data` → text fields as a flat JSON object; file
+///   parts (anything with a `filename`) are **dropped** with an audit
+///   note — attachment handling stays upstream or behind an MCP
+///   document parser by design.
+/// - anything else → the legacy behaviour: empty body is `null`,
+///   otherwise the body must parse as JSON.
+fn parse_body(body: &[u8], content_type: &str) -> std::result::Result<Value, String> {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match ct.as_str() {
+        "application/x-www-form-urlencoded" => parse_urlencoded(body),
+        "multipart/form-data" => {
+            let boundary = multipart_boundary(content_type)
+                .ok_or_else(|| "multipart body without a boundary parameter".to_string())?;
+            parse_multipart(body, &boundary)
+        }
+        _ => {
+            if body.is_empty() {
+                return Ok(Value::Null);
+            }
+            serde_json::from_slice::<Value>(body).map_err(|e| format!("invalid JSON body: {e}"))
+        }
+    }
+}
+
+/// Strict `application/x-www-form-urlencoded` → flat JSON object.
+/// `+` decodes to space; `%XX` must be a valid escape; the decoded
+/// bytes must be UTF-8. Duplicate keys: last wins (documented).
+fn parse_urlencoded(body: &[u8]) -> std::result::Result<Value, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "form body is not UTF-8".to_string())?;
+    let mut map = serde_json::Map::new();
+    for pair in text.split('&').filter(|p| !p.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(raw_key)?;
+        let value = percent_decode(raw_value)?;
+        map.insert(key, Value::String(value));
+    }
+    Ok(Value::Object(map))
+}
+
+/// Percent-decode one urlencoded token (strict). `+` → space.
+fn percent_decode(s: &str) -> std::result::Result<String, String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .ok_or_else(|| format!("truncated percent escape in `{s}`"))?;
+                let hi = (hex[0] as char)
+                    .to_digit(16)
+                    .ok_or_else(|| format!("invalid percent escape in `{s}`"))?;
+                let lo = (hex[1] as char)
+                    .to_digit(16)
+                    .ok_or_else(|| format!("invalid percent escape in `{s}`"))?;
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| "form field decodes to invalid UTF-8".to_string())
+}
+
+/// Extract the `boundary` parameter from a multipart content type.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    for param in content_type.split(';').skip(1) {
+        let (k, v) = param.trim().split_once('=')?;
+        if k.trim().eq_ignore_ascii_case("boundary") {
+            let v = v.trim();
+            let v = v.strip_prefix('"').unwrap_or(v);
+            let v = v.strip_suffix('"').unwrap_or(v);
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Minimal, strict `multipart/form-data` field extractor. Text fields
+/// become string values; file parts are dropped with an audit note.
+/// The whole body already sits under the request-size cap.
+fn parse_multipart(body: &[u8], boundary: &str) -> std::result::Result<Value, String> {
+    let delim = format!("--{boundary}");
+    let text = std::str::from_utf8(body)
+        .map_err(|_| "multipart body with non-UTF-8 content (binary attachments are not accepted; drop the file part upstream)".to_string())?;
+    let mut map = serde_json::Map::new();
+    let mut sections = text.split(delim.as_str());
+    // Everything before the first boundary is a preamble — ignore.
+    sections.next();
+    for section in sections {
+        let section = section.strip_prefix("\r\n").unwrap_or(section);
+        if section.starts_with("--") {
+            break; // closing boundary
+        }
+        let (raw_headers, content) = section
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| "malformed multipart part (no header/body separator)".to_string())?;
+        let mut name: Option<String> = None;
+        let mut filename: Option<String> = None;
+        for line in raw_headers.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if k.trim().eq_ignore_ascii_case("content-disposition") {
+                for param in v.split(';').skip(1) {
+                    let Some((pk, pv)) = param.trim().split_once('=') else {
+                        continue;
+                    };
+                    let pv = pv.trim().trim_matches('"').to_string();
+                    match pk.trim().to_ascii_lowercase().as_str() {
+                        "name" => name = Some(pv),
+                        "filename" => filename = Some(pv),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let name = name.ok_or_else(|| "multipart part without a field name".to_string())?;
+        let content = content.strip_suffix("\r\n").unwrap_or(content);
+        if let Some(fname) = filename {
+            tracing::info!(
+                target: "agentd::audit",
+                event = "http.multipart_file_dropped",
+                field = %name,
+                filename = %fname,
+                bytes = content.len(),
+            );
+            continue;
+        }
+        map.insert(name, Value::String(content.to_string()));
+    }
+    Ok(Value::Object(map))
+}
 
 /// Minimal reason phrase for a `respond`-declared status. Clients
 /// ignore the phrase; this keeps the status line well-formed.
@@ -1682,5 +1844,59 @@ mod tests {
         reader.read_to_string(&mut buf).unwrap();
         assert!(buf.contains("413"));
         handle.shutdown_and_drain();
+    }
+
+    // -- body parsing (content-type aware) --------------------------------
+
+    #[test]
+    fn urlencoded_body_becomes_flat_object() {
+        // Twilio-shaped: form fields, +-encoded spaces, percent escapes.
+        let body = b"CallSid=CA123&SpeechResult=I+need%20billing&From=%2B15551234567";
+        let v = parse_body(body, "application/x-www-form-urlencoded").unwrap();
+        assert_eq!(v["CallSid"], "CA123");
+        assert_eq!(v["SpeechResult"], "I need billing");
+        assert_eq!(v["From"], "+15551234567");
+    }
+
+    #[test]
+    fn urlencoded_duplicate_keys_last_wins_and_bad_escape_is_400() {
+        let v = parse_body(b"a=1&a=2", "application/x-www-form-urlencoded").unwrap();
+        assert_eq!(v["a"], "2");
+        let err = parse_body(b"a=%zz", "application/x-www-form-urlencoded").unwrap_err();
+        assert!(err.contains("percent escape"), "{err}");
+    }
+
+    #[test]
+    fn multipart_fields_parse_and_files_are_dropped() {
+        let ct = r#"multipart/form-data; boundary="xYzBoundary""#;
+        let body = b"--xYzBoundary\r\n\
+            Content-Disposition: form-data; name=\"subject\"\r\n\r\n\
+            Hello there\r\n\
+            --xYzBoundary\r\n\
+            Content-Disposition: form-data; name=\"attachment1\"; filename=\"a.pdf\"\r\n\
+            Content-Type: application/pdf\r\n\r\n\
+            FAKEPDF\r\n\
+            --xYzBoundary--\r\n";
+        let v = parse_body(body, ct).unwrap();
+        assert_eq!(v["subject"], "Hello there");
+        assert!(v.get("attachment1").is_none(), "file part must be dropped");
+    }
+
+    #[test]
+    fn multipart_without_boundary_is_400() {
+        let err = parse_body(b"x", "multipart/form-data").unwrap_err();
+        assert!(err.contains("boundary"), "{err}");
+    }
+
+    #[test]
+    fn legacy_json_behaviour_is_unchanged() {
+        // No / unknown content type: empty → null, JSON → parsed,
+        // garbage → 400. Exactly the pre-1.2 contract.
+        assert_eq!(parse_body(b"", "").unwrap(), Value::Null);
+        assert_eq!(
+            parse_body(br#"{"n":1}"#, "text/plain").unwrap()["n"],
+            json!(1)
+        );
+        assert!(parse_body(b"not json", "").is_err());
     }
 }

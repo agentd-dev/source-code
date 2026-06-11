@@ -21,7 +21,12 @@ use crate::intelligence::protocol::{RpcRequest, RpcResponse};
 use crate::intelligence::protocol::{read_frame, write_frame};
 
 #[cfg(any(unix, feature = "intel-http"))]
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
+// BufWriter wraps only the Unix-socket stream; the HTTP client writes
+// through its own buffer. On Windows + intel-http a joint import would
+// be unused — and clippy lints --all-features on every OS.
+#[cfg(unix)]
+use std::io::BufWriter;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]

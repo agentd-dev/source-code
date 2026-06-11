@@ -783,6 +783,8 @@ path   = "/webhooks/github"                  # required; routed on exact path
 start_node = "on_push"                       # required; must exist in start_nodes
 input_schema = "schemas/gh-push.json"        # optional; not enforced today (future)
 auth = "hmac:github"                         # optional; none | bearer:name | basic:name | hmac:name | oidc:name | mtls
+idempotency_key = "trigger.order.id"         # optional; payload path or "body_sha256"
+idempotency_ttl_secs = 86400                 # optional; replay window (default 86400)
 [http_routes.rate_limit]                     # optional
 capacity   = 10
 per_second = 1.0
@@ -790,7 +792,30 @@ per_second = 1.0
 
 Per-route auth and rate-limit settings are validated at server
 startup — misconfigured bindings fail the bind, not the first
-request.
+request. So is idempotency: a keyed route without `--state-dir`
+fails the bind.
+
+**Idempotency.** Webhook providers deliver at-least-once. With
+`idempotency_key`, a redelivery whose key was already seen (within the
+TTL) **replays the recorded response** — marked with an
+`X-Agentd-Idempotent-Replay: true` header — instead of re-running the
+workflow: exactly-once *effect* at the route boundary. Semantics, all
+fail-closed:
+
+- The key is a dotted path into the parsed payload (`trigger.` prefix
+  accepted) and must resolve to a scalar — otherwise the request is a
+  400 and nothing runs. `"body_sha256"` keys on the raw body instead
+  (needs the `auth` feature for sha2).
+- The check runs **after auth** (an unauthenticated caller can't probe
+  the replay cache) and after body parsing.
+- A concurrent duplicate gets **409** while the first delivery is in
+  flight; a marker older than 2× the run timeout is treated as a
+  crashed run and taken over.
+- **Successes and pauses are recorded; failures are not** — a failed
+  delivery stays retryable, because the provider's redelivery *is* the
+  retry mechanism. `respond`-shaped replies are recorded verbatim.
+- Entries live under `<state-dir>/idempotency/`; delete a file to
+  forget a key.
 
 **Request bodies** parse by content type into the trigger payload:
 

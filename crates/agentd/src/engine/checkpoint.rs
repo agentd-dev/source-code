@@ -18,7 +18,10 @@ use serde_json::Value;
 
 use crate::engine::context::TriggerKind;
 
-/// The persisted state of a paused run.
+/// The persisted state of a suspended run — either a `pause_for_approval`
+/// pause (awaiting a human) or a per-node progress snapshot for
+/// crash-recovery. Resume treats both identically; only auto-resume
+/// distinguishes them via [`Checkpoint::awaiting_approval`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// The run's execution id — also the checkpoint file's stem.
@@ -29,16 +32,27 @@ pub struct Checkpoint {
     pub start_node: String,
     pub trigger_kind: TriggerKind,
     pub trigger_input: Value,
-    /// Node outputs accumulated up to the pause (includes the reserved
+    /// Node outputs accumulated up to this point (includes the reserved
     /// `trigger` entry).
     pub node_outputs: HashMap<String, Value>,
-    /// The `pause_for_approval` node that suspended the run.
+    /// The node the run last reached (a pause node, or the last node
+    /// that completed before a progress snapshot).
     pub paused_at: String,
-    /// The node to execute on resume (the pause node's successor).
-    /// `None` means the pause node had no out-edge — resuming completes.
+    /// The node to execute on resume. `None` means there is no successor
+    /// — resuming completes.
     pub resume_node: Option<String>,
-    /// The operator-facing approval prompt.
+    /// The operator-facing approval prompt (pause checkpoints only).
     pub reason: Option<String>,
+    /// `true` for a `pause_for_approval` checkpoint (a human must resume
+    /// it); `false` for an automatic per-node progress snapshot (safe to
+    /// auto-resume after a crash). Defaults to `true` so checkpoints
+    /// written before this field existed are treated as deliberate.
+    #[serde(default = "default_true")]
+    pub awaiting_approval: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Checkpoint {
@@ -70,6 +84,28 @@ impl Checkpoint {
     pub fn discard(dir: &Path, run_id: &str) {
         let _ = std::fs::remove_file(Self::path(dir, run_id));
     }
+
+    /// Every parseable checkpoint under `dir`, sorted by run id.
+    /// Unreadable / non-checkpoint `.json` files are skipped.
+    pub fn list(dir: &Path) -> Vec<Checkpoint> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw) {
+                    out.push(cp);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +128,7 @@ mod tests {
             paused_at: "gate".into(),
             resume_node: Some("after".into()),
             reason: Some("approve?".into()),
+            awaiting_approval: true,
         };
         cp.save(dir.path()).unwrap();
         let back = Checkpoint::load(dir.path(), "exec-7").unwrap();

@@ -37,10 +37,11 @@ first-class; neither is allowed to erode the other.
       (CLI today, UI later) consumes.
 - [x] **Durable execution + `pause_for_approval`** — the engine writes a
       checkpoint at a `pause_for_approval` node and stops with a `Paused`
-      outcome (exit 7); `--resume RUN_ID` continues from the checkpoint
-      with state restored. The line between automation and an agent that
-      works alongside you. (Crash-recovery at any node boundary is the
-      next increment.)
+      outcome (exit 7); `--resume RUN_ID` continues with state restored.
+- [x] **Crash-recovery** — `--checkpoint-each-node` snapshots after every
+      node; a crashed run is recoverable from its last completed node via
+      `--resume` / `--resume-incomplete` / `--list-checkpoints`.
+      At-least-once for the interrupted node.
 - [x] **Sub-workflow `call` node** — invoke another workflow as a sub-DAG
       under the parent's policy/budget envelope, depth-bounded. Compose
       the substrate; never invent an orchestrator-of-agents.

@@ -1,5 +1,6 @@
 import "./globals.css";
 import Link from "next/link";
+import ResourcesMenu from "./resources-menu";
 
 export const metadata = {
   title: "agentd — spin up an AI agent that works on its own",
@@ -19,16 +20,28 @@ export default function RootLayout({ children }) {
               agentd<span className="text-[var(--dim)]">@~</span>
               <span className="cursor" />
             </Link>
-            <Link href="/use-cases/" className="text-[var(--dim)] hover:text-[var(--accent)]">
+            {/* Mobile: rfcs / use cases / inspect group under one
+                dropdown; docs and [github] stay directly tappable. */}
+            <ResourcesMenu />
+            <Link
+              href="/use-cases/"
+              className="hidden md:inline text-[var(--dim)] hover:text-[var(--accent)]"
+            >
               use cases
             </Link>
             <Link href="/docs/overview/" className="text-[var(--dim)] hover:text-[var(--accent)]">
               docs
             </Link>
-            <Link href="/docs/rfc-0001/" className="text-[var(--dim)] hover:text-[var(--accent)]">
+            <Link
+              href="/docs/rfc-0001/"
+              className="hidden md:inline text-[var(--dim)] hover:text-[var(--accent)]"
+            >
               rfcs
             </Link>
-            <Link href="/inspect/" className="text-[var(--dim)] hover:text-[var(--accent)]">
+            <Link
+              href="/inspect/"
+              className="hidden md:inline text-[var(--dim)] hover:text-[var(--accent)]"
+            >
               inspect
             </Link>
             <a

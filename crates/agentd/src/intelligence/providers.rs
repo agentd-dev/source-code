@@ -39,9 +39,11 @@ pub struct RemoteClient {
     kind: ProviderKind,
     model: String,
     base_url: String,
-    /// Resolved key material (read from `api_key_env` at build time;
-    /// hot reload rebuilds clients, which re-reads the env).
-    api_key: Option<String>,
+    /// The secret NAME from `api_key_env` — resolved through the
+    /// secrets registry *per request*, so a rotating source (OAuth2
+    /// token, Vault-managed file) is always served fresh. Build time
+    /// still probes it once, so a missing key is a startup error.
+    api_key_name: Option<String>,
     default_max_tokens: Option<u32>,
     agent: ureq::Agent,
 }
@@ -51,18 +53,18 @@ impl RemoteClient {
     /// here — a named-but-unset env var is a startup error, not a
     /// first-request 401.
     pub fn from_def(def: &BackendDef, timeout: Duration) -> Result<Self> {
-        let api_key = match &def.api_key_env {
-            Some(var) => match std::env::var(var) {
-                Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
-                _ => {
-                    return Err(Error::Config(format!(
-                        "intelligence.backends.{}: env var `{var}` is unset or empty",
-                        def.name
-                    )));
-                }
-            },
-            None => None,
-        };
+        // Probe the key once so a bad reference is a startup error —
+        // but store the NAME: each request re-resolves through the
+        // secrets registry, keeping OAuth2/file-rotated keys fresh.
+        if let Some(var) = &def.api_key_env
+            && let Err(e) = crate::secrets::resolve(var)
+        {
+            return Err(Error::Config(format!(
+                "intelligence.backends.{}: {e}",
+                def.name
+            )));
+        }
+        let api_key_name = def.api_key_env.clone();
         let base_url = def
             .base_url
             .clone()
@@ -77,7 +79,7 @@ impl RemoteClient {
             kind: def.provider,
             model: def.model.clone().expect("validate_list enforces model"),
             base_url,
-            api_key,
+            api_key_name,
             default_max_tokens: def.max_tokens,
             agent,
         })
@@ -116,6 +118,15 @@ fn split_system(req: &Request) -> (Option<&str>, Vec<(&str, &str)>) {
 
 impl IntelligenceClient for RemoteClient {
     fn complete(&self, req: &Request) -> Result<Response> {
+        // Per-request resolution: a rotated file or refreshed OAuth2
+        // token is picked up on the very next call, no reload needed.
+        let api_key = match &self.api_key_name {
+            Some(name) => Some(
+                crate::secrets::resolve(name)
+                    .map_err(|e| Error::Intelligence(format!("{}: {e}", self.kind.as_str())))?,
+            ),
+            None => None,
+        };
         let (url, body, headers): (String, Value, Vec<(&str, String)>) = match self.kind {
             ProviderKind::Anthropic => {
                 let (system, turns) = split_system(req);
@@ -136,7 +147,7 @@ impl IntelligenceClient for RemoteClient {
                     format!("{}/v1/messages", self.base_url),
                     body,
                     vec![
-                        ("x-api-key", self.api_key.clone().unwrap_or_default()),
+                        ("x-api-key", api_key.clone().unwrap_or_default()),
                         ("anthropic-version", "2023-06-01".into()),
                     ],
                 )
@@ -155,7 +166,7 @@ impl IntelligenceClient for RemoteClient {
                     body["temperature"] = json!(t);
                 }
                 let mut headers = Vec::new();
-                if let Some(k) = &self.api_key {
+                if let Some(k) = &api_key {
                     headers.push(("authorization", format!("Bearer {k}")));
                 }
                 (
@@ -186,7 +197,7 @@ impl IntelligenceClient for RemoteClient {
                         self.base_url, self.model
                     ),
                     body,
-                    vec![("x-goog-api-key", self.api_key.clone().unwrap_or_default())],
+                    vec![("x-goog-api-key", api_key.clone().unwrap_or_default())],
                 )
             }
         };
@@ -371,7 +382,19 @@ mod tests {
             max_tokens: None,
         };
         let mut c = RemoteClient::from_def(&def, Duration::from_secs(5)).unwrap();
-        c.api_key = key.map(String::from);
+        // Keys are now resolved by NAME per request; park the literal
+        // in a per-kind env var and reference it (env fallback path).
+        c.api_key_name = key.map(|literal| {
+            // Var name derived from the literal: parallel tests with
+            // different keys never clobber each other.
+            let var = format!(
+                "AGENTD_TEST_PROVIDER_KEY_{}",
+                literal.replace(['-', ':'], "_").to_uppercase()
+            );
+            // SAFETY: test-scoped env mutation, unique var per key.
+            unsafe { std::env::set_var(&var, literal) };
+            var
+        });
         c
     }
 

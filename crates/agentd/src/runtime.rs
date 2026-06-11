@@ -669,6 +669,19 @@ fn has_long_lived_trigger(doc: &WorkflowDoc) -> bool {
 // ---------------------------------------------------------------------------
 
 fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
+    // Install the secret registry BEFORE anything that resolves a
+    // secret (backends probe their keys at build; MCP servers spawn
+    // with declared env). A named-but-unresolvable secret — bad file,
+    // missing feature, down token endpoint — is a startup error here,
+    // not a confusing first-request failure.
+    match crate::secrets::SecretsRegistry::build(&doc.secrets) {
+        Ok(reg) => crate::secrets::install(reg),
+        Err(e) => {
+            eprintln!("agentd: [[secrets]]: {e}");
+            return Err(ExitCode::from(EXIT_SEMANTIC));
+        }
+    }
+
     let (reloadable_policy, mcp_allowlist) = build_policy(doc);
     // `Arc<ReloadablePolicy>` coerces to `Arc<dyn Policy>` at the
     // handler-registration boundary. Keep the typed handle around so
@@ -925,7 +938,7 @@ fn spawn_mcp_handle(
         .command
         .split_first()
         .expect("validate_list enforces non-empty command");
-    match crate::mcp::client::StdioMcpClient::spawn(head.clone(), tail) {
+    match crate::mcp::client::StdioMcpClient::spawn_with_env(head.clone(), tail, &def.env) {
         Ok(client) => {
             let initial: Box<dyn crate::mcp::client::McpClient> = Box::new(client);
             let allowlist = crate::mcp::allowlist::McpAllowlist {
@@ -1574,6 +1587,23 @@ fn run_reload(
         return;
     }
 
+    // Reload secrets — rebuilds the registry from the fresh
+    // [[secrets]] block: command caches drop, OAuth2 tokens re-fetch,
+    // and the build-time probe applies the same fail-closed contract
+    // as startup (a bad source keeps the OLD registry installed).
+    match crate::secrets::SecretsRegistry::build(&doc.secrets) {
+        Ok(reg) => crate::secrets::install(reg),
+        Err(e) => {
+            tracing::error!(
+                target: "agentd::audit",
+                event = "reload.failed",
+                stage = "secrets",
+                reason = %format!("{e}"),
+            );
+            return;
+        }
+    }
+
     // Reload TLS — pulls cert/key off disk fresh, rebuilds the
     // rustls::ServerConfig, swaps atomically.
     let tls_cfg = doc.server.as_ref().and_then(|s| s.tls.as_ref());
@@ -1652,9 +1682,11 @@ fn run_reload(
             // Look up the new server def (if any) so we can rotate
             // the allowlist + respawn with the new command.
             let def = doc.mcp_servers.iter().find(|d| d.name == handle.name);
-            let (cmd, allowlist) = match def {
+            let empty_env = std::collections::HashMap::new();
+            let (cmd, child_env, allowlist) = match def {
                 Some(d) => (
                     d.command.as_slice(),
+                    &d.env,
                     crate::mcp::allowlist::McpAllowlist {
                         allowed_tools: d.allow_tools.clone(),
                         allowed_resource_patterns: d.allow_resources.clone(),
@@ -1664,7 +1696,7 @@ fn run_reload(
                     // Legacy `--mcp-stdio` default server — command
                     // comes from CLI, allowlist comes from `[policy.mcp]`.
                     match args.mcp_stdio.as_deref() {
-                        Some(c) => (c, global_mcp_allowlist.clone()),
+                        Some(c) => (c, &empty_env, global_mcp_allowlist.clone()),
                         None => {
                             // Server was registered at startup but the
                             // CLI arg vanished — can't respawn. Skip.
@@ -1692,7 +1724,8 @@ fn run_reload(
             let (head, tail) = cmd
                 .split_first()
                 .expect("config validator enforces non-empty command");
-            match crate::mcp::client::StdioMcpClient::spawn(head.clone(), tail) {
+            match crate::mcp::client::StdioMcpClient::spawn_with_env(head.clone(), tail, child_env)
+            {
                 Ok(new_client) => {
                     let boxed: Box<dyn crate::mcp::client::McpClient> = Box::new(new_client);
                     handle.client.swap(boxed);

@@ -46,6 +46,16 @@ pub struct McpServerDef {
     /// literal, `prefix/*`, `prefix/**`, or `*`).
     #[serde(default)]
     pub allow_resources: Vec<String>,
+
+    /// Environment variables for the child process, as
+    /// `VAR = "<secret name>"` pairs. Each value is a NAME resolved
+    /// through the secrets registry at spawn ([[secrets]] source
+    /// first, process env second) — so an MCP server gets its
+    /// `DATABASE_URL` from a file, a command, or an OAuth2 grant
+    /// without the secret ever entering this process's own
+    /// environment (children inherit that too; this is additive).
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 impl McpServerDef {
@@ -92,6 +102,7 @@ pub fn from_cli_stdio(argv: Vec<String>) -> McpServerDef {
         command: argv,
         allow_tools: vec!["*".into()],
         allow_resources: vec!["*".into()],
+        env: Default::default(),
     }
 }
 
@@ -111,12 +122,14 @@ mod tests {
                 command: vec!["/bin/a".into()],
                 allow_tools: vec![],
                 allow_resources: vec![],
+                env: Default::default(),
             },
             McpServerDef {
                 name: "a".into(),
                 command: vec!["/bin/b".into()],
                 allow_tools: vec![],
                 allow_resources: vec![],
+                env: Default::default(),
             },
         ];
         let err = McpServerDef::validate_list(&entries).unwrap_err();
@@ -130,6 +143,7 @@ mod tests {
             command: vec![],
             allow_tools: vec![],
             allow_resources: vec![],
+            env: Default::default(),
         }];
         let err = McpServerDef::validate_list(&entries).unwrap_err();
         assert!(err.contains("at least one element"));
@@ -142,6 +156,7 @@ mod tests {
             command: vec!["/bin/x".into()],
             allow_tools: vec![],
             allow_resources: vec![],
+            env: Default::default(),
         }];
         let err = McpServerDef::validate_list(&entries).unwrap_err();
         assert!(err.contains("non-empty"));

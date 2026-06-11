@@ -99,7 +99,7 @@ impl BearerDef {
             .map(String::from)
             .collect();
         if let Some(var) = &self.tokens_env
-            && let Ok(raw) = std::env::var(var)
+            && let Ok(raw) = crate::secrets::resolve(var)
         {
             for line in raw.lines() {
                 let trimmed = line.trim();
@@ -152,7 +152,7 @@ impl HmacDef {
     /// var is unset).
     pub fn secret_bytes(&self) -> Option<Vec<u8>> {
         if let Some(var) = &self.secret_env
-            && let Ok(val) = std::env::var(var)
+            && let Ok(val) = crate::secrets::resolve(var)
             && !val.is_empty()
         {
             return Some(val.into_bytes());

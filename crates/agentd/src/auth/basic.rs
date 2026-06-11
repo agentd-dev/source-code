@@ -39,7 +39,7 @@ impl BasicDef {
             .cloned()
             .collect();
         if let Some(var) = &self.credentials_env
-            && let Ok(raw) = std::env::var(var)
+            && let Ok(raw) = crate::secrets::resolve(var)
         {
             out.extend(
                 raw.lines()

@@ -249,6 +249,7 @@ mod tests {
             command: vec!["/bin/mcp".into()],
             allow_tools: vec!["comment".into()],
             allow_resources: vec![],
+            env: Default::default(),
         }];
         let cat = CapabilityCatalog::from_base(Some(&doc), vec!["m".into()]);
         let out = cat.render();

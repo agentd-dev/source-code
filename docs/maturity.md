@@ -4,7 +4,7 @@
 pre-production-ready-with-caveats, and what's still aspirational. Read
 before deploying.
 
-**Date:** as of **v1.2.0** (2026-06-11); kept current with the release
+**Date:** as of **v1.3.0** (2026-06-11); kept current with the release
 tags. Reassess quarterly or after any RFC-scale change.
 
 **Scope:** `crates/agentd/` only.
@@ -18,9 +18,9 @@ audit, hot reload, Prometheus, OTLP — is Green with tests. The
 remaining Red cells are **shape choices**, not gaps: durability
 (use an upstream queue), fleet-wide rate limits (use your LB),
 multi-workflow inside one process (run multiple processes),
-browser surfaces (front it with a real gateway), secret-fetching
-(mount env vars or files from your orchestrator — k8s `Secret`,
-systemd `EnvironmentFile`, Vault Agent sidecar, SOPS, etc.).
+browser surfaces (front it with a real gateway). Secret-fetching is
+now in-runtime via `[[secrets]]` (env / file / command / OAuth2);
+orchestrator-mounted env/files keep working unchanged.
 
 **When this runtime is the right tool.** You want a small, fast,
 single-binary runtime that executes a declarative TOML workflow,
@@ -93,6 +93,7 @@ surface is trimmed — see §1.5).
 | mTLS client identity in the workflow | Green | Injected as `trigger.principal = { kind: "mtls", name: "sha256:<hex>" }`. |
 | Bearer / HMAC principal injection | Green | `{ kind, name }`. |
 | Peer CN / SAN extraction (mTLS) | Green | `x509-parser` parses CN + DNS SANs out of the peer cert and attaches them to `trigger.principal`. Fingerprint stays authoritative for auth; CN / SAN are advisory for routing only. See §2.7. |
+| Pluggable secret sources (`[[secrets]]`: env / file / command / oauth2) | Green | One resolution front door with env fallback; startup/SIGHUP probe fails closed; file sources live-read (rotation works); OAuth2 cached + self-refreshing (fake-endpoint tests); literal secret material in TOML is a parse error; per-request re-resolution in LLM backends. `command`/`oauth2` feature-gated. |
 | Audit-event sink (dedicated JSONL file with redaction) | Green | `[logging.audit]` renders a dedicated JSONL sink for target `agentd::audit` with field-level redaction; built-in mask list + operator extension. See §2.2. |
 | TLS hot reload | Green | `SIGHUP` rebuilds `rustls::ServerConfig` from the workflow's `[server.tls]` block (cert / key / optional client-auth CA) and swaps via `ArcSwap` without dropping in-flight sessions. See row 1.5 below + §2.4. |
 | Secret injection (env-var only) | Green | The supported path is **environment variables**, read at request time by each auth binding. `[auth.bearer.<name>].tokens_env`, `[auth.hmac.<name>].secret_env`, `--intel-http-bearer-file`, `AGENTD_INTEL_HTTP_BEARER`. Rotation is SIGHUP-free — each request re-reads `std::env::var(...)`, so the operator replaces the env var and the next request sees the new value. For non-env surfaces (TLS cert/key, JWKS) SIGHUP re-reads the file contents from disk. The harness embeds **no vendor SDKs**; any KMS / Vault / Secrets-Manager integration lives in the orchestrator (k8s `Secret` + `envFrom`, systemd `EnvironmentFile`, Vault Agent sidecar writing a `.token` file, SOPS-decrypted `.env`, AWS SSM `GetParameter` → env). Declaring a `[secrets]` block in the workflow TOML is an error — the binary rejects it at startup with a pointer to the env-var path. |

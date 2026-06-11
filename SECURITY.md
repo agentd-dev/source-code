@@ -91,14 +91,24 @@ rest of the model hangs off.
 
 ### Secrets
 
-- Secrets are referenced by **indirection only** — `api_key_env` names an
-  environment variable; the secret value never appears in the workflow
-  TOML. (Post-1.0, pluggable secret providers resolve into the same
-  indirection — see the roadmap.)
+- Secrets are referenced by **indirection only**: every
+  secret-consuming field names a secret, and the name resolves through
+  one front door — a `[[secrets]]` entry (env alias / file / command /
+  OAuth2 client-credentials) or the process environment. Secret
+  material never appears in workflow TOML; a literal `client_secret`
+  field is a **parse error**, not a lint.
+- `file` sources are read per use, so rotation is "replace the file"
+  (k8s `Secret` mounts, Vault Agent sidecars, SOPS output). `oauth2`
+  tokens cache and refresh themselves before expiry. Consumers that
+  hold clients long-term (LLM backends) re-resolve per request.
 - `Debug` impls never print key material; the audit sink redacts a
-  built-in mask list plus operator-supplied fields.
-- Mount secrets from your orchestrator (k8s `Secret`, systemd
-  `EnvironmentFile`, a Vault Agent sidecar, SOPS) — see below.
+  built-in mask list plus operator-supplied fields; resolved header
+  secrets never echo into node outputs or run records; the `read_env`
+  node deliberately cannot read registry secrets (they would land in
+  records).
+- MCP servers receive credentials via per-server `env` maps resolved
+  at spawn — set on the child only, never exported into agentd's own
+  environment.
 
 ### Prompt-injection posture
 
@@ -113,8 +123,9 @@ battery of injection attempts.
 
 `agentd` is one bounded process. These live upstream of it by design:
 
-- **Secret storage / rotation** — mount from your orchestrator; agentd
-  consumes env / files, it does not manage a secret store.
+- **Secret storage** — agentd *fetches* secrets (`[[secrets]]`: env /
+  file / command / OAuth2) but does not *store* them; the vault, KMS,
+  or secret manager of record lives upstream.
 - **Multi-tenant isolation** — run one process per tenant; agentd is
   single-tenant by shape, not a shared sandbox.
 - **Network-edge DoS** — front it with a load balancer / WAF; the

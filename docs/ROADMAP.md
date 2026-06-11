@@ -163,13 +163,13 @@ and sizing:
 - [ ] **JWKS live fetch** — the OIDC verifier fetches and caches signing
       keys from the issuer's JWKS endpoint in-process (keys are
       configured statically today), with bounded refresh + rotation.
-- [ ] **Secrets-provider integration** — pluggable secret sources beyond
-      env / file (Vault, cloud secret managers) behind a feature,
-      resolved at load time into the same `*_env`-style indirection,
-      with `oauth2-client-credentials` (fetch + cache + refresh) as the
-      first non-trivial source — hourly-expiring SaaS tokens are the
-      use-case catalog's recurring friction (GAP-ANALYSIS §6). Secrets
-      never enter the workflow TOML.
+- [x] **Secrets-provider integration** — `[[secrets]]` pluggable
+      sources (env alias / file / command / OAuth2 client-credentials)
+      resolved through one front door with env fallback, so every
+      `*_env` consumer upgraded at once; per-request re-resolution in
+      LLM backends; `{{secret:NAME}}` http_request headers + MCP child
+      env give tokens somewhere to go. Secret material in TOML is a
+      parse error. Shipped in v1.3.0 (GAP-ANALYSIS §6).
 - [x] **Array-index context paths** — `resolve_path` (and the
       json_select / template walk) index into arrays (`items.0.id`),
       not just object keys, so nodes address fan-out / parallel / map

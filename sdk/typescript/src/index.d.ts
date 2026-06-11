@@ -34,7 +34,7 @@ export const node: {
   parseJson(o: { inputFrom: string }): NodeSpec;
   jsonSelect(o: { inputFrom: string; path: string }): NodeSpec;
   templateRender(o: { template: string; inputFrom?: string }): NodeSpec;
-  httpRequest(o: { method: string; urlFrom: string; bodyFrom?: string }): NodeSpec;
+  httpRequest(o: { method: string; urlFrom: string; bodyFrom?: string; headers?: Record<string, string> }): NodeSpec;
   call(o: { workflow: string; inputFrom?: string; start?: string }): NodeSpec;
   /** Shape the HTTP reply of an http-triggered run (TwiML, Slack shapes, challenge echoes). */
   respond(o: { bodyTemplate: string; status?: number; contentType?: string; inputFrom?: string }): NodeSpec;

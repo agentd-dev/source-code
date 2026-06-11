@@ -8,7 +8,7 @@
 # and if anything drifted, have one bounded LLM step explain WHAT in
 # operator language before alerting. Quiet nights terminate silently.
 #
-#   ANTHROPIC_API_KEY=… DATABASE_URL=… SLACK_WEBHOOK_URL=… \
+#   ANTHROPIC_API_KEY=… SLACK_WEBHOOK_URL=… \
 #     agentd --config examples/use-cases/data-reconciliation.toml
 #
 # Build: --features intel-remote,tools-http-tls,trigger-cron (MCP is
@@ -23,10 +23,19 @@ provider = "anthropic"
 model = "claude-opus-4-8"
 api_key_env = "ANTHROPIC_API_KEY"
 
+# The DSN comes from a [[secrets]] source and is set on the MCP child
+# ONLY — it never enters agentd's own environment. Rotate by replacing
+# the file; the next SIGHUP respawn picks it up.
+[[secrets]]
+name = "WAREHOUSE_DSN"
+source = "file"
+path = "/run/secrets/warehouse_dsn"
+
 [[mcp_servers]]
 name = "warehouse"
 command = ["npx", "-y", "@modelcontextprotocol/server-postgres"]
 allow_tools = ["query"]
+env = { DATABASE_URL = "WAREHOUSE_DSN" }
 
 [budget]
 max_llm_tokens = 15000

@@ -87,15 +87,20 @@ impl ExecutionContext {
     /// `"trigger.resource_uri"` → the nested JSON value.
     ///
     /// The first segment is the node id (or the reserved `"trigger"`
-    /// pseudo-node). Subsequent segments walk through JSON objects.
-    /// Returns `None` if any segment is missing or a non-object is
-    /// indexed.
+    /// pseudo-node). Subsequent segments walk through JSON objects;
+    /// on an array, a segment that parses as an index steps into it
+    /// (`split.results.0.result`). Returns `None` if any segment is
+    /// missing or the cursor can't be indexed.
     pub fn resolve_path<'a>(&'a self, path: &str) -> Option<&'a Value> {
         let mut parts = path.split('.');
         let head = parts.next()?;
         let mut cursor = self.node_outputs.get(head)?;
         for segment in parts {
-            cursor = cursor.as_object()?.get(segment)?;
+            cursor = match cursor {
+                Value::Object(map) => map.get(segment)?,
+                Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
         }
         Some(cursor)
     }
@@ -269,5 +274,27 @@ mod tests {
             &RunOptions::default(),
         );
         assert_eq!(ctx.resolve_path("trigger.input"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn array_segments_index_into_arrays() {
+        let mut ctx = mk_ctx();
+        ctx.node_outputs.insert(
+            "split".into(),
+            json!({ "results": [{ "result": "de" }, { "result": "fr" }], "ok": true }),
+        );
+        assert_eq!(
+            ctx.resolve_path("split.results.0.result"),
+            Some(&json!("de"))
+        );
+        assert_eq!(
+            ctx.resolve_path("split.results.1.result"),
+            Some(&json!("fr"))
+        );
+        // Out of bounds / non-numeric segment on an array → None.
+        assert!(ctx.resolve_path("split.results.2").is_none());
+        assert!(ctx.resolve_path("split.results.first").is_none());
+        // Scalars still refuse to be indexed.
+        assert!(ctx.resolve_path("split.ok.0").is_none());
     }
 }

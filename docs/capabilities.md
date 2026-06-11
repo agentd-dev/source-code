@@ -1013,8 +1013,11 @@ See [`architecture.md`](architecture.md) §8 for the full event taxonomy.
 `ExecutionContext::resolve_path("head.segment.segment")`:
 
 1. First segment → node id (or the reserved `"trigger"` pseudo-node).
-2. Each subsequent segment → JSON object key.
-3. Any miss → the caller gets `None`.
+2. Each subsequent segment → JSON object key; on an **array**, a
+   numeric segment indexes into it (`split.results.0.result` reaches
+   the first parallel/map branch's value).
+3. Any miss — missing key, out-of-bounds or non-numeric index on an
+   array, indexing a scalar — → the caller gets `None`.
 
 Pre-populated:
 

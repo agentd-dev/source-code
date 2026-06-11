@@ -55,6 +55,7 @@ impl HandlerRegistry {
         r.register("merge", Box::new(MergeHandler));
         r.register("fail", Box::new(FailHandler));
         r.register("terminate", Box::new(TerminateHandler));
+        r.register("respond", Box::new(RespondHandler));
         r
     }
 
@@ -159,6 +160,67 @@ pub struct TerminateHandler;
 impl NodeHandler for TerminateHandler {
     fn handle(&self, _node: &Node, _ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
         Ok(NodeOutcome::Terminate { value: Value::Null })
+    }
+}
+
+/// `respond { status?, content_type?, body_template, input_from? }` →
+/// renders the declared HTTP reply and records it on the context. The
+/// HTTP trigger writes it verbatim when the run completes; non-HTTP
+/// runs carry it in the outcome/record (visible, inert). Last
+/// `respond` wins.
+pub struct RespondHandler;
+
+impl NodeHandler for RespondHandler {
+    fn handle(&self, node: &Node, ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
+        let NodeKind::Respond {
+            status,
+            content_type,
+            body_template,
+            input_from,
+        } = &node.kind
+        else {
+            return Err(wrong_kind(node, "respond"));
+        };
+        let data = match input_from {
+            Some(path) => {
+                ctx.resolve_path(path)
+                    .cloned()
+                    .ok_or_else(|| crate::error::Error::Tool {
+                        tool: "respond".into(),
+                        reason: format!(
+                            "input_from path `{path}` is not set in the execution context"
+                        ),
+                    })?
+            }
+            None => ctx.trigger.input.clone(),
+        };
+        let status = status.unwrap_or(200);
+        // The validator enforces this statically; keep the runtime
+        // check so programmatically-built workflows fail loudly too.
+        if !(100..=599).contains(&status) {
+            return Err(crate::error::Error::Tool {
+                tool: "respond".into(),
+                reason: format!("status {status} is outside 100..=599"),
+            });
+        }
+        let body = crate::engine::template::render_template(body_template, &data)?;
+        let spec = crate::engine::outcome::HttpResponseSpec {
+            status,
+            content_type: content_type
+                .clone()
+                .unwrap_or_else(|| "application/json".into()),
+            body,
+        };
+        let summary = json!({
+            "status": spec.status,
+            "content_type": spec.content_type,
+            "bytes": spec.body.len(),
+        });
+        ctx.http_response = Some(spec);
+        Ok(NodeOutcome::Continue {
+            value: summary,
+            branch: None,
+        })
     }
 }
 
@@ -364,6 +426,89 @@ mod tests {
         let h = TerminateHandler;
         let out = h.handle(&node("t", NodeKind::Terminate), &mut c).unwrap();
         assert!(matches!(out, NodeOutcome::Terminate { .. }));
+    }
+
+    #[test]
+    fn respond_records_templated_reply_on_context() {
+        let mut c = ctx();
+        c.node_outputs
+            .insert("classify".into(), json!({ "reply": "Connecting you now." }));
+        let h = RespondHandler;
+        let out = h
+            .handle(
+                &node(
+                    "answer",
+                    NodeKind::Respond {
+                        status: Some(200),
+                        content_type: Some("text/xml".into()),
+                        body_template: "<Response><Say>{{reply}}</Say></Response>".into(),
+                        input_from: Some("classify".into()),
+                    },
+                ),
+                &mut c,
+            )
+            .unwrap();
+        let spec = c.http_response.as_ref().expect("spec recorded");
+        assert_eq!(spec.status, 200);
+        assert_eq!(spec.content_type, "text/xml");
+        assert_eq!(
+            spec.body,
+            "<Response><Say>Connecting you now.</Say></Response>"
+        );
+        match out {
+            NodeOutcome::Continue { value, branch } => {
+                assert_eq!(value["status"], 200);
+                assert_eq!(value["bytes"], spec.body.len());
+                assert!(branch.is_none());
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn respond_defaults_and_trigger_input() {
+        // No input_from → templates against the trigger input; default
+        // status/content-type fill in.
+        let mut c = ctx();
+        let h = RespondHandler;
+        h.handle(
+            &node(
+                "answer",
+                NodeKind::Respond {
+                    status: None,
+                    content_type: None,
+                    body_template: r#"{"echo": {{x}}}"#.into(),
+                    input_from: None,
+                },
+            ),
+            &mut c,
+        )
+        .unwrap();
+        let spec = c.http_response.as_ref().unwrap();
+        assert_eq!(spec.status, 200);
+        assert_eq!(spec.content_type, "application/json");
+        assert_eq!(spec.body, r#"{"echo": 1}"#);
+    }
+
+    #[test]
+    fn respond_missing_input_path_errors() {
+        let mut c = ctx();
+        let h = RespondHandler;
+        let err = h
+            .handle(
+                &node(
+                    "answer",
+                    NodeKind::Respond {
+                        status: None,
+                        content_type: None,
+                        body_template: "x".into(),
+                        input_from: Some("nope.value".into()),
+                    },
+                ),
+                &mut c,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("nope.value"));
     }
 
     #[test]

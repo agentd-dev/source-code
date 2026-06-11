@@ -264,6 +264,7 @@ impl Engine {
                 ExecutionOutcome::Completed {
                     final_value: Value::Null,
                     last_node: Some(checkpoint.paused_at.clone()),
+                    http_response: None,
                 },
                 trace,
             ));
@@ -412,6 +413,7 @@ impl Engine {
                         ExecutionOutcome::Completed {
                             final_value: value,
                             last_node: Some(current_id),
+                            http_response: ctx.http_response.take(),
                         },
                         trace,
                     ));
@@ -483,6 +485,7 @@ impl Engine {
                                 ExecutionOutcome::Completed {
                                     final_value,
                                     last_node: Some(current_id),
+                                    http_response: ctx.http_response.take(),
                                 },
                                 trace,
                             ));
@@ -1101,6 +1104,47 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+    }
+
+    #[test]
+    fn respond_spec_rides_the_completed_outcome() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "answer")],
+            nodes: vec![
+                n(
+                    "answer",
+                    NodeKind::Respond {
+                        status: Some(201),
+                        content_type: Some("text/xml".into()),
+                        body_template: "<ok>{{x}}</ok>".into(),
+                        input_from: None,
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("answer", "done", None)],
+            ..Default::default()
+        };
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({"x": 7})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        match out {
+            ExecutionOutcome::Completed {
+                http_response: Some(spec),
+                ..
+            } => {
+                assert_eq!(spec.status, 201);
+                assert_eq!(spec.content_type, "text/xml");
+                assert_eq!(spec.body, "<ok>7</ok>");
+            }
+            other => panic!("expected Completed with http_response, got {other:?}"),
+        }
     }
 
     #[test]

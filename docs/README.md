@@ -29,7 +29,7 @@ final source of truth; these docs describe the code as it stands.
   modify the runtime.
 
 - **[capabilities.md](capabilities.md)** — complete node catalogue
-  (all 22 `NodeKind` variants), edge rules, start nodes, triggers,
+  (all 23 `NodeKind` variants), edge rules, start nodes, triggers,
   HTTP routes, policy grammar, auth, TLS, rate limiting, retries,
   input resolution, execution outcome + exit codes, test harness.
   Start here if you're authoring a workflow.

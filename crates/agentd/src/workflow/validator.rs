@@ -79,6 +79,7 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     check_edges(doc, &node_ids, &mut r);
     check_mcp_nodes(doc, &mut r);
     check_agent_loops(doc, &mut r);
+    check_respond_nodes(doc, &mut r);
 
     // Graph-level checks only make sense once every edge references a
     // known node. Skip them if dangling edges were detected so the
@@ -323,6 +324,36 @@ fn check_agent_loops(doc: &WorkflowDoc, r: &mut ValidationReport) {
     }
 }
 
+fn check_respond_nodes(doc: &WorkflowDoc, r: &mut ValidationReport) {
+    use crate::workflow::model::NodeKind;
+    for node in &doc.nodes {
+        let NodeKind::Respond {
+            status,
+            content_type,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        if let Some(code) = status
+            && !(100..=599).contains(code)
+        {
+            r.issues.push(ValidationIssue::new(
+                "respond_status_out_of_range",
+                format!("node `{}`: status must be 100..=599 (got {code})", node.id),
+            ));
+        }
+        if let Some(ct) = content_type
+            && ct.trim().is_empty()
+        {
+            r.issues.push(ValidationIssue::new(
+                "respond_empty_content_type",
+                format!("node `{}`: content_type must not be empty", node.id),
+            ));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Step 3: acyclicity (Kahn's algorithm)
 // ---------------------------------------------------------------------------
@@ -555,6 +586,41 @@ mod tests {
         };
         let r = validate(&unbounded);
         assert!(r.issues.iter().any(|i| i.code == "cycle"), "{:?}", r.issues);
+    }
+
+    #[test]
+    fn respond_status_range_is_validated() {
+        let mk = |status: Option<u16>, content_type: Option<&str>| WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("answer"))],
+            nodes: vec![n(
+                "answer",
+                NodeKind::Respond {
+                    status,
+                    content_type: content_type.map(Into::into),
+                    body_template: "ok".into(),
+                    input_from: None,
+                },
+            )],
+            ..Default::default()
+        };
+        assert!(validate(&mk(Some(204), Some("text/plain"))).ok());
+        let r = validate(&mk(Some(42), None));
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.code == "respond_status_out_of_range"),
+            "{:?}",
+            r.issues
+        );
+        let r = validate(&mk(None, Some("  ")));
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.code == "respond_empty_content_type"),
+            "{:?}",
+            r.issues
+        );
     }
 
     #[test]

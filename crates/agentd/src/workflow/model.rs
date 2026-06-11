@@ -535,6 +535,28 @@ pub enum NodeKind {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// Declare the HTTP reply for an http-triggered run: status,
+    /// content type, and a `{{path}}`-templated body. The reply is
+    /// written when the run completes (in place of the outcome JSON),
+    /// so callers that act on the response body — TwiML, Slack
+    /// command shapes, webhook challenge echoes — are answered
+    /// natively. On non-HTTP runs the declared reply still lands in
+    /// the outcome/record (visible, inert). Last `respond` wins.
+    Respond {
+        /// HTTP status code (100–599). Default 200.
+        #[serde(default)]
+        status: Option<u16>,
+        /// `Content-Type` header value. Default `application/json`.
+        #[serde(default)]
+        content_type: Option<String>,
+        /// Body template; `{{key}}` substitutes dotted paths into the
+        /// `input_from` value (same grammar as `template_render`).
+        body_template: String,
+        /// Context path the template renders against; defaults to the
+        /// trigger input.
+        #[serde(default)]
+        input_from: Option<String>,
+    },
     Terminate,
 }
 
@@ -564,6 +586,7 @@ impl NodeKind {
             NodeKind::Merge => "merge",
             NodeKind::Fail { .. } => "fail",
             NodeKind::PauseForApproval { .. } => "pause_for_approval",
+            NodeKind::Respond { .. } => "respond",
             NodeKind::Terminate => "terminate",
         }
     }

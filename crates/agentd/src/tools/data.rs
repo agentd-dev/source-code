@@ -66,21 +66,11 @@ impl NodeHandler for JsonSelectHandler {
     }
 }
 
-/// Walk a dotted path into a JSON value. Unlike
-/// `ExecutionContext::resolve_path`, the head is NOT a node id — the
-/// whole path is relative to `root`. Arrays accept numeric segments
-/// (`items.0.name`), mirroring `resolve_path`.
-fn walk_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut cursor = root;
-    for segment in path.split('.').filter(|s| !s.is_empty()) {
-        cursor = match cursor {
-            Value::Object(map) => map.get(segment)?,
-            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
-    }
-    Some(cursor)
-}
+// The dotted-path walk + `{{key}}` renderer live in
+// `engine::template` (always compiled) — the core `respond` node uses
+// the same machinery, and a control node can't depend on this optional
+// tool family.
+use crate::engine::template::{render_template, walk_path};
 
 /// Distinguish "path missing" from "path resolves to `null`".
 fn is_null_literal(root: &Value, path: &str) -> bool {
@@ -112,38 +102,6 @@ impl NodeHandler for TemplateRenderHandler {
             branch: None,
         })
     }
-}
-
-/// Minimal `{{key}}` substitution. `key` is a dotted path into `data`.
-/// Unknown keys render as the literal `{{key}}` marker so the author
-/// sees what went missing rather than a silent empty string.
-fn render_template(template: &str, data: &Value) -> Result<String> {
-    let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            // find matching `}}`
-            let rest = &template[i + 2..];
-            if let Some(end_rel) = rest.find("}}") {
-                let key = rest[..end_rel].trim();
-                match walk_path(data, key) {
-                    Some(Value::String(s)) => out.push_str(s),
-                    Some(v) => out.push_str(&serde_json::to_string(v).map_err(Error::Json)?),
-                    None => {
-                        out.push_str("{{");
-                        out.push_str(key);
-                        out.push_str("}}");
-                    }
-                }
-                i += 2 + end_rel + 2; // skip over `{{key}}`
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

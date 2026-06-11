@@ -1,0 +1,36 @@
+# Child workflow — German localization branch of
+# examples/use-cases/content-localization.toml. Runs as a parallel
+# branch under the parent's policy and budget envelope.
+
+name = "localize_de"
+
+[[intelligence.backends]]
+name = "translator"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "translate"
+
+[[nodes]]
+id = "translate"
+type = "llm_infer"
+backend = "translator"
+prompt = """
+Translate this marketing copy to German. Keep the tone, adapt idioms,
+keep markdown structure intact. Return only the translated markdown.
+
+{{content}}
+"""
+input_from = "trigger"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "translate"
+to = "done"

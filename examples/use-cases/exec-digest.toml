@@ -1,0 +1,154 @@
+# Use case — the daily executive digest that writes itself
+# =========================================================
+# Article: docs/use-cases/exec-digest.md
+#
+# Weekday mornings at 07:00: pull the KPI snapshot from the metrics API,
+# have one bounded LLM step turn numbers into narrative (what moved, why
+# it matters, what to watch), post it to the leadership Slack channel and
+# keep a dated copy on disk. No inbound network surface at all.
+#
+#   ANTHROPIC_API_KEY=… SLACK_WEBHOOK_URL=… METRICS_TOKEN_URL=… \
+#     agentd --config examples/use-cases/exec-digest.toml
+#
+# Build: --features intel-remote,tools-http-tls,trigger-cron
+
+name = "exec_digest"
+
+[[intelligence.backends]]
+name = "writer"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 25000
+max_run_time_secs = 120
+max_fs_write_mb = 4
+
+[policy.http]
+urls = [
+  "https://metrics.example.com/api/**",
+  "https://hooks.slack.com/services/**",
+]
+methods = ["GET", "POST"]
+
+[policy.env]
+read_keys = ["SLACK_WEBHOOK_URL"]
+
+[policy.fs]
+write = ["/var/lib/agentd/digests/**"]
+
+[[start_nodes]]
+name = "morning"
+source = "event"
+entry_node = "kpi_url"
+
+[[triggers]]
+type = "cron"
+schedule = "0 7 * * 1-5"
+start_node = "morning"
+
+# 1. Fetch the KPI snapshot.
+[[nodes]]
+id = "kpi_url"
+type = "template_render"
+template = "https://metrics.example.com/api/kpi/daily"
+
+[[nodes]]
+id = "fetch"
+type = "http_request"
+method = "GET"
+url_from = "kpi_url.rendered"
+
+[[nodes]]
+id = "kpis"
+type = "parse_json"
+input_from = "fetch.body"
+
+# 2. Numbers → narrative, one bounded step. The model sees data; the
+#    schedule, the destination, and the budget are all out of its reach.
+[[nodes]]
+id = "narrate"
+type = "llm_infer"
+backend = "writer"
+prompt = """
+Write the daily executive digest from this KPI snapshot. Three short
+sections in markdown: **What moved** (numbers + direction), **Why it
+matters** (one insight each), **Watch today** (max 3 items). Be
+specific; no filler.
+
+Snapshot:
+{{parsed}}
+"""
+input_from = "kpis"
+
+# 3. Deliver: Slack + a dated file.
+[[nodes]]
+id = "slack_url"
+type = "read_env"
+key = "SLACK_WEBHOOK_URL"
+
+[[nodes]]
+id = "post_slack"
+type = "http_request"
+method = "POST"
+url_from = "slack_url.value"
+body_from = "narrate.content"
+
+[[nodes]]
+id = "save_path"
+type = "template_render"
+template = "/var/lib/agentd/digests/digest-{{fired_at_unix_ms}}.md"
+input_from = "trigger"
+
+[[nodes]]
+id = "save"
+type = "write_file"
+path_from = "save_path.rendered"
+content_from = "narrate.content"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "metrics_down"
+type = "fail"
+reason = "metrics API unreachable — no digest this morning"
+
+[[edges]]
+from = "kpi_url"
+to = "fetch"
+
+[[edges]]
+from = "fetch"
+to = "kpis"
+
+[[edges]]
+from = "fetch"
+when = "error"
+to = "metrics_down"
+
+[[edges]]
+from = "kpis"
+to = "narrate"
+
+[[edges]]
+from = "narrate"
+to = "slack_url"
+
+[[edges]]
+from = "slack_url"
+to = "post_slack"
+
+[[edges]]
+from = "post_slack"
+to = "save_path"
+
+[[edges]]
+from = "save_path"
+to = "save"
+
+[[edges]]
+from = "save"
+to = "done"

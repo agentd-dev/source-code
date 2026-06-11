@@ -1,0 +1,141 @@
+# Use case — support ticket triage with drafted replies
+# ======================================================
+# Article: docs/use-cases/support-triage.md
+#
+# Every new helpdesk ticket gets classified (severity, topic) and a
+# reply drafted in one bounded LLM step. The workflow — not the model —
+# decides what happens next: high-confidence drafts post automatically;
+# low-confidence ones checkpoint and wait for a human (exit 7, resume by
+# run id). The confidence gate is a declared edge you can audit, tighten,
+# or widen as the agent earns trust — the autonomy dial in practice.
+#
+#   ANTHROPIC_API_KEY=… HELPDESK_TOKENS=… \
+#     agentd --config examples/use-cases/support-triage.toml \
+#            --bind 0.0.0.0:8080 --state-dir /var/lib/agentd/state
+
+name = "support_triage"
+
+[[intelligence.backends]]
+name = "triage"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 20000
+max_run_time_secs = 60
+max_memory_mb = 256
+
+[auth.bearer.helpdesk]
+tokens_env = "HELPDESK_TOKENS"   # newline-separated set; rotate by adding then removing
+
+[policy.http]
+urls = ["https://helpdesk.example.com/api/**"]
+methods = ["POST"]
+
+[logging.audit]
+target = "file:/var/log/agentd/support-audit.jsonl"
+
+[[start_nodes]]
+name = "on_ticket"
+source = "http"
+entry_node = "triage"
+
+[[http_routes]]
+method = "POST"
+path = "/helpdesk/ticket-created"
+start_node = "on_ticket"
+auth = "bearer:helpdesk"
+rate_limit = { capacity = 60, per_second = 10.0 }
+
+# 1. Classify + draft, schema-enforced. The model must also rate its own
+#    confidence — and the schema forces that to be an honest enum, not
+#    prose hedging.
+[[nodes]]
+id = "triage"
+type = "llm_infer"
+backend = "triage"
+prompt = """
+Triage this support ticket and draft a reply in our voice (concise,
+warm, no corporate filler). If you are not sure the draft fully
+resolves the ticket, set confidence to "low".
+
+Subject: {{subject}}
+Body: {{body}}
+Customer plan: {{plan}}
+
+JSON only:
+{"severity": "p1|p2|p3", "topic": "billing|bug|how-to|account|other",
+ "confidence": "high|low", "draft": "..."}
+"""
+input_from = "trigger"
+output_schema = "examples/use-cases/schemas/ticket.json"
+output_repairs = 2
+
+# 2. The gate is structural: confidence routes the graph.
+[[nodes]]
+id = "gate"
+type = "switch"
+expr = "triage.parsed.confidence"
+
+# 3a. High confidence → reply posts immediately.
+[[nodes]]
+id = "reply_url"
+type = "template_render"
+template = "https://helpdesk.example.com/api/tickets/{{ticket_id}}/replies"
+input_from = "trigger"
+
+[[nodes]]
+id = "post_reply"
+type = "http_request"
+method = "POST"
+url_from = "reply_url.rendered"
+body_from = "triage.parsed"
+
+# 3b. Low confidence → the run checkpoints and stops. A human reads the
+#     draft (agentd inspect, or the /inspect UI), edits it in the
+#     helpdesk, then resumes — or just resumes to send as-is.
+[[nodes]]
+id = "human_review"
+type = "pause_for_approval"
+reason = "Low-confidence draft — review before it reaches the customer."
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "helpdesk_down"
+type = "fail"
+reason = "helpdesk API rejected the reply"
+
+[[edges]]
+from = "triage"
+to = "gate"
+
+[[edges]]
+from = "gate"
+when = "high"
+to = "reply_url"
+
+[[edges]]
+from = "gate"
+when = "low"
+to = "human_review"
+
+[[edges]]
+from = "human_review"
+to = "reply_url"
+
+[[edges]]
+from = "reply_url"
+to = "post_reply"
+
+[[edges]]
+from = "post_reply"
+to = "done"
+
+[[edges]]
+from = "post_reply"
+when = "error"
+to = "helpdesk_down"

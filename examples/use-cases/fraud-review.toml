@@ -1,0 +1,198 @@
+# Use case — order fraud review (three-lane routing)
+# ===================================================
+# Article: docs/use-cases/fraud-review.md
+#
+# Every order webhook gets risk-scored into three lanes: low fulfills
+# immediately, medium checkpoints for the fraud queue, high goes on hold
+# with a notification. The LLM contributes a judgment; the LANES are
+# declared edges — widen or tighten them per loss data without touching
+# a line of code.
+#
+# Honest caveat baked into the article: webhook providers redeliver.
+# Until idempotency keys land (see GAP-ANALYSIS.md §5), make the
+# fulfill endpoint idempotent on order_id — at-least-once delivery is
+# yours to absorb downstream.
+#
+#   ANTHROPIC_API_KEY=… SHOP_WEBHOOK_SECRET=… \
+#     agentd --config examples/use-cases/fraud-review.toml \
+#            --bind 0.0.0.0:8080 --state-dir /var/lib/agentd/state
+
+name = "fraud_review"
+
+[[intelligence.backends]]
+name = "risk"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 12000
+max_run_time_secs = 30        # an order is waiting — fail fast
+
+[auth.hmac.shop]
+secret_env = "SHOP_WEBHOOK_SECRET"
+header = "X-Shop-Hmac-Sha256"
+prefix = ""
+
+[policy.http]
+urls = [
+  "https://shop.example.com/api/orders/**",
+  "https://hooks.slack.com/services/**",
+]
+methods = ["POST"]
+
+[policy.env]
+read_keys = ["SLACK_WEBHOOK_URL"]
+
+[logging.audit]
+target = "file:/var/log/agentd/fraud-audit.jsonl"
+
+[[start_nodes]]
+name = "on_order"
+source = "http"
+entry_node = "score"
+
+[[http_routes]]
+method = "POST"
+path = "/orders/created"
+start_node = "on_order"
+auth = "hmac:shop"
+rate_limit = { capacity = 120, per_second = 20.0 }
+
+# 1. Risk-score, schema-enforced to a hard band.
+[[nodes]]
+id = "score"
+type = "llm_infer"
+backend = "risk"
+prompt = """
+Score fraud risk for this order. Signals to weigh: mismatch between
+billing and shipping country, order value vs account age, rush
+shipping on high-value goods, disposable email domains, repeated
+failed payments.
+
+Order:
+{{order}}
+
+JSON only:
+{"band": "low|medium|high", "signals": "what drove the band, plainly"}
+"""
+input_from = "trigger"
+output_schema = "examples/use-cases/schemas/risk.json"
+output_repairs = 2
+
+[[nodes]]
+id = "lanes"
+type = "switch"
+expr = "score.parsed.band"
+
+# 2a. Low → fulfill now.
+[[nodes]]
+id = "fulfill_url"
+type = "template_render"
+template = "https://shop.example.com/api/orders/{{order.id}}/fulfill"
+input_from = "trigger"
+
+[[nodes]]
+id = "fulfill"
+type = "http_request"
+method = "POST"
+url_from = "fulfill_url.rendered"
+body_from = "score.parsed"
+
+# 2b. Medium → the fraud queue resumes (fulfill) or kills (refund) it.
+[[nodes]]
+id = "fraud_queue"
+type = "pause_for_approval"
+reason = "Medium-risk order — fraud-team review; resume to fulfill."
+
+# 2c. High → hold + alert. No automatic fulfillment path exists.
+[[nodes]]
+id = "hold_url"
+type = "template_render"
+template = "https://shop.example.com/api/orders/{{order.id}}/hold"
+input_from = "trigger"
+
+[[nodes]]
+id = "hold"
+type = "http_request"
+method = "POST"
+url_from = "hold_url.rendered"
+body_from = "score.parsed"
+
+[[nodes]]
+id = "slack_url"
+type = "read_env"
+key = "SLACK_WEBHOOK_URL"
+
+[[nodes]]
+id = "alert"
+type = "http_request"
+method = "POST"
+url_from = "slack_url.value"
+body_from = "score.parsed"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "shop_api_down"
+type = "fail"
+reason = "shop API rejected the order action"
+
+[[edges]]
+from = "score"
+to = "lanes"
+
+[[edges]]
+from = "lanes"
+when = "low"
+to = "fulfill_url"
+
+[[edges]]
+from = "lanes"
+when = "medium"
+to = "fraud_queue"
+
+[[edges]]
+from = "lanes"
+when = "high"
+to = "hold_url"
+
+[[edges]]
+from = "fraud_queue"
+to = "fulfill_url"
+
+[[edges]]
+from = "fulfill_url"
+to = "fulfill"
+
+[[edges]]
+from = "fulfill"
+to = "done"
+
+[[edges]]
+from = "fulfill"
+when = "error"
+to = "shop_api_down"
+
+[[edges]]
+from = "hold_url"
+to = "hold"
+
+[[edges]]
+from = "hold"
+to = "slack_url"
+
+[[edges]]
+from = "hold"
+when = "error"
+to = "shop_api_down"
+
+[[edges]]
+from = "slack_url"
+to = "alert"
+
+[[edges]]
+from = "alert"
+to = "done"

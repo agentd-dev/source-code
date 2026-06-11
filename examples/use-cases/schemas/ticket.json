@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "support ticket triage",
+  "type": "object",
+  "required": ["severity", "topic", "confidence", "draft"],
+  "additionalProperties": false,
+  "properties": {
+    "severity": { "type": "string", "enum": ["p1", "p2", "p3"] },
+    "topic": { "type": "string", "enum": ["billing", "bug", "how-to", "account", "other"] },
+    "confidence": { "type": "string", "enum": ["high", "low"] },
+    "draft": { "type": "string", "minLength": 1 }
+  }
+}

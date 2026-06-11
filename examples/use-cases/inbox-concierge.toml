@@ -1,0 +1,171 @@
+# Use case — shared-inbox concierge
+# ==================================
+# Article: docs/use-cases/inbox-concierge.md
+#
+# Inbound email lands as a webhook (SES / SendGrid inbound-parse relayed
+# as JSON — the multipart gap is called out in the article). One bounded
+# LLM step classifies the email and drafts a reply; routine categories
+# with high confidence auto-send, everything else checkpoints for the
+# inbox owner. Spam terminates silently — no tokens wasted arguing
+# with it.
+#
+#   ANTHROPIC_API_KEY=… MAIL_RELAY_TOKENS=… \
+#     agentd --config examples/use-cases/inbox-concierge.toml \
+#            --bind 0.0.0.0:8080 --state-dir /var/lib/agentd/state
+
+name = "inbox_concierge"
+
+[[intelligence.backends]]
+name = "concierge"
+provider = "anthropic"
+model = "claude-opus-4-8"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+max_llm_tokens = 15000
+max_run_time_secs = 45
+
+[auth.bearer.relay]
+tokens_env = "MAIL_RELAY_TOKENS"
+
+[policy.http]
+urls = ["https://api.mailprovider.example.com/v3/send/**"]
+methods = ["POST"]
+
+[logging.audit]
+target = "file:/var/log/agentd/inbox-audit.jsonl"
+
+[[start_nodes]]
+name = "on_email"
+source = "http"
+entry_node = "triage"
+
+[[http_routes]]
+method = "POST"
+path = "/email/inbound"
+start_node = "on_email"
+auth = "bearer:relay"
+rate_limit = { capacity = 60, per_second = 10.0 }
+
+# 1. Classify + draft. The enum carries the routing; the draft carries
+#    the work.
+[[nodes]]
+id = "triage"
+type = "llm_infer"
+backend = "concierge"
+prompt = """
+Triage this inbound email to our shared inbox and draft a reply in our
+voice (helpful, direct, signed "The Acme team"). Set confidence to
+"low" unless the category is unambiguous AND the draft fully answers
+the email without needing account access.
+
+From: {{from}}
+Subject: {{subject}}
+Body:
+{{text}}
+
+JSON only:
+{"category": "order-status|refund|partnership|spam|other",
+ "confidence": "high|low", "draft_reply": "..."}
+"""
+input_from = "trigger"
+output_schema = "examples/use-cases/schemas/email.json"
+output_repairs = 2
+
+[[nodes]]
+id = "by_category"
+type = "switch"
+expr = "triage.parsed.category"
+
+# Spam: terminate. Not "reply politely" — terminate.
+[[nodes]]
+id = "drop_spam"
+type = "terminate"
+
+# Everything else funnels through the confidence gate.
+[[nodes]]
+id = "gate"
+type = "switch"
+expr = "triage.parsed.confidence"
+
+[[nodes]]
+id = "send_url"
+type = "template_render"
+template = "https://api.mailprovider.example.com/v3/send/reply"
+
+[[nodes]]
+id = "send"
+type = "http_request"
+method = "POST"
+url_from = "send_url.rendered"
+body_from = "triage.parsed"
+
+[[nodes]]
+id = "owner_review"
+type = "pause_for_approval"
+reason = "Draft needs the inbox owner's eyes before it sends."
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[nodes]]
+id = "send_failed"
+type = "fail"
+reason = "mail provider rejected the reply"
+
+[[edges]]
+from = "triage"
+to = "by_category"
+
+[[edges]]
+from = "by_category"
+when = "spam"
+to = "drop_spam"
+
+[[edges]]
+from = "by_category"
+when = "order-status"
+to = "gate"
+
+[[edges]]
+from = "by_category"
+when = "refund"
+to = "gate"
+
+[[edges]]
+from = "by_category"
+when = "partnership"
+to = "gate"
+
+[[edges]]
+from = "by_category"
+when = "other"
+to = "gate"
+
+[[edges]]
+from = "gate"
+when = "high"
+to = "send_url"
+
+[[edges]]
+from = "gate"
+when = "low"
+to = "owner_review"
+
+[[edges]]
+from = "owner_review"
+to = "send_url"
+
+[[edges]]
+from = "send_url"
+to = "send"
+
+[[edges]]
+from = "send"
+to = "done"
+
+[[edges]]
+from = "send"
+when = "error"
+to = "send_failed"

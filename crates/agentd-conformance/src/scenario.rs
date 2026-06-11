@@ -36,6 +36,14 @@ pub struct Scenario {
     /// Reliability trial count (pass^k). Defaults to 1.
     #[serde(default = "default_trials")]
     pub trials: u32,
+    /// The reliability bar this scenario must clear to be trusted: the
+    /// minimum fraction of trials that must pass (`pass_rate`). A
+    /// scenario that declares one and falls below it is a gate
+    /// violation — the basis of reliability-gated autonomy. `None`
+    /// means "no declared bar" (only an explicit `--min-pass-rate`
+    /// floor applies).
+    #[serde(default)]
+    pub min_pass_rate: Option<f64>,
     /// Per-run wall-clock deadline. Defaults to 30s.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,

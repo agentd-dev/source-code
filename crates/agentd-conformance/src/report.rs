@@ -14,6 +14,15 @@ pub struct SuiteReport {
     pub scenarios: Vec<ScenarioReport>,
 }
 
+/// A scenario whose measured `pass_rate` fell below the reliability bar
+/// it was held to (its own `min_pass_rate`, or a suite-wide floor).
+#[derive(Debug, Clone)]
+pub struct ReliabilityViolation {
+    pub name: String,
+    pub pass_rate: f64,
+    pub required: f64,
+}
+
 impl SuiteReport {
     pub fn new(scenarios: Vec<ScenarioReport>) -> Self {
         Self { scenarios }
@@ -45,6 +54,30 @@ impl SuiteReport {
     /// Capability-matrix coverage across the passing scenarios.
     pub fn coverage(&self) -> Coverage {
         Coverage::compute(&self.scenarios)
+    }
+
+    /// Scenarios that fell below their reliability bar — the heart of
+    /// reliability-gated autonomy. Each scenario is held to the higher
+    /// of its own declared `min_pass_rate` and the suite-wide `floor`
+    /// (`--min-pass-rate`); a scenario with neither is not gated.
+    pub fn reliability_violations(&self, floor: Option<f64>) -> Vec<ReliabilityViolation> {
+        self.scenarios
+            .iter()
+            .filter_map(|s| {
+                let required = match (floor, s.min_pass_rate) {
+                    (Some(f), Some(m)) => f.max(m),
+                    (Some(f), None) => f,
+                    (None, Some(m)) => m,
+                    (None, None) => return None,
+                };
+                let rate = s.pass_rate();
+                (rate + 1e-9 < required).then(|| ReliabilityViolation {
+                    name: s.name.clone(),
+                    pass_rate: rate,
+                    required,
+                })
+            })
+            .collect()
     }
 
     /// Passing trials summed across the suite.
@@ -155,6 +188,8 @@ impl SuiteReport {
                     "trials": r.trials,
                     "passed_trials": r.passed_trials,
                     "pass_k": r.pass_k(),
+                    "pass_rate": r.pass_rate(),
+                    "min_pass_rate": r.min_pass_rate,
                     "passed": r.passed(),
                     "cost": {
                         "llm_calls": r.cost.llm_calls,
@@ -204,6 +239,7 @@ mod tests {
             capabilities: vec!["terminate".into()],
             trials,
             passed_trials,
+            min_pass_rate: None,
             failures: if passed_trials == trials {
                 vec![]
             } else {

@@ -31,6 +31,8 @@ pub struct ScenarioReport {
     pub capabilities: Vec<String>,
     pub trials: u32,
     pub passed_trials: u32,
+    /// The reliability bar this scenario declared, if any (min pass_rate).
+    pub min_pass_rate: Option<f64>,
     /// One line per failed assertion, prefixed with its trial index.
     pub failures: Vec<String>,
     /// Representative per-run cost (trial 0).
@@ -46,15 +48,39 @@ pub struct ScenarioReport {
 }
 
 impl ScenarioReport {
-    /// A scenario passes iff it built and *every* trial passed
-    /// (tau-bench per-scenario pass^k semantics).
+    /// Whether the scenario met its contract. With a declared
+    /// `min_pass_rate`, the contract is "≥ that fraction of trials
+    /// passed" (tolerated flakiness); without one it is the strict
+    /// "every trial passed". A load error always fails.
     pub fn passed(&self) -> bool {
-        self.load_error.is_none() && self.trials > 0 && self.passed_trials == self.trials
+        if self.load_error.is_some() || self.trials == 0 {
+            return false;
+        }
+        match self.min_pass_rate {
+            Some(floor) => self.pass_rate() + 1e-9 >= floor,
+            None => self.passed_trials == self.trials,
+        }
     }
 
-    /// pass^k for this scenario: 1.0 iff all k trials passed, else 0.0.
+    /// pass^k for this scenario: the strict tau-bench metric — 1.0 iff
+    /// *every* trial passed, else 0.0 — regardless of any tolerated
+    /// `min_pass_rate`. Always the honest reliability number.
     pub fn pass_k(&self) -> f64 {
-        if self.passed() { 1.0 } else { 0.0 }
+        if self.load_error.is_none() && self.trials > 0 && self.passed_trials == self.trials {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// The fraction of trials that passed — a *continuous* reliability
+    /// score (unlike all-or-nothing pass^k), used by the reliability
+    /// gate. A scenario that failed to load scores 0.
+    pub fn pass_rate(&self) -> f64 {
+        if self.load_error.is_some() || self.trials == 0 {
+            return 0.0;
+        }
+        self.passed_trials as f64 / self.trials as f64
     }
 
     /// Tokens spent per *passing* trial — the reliability-adjusted cost
@@ -83,6 +109,7 @@ pub fn run_scenario(scenario: &Scenario) -> ScenarioReport {
         capabilities: scenario.capabilities.clone(),
         trials: scenario.trials.max(1),
         passed_trials: 0,
+        min_pass_rate: scenario.min_pass_rate,
         failures: Vec::new(),
         cost: Cost::default(),
         total_cost: Cost::default(),
@@ -152,6 +179,7 @@ pub fn run_scenario_file(path: &Path) -> ScenarioReport {
             capabilities: Vec::new(),
             trials: 0,
             passed_trials: 0,
+            min_pass_rate: None,
             failures: Vec::new(),
             cost: Cost::default(),
             total_cost: Cost::default(),

@@ -174,6 +174,7 @@ mod tests {
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
             trials: 1,
             passed_trials: if passed { 1 } else { 0 },
+            min_pass_rate: None,
             failures: vec![],
             cost: Cost::default(),
             total_cost: Cost::default(),

@@ -51,8 +51,8 @@ curl -fsSL https://agentd.dev/install.sh | sh
 **Straight from a GitHub release** (static musl build shown — runs on any Linux):
 
 ```bash
-curl -fsSLO https://github.com/agentd-dev/source-code/releases/latest/download/agentd-v1.0.0-x86_64-unknown-linux-musl.tar.gz
-tar -xzf agentd-v1.0.0-x86_64-unknown-linux-musl.tar.gz
+curl -fsSLO https://github.com/agentd-dev/source-code/releases/latest/download/agentd-v1.2.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf agentd-v1.2.0-x86_64-unknown-linux-musl.tar.gz
 sudo install -m 0755 agentd /usr/local/bin/agentd
 ```
 

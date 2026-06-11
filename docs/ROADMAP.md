@@ -119,14 +119,13 @@ composes daemons rather than complicating one:
 
 ### Exactly-once & idempotency
 
-- [ ] **Idempotency keys** — a per-route key (`idempotency_key =
-      "trigger.order.id"` or a body hash) dedupes retried webhook
+- [x] **Idempotency keys** — a per-route key (`idempotency_key =
+      "trigger.order.id"` or `"body_sha256"`) dedupes retried webhook
       deliveries to exactly-once *effect*: seen key → replay the
-      recorded outcome, don't re-execute. Persisted in the run-state
-      store (`--state-dir`); single-node first, pairs with the
-      queue-backed trigger above for fleets. Promoted by the
-      fraud-review use case
-      (docs/use-cases/GAP-ANALYSIS.md §5).
+      recorded response, don't re-execute. Persisted under
+      `--state-dir`; failures stay retryable; concurrent duplicates get
+      409. Shipped in v1.2.0 (single-node) — the queue-backed fleet
+      variant above still composes on top.
 
 ### Demanded by the use-case catalog (gap analysis)
 
@@ -136,21 +135,22 @@ produced, in recommended order — see
 [docs/use-cases/GAP-ANALYSIS.md](use-cases/GAP-ANALYSIS.md) for designs
 and sizing:
 
-- [ ] **`respond` node** — let an http-triggered workflow shape its own
-      HTTP reply (status / content-type / templated body) so callers
-      that act on the response — Twilio TwiML, Slack slash commands,
-      webhook challenge echoes — are answered natively (§2).
-- [ ] **`map` node + array-index context paths** — run one sub-workflow
-      per element of a context-resolved array, bounded by a mandatory
-      `max_items` + concurrency cap, joining like `parallel`. "For each
-      X, do the bounded thing" is half of business automation (§3).
-- [ ] **Form-encoded / multipart webhook bodies** — content-type-aware
+- [x] **`respond` node** — an http-triggered workflow shapes its own
+      HTTP reply (status / content-type / templated body); Twilio
+      TwiML, Slack slash commands, and challenge echoes are answered
+      natively (§2). Shipped in v1.2.0.
+- [x] **`map` node + array-index context paths** — one sub-workflow per
+      element of a context-resolved array, bounded by a mandatory
+      `max_items` + concurrency cap, joining like `parallel` (§3).
+      Shipped in v1.2.0.
+- [x] **Form-encoded / multipart webhook bodies** — content-type-aware
       trigger parsing (urlencoded → flat JSON; multipart fields, with
-      attachments dropped + audited in v1) so Twilio / inbound-email
-      callers don't need a JSON relay (§4).
-- [ ] **HTTP basic auth scheme** — RFC 7617, constant-time, same
-      `tokens_env` plumbing as bearer; removes the last auth friction
-      for telephony-style webhook callers (§9).
+      attachments dropped + audited) so Twilio / inbound-email callers
+      don't need a JSON relay (§4). Shipped in v1.2.0.
+- [x] **HTTP basic auth scheme** — RFC 7617, constant-time, hand-rolled
+      strict base64 (the default `auth` build stays dependency-free);
+      removes the last auth friction for telephony-style webhook
+      callers (§9). Shipped in v1.2.0.
 
 ### Substrate hardening (smaller, scoped)
 

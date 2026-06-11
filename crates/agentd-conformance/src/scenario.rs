@@ -117,9 +117,26 @@ impl Scenario {
     /// Resolve the workflow source into a validated-shape document.
     /// (Structural validation happens in the harness so a malformed
     /// workflow is a scenario failure, not a panic.)
+    ///
+    /// Inline workflows may reference sibling fixture files via the
+    /// `${SCENARIO_DIR}` placeholder — substituted with the scenario
+    /// file's directory as an absolute, forward-slashed path, so a
+    /// scenario resolves identically from any working directory (the
+    /// CLI runs from the repo root; `cargo test` runs from the crate).
     pub fn workflow_doc(&self) -> Result<WorkflowDoc, String> {
         let toml_src = match (&self.workflow.inline, &self.workflow.path) {
-            (Some(inline), _) => inline.clone(),
+            (Some(inline), _) => match &self.base_dir {
+                Some(dir) => {
+                    let canonical = dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| dir.clone())
+                        .display()
+                        .to_string()
+                        .replace('\\', "/");
+                    inline.replace("${SCENARIO_DIR}", &canonical)
+                }
+                None => inline.clone(),
+            },
             (None, Some(rel)) => {
                 let p = match &self.base_dir {
                     Some(dir) => dir.join(rel),

@@ -4,7 +4,7 @@
 pre-production-ready-with-caveats, and what's still aspirational. Read
 before deploying.
 
-**Date:** as of **v1.0.0** (2026-06-11); kept current with the release
+**Date:** as of **v1.2.0** (2026-06-11); kept current with the release
 tags. Reassess quarterly or after any RFC-scale change.
 
 **Scope:** `crates/agentd/` only.
@@ -73,6 +73,8 @@ surface is trimmed — see §1.5).
 | mTLS (required mode) | Green | rustls 0.23 + aws-lc-rs; peer cert fingerprint exposed as principal. |
 | TLS termination | Green | PEM loader handles chain + PKCS1/8/SEC1 keys; startup fails loudly on bad cert paths. |
 | Rate limit (per-route token bucket) | Green | Validated at spawn; counter drift under contention is acceptable. |
+| Per-route idempotency keys | Green | `idempotency_key` replays the recorded response on redelivery (TTL'd, under `--state-dir`); failures stay retryable; concurrent duplicates 409; keyed route without a state dir fails the bind. End-to-end replay test through a real server. |
+| Webhook body parsing (JSON / urlencoded / multipart fields) | Green | Content-type-aware; strict decoding fails 400; multipart file parts dropped with an audit note (by design — documents parse upstream or via MCP). |
 | `llm_infer` output schema validation | Green (with `schema`) | With the `schema` feature, an `output_schema` that names a file is validated against that JSON Schema, with bounded `output_repairs` re-prompts on failure. Without the feature, `output_schema` enforces valid-JSON only. |
 | Graceful drain on SIGTERM/SIGINT | Green | In-flight counter + bounded timeout; exits `0` on clean drain, `5` on timeout. |
 | HTTP/1.1 keep-alive | Green | Up to 100 requests per connection; idle-timeout = socket read_timeout (30s). Client opts out per-request via `Connection: close`. |

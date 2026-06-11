@@ -14,6 +14,64 @@ version bump.
 
 _Nothing yet. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next._
 
+## [1.2.0] — 2026-06-11
+
+The wave the [use-case gap analysis](docs/use-cases/GAP-ANALYSIS.md)
+asked for, shipped in its recommended order: voice-native first, then
+`map`, then hardening. Five of the catalog's nine named gaps close
+(§2 §3 §4 §5 §9); the voice receptionist runs **end to end with no
+bridge service** as the proof.
+
+### Added
+
+- **`respond` node** — an http-triggered workflow declares its own
+  HTTP reply: status, content type, and a `{{path}}`-templated body.
+  TwiML, Slack command shapes, and webhook challenge echoes are
+  answered natively. The reply is written at run completion;
+  `Failed`/`TimedOut`/`Paused` runs ignore it (a failure can't
+  masquerade as a clean answer). Replies ride
+  `ExecutionOutcome::Completed.http_response` and run records, so
+  `agentd inspect` shows exactly what the caller was told.
+- **`map` node** — bounded fan-out over *data*: one sub-workflow per
+  element of a context-resolved array, in waves of `max_concurrent`
+  (default 4), joining `{results, ok}` in input order with `parallel`'s
+  failure contract. `max_items` is **mandatory**, and an oversized
+  list is a hard error — never a silent truncation.
+- **Array-index context paths** — `resolve_path` and the
+  json_select/template walk index into arrays (`split.results.0.result`).
+- **Content-type-aware webhook bodies** — `application/x-www-form-urlencoded`
+  (strict percent-decoding) and `multipart/form-data` (text fields;
+  file parts dropped with an audit note) parse into the trigger
+  payload. Unknown types keep the legacy JSON contract exactly.
+- **HTTP basic auth** (`[auth.basic.<name>]`, `auth = "basic:<name>"`) —
+  RFC 7617 with a strict hand-rolled base64 decoder (the default
+  `auth` build stays dependency-free) and constant-time compare;
+  principal carries the user.
+- **Per-route idempotency keys** — `idempotency_key =
+  "trigger.order.id"` (or `"body_sha256"`) + optional
+  `idempotency_ttl_secs`. Redeliveries replay the recorded response
+  (`X-Agentd-Idempotent-Replay: true`); concurrent duplicates get 409;
+  failures stay retryable; a keyed route without `--state-dir` fails
+  the bind. Exactly-once *effect* at the route boundary.
+- TypeScript SDK: `respond` and `map` builders.
+
+### Fixed
+
+- `template_render` (and everything sharing the renderer) no longer
+  mangles multi-byte UTF-8 in literal template text — the renderer
+  copies string slices instead of bytes-as-chars. (The renderer moved
+  to an always-compiled engine module so the core `respond` node and
+  the `tools-data` family share one implementation.)
+
+### Changed
+
+- The voice-receptionist use case (sample + article) is rewritten
+  fully native: form-encoded Twilio events in, basic auth on the
+  route, TwiML out via `respond` — the bridge service is deleted.
+  The fraud-review sample declares an idempotency key.
+- Conformance: `respond` and `map` join the capability matrix with
+  corpus scenarios (15/15 pass).
+
 ## [1.1.0] — 2026-06-11
 
 ### Added
@@ -132,6 +190,7 @@ signing, and the observability spine (spans, Prometheus `/metrics`,
 `/healthz`, audit JSONL, OTLP, traceparent). See the git history and the
 RFCs under [`rfcs/`](rfcs/) for the design record.
 
-[Unreleased]: https://github.com/agentd-dev/source-code/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/agentd-dev/source-code/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/agentd-dev/source-code/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/agentd-dev/source-code/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/agentd-dev/source-code/compare/v0.8.0...v1.0.0

@@ -159,6 +159,29 @@ const wf = workflow("classifier")
 console.log(wf.toToml());   // → agentd --config - --validate-only
 ```
 
+## 9 · Reference deployments
+
+Two production-shaped agents in [`examples/reference/`](../examples/reference/) —
+the dogfood, with auth, budgets, fail-closed policy, an audit sink, and
+durable HITL. Each has its own walkthrough in
+[`examples/reference/README.md`](../examples/reference/README.md).
+
+```bash
+# Webhook triage: HMAC-verified GitHub issue → classify → pause for a
+# human on high severity, file the rest automatically.
+agentd --config examples/reference/issue-triage.toml --validate-only
+
+# Scheduled digest: every 24h, read the day's events → summarize →
+# write a markdown report. No inbound network surface.
+agentd --config examples/reference/digest-report.toml --validate-only
+```
+
+Both validate on the default build; running them needs the capabilities
+they use (`intel-remote` for a hosted model, `schema` for output
+enforcement, `trigger-cron` for the interval). Deploy them behind the
+hardened systemd unit or the distroless image — see
+[operations.md](operations.md).
+
 ---
 
 **The through-line:** a frozen, validated graph is the unit of

@@ -257,6 +257,28 @@ workflow name). A `pause_for_approval` node without a `--state-dir` is a
 configuration error — there is nowhere to persist the run. Run ids are
 unique across processes, so concurrent paused runs never collide.
 
+**Crash-recovery (`--checkpoint-each-node`).** The pauses above are
+*declared*. For unattended durability, `--checkpoint-each-node` (with
+`--state-dir`) writes a progress checkpoint after *every* node, recording
+the accumulated outputs and the next node to run. A clean terminal
+(completed / declared-failed) retires the checkpoint; a timeout, an
+errored abort, or a crash leaves it, so the run is recoverable:
+
+```bash
+agentd --config wf.toml --state-dir /var/lib/agentd/state --checkpoint-each-node --input ev.json
+# … process is killed mid-run …
+agentd --state-dir /var/lib/agentd/state --list-checkpoints
+#   exec-…  recoverable  workflow=wf  resume_node=enrich
+agentd --config wf.toml --state-dir /var/lib/agentd/state --resume-incomplete
+#   resumes every recoverable run for this workflow from its last node
+```
+
+Recovery is **at-least-once** for the interrupted node: a crash *during*
+a side-effecting node (before its checkpoint) re-runs that node on
+resume, repeating its side effect. Design nodes whose retry is safe, or
+put an idempotency key in the work. Checkpointing after every node is an
+I/O cost paid only by runs that opt in.
+
 Checkpoints contain node outputs verbatim: a state directory deserves
 the same protection as the data the workflow handles. Exit code 7 lets a
 supervisor (systemd, a queue worker) distinguish "awaiting approval"

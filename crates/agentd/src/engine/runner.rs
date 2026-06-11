@@ -65,6 +65,11 @@ pub struct Engine {
     /// `resume` reads them. `None` → a `pause_for_approval` node is a
     /// configuration error (no place to persist the run).
     pub state_dir: Option<std::path::PathBuf>,
+    /// When `true` (and a `state_dir` is set), the engine writes a
+    /// progress checkpoint after every node so a crashed run can be
+    /// `--resume`d from its last completed node. Off by default — it is
+    /// an I/O cost paid only by runs that need durability.
+    pub checkpoint_each_node: bool,
 }
 
 /// Handles for components the runtime can hot-swap on SIGHUP. Each
@@ -110,6 +115,7 @@ impl Engine {
             metrics: Metrics::new(),
             reload: ReloadHandles::default(),
             state_dir: None,
+            checkpoint_each_node: false,
         }
     }
 
@@ -122,6 +128,7 @@ impl Engine {
             metrics,
             reload: ReloadHandles::default(),
             state_dir: None,
+            checkpoint_each_node: false,
         }
     }
 
@@ -129,6 +136,12 @@ impl Engine {
     /// written and `resume` reads them.
     pub fn with_state_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
         self.state_dir = dir;
+        self
+    }
+
+    /// Enable per-node progress checkpointing for crash-recovery.
+    pub fn with_checkpoint_each_node(mut self, on: bool) -> Self {
+        self.checkpoint_each_node = on;
         self
     }
 
@@ -387,6 +400,7 @@ impl Engine {
                         elapsed_ms: latency_ms,
                     });
                     ctx.node_outputs.insert(current_id.clone(), value.clone());
+                    self.discard_progress(&ctx.execution_id);
                     self.metrics.inc_workflow_completed();
                     info!(
                         target: "agentd::audit",
@@ -411,6 +425,7 @@ impl Engine {
                         output: Value::Null,
                         elapsed_ms: latency_ms,
                     });
+                    self.discard_progress(&ctx.execution_id);
                     self.metrics.inc_workflow_failed();
                     warn!(
                         target: "agentd::audit",
@@ -443,7 +458,11 @@ impl Engine {
                     let next_id =
                         pick_next(workflow, &current_id, branch.as_deref(), &mut loop_counts)?;
                     match next_id {
-                        Some(id) => current_id = id,
+                        Some(id) => {
+                            // Snapshot progress: this node done, `id` next.
+                            self.write_progress(&ctx, &current_id, &id);
+                            current_id = id;
+                        }
                         None => {
                             // Dead-end — treat as completion carrying the last value.
                             let final_value = ctx
@@ -451,6 +470,7 @@ impl Engine {
                                 .get(&current_id)
                                 .cloned()
                                 .unwrap_or(Value::Null);
+                            self.discard_progress(&ctx.execution_id);
                             self.metrics.inc_workflow_completed();
                             info!(
                                 target: "agentd::audit",
@@ -520,6 +540,7 @@ impl Engine {
             paused_at: node_id.to_string(),
             resume_node,
             reason: reason.clone(),
+            awaiting_approval: true,
         };
         let path = checkpoint.save(&dir).map_err(|e| Error::Workflow {
             workflow: workflow.name.clone(),
@@ -545,6 +566,42 @@ impl Engine {
             last_node: Some(node_id.to_string()),
             reason,
         })
+    }
+
+    /// Write a per-node progress checkpoint (crash-recovery), recording
+    /// the just-completed node and the next one to run. Best-effort: a
+    /// failed write must never abort the run. No-op unless
+    /// `checkpoint_each_node` and a `state_dir` are set.
+    fn write_progress(&self, ctx: &ExecutionContext, last_node: &str, next_node: &str) {
+        if !self.checkpoint_each_node {
+            return;
+        }
+        let Some(dir) = &self.state_dir else {
+            return;
+        };
+        let cp = crate::engine::checkpoint::Checkpoint {
+            run_id: ctx.execution_id.clone(),
+            workflow: ctx.workflow_id.clone(),
+            start_node: ctx.start_node.clone(),
+            trigger_kind: ctx.trigger.kind,
+            trigger_input: ctx.trigger.input.clone(),
+            node_outputs: ctx.node_outputs.clone(),
+            paused_at: last_node.to_string(),
+            resume_node: Some(next_node.to_string()),
+            reason: None,
+            awaiting_approval: false,
+        };
+        let _ = cp.save(dir);
+    }
+
+    /// Retire a progress checkpoint once the run reaches a clean
+    /// terminal (Completed / Failed) — nothing left to recover.
+    fn discard_progress(&self, run_id: &str) {
+        if self.checkpoint_each_node {
+            if let Some(dir) = &self.state_dir {
+                crate::engine::checkpoint::Checkpoint::discard(dir, run_id);
+            }
+        }
     }
 
     /// Run a `call` node's child workflow as a sub-DAG on this engine
@@ -1096,6 +1153,102 @@ mod tests {
         assert_eq!(trace2.node_ids(), vec!["done"]);
         // The checkpoint retires once the resumed run reaches a terminal.
         assert!(crate::engine::checkpoint::Checkpoint::load(dir.path(), &run_id).is_err());
+    }
+
+    /// A handler that errors the first time it runs, then succeeds —
+    /// stands in for a transient crash mid-run.
+    struct FailOnce(std::sync::atomic::AtomicBool);
+    impl NodeHandler for FailOnce {
+        fn handle(&self, _node: &Node, _ctx: &mut ExecutionContext) -> Result<NodeOutcome> {
+            if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Err(Error::Tool {
+                    tool: "flaky".into(),
+                    reason: "transient".into(),
+                })
+            } else {
+                Ok(NodeOutcome::ok_null())
+            }
+        }
+    }
+
+    #[test]
+    fn progress_checkpoint_recovers_a_crashed_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wf = WorkflowDoc {
+            name: "recover".into(),
+            start_nodes: vec![start("main", "pre")],
+            nodes: vec![
+                n(
+                    "pre",
+                    NodeKind::Condition {
+                        expr: "trigger.go".into(),
+                    },
+                ),
+                n("flaky", NodeKind::Merge),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("pre", "flaky", Some("true")), e("flaky", "done", None)],
+            ..Default::default()
+        };
+        // Override `merge` with the fail-once handler so `flaky` crashes
+        // the first time it runs.
+        let mut r = HandlerRegistry::with_builtin_controls();
+        r.register(
+            "merge",
+            Box::new(FailOnce(std::sync::atomic::AtomicBool::new(false))),
+        );
+        r.set_fallback(Box::new(StubHandler));
+        let engine = Engine::new(r)
+            .with_state_dir(Some(dir.path().to_path_buf()))
+            .with_checkpoint_each_node(true);
+
+        // Run 1: `pre` completes (snapshots → flaky), then `flaky` crashes.
+        let err = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({ "go": true })),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("transient"));
+        // A recoverable progress checkpoint remains at the failed node.
+        let cps = crate::engine::checkpoint::Checkpoint::list(dir.path());
+        assert_eq!(cps.len(), 1);
+        assert!(!cps[0].awaiting_approval);
+        assert_eq!(cps[0].resume_node.as_deref(), Some("flaky"));
+
+        // Resume: `flaky` now succeeds → run completes; checkpoint retired.
+        let (out, _trace) = engine
+            .resume(&wf, cps.into_iter().next().unwrap(), RunOptions::default())
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        assert!(crate::engine::checkpoint::Checkpoint::list(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn clean_run_leaves_no_progress_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wf = WorkflowDoc {
+            name: "clean".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![n("a", NodeKind::Merge), n("b", NodeKind::Terminate)],
+            edges: vec![e("a", "b", None)],
+            ..Default::default()
+        };
+        let engine = engine_with_stub()
+            .with_state_dir(Some(dir.path().to_path_buf()))
+            .with_checkpoint_each_node(true);
+        let out = engine
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        assert!(crate::engine::checkpoint::Checkpoint::list(dir.path()).is_empty());
     }
 
     #[test]

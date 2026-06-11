@@ -75,6 +75,12 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         }
     };
 
+    // `--list-checkpoints`: report resumable runs and exit (no workflow
+    // needed).
+    if args.list_checkpoints {
+        return run_list_checkpoints(&args);
+    }
+
     // Mode 3 (RFC 0006 §3): the agent compiles its own workflow from a
     // natural-language instruction, then runs it. Resolved before the
     // declared-workflow path below — here `--config` is the *base
@@ -178,6 +184,9 @@ pub fn run(argv: Vec<String>) -> ExitCode {
     if args.resume.is_some() {
         return run_resume_mode(doc, engine, options, &args);
     }
+    if args.resume_incomplete {
+        return run_resume_incomplete_mode(doc, engine, options, &args);
+    }
 
     match resolve_mode(&doc, args.mode.as_deref()) {
         Mode::Serve => run_serve_mode(doc, engine, options, &args),
@@ -249,6 +258,16 @@ struct Args {
     /// `--resume RUN_ID` — continue a paused run from its checkpoint in
     /// `--state-dir`, instead of starting fresh.
     resume: Option<String>,
+    /// `--checkpoint-each-node` / `AGENTD_CHECKPOINT_EACH_NODE` — write a
+    /// progress checkpoint after every node so a crashed run can be
+    /// `--resume`d from its last completed node (needs `--state-dir`).
+    checkpoint_each_node: bool,
+    /// `--resume-incomplete` — resume every recoverable (non-pause)
+    /// checkpoint in `--state-dir` for the loaded workflow, then exit.
+    resume_incomplete: bool,
+    /// `--list-checkpoints` — print the resumable runs in `--state-dir`
+    /// and exit (no workflow needed).
+    list_checkpoints: bool,
 }
 
 /// CLI / env overrides for logging. `None` means "defer to workflow
@@ -310,6 +329,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         resume: std::env::var("AGENTD_RESUME")
             .ok()
             .filter(|s| !s.trim().is_empty()),
+        checkpoint_each_node: env_bool("AGENTD_CHECKPOINT_EACH_NODE"),
+        resume_incomplete: false,
+        list_checkpoints: false,
     };
     let mut t = TracingOverrides {
         level: std::env::var("AGENTD_LOG")
@@ -427,6 +449,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
             "--resume" => {
                 a.resume = Some(require_value(argv, &mut i, arg)?.to_string());
             }
+            "--checkpoint-each-node" => a.checkpoint_each_node = true,
+            "--resume-incomplete" => a.resume_incomplete = true,
+            "--list-checkpoints" => a.list_checkpoints = true,
             "--log-level" => {
                 t.level = Some(require_value(argv, &mut i, arg)?.to_string());
             }
@@ -823,6 +848,7 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
     registry.set_fallback(Box::new(StubHandler));
     Ok(Engine::with_metrics(registry, metrics)
         .with_state_dir(args.state_dir.clone())
+        .with_checkpoint_each_node(args.checkpoint_each_node)
         .with_reload_handles(crate::engine::ReloadHandles {
             policy: Some(reloadable_policy),
             intel: intel_reload,
@@ -1065,6 +1091,82 @@ fn run_resume_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: 
     let result = engine.resume(&doc, checkpoint, options);
     let wall_ms = started.elapsed().as_millis() as u64;
     emit_run_result(&doc.name, &start, &engine, result, wall_ms, args)
+}
+
+/// `--list-checkpoints`: print the resumable runs in `--state-dir`.
+fn run_list_checkpoints(args: &Args) -> ExitCode {
+    let Some(dir) = &args.state_dir else {
+        eprintln!("agentd: --list-checkpoints needs --state-dir");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let cps = crate::engine::Checkpoint::list(dir);
+    if cps.is_empty() {
+        println!("no checkpoints in {}", dir.display());
+        return ExitCode::from(EXIT_OK);
+    }
+    for cp in &cps {
+        let kind = if cp.awaiting_approval {
+            "paused     "
+        } else {
+            "recoverable"
+        };
+        println!(
+            "{}  {kind}  workflow={}  resume_node={}",
+            cp.run_id,
+            cp.workflow,
+            cp.resume_node.as_deref().unwrap_or("-"),
+        );
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+/// `--resume-incomplete`: resume every recoverable (non-pause)
+/// checkpoint in `--state-dir` for the loaded workflow, then exit.
+fn run_resume_incomplete_mode(
+    doc: WorkflowDoc,
+    engine: Engine,
+    options: RunOptions,
+    args: &Args,
+) -> ExitCode {
+    let Some(dir) = &args.state_dir else {
+        eprintln!("agentd: --resume-incomplete needs --state-dir");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let recoverable: Vec<_> = crate::engine::Checkpoint::list(dir)
+        .into_iter()
+        .filter(|c| !c.awaiting_approval && c.workflow == doc.name)
+        .collect();
+    if recoverable.is_empty() {
+        eprintln!(
+            "agentd: no recoverable runs for workflow `{}` in {}",
+            doc.name,
+            dir.display()
+        );
+        return ExitCode::from(EXIT_OK);
+    }
+    let mut worst = EXIT_OK;
+    for cp in recoverable {
+        let run_id = cp.run_id.clone();
+        eprintln!("agentd: resuming {run_id} …");
+        match engine.resume(&doc, cp, options.clone()) {
+            Ok((outcome, _)) => {
+                println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+                let code = match &outcome {
+                    ExecutionOutcome::Completed { .. } => EXIT_OK,
+                    ExecutionOutcome::Paused { .. } => EXIT_PAUSED,
+                    _ => EXIT_SEMANTIC,
+                };
+                if code != EXIT_OK {
+                    worst = code;
+                }
+            }
+            Err(e) => {
+                eprintln!("agentd: resume {run_id}: {e}");
+                worst = EXIT_SEMANTIC;
+            }
+        }
+    }
+    ExitCode::from(worst)
 }
 
 /// Shared tail for a one-shot or resumed run: write the optional run
@@ -2249,8 +2351,11 @@ usage:
         [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
         [--dry-run]                AGENTD_DRY_RUN=1
         [--record PATH]            AGENTD_RECORD          write a run record; inspect with `agentd inspect PATH`
-        [--state-dir DIR]          AGENTD_STATE_DIR       where pause_for_approval checkpoints live
-        [--resume RUN_ID]          AGENTD_RESUME          continue a paused run from its checkpoint
+        [--state-dir DIR]          AGENTD_STATE_DIR       where pause / progress checkpoints live
+        [--resume RUN_ID]          AGENTD_RESUME          continue a paused or crashed run from its checkpoint
+        [--checkpoint-each-node]   AGENTD_CHECKPOINT_EACH_NODE=1  snapshot after every node (crash-recovery)
+        [--resume-incomplete]                            resume every recoverable run in --state-dir, then exit
+        [--list-checkpoints]                             list resumable runs in --state-dir and exit
         [--validate-only]          AGENTD_VALIDATE_ONLY=1
         [--log-level LEVEL]        AGENTD_LOG             (default warn)
         [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)

@@ -59,6 +59,11 @@ static MATRIX: &[Capability] = &[
     // Network / exec / MCP.
     c("http_request", "net", "outbound HTTP (policy-gated)"),
     c("shell_run", "exec", "allowlisted command (policy-gated)"),
+    c(
+        "call",
+        "composition",
+        "invoke another workflow as a sub-DAG",
+    ),
     c("call_mcp_tool", "mcp", "invoke an MCP tool"),
     c("read_mcp_resource", "mcp", "read an MCP resource"),
     // Intelligence.

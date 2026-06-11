@@ -29,6 +29,10 @@ use crate::workflow::{Edge, WorkflowDoc};
 /// is already validator-checked; this is pure belt-and-suspenders.)
 const MAX_STEPS: usize = 10_000;
 
+/// How deep `call` nodes may nest before the engine refuses — a
+/// belt-and-suspenders bound against mutually-recursive workflows.
+const MAX_CALL_DEPTH: u32 = 8;
+
 /// Monotonically-incrementing execution id counter. Scoped to the
 /// process; each engine instance shares it via a process-wide atomic.
 static EXEC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -200,7 +204,7 @@ impl Engine {
 
         // 3) Walk the DAG. Extracted into `walk_loop` so `resume` can
         // re-enter the same traversal at a checkpoint.
-        self.walk_loop(workflow, ctx, entry_id.to_string(), trace)
+        self.walk_loop(workflow, ctx, entry_id.to_string(), trace, 0)
     }
 
     /// Resume a paused run: rebuild the context from its checkpoint and
@@ -260,7 +264,7 @@ impl Engine {
         // Restore the accumulated node outputs from before the pause.
         ctx.node_outputs = checkpoint.node_outputs.clone();
 
-        let result = self.walk_loop(workflow, ctx, resume_node, trace);
+        let result = self.walk_loop(workflow, ctx, resume_node, trace, 0);
         if let (Some(dir), Ok((outcome, _))) = (self.state_dir.as_ref(), &result) {
             if !matches!(outcome, ExecutionOutcome::Paused { .. }) {
                 crate::engine::checkpoint::Checkpoint::discard(dir, &checkpoint.run_id);
@@ -276,6 +280,7 @@ impl Engine {
         mut ctx: ExecutionContext,
         mut current_id: String,
         mut trace: ExecutionTrace,
+        depth: u32,
     ) -> Result<(ExecutionOutcome, ExecutionTrace)> {
         let started_at = Instant::now();
 
@@ -325,7 +330,13 @@ impl Engine {
 
             // Dispatch — with optional retry. The first attempt plus
             // `retry.max_attempts - 1` re-tries.
-            let dispatch = dispatch_with_retry(&self.registry, node, &mut ctx);
+            // `call` runs a sub-workflow on this same engine; every
+            // other node kind dispatches to its handler.
+            let dispatch = if matches!(node.kind, crate::workflow::NodeKind::Call { .. }) {
+                self.run_call(node, &mut ctx, depth)
+            } else {
+                dispatch_with_retry(&self.registry, node, &mut ctx)
+            };
             let latency_ms = node_started.elapsed().as_millis() as u64;
 
             let outcome = match dispatch {
@@ -519,6 +530,110 @@ impl Engine {
             last_node: Some(node_id.to_string()),
             reason,
         })
+    }
+
+    /// Run a `call` node's child workflow as a sub-DAG on this engine
+    /// (sharing its registry → policy, tools, and metrics). The child
+    /// inherits the parent's remaining deadline; its `Completed` value
+    /// becomes `{result: …}`, a failure/timeout routes the `error`
+    /// branch. Depth-bounded to stop mutual recursion.
+    fn run_call(
+        &self,
+        node: &crate::workflow::Node,
+        ctx: &mut ExecutionContext,
+        depth: u32,
+    ) -> Result<NodeOutcome> {
+        let crate::workflow::NodeKind::Call {
+            workflow: path,
+            input_from,
+            start,
+        } = &node.kind
+        else {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!("node `{}` dispatched as call but is not one", node.id),
+            });
+        };
+        if depth + 1 > MAX_CALL_DEPTH {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!("call depth exceeded {MAX_CALL_DEPTH} at node `{}`", node.id),
+            });
+        }
+
+        // Load + validate the child like any workflow.
+        let src = std::fs::read_to_string(path).map_err(|e| Error::Workflow {
+            workflow: ctx.workflow_id.clone(),
+            reason: format!("call `{}`: read child workflow {path}: {e}", node.id),
+        })?;
+        let child = WorkflowDoc::from_toml(&src).map_err(|e| Error::Workflow {
+            workflow: ctx.workflow_id.clone(),
+            reason: format!("call `{}`: parse child {path}: {e}", node.id),
+        })?;
+        let report = crate::workflow::validate(&child);
+        if !report.ok() {
+            return Err(Error::Workflow {
+                workflow: child.name.clone(),
+                reason: format!("call `{}`: child {path} failed validation", node.id),
+            });
+        }
+
+        // Resolve the child's input + start node.
+        let input = match input_from {
+            Some(p) => ctx.resolve_path(p).cloned().unwrap_or(Value::Null),
+            None => ctx.trigger.input.clone(),
+        };
+        let start_name = start
+            .clone()
+            .or_else(|| child.start_nodes.first().map(|s| s.name.clone()))
+            .ok_or_else(|| Error::Workflow {
+                workflow: child.name.clone(),
+                reason: "child workflow declares no start nodes".to_string(),
+            })?;
+        let start_node = child
+            .start_node(&start_name)
+            .ok_or_else(|| Error::Workflow {
+                workflow: child.name.clone(),
+                reason: format!("child start node `{start_name}` not found"),
+            })?;
+        let entry = resolve_entry(&child, start_node)?.to_string();
+
+        // The child shares the parent's *remaining* deadline.
+        let remaining = ctx.deadline.saturating_duration_since(Instant::now());
+        let exec_id = next_execution_id();
+        let child_ctx = ExecutionContext::new(
+            exec_id.clone(),
+            child.name.clone(),
+            &start_name,
+            TriggerMeta::manual(input),
+            &RunOptions {
+                timeout: remaining,
+                dry_run: ctx.dry_run,
+            },
+        );
+        let child_trace = ExecutionTrace::new(exec_id);
+
+        let (outcome, _child_trace) =
+            self.walk_loop(&child, child_ctx, entry, child_trace, depth + 1)?;
+        match outcome {
+            ExecutionOutcome::Completed { final_value, .. } => Ok(NodeOutcome::Continue {
+                value: serde_json::json!({ "result": final_value }),
+                branch: None,
+            }),
+            ExecutionOutcome::Failed { reason, .. } => Ok(NodeOutcome::Continue {
+                value: serde_json::json!({ "error": reason }),
+                branch: Some("error".to_string()),
+            }),
+            ExecutionOutcome::TimedOut { .. } => Ok(NodeOutcome::Continue {
+                value: serde_json::json!({ "error": "sub-workflow timed out" }),
+                branch: Some("error".to_string()),
+            }),
+            ExecutionOutcome::Paused { .. } => Err(Error::Workflow {
+                workflow: child.name.clone(),
+                reason: "sub-workflow paused; nested pause_for_approval is not supported"
+                    .to_string(),
+            }),
+        }
     }
 }
 
@@ -820,6 +935,104 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("state directory"), "{err}");
+    }
+
+    #[test]
+    fn call_runs_child_and_returns_result() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let child_path = dir.path().join("child.toml");
+        std::fs::write(
+            &child_path,
+            r#"
+            name = "child"
+            [[start_nodes]]
+            name = "main"
+            source = "manual"
+            entry_node = "render"
+            [[nodes]]
+            id = "render"
+            type = "template_render"
+            template = "hi {{who}}"
+            input_from = "trigger"
+            "#,
+        )
+        .unwrap();
+
+        let wf = WorkflowDoc {
+            name: "parent".into(),
+            start_nodes: vec![start("main", "greet")],
+            nodes: vec![
+                n(
+                    "greet",
+                    NodeKind::Call {
+                        workflow: child_path.to_string_lossy().into_owned(),
+                        input_from: Some("trigger".into()),
+                        start: None,
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("greet", "done", None)],
+            ..Default::default()
+        };
+        let engine = {
+            let mut r = HandlerRegistry::with_builtin_controls();
+            crate::tools::register_default_tools(
+                &mut r,
+                crate::tools::policy::allow_all(),
+                crate::budget::unbounded(),
+            );
+            r.set_fallback(Box::new(StubHandler));
+            Engine::new(r)
+        };
+        let (out, trace) = engine
+            .run_with_trace(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({"who": "there"})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        assert_eq!(trace.node_ids(), vec!["greet", "done"]);
+        // The call node's output carries the child's result.
+        let greet = &trace.entries[0];
+        assert_eq!(greet.output["result"]["rendered"], "hi there");
+    }
+
+    #[test]
+    fn call_depth_is_bounded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("loop.toml");
+        // A workflow that calls itself — bounded by MAX_CALL_DEPTH.
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                name = "looper"
+                [[start_nodes]]
+                name = "main"
+                source = "manual"
+                entry_node = "again"
+                [[nodes]]
+                id = "again"
+                type = "call"
+                workflow = "{}"
+                "#,
+                path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let doc = WorkflowDoc::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let err = engine_with_stub()
+            .run(
+                &doc,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("call depth"), "{err}");
     }
 
     #[test]

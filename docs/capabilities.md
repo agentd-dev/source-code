@@ -464,6 +464,33 @@ Produces:
   `truncated: true`.
 - Timeout kills the child with SIGKILL.
 
+### 1.45 Composition
+
+#### `call`
+
+Invoke another workflow as a sub-DAG on the same engine — same policy,
+same tools, same metrics — under this run's *remaining* deadline.
+
+```toml
+[[nodes]]
+id = "enrich"
+type = "call"
+workflow = "workflows/enrich.toml"   # author-declared path, never from input
+input_from = "trigger"               # optional; defaults to this run's trigger
+start = "main"                       # optional; defaults to the child's first
+```
+
+- The child's `Completed` value becomes `{ "result": … }` (a child that
+  returns a value should end at a dead-end node, since `terminate`
+  yields null).
+- A child `Failed` / timeout routes `branch = "error"` with
+  `{ "error": reason }`, so the parent can react with a `when = "error"`
+  edge; with no such edge the parent dead-ends carrying the error.
+- Recursion is bounded (`MAX_CALL_DEPTH = 8`); a nested
+  `pause_for_approval` is rejected (resume the top-level run instead).
+- The child is parsed and validated on each call. Compose the
+  substrate — don't reach for an orchestrator-of-agents.
+
 ### 1.5 Control
 
 Drive the traversal. No side effects. Always compiled.

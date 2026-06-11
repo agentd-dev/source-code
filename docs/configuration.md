@@ -309,6 +309,69 @@ agent: workflow `foo`: auth ref `bearer:missing` is not defined in [auth.bearer]
 
 ---
 
+## 8.5 `[[secrets]]` — pluggable secret sources
+
+Every secret-consuming field (`api_key_env`, `tokens_env`,
+`credentials_env`, `secret_env`, MCP child `env` values,
+`{{secret:NAME}}` header placeholders) names a secret. By default the
+name is read from the process environment; a `[[secrets]]` entry gives
+the name a different source — and because resolution goes through one
+front door, declaring a source upgrades **every** consumer at once.
+
+```toml
+# Alias another env var.
+[[secrets]]
+name = "API_TOKEN"
+source = "env"
+var = "LEGACY_TOKEN_VAR"
+
+# Live file read per use — rotation = replace the file. Covers k8s
+# Secret mounts, Vault Agent sidecars, SOPS-decrypted files.
+[[secrets]]
+name = "DB_PASSWORD"
+source = "file"
+path = "/run/secrets/db_password"
+trim = true                        # default: trim trailing whitespace
+
+# Argv-declared command; stdout is the value. Cached until SIGHUP.
+# Feature `secrets-exec`. Covers `op read`, `vault kv get`, `pass`.
+[[secrets]]
+name = "OP_TOKEN"
+source = "command"
+argv = ["op", "read", "op://vault/item/credential"]
+
+# OAuth2 client-credentials grant; token cached until expires_in − skew.
+# Feature `secrets-oauth2`. The client credentials THEMSELVES resolve
+# through this registry (env / file / command compose).
+[[secrets]]
+name = "SALESFORCE_TOKEN"
+source = "oauth2"
+token_url = "https://login.salesforce.com/services/oauth2/token"
+client_id_env = "SF_CLIENT_ID"
+client_secret_env = "SF_CLIENT_SECRET"
+scopes = ["api"]
+extra_params = { audience = "https://api.example.com" }   # Auth0-style
+auth_style = "body"                # or "basic" (RFC 6749 §2.3.1)
+skew_secs = 60                     # refresh this early; default 60
+```
+
+Semantics:
+
+- **Resolution order:** `[[secrets]]` entry → process env. Existing
+  workflows are unchanged.
+- **Startup probe:** every declared entry resolves once at startup
+  (and on SIGHUP); a bad source fails the bind, not the first request.
+  On reload, a bad source keeps the OLD registry.
+- **Liveness:** `env`/`file` read per use (rotation just works);
+  `command` caches until reload; `oauth2` refreshes itself before
+  expiry (monotonic clock).
+- **Material never enters the TOML** — an unknown field like a literal
+  `client_secret` is a parse error, values never serialize, `Debug`
+  prints `***`, and the `read_env` node deliberately can NOT read
+  registry secrets (they would land in run records).
+- `body_sha256` idempotency keys and HMAC verification still work —
+  those consume their secrets through the same front door.
+
 ## 9. `[server.tls]`
 
 Behind the `server-tls` Cargo feature.
@@ -447,6 +510,9 @@ tools-http-tls          https:// in http_request + the agent_loop http tool
                         tools-http; redirects never followed, so the policy
                         allowlist decision stays exact)
 tools-shell             shell_run
+secrets-exec            [[secrets]] source = "command" (argv-declared exec)
+secrets-oauth2          [[secrets]] source = "oauth2" (client-credentials
+                        grant via ureq/rustls; cached + self-refreshing)
 tools-mcp               (pre-declared; MCP is currently always compiled when used)
 
 trigger-http            HTTP listener (agent serve HTTP)                    [default]

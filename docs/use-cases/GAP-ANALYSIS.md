@@ -11,9 +11,10 @@ to "can agentd do X?" for the business-automation domain.
 answer is documented instead).
 
 **Scoreboard:** the catalog shipped 2026-06-11 with one gap closed
-(§1, v1.1.0). The v1.2.0 wave closed four more — §2, §3, §4, §5 and
-§9 — in the order this document recommended. §6 (secrets + OAuth2) is
-the next planned wave; §7/§8 remain deliberate architecture guidance.
+(§1, v1.1.0). The v1.2.0 wave closed §2, §3, §4, §5, §9 in the order
+this document recommended, and v1.3.0 closed §6 (secrets + OAuth2).
+**Every buildable gap the catalog surfaced is now shipped**; §7/§8
+remain architecture guidance on purpose.
 
 | # | Capability | Blocked / shaped which use cases | Status |
 |---|---|---|---|
@@ -22,7 +23,7 @@ the next planned wave; §7/§8 remain deliberate architecture guidance.
 | 3 | Fan-out over dynamic lists (`map` node) + array-index paths | churn per-account, localization, contract clauses | ✅ shipped v1.2.0 |
 | 4 | Form-encoded / multipart webhook bodies | voice (Twilio), inbox (inbound-parse) | ✅ shipped v1.2.0 |
 | 5 | Idempotency keys (exactly-once effect) | fraud review, any retried webhook | ✅ shipped v1.2.0 |
-| 6 | Secrets providers + OAuth2 refresh | every SaaS API beyond static tokens | 🔶 next wave |
+| 6 | Secrets providers + OAuth2 refresh | every SaaS API beyond static tokens | ✅ shipped v1.3.0 |
 | 7 | Document parsing (PDF / DOCX) | invoices, contracts, resumes | 📘 MCP / upstream |
 | 8 | Realtime + streaming I/O (websockets) | full-duplex voice | 📘 sidecar pattern |
 | 9 | HTTP basic auth scheme | Twilio webhook auth option | ✅ shipped v1.2.0 |
@@ -156,7 +157,7 @@ execution already requires): seen key → replay the recorded outcome
 At-least-once delivery collapses to exactly-once *effect* at the
 workflow boundary, per route, opt-in.
 
-## 6. Secrets providers + OAuth2 refresh
+## 6. Secrets providers + OAuth2 refresh — ✅ closed in v1.3.0
 
 **The finding.** Every SaaS API in the catalog authenticates; today
 that means long-lived tokens in env vars (`api_key_env`,
@@ -171,6 +172,23 @@ time, behind a feature — and an `oauth2-client-credentials` source as
 the first non-trivial provider (fetch + cache + refresh-before-expiry
 in-process). Secrets stay out of workflow TOML, Debug impls, and audit
 logs — those invariants don't move.
+
+**As shipped (v1.3.0).** `[[secrets]]` declares pluggable sources —
+`env` alias, `file` (live-read: rotation = replace the file), `command`
+(argv-declared; `op read`, `vault kv get`, any CLI manager; feature
+`secrets-exec`), and `oauth2` client-credentials (cached,
+self-refreshing, `extra_params` + both auth styles for provider
+quirks; feature `secrets-oauth2`). One resolution front door with env
+fallback means every existing `*_env` field — LLM keys, webhook
+verifiers, basic-auth credential sets — gained all sources with zero
+consumer changes; LLM backends re-resolve per request so hourly tokens
+stay fresh. Two companion surfaces give the tokens somewhere to go:
+declared `http_request` headers with `{{secret:NAME}}` placeholders
+(never context-interpolated; never echoed into records; the model's
+loop tool gets no headers at all), and per-server MCP `env` maps
+resolved at spawn. Bonus finding: the production engine had a silent
+StubHandler fallback masking missing capabilities — removed; missing
+tool families now fail loudly, as always documented.
 
 ## 7. Document parsing (PDF / DOCX) — 📘 guidance
 
@@ -219,9 +237,9 @@ telephony-style callers. P3 because bearer-capable relays exist.
 ## Reading the table strategically
 
 The recommended sequence — voice native (§2+§4+§9), then `map` (§3),
-then hardening (§5) — **is exactly what the v1.2.0 wave shipped**, each
-with tests, docs, and an upgraded article as the proof. What remains:
-§6 (secrets providers + OAuth2 refresh) is the next planned wave; §7
-and §8 stay architecture guidance on purpose. This document's job now
-is to stay honest the same way the maturity page does: when a use case
-hits a wall, the wall gets a number here.
+then hardening (§5, §6) — shipped across v1.2.0 and v1.3.0, each gap
+with tests, docs, and an upgraded artifact as the proof. The catalog's
+buildable demands are now all closed; §7 and §8 stay architecture
+guidance on purpose. This document's job continues the same way the
+maturity page works: when a use case hits a wall, the wall gets a
+number here — and then it gets shipped or defended.

@@ -400,6 +400,21 @@ Produces:
 ```
 
 - Feature: `tools-http`; HTTPS additionally needs `tools-http-tls`.
+- **Declared headers** (optional): literals plus `{{secret:NAME}}`
+  placeholders resolved through the `[[secrets]]` registry at request
+  time —
+
+  ```toml
+  [nodes.headers]
+  Authorization = "Bearer {{secret:SALESFORCE_TOKEN}}"
+  X-Api-Version = "58.0"
+  ```
+
+  Values are **never context-interpolated** (model output cannot shape
+  a header), CR/LF is rejected fail-closed, resolved secrets never
+  echo into node outputs or run records, and the agent_loop http tool
+  takes no headers at all — a model must not be able to ask for secret
+  injection.
 - Policy: `Policy::check_http_request(method, url)` — both schemes.
 - 1 MiB caps on request and response bodies — both schemes.
 - Non-2xx status sets `branch = "error"` — wire a `when = "error"`

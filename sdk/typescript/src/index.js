@@ -16,6 +16,13 @@ function emitScalar(v) {
   if (Array.isArray(v)) return `[${v.map((x) => `"${escape(String(x))}"`).join(", ")}]`;
   if (typeof v === "string") return `"${escape(v)}"`;
   if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "object" && v !== null) {
+    // Inline table — used for http_request `headers` maps.
+    const entries = Object.entries(v)
+      .filter(([, val]) => val !== undefined && val !== null)
+      .map(([k, val]) => `${/^[A-Za-z0-9_-]+$/.test(k) ? k : `"${escape(k)}"`} = ${emitScalar(val)}`);
+    return `{ ${entries.join(", ")} }`;
+  }
   return String(v); // number
 }
 
@@ -48,7 +55,7 @@ export const node = {
   parseJson: (o) => ({ type: "parse_json", input_from: o.inputFrom }),
   jsonSelect: (o) => ({ type: "json_select", input_from: o.inputFrom, path: o.path }),
   templateRender: (o) => ({ type: "template_render", template: o.template, input_from: o.inputFrom }),
-  httpRequest: (o) => ({ type: "http_request", method: o.method, url_from: o.urlFrom, body_from: o.bodyFrom }),
+  httpRequest: (o) => ({ type: "http_request", method: o.method, url_from: o.urlFrom, body_from: o.bodyFrom, headers: o.headers }),
   call: (o) => ({ type: "call", workflow: o.workflow, input_from: o.inputFrom, start: o.start }),
   respond: (o) => ({ type: "respond", status: o?.status, content_type: o?.contentType, body_template: o.bodyTemplate, input_from: o?.inputFrom }),
   map: (o) => ({ type: "map", items_from: o.itemsFrom, workflow: o.workflow, start: o.start, max_items: o.maxItems, max_concurrent: o.maxConcurrent }),

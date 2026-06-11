@@ -42,6 +42,9 @@ jobs:
           # TLS client WITHOUT server-tls: the single-crypto-provider
           # build (ureq/ring only) that --all-features can't exercise.
           - "--features tools-http-tls"
+          # Secrets sources standalone (oauth2 pulls ureq without the
+          # other ureq features; exec has no deps at all).
+          - "--features secrets-oauth2,secrets-exec"
           - "--features trigger-cron,trigger-fs-watch"
           - "--features signing,auth-oidc,policy-rego,schema"
           - "--features intel-unix,intel-http,intel-remote"

@@ -14,6 +14,47 @@ version bump.
 
 _Nothing yet. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next._
 
+## [1.3.0] — 2026-06-11
+
+The secrets wave — gap analysis §6, the last buildable item the
+use-case catalog demanded. Designed for reuse above all: one
+resolution front door, every consumer upgraded at once.
+
+### Added
+
+- **`[[secrets]]` pluggable secret sources.** Every secret-consuming
+  field (`api_key_env`, `tokens_env`, `credentials_env`, `secret_env`,
+  MCP child `env`, header placeholders) resolves through
+  `secrets::resolve` — a `[[secrets]]` entry first, the process
+  environment second, so existing workflows are unchanged. Sources:
+  `env` (alias), `file` (live-read; rotation = replace the file —
+  k8s Secret mounts, Vault Agent, SOPS), `command` (argv-declared CLI
+  manager; feature `secrets-exec`), and `oauth2` client-credentials
+  (cached, self-refreshing before expiry, `extra_params` +
+  `auth_style` for provider quirks; feature `secrets-oauth2`; client
+  credentials themselves resolve through the registry). Startup and
+  SIGHUP probe every entry fail-closed. Secret material in workflow
+  TOML is a **parse error**; values never serialize; `Debug` prints
+  `***`; `read_env` deliberately cannot read registry secrets.
+- **LLM backends re-resolve keys per request** — an hourly-expiring
+  gateway token stays fresh with no reload (startup still fail-fasts a
+  bad reference).
+- **Declared `http_request` headers** with `{{secret:NAME}}`
+  placeholders — `Authorization = "Bearer {{secret:SALESFORCE_TOKEN}}"`.
+  Literals + secrets only (never context data), CR/LF rejected, secrets
+  never echo into outputs or records, and the agent_loop http tool
+  takes no headers at all.
+- **MCP per-server `env` maps** — `env = { DATABASE_URL = "<secret
+  name>" }` resolved at spawn, set on the child only.
+
+### Fixed
+
+- **Removed the production `StubHandler` fallback.** A node whose tool
+  family wasn't compiled in silently returned `{"stub": …}` and the
+  run completed — the exact silent-degradation mode the runtime
+  documents against. Missing capabilities now fail loudly with the
+  `CapabilityUnavailable` message.
+
 ## [1.2.0] — 2026-06-11
 
 The wave the [use-case gap analysis](docs/use-cases/GAP-ANALYSIS.md)
@@ -190,7 +231,8 @@ signing, and the observability spine (spans, Prometheus `/metrics`,
 `/healthz`, audit JSONL, OTLP, traceparent). See the git history and the
 RFCs under [`rfcs/`](rfcs/) for the design record.
 
-[Unreleased]: https://github.com/agentd-dev/source-code/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/agentd-dev/source-code/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/agentd-dev/source-code/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/agentd-dev/source-code/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/agentd-dev/source-code/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/agentd-dev/source-code/compare/v0.8.0...v1.0.0

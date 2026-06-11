@@ -100,8 +100,9 @@ composes daemons rather than complicating one:
       and fleet-wide budget accounting.
 - [ ] **Fleet governance**: centrally-distributed signed policies and
       instruction files; per-tenant budget envelopes; audit shipping.
-- [ ] **Run inspector UI** — a hosted/local web surface over run
-      records: node timeline, model I/O, cost, policy decisions, replay,
-      search, run diff. The control-plane half of the trust story.
+- [x] **Run inspector UI** (v1) — a browser surface over run records at
+      `/inspect`: paste/upload a record, see the node timeline with
+      per-node I/O, cost, and policy decisions, client-side. Replay,
+      search, and run-diff are the next increments.
 - [ ] Windows path-pattern canonicalisation for `[policy.fs]`
       (matcher is `/`-separated today; see maturity.md).

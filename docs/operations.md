@@ -224,11 +224,13 @@ run exec-00000001  workflow=demo  status=completed
      2. done [terminate] terminate  0 ms
 ```
 
-The record is plain JSON keyed for machine consumption (a dashboard or a
-hosted inspector reads the same file). Its `execution_id` matches the
-`execution_id` field in the audit log, so a record and its audit events
-line up. Records may contain node outputs verbatim — treat a record file
-with the same care as the data it processed.
+The record is plain JSON keyed for machine consumption. Its
+`execution_id` matches the `execution_id` field in the audit log, so a
+record and its audit events line up. A browser inspector at
+[agentd.dev/inspect](https://agentd.dev/inspect) renders the same file
+visually (paste or upload — it runs entirely client-side, nothing is
+uploaded). Records may contain node outputs verbatim — treat a record
+file with the same care as the data it processed.
 
 ### 3.7 Human-in-the-loop + durable execution
 

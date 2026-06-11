@@ -25,6 +25,9 @@ export default function RootLayout({ children }) {
             <Link href="/docs/rfc-0001/" className="text-[var(--dim)] hover:text-[var(--accent)]">
               rfcs
             </Link>
+            <Link href="/inspect/" className="text-[var(--dim)] hover:text-[var(--accent)]">
+              inspect
+            </Link>
             <a
               href="https://github.com/agentd-dev/source-code"
               className="ml-auto text-[var(--dim)] hover:text-[var(--accent)]"

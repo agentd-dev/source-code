@@ -1,0 +1,14 @@
+# Child for the compose-map scenario: each map element arrives as the
+# trigger; select its `n` and dead-end so the value flows back.
+name = "map_child"
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "pick"
+
+[[nodes]]
+id = "pick"
+type = "json_select"
+input_from = "trigger"
+path = "n"

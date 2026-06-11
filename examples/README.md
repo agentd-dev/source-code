@@ -14,6 +14,7 @@ in [docs/SAMPLES.md](../docs/SAMPLES.md); this is the index.
 | [`approval-gate.toml`](approval-gate.toml) | human-in-the-loop: `pause_for_approval` → checkpoint → `--resume` |
 | [`subworkflow-parent.toml`](subworkflow-parent.toml) + [`subworkflow-child.toml`](subworkflow-child.toml) | composition: a `call` node runs another workflow as a sub-DAG |
 | [`parallel-fanout.toml`](parallel-fanout.toml) | concurrent fan-out: a `parallel` node runs sub-workflows on threads, then joins |
+| [`map-fanout.toml`](map-fanout.toml) | bounded fan-out over DATA: a `map` node runs one sub-workflow per array element (mandatory `max_items`), joins in input order |
 | [`self-planning-agent.toml`](self-planning-agent.toml) | an instructions file (`[agent]`) with a standing task — instruction mode + `--promote` |
 
 ```bash

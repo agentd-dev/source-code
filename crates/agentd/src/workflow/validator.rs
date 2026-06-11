@@ -80,6 +80,7 @@ pub fn validate(doc: &WorkflowDoc) -> ValidationReport {
     check_mcp_nodes(doc, &mut r);
     check_agent_loops(doc, &mut r);
     check_respond_nodes(doc, &mut r);
+    check_map_nodes(doc, &mut r);
 
     // Graph-level checks only make sense once every edge references a
     // known node. Skip them if dangling edges were detected so the
@@ -320,6 +321,42 @@ fn check_agent_loops(doc: &WorkflowDoc, r: &mut ValidationReport) {
                     ),
                 ));
             }
+        }
+    }
+}
+
+fn check_map_nodes(doc: &WorkflowDoc, r: &mut ValidationReport) {
+    use crate::workflow::model::NodeKind;
+    for node in &doc.nodes {
+        let NodeKind::Map {
+            workflow,
+            max_items,
+            max_concurrent,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        if *max_items == 0 {
+            r.issues.push(ValidationIssue::new(
+                "map_zero_max_items",
+                format!(
+                    "node `{}`: max_items must be >= 1 — the bound is mandatory",
+                    node.id
+                ),
+            ));
+        }
+        if let Some(0) = max_concurrent {
+            r.issues.push(ValidationIssue::new(
+                "map_zero_concurrency",
+                format!("node `{}`: max_concurrent must be >= 1 when set", node.id),
+            ));
+        }
+        if workflow.trim().is_empty() {
+            r.issues.push(ValidationIssue::new(
+                "map_empty_workflow",
+                format!("node `{}`: workflow path must not be empty", node.id),
+            ));
         }
     }
 }
@@ -618,6 +655,38 @@ mod tests {
             r.issues
                 .iter()
                 .any(|i| i.code == "respond_empty_content_type"),
+            "{:?}",
+            r.issues
+        );
+    }
+
+    #[test]
+    fn map_bounds_are_validated() {
+        let mk = |max_items: u32, max_concurrent: Option<u32>| WorkflowDoc {
+            name: "x".into(),
+            start_nodes: vec![start("main", StartSource::Manual, Some("fan"))],
+            nodes: vec![n(
+                "fan",
+                NodeKind::Map {
+                    items_from: "trigger.items".into(),
+                    workflow: "child.toml".into(),
+                    start: None,
+                    max_items,
+                    max_concurrent,
+                },
+            )],
+            ..Default::default()
+        };
+        assert!(validate(&mk(10, Some(4))).ok());
+        let r = validate(&mk(0, None));
+        assert!(
+            r.issues.iter().any(|i| i.code == "map_zero_max_items"),
+            "{:?}",
+            r.issues
+        );
+        let r = validate(&mk(10, Some(0)));
+        assert!(
+            r.issues.iter().any(|i| i.code == "map_zero_concurrency"),
             "{:?}",
             r.issues
         );

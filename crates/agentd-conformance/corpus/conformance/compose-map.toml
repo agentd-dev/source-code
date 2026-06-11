@@ -1,0 +1,33 @@
+name = "compose-map"
+description = "A map node runs one bounded child per array element and joins {results, ok} in input order."
+capabilities = ["map", "json_select", "terminate", "trigger_manual"]
+
+[workflow]
+inline = """
+name = "mapper"
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "fan"
+[[nodes]]
+id = "fan"
+type = "map"
+items_from = "trigger.items"
+workflow = "crates/agentd-conformance/fixtures/map-child.toml"
+max_items = 8
+max_concurrent = 2
+[[nodes]]
+id = "done"
+type = "terminate"
+[[edges]]
+from = "fan"
+to = "done"
+"""
+
+[trigger]
+payload = { items = [{ n = 1 }, { n = 2 }, { n = 3 }] }
+
+[expected]
+status = "completed"
+last_node = "done"
+path = ["fan", "done"]

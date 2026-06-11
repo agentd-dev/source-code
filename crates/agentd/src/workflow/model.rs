@@ -512,6 +512,30 @@ pub enum NodeKind {
     Parallel {
         branches: Vec<ParallelBranch>,
     },
+    /// Run ONE sub-workflow per element of a context-resolved array
+    /// ("for each X, do the bounded thing"). The bound is the point:
+    /// `max_items` is mandatory and an oversized list is a hard error,
+    /// never a silent truncation. Elements run in waves of
+    /// `max_concurrent` (default 4); output is
+    /// `{results: [{result|error}, …], ok}` in input order; any element
+    /// failure routes the `error` branch (parallel parity). Budgets and
+    /// the deadline stay process-wide — a map cannot out-spend its
+    /// envelope.
+    Map {
+        /// Context path that must resolve to a JSON array.
+        items_from: String,
+        /// Path to the child workflow TOML, author-declared — never
+        /// from runtime input.
+        workflow: String,
+        /// Start-node name in the child; defaults to its first.
+        #[serde(default)]
+        start: Option<String>,
+        /// Hard ceiling on the array length. Required.
+        max_items: u32,
+        /// Concurrent elements per wave. Default 4.
+        #[serde(default)]
+        max_concurrent: Option<u32>,
+    },
 
     // --- Control ---
     Condition {
@@ -581,6 +605,7 @@ impl NodeKind {
             NodeKind::ShellRun { .. } => "shell_run",
             NodeKind::Call { .. } => "call",
             NodeKind::Parallel { .. } => "parallel",
+            NodeKind::Map { .. } => "map",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
             NodeKind::Merge => "merge",

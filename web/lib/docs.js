@@ -8,6 +8,7 @@ const ROOT = path.join(process.cwd(), "..");
 
 export const DOCS = [
   { slug: "overview", file: "docs/README.md", title: "overview" },
+  { slug: "quickstart", file: "docs/quickstart.md", title: "quickstart" },
   { slug: "architecture", file: "docs/architecture.md", title: "architecture" },
   { slug: "capabilities", file: "docs/capabilities.md", title: "capabilities" },
   { slug: "configuration", file: "docs/configuration.md", title: "configuration" },

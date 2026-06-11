@@ -938,6 +938,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tools-data")] // the child uses template_render
     fn call_runs_child_and_returns_result() {
         let dir = tempfile::TempDir::new().unwrap();
         let child_path = dir.path().join("child.toml");
@@ -1019,7 +1020,9 @@ mod tests {
                 type = "call"
                 workflow = "{}"
                 "#,
-                path.to_string_lossy()
+                // Forward slashes: backslashes from a Windows temp path
+                // would be TOML escapes. fs accepts `/` on Windows too.
+                path.to_string_lossy().replace('\\', "/")
             ),
         )
         .unwrap();

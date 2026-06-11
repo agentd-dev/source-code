@@ -36,6 +36,10 @@ export const node: {
   templateRender(o: { template: string; inputFrom?: string }): NodeSpec;
   httpRequest(o: { method: string; urlFrom: string; bodyFrom?: string }): NodeSpec;
   call(o: { workflow: string; inputFrom?: string; start?: string }): NodeSpec;
+  /** Shape the HTTP reply of an http-triggered run (TwiML, Slack shapes, challenge echoes). */
+  respond(o: { bodyTemplate: string; status?: number; contentType?: string; inputFrom?: string }): NodeSpec;
+  /** Run one sub-workflow per element of a context-resolved array, bounded by maxItems. */
+  map(o: { itemsFrom: string; workflow: string; maxItems: number; start?: string; maxConcurrent?: number }): NodeSpec;
 };
 
 export class Workflow {

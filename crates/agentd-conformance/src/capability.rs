@@ -46,6 +46,11 @@ static MATRIX: &[Capability] = &[
         "checkpoint + suspend for human approval",
     ),
     c("terminate", "control", "success terminal"),
+    c(
+        "respond",
+        "control",
+        "declare the HTTP reply of an http-triggered run",
+    ),
     // Data plane.
     c("parse_json", "data", "parse a JSON string"),
     c("json_select", "data", "dotted-path select into a value"),

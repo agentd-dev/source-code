@@ -1,23 +1,27 @@
-# Use case — AI receptionist on Twilio (the call-control brain)
-# =============================================================
+# Use case — AI receptionist on Twilio (fully native)
+# ====================================================
 # Article: docs/use-cases/voice-receptionist.md
 #
-# Twilio drives a phone call by POSTing call events to a webhook and
-# acting on the instructions it gets back. This workflow is the BRAIN of
-# that exchange: it receives the caller's transcribed speech (Twilio
-# <Gather input="speech">), classifies intent with one bounded llm_infer
-# step, routes on the answer, and hands the decision to a thin TwiML
-# bridge that renders the telephony XML. The model picks neither tools
-# nor edges — a hostile caller can change what the workflow KNOWS, not
-# what it CAN DO.
+# Twilio drives a phone call by POSTing call events (form-encoded) to a
+# webhook and ACTING ON the TwiML XML it gets back. As of v1.2.0 the
+# whole exchange is native — no bridge service:
 #
-#   ANTHROPIC_API_KEY=… VOICE_BRIDGE_TOKENS=… \
+#   - Twilio's application/x-www-form-urlencoded body parses straight
+#     into the trigger payload ({{SpeechResult}}, {{CallSid}}, …).
+#   - `auth = "basic:twilio"` verifies the credentials Twilio carries
+#     in the webhook URL (https://user:pass@agent.example.com/…).
+#   - A `respond` node renders the TwiML reply verbatim — status 200,
+#     text/xml, templated body.
+#
+# The model classifies; the graph routes; the caller can change what
+# the workflow KNOWS, never what it CAN DO.
+#
+#   OPENAI_API_KEY=… TWILIO_WEBHOOK_CREDS="acct:s3cret" \
 #     agentd --config examples/use-cases/voice-receptionist.toml \
 #            --bind 0.0.0.0:8080
 #
-# Today this terminates at an HTTPS POST to the bridge (tools-http-tls
-# build). The gap analysis proposes a `respond` node so the workflow can
-# answer Twilio with TwiML directly — see GAP-ANALYSIS.md §2.
+# Build: --features intel-remote,schema (server-tls or a TLS gateway in
+# front — Twilio requires HTTPS webhook URLs).
 
 name = "voice_receptionist"
 
@@ -32,15 +36,14 @@ max_llm_tokens = 8000
 max_run_time_secs = 15        # a caller is waiting — fail fast
 max_memory_mb = 256
 
-[auth.bearer.bridge]
-tokens_env = "VOICE_BRIDGE_TOKENS"   # newline-separated set; rotate by adding then removing
+# Twilio can't set custom headers; it carries basic-auth credentials in
+# the webhook URL. Newline-separated user:pass entries — rotate by
+# adding the new pair, switching Twilio, then removing the old.
+[auth.basic.twilio]
+credentials_env = "TWILIO_WEBHOOK_CREDS"
 
-# Fail-closed: this run may reach the TwiML bridge and the CRM, nothing
-# else. No shell, no filesystem writes outside the call log.
-[policy.http]
-urls = ["https://voice-bridge.internal/**", "https://crm.example.com/api/**"]
-methods = ["POST"]
-
+# Fail-closed: this run may write the call log and nothing else. No
+# outbound HTTP at all — the reply IS the side effect.
 [policy.fs]
 write = ["/var/lib/agentd/calls/**"]
 
@@ -56,12 +59,12 @@ entry_node = "classify"
 method = "POST"
 path = "/voice/turn"
 start_node = "on_speech"
-auth = "bearer:bridge"
+auth = "basic:twilio"
 rate_limit = { capacity = 30, per_second = 10.0 }
 
 # 1. One bounded reasoning step: caller speech in, intent + scripted
 #    reply out, schema-enforced. The model cannot transfer the call,
-#    cannot query the CRM, cannot end the call — it fills this node.
+#    cannot end it, cannot reach anything — it fills this node.
 [[nodes]]
 id = "classify"
 type = "llm_infer"
@@ -85,46 +88,39 @@ id = "route"
 type = "switch"
 expr = "classify.parsed.intent"
 
-# 3. Hand the decision to the TwiML bridge: it renders <Say>/<Dial> XML
-#    back to Twilio. One bridge URL per outcome keeps the bridge dumb.
+# 3. Each lane renders its TwiML natively. Sales and support speak the
+#    model's (schema-bounded) reply and gather the next turn; operator
+#    speaks, then transfers to a human — a number declared HERE, not
+#    anywhere a caller can influence.
 [[nodes]]
-id = "say_sales"
-type = "template_render"
-template = "https://voice-bridge.internal/twiml/sales"
+id = "say_and_gather_sales"
+type = "respond"
+content_type = "text/xml"
+body_template = """
+<Response><Say>{{reply}}</Say><Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto"/></Response>
+"""
+input_from = "classify.parsed"
 
 [[nodes]]
-id = "say_support"
-type = "template_render"
-template = "https://voice-bridge.internal/twiml/support"
+id = "say_and_gather_support"
+type = "respond"
+content_type = "text/xml"
+body_template = """
+<Response><Say>{{reply}}</Say><Gather input="speech" action="/voice/turn" method="POST" speechTimeout="auto"/></Response>
+"""
+input_from = "classify.parsed"
 
 [[nodes]]
-id = "to_operator"
-type = "template_render"
-template = "https://voice-bridge.internal/twiml/operator"
+id = "transfer_to_human"
+type = "respond"
+content_type = "text/xml"
+body_template = """
+<Response><Say>{{reply}}</Say><Dial>+15550100</Dial></Response>
+"""
+input_from = "classify.parsed"
 
-[[nodes]]
-id = "tell_bridge_sales"
-type = "http_request"
-method = "POST"
-url_from = "say_sales.rendered"
-body_from = "classify.parsed"
-
-[[nodes]]
-id = "tell_bridge_support"
-type = "http_request"
-method = "POST"
-url_from = "say_support.rendered"
-body_from = "classify.parsed"
-
-[[nodes]]
-id = "tell_bridge_operator"
-type = "http_request"
-method = "POST"
-url_from = "to_operator.rendered"
-body_from = "classify.parsed"
-
-# 4. Append the turn to the call log — the audit trail of what was
-#    heard and what was decided, per CallSid.
+# 4. Append the turn to the per-call audit log — what was heard, what
+#    was decided — then terminate (the reply is written at completion).
 [[nodes]]
 id = "log_path"
 type = "template_render"
@@ -141,11 +137,6 @@ content_from = "classify.parsed"
 id = "done"
 type = "terminate"
 
-[[nodes]]
-id = "bridge_down"
-type = "fail"
-reason = "TwiML bridge unreachable — Twilio will play the static fallback"
-
 [[edges]]
 from = "classify"
 to = "route"
@@ -153,56 +144,29 @@ to = "route"
 [[edges]]
 from = "route"
 when = "sales"
-to = "say_sales"
+to = "say_and_gather_sales"
 
 [[edges]]
 from = "route"
 when = "support"
-to = "say_support"
+to = "say_and_gather_support"
 
 [[edges]]
 from = "route"
 when = "operator"
-to = "to_operator"
+to = "transfer_to_human"
 
 [[edges]]
-from = "say_sales"
-to = "tell_bridge_sales"
-
-[[edges]]
-from = "say_support"
-to = "tell_bridge_support"
-
-[[edges]]
-from = "to_operator"
-to = "tell_bridge_operator"
-
-[[edges]]
-from = "tell_bridge_sales"
+from = "say_and_gather_sales"
 to = "log_path"
 
 [[edges]]
-from = "tell_bridge_support"
+from = "say_and_gather_support"
 to = "log_path"
 
 [[edges]]
-from = "tell_bridge_operator"
+from = "transfer_to_human"
 to = "log_path"
-
-[[edges]]
-from = "tell_bridge_sales"
-when = "error"
-to = "bridge_down"
-
-[[edges]]
-from = "tell_bridge_support"
-when = "error"
-to = "bridge_down"
-
-[[edges]]
-from = "tell_bridge_operator"
-when = "error"
-to = "bridge_down"
 
 [[edges]]
 from = "log_path"

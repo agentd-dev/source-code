@@ -50,6 +50,8 @@ export const node = {
   templateRender: (o) => ({ type: "template_render", template: o.template, input_from: o.inputFrom }),
   httpRequest: (o) => ({ type: "http_request", method: o.method, url_from: o.urlFrom, body_from: o.bodyFrom }),
   call: (o) => ({ type: "call", workflow: o.workflow, input_from: o.inputFrom, start: o.start }),
+  respond: (o) => ({ type: "respond", status: o?.status, content_type: o?.contentType, body_template: o.bodyTemplate, input_from: o?.inputFrom }),
+  map: (o) => ({ type: "map", items_from: o.itemsFrom, workflow: o.workflow, start: o.start, max_items: o.maxItems, max_concurrent: o.maxConcurrent }),
 };
 
 export class Workflow {

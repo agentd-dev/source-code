@@ -14,6 +14,31 @@ version bump.
 
 _Nothing yet. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's next._
 
+## [1.1.0] — 2026-06-11
+
+### Added
+
+- **`tools-http-tls` feature — HTTPS for `http_request`** (and the
+  `agent_loop` http tool). `https://` URLs route through ureq + rustls,
+  the same client stack `intel-remote` already ships, so no async
+  runtime enters the core. Full parity with the plaintext path: policy
+  allowlist, 1 MiB request/response caps, non-2xx → `error` branch,
+  W3C `traceparent` propagation, dry-run. The TLS client never follows
+  redirects — the policy allowlist vetted the exact URL, so a
+  `Location` hop comes back to the workflow as a 3xx instead of being
+  followed silently. Covered by real-handshake round-trip tests
+  (rustls test server + throwaway rcgen CA).
+- **Business-automation use-case catalog** — fourteen general-audience
+  articles under [docs/use-cases/](docs/use-cases/) with a runnable
+  sample workflow each (`examples/use-cases/`), a capability gap
+  analysis, and a `/use-cases` section on the website.
+
+### Fixed
+
+- One remaining `collapsible_if` in the feature-gated intelligence HTTP
+  client (lint passes now run `--all-features` in CI so gated modules
+  can't rot unlinted).
+
 ## [1.0.0] — 2026-06-11
 
 The 1.0 cut freezes the substrate and the autonomy dial together. A
@@ -107,5 +132,6 @@ signing, and the observability spine (spans, Prometheus `/metrics`,
 `/healthz`, audit JSONL, OTLP, traceparent). See the git history and the
 RFCs under [`rfcs/`](rfcs/) for the design record.
 
-[Unreleased]: https://github.com/agentd-dev/source-code/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/agentd-dev/source-code/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/agentd-dev/source-code/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/agentd-dev/source-code/compare/v0.8.0...v1.0.0

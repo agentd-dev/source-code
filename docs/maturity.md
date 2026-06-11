@@ -129,6 +129,7 @@ surface is trimmed — see §1.5).
 
 | Concern | Status | Notes |
 |---|---|---|
+| Outbound HTTPS (`http_request` / loop http tool) | Green (with `tools-http-tls`) | `https://` URLs route through ureq + rustls (the intel-remote stack). Policy allowlist, 1 MiB caps, non-2xx `error` branch, and traceparent propagation all match the plaintext path. Redirects deliberately not followed — the allowlist vetted the exact URL. Real-handshake round-trip tests (rcgen CA + rustls server) in `tools::http::tests::tls_roundtrip`. Without the feature, https fails loudly. |
 | MCP stdio client (tools + resources) | Green | Persistent child process; NDJSON JSON-RPC 2.0; allowlist enforced. |
 | MCP trigger (inbound) | Green | Works with `trigger-mcp` feature. |
 | Intelligence adapter over Unix socket | Green | Length-framed JSON-RPC; any server speaking the shape plugs in. |

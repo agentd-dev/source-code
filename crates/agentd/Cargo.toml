@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Bounded workflow-driven agent runtime (RFC: rfcs/0001-bounded-workflow-runtime.md)"
@@ -36,6 +36,12 @@ tools-fs = []
 tools-env = []
 tools-data = []
 tools-http = []
+# HTTPS for the `http_request` node (and the agent_loop http tool).
+# Pulls `ureq` (blocking, rustls — the same client stack intel-remote
+# uses; no async runtime enters the core). Without it, https:// URLs
+# fail loudly. Redirects are NOT followed — a redirect could bounce an
+# allowed URL to a non-allowed one, so the policy boundary stays exact.
+tools-http-tls = ["tools-http", "dep:ureq"]
 tools-shell = []
 tools-mcp = []
 

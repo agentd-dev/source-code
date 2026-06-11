@@ -65,6 +65,9 @@ rest of the model hangs off.
   or open an outbound socket — no runtime misconfiguration can restore a
   leg that isn't compiled in. This is the lethal-trifecta cut (private
   data + untrusted content + exfil channel) made structural.
+  (`tools-http-tls` extends the same leg to HTTPS; it implies
+  `tools-http`, obeys the same URL+method allowlist, and never follows
+  redirects — the policy decision applies to the exact URL reached.)
 - **Fail-closed least privilege.** Empty `[policy]` sections deny. The
   fs / env / http / shell / mcp allowlists gate every side effect;
   optional Rego (`policy-rego`) layers on top with AND semantics. Denials

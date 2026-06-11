@@ -440,6 +440,10 @@ tools-fs                fs handlers (read_file, write_file, create_dir)     [def
 tools-env               read_env                                             [default]
 tools-data              parse_json, json_select, template_render             [default]
 tools-http              http_request (outbound plain HTTP/1.1 client)
+tools-http-tls          https:// in http_request + the agent_loop http tool
+                        (ureq, rustls — same stack as intel-remote; implies
+                        tools-http; redirects never followed, so the policy
+                        allowlist decision stays exact)
 tools-shell             shell_run
 tools-mcp               (pre-declared; MCP is currently always compiled when used)
 
@@ -466,9 +470,9 @@ cargo build --release -p agentd \
     --no-default-features \
     --features "tools-fs tools-data"
 
-# Production HTTPS service
+# Production HTTPS service (in-process TLS + HTTPS outbound)
 cargo build --release -p agentd \
-    --features "auth server-tls tools-http tools-shell"
+    --features "auth server-tls tools-http-tls tools-shell"
 
 # Baked config (Mode B — RFC §11.2)
 AGENTD_EMBED_CONFIG=./my-workflow.toml cargo build --release -p agentd

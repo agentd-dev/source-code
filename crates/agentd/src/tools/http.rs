@@ -1,15 +1,19 @@
 //! Outbound HTTP tool (RFC §10.2).
 //!
 //! Plain HTTP/1.1, hand-rolled — zero external HTTP crate (same
-//! posture as the server in `triggers::http`). TLS is deliberately
-//! out of scope for R2; HTTPS URLs fail loudly with a pointer at
-//! the future `tools-http-tls` feature.
+//! posture as the server in `triggers::http`). With the
+//! `tools-http-tls` feature, `https://` URLs route through `ureq`
+//! (blocking, rustls — the same client stack `intel-remote` uses);
+//! without it they fail loudly. The plaintext path is byte-identical
+//! either way.
 //!
-//! One handler, two safety rails:
+//! One handler, two safety rails (both schemes):
 //!
 //! 1. **Policy gate.** `Policy::check_http_request` vets the
 //!    method + URL against the operator's allowlist before a
-//!    socket opens.
+//!    socket opens. The TLS client does NOT follow redirects — a
+//!    redirect could bounce an allowed URL to a non-allowed one, so
+//!    the policy decision stays exact.
 //! 2. **Size caps.** Request body ≤ 1 MiB, response body ≤ 1 MiB.
 //!    A malicious endpoint cannot OOM the runtime.
 //!
@@ -110,11 +114,10 @@ impl NodeHandler for HttpRequestHandler {
             None => None,
         };
 
-        let parsed = parse_url(&url)?;
         let outbound_traceparent = ctx.outbound_traceparent();
-        let response = perform_request(
+        let response = dispatch_request(
             &method_upper,
-            &parsed,
+            &url,
             body_bytes.as_deref(),
             outbound_traceparent.as_deref(),
         )?;
@@ -156,8 +159,7 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
             tool: "http_request".into(),
             reason: format!(
                 "https scheme not supported in this build \
-                 (rebuild with `--features tools-http-tls` when the TLS \
-                 client lands; URL: {url})"
+                 (rebuild with `--features tools-http-tls`; URL: {url})"
             ),
         });
     }
@@ -191,6 +193,135 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
         host,
         port,
         path_and_query: path_and_query.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Scheme dispatch
+// ---------------------------------------------------------------------------
+
+/// Route a vetted request to the right client: `https://` through the
+/// rustls-backed client (feature `tools-http-tls`), everything else
+/// through the hand-rolled plaintext HTTP/1.1 client. Policy, body
+/// caps, and dry-run are all enforced by the caller before this point.
+fn dispatch_request(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    traceparent: Option<&str>,
+) -> Result<HttpResponse> {
+    #[cfg(feature = "tools-http-tls")]
+    if url.starts_with("https://") {
+        return perform_request_tls(tls_agent(), method, url, body, traceparent);
+    }
+    let parsed = parse_url(url)?;
+    perform_request(method, &parsed, body, traceparent)
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS client (feature `tools-http-tls`)
+// ---------------------------------------------------------------------------
+
+/// Process-wide TLS client. Built once — the expensive part is the
+/// rustls `ClientConfig` (root-store load), not the connection.
+/// `redirects(0)` is a policy property, not a convenience choice: the
+/// allowlist vetted THIS url, so the client must not silently follow a
+/// `Location` to one it never vetted. A 3xx comes back to the workflow
+/// as a normal response (non-2xx → `error` branch).
+#[cfg(feature = "tools-http-tls")]
+fn tls_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        // A build that also carries `server-tls` links TWO rustls
+        // crypto providers (ring via ureq, aws-lc-rs via the server),
+        // so the process default must be chosen explicitly or the
+        // first TLS handshake panics. Mirror the server's choice;
+        // idempotent, first installer wins. Without `server-tls` only
+        // ring is linked and rustls auto-selects it.
+        #[cfg(feature = "server-tls")]
+        {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(DEFAULT_TIMEOUT)
+            .redirects(0)
+            .build()
+    })
+}
+
+/// Perform an HTTPS request through a supplied agent (tests inject one
+/// trusting a throwaway CA; production uses [`tls_agent`]). Mirrors the
+/// plaintext client's contract exactly: non-2xx statuses are responses
+/// (the handler routes them to the `error` branch), bodies are capped
+/// at [`MAX_RESPONSE_BODY_BYTES`], header names are lowercased, and a
+/// `traceparent` is propagated when the run carries one.
+#[cfg(feature = "tools-http-tls")]
+fn perform_request_tls(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    traceparent: Option<&str>,
+) -> Result<HttpResponse> {
+    let mut request = agent.request(method, url);
+    if body.is_some() {
+        request = request.set("content-type", "application/json");
+    }
+    if let Some(tp) = traceparent {
+        request = request.set("traceparent", tp);
+    }
+
+    let result = match body {
+        Some(b) => request.send_bytes(b),
+        None => request.call(),
+    };
+    // `ureq` models non-2xx as an error variant; for the tool they are
+    // ordinary responses — same contract as the plaintext client.
+    let response = match result {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_code, r)) => r,
+        Err(ureq::Error::Transport(t)) => {
+            return Err(Error::Tool {
+                tool: "http_request".into(),
+                reason: format!("https {url}: {t}"),
+            });
+        }
+    };
+
+    let status = response.status();
+    let mut headers = HashMap::new();
+    for name in response.headers_names() {
+        if let Some(value) = response.header(&name) {
+            headers.insert(name.to_ascii_lowercase(), value.to_string());
+        }
+    }
+
+    // Cap the body read; one extra byte detects truncation.
+    let mut body_buf = Vec::with_capacity(64 * 1024);
+    response
+        .into_reader()
+        .take(MAX_RESPONSE_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body_buf)
+        .map_err(|e| Error::Tool {
+            tool: "http_request".into(),
+            reason: format!("read body: {e}"),
+        })?;
+    if body_buf.len() > MAX_RESPONSE_BODY_BYTES {
+        body_buf.truncate(MAX_RESPONSE_BODY_BYTES);
+        tracing::warn!(
+            target: "agentd::audit",
+            event = "http_response.truncated",
+            cap_bytes = MAX_RESPONSE_BODY_BYTES,
+        );
+    }
+    let body_bytes_len = body_buf.len();
+    let body_string = String::from_utf8_lossy(&body_buf).into_owned();
+    Ok(HttpResponse {
+        status,
+        headers,
+        body_string,
+        body_bytes_len,
     })
 }
 
@@ -368,8 +499,7 @@ pub(crate) fn perform_for_loop(
             ),
         });
     }
-    let parsed = parse_url(url)?;
-    let response = perform_request(method, &parsed, body, traceparent)?;
+    let response = dispatch_request(method, url, body, traceparent)?;
     Ok(json!({
         "status": response.status,
         "headers": response.headers,
@@ -637,6 +767,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "tools-http-tls"))]
     #[test]
     fn https_is_rejected_with_clear_error() {
         let mut c = ctx(json!({ "url": "https://example.com/" }));
@@ -649,6 +780,152 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("https"), "msg: {msg}");
         assert!(msg.contains("tools-http-tls"), "msg: {msg}");
+    }
+
+    #[cfg(feature = "tools-http-tls")]
+    #[test]
+    fn https_is_accepted_in_dry_run() {
+        // With the feature on, an https URL passes the scheme gate;
+        // dry-run proves the vetting path without opening a socket.
+        let mut c = ctx(json!({ "url": "https://api.example.com/v1/x" }));
+        c.dry_run = true;
+        let h = HttpRequestHandler {
+            policy: allow_all(),
+        };
+        let out = h
+            .handle(&node("r", "POST", "trigger.url", None), &mut c)
+            .unwrap();
+        match out {
+            NodeOutcome::Continue { value, .. } => {
+                assert_eq!(value["dry_run"], true);
+                assert_eq!(value["url"], "https://api.example.com/v1/x");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[cfg(feature = "tools-http-tls")]
+    #[test]
+    fn https_policy_deny_blocks_before_network() {
+        struct DenyAll;
+        impl Policy for DenyAll {
+            fn check_http_request(&self, _m: &str, _u: &str) -> Decision {
+                Decision::Deny("denied by test".into())
+            }
+        }
+        // Port 1 — if the handler reached the network this would be a
+        // different error; the policy error proves the gate fired first.
+        let mut c = ctx(json!({ "url": "https://127.0.0.1:1/" }));
+        let h = HttpRequestHandler {
+            policy: Arc::new(DenyAll),
+        };
+        let err = h
+            .handle(&node("r", "GET", "trigger.url", None), &mut c)
+            .unwrap_err();
+        assert!(format!("{err}").contains("denied by test"));
+    }
+
+    /// Full TLS round-trip against an in-process rustls server with a
+    /// throwaway rcgen CA: proves request write, status/header/body
+    /// mapping, and the non-2xx contract over a real handshake. Needs
+    /// `server-tls` for the rustls server side (both are on under
+    /// `--all-features`, which CI runs).
+    #[cfg(all(feature = "tools-http-tls", feature = "server-tls"))]
+    mod tls_roundtrip {
+        use super::*;
+        use std::sync::Arc;
+
+        /// Both rustls providers are linked in this feature set; pick
+        /// one for the process before any config is built (idempotent).
+        fn install_provider() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+
+        fn spawn_tls_server(
+            status_line: &'static str,
+            body: &'static [u8],
+        ) -> (String, rustls::pki_types::CertificateDer<'static>) {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+            let key_der: rustls::pki_types::PrivateKeyDer<'static> =
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
+
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)
+                .unwrap();
+            let server_config = Arc::new(server_config);
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let url = format!("https://localhost:{port}/hook");
+
+            thread::spawn(move || {
+                let (mut tcp, _) = listener.accept().unwrap();
+                let mut conn = rustls::ServerConnection::new(server_config).unwrap();
+                let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+                // Read until end of request headers (these tests send
+                // header-only or small-body requests).
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = tls.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nX-Probe: tls\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                tls.write_all(response.as_bytes()).unwrap();
+                tls.write_all(body).unwrap();
+                tls.flush().unwrap();
+            });
+            (url, cert_der)
+        }
+
+        fn agent_trusting(cert: &rustls::pki_types::CertificateDer<'static>) -> ureq::Agent {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.clone()).unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(10))
+                .redirects(0)
+                .tls_config(Arc::new(client_config))
+                .build()
+        }
+
+        #[test]
+        fn https_get_round_trips_status_headers_body() {
+            install_provider();
+            let (url, cert) = spawn_tls_server("200 OK", b"secure hello");
+            let agent = agent_trusting(&cert);
+            let resp = perform_request_tls(&agent, "GET", &url, None, None).unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body_string, "secure hello");
+            assert_eq!(resp.body_bytes_len, 12);
+            assert_eq!(resp.headers.get("x-probe").map(String::as_str), Some("tls"));
+        }
+
+        #[test]
+        fn https_non_2xx_is_a_response_not_an_error() {
+            // ureq models 4xx/5xx as Err(Status); the tool contract
+            // says they are responses (the handler routes the `error`
+            // branch). Verify the mapping.
+            install_provider();
+            let (url, cert) = spawn_tls_server("503 Service Unavailable", b"down");
+            let agent = agent_trusting(&cert);
+            let resp = perform_request_tls(&agent, "GET", &url, None, None).unwrap();
+            assert_eq!(resp.status, 503);
+            assert_eq!(resp.body_string, "down");
+        }
     }
 
     #[test]

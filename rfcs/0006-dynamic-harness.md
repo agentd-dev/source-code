@@ -136,9 +136,12 @@ the backend named by the instructions file's `default_backend` against
 `AGENTD_GOAL_BACKEND=provider:model` for a zero-TOML run.
 
 The plan is a file. It can be saved (`--plan-out`), diffed, signed, and
-**promoted** (`--promote PATH`, which prepends provenance — the
-instruction it came from and the planner-attempt count) into a Mode-1
-workflow. This is the resolution of the dynamic-vs-bounded tension:
+**promoted** (`--promote PATH`) into a Mode-1 workflow. Promotion writes
+a *self-contained* workflow: the generated graph plus a provenance
+header plus the `--config` base environment (`[policy]`,
+`[[intelligence.backends]]`, budgets, signing) carried over, so the
+promoted file validates and runs standalone — no longer paired with the
+base config. This is the resolution of the dynamic-vs-bounded tension:
 instruction mode is the *design-time* fast path; the promoted, signed,
 versioned workflow is the *production* path. Dynamism collapses to a
 bound — the intended lifecycle for anything that proves itself.

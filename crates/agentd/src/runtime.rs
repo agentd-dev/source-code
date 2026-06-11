@@ -28,7 +28,7 @@
 //! default is wrong.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1914,22 +1914,39 @@ fn run_instruction_mode(
     // workflow artifact — the static Mode-1 form of this dynamism, so
     // it stops being re-generated each run.
     if let Some(path) = &args.promote {
-        let body = format!(
-            "{}{}",
-            promote_header(&instruction, plan.attempts),
-            plan.source
-        );
+        let body = match build_promoted(
+            &instruction,
+            plan.attempts,
+            &plan.source,
+            args.config.as_deref(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("agentd: promote: {e}");
+                return ExitCode::from(EXIT_SEMANTIC);
+            }
+        };
         if let Err(e) = fs::write(path, body) {
             eprintln!("agentd: failed to promote plan to {}: {e}", path.display());
             return ExitCode::from(EXIT_SEMANTIC);
         }
-        eprintln!(
-            "agentd: promoted to {} — add/confirm its [policy] and \
-             [[intelligence.backends]] (see the summary above), sign it, then \
-             run it directly with --config {}",
-            path.display(),
-            path.display(),
-        );
+        if args.config.is_some() {
+            eprintln!(
+                "agentd: promoted a self-contained workflow to {} (graph + the base \
+                 config's policy / backends / budgets) — review, sign, then run it \
+                 directly with --config {}",
+                path.display(),
+                path.display(),
+            );
+        } else {
+            eprintln!(
+                "agentd: promoted the graph to {} — add a [policy] + \
+                 [[intelligence.backends]] (see the summary above), sign it, then run \
+                 with --config {}",
+                path.display(),
+                path.display(),
+            );
+        }
     }
 
     // Raw TOML only when explicitly requested, so the default approval
@@ -2024,9 +2041,57 @@ fn promote_header(instruction: &str, attempts: u32) -> String {
         "# Promoted agentd workflow — compiled from an instruction, then approved.\n\
          # Instruction: {snippet}\n\
          # Planner attempts: {attempts}.\n\
-         # Before production: confirm the [policy] and [[intelligence.backends]] this\n\
-         # plan needs (see the capability summary printed at promotion), then sign it.\n\n"
+         # Review and sign this file before running it in production.\n\n"
     )
+}
+
+/// Assemble a `--promote`d workflow: the provenance header, the
+/// generated graph, and — when a `--config` base environment was used —
+/// its `[policy]` / `[[intelligence.backends]]` / budgets / signing
+/// carried over, so the promoted file is self-contained and runnable on
+/// its own. Without a base config it is the graph alone.
+fn build_promoted(
+    instruction: &str,
+    attempts: u32,
+    graph_source: &str,
+    base_config: Option<&Path>,
+) -> std::result::Result<String, String> {
+    let header = promote_header(instruction, attempts);
+    let env = match base_config {
+        Some(p) => extract_environment_toml(p)?,
+        None => String::new(),
+    };
+    Ok(format!("{header}{graph_source}{env}"))
+}
+
+/// Read the base config and serialise everything *except* the graph
+/// keys (the generated plan supplies those) — the environment the
+/// promoted workflow needs to run standalone. Serialised from a parsed
+/// `toml::Table`, which round-trips cleanly (TOML has no nulls).
+fn extract_environment_toml(path: &Path) -> std::result::Result<String, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("read base config {}: {e}", path.display()))?;
+    let mut table: toml::Table =
+        toml::from_str(&text).map_err(|e| format!("parse base config {}: {e}", path.display()))?;
+    for key in [
+        "name",
+        "description",
+        "start_nodes",
+        "triggers",
+        "http_routes",
+        "nodes",
+        "edges",
+    ] {
+        table.remove(key);
+    }
+    if table.is_empty() {
+        return Ok(String::new());
+    }
+    let env = toml::to_string(&table).map_err(|e| format!("serialise environment: {e}"))?;
+    Ok(format!(
+        "\n# --- environment (policy / backends / budgets / signing) carried from \
+         the base config ---\n{env}"
+    ))
 }
 
 /// Build the client the planner uses to compile the workflow.
@@ -2549,5 +2614,31 @@ mod tests {
         let names = resolve_backend_names(Some(&base), &with_socket);
         assert_eq!(names.first().map(String::as_str), Some("default"));
         assert!(names.contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn promote_carries_base_environment_and_strips_its_graph() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        std::fs::write(
+            &base,
+            "name = \"env\"\n[policy.fs]\nwrite = [\"/tmp/out/**\"]\n\
+             [[nodes]]\nid = \"placeholder\"\ntype = \"terminate\"\n",
+        )
+        .unwrap();
+        let graph = "name = \"plan\"\n[[start_nodes]]\nname=\"m\"\nsource=\"manual\"\n\
+                     entry_node=\"a\"\n[[nodes]]\nid=\"a\"\ntype=\"terminate\"\n";
+
+        let out = build_promoted("do x", 1, graph, Some(&base)).unwrap();
+        assert!(out.contains("name = \"plan\""), "keeps the generated graph");
+        assert!(out.contains("[policy.fs]"), "carries the base policy");
+        assert!(out.contains("/tmp/out/**"));
+        // The base config's own graph nodes are stripped, not carried.
+        assert!(!out.contains("placeholder"), "base graph must be stripped");
+
+        // No base config → graph only, no environment.
+        let bare = build_promoted("do x", 1, graph, None).unwrap();
+        assert!(!bare.contains("[policy"));
+        assert!(bare.contains("name = \"plan\""));
     }
 }

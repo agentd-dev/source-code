@@ -356,6 +356,8 @@ impl Engine {
                 self.run_call(node, &mut ctx, depth)
             } else if matches!(node.kind, crate::workflow::NodeKind::Parallel { .. }) {
                 self.run_parallel(node, &mut ctx, depth)
+            } else if matches!(node.kind, crate::workflow::NodeKind::Map { .. }) {
+                self.run_map(node, &mut ctx, depth)
             } else {
                 dispatch_with_retry(&self.registry, node, &mut ctx)
             };
@@ -798,6 +800,135 @@ impl Engine {
         })
     }
 
+    /// `map`: one child run per element of a context-resolved array,
+    /// in waves of `max_concurrent`. The mandatory `max_items` is a
+    /// contract — an oversized list is a hard error, never a silent
+    /// truncation. Output and failure semantics mirror `parallel`:
+    /// `{results, ok}` in input order, any element failure routes the
+    /// `error` branch.
+    fn run_map(
+        &self,
+        node: &crate::workflow::Node,
+        ctx: &mut ExecutionContext,
+        depth: u32,
+    ) -> Result<NodeOutcome> {
+        let crate::workflow::NodeKind::Map {
+            items_from,
+            workflow,
+            start,
+            max_items,
+            max_concurrent,
+        } = &node.kind
+        else {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!("node `{}` dispatched as map but is not one", node.id),
+            });
+        };
+        if depth + 1 > MAX_CALL_DEPTH {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!("call depth exceeded {MAX_CALL_DEPTH} at node `{}`", node.id),
+            });
+        }
+
+        let items = match ctx.resolve_path(items_from) {
+            Some(Value::Array(items)) => items.clone(),
+            Some(other) => {
+                return Err(Error::Workflow {
+                    workflow: ctx.workflow_id.clone(),
+                    reason: format!(
+                        "map node `{}`: items_from `{items_from}` resolved to {} — an array is required",
+                        node.id,
+                        kind_of(other)
+                    ),
+                });
+            }
+            None => {
+                return Err(Error::Workflow {
+                    workflow: ctx.workflow_id.clone(),
+                    reason: format!(
+                        "map node `{}`: items_from `{items_from}` is not set in the execution context",
+                        node.id
+                    ),
+                });
+            }
+        };
+        // The declared bound is a contract; exceeding it is loud.
+        if items.len() > *max_items as usize {
+            return Err(Error::Workflow {
+                workflow: ctx.workflow_id.clone(),
+                reason: format!(
+                    "map node `{}`: {} items exceed the declared max_items {} — \
+                     raise the bound deliberately or shrink the input",
+                    node.id,
+                    items.len(),
+                    max_items
+                ),
+            });
+        }
+        if items.is_empty() {
+            return Ok(NodeOutcome::Continue {
+                value: serde_json::json!({ "results": [], "ok": true }),
+                branch: None,
+            });
+        }
+
+        let dry = ctx.dry_run;
+        let child_depth = depth + 1;
+        let wave = (*max_concurrent).unwrap_or(4).max(1) as usize;
+
+        let mut results: Vec<std::result::Result<Value, String>> = Vec::with_capacity(items.len());
+        for chunk in items.chunks(wave) {
+            // Recompute the remaining deadline per wave so a slow early
+            // wave shrinks the budget of later ones.
+            let remaining = ctx.deadline.saturating_duration_since(Instant::now());
+            let wave_results: Vec<std::result::Result<Value, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|item| {
+                        let input = item.clone();
+                        s.spawn(move || {
+                            self.run_child_workflow(
+                                workflow,
+                                input,
+                                start.as_deref(),
+                                remaining,
+                                dry,
+                                child_depth,
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err("map element panicked".to_string()))
+                    })
+                    .collect()
+            });
+            results.extend(wave_results);
+        }
+
+        let any_err = results.iter().any(|r| r.is_err());
+        let arr: Vec<Value> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => serde_json::json!({ "result": v }),
+                Err(e) => serde_json::json!({ "error": e }),
+            })
+            .collect();
+        Ok(NodeOutcome::Continue {
+            value: serde_json::json!({ "results": arr, "ok": !any_err }),
+            branch: if any_err {
+                Some("error".to_string())
+            } else {
+                None
+            },
+        })
+    }
+
     /// Load, validate, and run one child workflow to completion, sharing
     /// the parent's remaining deadline. Returns the child's final value
     /// or a human-readable failure reason. Shared by `call` and
@@ -854,6 +985,18 @@ impl Engine {
                 Err("sub-workflow paused; nested pause_for_approval is not supported".to_string())
             }
         }
+    }
+}
+
+/// Human-readable JSON type name for error messages.
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -1380,6 +1523,203 @@ mod tests {
         // The call node's output carries the child's result.
         let greet = &trace.entries[0];
         assert_eq!(greet.output["result"]["rendered"], "hi there");
+    }
+
+    #[test]
+    #[cfg(feature = "tools-data")] // the child uses template_render
+    fn map_runs_one_child_per_item_in_input_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let child_path = dir.path().join("child.toml");
+        std::fs::write(
+            &child_path,
+            r#"
+            name = "labeller"
+            [[start_nodes]]
+            name = "main"
+            source = "manual"
+            entry_node = "render"
+            [[nodes]]
+            id = "render"
+            type = "template_render"
+            template = "n={{n}}"
+            input_from = "trigger"
+            "#,
+        )
+        .unwrap();
+
+        let wf = WorkflowDoc {
+            name: "parent".into(),
+            start_nodes: vec![start("main", "fan")],
+            nodes: vec![
+                n(
+                    "fan",
+                    NodeKind::Map {
+                        items_from: "trigger.items".into(),
+                        workflow: child_path.to_string_lossy().replace('\\', "/"),
+                        start: None,
+                        max_items: 10,
+                        max_concurrent: Some(2),
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("fan", "done", None)],
+            ..Default::default()
+        };
+        let engine = {
+            let mut r = HandlerRegistry::with_builtin_controls();
+            crate::tools::register_default_tools(
+                &mut r,
+                crate::tools::policy::allow_all(),
+                crate::budget::unbounded(),
+            );
+            r.set_fallback(Box::new(StubHandler));
+            Engine::new(r)
+        };
+        let (out, trace) = engine
+            .run_with_trace(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({"items": [{"n": 1}, {"n": 2}, {"n": 3}]})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        let fan = &trace.entries[0];
+        assert_eq!(fan.output["ok"], true);
+        let results = fan.output["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        // Input order survives the waves (wave size 2 over 3 items).
+        assert_eq!(results[0]["result"]["rendered"], "n=1");
+        assert_eq!(results[1]["result"]["rendered"], "n=2");
+        assert_eq!(results[2]["result"]["rendered"], "n=3");
+    }
+
+    #[test]
+    fn map_bound_violation_is_a_hard_error() {
+        let wf = WorkflowDoc {
+            name: "parent".into(),
+            start_nodes: vec![start("main", "fan")],
+            nodes: vec![
+                n(
+                    "fan",
+                    NodeKind::Map {
+                        items_from: "trigger.items".into(),
+                        workflow: "does-not-matter.toml".into(),
+                        start: None,
+                        max_items: 2,
+                        max_concurrent: None,
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("fan", "done", None)],
+            ..Default::default()
+        };
+        let err = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({"items": [1, 2, 3]})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("max_items"), "{msg}");
+        assert!(msg.contains('3'), "{msg}");
+    }
+
+    #[test]
+    fn map_non_array_items_is_a_hard_error_and_empty_is_ok() {
+        let mk = |items_from: &str| WorkflowDoc {
+            name: "parent".into(),
+            start_nodes: vec![start("main", "fan")],
+            nodes: vec![
+                n(
+                    "fan",
+                    NodeKind::Map {
+                        items_from: items_from.into(),
+                        workflow: "unused.toml".into(),
+                        start: None,
+                        max_items: 5,
+                        max_concurrent: None,
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("fan", "done", None)],
+            ..Default::default()
+        };
+        // Scalar → hard error naming the type.
+        let err = engine_with_stub()
+            .run(
+                &mk("trigger.n"),
+                "main",
+                TriggerMeta::manual(json!({"n": 7, "empty": []})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("array is required"), "{err}");
+        // Empty array → clean completion, ok=true, no child runs.
+        let (out, trace) = engine_with_stub()
+            .run_with_trace(
+                &mk("trigger.empty"),
+                "main",
+                TriggerMeta::manual(json!({"n": 7, "empty": []})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+        assert_eq!(
+            trace.entries[0].output["results"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(trace.entries[0].output["ok"], true);
+    }
+
+    #[test]
+    fn map_element_failure_routes_error_branch() {
+        // Child workflow file doesn't exist — every element fails; the
+        // map joins with ok=false and routes the declared error edge.
+        let wf = WorkflowDoc {
+            name: "parent".into(),
+            start_nodes: vec![start("main", "fan")],
+            nodes: vec![
+                n(
+                    "fan",
+                    NodeKind::Map {
+                        items_from: "trigger.items".into(),
+                        workflow: "definitely-missing.toml".into(),
+                        start: None,
+                        max_items: 5,
+                        max_concurrent: None,
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+                n(
+                    "fanned_failed",
+                    NodeKind::Fail {
+                        reason: Some("an element failed".into()),
+                    },
+                ),
+            ],
+            edges: vec![
+                e("fan", "done", None),
+                e("fan", "fanned_failed", Some("error")),
+            ],
+            ..Default::default()
+        };
+        let out = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({"items": [1]})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            matches!(out, ExecutionOutcome::Failed { ref reason, .. } if reason.contains("element failed"))
+        );
     }
 
     #[test]

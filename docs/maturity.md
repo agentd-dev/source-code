@@ -52,7 +52,7 @@ surface is trimmed — see §1.5).
 |---|---|---|
 | TOML parse + structural validation | Green | `deny_unknown_fields` on every struct; 100+ parser tests. |
 | Full validator (acyclicity, reachability, start-node shape, fan-in/out, edge / route / trigger integrity) | Green | Kahn + BFS implementations; tests cover every error code. |
-| Node execution dispatch (23 kinds) | Green | All 23 kinds wired and tested. |
+| Node execution dispatch (24 kinds) | Green | All 24 kinds wired and tested. |
 | `ExecutionContext::resolve_path` (single dotted-path lookup) | Green | Every node input flows through it; property-like tests in `context.rs`. |
 | Condition / switch / merge / fail / terminate control flow | Green | Branch selection, merge barrier, fail propagation all covered by fixture tests. |
 | Retry (per-node, `max_attempts` + `backoff_ms` + `on: Any\|Transient`, optional `jitter`) | Green | Bounded; deterministic by default (`jitter = 0.0`). Operator opts in to bounded random jitter `∈ [1-j, 1+j]` (clamp `[0.0, 0.5]`) to avoid thundering-herd retries. See §2.11. |

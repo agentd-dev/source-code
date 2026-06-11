@@ -528,6 +528,41 @@ branches = [
   bound; branch inputs are resolved from the parent context before any
   thread starts, so branches share nothing mutable.
 
+#### `map`
+
+"For each X, do the bounded thing": run **one sub-workflow per element
+of a context-resolved array**. Where `parallel` fans out over *declared*
+branches, `map` fans out over *data* — under a bound that is mandatory
+by design.
+
+```toml
+[[nodes]]
+id = "score_each"
+type = "map"
+items_from = "accounts.parsed"          # must resolve to a JSON array
+workflow = "workflows/score-account.toml"
+max_items = 500                          # REQUIRED — the bound is the point
+max_concurrent = 8                       # optional; default 4
+start = "main"                           # optional; child's first otherwise
+```
+
+- Each element becomes one child run's trigger input; elements run in
+  waves of `max_concurrent` on scoped threads.
+- Output: `{ "results": [ {"result": …} | {"error": …}, … ], "ok": bool }`
+  in **input order**; any element failing sets `ok = false` and routes
+  the `error` branch — exactly `parallel`'s contract.
+- **An oversized list is a hard error, never a silent truncation**:
+  `items.len() > max_items` aborts the run with a message telling you to
+  raise the bound deliberately or shrink the input. A non-array
+  `items_from` is also a hard error; an empty array completes cleanly
+  with `results: []`.
+- Address individual results positionally with array-index paths:
+  `score_each.results.0.result`.
+- Budgets (`max_llm_tokens`, fs-write, …) and the deadline stay
+  process-wide — a map cannot out-spend the run's envelope. The
+  validator requires `max_items >= 1` (and `max_concurrent >= 1` when
+  set); the depth bound (`MAX_CALL_DEPTH = 8`) applies as with `call`.
+
 ### 1.5 Control
 
 Drive the traversal. No side effects. Always compiled.
@@ -1215,7 +1250,7 @@ fixture's `[mocks]`, runs the engine, and diffs against `[expected]`.
 | Not supported | Why |
 |---|---|
 | Unbounded cycles | Acyclicity is the termination guarantee. A *bounded* cycle is allowed via a `max_iterations` loop edge — the only cycle the validator admits. |
-| Open-ended parallelism | The main walk is sequential. Concurrency is a *declared* exception: a `parallel` node fans out to sub-workflows and joins — no free-form fork/join. |
+| Open-ended parallelism | The main walk is sequential. Concurrency is a *declared* exception: `parallel` fans out over declared branches, `map` over a bounded array — no free-form fork/join. |
 | Arbitrary shell (`sh -c "..."`) | `shell_run` is argv-only — injection-safe by construction |
 | Dynamic plugin loading | Compile-time-only capability surface |
 | LLM-invented tool calls | Intelligence is a bounded reasoning step; it can't add edges or capabilities |

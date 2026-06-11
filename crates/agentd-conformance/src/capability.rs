@@ -74,6 +74,11 @@ static MATRIX: &[Capability] = &[
         "composition",
         "run sub-workflows concurrently, then join",
     ),
+    c(
+        "map",
+        "composition",
+        "one bounded sub-workflow per array element",
+    ),
     c("call_mcp_tool", "mcp", "invoke an MCP tool"),
     c("read_mcp_resource", "mcp", "read an MCP resource"),
     // Intelligence.

@@ -35,9 +35,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::engine::{
-    Engine, ExecutionOutcome, HandlerRegistry, RunOptions, StubHandler, TriggerMeta,
-};
+use crate::engine::{Engine, ExecutionOutcome, HandlerRegistry, RunOptions, TriggerMeta};
 use crate::workflow::{self, WorkflowDoc};
 
 pub const EXIT_OK: u8 = 0;
@@ -865,7 +863,13 @@ fn build_engine(doc: &WorkflowDoc, args: &Args) -> Result<Engine, ExitCode> {
         );
     }
 
-    registry.set_fallback(Box::new(StubHandler));
+    // NO fallback handler in production: a node kind whose tool family
+    // isn't compiled in must fail loudly with CapabilityUnavailable
+    // ("rebuild with --features …"), never silently stub. The
+    // StubHandler is a test-harness affordance only — a leftover
+    // fallback here made `http_request` on a non-tools-http build
+    // return `{"stub": …}` and complete the run, which is exactly the
+    // silent-degradation failure mode this runtime exists to prevent.
     Ok(Engine::with_metrics(registry, metrics)
         .with_state_dir(args.state_dir.clone())
         .with_checkpoint_each_node(args.checkpoint_each_node)

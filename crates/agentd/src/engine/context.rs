@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Per-run execution context. Handlers mutate `node_outputs` and
@@ -168,7 +169,8 @@ impl TriggerMeta {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TriggerKind {
     Manual,
     Http,
@@ -176,11 +178,23 @@ pub enum TriggerKind {
 }
 
 impl TriggerKind {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             TriggerKind::Manual => "manual",
             TriggerKind::Http => "http",
             TriggerKind::Event => "event",
+        }
+    }
+}
+
+impl TriggerMeta {
+    /// Rebuild a trigger from a checkpoint's persisted kind + input
+    /// (the ephemeral trace context is not carried across a resume).
+    pub fn from_kind(kind: TriggerKind, input: Value) -> Self {
+        Self {
+            kind,
+            input,
+            trace_context: None,
         }
     }
 }

@@ -35,7 +35,15 @@ static EXEC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 fn next_execution_id() -> String {
     let n = EXEC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("exec-{n:08x}")
+    // A per-process counter alone resets to 1 every invocation, which
+    // would collide checkpoint files across separate runs. Mix in the
+    // wall-clock second and the pid so a run id is unique across
+    // processes (for `--resume`) while staying sortable and terse.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("exec-{secs:x}-{:x}-{n:x}", std::process::id())
 }
 
 pub struct Engine {
@@ -47,6 +55,10 @@ pub struct Engine {
     /// through these handles takes effect on the next check without
     /// rebuilding the registry.
     pub reload: ReloadHandles,
+    /// Where `pause_for_approval` writes checkpoints, and where
+    /// `resume` reads them. `None` → a `pause_for_approval` node is a
+    /// configuration error (no place to persist the run).
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 /// Handles for components the runtime can hot-swap on SIGHUP. Each
@@ -91,6 +103,7 @@ impl Engine {
             registry,
             metrics: Metrics::new(),
             reload: ReloadHandles::default(),
+            state_dir: None,
         }
     }
 
@@ -102,7 +115,15 @@ impl Engine {
             registry,
             metrics,
             reload: ReloadHandles::default(),
+            state_dir: None,
         }
+    }
+
+    /// Set the directory where `pause_for_approval` checkpoints are
+    /// written and `resume` reads them.
+    pub fn with_state_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.state_dir = dir;
+        self
     }
 
     /// Attach hot-reload handles after construction. Returned by
@@ -156,7 +177,7 @@ impl Engine {
         // 2) Build the context.
         let execution_id = next_execution_id();
         trace.execution_id = execution_id.clone();
-        let mut ctx = ExecutionContext::new(
+        let ctx = ExecutionContext::new(
             execution_id.clone(),
             workflow.name.clone(),
             start_name,
@@ -177,8 +198,85 @@ impl Engine {
         let _run_guard = workflow_span.enter();
         info!(target: "agentd::audit", event = "workflow.started");
 
-        // 3) Walk the DAG.
-        let mut current_id = entry_id.to_string();
+        // 3) Walk the DAG. Extracted into `walk_loop` so `resume` can
+        // re-enter the same traversal at a checkpoint.
+        self.walk_loop(workflow, ctx, entry_id.to_string(), trace)
+    }
+
+    /// Resume a paused run: rebuild the context from its checkpoint and
+    /// continue at the node after the pause. A resumed run gets a fresh
+    /// deadline; on any terminal outcome the checkpoint is discarded.
+    pub fn resume(
+        &self,
+        workflow: &WorkflowDoc,
+        checkpoint: crate::engine::checkpoint::Checkpoint,
+        options: RunOptions,
+    ) -> Result<(ExecutionOutcome, ExecutionTrace)> {
+        if checkpoint.workflow != workflow.name {
+            return Err(Error::Workflow {
+                workflow: workflow.name.clone(),
+                reason: format!(
+                    "checkpoint is for workflow `{}`, not `{}`",
+                    checkpoint.workflow, workflow.name
+                ),
+            });
+        }
+        self.metrics.inc_workflow_started();
+        let trace = ExecutionTrace::new(checkpoint.run_id.clone());
+
+        let workflow_span = info_span!(
+            "workflow.run",
+            execution_id = %checkpoint.run_id,
+            workflow_id = %workflow.name,
+            start_node = %checkpoint.start_node,
+            dry_run = options.dry_run,
+        );
+        let _run_guard = workflow_span.enter();
+        info!(
+            target: "agentd::audit",
+            event = "workflow.resumed",
+            paused_at = %checkpoint.paused_at,
+        );
+
+        let Some(resume_node) = checkpoint.resume_node.clone() else {
+            // The pause node had no successor — resuming just completes.
+            self.metrics.inc_workflow_completed();
+            return Ok((
+                ExecutionOutcome::Completed {
+                    final_value: Value::Null,
+                    last_node: Some(checkpoint.paused_at.clone()),
+                },
+                trace,
+            ));
+        };
+
+        let mut ctx = ExecutionContext::new(
+            checkpoint.run_id.clone(),
+            workflow.name.clone(),
+            checkpoint.start_node.clone(),
+            TriggerMeta::from_kind(checkpoint.trigger_kind, checkpoint.trigger_input.clone()),
+            &options,
+        );
+        // Restore the accumulated node outputs from before the pause.
+        ctx.node_outputs = checkpoint.node_outputs.clone();
+
+        let result = self.walk_loop(workflow, ctx, resume_node, trace);
+        if let (Some(dir), Ok((outcome, _))) = (self.state_dir.as_ref(), &result) {
+            if !matches!(outcome, ExecutionOutcome::Paused { .. }) {
+                crate::engine::checkpoint::Checkpoint::discard(dir, &checkpoint.run_id);
+            }
+        }
+        result
+    }
+
+    /// The DAG traversal itself, shared by a fresh run and a resume.
+    fn walk_loop(
+        &self,
+        workflow: &WorkflowDoc,
+        mut ctx: ExecutionContext,
+        mut current_id: String,
+        mut trace: ExecutionTrace,
+    ) -> Result<(ExecutionOutcome, ExecutionTrace)> {
         let started_at = Instant::now();
 
         for _step in 0..MAX_STEPS {
@@ -206,6 +304,14 @@ impl Engine {
                 reason: format!("node `{current_id}` referenced in traversal is not declared"),
             })?;
             ctx.current_node_id = Some(current_id.clone());
+
+            // pause_for_approval: the engine checkpoints and suspends
+            // here instead of dispatching to a handler.
+            if let crate::workflow::NodeKind::PauseForApproval { reason } = &node.kind {
+                let reason = reason.clone();
+                let outcome = self.pause_run(workflow, &ctx, &current_id, reason, &mut trace)?;
+                return Ok((outcome, trace));
+            }
 
             // Per-node span. Everything the handler emits nests.
             let node_span = info_span!(
@@ -353,6 +459,65 @@ impl Engine {
                 "safety cap hit: engine walked {MAX_STEPS} nodes without reaching a \
                  terminal outcome (cycle slipped past the validator?)"
             ),
+        })
+    }
+
+    /// Write a checkpoint for a `pause_for_approval` node and return the
+    /// `Paused` outcome. The resume node is this node's single
+    /// successor; a missing state directory is a configuration error.
+    fn pause_run(
+        &self,
+        workflow: &WorkflowDoc,
+        ctx: &ExecutionContext,
+        node_id: &str,
+        reason: Option<String>,
+        trace: &mut ExecutionTrace,
+    ) -> Result<ExecutionOutcome> {
+        let Some(dir) = self.state_dir.clone() else {
+            self.metrics.inc_workflow_errored();
+            return Err(Error::Workflow {
+                workflow: workflow.name.clone(),
+                reason: format!(
+                    "node `{node_id}` is pause_for_approval but no state directory is \
+                     configured (set --state-dir) — nowhere to checkpoint the run"
+                ),
+            });
+        };
+        let resume_node = pick_next(workflow, node_id, None)?;
+        let checkpoint = crate::engine::checkpoint::Checkpoint {
+            run_id: ctx.execution_id.clone(),
+            workflow: workflow.name.clone(),
+            start_node: ctx.start_node.clone(),
+            trigger_kind: ctx.trigger.kind,
+            trigger_input: ctx.trigger.input.clone(),
+            node_outputs: ctx.node_outputs.clone(),
+            paused_at: node_id.to_string(),
+            resume_node,
+            reason: reason.clone(),
+        };
+        let path = checkpoint.save(&dir).map_err(|e| Error::Workflow {
+            workflow: workflow.name.clone(),
+            reason: format!("checkpoint: {e}"),
+        })?;
+        trace.entries.push(TraceEntry {
+            node_id: node_id.to_string(),
+            kind: "pause_for_approval".to_string(),
+            outcome: "pause",
+            branch: None,
+            output: Value::Null,
+            elapsed_ms: 0,
+        });
+        info!(
+            target: "agentd::audit",
+            event = "workflow.paused",
+            node = %node_id,
+            run_id = %ctx.execution_id,
+            checkpoint = %path.display(),
+        );
+        Ok(ExecutionOutcome::Paused {
+            run_id: ctx.execution_id.clone(),
+            last_node: Some(node_id.to_string()),
+            reason,
         })
     }
 }
@@ -580,6 +745,81 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(out, ExecutionOutcome::Completed { .. }));
+    }
+
+    #[test]
+    fn pause_then_resume_completes() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "a")],
+            nodes: vec![
+                n("a", NodeKind::Merge),
+                n(
+                    "gate",
+                    NodeKind::PauseForApproval {
+                        reason: Some("ok?".into()),
+                    },
+                ),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("a", "gate", None), e("gate", "done", None)],
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut r = HandlerRegistry::with_builtin_controls();
+        r.set_fallback(Box::new(StubHandler));
+        let engine = Engine::new(r).with_state_dir(Some(dir.path().to_path_buf()));
+
+        let (out, trace) = engine
+            .run_with_trace(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap();
+        let run_id = match &out {
+            ExecutionOutcome::Paused {
+                run_id, last_node, ..
+            } => {
+                assert_eq!(last_node.as_deref(), Some("gate"));
+                run_id.clone()
+            }
+            other => panic!("expected paused, got {other:?}"),
+        };
+        assert_eq!(trace.node_ids(), vec!["a", "gate"]);
+
+        let cp = crate::engine::checkpoint::Checkpoint::load(dir.path(), &run_id).unwrap();
+        assert_eq!(cp.resume_node.as_deref(), Some("done"));
+
+        let (out2, trace2) = engine.resume(&wf, cp, RunOptions::default()).unwrap();
+        assert!(matches!(out2, ExecutionOutcome::Completed { .. }));
+        assert_eq!(trace2.node_ids(), vec!["done"]);
+        // The checkpoint retires once the resumed run reaches a terminal.
+        assert!(crate::engine::checkpoint::Checkpoint::load(dir.path(), &run_id).is_err());
+    }
+
+    #[test]
+    fn pause_without_state_dir_is_an_error() {
+        let wf = WorkflowDoc {
+            name: "wf".into(),
+            start_nodes: vec![start("main", "gate")],
+            nodes: vec![
+                n("gate", NodeKind::PauseForApproval { reason: None }),
+                n("done", NodeKind::Terminate),
+            ],
+            edges: vec![e("gate", "done", None)],
+            ..Default::default()
+        };
+        let err = engine_with_stub()
+            .run(
+                &wf,
+                "main",
+                TriggerMeta::manual(json!({})),
+                RunOptions::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("state directory"), "{err}");
     }
 
     #[test]

@@ -180,7 +180,8 @@ impl RunResult {
             RunResult::Ran(o, _) => match o {
                 ExecutionOutcome::Completed { last_node, .. }
                 | ExecutionOutcome::Failed { last_node, .. }
-                | ExecutionOutcome::TimedOut { last_node, .. } => last_node.clone(),
+                | ExecutionOutcome::TimedOut { last_node, .. }
+                | ExecutionOutcome::Paused { last_node, .. } => last_node.clone(),
             },
             RunResult::Errored(_) => None,
         }

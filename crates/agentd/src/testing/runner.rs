@@ -227,11 +227,7 @@ fn diff_expected(
 
     // `status` check
     if let Some(want) = &expected.status {
-        let got = match outcome {
-            ExecutionOutcome::Completed { .. } => "completed",
-            ExecutionOutcome::Failed { .. } => "failed",
-            ExecutionOutcome::TimedOut { .. } => "timed_out",
-        };
+        let got = outcome.status_label();
         if want != got {
             out.push(format!("status mismatch: expected `{want}`, got `{got}`"));
         }
@@ -240,9 +236,10 @@ fn diff_expected(
     // `last_node` check
     if let Some(want) = &expected.last_node {
         let got = match outcome {
-            ExecutionOutcome::Completed { last_node, .. } => last_node.clone(),
-            ExecutionOutcome::Failed { last_node, .. } => last_node.clone(),
-            ExecutionOutcome::TimedOut { last_node, .. } => last_node.clone(),
+            ExecutionOutcome::Completed { last_node, .. }
+            | ExecutionOutcome::Failed { last_node, .. }
+            | ExecutionOutcome::TimedOut { last_node, .. }
+            | ExecutionOutcome::Paused { last_node, .. } => last_node.clone(),
         };
         if got.as_deref() != Some(want.as_str()) {
             out.push(format!(

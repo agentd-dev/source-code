@@ -56,6 +56,15 @@ impl RunRecord {
                 last_node.clone(),
                 json!({ "elapsed_ms": elapsed.as_millis() as u64 }),
             ),
+            ExecutionOutcome::Paused {
+                run_id,
+                last_node,
+                reason,
+            } => (
+                "paused",
+                last_node.clone(),
+                json!({ "run_id": run_id, "reason": reason }),
+            ),
         };
         Self {
             workflow: workflow.into(),

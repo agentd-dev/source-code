@@ -845,6 +845,9 @@ fn handle_one_request<S: std::io::Read + Write>(
                 ExecutionOutcome::Completed { .. } => Status::new(200, "OK"),
                 ExecutionOutcome::Failed { .. } => Status::new(422, "Unprocessable Entity"),
                 ExecutionOutcome::TimedOut { .. } => Status::new(504, "Gateway Timeout"),
+                // A run that paused for approval is accepted but not
+                // complete; the body carries the run_id to resume.
+                ExecutionOutcome::Paused { .. } => Status::new(202, "Accepted"),
             };
             write_response_with_header(stream, status, &outcome, &connection_headers(keep_alive))?;
             Ok(keep_alive)

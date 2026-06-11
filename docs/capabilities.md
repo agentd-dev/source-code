@@ -747,7 +747,7 @@ method = "POST"                              # required
 path   = "/webhooks/github"                  # required; routed on exact path
 start_node = "on_push"                       # required; must exist in start_nodes
 input_schema = "schemas/gh-push.json"        # optional; not enforced today (future)
-auth = "hmac:github"                         # optional; none | bearer:name | hmac:name | mtls
+auth = "hmac:github"                         # optional; none | bearer:name | basic:name | hmac:name | oidc:name | mtls
 [http_routes.rate_limit]                     # optional
 capacity   = 10
 per_second = 1.0
@@ -841,6 +841,10 @@ configs should always declare the block.
 tokens_env = "OPS_TOKENS"            # newline-separated tokens in env
 # tokens = ["literal"]                # tests only; discouraged
 
+[auth.basic.twilio]
+credentials_env = "TWILIO_WEBHOOK_CREDS"   # newline-separated user:pass entries
+# credentials = ["user:pass"]               # tests only; discouraged
+
 [auth.hmac.github]
 secret_env = "GITHUB_WEBHOOK_SECRET"
 header = "X-Hub-Signature-256"       # optional; default "X-Agent-Signature"
@@ -853,6 +857,8 @@ prefix = "sha256="                   # optional; default "sha256="
 auth = "none"           # or omit entirely
 auth = "bearer"         # → bearer:default
 auth = "bearer:ops"
+auth = "basic"          # → basic:default   (RFC 7617; for callers that
+auth = "basic:twilio"   #   can't set headers — creds ride the URL)
 auth = "hmac"           # → hmac:default
 auth = "hmac:github"
 auth = "mtls"           # requires [server.tls.client_auth] mode = "required"
@@ -863,6 +869,7 @@ auth = "mtls"           # requires [server.tls.client_auth] mode = "required"
 | Kind | What passes |
 |---|---|
 | Bearer | `Authorization: Bearer <token>` matches a token in the configured set (constant-time compare) |
+| Basic | `Authorization: Basic <base64(user:pass)>` matches a `user:pass` entry in the configured set (strict base64, constant-time compare); principal name = the user |
 | HMAC | `HMAC-SHA256(secret, body)` in hex equals the declared header's value after stripping the configured prefix (constant-time compare) |
 | mTLS | A client certificate was presented and accepted by the TLS layer's `WebPkiClientVerifier`; principal name = `sha256:<64-hex>` of the DER bytes |
 
@@ -875,7 +882,7 @@ body.
 On successful auth, the runtime inserts into the trigger payload:
 
 ```json
-"principal": { "kind": "bearer" | "hmac" | "mtls" | "anonymous", "name": "<binding name or fingerprint>" }
+"principal": { "kind": "bearer" | "basic" | "hmac" | "mtls" | "oidc" | "anonymous", "name": "<binding name or fingerprint>" }
 ```
 
 Workflow `condition` / `switch` nodes can route on

@@ -290,6 +290,7 @@ prefix = "sha256="                      # default "sha256="
 auth = "none"             # or omit entirely
 auth = "bearer"           # → bearer:default
 auth = "bearer:ops"
+auth = "basic:twilio"     # RFC 7617; [auth.basic.<name>] credentials_env = newline-separated user:pass
 auth = "hmac"             # → hmac:default
 auth = "hmac:github"
 auth = "mtls"             # requires [server.tls.client_auth]

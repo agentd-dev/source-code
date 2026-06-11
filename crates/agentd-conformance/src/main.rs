@@ -1,11 +1,14 @@
 //! `agentd-conformance` — run the conformance corpus and report.
 //!
 //! Usage:
-//!   agentd-conformance [run] [CORPUS_DIR] [--json]
+//!   agentd-conformance [run] [CORPUS_DIR] [--json] [--min-pass-rate T]
 //!
 //! `CORPUS_DIR` defaults to `./corpus`. With `--json`, prints the
-//! machine-readable suite report instead of the text summary. Exits
-//! non-zero if any scenario fails, so it slots into CI as a gate.
+//! machine-readable suite report instead of the text summary.
+//! `--min-pass-rate T` enforces a suite-wide reliability floor (in
+//! addition to any per-scenario `min_pass_rate`) — the deploy gate for
+//! reliability-gated autonomy. Exits non-zero if any scenario fails or
+//! falls below its reliability bar, so it slots into CI as a gate.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,12 +18,24 @@ use agentd_conformance::run_corpus;
 fn main() -> ExitCode {
     let mut dir: Option<PathBuf> = None;
     let mut json = false;
-    for arg in std::env::args().skip(1) {
+    let mut min_pass_rate: Option<f64> = None;
+
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "run" => {}
             "--json" => json = true,
+            "--min-pass-rate" => match args.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) if (0.0..=1.0).contains(&v) => min_pass_rate = Some(v),
+                _ => {
+                    eprintln!("agentd-conformance: --min-pass-rate expects a number in [0,1]");
+                    return ExitCode::from(2);
+                }
+            },
             "-h" | "--help" => {
-                eprintln!("usage: agentd-conformance [run] [CORPUS_DIR] [--json]");
+                eprintln!(
+                    "usage: agentd-conformance [run] [CORPUS_DIR] [--json] [--min-pass-rate T]"
+                );
                 return ExitCode::SUCCESS;
             }
             other if other.starts_with('-') => {
@@ -51,6 +66,21 @@ fn main() -> ExitCode {
         );
     } else {
         print!("{}", report.render_text());
+    }
+
+    // Reliability gate: per-scenario declared bars + the optional
+    // suite-wide floor. A violation fails the run independent of the
+    // pass/fail tally above.
+    let violations = report.reliability_violations(min_pass_rate);
+    if !violations.is_empty() {
+        eprintln!("\nreliability gate FAILED:");
+        for v in &violations {
+            eprintln!(
+                "  {} — pass_rate {:.2} < required {:.2}",
+                v.name, v.pass_rate, v.required
+            );
+        }
+        return ExitCode::FAILURE;
     }
 
     if report.all_passed() {

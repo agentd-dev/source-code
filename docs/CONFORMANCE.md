@@ -88,6 +88,32 @@ workflow that routes every possible answer holds `pass^8 = 1.0` where a
 fragile one decays — a measurable differentiator, not a slogan. The
 suite reports per-scenario `pass^k` and the mean across the corpus.
 
+### Reliability-gated autonomy
+
+Autonomy is earned, measured. A scenario reports a continuous
+`pass_rate` (fraction of trials passed) alongside the strict `pass^k`,
+and can declare the bar it must clear to be trusted:
+
+```toml
+trials = 8
+min_pass_rate = 0.95   # this workflow must pass ≥ 95% of trials
+```
+
+A scenario that declares a `min_pass_rate` passes when it clears that
+bar (tolerated flakiness); without one, the strict "every trial" rule
+applies. The CLI adds a suite-wide floor:
+
+```bash
+agentd-conformance run corpus/ --min-pass-rate 0.95   # CI deploy gate
+```
+
+Any scenario below the higher of its own bar and the floor fails the
+run (exit non-zero) — independent of pass/fail tallies. This is the gate
+that decides whether a workflow has earned the right to run unattended:
+certify it in CI, promote it (`agentd --promote`), then deploy it. The
+strict `pass^k` is always reported, so the headline number stays honest
+even when a tolerated bar is set.
+
 ### Capability coverage (goal tracking)
 
 Every scenario tags the capabilities it exercises against a canonical

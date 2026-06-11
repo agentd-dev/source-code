@@ -167,6 +167,12 @@ agentd --config prod.toml --instruction @./task.md --auto-approve
 agentd --config prod.toml --instructions agent.toml --auto-approve   # task lives in agent.toml
 ```
 
+**Author in TypeScript, run in Rust.** TOML is the compile target, not
+the authoring surface. [`@agentd/sdk`](sdk/typescript) is a typed
+builder that emits workflow TOML; its CI round-trips the output through
+a real `agentd --validate-only`, so what you author is what the runtime
+accepts.
+
 Before planning, the agent injects its **actual** capabilities into the
 planner prompt — only the node kinds this binary can execute, the configured
 intelligence backends, the MCP servers and their tools, and the active policy

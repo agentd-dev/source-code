@@ -71,10 +71,11 @@ first-class; neither is allowed to erode the other.
 
 ### Authoring
 
-- [ ] **TypeScript authoring SDK** — a typed builder that emits
-      validated workflow TOML, so app engineers author in their stack
+- [x] **TypeScript authoring SDK** (`sdk/typescript`) — a typed builder
+      that emits workflow TOML, so app engineers author in their stack
       and inherit the runtime's guarantees. TOML stays the compile
-      target, not the authoring surface.
+      target; the package round-trips its output through a real `agentd
+      --validate-only` in CI.
 
 ### Substrate depth (carried forward)
 

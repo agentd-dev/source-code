@@ -107,7 +107,7 @@ pub fn verify(config: &AuthConfig, name: &str, req: &AuthRequest<'_>) -> AuthDec
 /// Returns `None` on any irregularity — fail closed, never guess.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
     fn val(b: u8) -> Option<u32> {
@@ -128,7 +128,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         if (pad > 0 && !last) || pad > 2 {
             return None;
         }
-        if pad > 0 && chunk[..4 - pad].iter().any(|&b| b == b'=') {
+        if pad > 0 && chunk[..4 - pad].contains(&b'=') {
             return None;
         }
         let v0 = val(chunk[0])?;

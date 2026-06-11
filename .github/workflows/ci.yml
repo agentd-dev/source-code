@@ -78,3 +78,31 @@ jobs:
         working-directory: sdk/typescript
         env:
           AGENTD_BIN: ${{ github.workspace }}/target/debug/agentd
+
+  # Every showcased example workflow must stay valid against the real
+  # binary, so a docs example can never silently rot. Built --all-features
+  # so every node kind / trigger / provider an example uses resolves.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p agentd --all-features
+      - name: Validate every example workflow
+        run: |
+          bin=target/debug/agentd
+          fail=0
+          for f in examples/*.toml examples/reference/*.toml; do
+            case "$f" in
+              # self-planning-agent.toml is an instruction file, not a
+              # workflow — it has its own mode, not --validate-only.
+              *self-planning-agent.toml) echo "skip $f (instruction file)"; continue ;;
+            esac
+            if "$bin" --config "$f" --validate-only >/dev/null; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"; "$bin" --config "$f" --validate-only || true; fail=1
+            fi
+          done
+          exit $fail

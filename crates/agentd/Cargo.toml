@@ -2,7 +2,7 @@
 name = "agentd"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Bounded workflow-driven agent runtime (RFC: rfcs/0001-bounded-workflow-runtime.md)"
 license = "MIT"
 repository = "https://github.com/agentd-dev/source-code"
@@ -210,7 +210,7 @@ priority = "optional"
 assets = [
     ["target/release/agentd", "usr/bin/", "755"],
     ["../../packaging/systemd/agentd.service", "lib/systemd/system/", "644"],
-    ["../../packaging/systemd/agentd.env", "etc/default/agent", "644"],
+    ["../../packaging/systemd/agentd.env", "etc/default/agentd", "644"],
     ["../../packaging/README.md", "usr/share/doc/agentd/", "644"],
     ["../../docs/README.md", "usr/share/doc/agentd/docs/", "644"],
 ]

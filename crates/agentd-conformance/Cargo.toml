@@ -2,7 +2,7 @@
 name = "agentd-conformance"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Conformance, reliability, and benchmark suite for the agentd runtime"
 license = "MIT"
 repository = "https://github.com/agentd-dev/source-code"

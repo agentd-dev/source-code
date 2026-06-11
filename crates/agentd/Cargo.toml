@@ -68,6 +68,15 @@ policy-rego = ["dep:regorus"]
 # against it; off, a file `output_schema` degrades to a JSON-only check.
 schema = ["dep:jsonschema"]
 
+# Secret sources beyond env/file ([[secrets]]). `secrets-exec` runs an
+# argv-declared command (1Password CLI, `vault kv get`, `pass`, …);
+# `secrets-oauth2` adds the client-credentials grant (ureq + rustls —
+# the same stack intel-remote ships). env + file sources are always
+# compiled; these two are opt-in capability surface like everything
+# else.
+secrets-exec = []
+secrets-oauth2 = ["dep:ureq"]
+
 # Intelligence transports.
 intel-unix = []
 intel-http = []

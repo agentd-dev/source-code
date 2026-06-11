@@ -376,8 +376,9 @@ path_from = "trigger.dir"
 
 #### `http_request`
 
-Outbound HTTP/1.1 request. Plain HTTP only in the current build;
-HTTPS is a future `tools-http-tls` feature (see maturity).
+Outbound HTTP request. `http://` always; `https://` with the
+`tools-http-tls` feature (ureq, rustls-backed — the same client stack
+`intel-remote` uses).
 
 ```toml
 [[nodes]]
@@ -398,13 +399,16 @@ Produces:
 }
 ```
 
-- Feature: `tools-http`
-- Policy: `Policy::check_http_request(method, url)`
-- 1 MiB caps on request and response bodies.
+- Feature: `tools-http`; HTTPS additionally needs `tools-http-tls`.
+- Policy: `Policy::check_http_request(method, url)` — both schemes.
+- 1 MiB caps on request and response bodies — both schemes.
 - Non-2xx status sets `branch = "error"` — wire a `when = "error"`
   edge to route failures cleanly.
-- HTTPS URL → `Error::Tool` with a clear "rebuild with
-  tools-http-tls" hint.
+- The TLS client never follows redirects: the allowlist vetted *this*
+  URL, so a `Location` hop to an unvetted one must come back to the
+  workflow (as a 3xx on the `error` branch), not be followed silently.
+- Without `tools-http-tls`, an HTTPS URL → `Error::Tool` with a clear
+  "rebuild with tools-http-tls" hint.
 
 #### `call_mcp_tool`
 
@@ -1156,9 +1160,8 @@ fixture's `[mocks]`, runs the engine, and diffs against `[expected]`.
 | Dynamic plugin loading | Compile-time-only capability surface |
 | LLM-invented tool calls | Intelligence is a bounded reasoning step; it can't add edges or capabilities |
 | Unrestricted network access | HTTP goes through `http_request` with policy; no raw sockets exposed |
-| Durable state across runs | `pause_for_approval` + `--resume` checkpoint a run; broader crash-recovery is on the roadmap |
+| Durable state across runs | `pause_for_approval` + `--resume` checkpoint a run; `--checkpoint-each-node` adds per-node crash-recovery. Fleet-wide durable state stays upstream (roadmap). |
 | HTTP/2 | HTTP/1.1 only |
-| HTTPS outbound in `http_request` | Plain HTTP only; `tools-http-tls` feature is a follow-up |
 | MCP subscription trigger (live listener) | Declarations parse; the listener side needs `resources/subscribe` on the client |
 
 ---

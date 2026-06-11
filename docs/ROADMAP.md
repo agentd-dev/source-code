@@ -127,9 +127,12 @@ composes daemons rather than complicating one:
 
 ### Substrate hardening (smaller, scoped)
 
-- [ ] **`tools-http-tls`** — an HTTPS client for the `http_request` node
-      (rustls), so outbound calls aren't plaintext-only. Feature-gated
-      like the rest of the capability surface.
+- [x] **`tools-http-tls`** — an HTTPS client for the `http_request` node
+      (ureq + rustls, the intel-remote stack), so outbound calls aren't
+      plaintext-only. Feature-gated like the rest of the capability
+      surface; redirects never followed so the policy decision stays
+      exact. Shipped in v1.1.0 — the gap every SaaS-facing business
+      automation hit first (see docs/use-cases/GAP-ANALYSIS.md).
 - [ ] **JWKS live fetch** — the OIDC verifier fetches and caches signing
       keys from the issuer's JWKS endpoint in-process (keys are
       configured statically today), with bounded refresh + rotation.

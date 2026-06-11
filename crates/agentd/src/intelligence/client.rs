@@ -364,10 +364,10 @@ fn parse_http_headers<R: std::io::BufRead>(
         if let Some((k, v)) = trimmed.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
             let value = v.trim().to_string();
-            if key == "content-length" {
-                if let Ok(n) = value.parse::<usize>() {
-                    content_length = n;
-                }
+            if key == "content-length"
+                && let Ok(n) = value.parse::<usize>()
+            {
+                content_length = n;
             }
             headers.insert(key, value);
         }

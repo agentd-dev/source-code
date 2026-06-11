@@ -9,6 +9,7 @@ in [docs/SAMPLES.md](../docs/SAMPLES.md); this is the index.
 | [`webhook-receiver.toml`](webhook-receiver.toml) | an authenticated HTTP trigger into a bounded pipeline |
 | [`cron-poller.toml`](cron-poller.toml) | a scheduled (cron) trigger |
 | [`agent-loop.toml`](agent-loop.toml) | a bounded ReAct loop inside one node (`max_steps`, tool subset, policy-gated) |
+| [`evaluator-optimizer.toml`](evaluator-optimizer.toml) | a declared bounded cycle (`max_iterations` loop edge): generate → evaluate → retry, capped |
 | [`multi-provider.toml`](multi-provider.toml) | named backends across Anthropic / OpenAI / Gemini / local |
 | [`approval-gate.toml`](approval-gate.toml) | human-in-the-loop: `pause_for_approval` → checkpoint → `--resume` |
 | [`subworkflow-parent.toml`](subworkflow-parent.toml) + [`subworkflow-child.toml`](subworkflow-child.toml) | composition: a `call` node runs another workflow as a sub-DAG |

@@ -62,6 +62,7 @@ fn linear_workflow() -> WorkflowDoc {
             from: "a".into(),
             to: "b".into(),
             when: None,
+            max_iterations: None,
         }],
         ..Default::default()
     }

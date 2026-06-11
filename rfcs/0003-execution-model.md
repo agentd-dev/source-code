@@ -75,19 +75,21 @@ We consider this the correct trade for the runtime's target domain —
 repeatable, policy-bound automation — and say so in user-facing docs
 rather than pretending otherwise.
 
-## 5. Bounded relaxations (future)
+## 5. Bounded relaxations
 
-Two extensions preserve the invariants and may land later; both are
-explicitly *declared-by-the-author*, never model-initiated:
+Both preserve the invariants and are explicitly
+*declared-by-the-author*, never model-initiated:
 
-- **Declared bounded cycles.** An edge annotated
-  `max_iterations = N` would let the validator admit exactly that
-  cycle, enabling evaluator–optimizer patterns (generate → check →
-  retry) with a hard cap. The acyclicity check becomes "acyclic
-  modulo annotated edges, each provably bounded".
-- **Parallel fan-out / fan-in** (RFC 0001 §9.1). Changes scheduling,
-  not authority: the set of reachable actions is still the declared
-  graph.
+- **Declared bounded cycles** (shipped). An edge annotated
+  `max_iterations = N` is a loop edge: the validator admits exactly the
+  cycle it forms (the acyclicity check is "acyclic modulo loop edges"),
+  and the engine follows it at most N times per run, tracked per edge.
+  This enables evaluator–optimizer patterns (generate → evaluate →
+  retry) with a hard cap, without an open-ended agent loop. See
+  `examples/evaluator-optimizer.toml`.
+- **Parallel fan-out / fan-in** (RFC 0001 §9.1, future). Changes
+  scheduling, not authority: the set of reachable actions is still the
+  declared graph.
 
 A model-owned inner loop ("agentic sub-node") is the only relaxation
 that would weaken §2's guarantees; if it ever lands it will be a

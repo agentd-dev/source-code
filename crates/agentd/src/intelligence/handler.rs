@@ -9,8 +9,9 @@
 //!    an optional system prefix.
 //! 4. Dispatch through the registered [`IntelligenceClient`].
 //! 5. If `output_schema` is declared, require the response content to
-//!    be valid JSON (full JSON-Schema enforcement arrives in Phase 7
-//!    alongside the policy pass).
+//!    be valid JSON — and, with the `schema` feature, conform to the
+//!    named JSON Schema file. `output_repairs` re-prompts with the
+//!    validation error a bounded number of times before failing.
 //!
 //! The handler emits `{"content": "...", "parsed": <value|null>,
 //! "usage": {...}}` so downstream nodes can branch on either the raw
@@ -89,6 +90,7 @@ impl NodeHandler for LlmInferHandler {
             prompt,
             input_from,
             output_schema,
+            output_repairs,
         } = &node.kind
         else {
             return Err(Error::Tool {
@@ -139,61 +141,130 @@ impl NodeHandler for LlmInferHandler {
         };
         let rendered = render_template(prompt, &input);
 
-        // Submit. Single user message — system messages are a Phase 6
-        // concern (they land when mission config defines a persona).
-        let request = Request {
-            model: "fast".into(),
-            messages: vec![Message {
-                role: "user".into(),
-                content: rendered,
-            }],
-            max_tokens: Some(self.default_max_tokens),
-            temperature: None,
-        };
-        // Token budget gate (RFC 0006 §5) — checked before the call.
-        if let Some(budget) = &self.budget {
-            if let Err(reason) = budget.check_llm_budget() {
-                return Err(Error::Tool {
-                    tool: "llm_infer".into(),
-                    reason,
+        // One user message to start; repair rounds append the rejected
+        // output + the error and re-prompt (system messages are a
+        // later concern).
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: rendered,
+        }];
+        let max_repairs = output_repairs.unwrap_or(0);
+        let mut last_err = String::new();
+
+        for attempt in 0..=max_repairs {
+            // Token budget gate (RFC 0006 §5) — checked before each call;
+            // repair rounds cost tokens too.
+            if let Some(budget) = &self.budget {
+                if let Err(reason) = budget.check_llm_budget() {
+                    return Err(Error::Tool {
+                        tool: "llm_infer".into(),
+                        reason,
+                    });
+                }
+            }
+            let request = Request {
+                model: "fast".into(),
+                messages: messages.clone(),
+                max_tokens: Some(self.default_max_tokens),
+                temperature: None,
+            };
+            let response = client.complete(&request)?;
+            let tokens = u64::from(response.usage.prompt_tokens + response.usage.completion_tokens);
+            if let Some(budget) = &self.budget {
+                budget.add_llm_tokens(tokens);
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics.add_llm(tokens);
+            }
+
+            // No output contract → raw content out.
+            let Some(schema_spec) = output_schema.as_deref() else {
+                return Ok(NodeOutcome::Continue {
+                    value: json!({
+                        "content": response.content,
+                        "parsed": null,
+                        "usage": usage_value(&response),
+                    }),
+                    branch: None,
                 });
+            };
+
+            match parse_and_validate(&response.content, schema_spec) {
+                Ok(parsed) => {
+                    return Ok(NodeOutcome::Continue {
+                        value: json!({
+                            "content": response.content,
+                            "parsed": parsed,
+                            "usage": usage_value(&response),
+                        }),
+                        branch: None,
+                    });
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt < max_repairs {
+                        tracing::warn!(
+                            target: "agentd::audit",
+                            event = "llm_infer.repair",
+                            node = %node.id,
+                            attempt = attempt + 1,
+                            reason = %last_err,
+                        );
+                        messages.push(Message {
+                            role: "assistant".into(),
+                            content: response.content,
+                        });
+                        messages.push(Message {
+                            role: "user".into(),
+                            content: format!(
+                                "Your previous output was rejected: {last_err}. \
+                                 Reply with corrected output only."
+                            ),
+                        });
+                    }
+                }
             }
         }
-        let response = client.complete(&request)?;
-        let tokens = u64::from(response.usage.prompt_tokens + response.usage.completion_tokens);
-        if let Some(budget) = &self.budget {
-            budget.add_llm_tokens(tokens);
-        }
-        if let Some(metrics) = &self.metrics {
-            metrics.add_llm(tokens);
-        }
 
-        // Optional parse. If a schema is declared, the model must
-        // return JSON; otherwise the raw content becomes the output.
-        let parsed = if output_schema.is_some() {
-            let p: Value = serde_json::from_str(&response.content).map_err(|e| {
-                Error::Schema(format!(
-                    "llm_infer node `{}`: model returned invalid JSON: {e}",
-                    node.id
-                ))
-            })?;
-            Some(p)
-        } else {
-            None
-        };
-
-        Ok(NodeOutcome::Continue {
-            value: json!({
-                "content": response.content,
-                "parsed": parsed,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                },
-            }),
-            branch: None,
-        })
+        Err(Error::Schema(format!(
+            "llm_infer node `{}`: output failed validation after {} attempt(s): {last_err}",
+            node.id,
+            max_repairs + 1
+        )))
     }
+}
+
+fn usage_value(response: &crate::intelligence::protocol::Response) -> Value {
+    json!({
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
+    })
+}
+
+/// Parse the model's output as JSON and, when `spec` names a readable
+/// schema file (and the `schema` feature is compiled), validate it
+/// against that JSON Schema. A non-file `spec` (e.g. `inline`) is a
+/// JSON-only contract. Returns the parsed value or a human-readable
+/// rejection reason for the repair loop.
+fn parse_and_validate(content: &str, spec: &str) -> std::result::Result<Value, String> {
+    let parsed: Value =
+        serde_json::from_str(content).map_err(|e| format!("model returned invalid JSON: {e}"))?;
+
+    #[cfg(feature = "schema")]
+    if let Ok(schema_text) = std::fs::read_to_string(spec) {
+        let schema: Value = serde_json::from_str(&schema_text)
+            .map_err(|e| format!("output_schema `{spec}` is not valid JSON: {e}"))?;
+        let compiled = jsonschema::JSONSchema::compile(&schema)
+            .map_err(|e| format!("output_schema `{spec}` is not a valid schema: {e}"))?;
+        if let Err(errors) = compiled.validate(&parsed) {
+            let msgs: Vec<String> = errors.map(|e| e.to_string()).collect();
+            return Err(format!("schema violation: {}", msgs.join("; ")));
+        }
+    }
+    #[cfg(not(feature = "schema"))]
+    let _ = spec;
+
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +339,15 @@ mod tests {
     }
 
     fn node_with(prompt: &str, input_from: Option<&str>, output_schema: Option<&str>) -> Node {
+        node_full(prompt, input_from, output_schema, None)
+    }
+
+    fn node_full(
+        prompt: &str,
+        input_from: Option<&str>,
+        output_schema: Option<&str>,
+        output_repairs: Option<u32>,
+    ) -> Node {
         Node {
             id: "infer".into(),
             retry: None,
@@ -276,6 +356,7 @@ mod tests {
                 prompt: prompt.into(),
                 input_from: input_from.map(Into::into),
                 output_schema: output_schema.map(Into::into),
+                output_repairs,
             },
         }
     }
@@ -361,6 +442,77 @@ mod tests {
     }
 
     #[test]
+    fn repair_round_recovers_from_bad_then_good_json() {
+        let mock = Arc::new(MockClient::new());
+        mock.enqueue_text("not json at all"); // attempt 1: parse fails
+        mock.enqueue_text(r#"{"decision":"alpha"}"#); // attempt 2: ok
+        let h = LlmInferHandler::new(single_backend(mock.clone()));
+        let mut c = ctx(json!({}));
+        let out = h
+            .handle(
+                &node_full("classify", None, Some("inline"), Some(1)),
+                &mut c,
+            )
+            .unwrap();
+        assert_eq!(mock.received().len(), 2, "one repair round");
+        match out {
+            NodeOutcome::Continue { value, .. } => assert_eq!(value["parsed"]["decision"], "alpha"),
+            other => panic!("{other:?}"),
+        }
+        // The repair turn fed the rejection back to the model.
+        let second = &mock.received()[1];
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|m| m.content.contains("rejected"))
+        );
+    }
+
+    #[test]
+    fn no_repair_budget_fails_bounded_on_bad_output() {
+        let mock = Arc::new(MockClient::new());
+        mock.enqueue_text("not json");
+        let h = LlmInferHandler::new(single_backend(mock));
+        let mut c = ctx(json!({}));
+        let err = h
+            .handle(
+                &node_full("classify", None, Some("inline"), Some(0)),
+                &mut c,
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("after 1 attempt"));
+    }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn schema_violation_is_caught_then_repaired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let schema = dir.path().join("decision.json");
+        std::fs::write(
+            &schema,
+            r#"{"type":"object","required":["decision"],
+                "properties":{"decision":{"enum":["alpha","beta"]}}}"#,
+        )
+        .unwrap();
+        let spec = schema.to_string_lossy().into_owned();
+
+        let mock = Arc::new(MockClient::new());
+        mock.enqueue_text(r#"{"decision":"zeta"}"#); // valid JSON, wrong enum
+        mock.enqueue_text(r#"{"decision":"alpha"}"#); // conforms
+        let h = LlmInferHandler::new(single_backend(mock.clone()));
+        let mut c = ctx(json!({}));
+        let out = h
+            .handle(&node_full("classify", None, Some(&spec), Some(1)), &mut c)
+            .unwrap();
+        assert_eq!(mock.received().len(), 2, "schema rejection forced a repair");
+        match out {
+            NodeOutcome::Continue { value, .. } => assert_eq!(value["parsed"]["decision"], "alpha"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn token_budget_blocks_when_exhausted() {
         let mock = Arc::new(MockClient::new());
         mock.enqueue(Response {
@@ -409,6 +561,7 @@ mod tests {
                         prompt: "hi".into(),
                         input_from: None,
                         output_schema: None,
+                        output_repairs: None,
                     },
                 },
                 &mut c,

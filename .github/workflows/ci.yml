@@ -38,7 +38,7 @@ jobs:
           - "--no-default-features --features tools-fs,tools-data,trigger-http,auth,server-tls"
           - "--features tools-http,tools-shell"
           - "--features trigger-cron,trigger-fs-watch"
-          - "--features signing,auth-oidc,policy-rego"
+          - "--features signing,auth-oidc,policy-rego,schema"
           - "--features intel-unix,intel-http,intel-remote"
           - "--all-features"
     steps:

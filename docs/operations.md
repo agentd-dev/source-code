@@ -132,6 +132,8 @@ re-validate when the file or env actually changes.
 | `intel-http` | — | Intelligence JSON-RPC HTTP client |
 | `auth` | `sha2`, `hmac` | Bearer + HMAC-SHA256 webhook verification |
 | `server-tls` | `rustls`, `rustls-pemfile` (implies `auth`) | In-process TLS termination + mTLS client-cert verification |
+| `schema` | `jsonschema` | Validate `llm_infer` output against a JSON Schema file (off → JSON-only check) |
+| `intel-remote` | `ureq` | Remote LLM providers (Anthropic / OpenAI / Gemini / openai-compatible) |
 
 The default feature set is `tools-fs + tools-env + tools-data +
 trigger-http + auth`. Everything else is opt-in.

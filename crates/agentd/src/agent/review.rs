@@ -123,6 +123,7 @@ mod tests {
                         prompt: "x".into(),
                         input_from: None,
                         output_schema: None,
+                        output_repairs: None,
                     },
                 ),
                 node(

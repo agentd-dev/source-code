@@ -57,6 +57,11 @@ trigger-fs-watch = ["dep:notify"]
 # Rego's `allow` decision becomes authoritative).
 policy-rego = ["dep:regorus"]
 
+# Full JSON-Schema enforcement on `llm_infer` outputs (RFC 0006). When
+# `output_schema` names a schema file, the parsed output is validated
+# against it; off, a file `output_schema` degrades to a JSON-only check.
+schema = ["dep:jsonschema"]
+
 # Intelligence transports.
 intel-unix = []
 intel-http = []
@@ -111,6 +116,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 tracing-appender = { version = "0.2", default-features = false }
 sha2 = { version = "0.10", default-features = false, optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
+# JSON-Schema validator for `llm_infer` output enforcement (`schema`
+# feature). Default features off to avoid the HTTP `$ref` resolver —
+# schemas are local files, validated offline.
+jsonschema = { version = "0.18", default-features = false, optional = true }
 # Atomic swap for hot-reload state (SIGHUP). Pure-Rust, no deps.
 # Readers see a consistent snapshot with no mutex contention;
 # writers replace the current value atomically.

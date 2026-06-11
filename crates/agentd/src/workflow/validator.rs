@@ -829,6 +829,8 @@ mod tests {
                 input_schema: None,
                 auth: None,
                 rate_limit: None,
+                idempotency_key: None,
+                idempotency_ttl_secs: None,
             }],
             ..Default::default()
         };
@@ -875,6 +877,8 @@ mod tests {
                     input_schema: None,
                     auth: None,
                     rate_limit: None,
+                    idempotency_key: None,
+                    idempotency_ttl_secs: None,
                 },
                 HttpRoute {
                     method: "post".into(), // case-insensitive match
@@ -883,6 +887,8 @@ mod tests {
                     input_schema: None,
                     auth: None,
                     rate_limit: None,
+                    idempotency_key: None,
+                    idempotency_ttl_secs: None,
                 },
             ],
             ..Default::default()
@@ -920,6 +926,8 @@ mod tests {
                 input_schema: None,
                 auth: None,
                 rate_limit: None,
+                idempotency_key: None,
+                idempotency_ttl_secs: None,
             }],
             nodes: vec![
                 n(

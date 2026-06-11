@@ -8,10 +8,10 @@
 # declared edges — widen or tighten them per loss data without touching
 # a line of code.
 #
-# Honest caveat baked into the article: webhook providers redeliver.
-# Until idempotency keys land (see GAP-ANALYSIS.md §5), make the
-# fulfill endpoint idempotent on order_id — at-least-once delivery is
-# yours to absorb downstream.
+# Webhook providers redeliver; this route declares an idempotency key
+# (v1.2.0), so a redelivered order REPLAYS the recorded response
+# instead of re-running — no double fulfillment, exactly-once effect at
+# the route boundary. Requires --state-dir.
 #
 #   ANTHROPIC_API_KEY=… SHOP_WEBHOOK_SECRET=… \
 #     agentd --config examples/use-cases/fraud-review.toml \
@@ -58,6 +58,10 @@ path = "/orders/created"
 start_node = "on_order"
 auth = "hmac:shop"
 rate_limit = { capacity = 120, per_second = 20.0 }
+# At-least-once delivery collapses to exactly-once effect: a redelivery
+# of the same order id replays the recorded decision.
+idempotency_key = "trigger.order.id"
+idempotency_ttl_secs = 172800
 
 # 1. Risk-score, schema-enforced to a hard band.
 [[nodes]]

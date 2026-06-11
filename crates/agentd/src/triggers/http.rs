@@ -111,6 +111,21 @@ impl HttpServer {
         // both into the hot-reloadable shape the accept loop reads.
         let reloadable = HttpReloadable::build(&self.workflow.http_routes, &self.workflow.name)?;
 
+        // Startup validation #2b — an idempotent route without a state
+        // directory would silently drop its guarantee; fail the bind.
+        if self.engine.state_dir.is_none()
+            && let Some(r) = self
+                .workflow
+                .http_routes
+                .iter()
+                .find(|r| r.idempotency_key.is_some())
+        {
+            return Err(Error::Config(format!(
+                "route `{} {}` declares idempotency_key but no --state-dir is set",
+                r.method, r.path
+            )));
+        }
+
         // Startup validation #3 — if `[server.tls]` is declared,
         // load the cert/key + (optional) client-auth CA so a
         // misconfigured cert path fails the bind rather than the
@@ -817,6 +832,59 @@ fn handle_one_request<S: std::io::Read + Write>(
         input
     };
 
+    // Idempotency: webhook providers deliver at-least-once. With a
+    // declared key, a redelivery REPLAYS the recorded response instead
+    // of re-running the workflow; a concurrent duplicate gets 409
+    // while the first is in flight. Runs after auth (an unauthenticated
+    // caller can't probe the replay cache) and after body parsing (the
+    // key usually lives in the payload).
+    let mut idem_guard: Option<IdempotencyGuard> = None;
+    if let Some(key_spec) = &route.idempotency_key {
+        let ttl = Duration::from_secs(route.idempotency_ttl_secs.unwrap_or(86_400));
+        match idempotency_begin(
+            engine.state_dir.as_deref(),
+            &route.method,
+            &route.path,
+            key_spec,
+            ttl,
+            options.timeout,
+            &request.body,
+            &input,
+        ) {
+            IdemBegin::Replay(stored) => {
+                let mut headers = connection_headers(keep_alive);
+                headers.push(("X-Agentd-Idempotent-Replay".into(), "true".into()));
+                write_text_response_with_header(
+                    stream,
+                    Status::new(stored.status, respond_reason(stored.status)),
+                    &stored.content_type,
+                    stored.body.as_bytes(),
+                    &headers,
+                )?;
+                return Ok(keep_alive);
+            }
+            IdemBegin::InFlight => {
+                write_response_with_header(
+                    stream,
+                    Status::new(409, "Conflict"),
+                    &json!({ "error": "a delivery with this idempotency key is in flight" }),
+                    &connection_headers(keep_alive),
+                )?;
+                return Ok(keep_alive);
+            }
+            IdemBegin::Fresh(guard) => idem_guard = Some(guard),
+            IdemBegin::Reject(reason) => {
+                write_response_with_header(
+                    stream,
+                    Status::new(400, "Bad Request"),
+                    &json!({ "error": reason }),
+                    &connection_headers(keep_alive),
+                )?;
+                return Ok(keep_alive);
+            }
+        }
+    }
+
     // Run. Propagate W3C trace-context if the caller supplied a
     // `traceparent` header — fields land on a span that parents the
     // engine's `workflow.run`, so JSON-format log consumers see
@@ -854,6 +922,9 @@ fn handle_one_request<S: std::io::Read + Write>(
                 ..
             } = &outcome
             {
+                if let Some(guard) = idem_guard.take() {
+                    guard.store(spec.status, &spec.content_type, &spec.body);
+                }
                 write_text_response_with_header(
                     stream,
                     Status::new(spec.status, respond_reason(spec.status)),
@@ -871,13 +942,30 @@ fn handle_one_request<S: std::io::Read + Write>(
                 // complete; the body carries the run_id to resume.
                 ExecutionOutcome::Paused { .. } => Status::new(202, "Accepted"),
             };
+            if let Some(guard) = idem_guard.take() {
+                match &outcome {
+                    // Success-class outcomes are recorded for replay.
+                    // Failures are NOT — a failed delivery stays
+                    // retryable (the provider's redelivery is the
+                    // retry mechanism).
+                    ExecutionOutcome::Completed { .. } | ExecutionOutcome::Paused { .. } => {
+                        let body = serde_json::to_string(&outcome).unwrap_or_default();
+                        guard.store(status.code, "application/json", &body);
+                    }
+                    _ => guard.release(),
+                }
+            }
             write_response_with_header(stream, status, &outcome, &connection_headers(keep_alive))?;
             Ok(keep_alive)
         }
         Err(e) => {
             // Engine-level errors close the connection — the server
             // has observably misbehaved and keeping the socket open
-            // for more traffic would just amplify the problem.
+            // for more traffic would just amplify the problem. An
+            // errored delivery stays retryable: release the guard.
+            if let Some(guard) = idem_guard.take() {
+                guard.release();
+            }
             write_response_with_header(
                 stream,
                 Status::new(500, "Internal Server Error"),
@@ -1065,6 +1153,199 @@ fn silent_close() -> ParseError {
 // ---------------------------------------------------------------------------
 // Response writing
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Idempotency — exactly-once effect per route
+// ---------------------------------------------------------------------------
+
+/// Outcome of the idempotency check for a keyed route.
+enum IdemBegin {
+    /// Seen before within the TTL: replay this stored response.
+    Replay(StoredResponse),
+    /// A delivery with the same key is currently executing.
+    InFlight,
+    /// First sight (or expired): proceed; the guard owns the pending
+    /// marker and must be `store`d or `release`d.
+    Fresh(IdempotencyGuard),
+    /// Fail closed: key didn't resolve, or no `--state-dir`.
+    Reject(String),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredResponse {
+    status: u16,
+    content_type: String,
+    body: String,
+    stored_unix: u64,
+}
+
+/// Owns the `.pending` marker for one in-flight keyed delivery.
+struct IdempotencyGuard {
+    response_path: std::path::PathBuf,
+    pending_path: std::path::PathBuf,
+}
+
+impl IdempotencyGuard {
+    /// Record the response for replay and retire the marker.
+    fn store(self, status: u16, content_type: &str, body: &str) {
+        let stored = StoredResponse {
+            status,
+            content_type: content_type.to_string(),
+            body: body.to_string(),
+            stored_unix: now_unix(),
+        };
+        if let Ok(json) = serde_json::to_vec(&stored) {
+            // Best-effort: a failed write degrades to at-least-once
+            // for the NEXT redelivery, never to a lost response.
+            let _ = std::fs::write(&self.response_path, json);
+        }
+        let _ = std::fs::remove_file(&self.pending_path);
+    }
+
+    /// The delivery failed / errored — stays retryable.
+    fn release(self) {
+        let _ = std::fs::remove_file(&self.pending_path);
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Resolve the declared key against the parsed payload (dotted path,
+/// optional `trigger.` prefix) or hash the raw body (`body_sha256`).
+/// Non-scalar values are rejected — an object is not a key.
+fn resolve_idempotency_key(spec: &str, input: &Value, raw_body: &[u8]) -> Option<String> {
+    if spec == "body_sha256" {
+        #[cfg(feature = "auth")]
+        {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(raw_body);
+            return Some(format!("{:x}", h.finalize()));
+        }
+        #[cfg(not(feature = "auth"))]
+        {
+            let _ = raw_body;
+            return None; // documented: body_sha256 needs the `auth` feature (sha2)
+        }
+    }
+    let path = spec.strip_prefix("trigger.").unwrap_or(spec);
+    match crate::engine::template::walk_path(input, path)? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// FNV-1a 64 — dependency-free filename hashing. Collision resistance
+/// is not load-bearing: the sanitized key prefix keeps distinct keys
+/// in distinct files for any realistic key shape.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn idempotency_file_stem(method: &str, path: &str, key: &str) -> String {
+    let sanitized: String = key
+        .chars()
+        .take(48)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let full = format!("{method}|{path}|{key}");
+    format!("{sanitized}-{:016x}", fnv64(full.as_bytes()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn idempotency_begin(
+    state_dir: Option<&std::path::Path>,
+    method: &str,
+    route_path: &str,
+    key_spec: &str,
+    ttl: Duration,
+    run_timeout: Duration,
+    raw_body: &[u8],
+    input: &Value,
+) -> IdemBegin {
+    let Some(state_dir) = state_dir else {
+        // Validated at spawn; double-checked here so a hot-reloaded
+        // route can't silently drop the guarantee.
+        return IdemBegin::Reject(
+            "route declares idempotency_key but the server has no --state-dir".into(),
+        );
+    };
+    let Some(key) = resolve_idempotency_key(key_spec, input, raw_body) else {
+        return IdemBegin::Reject(format!(
+            "idempotency key `{key_spec}` did not resolve to a scalar in the request payload"
+        ));
+    };
+    let dir = state_dir.join("idempotency");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return IdemBegin::Reject(format!("idempotency store unavailable: {e}"));
+    }
+    let stem = idempotency_file_stem(method, route_path, &key);
+    let response_path = dir.join(format!("{stem}.json"));
+    let pending_path = dir.join(format!("{stem}.pending"));
+
+    // Replay window: a stored response younger than the TTL answers
+    // the redelivery without running anything.
+    if let Ok(raw) = std::fs::read(&response_path)
+        && let Ok(stored) = serde_json::from_slice::<StoredResponse>(&raw)
+    {
+        if now_unix().saturating_sub(stored.stored_unix) <= ttl.as_secs() {
+            return IdemBegin::Replay(stored);
+        }
+        let _ = std::fs::remove_file(&response_path);
+    }
+
+    // Pending marker via create_new: the winner proceeds, a concurrent
+    // duplicate sees InFlight. A marker older than twice the run
+    // timeout is a crashed run — take it over.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)
+    {
+        Ok(_) => IdemBegin::Fresh(IdempotencyGuard {
+            response_path,
+            pending_path,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stale_after = run_timeout.as_secs().saturating_mul(2).max(60);
+            let age = std::fs::metadata(&pending_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs());
+            match age {
+                Some(age) if age > stale_after => {
+                    let _ = std::fs::remove_file(&pending_path);
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&pending_path)
+                    {
+                        Ok(_) => IdemBegin::Fresh(IdempotencyGuard {
+                            response_path,
+                            pending_path,
+                        }),
+                        Err(_) => IdemBegin::InFlight,
+                    }
+                }
+                _ => IdemBegin::InFlight,
+            }
+        }
+        Err(e) => IdemBegin::Reject(format!("idempotency store unavailable: {e}")),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Body parsing — content-type aware
@@ -1359,6 +1640,8 @@ mod tests {
                 input_schema: None,
                 auth: None,
                 rate_limit: None,
+                idempotency_key: None,
+                idempotency_ttl_secs: None,
             }],
             nodes: vec![
                 Node {
@@ -1675,6 +1958,8 @@ mod tests {
                 input_schema: None,
                 auth: None,
                 rate_limit: None,
+                idempotency_key: None,
+                idempotency_ttl_secs: None,
             },
             HttpRoute {
                 method: "POST".into(),
@@ -1683,6 +1968,8 @@ mod tests {
                 input_schema: None,
                 auth: None,
                 rate_limit: None,
+                idempotency_key: None,
+                idempotency_ttl_secs: None,
             },
         ];
         handle
@@ -1707,6 +1994,8 @@ mod tests {
             input_schema: None,
             auth: None,
             rate_limit: None,
+            idempotency_key: None,
+            idempotency_ttl_secs: None,
         });
         let handle = start_server(wf);
 
@@ -1720,6 +2009,8 @@ mod tests {
             input_schema: None,
             auth: None,
             rate_limit: None,
+            idempotency_key: None,
+            idempotency_ttl_secs: None,
         }];
         handle.reload_http_state(&shrunk).expect("shrink routes");
 
@@ -1744,6 +2035,8 @@ mod tests {
                 capacity: 1,
                 per_second: 0.001,
             }),
+            idempotency_key: None,
+            idempotency_ttl_secs: None,
         }];
         handle
             .reload_http_state(&routes_with_limit)
@@ -1844,6 +2137,137 @@ mod tests {
         reader.read_to_string(&mut buf).unwrap();
         assert!(buf.contains("413"));
         handle.shutdown_and_drain();
+    }
+
+    // -- idempotency -------------------------------------------------------
+
+    /// Workflow with a keyed route whose respond body echoes the
+    /// payload's `n` — so a replayed response is distinguishable from
+    /// a re-run with different input.
+    fn idempotent_workflow() -> WorkflowDoc {
+        let mut wf = minimal_wf();
+        wf.http_routes[0].idempotency_key = Some("trigger.order_id".into());
+        wf.nodes.insert(
+            0,
+            Node {
+                id: "answer".into(),
+                retry: None,
+                kind: NodeKind::Respond {
+                    status: Some(200),
+                    content_type: Some("text/plain".into()),
+                    body_template: "saw n={{n}}".into(),
+                    input_from: None,
+                },
+            },
+        );
+        wf.start_nodes[0].entry_node = Some("answer".into());
+        wf.edges = vec![Edge {
+            from: "answer".into(),
+            to: "a".into(),
+            when: None,
+            max_iterations: None,
+        }];
+        wf
+    }
+
+    fn start_server_with_state(wf: WorkflowDoc, dir: &std::path::Path) -> ServerHandle {
+        let mut registry = HandlerRegistry::with_builtin_controls();
+        register_default_tools(&mut registry, allow_all(), crate::budget::unbounded());
+        registry.set_fallback(Box::new(StubHandler));
+        let engine = Arc::new(Engine::new(registry).with_state_dir(Some(dir.to_path_buf())));
+        let server = HttpServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(wf),
+            engine,
+            RunOptions::default(),
+        );
+        server.spawn().expect("spawn http server")
+    }
+
+    #[test]
+    fn idempotent_route_replays_the_first_response() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = start_server_with_state(idempotent_workflow(), dir.path());
+        let addr = handle.local_addr();
+
+        // First delivery runs the workflow.
+        let (s1, b1) = send(addr, "POST", "/run", br#"{"order_id":"A1","n":1}"#);
+        assert_eq!(s1, 200);
+        assert_eq!(b1, "saw n=1");
+
+        // Redelivery: same key, DIFFERENT body — must replay the first
+        // response, proving the workflow did not run again.
+        let (s2, b2) = send(addr, "POST", "/run", br#"{"order_id":"A1","n":2}"#);
+        assert_eq!(s2, 200);
+        assert_eq!(b2, "saw n=1");
+
+        // A different key runs fresh.
+        let (s3, b3) = send(addr, "POST", "/run", br#"{"order_id":"B7","n":3}"#);
+        assert_eq!(s3, 200);
+        assert_eq!(b3, "saw n=3");
+
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn idempotent_route_rejects_unresolvable_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = start_server_with_state(idempotent_workflow(), dir.path());
+        let addr = handle.local_addr();
+        // No order_id in the payload → fail closed, nothing runs.
+        let (status, body) = send(addr, "POST", "/run", br#"{"n":9}"#);
+        assert_eq!(status, 400);
+        assert!(body.contains("idempotency"), "{body}");
+        handle.shutdown_and_drain();
+    }
+
+    #[test]
+    fn idempotent_route_without_state_dir_fails_spawn() {
+        let mut registry = HandlerRegistry::with_builtin_controls();
+        register_default_tools(&mut registry, allow_all(), crate::budget::unbounded());
+        registry.set_fallback(Box::new(StubHandler));
+        let engine = Arc::new(Engine::new(registry)); // no state_dir
+        let server = HttpServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(idempotent_workflow()),
+            engine,
+            RunOptions::default(),
+        );
+        let err = match server.spawn() {
+            Ok(_) => panic!("must refuse to bind"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("state-dir"), "{err}");
+    }
+
+    #[test]
+    fn idempotency_in_flight_marker_yields_409_shape() {
+        // Unit-level: a fresh pending marker means InFlight; a stale
+        // one is taken over.
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = json!({"order_id": "Z9"});
+        let begin = || {
+            idempotency_begin(
+                Some(dir.path()),
+                "POST",
+                "/run",
+                "trigger.order_id",
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+                b"",
+                &input,
+            )
+        };
+        let IdemBegin::Fresh(guard) = begin() else {
+            panic!("first sight must be Fresh");
+        };
+        assert!(matches!(begin(), IdemBegin::InFlight));
+        guard.release();
+        let IdemBegin::Fresh(guard2) = begin() else {
+            panic!("released key must be Fresh again");
+        };
+        guard2.store(200, "application/json", "{}");
+        assert!(matches!(begin(), IdemBegin::Replay(_)));
     }
 
     // -- body parsing (content-type aware) --------------------------------

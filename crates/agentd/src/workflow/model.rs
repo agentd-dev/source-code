@@ -276,6 +276,22 @@ pub struct HttpRoute {
     /// a `Retry-After` header.
     #[serde(default)]
     pub rate_limit: Option<crate::ratelimit::RateLimitConfig>,
+    /// Optional idempotency key: a dotted path into the parsed request
+    /// payload (`"order.id"`, `trigger.` prefix accepted), or the
+    /// special value `"body_sha256"`. Webhook providers deliver
+    /// at-least-once; with a key, a redelivery REPLAYS the recorded
+    /// response instead of re-running the workflow — exactly-once
+    /// *effect* at the route boundary. Requires `--state-dir`; a
+    /// request whose key path doesn't resolve is a 400 (fail closed);
+    /// a concurrent duplicate gets 409 while the first is in flight.
+    /// Successful (and paused) outcomes are recorded; failures are NOT
+    /// — a failed delivery stays retryable.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Replay-window TTL in seconds (default 86400). Entries older
+    /// than this are treated as unseen.
+    #[serde(default)]
+    pub idempotency_ttl_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

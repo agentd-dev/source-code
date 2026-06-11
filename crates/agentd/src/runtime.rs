@@ -2467,6 +2467,8 @@ mod tests {
             input_schema: None,
             auth: None,
             rate_limit: None,
+            idempotency_key: None,
+            idempotency_ttl_secs: None,
         });
         assert!(matches!(resolve_mode(&doc, None), Mode::Serve));
     }

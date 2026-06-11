@@ -1,6 +1,6 @@
 # Order fraud review in three lanes — and what webhook retries teach us about honesty
 
-> **Trigger:** order webhook · **Pattern:** risk score → three-lane switch → fulfill / queue / hold · **Sample:** [`examples/use-cases/fraud-review.toml`](../../examples/use-cases/fraud-review.toml) · **Status:** runs today (`intel-remote,schema,tools-http-tls`); idempotency is a named gap
+> **Trigger:** order webhook · **Pattern:** risk score → three-lane switch → fulfill / queue / hold · **Sample:** [`examples/use-cases/fraud-review.toml`](../../examples/use-cases/fraud-review.toml) · **Status:** runs today (`intel-remote,schema,tools-http-tls`), redelivery-safe as of v1.2.0
 
 ## The problem
 
@@ -48,16 +48,23 @@ second [backend](../capabilities.md)) without touching the lanes.
 
 Every webhook provider redelivers — timeouts, retries, at-least-once
 semantics. Deliver the same order twice to a naive automation and it
-fulfills twice. Today, this workflow's answer is the industry-standard
-one: **the fulfill endpoint must be idempotent on `order_id`** —
-absorbing the duplicate downstream.
+fulfills twice. This workflow's route declares the answer (shipped in
+v1.2.0, promoted by exactly this use case in the
+[gap analysis §5](GAP-ANALYSIS.md#5-idempotency-keys--exactly-once-effect)):
 
-That works, but it's a duty the runtime should take on: an
-**idempotency key** on the trigger (order id or content hash), deduped
-in the run-state store, making redelivery collapse to exactly-once
-*effect* at the workflow boundary. It's a named proposal in the
-[gap analysis §5](GAP-ANALYSIS.md#5-idempotency-keys--exactly-once-effect),
-and e-commerce is the use case that earns it the priority.
+```toml
+[[http_routes]]
+path = "/orders/created"
+idempotency_key = "trigger.order.id"
+```
+
+A redelivered order id **replays the recorded decision** (marked
+`X-Agentd-Idempotent-Replay: true`) instead of re-running the workflow —
+at-least-once delivery collapses to exactly-once *effect* at the route
+boundary. The semantics are deliberately conservative: a missing key is
+a 400 and nothing runs; a concurrent duplicate gets a 409 while the
+first is in flight; **failed runs are not recorded**, so a genuine
+failure stays retryable by the provider's own redelivery.
 
 ## Honest limits
 

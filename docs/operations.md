@@ -196,6 +196,38 @@ Two always-live endpoints in serve mode (no auth, not rate-limited):
   | `agentd_node_failures_total` | Node dispatches that returned a non-success status. |
   | `agentd_policy_denials_total` | Tool invocations refused by the manifest policy. |
 
+### 3.6 Run records + inspection
+
+Metrics tell you the aggregate; a **run record** tells you what one run
+actually did. In one-shot mode, `--record PATH` (or `AGENTD_RECORD`)
+writes a structured JSON account of the run — the per-node trace with
+each node's output and timing, the cost (llm calls / tokens / policy
+denials), the wall-clock, and the outcome (or the error that aborted
+it). It is written whether the run completed, failed, timed out, or
+errored.
+
+```bash
+agentd --config wf.toml --input event.json --record /tmp/run.json
+agentd inspect /tmp/run.json
+```
+
+`agentd inspect` renders the record as a readable timeline:
+
+```
+run exec-00000001  workflow=demo  status=completed
+  start=main  3 ms  1 llm call(s) / 128 tokens  0 policy denial(s)
+  path:
+     1. classify [llm_infer] continue →alpha  2 ms
+        output: {"content":"…","parsed":{"decision":"alpha"}}
+     2. done [terminate] terminate  0 ms
+```
+
+The record is plain JSON keyed for machine consumption (a dashboard or a
+hosted inspector reads the same file). Its `execution_id` matches the
+`execution_id` field in the audit log, so a record and its audit events
+line up. Records may contain node outputs verbatim — treat a record file
+with the same care as the data it processed.
+
 ---
 
 ## 4. Security posture

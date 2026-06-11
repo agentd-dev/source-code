@@ -155,6 +155,7 @@ impl Engine {
 
         // 2) Build the context.
         let execution_id = next_execution_id();
+        trace.execution_id = execution_id.clone();
         let mut ctx = ExecutionContext::new(
             execution_id.clone(),
             workflow.name.clone(),
@@ -257,6 +258,8 @@ impl Engine {
                         kind: node.kind.name().to_string(),
                         outcome: "terminate",
                         branch: None,
+                        output: value.clone(),
+                        elapsed_ms: latency_ms,
                     });
                     ctx.node_outputs.insert(current_id.clone(), value.clone());
                     self.metrics.inc_workflow_completed();
@@ -280,6 +283,8 @@ impl Engine {
                         kind: node.kind.name().to_string(),
                         outcome: "fail",
                         branch: None,
+                        output: Value::Null,
+                        elapsed_ms: latency_ms,
                     });
                     self.metrics.inc_workflow_failed();
                     warn!(
@@ -306,6 +311,8 @@ impl Engine {
                         kind: node.kind.name().to_string(),
                         outcome: "continue",
                         branch: branch.clone(),
+                        output: value.clone(),
+                        elapsed_ms: latency_ms,
                     });
                     ctx.node_outputs.insert(current_id.clone(), value);
                     let next_id = pick_next(workflow, &current_id, branch.as_deref())?;

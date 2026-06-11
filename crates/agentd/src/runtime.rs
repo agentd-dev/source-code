@@ -119,31 +119,11 @@ pub fn run(argv: Vec<String>) -> ExitCode {
         cfg.public_key_pem = None;
     }
 
-    // Merge logging config: workflow `[logging]` → env → CLI → default.
-    // Now we know the full spec, install the subscriber.
-    let resolved = resolve_logging(&doc, &tracing_overrides);
-    if let Err(e) = crate::observability::apply(&resolved) {
-        eprintln!("agentd: failed to install log subscriber: {e}");
-        return ExitCode::from(EXIT_SEMANTIC);
-    }
-
-    // Signature verification (RFC 0002). Runs BEFORE validate() so a
-    // tampered manifest with otherwise-valid DAG shape still fails.
-    let sig_source = resolve_signature_source(&sig_path);
-    match crate::signing::verify_or_skip(
-        doc.signing.as_ref(),
-        &raw_bytes,
-        sig_source,
-        args.signing_required,
-    ) {
-        crate::signing::Outcome::Ok => {}
-        crate::signing::Outcome::Refused(reason) => {
-            eprintln!("agentd: workflow signature verification failed: {reason}");
-            return ExitCode::from(EXIT_SEMANTIC);
-        }
-    }
-
-    // Pre-validate — saves the operator a confusing engine error.
+    // Structural validation comes first and needs neither logging nor
+    // signing — so `--validate-only` is a pure pre-flight check that
+    // never touches the filesystem (no audit-log directory creation)
+    // and never requires a signature. Saves the operator a confusing
+    // engine error, too.
     let report = workflow::validate(&doc);
     if !report.ok() {
         emit_validation_report(&doc.name, &report);
@@ -159,6 +139,33 @@ pub fn run(argv: Vec<String>) -> ExitCode {
             .unwrap()
         );
         return ExitCode::from(EXIT_OK);
+    }
+
+    // From here we are going to execute. Merge logging config
+    // (workflow `[logging]` → env → CLI → default) and install the
+    // subscriber now, so signature verification and the run itself emit
+    // their audit events to the configured sink.
+    let resolved = resolve_logging(&doc, &tracing_overrides);
+    if let Err(e) = crate::observability::apply(&resolved) {
+        eprintln!("agentd: failed to install log subscriber: {e}");
+        return ExitCode::from(EXIT_SEMANTIC);
+    }
+
+    // Signature verification (RFC 0002) gates execution: a tampered
+    // manifest is refused before the engine builds, even if its DAG
+    // shape is otherwise valid.
+    let sig_source = resolve_signature_source(&sig_path);
+    match crate::signing::verify_or_skip(
+        doc.signing.as_ref(),
+        &raw_bytes,
+        sig_source,
+        args.signing_required,
+    ) {
+        crate::signing::Outcome::Ok => {}
+        crate::signing::Outcome::Refused(reason) => {
+            eprintln!("agentd: workflow signature verification failed: {reason}");
+            return ExitCode::from(EXIT_SEMANTIC);
+        }
     }
 
     // Apply process-wide resource budgets (RLIMIT_AS /
@@ -1894,12 +1901,11 @@ fn resolve_instruction(args: &Args) -> Option<String> {
     // agent.toml` a complete, self-contained agent: identity + the work.
     // Peeked here only to decide the mode; run_instruction_mode reloads
     // the file for the rest of the identity.
-    if let Some(p) = &args.instructions {
-        if let Ok(ins) = crate::agent::AgentInstructions::load(p) {
-            if let Some(task) = ins.task.filter(|s| !s.trim().is_empty()) {
-                return Some(task);
-            }
-        }
+    if let Some(p) = &args.instructions
+        && let Ok(ins) = crate::agent::AgentInstructions::load(p)
+        && let Some(task) = ins.task.filter(|s| !s.trim().is_empty())
+    {
+        return Some(task);
     }
     None
 }

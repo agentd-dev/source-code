@@ -137,6 +137,10 @@ jobs:
           image: ghcr.io/agentd-dev/agentd@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
+          # We attest the SBOM to the image with cosign (next step); we
+          # don't attach it to the GitHub Release, which would need
+          # `contents: write` this least-privilege job deliberately omits.
+          upload-release-assets: false
       - name: Attest SBOM
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

@@ -32,6 +32,7 @@
 //! auth = "bearer:ops"        # or "hmac:github" / "mtls" / "none"
 //! ```
 
+pub mod basic;
 pub mod bearer;
 pub mod config;
 pub mod hmac;
@@ -82,6 +83,11 @@ pub enum AuthRef {
     Bearer {
         name: String,
     },
+    /// HTTP basic auth (RFC 7617) — validated against
+    /// `[auth.basic.<name>]`.
+    Basic {
+        name: String,
+    },
     Hmac {
         name: String,
     },
@@ -100,6 +106,7 @@ impl AuthRef {
     /// - `"none"` / `""` / absent → [`AuthRef::None`]
     /// - `"bearer"` → `Bearer { name: "default" }`
     /// - `"bearer:NAME"` → `Bearer { name: "NAME" }`
+    /// - `"basic"` / `"basic:NAME"` → `Basic { … }`
     /// - `"hmac"` → `Hmac { name: "default" }`
     /// - `"hmac:NAME"` → `Hmac { name: "NAME" }`
     /// - `"mtls"` → `MTls`
@@ -119,6 +126,7 @@ impl AuthRef {
         };
         match kind {
             "bearer" => Ok(AuthRef::Bearer { name }),
+            "basic" => Ok(AuthRef::Basic { name }),
             "hmac" => Ok(AuthRef::Hmac { name }),
             "oidc" => Ok(AuthRef::Oidc { name }),
             "mtls" => {
@@ -130,7 +138,7 @@ impl AuthRef {
                 Ok(AuthRef::MTls)
             }
             other => Err(Error::Config(format!(
-                "unknown auth kind `{other}` (expected bearer / hmac / oidc / mtls / none)"
+                "unknown auth kind `{other}` (expected bearer / basic / hmac / oidc / mtls / none)"
             ))),
         }
     }
@@ -150,8 +158,8 @@ pub enum AuthDecision {
 /// who called them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
-    pub kind: &'static str, // "bearer" / "hmac" / "mtls" / "oidc"
-    pub name: String,       // the binding name, or subject (oidc)
+    pub kind: &'static str, // "bearer" / "basic" / "hmac" / "mtls" / "oidc"
+    pub name: String,       // the binding name, user (basic), or subject (oidc)
 }
 
 impl Principal {
@@ -184,6 +192,7 @@ pub fn evaluate(
             principal: Principal::anonymous(),
         },
         AuthRef::Bearer { name } => bearer::verify(&prepared.config, name, req),
+        AuthRef::Basic { name } => basic::verify(&prepared.config, name, req),
         AuthRef::Hmac { name } => hmac::verify(&prepared.config, name, req),
         AuthRef::MTls => mtls::verify(req),
         AuthRef::Oidc { name } => match prepared.oidc.get(name) {

@@ -7,13 +7,18 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthRef;
 use crate::error::{Error, Result};
 
-/// Complete auth configuration — bearer, HMAC, and OIDC definitions
-/// keyed by operator-facing name.
+/// Complete auth configuration — bearer, basic, HMAC, and OIDC
+/// definitions keyed by operator-facing name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default)]
     pub bearer: HashMap<String, BearerDef>,
+    /// HTTP basic-auth bindings (RFC 7617) — for callers that can't
+    /// set custom headers but can carry credentials in the webhook
+    /// URL (Twilio-style). Verification in [`crate::auth::basic`].
+    #[serde(default)]
+    pub basic: HashMap<String, crate::auth::basic::BasicDef>,
     #[serde(default)]
     pub hmac: HashMap<String, HmacDef>,
     /// OIDC / JWT bindings. Empty unless the workflow declares
@@ -35,6 +40,13 @@ impl AuthConfig {
                     if !self.bearer.contains_key(name) {
                         return Err(Error::Config(format!(
                             "auth ref `bearer:{name}` is not defined in [auth.bearer]"
+                        )));
+                    }
+                }
+                AuthRef::Basic { name } => {
+                    if !self.basic.contains_key(name) {
+                        return Err(Error::Config(format!(
+                            "auth ref `basic:{name}` is not defined in [auth.basic]"
                         )));
                     }
                 }

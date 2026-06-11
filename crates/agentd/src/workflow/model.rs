@@ -503,6 +503,15 @@ pub enum NodeKind {
         #[serde(default)]
         start: Option<String>,
     },
+    /// Run several sub-workflows **concurrently** (declared fan-out)
+    /// under this run's policy/budget envelope, then join. Output is
+    /// `{results: [{result|error}, …], ok}` in branch-declaration order;
+    /// any failure routes the `error` branch. Each branch is a sub-DAG
+    /// (same machinery as `call`), so the bounded substrate is preserved
+    /// — only scheduling changes.
+    Parallel {
+        branches: Vec<ParallelBranch>,
+    },
 
     // --- Control ---
     Condition {
@@ -549,6 +558,7 @@ impl NodeKind {
             NodeKind::CallMcpTool { .. } => "call_mcp_tool",
             NodeKind::ShellRun { .. } => "shell_run",
             NodeKind::Call { .. } => "call",
+            NodeKind::Parallel { .. } => "parallel",
             NodeKind::Condition { .. } => "condition",
             NodeKind::Switch { .. } => "switch",
             NodeKind::Merge => "merge",
@@ -576,6 +586,22 @@ impl NodeKind {
 // ---------------------------------------------------------------------------
 // Edges
 // ---------------------------------------------------------------------------
+
+/// One branch of a `parallel` node — a sub-workflow to run concurrently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ParallelBranch {
+    /// Path to the branch workflow TOML (author-declared, resolved from
+    /// the working directory).
+    pub workflow: String,
+    /// Context path whose value becomes this branch's trigger input;
+    /// defaults to the parent run's trigger input.
+    #[serde(default)]
+    pub input_from: Option<String>,
+    /// Start-node name in the branch; defaults to its first.
+    #[serde(default)]
+    pub start: Option<String>,
+}
 
 /// Directed edge. `when` selects a branch on the source node's output
 /// (e.g. a switch-node case label); `None` means unconditional.

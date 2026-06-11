@@ -64,6 +64,11 @@ static MATRIX: &[Capability] = &[
         "composition",
         "invoke another workflow as a sub-DAG",
     ),
+    c(
+        "parallel",
+        "composition",
+        "run sub-workflows concurrently, then join",
+    ),
     c("call_mcp_tool", "mcp", "invoke an MCP tool"),
     c("read_mcp_resource", "mcp", "read an MCP resource"),
     // Intelligence.

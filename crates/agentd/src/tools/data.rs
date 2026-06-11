@@ -68,11 +68,16 @@ impl NodeHandler for JsonSelectHandler {
 
 /// Walk a dotted path into a JSON value. Unlike
 /// `ExecutionContext::resolve_path`, the head is NOT a node id — the
-/// whole path is relative to `root`.
+/// whole path is relative to `root`. Arrays accept numeric segments
+/// (`items.0.name`), mirroring `resolve_path`.
 fn walk_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cursor = root;
     for segment in path.split('.').filter(|s| !s.is_empty()) {
-        cursor = cursor.as_object()?.get(segment)?;
+        cursor = match cursor {
+            Value::Object(map) => map.get(segment)?,
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
     }
     Some(cursor)
 }
@@ -371,6 +376,30 @@ mod tests {
         match out {
             NodeOutcome::Continue { value, .. } => {
                 assert_eq!(value["value"], "Ada");
+                assert_eq!(value["found"], true);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn json_select_indexes_arrays_numerically() {
+        let mut c = ctx(json!({ "body": { "items": [{ "id": "a" }, { "id": "b" }] } }));
+        let out = JsonSelectHandler
+            .handle(
+                &node(
+                    "s",
+                    NodeKind::JsonSelect {
+                        input_from: "trigger.body".into(),
+                        path: "items.1.id".into(),
+                    },
+                ),
+                &mut c,
+            )
+            .unwrap();
+        match out {
+            NodeOutcome::Continue { value, .. } => {
+                assert_eq!(value["value"], "b");
                 assert_eq!(value["found"], true);
             }
             _ => panic!(),

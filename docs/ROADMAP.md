@@ -170,9 +170,10 @@ and sizing:
       first non-trivial source — hourly-expiring SaaS tokens are the
       use-case catalog's recurring friction (GAP-ANALYSIS §6). Secrets
       never enter the workflow TOML.
-- [ ] **Array-index context paths** — `resolve_path` indexes into arrays
-      (`items.0.id`), not just object keys, so nodes can address
-      fan-out / parallel results positionally.
+- [x] **Array-index context paths** — `resolve_path` (and the
+      json_select / template walk) index into arrays (`items.0.id`),
+      not just object keys, so nodes address fan-out / parallel / map
+      results positionally. Shipped in v1.2.0.
 - [ ] **Windows path-pattern canonicalisation** for `[policy.fs]`
       (matcher is `/`-separated today; see maturity.md).
 

@@ -1,0 +1,68 @@
+# The smallest useful workflow: no LLM, no network, no API key.
+# Reads a name from the environment, renders a greeting, writes it to
+# a file. Demonstrates the shape every workflow shares — typed nodes,
+# declared edges, a fail-closed policy — with nothing to configure.
+#
+#   AGENTD_NAME=world agentd --config examples/hello.toml
+#   cat /tmp/agentd-hello/greeting.txt
+#
+# Validate it without running anything:
+#
+#   agentd --config examples/hello.toml --validate-only
+
+name = "hello"
+
+# Fail-closed policy: the run may read exactly one env var and write
+# under exactly one directory. Everything else is denied.
+[policy.env]
+read_keys = ["AGENTD_NAME"]
+
+[policy.fs]
+write = ["/tmp/agentd-hello/**"]
+
+[[start_nodes]]
+name = "main"
+source = "manual"
+entry_node = "who"
+
+[[nodes]]
+id = "who"
+type = "read_env"
+key = "AGENTD_NAME"
+
+[[nodes]]
+id = "greeting"
+type = "template_render"
+template = "Hello, {{value}} - your agent is alive.\n"
+input_from = "who"
+
+[[nodes]]
+id = "path"
+type = "template_render"
+template = "/tmp/agentd-hello/greeting.txt"
+
+[[nodes]]
+id = "save"
+type = "write_file"
+path_from = "path.rendered"
+content_from = "greeting.rendered"
+
+[[nodes]]
+id = "done"
+type = "terminate"
+
+[[edges]]
+from = "who"
+to = "greeting"
+
+[[edges]]
+from = "greeting"
+to = "path"
+
+[[edges]]
+from = "path"
+to = "save"
+
+[[edges]]
+from = "save"
+to = "done"

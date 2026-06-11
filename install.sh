@@ -9,7 +9,7 @@
 # No sudo is invoked on your behalf.
 #
 # Options (env vars):
-#   AGENTD_VERSION=v0.7.0     pin a release instead of latest
+#   AGENTD_VERSION=v1.0.0     pin a release instead of latest
 #   AGENTD_INSTALL_DIR=/path  override the install directory
 
 set -eu

@@ -77,7 +77,7 @@ impl Metrics {
 }
 
 /// Frozen read of all counters at one instant.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub workflow_starts: u64,
     pub workflow_completions: u64,

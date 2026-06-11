@@ -47,6 +47,12 @@ pub const EXIT_SEMANTIC: u8 = 5;
 // ---------------------------------------------------------------------------
 
 pub fn run(argv: Vec<String>) -> ExitCode {
+    // `agentd inspect RUN.json` — render a run record. A leading
+    // subcommand, resolved before flag parsing.
+    if argv.get(1).map(String::as_str) == Some("inspect") {
+        return run_inspect(argv.get(2).map(String::as_str));
+    }
+
     let (args, tracing_overrides) = match parse_args(&argv[1..]) {
         Ok((a, t)) => (a, t),
         Err(ArgErr::Usage(msg)) => {
@@ -219,6 +225,10 @@ struct Args {
     /// rotates). The file's content is ignored — any mtime bump
     /// triggers a reload.
     reload_file: Option<PathBuf>,
+    /// `--record PATH` / `AGENTD_RECORD` — write a structured run record
+    /// (per-node output + timing, cost, outcome) to PATH after a
+    /// one-shot run. Render it with `agentd inspect PATH`.
+    record: Option<PathBuf>,
 }
 
 /// CLI / env overrides for logging. `None` means "defer to workflow
@@ -274,6 +284,7 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
         signing_required: env_bool("AGENTD_SIGNING_REQUIRED"),
         signing_key_file: env_opt_path("AGENTD_SIGNING_KEY_FILE"),
         reload_file: env_opt_path("AGENTD_RELOAD_FILE"),
+        record: env_opt_path("AGENTD_RECORD"),
     };
     let mut t = TracingOverrides {
         level: std::env::var("AGENTD_LOG")
@@ -378,6 +389,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
             }
             "--reload-file" => {
                 a.reload_file = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
+            "--record" => {
+                a.record = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
             }
             "--log-level" => {
                 t.level = Some(require_value(argv, &mut i, arg)?.to_string());
@@ -992,8 +1006,43 @@ fn run_once_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &A
         None => Value::Null,
     };
 
-    match engine.run(&doc, &start, TriggerMeta::manual(input), options) {
-        Ok(outcome) => {
+    let started = std::time::Instant::now();
+    let result = engine.run_with_trace(&doc, &start, TriggerMeta::manual(input), options);
+    let wall_ms = started.elapsed().as_millis() as u64;
+
+    // Optional run record (`--record PATH`) — the structured account a
+    // run inspector renders. Captured from the same run, written
+    // whether it completed, failed, timed out, or errored.
+    if let Some(path) = &args.record {
+        let cost = engine.metrics().snapshot();
+        let record = match &result {
+            Ok((outcome, trace)) => crate::engine::RunRecord::from_outcome(
+                doc.name.clone(),
+                start.clone(),
+                wall_ms,
+                cost,
+                outcome,
+                trace.clone(),
+            ),
+            Err(e) => crate::engine::RunRecord::errored(
+                doc.name.clone(),
+                start.clone(),
+                wall_ms,
+                cost,
+                e.to_string(),
+            ),
+        };
+        match fs::write(path, record.to_json_pretty()) {
+            Ok(()) => eprintln!("agentd: run record written to {}", path.display()),
+            Err(e) => eprintln!(
+                "agentd: failed to write run record to {}: {e}",
+                path.display()
+            ),
+        }
+    }
+
+    match result {
+        Ok((outcome, _trace)) => {
             let success = outcome.is_success();
             println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
             ExitCode::from(if success { EXIT_OK } else { EXIT_SEMANTIC })
@@ -1003,6 +1052,32 @@ fn run_once_mode(doc: WorkflowDoc, engine: Engine, options: RunOptions, args: &A
             ExitCode::from(EXIT_SEMANTIC)
         }
     }
+}
+
+/// `agentd inspect RUN.json` — read a run record and render its
+/// timeline. Parses to a generic JSON value so it can render records
+/// written by any version.
+fn run_inspect(path: Option<&str>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("agentd inspect: usage: agentd inspect RUN.json");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let raw = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("agentd inspect: read {path}: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    let value: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("agentd inspect: {path}: invalid run record JSON: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
+    print!("{}", crate::engine::record::render(&value));
+    ExitCode::from(EXIT_OK)
 }
 
 /// Choose a start node for one-shot mode.
@@ -1974,6 +2049,9 @@ fn print_help() {
         "\
 agentd {version} — bounded workflow runtime
 
+subcommands:
+  agentd inspect RUN.json          render a run record written by --record
+
 usage:
   agentd [--config FILE]            AGENTD_CONFIG          (required unless embedded)
         [--input FILE]             AGENTD_INPUT           one-shot trigger payload
@@ -1987,6 +2065,7 @@ usage:
         [--intel-http-bearer-file P] AGENTD_INTEL_HTTP_BEARER_FILE  or AGENTD_INTEL_HTTP_BEARER
         [--mcp-stdio \"CMD ARGS\"]   AGENTD_MCP_STDIO       legacy single-server; prefer [[mcp_servers]] TOML
         [--dry-run]                AGENTD_DRY_RUN=1
+        [--record PATH]            AGENTD_RECORD          write a run record; inspect with `agentd inspect PATH`
         [--validate-only]          AGENTD_VALIDATE_ONLY=1
         [--log-level LEVEL]        AGENTD_LOG             (default warn)
         [--log-format text|json]   AGENTD_LOG_FORMAT      (default text)

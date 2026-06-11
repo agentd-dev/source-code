@@ -98,7 +98,9 @@ where
 // Execution trace — what the engine actually walked during a run.
 // ---------------------------------------------------------------------------
 
-/// One entry in an [`ExecutionTrace`] — records a single node visit.
+/// One entry in an [`ExecutionTrace`] — records a single node visit,
+/// with the value it produced and how long it took. The value + timing
+/// power the run inspector; path-only consumers (`node_ids`) ignore them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TraceEntry {
     pub node_id: String,
@@ -109,16 +111,35 @@ pub struct TraceEntry {
     /// Branch label the handler emitted, if any (for Switch /
     /// Condition branching).
     pub branch: Option<String>,
+    /// The value the node produced (`Null` for a `fail` node, whose
+    /// explanation lives in the run outcome). Read by `agentd inspect`.
+    #[serde(default)]
+    pub output: Value,
+    /// Wall-clock the handler took, in milliseconds.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
-/// Ordered list of [`TraceEntry`]s across a single workflow run.
-/// Fixture-driven tests diff these against their `expected.path`.
+/// Ordered list of [`TraceEntry`]s across a single workflow run, tagged
+/// with the run's `execution_id` so a record correlates with the audit
+/// log. Fixture-driven tests diff the entries against `expected.path`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ExecutionTrace {
+    /// Correlates with the `execution_id` field in audit events.
+    #[serde(default)]
+    pub execution_id: String,
     pub entries: Vec<TraceEntry>,
 }
 
 impl ExecutionTrace {
+    /// A trace tagged with its run's execution id.
+    pub fn new(execution_id: impl Into<String>) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            entries: Vec::new(),
+        }
+    }
+
     pub fn node_ids(&self) -> Vec<String> {
         self.entries.iter().map(|e| e.node_id.clone()).collect()
     }

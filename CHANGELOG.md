@@ -78,6 +78,9 @@ conformance suite, green across Linux / macOS / Windows.
 
 - The public surface (TOML schema, CLI, outcome / record JSON, exit
   codes) is now declared **stable under semver**.
+- **MSRV is now Rust 1.88** (was 1.85). The dependency graph
+  (`tracing-appender` → `time 0.3.47`) requires it; edition 2024 already
+  set a 1.85 floor. The release image pins `rust:1.88-bookworm`.
 - Plan promotion now emits a **self-contained** workflow — the base
   environment (backends, policy, budgets, auth) is carried into the
   promoted file rather than referenced, so the production artifact runs

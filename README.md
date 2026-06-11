@@ -8,7 +8,7 @@
 
 [![ci](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml/badge.svg)](https://github.com/agentd-dev/source-code/actions/workflows/ci.yml)
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](crates/agentd/Cargo.toml)
+[![rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](crates/agentd/Cargo.toml)
 
 [Install](#install) · [Quick start](#quick-start) · [Three modes](#three-execution-modes) · [The loop](#the-agent-loop) · [Capabilities](#capabilities) · [Security model](#the-security-model) · [When not to use it](#when-not-to-use-agentd) · [Docs](docs/README.md)
 

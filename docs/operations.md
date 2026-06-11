@@ -1013,10 +1013,8 @@ to `ghcr.io/agentd-dev/agentd`:
 
 | Tag | Meaning |
 |---|---|
-| `latest` | Latest `agent-v*` tagged release. |
-| `1.0.0`, `1.0`, `1` | Specific semver (matches tag `agent-v1.0.0`). |
-| `edge` | Latest main-branch build. Unsigned; use for canary only. |
-| `sha-<7>` | Specific commit. Unsigned. |
+| `latest` | Latest `v*` tagged release. |
+| `1.0.0`, `1.0`, `1` | Specific semver (matches tag `v1.0.0`). |
 
 Released tags are cosign-signed (keyless OIDC from GitHub Actions)
 and carry an SPDX SBOM attestation. Verify:
@@ -1043,8 +1041,8 @@ Rough shape:
 spec:
   terminationGracePeriodSeconds: 45           # > drain_timeout_secs
   containers:
-    - name: agent
-      image: registry/agent:1.0.0
+    - name: agentd
+      image: ghcr.io/agentd-dev/agentd:1.0.0
       args:
         - --config=/etc/agentd/wf.toml
         - --bind=0.0.0.0:8080
@@ -1071,23 +1069,23 @@ limited). `terminationGracePeriodSeconds` must exceed
 
 ### 8.6 Debian / RPM packages + systemd
 
-Pre-built `.deb` and `.rpm` attach to each `agent-v*` release on
+Pre-built `.deb` and `.rpm` attach to each `v*` release on
 GitHub. Both drop a hardened systemd unit with `DynamicUser`,
 `ProtectSystem=strict`, empty `CapabilityBoundingSet`,
 `MemoryDenyWriteExecute`, and a restrictive `SystemCallFilter`.
 
 ```bash
 # Debian / Ubuntu
-sudo apt install ./agent_0.1.0_amd64.deb
+sudo apt install ./agentd_1.0.0_amd64.deb
 
 # RHEL / Fedora / Rocky
-sudo dnf install ./agent-0.1.0-1.x86_64.rpm
+sudo dnf install ./agentd-1.0.0-1.x86_64.rpm
 
 sudo cp my-workflow.toml /etc/agentd/workflow.toml
-sudo systemctl enable --now agent
+sudo systemctl enable --now agentd
 ```
 
-Config knobs live in `/etc/default/agent` as `AGENTD_ARGS=...`. See
+Config knobs live in `/etc/default/agentd` as `AGENTD_ARGS=...`. See
 [`packaging/README.md`](../../packaging/README.md) for full unit
 details, drop-in overrides, and the locked-down filesystem /
 syscall / network posture.

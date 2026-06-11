@@ -13,7 +13,7 @@ required for the first run.
 # Linux x86_64 · macOS Apple Silicon — detects your platform
 curl -fsSL https://agentd.dev/install.sh | sh
 
-# …or build from source (Rust 1.85+)
+# …or build from source (Rust 1.88+)
 cargo build --release -p agentd
 ```
 

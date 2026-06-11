@@ -1,17 +1,17 @@
 # Packaging — `.deb` / `.rpm`
 
 Pre-built packages for tagged releases attach to the GitHub Release
-page as `agent_<version>_amd64.deb` and
+page as `agentd_<version>_amd64.deb` and
 `agentd-<version>-1.x86_64.rpm`.
 
 ## Install
 
 ```bash
 # Debian / Ubuntu
-sudo apt install ./agent_0.1.0_amd64.deb
+sudo apt install ./agentd_1.0.0_amd64.deb
 
 # RHEL / Fedora / Rocky
-sudo dnf install ./agentd-0.1.0-1.x86_64.rpm
+sudo dnf install ./agentd-1.0.0-1.x86_64.rpm
 ```
 
 Both drop:

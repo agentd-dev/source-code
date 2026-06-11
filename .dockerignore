@@ -1,0 +1,11 @@
+# Keep the build context small and the build hermetic: the builder
+# compiles from source, so ship sources only.
+target/
+.git/
+**/node_modules/
+web/.next/
+web/out/
+dist/
+*.tar.gz
+*.zip
+**/*.log

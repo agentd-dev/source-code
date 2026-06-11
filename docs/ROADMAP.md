@@ -119,11 +119,38 @@ composes daemons rather than complicating one:
 
 ### Exactly-once & idempotency
 
-- [ ] **Idempotency keys** — a trigger-supplied key (or a content hash of
-      the input) dedupes retried deliveries to at-most-once *effect*,
-      collapsing the at-least-once recovery boundary (crash-recovery,
-      queue redelivery) into exactly-once for keyed runs. Persisted in
-      the run-state store; pairs with the queue-backed trigger above.
+- [ ] **Idempotency keys** — a per-route key (`idempotency_key =
+      "trigger.order.id"` or a body hash) dedupes retried webhook
+      deliveries to exactly-once *effect*: seen key → replay the
+      recorded outcome, don't re-execute. Persisted in the run-state
+      store (`--state-dir`); single-node first, pairs with the
+      queue-backed trigger above for fleets. Promoted by the
+      fraud-review use case
+      (docs/use-cases/GAP-ANALYSIS.md §5).
+
+### Demanded by the use-case catalog (gap analysis)
+
+The business-automation catalog (docs/use-cases/) was built against the
+real runtime as a stress test; these are the capability proposals it
+produced, in recommended order — see
+[docs/use-cases/GAP-ANALYSIS.md](use-cases/GAP-ANALYSIS.md) for designs
+and sizing:
+
+- [ ] **`respond` node** — let an http-triggered workflow shape its own
+      HTTP reply (status / content-type / templated body) so callers
+      that act on the response — Twilio TwiML, Slack slash commands,
+      webhook challenge echoes — are answered natively (§2).
+- [ ] **`map` node + array-index context paths** — run one sub-workflow
+      per element of a context-resolved array, bounded by a mandatory
+      `max_items` + concurrency cap, joining like `parallel`. "For each
+      X, do the bounded thing" is half of business automation (§3).
+- [ ] **Form-encoded / multipart webhook bodies** — content-type-aware
+      trigger parsing (urlencoded → flat JSON; multipart fields, with
+      attachments dropped + audited in v1) so Twilio / inbound-email
+      callers don't need a JSON relay (§4).
+- [ ] **HTTP basic auth scheme** — RFC 7617, constant-time, same
+      `tokens_env` plumbing as bearer; removes the last auth friction
+      for telephony-style webhook callers (§9).
 
 ### Substrate hardening (smaller, scoped)
 
@@ -138,8 +165,11 @@ composes daemons rather than complicating one:
       configured statically today), with bounded refresh + rotation.
 - [ ] **Secrets-provider integration** — pluggable secret sources beyond
       env / file (Vault, cloud secret managers) behind a feature,
-      resolved at load time into the same `*_env`-style indirection.
-      Secrets never enter the workflow TOML.
+      resolved at load time into the same `*_env`-style indirection,
+      with `oauth2-client-credentials` (fetch + cache + refresh) as the
+      first non-trivial source — hourly-expiring SaaS tokens are the
+      use-case catalog's recurring friction (GAP-ANALYSIS §6). Secrets
+      never enter the workflow TOML.
 - [ ] **Array-index context paths** — `resolve_path` indexes into arrays
       (`items.0.id`), not just object keys, so nodes can address
       fan-out / parallel results positionally.

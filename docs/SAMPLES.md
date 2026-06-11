@@ -159,7 +159,17 @@ const wf = workflow("classifier")
 console.log(wf.toToml());   // → agentd --config - --validate-only
 ```
 
-## 9 · Reference deployments
+## 9 · The business-automation catalog
+
+Fourteen worked use cases — an AI receptionist on Twilio, lead
+deep-research, support triage, invoice approval, incident copilot,
+resume screening with an audit trail, and more — each a
+general-audience article plus a validated workflow under
+[`examples/use-cases/`](../examples/use-cases/). Start at
+[docs/use-cases/](use-cases/README.md); the honest capability map is
+[GAP-ANALYSIS.md](use-cases/GAP-ANALYSIS.md).
+
+## 10 · Reference deployments
 
 Two production-shaped agents in [`examples/reference/`](../examples/reference/) —
 the dogfood, with auth, budgets, fail-closed policy, an audit sink, and

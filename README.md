@@ -51,8 +51,8 @@ curl -fsSL https://agentd.dev/install.sh | sh
 **Straight from a GitHub release** (static musl build shown — runs on any Linux):
 
 ```bash
-curl -fsSLO https://github.com/agentd-dev/source-code/releases/latest/download/agentd-v0.7.0-x86_64-unknown-linux-musl.tar.gz
-tar -xzf agentd-v0.7.0-x86_64-unknown-linux-musl.tar.gz
+curl -fsSLO https://github.com/agentd-dev/source-code/releases/latest/download/agentd-v1.0.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf agentd-v1.0.0-x86_64-unknown-linux-musl.tar.gz
 sudo install -m 0755 agentd /usr/local/bin/agentd
 ```
 
@@ -66,6 +66,9 @@ cargo build --release -p agentd
 ```
 
 ## Quick start
+
+> Five-minute guided walkthrough — install → first run → inspect → serve:
+> [`docs/quickstart.md`](docs/quickstart.md).
 
 ```bash
 # Validate a workflow and exit
@@ -298,6 +301,9 @@ architectural, not prompt-engineered:
   does. Deny messages name the operation and the path that was blocked,
   and land in the audit stream.
 
+Full threat model, hardening checklist, and how to report a
+vulnerability: [`SECURITY.md`](SECURITY.md).
+
 ## When NOT to use agentd
 
 Honesty section. A frozen graph is the wrong tool when:
@@ -306,10 +312,11 @@ Honesty section. A frozen graph is the wrong tool when:
   for hours redirecting itself with no ceiling. `agent_loop` and instruction
   mode are deliberately *bounded* (step caps, token budgets, approval gates);
   if you want an agent with no governor, that's a different tool.
-- **You need durable, resumable multi-day executions.** Runs are
-  in-memory and bounded; a crash re-runs rather than resuming mid-graph.
-  (Checkpoint/resume is on the [roadmap](docs/ROADMAP.md); Temporal-class
-  durability is not the near-term target.)
+- **You need durable, resumable multi-day executions.** Opt-in
+  checkpoint/resume (`--checkpoint-each-node`, `--resume`) gives
+  single-node crash-recovery, but runs are still bounded and in-process;
+  Temporal-class durable execution across a queue boundary or a multi-day
+  horizon is not the near-term target (see the [roadmap](docs/ROADMAP.md)).
 - **You need a coordinated fleet today.** agentd is one excellent process;
   clustering, work distribution, and a coordination layer are designed
   but not built (see the [roadmap](docs/ROADMAP.md)).
@@ -324,7 +331,7 @@ trade — bounded dynamism for governance you can actually audit.
 ```
 crates/agentd/     the runtime (lib + bin)
 docs/              architecture · capabilities · configuration · operations · maturity
-rfcs/              0001 bounded workflow runtime · 0002 signed workflows
+rfcs/              0001 runtime · 0002 signing · 0003 execution model · 0004 MCP routing · 0005 hot reload · 0006 dynamic harness
 examples/          validated, runnable workflow TOMLs
 packaging/         systemd unit + debian scripts (deb/rpm via cargo-deb/generate-rpm)
 web/               documentation site

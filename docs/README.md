@@ -14,12 +14,16 @@ final source of truth; these docs describe the code as it stands.
 
 ## Read this first
 
+- **[quickstart.md](quickstart.md)** — five minutes from install to a
+  running, inspectable agent. No API key for the first run. Start here if
+  you've never run agentd.
+
 - **[architecture.md](architecture.md)** — mental model, module layout,
   execution lifecycle, data flow, invariants. Start here if you want to
   modify the runtime.
 
 - **[capabilities.md](capabilities.md)** — complete node catalogue
-  (all 17 `NodeKind` variants), edge rules, start nodes, triggers,
+  (all 22 `NodeKind` variants), edge rules, start nodes, triggers,
   HTTP routes, policy grammar, auth, TLS, rate limiting, retries,
   input resolution, execution outcome + exit codes, test harness.
   Start here if you're authoring a workflow.
@@ -56,6 +60,7 @@ final source of truth; these docs describe the code as it stands.
 
 | If you want to… | Start here |
 |---|---|
+| Run agentd for the first time | `quickstart.md`. |
 | Author your first workflow | `capabilities.md` → §1 mental model, then the §"Node catalogue". |
 | Understand the TOML grammar | `configuration.md`. |
 | Deploy the binary | `operations.md`. |

@@ -109,6 +109,15 @@ pub struct WorkflowDoc {
     /// socket transports.
     #[serde(default)]
     pub intelligence: Option<crate::intelligence::backends::IntelligenceConfig>,
+
+    /// Declared secret sources (`[[secrets]]`). Every secret-consuming
+    /// field (`api_key_env`, `tokens_env`, `credentials_env`,
+    /// `secret_env`, MCP child `env`, `{{secret:NAME}}` header
+    /// placeholders) resolves its name through this registry first,
+    /// the process environment second — so declaring a source for a
+    /// name upgrades every consumer at once. See `crate::secrets`.
+    #[serde(default)]
+    pub secrets: Vec<crate::secrets::SecretDef>,
 }
 
 impl WorkflowDoc {

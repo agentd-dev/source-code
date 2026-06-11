@@ -136,13 +136,33 @@ impl StdioMcpClient {
     /// initialize handshake yet — that happens lazily on the first
     /// real call so spawn cost isn't paid for unused clients.
     pub fn spawn(command: impl Into<PathBuf>, args: &[String]) -> Result<Self> {
+        Self::spawn_with_env(command, args, &std::collections::HashMap::new())
+    }
+
+    /// Spawn with declared child environment. Each value in `env` is a
+    /// secret NAME resolved through the secrets registry at spawn time
+    /// (`[[secrets]]` source first, process env second), so the server
+    /// gets its credentials without them living in this process's own
+    /// environment. An unresolvable name fails the spawn loudly.
+    pub fn spawn_with_env(
+        command: impl Into<PathBuf>,
+        args: &[String],
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<Self> {
         let command: PathBuf = command.into();
         let label = command.display().to_string();
-        let mut child = Command::new(&command)
-            .args(args)
+        let mut cmd = Command::new(&command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        for (var, secret_name) in env {
+            let value = crate::secrets::resolve(secret_name).map_err(|e| {
+                Error::Mcp(format!("spawn {}: env `{var}`: {e}", command.display()))
+            })?;
+            cmd.env(var, value);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::Mcp(format!("spawn {}: {e}", command.display())))?;
         let stdin = child

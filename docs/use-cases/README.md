@@ -17,7 +17,7 @@ sign-off is a durable checkpoint where it belongs, not a hope.
 
 | Use case | Trigger | The pattern in one line | Status |
 |---|---|---|---|
-| [AI voice receptionist](voice-receptionist.md) | Twilio webhook | speech → intent → declared routing; the caller can't talk the graph into anything | Brain runs today; TwiML reply is a [named gap](GAP-ANALYSIS.md#2-webhook-response-shaping--the-respond-node) |
+| [AI voice receptionist](voice-receptionist.md) | Twilio webhook | speech → intent → declared routing → native TwiML reply; the caller can't talk the graph into anything | Runs today, end to end (v1.2.0: `respond` + form bodies + basic auth) |
 | [Lead deep-research](lead-enrichment.md) | CRM webhook | bounded `agent_loop` investigates allowlisted sources → brief lands in CRM | Runs today |
 | [Support triage](support-triage.md) | Helpdesk webhook | classify + draft → confidence gate → send or human review | Runs today |
 | [Invoice approval](invoice-approval.md) | Watched folder | schema'd extraction → threshold gate → book or controller sign-off | Runs today |

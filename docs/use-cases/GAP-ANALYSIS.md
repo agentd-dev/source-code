@@ -10,17 +10,22 @@ to "can agentd do X?" for the business-automation domain.
 📘 guidance (deliberately out of runtime scope — the architecture
 answer is documented instead).
 
+**Scoreboard:** the catalog shipped 2026-06-11 with one gap closed
+(§1, v1.1.0). The v1.2.0 wave closed four more — §2, §3, §4, §5 and
+§9 — in the order this document recommended. §6 (secrets + OAuth2) is
+the next planned wave; §7/§8 remain deliberate architecture guidance.
+
 | # | Capability | Blocked / shaped which use cases | Status |
 |---|---|---|---|
 | 1 | Outbound HTTPS (`tools-http-tls`) | **all 11 SaaS-touching cases** | ✅ shipped v1.1.0 |
-| 2 | Webhook response shaping (`respond` node) | voice (TwiML), Slack ack formats | 🔶 P1 |
-| 3 | Fan-out over dynamic lists (`map` node) + array-index paths | churn per-account, localization, contract clauses | 🔶 P1 |
-| 4 | Form-encoded / multipart webhook bodies | voice (Twilio), inbox (inbound-parse) | 🔶 P2 |
-| 5 | Idempotency keys (exactly-once effect) | fraud review, any retried webhook | 🔶 P2 (roadmap, promoted) |
-| 6 | Secrets providers + OAuth2 refresh | every SaaS API beyond static tokens | 🔶 P2 (roadmap) |
+| 2 | Webhook response shaping (`respond` node) | voice (TwiML), Slack ack formats | ✅ shipped v1.2.0 |
+| 3 | Fan-out over dynamic lists (`map` node) + array-index paths | churn per-account, localization, contract clauses | ✅ shipped v1.2.0 |
+| 4 | Form-encoded / multipart webhook bodies | voice (Twilio), inbox (inbound-parse) | ✅ shipped v1.2.0 |
+| 5 | Idempotency keys (exactly-once effect) | fraud review, any retried webhook | ✅ shipped v1.2.0 |
+| 6 | Secrets providers + OAuth2 refresh | every SaaS API beyond static tokens | 🔶 next wave |
 | 7 | Document parsing (PDF / DOCX) | invoices, contracts, resumes | 📘 MCP / upstream |
 | 8 | Realtime + streaming I/O (websockets) | full-duplex voice | 📘 sidecar pattern |
-| 9 | HTTP basic auth scheme | Twilio webhook auth option | 🔶 P3 |
+| 9 | HTTP basic auth scheme | Twilio webhook auth option | ✅ shipped v1.2.0 |
 
 ---
 
@@ -45,7 +50,7 @@ This is the pattern this document wants to repeat: the use cases name
 the gap, the gap closes structurally, the articles upgrade from
 "workaround" to "runs today."
 
-## 2. Webhook response shaping — the `respond` node
+## 2. Webhook response shaping — the `respond` node — ✅ closed in v1.2.0
 
 **The finding.** A webhook reply from agentd is always the engine's
 outcome JSON (`{status, final_value, …}`, 200/202/422/5xx). Callers
@@ -69,15 +74,17 @@ body_template = """
 input_from = "classify.parsed"
 ```
 
-Semantics: only meaningful on an http-triggered run (validator enforces
-reachability only from http start nodes); at most one fires per run;
-the run continues afterward if edges exist (respond-then-keep-working),
-mirroring how webhook handlers ack fast and continue. Non-http triggers
-treat it as a no-op pass-through. Sized: a node kind + trigger plumbing
-for an early-write channel + validator rule + docs/tests — comfortably
-one focused PR. **Deletes the bridge from the voice use case.**
+**As shipped**, one deliberate refinement to the sketch: `respond` sets
+the reply's *shape*, not its *timing* — the reply is written when the
+run completes, and a run that ends `Failed`/`TimedOut` ignores it (a
+failure can't masquerade as a clean answer). Early-ack-then-continue
+would have needed a mid-run write channel through the engine; the
+actual use cases (TwiML, Slack shapes, challenge echoes) all want "the
+whole response is the answer," so the simpler, more bounded semantics
+won. **It deleted the bridge from the voice use case** — see the
+rewritten [voice article](voice-receptionist.md).
 
-## 3. Fan-out over dynamic lists — the `map` node
+## 3. Fan-out over dynamic lists — the `map` node — ✅ closed in v1.2.0
 
 **The finding.** `parallel` fans out over **declared** branches —
 perfect for "our four locales," wrong for "whatever accounts the export
@@ -111,7 +118,7 @@ Budgets stay process-wide (a map can't out-spend its envelope). This is
 the single highest-leverage substrate addition for business automation:
 "for each X, do the bounded thing" is half the genre.
 
-## 4. Form-encoded webhook bodies
+## 4. Form-encoded webhook bodies — ✅ closed in v1.2.0
 
 **The finding.** The HTTP trigger parses JSON bodies (or empty). Twilio
 posts `application/x-www-form-urlencoded`; SendGrid/SES inbound-parse
@@ -126,7 +133,7 @@ handling is the document-parsing question, §7). Fail-closed: unknown
 content types still 400. Small, self-contained, kills two relays in
 the catalog.
 
-## 5. Idempotency keys — exactly-once effect
+## 5. Idempotency keys — exactly-once effect — ✅ closed in v1.2.0
 
 **The finding.** Webhook providers deliver at-least-once; today the
 duty to dedupe lands on the downstream API ("make fulfill idempotent on
@@ -199,7 +206,7 @@ policy-bounded answers. The voice article shows the split. If a
 first-party sidecar reference implementation proves popular, it belongs
 in `examples/`, not in the engine.
 
-## 9. HTTP basic auth — small
+## 9. HTTP basic auth — ✅ closed in v1.2.0
 
 Twilio can't set custom headers but supports basic auth in webhook
 URLs. agentd has bearer / HMAC / mTLS / OIDC — adding `basic` (RFC
@@ -211,10 +218,10 @@ telephony-style callers. P3 because bearer-capable relays exist.
 
 ## Reading the table strategically
 
-Close §2 (`respond`) and §4 (form bodies) and the **voice use case goes
-end-to-end native** — the showcase with the most "wow" per line of
-TOML. Close §3 (`map`) and the catalog's three list-shaped cases
-upgrade, plus most unwritten ones ("for each row…"). §5 and §6 are the
-production-hardening pair. That ordering — voice native, then map, then
-hardening — is the recommended sequence, and the roadmap now reflects
-it.
+The recommended sequence — voice native (§2+§4+§9), then `map` (§3),
+then hardening (§5) — **is exactly what the v1.2.0 wave shipped**, each
+with tests, docs, and an upgraded article as the proof. What remains:
+§6 (secrets providers + OAuth2 refresh) is the next planned wave; §7
+and §8 stay architecture guidance on purpose. This document's job now
+is to stay honest the same way the maturity page does: when a use case
+hits a wall, the wall gets a number here.

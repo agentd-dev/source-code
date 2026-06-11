@@ -13,7 +13,7 @@ entry_node = "fan"
 id = "fan"
 type = "map"
 items_from = "trigger.items"
-workflow = "crates/agentd-conformance/fixtures/map-child.toml"
+workflow = "${SCENARIO_DIR}/../../fixtures/map-child.toml"
 max_items = 8
 max_concurrent = 2
 [[nodes]]

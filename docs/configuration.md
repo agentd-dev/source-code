@@ -158,9 +158,10 @@ The discriminator `type` is one of:
 ```
 read_file, read_env, read_mcp_resource, parse_json,
 template_render, json_select, diff_compute,
-llm_infer,
+llm_infer, agent_loop,
 write_file, create_dir, http_request, call_mcp_tool, shell_run,
-condition, switch, merge, fail, terminate
+call, parallel, map,
+condition, switch, merge, fail, pause_for_approval, respond, terminate
 ```
 
 See [`capabilities.md` §1](capabilities.md#1-node-catalog) for the

@@ -280,10 +280,10 @@ impl Engine {
         ctx.node_outputs = checkpoint.node_outputs.clone();
 
         let result = self.walk_loop(workflow, ctx, resume_node, trace, 0);
-        if let (Some(dir), Ok((outcome, _))) = (self.state_dir.as_ref(), &result) {
-            if !matches!(outcome, ExecutionOutcome::Paused { .. }) {
-                crate::engine::checkpoint::Checkpoint::discard(dir, &checkpoint.run_id);
-            }
+        if let (Some(dir), Ok((outcome, _))) = (self.state_dir.as_ref(), &result)
+            && !matches!(outcome, ExecutionOutcome::Paused { .. })
+        {
+            crate::engine::checkpoint::Checkpoint::discard(dir, &checkpoint.run_id);
         }
         result
     }
@@ -597,10 +597,10 @@ impl Engine {
     /// Retire a progress checkpoint once the run reaches a clean
     /// terminal (Completed / Failed) — nothing left to recover.
     fn discard_progress(&self, run_id: &str) {
-        if self.checkpoint_each_node {
-            if let Some(dir) = &self.state_dir {
-                crate::engine::checkpoint::Checkpoint::discard(dir, run_id);
-            }
+        if self.checkpoint_each_node
+            && let Some(dir) = &self.state_dir
+        {
+            crate::engine::checkpoint::Checkpoint::discard(dir, run_id);
         }
     }
 

@@ -86,13 +86,13 @@ impl BearerDef {
             .filter(|s| !s.trim().is_empty())
             .map(String::from)
             .collect();
-        if let Some(var) = &self.tokens_env {
-            if let Ok(raw) = std::env::var(var) {
-                for line in raw.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        out.push(trimmed.to_string());
-                    }
+        if let Some(var) = &self.tokens_env
+            && let Ok(raw) = std::env::var(var)
+        {
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
                 }
             }
         }
@@ -139,12 +139,11 @@ impl HmacDef {
     /// `secret_env` nor literal `secret` is configured (or the env
     /// var is unset).
     pub fn secret_bytes(&self) -> Option<Vec<u8>> {
-        if let Some(var) = &self.secret_env {
-            if let Ok(val) = std::env::var(var) {
-                if !val.is_empty() {
-                    return Some(val.into_bytes());
-                }
-            }
+        if let Some(var) = &self.secret_env
+            && let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            return Some(val.into_bytes());
         }
         self.secret.as_ref().and_then(|s| {
             if s.is_empty() {

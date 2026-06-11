@@ -97,10 +97,10 @@ impl Checkpoint {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw) {
-                    out.push(cp);
-                }
+            if let Ok(raw) = std::fs::read_to_string(&path)
+                && let Ok(cp) = serde_json::from_str::<Checkpoint>(&raw)
+            {
+                out.push(cp);
             }
         }
         out.sort_by(|a, b| a.run_id.cmp(&b.run_id));

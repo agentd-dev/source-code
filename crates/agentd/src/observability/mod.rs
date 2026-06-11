@@ -306,15 +306,15 @@ fn build_audit_layer(
         LogTarget::Stderr => Ok(Some(audit::AuditLayer::new(std::io::stderr(), audit_cfg))),
         LogTarget::Stdout => Ok(Some(audit::AuditLayer::new(std::io::stdout(), audit_cfg))),
         LogTarget::File(path) => {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        InitError::Install(format!(
-                            "mkdir_p {} for audit target: {e}",
-                            parent.display()
-                        ))
-                    })?;
-                }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    InitError::Install(format!(
+                        "mkdir_p {} for audit target: {e}",
+                        parent.display()
+                    ))
+                })?;
             }
             let file = OpenOptions::new()
                 .create(true)
@@ -468,12 +468,12 @@ pub struct FileWriter {
 
 impl FileWriter {
     pub fn open(path: &Path) -> Result<Self, InitError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    InitError::Install(format!("mkdir_p {} for log target: {e}", parent.display()))
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                InitError::Install(format!("mkdir_p {} for log target: {e}", parent.display()))
+            })?;
         }
         let file = OpenOptions::new()
             .create(true)

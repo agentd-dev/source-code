@@ -173,16 +173,16 @@ fn check_start_node_entries(
     r: &mut ValidationReport,
 ) {
     for start in &doc.start_nodes {
-        if let Some(entry) = &start.entry_node {
-            if !node_ids.contains(entry) {
-                r.issues.push(ValidationIssue::new(
-                    "unknown_start_entry_node",
-                    format!(
-                        "start node `{}` references unknown entry node `{entry}`",
-                        start.name
-                    ),
-                ));
-            }
+        if let Some(entry) = &start.entry_node
+            && !node_ids.contains(entry)
+        {
+            r.issues.push(ValidationIssue::new(
+                "unknown_start_entry_node",
+                format!(
+                    "start node `{}` references unknown entry node `{entry}`",
+                    start.name
+                ),
+            ));
         }
     }
 }

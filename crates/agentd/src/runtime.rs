@@ -212,6 +212,9 @@ struct Args {
     plan_only: bool,
     auto_approve: bool,
     plan_out: Option<PathBuf>,
+    /// `--promote PATH` — save the compiled plan as a durable, versioned
+    /// workflow artifact (the static Mode-1 form of the dynamism).
+    promote: Option<PathBuf>,
     max_replans: u32,
     intel_http: Option<String>,
     intel_http_bearer_file: Option<PathBuf>,
@@ -285,6 +288,7 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
             .ok()
             .filter(|s| !s.trim().is_empty()),
         plan_only: env_bool("AGENTD_PLAN_ONLY"),
+        promote: env_opt_path("AGENTD_PROMOTE"),
         auto_approve: env_bool("AGENTD_AUTO_APPROVE"),
         plan_out: env_opt_path("AGENTD_PLAN_OUT"),
         max_replans: env_u64("AGENTD_MAX_REPLANS", 2) as u32,
@@ -370,6 +374,9 @@ fn parse_args(argv: &[String]) -> Result<(Args, TracingOverrides), ArgErr> {
                 a.goal = Some(require_value(argv, &mut i, arg)?.to_string());
             }
             "--plan-only" => a.plan_only = true,
+            "--promote" => {
+                a.promote = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
+            }
             "--auto-approve" => a.auto_approve = true,
             "--plan-out" => {
                 a.plan_out = Some(PathBuf::from(require_value(argv, &mut i, arg)?));
@@ -1883,11 +1890,17 @@ fn run_instruction_mode(
     // from the base config. The agent cannot grant itself capabilities.
     let doc = graft_environment(plan.doc, base);
 
+    // Capability-altitude review for the approval gate: what the plan
+    // does to the world + the policy it runs under — not raw TOML. The
+    // full TOML is one flag away (--plan-only / --plan-out).
     eprintln!(
-        "agentd: compiled workflow `{}` from the instruction in {} attempt(s):\n",
+        "agentd: compiled workflow `{}` from the instruction in {} attempt(s).\n",
         doc.name, plan.attempts
     );
-    println!("{}", plan.source);
+    eprint!(
+        "{}",
+        crate::agent::review::summarize_plan(&doc, &catalog.policy_summary)
+    );
 
     if let Some(out) = &args.plan_out {
         if let Err(e) = fs::write(out, &plan.source) {
@@ -1895,6 +1908,34 @@ fn run_instruction_mode(
             return ExitCode::from(EXIT_SEMANTIC);
         }
         eprintln!("agentd: plan written to {}", out.display());
+    }
+
+    // `--promote PATH`: save the approved plan as a durable, versioned
+    // workflow artifact — the static Mode-1 form of this dynamism, so
+    // it stops being re-generated each run.
+    if let Some(path) = &args.promote {
+        let body = format!(
+            "{}{}",
+            promote_header(&instruction, plan.attempts),
+            plan.source
+        );
+        if let Err(e) = fs::write(path, body) {
+            eprintln!("agentd: failed to promote plan to {}: {e}", path.display());
+            return ExitCode::from(EXIT_SEMANTIC);
+        }
+        eprintln!(
+            "agentd: promoted to {} — add/confirm its [policy] and \
+             [[intelligence.backends]] (see the summary above), sign it, then \
+             run it directly with --config {}",
+            path.display(),
+            path.display(),
+        );
+    }
+
+    // Raw TOML only when explicitly requested, so the default approval
+    // view stays at the capability altitude.
+    if args.plan_only || args.plan_out.is_some() {
+        println!("{}", plan.source);
     }
 
     if args.plan_only {
@@ -1966,6 +2007,26 @@ fn graft_environment(generated: WorkflowDoc, base: Option<WorkflowDoc>) -> Workf
             merged
         }
     }
+}
+
+/// Provenance header prepended to a `--promote`d plan, so a saved
+/// workflow records where it came from.
+fn promote_header(instruction: &str, attempts: u32) -> String {
+    let snippet: String = instruction
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(100)
+        .collect();
+    format!(
+        "# Promoted agentd workflow — compiled from an instruction, then approved.\n\
+         # Instruction: {snippet}\n\
+         # Planner attempts: {attempts}.\n\
+         # Before production: confirm the [policy] and [[intelligence.backends]] this\n\
+         # plan needs (see the capability summary printed at promotion), then sign it.\n\n"
+    )
 }
 
 /// Build the client the planner uses to compile the workflow.
@@ -2143,6 +2204,7 @@ instruction mode (RFC 0006 §3) — compile a workflow from an instruction, then
         [--auto-approve]           AGENTD_AUTO_APPROVE=1 run the compiled plan (else stops, fail-closed)
         [--plan-only]              AGENTD_PLAN_ONLY=1    print the compiled workflow and exit
         [--plan-out PATH]          AGENTD_PLAN_OUT       also write the compiled workflow here
+        [--promote PATH]           AGENTD_PROMOTE        save the approved plan as a durable workflow
         [--max-replans N]          AGENTD_MAX_REPLANS    bounded validation-repair rounds (default 2)
   The planner's model comes from --config's [[intelligence.backends]] (by default_backend),
   else --intel-unix / --intel-http, else AGENTD_GOAL_BACKEND=provider:model. The compiled plan

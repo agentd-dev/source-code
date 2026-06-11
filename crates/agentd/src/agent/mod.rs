@@ -15,5 +15,6 @@ pub mod catalog;
 pub mod instructions;
 pub mod loop_node;
 pub mod planner;
+pub mod review;
 
 pub use instructions::AgentInstructions;

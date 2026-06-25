@@ -87,6 +87,11 @@ pub struct SpawnPayload {
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
     pub depth: u32,
+    /// Whether the gated `exec` self-tool is available (from `--enable-exec`;
+    /// inherited by children). Off by default (RFC 0012). `#[serde(default)]`
+    /// keeps older frames parseable.
+    #[serde(default)]
+    pub enable_exec: bool,
 }
 
 /// A single seed message — a minimal {role, content} pair. Roles mirror the
@@ -157,6 +162,7 @@ mod tests {
                 log_level: "info".into(),
             },
             depth: 1,
+            enable_exec: false,
         }
     }
 

@@ -49,18 +49,17 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** **All four execution modes now work** (once / loop / reactive /
-  schedule). M3 reactive core + M4 loop/schedule drivers done; deferred-but-known
-  items (self-scheduling, exec, vsock, self-MCP-serving, restart governor) remain.
-- **Last completed:** the **`loop`/`schedule` daemon drivers**
-  (`triggers/mode.rs::run_scheduled`) — interval-based re-run of the standing
-  instruction (each fire = an independent supervised `once` run); `loop`
-  re-enters back-to-back, `schedule` on `--interval`; **SIGTERM → graceful drain
-  → exit 0**; fast-failing runs back off (capped) so they can't hot-spin. Wired
-  exhaustively in `main.rs`. e2e-proven (`tests/daemon_modes.rs`: loop fires runs
-  + exits 0 on SIGTERM). Added `libc` as a unix dev-dep (no new crate) to send
-  SIGTERM in tests. 105 unit + 9 integration tests, clippy clean, default build
-  still serde + libc only.
+- **Phase:** M4 underway — the gated `exec` self-tool landed (the one non-MCP
+  capability). All four modes + self-orchestration + reactivity + exec now work.
+- **Last completed:** the gated **`exec` self-tool** (`sec/exec.rs`) — off by
+  default, exposed via `--enable-exec` (propagated in the spawn payload). Runs a
+  local command argv-style (no shell), argv[0] = absolute executable, env
+  scrubbed, output capped, own process group `killpg`'d on a per-call timeout
+  (salvaged from the retired `shell.rs`). Wired as an Orchestrator self-tool
+  gated by the flag. Also dropped the destructive `reap_pending` unit test
+  (its `waitpid(-1)` stole other tests' children in the shared test process —
+  a test-only artifact; covered in prod by the integration tests). 111 unit + 9
+  integration tests, clippy clean, default build still serde + libc.
 - **Next action:** pick from the remaining priority items — most valuable is the
   **gated `exec` self-tool** (`sec/exec.rs`, M4): a built-in MCP tool, off by
   default (`--enable-exec`), that runs a local command under the same
@@ -70,10 +69,17 @@ cargo clippy -p agentd -- -D warnings # keep clean
   exit-code table, health file, RUN_ID idempotency). Deferred big item:
   self-scheduling (self-`subscribe` self-tool + warm `Continue` sessions). M2
   tail: `restart.rs`, live stuck/orphan chaos tests.
-- **Active milestone:** M4 (composition, transports, exec, schedule) — schedule
-  done; exec/vsock/serve-mcp next. (M3 core complete; self-scheduling deferred.)
-- **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
-  prctl/waitpid are Linux/Unix; agentd targets Linux for production.)
+- **Active milestone:** M4 — schedule + exec done; `cron` feature, `net/vsock`,
+  the `--serve-mcp` peer listener next. (M3 core complete; self-scheduling deferred.)
+- **Next action:** `net/vsock.rs` + vsock intelligence transport (feature `vsock`)
+  OR the `cron` feature (feature `cron`, croner) OR start M5 (cloud-native
+  hardening: full exit-code table, `--health-file`, RUN_ID idempotency) — all
+  small/independent. Deferred big item: self-scheduling.
+- **Blockers:** ENVIRONMENT — the host root fs is ~100% full (163G/168G), driven
+  by OTHER projects under /root (e.g. mcpg-dev ≈91G), not agentd (~1G). I freed
+  agentd's own `target/` (`cargo clean`, ~680M) to keep building; the gate works,
+  but the hourly loop may hit ENOSPC again. Operator may need to reclaim space.
+  (Code blockers: none. `net/tls.rs`/otel deferred; Unix-only syscalls as noted.)
 
 _(The loop updates the lines above every iteration.)_
 
@@ -142,7 +148,7 @@ Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `s
 Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,timer}.rs`
 - [ ] serve self-MCP over `unix:` (`--serve-mcp unix:…`)
 - [ ] `net/vsock.rs` + vsock intelligence transport [vsock]
-- [ ] `sec/exec.rs` gated `exec` self-tool folded into kill ladder + budgets + caps
+- [x] `sec/exec.rs` gated `exec` self-tool — off by default, advertised only with `--enable-exec` (propagated via the spawn payload, inherited by children). argv-style (no shell/PATH/interpolation), argv[0] = absolute path to an existing executable, scrubbed env, output capped (64 KiB), own process group `killpg`'d on a mandatory per-call timeout. Salvaged from the retired `shell.rs`. Validation/spawn failures are recoverable observations. (Budget/Rule-of-Two folding = later refinement.)
 - [x] `--mode loop`/`schedule` drivers (`triggers/mode.rs::run_scheduled`): interval-based re-run of the standing instruction (each fire = an independent supervised `once` run); `loop` re-enters back-to-back (interval default 0), `schedule` fires on `--interval`; SIGTERM → graceful drain → exit 0; fast-failing runs back off (capped) so they can't hot-spin. e2e-proven (`tests/daemon_modes.rs`). _Remaining: optional 5-field `cron` feature (croner)._
 - [ ] optional `cron` feature (croner) as a `triggers/timer.rs` event source [feature: cron]
 - **Acceptance:** second agentd connects to served unix self-MCP, subscribes to `agentd://session/…`, reacts to first agent's progress; `--enable-exec` exposes exec only when binary exists, runs under deadline, killed+reaped by subtree ladder; `--mode loop --interval 5m` re-enters with idle backoff, terminates on global budget; vsock intelligence works in a microVM.

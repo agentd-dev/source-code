@@ -94,6 +94,7 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     }
 
     loop {
+        crate::obs::health::tick();
         if signals::draining() {
             for (uri, &i) in &owner {
                 let _ = servers[i].unsubscribe(uri); // best-effort
@@ -152,6 +153,7 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
     );
 
     loop {
+        crate::obs::health::tick();
         if signals::draining() {
             log.info("proc.exit", json!({"reason": "drain", "mode": cfg.mode.as_str()}));
             return exit::SUCCESS;
@@ -195,6 +197,7 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
 fn sleep_interruptible(dur: Duration) {
     let deadline = Instant::now() + dur;
     loop {
+        crate::obs::health::tick(); // stay alive across a long inter-run wait
         if signals::draining() {
             return;
         }

@@ -49,17 +49,17 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M4 underway — the gated `exec` self-tool landed (the one non-MCP
-  capability). All four modes + self-orchestration + reactivity + exec now work.
-- **Last completed:** the gated **`exec` self-tool** (`sec/exec.rs`) — off by
-  default, exposed via `--enable-exec` (propagated in the spawn payload). Runs a
-  local command argv-style (no shell), argv[0] = absolute executable, env
-  scrubbed, output capped, own process group `killpg`'d on a per-call timeout
-  (salvaged from the retired `shell.rs`). Wired as an Orchestrator self-tool
-  gated by the flag. Also dropped the destructive `reap_pending` unit test
-  (its `waitpid(-1)` stole other tests' children in the shared test process —
-  a test-only artifact; covered in prod by the integration tests). 111 unit + 9
-  integration tests, clippy clean, default build still serde + libc.
+- **Phase:** M4 mostly done; opportunistically started **M5 (cloud-native
+  hardening)** with the health-file because disk pressure (see Blockers) favours
+  no-new-dependency work over the vsock/cron features.
+- **Last completed:** **`--health-file` supervisor-heartbeat liveness**
+  (`obs/health.rs`) — a global `tick()` bumped by every supervisor hot loop
+  (reactor, daemon driver, interval sleep) reflects whether the *supervisor* is
+  making progress (idle healthy; a stuck subagent doesn't flip it). A 1s writer
+  thread atomically renders `{alive, supervisor_tick_age_ms, mode, draining, ts}`
+  for a K8s exec probe. e2e-proven (`tests/daemon_modes.rs`). (Prior: the gated
+  `exec` self-tool.) 113 unit + 10 integration tests, clippy clean, default
+  build still serde + libc only.
 - **Next action:** pick from the remaining priority items — most valuable is the
   **gated `exec` self-tool** (`sec/exec.rs`, M4): a built-in MCP tool, off by
   default (`--enable-exec`), that runs a local command under the same
@@ -71,10 +71,12 @@ cargo clippy -p agentd -- -D warnings # keep clean
   tail: `restart.rs`, live stuck/orphan chaos tests.
 - **Active milestone:** M4 — schedule + exec done; `cron` feature, `net/vsock`,
   the `--serve-mcp` peer listener next. (M3 core complete; self-scheduling deferred.)
-- **Next action:** `net/vsock.rs` + vsock intelligence transport (feature `vsock`)
-  OR the `cron` feature (feature `cron`, croner) OR start M5 (cloud-native
-  hardening: full exit-code table, `--health-file`, RUN_ID idempotency) — all
-  small/independent. Deferred big item: self-scheduling.
+- **Next action:** continue M5 no-new-dep hardening while disk is tight:
+  **RUN_ID idempotency** (propagate `cfg.run_id` into every MCP tool-call
+  `_meta` so backing services dedupe retries — small change in `mcp/client.rs`
+  `call_tool`, testable via the mock echoing `_meta`), then the full exit-code
+  table polish + cgroup-v2 awareness. Defer vsock/cron (new crates) until disk
+  frees. Deferred big item: self-scheduling.
 - **Blockers:** ENVIRONMENT — the host root fs is ~100% full (163G/168G), driven
   by OTHER projects under /root (e.g. mcpg-dev ≈91G), not agentd (~1G). I freed
   agentd's own `target/` (`cargo clean`, ~680M) to keep building; the gate works,
@@ -156,7 +158,7 @@ Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,ti
 ### M5 — Cloud-native hardening: drain, health, exit codes, idempotency
 Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.rs`
 - [ ] full drain choreography with `AGENTD_DRAIN_TIMEOUT` < grace
-- [ ] `obs/health.rs` supervisor heartbeat + `--health-file`; opt-in `/healthz`+`/readyz`
+- [x] `obs/health.rs` **supervisor-heartbeat liveness** + `--health-file`: a process-global `tick()` is bumped by every supervisor hot loop (reactor, daemon driver, interval sleep) so liveness reflects the *supervisor* making progress — idle is healthy, a busy/stuck *subagent* doesn't flip it. A 1s writer thread renders `{alive, supervisor_tick_age_ms, mode, draining, ts}` atomically (temp+rename); a K8s exec probe checks `alive`/tick-age freshness. e2e-proven (`tests/daemon_modes.rs`: loop mode writes a live health file). _Opt-in `/healthz`+`/readyz` HTTP surface: later._
 - [ ] complete exit-code table in `exit.rs`
 - [ ] RUN_ID propagation into MCP `_meta`
 - [ ] cgroup-v2 awareness (read `memory.max`, optional child-cgroup + `cgroup.kill`, `memory.high` backpressure, never required)

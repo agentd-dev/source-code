@@ -60,3 +60,46 @@ fn loop_mode_fires_runs_then_drains_to_exit_0_on_sigterm() {
     assert!(out.contains(r#""event":"subagent.spawn""#), "no run subagent.spawn:\n{out}");
     assert!(out.contains(r#""reason":"drain""#), "no graceful drain logged:\n{out}");
 }
+
+#[test]
+#[cfg(unix)]
+fn daemon_writes_a_live_health_file() {
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hf = dir.path().join("health.json");
+
+    let mut child = Command::new(exe)
+        .args([
+            "--mode",
+            "loop",
+            "--interval",
+            "2s",
+            "--instruction",
+            "x",
+            "--intelligence",
+            "unix:/nonexistent.sock",
+            "--model",
+            "m",
+            "--health-file",
+            hf.to_str().unwrap(),
+            "--log-level",
+            "warn",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn agentd loop");
+
+    // Let the writer thread emit at least one heartbeat, then snapshot it.
+    std::thread::sleep(Duration::from_millis(1400));
+    let body = std::fs::read_to_string(&hf).unwrap_or_default();
+    sigterm(child.id());
+    let _ = child.wait();
+
+    // A live supervisor: alive=true, the right mode, and a fresh tick age
+    // (string-asserted to avoid a serde_json dev-dep).
+    // alive=true already means the tick was fresh (age < stale window) at write.
+    assert!(body.contains(r#""alive":true"#), "health file not alive:\n{body}");
+    assert!(body.contains(r#""mode":"loop""#), "wrong mode in health file:\n{body}");
+    assert!(body.contains(r#""supervisor_tick_age_ms""#), "no tick age:\n{body}");
+}

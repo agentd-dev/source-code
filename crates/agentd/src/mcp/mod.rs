@@ -1,4 +1,5 @@
 pub mod client;
-pub mod registry;
 pub mod config;
+pub mod mock;
+pub mod registry;
 pub mod server;

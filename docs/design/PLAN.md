@@ -49,29 +49,26 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M3 (reactivity) underway — the reactive driver is wired end to end
-  (router + MCP subscriptions + notify-then-read + spawn). A live update→react
-  test needs a mock MCP server (next, also reused by the M7 observe-suite).
-- **Last completed:** `triggers/mode.rs::run_reactive` + `--mode reactive` — the
-  supervisor subscribes to the configured MCP resources and, on each
-  `updated{uri}`, reads the current state and spawns a fresh root subagent
-  templated from the event (standing instruction + changed-resource context),
-  debounced via the `Router`; drains to exit 0 on SIGTERM. Wired in `main.rs`;
-  `reactive_payload` templating is pure + unit-tested; CLI regression tests
-  (reactive validation → exit 2, required-MCP-down → exit 6). (Prior:
-  `triggers/router.rs` routing core.) 100 unit + 4 integration tests, clippy
+- **Phase:** M3 (reactivity) — the end-to-end reactive path is **live and
+  proven by observation**. Remaining M3 polish: read-after-subscribe,
+  list_changed, the subscribe/resource.read self-tools, warm sessions.
+- **Last completed:** the built-in **mock MCP server** (`mcp/mock.rs`, hidden
+  `--internal-mock-mcp`) + an **observe-to-validate E2E test** (`tests/
+  reactive_e2e.rs`): a real reactive agentd subscribes to the mock's resource,
+  receives its `updated`, reads it, and fires a reaction — all asserted from the
+  observed JSON-lines telemetry (`subscribe`→`resource.updated`→`trigger.fired`
+  →`subagent.spawn`). Fixed a latent `json::Incoming` ordering bug (Response was
+  swallowing server→client Requests). 101 unit + 7 integration tests, clippy
   clean, default build still serde + libc only.
-- **Next action:** build a **minimal mock MCP server** (test fixture: speaks
-  stdio JSON-RPC — initialize w/ resources.subscribe, resources/list+read,
-  subscribe, then emits `notifications/resources/updated` after a delay) so the
-  live reactive path is testable by *observation* (assert agentd logs
-  `subscribe`→`resource.updated`→`trigger.fired`→`subagent.spawn`). Reused by the
-  M7 observe-suite. THEN finish M3: `read-after-subscribe` on connect (synthesize
-  one "possibly changed" per URI — recovers missed updates), `list_changed`
-  consumption, the `subscribe`/`unsubscribe`/`resource.read` **self-tools**
-  (self-scheduling), warm `Continue` sessions, async subagents; then `loop`/
-  `schedule` modes (M4). (M2 tail still open: `restart.rs`, `--serve-mcp`
-  listener, live stuck/orphan tests.)
+- **Next action (finish M3):** the **`subscribe`/`unsubscribe`/`resource.read`
+  self-tools** (in `mcp/server.rs` / the `SelfHandler` path) so a running agent
+  can self-subscribe → **self-scheduling** (the signature recursion: an agent
+  arranges its own future wake). The supervisor auto-creates a `Continue(this
+  session)` route. Then **read-after-subscribe** on (re)connect (synthesize one
+  "possibly changed" per URI — recovers missed updates), `list_changed`
+  consumption, `unsubscribe` on drain, and warm `Continue` sessions. Then
+  `loop`/`schedule` modes + internal interval (M4). (M2 tail still open:
+  `restart.rs`, `--serve-mcp` listener, live stuck/orphan tests.)
 - **Active milestone:** M3 (reactivity).
 - **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
   prctl/waitpid are Linux/Unix; agentd targets Linux for production.)
@@ -128,7 +125,8 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 
 ### M3 — Reactivity: subscriptions, routing, warm sessions, async subagents
 Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `supervisor/tree.rs`
-- [x] **reactive driver** (`triggers/mode.rs::run_reactive` + `--mode reactive`): supervisor connects MCP, issues capability-gated `resources/subscribe` for `--subscribe` URIs (tracking owner server), loops draining `updated{uri}` notifications → `router.on_updated` → on `due` does **notify-then-read** (`resources/read`) → spawns a fresh root subagent templated from the event (standing instruction + changed-resource context). Drains to exit 0 on SIGTERM. CLI tests (validation→2, required-MCP-down→6). _Remaining: consume `list_changed`, **read-after-subscribe** on (re)connect, `unsubscribe` on shutdown._
+- [x] **reactive driver** (`triggers/mode.rs::run_reactive` + `--mode reactive`): supervisor connects MCP, issues capability-gated `resources/subscribe` for `--subscribe` URIs (tracking owner server), loops draining `updated{uri}` notifications → `router.on_updated` → on `due` does **notify-then-read** (`resources/read`) → spawns a fresh root subagent templated from the event (standing instruction + changed-resource context). Drains to exit 0 on SIGTERM. **Proven end to end by observation** (`tests/reactive_e2e.rs` + the mock MCP server): subscribe→`resource.updated`→`trigger.fired`→reaction `subagent.spawn` all visible in telemetry. _Remaining: consume `list_changed`, **read-after-subscribe** on (re)connect, `unsubscribe` on shutdown._
+- [x] built-in **mock MCP server** (`mcp/mock.rs`, hidden `--internal-mock-mcp <uri>`): a tiny stdio MCP server advertising `resources.subscribe`, serving one resource, emitting one `updated` after subscribe — the fixture for live reactive tests + the M7 observe-suite. (Also fixed a latent codec bug: `json::Incoming` tried `Response` before `Request`, swallowing server→client requests; now `Request` first, regression-tested.)
 - [x] `triggers/router.rs` reactive routing (pure, unit-tested): exact-beats-glob + longest-prefix exactly-one-owner match, `Disposition::Spawn`/`Continue` as a route property, debounce + newest-wins coalesce, `on_updated`/`due`/`next_deadline`, dropped-counter for no-match
 - [ ] warm-session state in `tree.rs`
 - [ ] `subscribe`/`unsubscribe` + `resource.read` self-tools; self-subscribe → auto continue-route (self-scheduling)

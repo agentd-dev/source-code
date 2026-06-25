@@ -64,3 +64,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Unix-only test helper: send SIGTERM to a spawned agentd to exercise the
+# graceful-drain → exit-0 contract for the long-lived (loop/schedule/reactive)
+# modes. `libc` is already a runtime dependency on Unix; this adds no new crate.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

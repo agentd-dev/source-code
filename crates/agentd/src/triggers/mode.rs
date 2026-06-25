@@ -132,6 +132,80 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     }
 }
 
+/// `loop`/`schedule` driver — re-run the standing instruction on a timer until
+/// SIGTERM. RFC 0008 §modes: a clock is just another trigger; each fire is an
+/// independent supervised run (`once` semantics). `loop` (interval default 0)
+/// re-enters back-to-back; `schedule` fires on its `--interval`. The optional
+/// 5-field-cron source is the `cron` feature (later); v1 is interval-based.
+///
+/// Daemon exit predicate = signal only; a per-fire run carries its own
+/// deadline, and the orchestrator bounds the daemon (Job deadline). A
+/// fast-failing run backs off (capped) so it can't hot-spin — a lightweight
+/// stand-in for the restart governor (RFC 0003).
+pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger) -> i32 {
+    let interval = cfg.interval.unwrap_or(Duration::ZERO);
+    let mut backoff = Duration::from_millis(500);
+    let mut iteration: u64 = 0;
+    log.info(
+        "schedule.armed",
+        json!({"mode": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64}),
+    );
+
+    loop {
+        if signals::draining() {
+            log.info("proc.exit", json!({"reason": "drain", "mode": cfg.mode.as_str()}));
+            return exit::SUCCESS;
+        }
+        iteration += 1;
+        log.info("schedule.fired", json!({"iteration": iteration}));
+
+        let ok = match supervise_once(exe.clone(), &base, cfg.drain_timeout, log.clone()) {
+            Ok(SuperviseResult::Completed(o)) => {
+                log.info("run.completed", json!({"status": o.status.as_str()}));
+                true
+            }
+            Ok(SuperviseResult::Failed(e)) => {
+                log.warn("run.failed", json!({"err": e}));
+                false
+            }
+            Ok(SuperviseResult::Killed(r)) => {
+                log.warn("run.killed", json!({"reason": format!("{r:?}")}));
+                false
+            }
+            Err(e) => {
+                log.error("run.spawn_fail", json!({"err": e.to_string()}));
+                false
+            }
+        };
+
+        let wait = if ok {
+            backoff = Duration::from_millis(500);
+            interval
+        } else {
+            let w = backoff.max(interval);
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+            w
+        };
+        sleep_interruptible(wait);
+    }
+}
+
+/// Sleep up to `dur`, returning early if a drain is requested (so SIGTERM
+/// during a long interval wakes the daemon promptly).
+fn sleep_interruptible(dur: Duration) {
+    let deadline = Instant::now() + dur;
+    loop {
+        if signals::draining() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(100)));
+    }
+}
+
 /// Spawn + supervise one reaction synchronously, logging the outcome.
 fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) {
     match supervise_once(exe.to_path_buf(), payload, drain, log.clone()) {

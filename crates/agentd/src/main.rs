@@ -11,10 +11,14 @@
 //! with a clear "scaffold only" notice — but `--help`, `--version`, and config
 //! validation (exit 2) already behave per the contract.
 
+use agentd::agentloop::runner::{run_root, LoopAbort};
 use agentd::config::{Config, ConfigError, Mode};
+use agentd::intel::client::IntelClient;
+use agentd::mcp::client::McpClient;
 use agentd::obs::log::{Comp, LogCtx, Logger};
 use agentd::{exit, signals};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::time::Duration;
 
 fn main() {
     std::process::exit(run());
@@ -68,20 +72,87 @@ fn run() -> i32 {
     );
 
     match cfg.mode {
-        Mode::Once | Mode::Loop | Mode::Reactive | Mode::Schedule => {
+        Mode::Once => run_once(&cfg, &log),
+        other => {
             log.warn(
                 "proc.exit",
-                json!({
-                    "reason": "not_implemented",
-                    "detail": "supervisor + agentic loop land in M1-M3",
-                }),
+                json!({"reason": "not_implemented", "mode": other.as_str()}),
             );
             eprintln!(
-                "agentd {}: scaffold only — '{}' mode runs once M1-M3 land (docs/design/PLAN.md)",
+                "agentd {}: '{}' mode lands in M3-M4 (docs/design/PLAN.md); 'once' works now",
                 agentd::VERSION,
-                cfg.mode.as_str()
+                other.as_str()
             );
             exit::GENERIC
         }
+    }
+}
+
+/// One-shot mode: build the intelligence client, connect the MCP servers, run
+/// the root agent loop, print the result to stdout, and map the terminal
+/// status to an exit code (RFC 0011 §5). stdout is the result; stderr is
+/// telemetry.
+fn run_once(cfg: &Config, log: &Logger) -> i32 {
+    let intel = match IntelClient::from_config(cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            log.error("intel.config.fail", json!({"err": e.to_string()}));
+            eprintln!("agentd: {e}");
+            // An unsupported transport (e.g. https without --features tls) is a
+            // build/config mismatch, not a runtime outage.
+            return exit::USAGE;
+        }
+    };
+
+    let mut servers = Vec::new();
+    for spec in &cfg.mcp_servers {
+        match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60)) {
+            Ok(mut client) => match client.initialize() {
+                Ok(()) => {
+                    log.info(
+                        "mcp.connect",
+                        json!({"server": spec.name, "tools": client.capabilities().supports_tools()}),
+                    );
+                    servers.push(client);
+                }
+                Err(e) => {
+                    log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
+                    eprintln!("agentd: MCP server '{}' handshake failed: {e}", spec.name);
+                    return exit::MCP_REQUIRED_DOWN;
+                }
+            },
+            Err(e) => {
+                log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
+                eprintln!("agentd: MCP server '{}' failed to spawn: {e}", spec.name);
+                return exit::MCP_REQUIRED_DOWN;
+            }
+        }
+    }
+
+    match run_root(&intel, &servers, cfg, log) {
+        Ok(outcome) => {
+            print_result(&outcome.result);
+            log.info("proc.exit", json!({"status": outcome.status.as_str(), "partial": outcome.partial}));
+            exit::once_exit(outcome.status, outcome.partial)
+        }
+        Err(LoopAbort::Intel(m)) => {
+            log.error("intel.error", json!({"err": m}));
+            eprintln!("agentd: intelligence error: {m}");
+            exit::INTEL_UNAVAILABLE
+        }
+        Err(LoopAbort::Mcp(m)) => {
+            log.error("mcp.error", json!({"err": m}));
+            eprintln!("agentd: mcp error: {m}");
+            exit::MCP_REQUIRED_DOWN
+        }
+    }
+}
+
+/// The agent's result goes to stdout (so a caller can capture it); a string
+/// result prints verbatim, anything else as pretty JSON.
+fn print_result(v: &Value) {
+    match v {
+        Value::String(s) => println!("{s}"),
+        other => println!("{}", serde_json::to_string_pretty(other).unwrap_or_default()),
     }
 }

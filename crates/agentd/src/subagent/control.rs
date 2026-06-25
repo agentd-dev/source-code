@@ -69,7 +69,12 @@ pub fn run() -> i32 {
         let connected = McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60))
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
-            Ok(c) => servers.push(c),
+            Ok(mut c) => {
+                // Stamp the run id on every tool call so backing services can
+                // dedupe retries of this run (RFC 0011 §idempotency).
+                c.set_tool_meta(serde_json::json!({"agentd/run_id": payload.telemetry.run_id}));
+                servers.push(c);
+            }
             Err(e) => {
                 return fail(&up, &log, format!("mcp '{}': {e}", spec.name), crate::exit::MCP_REQUIRED_DOWN)
             }

@@ -82,6 +82,7 @@ pub struct LogCtx {
 
 /// A logger bound to one [`LogCtx`]. Cheap to clone (clones the ctx); writes
 /// serialize behind a process-global stderr mutex so lines never interleave.
+#[derive(Clone)]
 pub struct Logger {
     ctx: LogCtx,
     min: Level,

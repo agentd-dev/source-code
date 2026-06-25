@@ -42,31 +42,32 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M2 in progress — every supervision *primitive* is in and tested
-  (spawn, control, liveness, reap, kill ladder, SIGCHLD self-pipe); only the
-  `reactor.rs` that wires them together (and the once-mode switch + self-MCP)
-  remains.
-- **Last completed:** the dead/stuck + reaping foundations, both with pure,
-  unit-tested cores. `supervisor/liveness.rs` — the three-detector model
-  (hard deadline / no-progress watchdog / ping-pong) folded into the EOF×pong
-  2×2 classifier returning `Healthy`/`Busy`/`Stuck`/`Dead`/`DeadlineExceeded`
-  (+ `needs_teardown`), driven by `on_event`/`on_pong`/`on_eof`/`classify(now)`.
-  `supervisor/reap.rs` — `reap_pending` (`waitpid(-1,WNOHANG)` drain loop,
-  since SIGCHLD doesn't queue), the pure `classify_status` exit decode
-  (Exited/Signaled, libc `WIF*`), `PR_SET_CHILD_SUBREAPER`, and PID-1 detect.
-  (Earlier this milestone: `protocol.rs`, `tree.rs`, `sec/scope.rs`, `spawn.rs`,
-  `control.rs` + the spawn integration test.) 82 unit + 1 integration test,
-  clippy clean, default build still serde + libc only. **once-mode still in-process.**
-- **Next action (M2 — the keystone):** `supervisor/reactor.rs` — the single
-  loop that owns the tree + the `NodeId→Subagent` handle map, waits on the
-  merged event channel + the signal self-pipe (`recv_timeout` armed to the
-  nearest child deadline), drains SIGCHLD via `reap::reap_pending`, ticks
-  `liveness.classify` per child, and runs the `kill::Ladder` (walking
-  `tree.deepest_first()`, force on second signal) within the
-  `AGENTD_DRAIN_TIMEOUT` budget. Then **switch once-mode** to spawn + supervise
-  the root subagent (an integration test exercises drain + stuck-kill). Then
-  `supervisor/restart.rs` → `mcp/server.rs` self-MCP `subagent.spawn/*` (the
-  model self-orchestrates: it delegates subtasks to child agents via this tool).
+- **Phase:** M2 nearly complete — the reactor wires every primitive together
+  and **once-mode is now supervised** (spawn + supervise a root subagent).
+  Remaining: the self-MCP `subagent.spawn` tool (model self-orchestration),
+  restart governor, and a live stuck-kill test.
+- **Last completed:** `supervisor/reactor.rs` — the `Supervisor` loop (merged
+  mpsc + 200ms `recv_timeout` tick) owns the tree + `NodeId→Subagent` map +
+  per-child `Liveness`; processes events (Ready/Pong/Event/Usage/Result/Failed,
+  token rollup), reaps on SIGCHLD (reap-safe via `mark_reaped`), ticks the
+  liveness classifier, and drives the `kill::Ladder` (cancel→SIGTERM→SIGKILL,
+  deepest-first) on drain/stuck/deadline/tree-budget within the drain budget.
+  `main.rs` once-mode now calls `supervise_once` — it spawns + supervises a root
+  subagent and maps `SuperviseResult` → exit code; `set_child_subreaper()` wired
+  at startup. `spawn.rs` refactored to the merged channel + reap-safe teardown.
+  `Logger` made `Clone`. 87 unit + 3 integration tests (incl. `cli_once.rs`:
+  supervised once-mode → exit 4 on unreachable intel; bad-flag → exit 2), clippy
+  clean, default build still serde + libc only. **once-mode is now supervised.**
+- **Next action (finish M2):** `mcp/server.rs` — agentd's **self-MCP server**
+  (stdio) exposing `subagent.spawn/send/cancel/status`: this is where the model
+  *self-orchestrates* — it calls `subagent.spawn` to split its instruction into
+  delegated child agents; the supervisor enforces caps (`tree.mint_child` →
+  `SpawnRefused` as a tool result) + scope narrowing (`sec/scope`). Wire the
+  self-MCP into the loop's tool catalogue + route `subagent.*` calls to the
+  supervisor (needs the reactor to accept spawn requests from the running root —
+  a control-channel `spawn` upcall or an in-process broker). Then
+  `supervisor/restart.rs` (loop/reactive only) and a live stuck-kill test
+  (`kill -STOP` a child → Stuck → ladder → SIGKILL).
 - **Active milestone:** M2 (subagent processes).
 - **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
   prctl/waitpid are Linux/Unix; agentd targets Linux for production.)
@@ -107,7 +108,7 @@ Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ m
 ### M2 — Subagent processes: the supervised tree
 Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent/ mcp/server.rs sec/scope.rs`
 - [x] `supervisor/tree.rs` records (depth minting, caps chokepoint, token rollup, draining, deepest-first)
-- [ ] `supervisor/reactor.rs` merged-mpsc/recv_timeout loop
+- [x] `supervisor/reactor.rs` the `Supervisor` loop (merged mpsc + recv_timeout tick): owns tree + handle map + per-child liveness, processes events, reaps on SIGCHLD, ticks liveness, drives the kill ladder on drain/stuck/deadline/tree-budget. **once-mode switched** to `supervise_once` (spawns + supervises the root subagent); `set_child_subreaper()` wired at startup; CLI regression tests (`tests/cli_once.rs`)
 - [x] `supervisor/spawn.rs` re-exec subagent mode (`AGENTD_SUBAGENT`); `setpgid` via pre_exec; payload delivery + upward-event reader thread; immediate process-group kill (rlimit in pre_exec + graceful ladder deferred to kill.rs)
 - [x] `subagent/protocol.rs` control protocol (ControlMsg/AgentMsg/SpawnPayload), length-framed
 - [x] `subagent/control.rs` child-side: PDEATHSIG, read payload, Ready, connect intel+scoped MCP, run loop, **ping/pong on a separate thread** + cancel flag; `main.rs` subagent dispatch; e2e integration test (`tests/subagent_spawn.rs`)

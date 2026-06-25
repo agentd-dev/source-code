@@ -11,14 +11,12 @@
 //! with a clear "scaffold only" notice — but `--help`, `--version`, and config
 //! validation (exit 2) already behave per the contract.
 
-use agentd::agentloop::runner::{run_root, LoopAbort};
 use agentd::config::{Config, ConfigError, Mode};
-use agentd::intel::client::IntelClient;
-use agentd::mcp::client::McpClient;
 use agentd::obs::log::{Comp, LogCtx, Logger};
+use agentd::subagent::protocol::{IntelConfig, Limits, SpawnPayload, Telemetry};
+use agentd::supervisor::reactor::{supervise_once, KillReason, SuperviseResult};
 use agentd::{exit, signals};
 use serde_json::{json, Value};
-use std::time::Duration;
 
 fn main() {
     std::process::exit(run());
@@ -48,6 +46,8 @@ fn run() -> i32 {
     };
 
     signals::install();
+    // Adopt orphaned grandchildren into our reaping domain (RFC 0003).
+    let subreaper = agentd::supervisor::reap::set_child_subreaper();
 
     let log = Logger::new(
         LogCtx {
@@ -67,6 +67,7 @@ fn run() -> i32 {
             "mode": cfg.mode.as_str(),
             "mcp_servers": cfg.mcp_servers.len(),
             "subscribe": cfg.subscribe.len(),
+            "subreaper": subreaper,
         }),
     );
 
@@ -87,63 +88,90 @@ fn run() -> i32 {
     }
 }
 
-/// One-shot mode: build the intelligence client, connect the MCP servers, run
-/// the root agent loop, print the result to stdout, and map the terminal
-/// status to an exit code (RFC 0011 §5). stdout is the result; stderr is
-/// telemetry.
+/// One-shot mode: spawn + supervise a root subagent that runs the agentic
+/// loop, then map its result to an exit code (RFC 0011 §5). stdout is the
+/// result; stderr is telemetry. The loop itself runs in the child process; the
+/// supervisor here owns lifecycle, liveness, and teardown.
 fn run_once(cfg: &Config, log: &Logger) -> i32 {
-    let intel = match IntelClient::from_config(cfg) {
-        Ok(c) => c,
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
         Err(e) => {
-            log.error("intel.config.fail", json!({"err": e.to_string()}));
-            eprintln!("agentd: {e}");
-            // An unsupported transport (e.g. https without --features tls) is a
-            // build/config mismatch, not a runtime outage.
-            return exit::USAGE;
+            log.error("proc.exit", json!({"err": format!("current_exe: {e}")}));
+            eprintln!("agentd: cannot locate own executable: {e}");
+            return exit::GENERIC;
         }
     };
+    let payload = root_payload(cfg);
 
-    let mut servers = Vec::new();
-    for spec in &cfg.mcp_servers {
-        match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60)) {
-            Ok(mut client) => match client.initialize() {
-                Ok(()) => {
-                    log.info(
-                        "mcp.connect",
-                        json!({"server": spec.name, "tools": client.capabilities().supports_tools()}),
-                    );
-                    servers.push(client);
-                }
-                Err(e) => {
-                    log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
-                    eprintln!("agentd: MCP server '{}' handshake failed: {e}", spec.name);
-                    return exit::MCP_REQUIRED_DOWN;
-                }
-            },
-            Err(e) => {
-                log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
-                eprintln!("agentd: MCP server '{}' failed to spawn: {e}", spec.name);
-                return exit::MCP_REQUIRED_DOWN;
-            }
-        }
-    }
-
-    match run_root(&intel, &servers, cfg, log) {
-        Ok(outcome) => {
+    match supervise_once(exe, &payload, cfg.drain_timeout, log.clone()) {
+        Ok(SuperviseResult::Completed(outcome)) => {
             print_result(&outcome.result);
             log.info("proc.exit", json!({"status": outcome.status.as_str(), "partial": outcome.partial}));
             exit::once_exit(outcome.status, outcome.partial)
         }
-        Err(LoopAbort::Intel(m)) => {
-            log.error("intel.error", json!({"err": m}));
-            eprintln!("agentd: intelligence error: {m}");
-            exit::INTEL_UNAVAILABLE
+        Ok(SuperviseResult::Failed(err)) => {
+            log.error("proc.exit", json!({"err": err}));
+            eprintln!("agentd: {err}");
+            failed_exit(&err)
         }
-        Err(LoopAbort::Mcp(m)) => {
-            log.error("mcp.error", json!({"err": m}));
-            eprintln!("agentd: mcp error: {m}");
-            exit::MCP_REQUIRED_DOWN
+        Ok(SuperviseResult::Killed(reason)) => {
+            log.warn("proc.exit", json!({"killed": format!("{reason:?}")}));
+            eprintln!("agentd: run terminated ({reason:?})");
+            match reason {
+                KillReason::Deadline | KillReason::Stuck => exit::DEADLINE,
+                KillReason::TreeBudget => exit::BUDGET,
+                KillReason::Drain => exit::SUCCESS, // clean drain (M5 refines 0 vs 143)
+            }
         }
+        Err(e) => {
+            log.error("proc.exit", json!({"err": format!("spawn: {e}")}));
+            eprintln!("agentd: failed to spawn root subagent: {e}");
+            exit::GENERIC
+        }
+    }
+}
+
+/// Build the root subagent's spawn payload from CLI config. The root gets the
+/// full configured MCP set (scope narrows only for *child* subagents).
+fn root_payload(cfg: &Config) -> SpawnPayload {
+    // ~10 years if no deadline, so the child's `Instant + ms` never overflows.
+    let deadline_ms = cfg.deadline.map(|d| d.as_millis() as u64).unwrap_or(315_360_000_000);
+    SpawnPayload {
+        instruction: cfg.instruction.clone().unwrap_or_default(),
+        output_contract: None,
+        context_seed: Vec::new(),
+        intelligence: IntelConfig {
+            uri: cfg.intelligence.clone().unwrap_or_default(),
+            token: cfg.intelligence_token.clone(),
+            model: cfg.model.clone(),
+        },
+        mcp_servers: cfg.mcp_servers.clone(),
+        limits: Limits {
+            max_steps: cfg.max_steps,
+            max_tokens: cfg.max_tokens,
+            deadline_ms,
+            max_depth: cfg.max_depth,
+        },
+        telemetry: Telemetry {
+            run_id: cfg.run_id.clone(),
+            agent_id: "0".into(),
+            agent_path: "0".into(),
+            trace_id: None,
+            log_level: cfg.log_level.as_str().into(),
+        },
+        depth: 0,
+    }
+}
+
+/// Map a fatal subagent failure to an exit code. The control layer prefixes
+/// errors with `intel:` / `mcp:` (RFC 0011 §5).
+fn failed_exit(err: &str) -> i32 {
+    if err.contains("intel") {
+        exit::INTEL_UNAVAILABLE
+    } else if err.contains("mcp") {
+        exit::MCP_REQUIRED_DOWN
+    } else {
+        exit::GENERIC
     }
 }
 

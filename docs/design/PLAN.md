@@ -42,25 +42,30 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M1 in progress — wire + transports + intelligence landed; MCP
-  client + the loop next. Rich docs + samples generated (docs/*.md, examples/).
-- **Last completed:** M1 foundation (config/exit/json/log/signals/stop) +
-  `wire/intel.rs` + `wire/mcp.rs` (MCP 2025-11-25 types, capability gating,
-  notify-then-read) + `net/http.rs` (hand-rolled HTTP/1.1) + `net/unixsock.rs`
-  + `intel/` (openai-compatible **and** anthropic adapters + transport-selecting
-  client). 47 tests green, clippy `-D warnings` clean, default build = serde +
-  libc only. Docs: 10 pages + README + index + runnable samples (instructions,
-  mcp config, run scripts, Dockerfile, k8s manifests, systemd unit).
-- **Next action (M1 remainder):** `mcp/client.rs` — spawn one stdio MCP server
-  (reader-thread + pending-request map + notification dispatch), `initialize` +
-  capability store, `tools/list`(+cursor)+`tools/call`, `resources/list`+`read`.
-  Then `agentloop/{context,action,runner}.rs` (the ReAct loop: assemble request
-  → intel.complete → tool calls via MCP → feed back → stop.rs) + a `budget`
-  check. Then wire `main.rs` once-mode to run the root loop and map the terminal
-  status to an exit code → M1 acceptance.
-- **Active milestone:** M1 (skeleton).
-- **Blockers:** none. (`net/tls.rs` deferred — implement when verifying the
-  https intelligence path under `--features tls`; otel deps undeclared until M6.)
+- **Phase:** M1 largely complete — once-mode runs end to end. Moving to M2
+  (subagent processes / supervised tree).
+- **Last completed:** the full M1 vertical slice — config/exit/json/log/signals,
+  `wire/{intel,mcp}`, `net/{http,unixsock}`, `intel/` (openai+anthropic+client),
+  `mcp/client.rs` (stdio, reader-thread, pending-map, timeouts, initialize,
+  tools/resources/subscribe), `supervisor/budget.rs`, `agentloop/runner.rs`
+  (the ReAct loop), and `main.rs` once-mode wiring. 55 tests green, clippy
+  `-D warnings` clean, default build = serde + libc only. Exit-code contract
+  verified (intel=4, mcp=6, config=2, budget partials, unimplemented modes=1).
+  Rich docs (10 pages) + runnable samples committed.
+- **Next action (M2 — supervised subagent tree):** `supervisor/reactor.rs`
+  (merged-mpsc/recv_timeout loop) + `tree.rs`; `supervisor/spawn.rs` (re-exec
+  subagent mode; setpgid; pre_exec rlimit + **PDEATHSIG**); `subagent/{control,
+  protocol}.rs` (length-framed control channel; reader on a separate thread;
+  ping/pong); `supervisor/reap.rs` (SIGCHLD self-pipe + waitpid loop +
+  SUBREAPER + PID-1 detect); `supervisor/liveness.rs` (three detectors +
+  EOF×pong); `supervisor/kill.rs` (kill ladder); `supervisor/restart.rs`;
+  `mcp/server.rs` self-MCP (stdio) `subagent.spawn/send/cancel/status`;
+  `sec/scope.rs` + spawn-chokepoint caps. (M1 follow-ups, low priority: split
+  `agentloop/{context,action}`, inject a resource catalogue, make
+  https-without-`tls` exit 2 not 4.)
+- **Active milestone:** M2 (subagent processes).
+- **Blockers:** none. (`net/tls.rs` deferred to the https-verify pass under
+  `--features tls`; otel deps undeclared until M6.)
 
 _(The loop updates the lines above every iteration.)_
 
@@ -78,7 +83,7 @@ they land; a milestone is **done** only when every acceptance bullet holds.
 - [x] `rfcs/README.md` index
 - [x] This plan committed
 
-### M1 — Skeleton: config, one-shot, one MCP server, the loop, budgets  _(in progress)_
+### M1 — Skeleton: config, one-shot, one MCP server, the loop, budgets  _(largely complete)_
 Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ mcp/{client,registry,config} agentloop/ supervisor/budget.rs obs/log.rs sec/secrets.rs signals.rs`
 > Note: the plan's `loop/` dir is `agentloop/` in code (`loop` is a Rust keyword).
 - [x] Scaffold workspace/crate/module tree (assessment §4.0); compiles
@@ -88,10 +93,10 @@ Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ m
 - [x] `wire/mcp.rs` (2025-11-25 types, capability gating) + `wire/intel.rs` (neutral + tool-calling)
 - [x] `net/http.rs` hand-rolled HTTP/1.1 over Read+Write + `net/unixsock.rs` (SSE + `net/tls.rs` deferred until https path/M6)
 - [x] `intel/` openai-compatible adapter + native tool-calling + anthropic adapter; client over `unix:` / `https:`(tls) / `vsock:`(feat)
-- [ ] `mcp/client.rs` one stdio server (reader-thread + pending-map) tools/list+call, resources/list+read
-- [ ] `agentloop/` ReAct loop (`runner.rs`/`context.rs`/`action.rs`) — `stop.rs` `TerminalStatus` done
-- [ ] `supervisor/budget.rs` token/step/deadline (salvage CAS tracker)
-- [ ] wire `main.rs` once-mode (root agent runs the loop) + M1 acceptance run
+- [x] `mcp/client.rs` one stdio server (reader-thread + pending-map + timeouts) tools/list+call, resources/list+read, subscribe
+- [x] `agentloop/runner.rs` ReAct loop (catalogue→intel→tools→observe→stop); `stop.rs` `TerminalStatus` done. (`context.rs`/`action.rs` split + resource-catalogue injection = M1 follow-up)
+- [x] `supervisor/budget.rs` step/token/deadline budget
+- [x] wire `main.rs` once-mode (intel + MCP connect + root loop + exit-code mapping). Structural acceptance verified (exit 4/6/2/1, budget partials); live LLM+MCP round-trip needs a real endpoint.
 - [x] `obs/log.rs` JSON-lines logger + line schema; `signals.rs` SIGTERM/INT/PIPE
 - **Acceptance:** `agentd --mode once --instruction … --intelligence https://… --mcp fs=…` → loop → real `tools/call` → result on stdout, JSON events on stderr; exit code maps terminal status; bad flag → exit 2 in <50ms; step/token/deadline cap → labeled partial not hang; `isError:true`→observation, JSON-RPC error→abort.
 

@@ -26,9 +26,12 @@ fn main() {
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
 
-    // Hidden built-in mock MCP server (tests / dev): `--internal-mock-mcp <uri>`.
+    // Hidden built-in mock MCP server (tests / dev):
+    // `--internal-mock-mcp <uri> [--no-emit]`.
     if argv.get(1).map(String::as_str) == Some("--internal-mock-mcp") {
-        return agentd::mcp::mock::run(argv.get(2).map(String::as_str).unwrap_or("mock://resource"));
+        let uri = argv.get(2).map(String::as_str).unwrap_or("mock://resource");
+        let emit = !argv.iter().any(|a| a == "--no-emit");
+        return agentd::mcp::mock::run(uri, emit);
     }
 
     // Subagent re-exec dispatch (M2). The supervisor sets this in the child's

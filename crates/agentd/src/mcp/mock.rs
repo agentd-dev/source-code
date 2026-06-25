@@ -17,20 +17,22 @@ use std::time::Duration;
 
 type Out = Arc<Mutex<io::Stdout>>;
 
-/// Run the mock server until stdin closes. Returns the process exit code.
-pub fn run(uri: &str) -> i32 {
+/// Run the mock server until stdin closes. `emit` controls whether it pushes a
+/// `resources/updated` after a subscribe (off = test read-after-subscribe in
+/// isolation). Returns the process exit code.
+pub fn run(uri: &str, emit: bool) -> i32 {
     let out: Out = Arc::new(Mutex::new(io::stdout()));
     let mut reader = BufReader::new(io::stdin());
     while let Ok(Some(bytes)) = frame::read_line(&mut reader) {
         if let Ok(Incoming::Request(req)) = serde_json::from_slice::<Incoming>(&bytes) {
-            handle(&out, req, uri);
+            handle(&out, req, uri, emit);
         }
         // Notifications (e.g. notifications/initialized) need no reply.
     }
     0
 }
 
-fn handle(out: &Out, req: Request, uri: &str) {
+fn handle(out: &Out, req: Request, uri: &str, emit: bool) {
     match req.method.as_str() {
         "initialize" => reply(
             out,
@@ -58,16 +60,21 @@ fn handle(out: &Out, req: Request, uri: &str) {
         "resources/unsubscribe" => reply(out, Response::ok(req.id, json!({}))),
         "resources/subscribe" => {
             reply(out, Response::ok(req.id, json!({})));
-            // Drive the reactive loop: emit one update shortly after subscribe.
-            let out = Arc::clone(out);
-            let uri = uri.to_string();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                let note =
-                    json::Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({"uri": uri})));
-                let mut g = out.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = frame::write_line(&mut *g, &note);
-            });
+            // Drive the reactive loop: emit one update shortly after subscribe
+            // (unless `emit` is off — used to test read-after-subscribe alone).
+            if emit {
+                let out = Arc::clone(out);
+                let uri = uri.to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let note = json::Notification::new(
+                        method::NOTIFY_RESOURCES_UPDATED,
+                        Some(json!({"uri": uri})),
+                    );
+                    let mut g = out.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = frame::write_line(&mut *g, &note);
+                });
+            }
         }
         other => reply(out, Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported: {other}"))),
     }

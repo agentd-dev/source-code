@@ -80,8 +80,24 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     }
     log.info("reactive.armed", json!({"subscriptions": owner.len(), "servers": servers.len()}));
 
+    // Read-after-subscribe (mandatory, RFC 0008 / assessment §2.8): treat every
+    // watched resource as possibly-changed at startup so a change that happened
+    // before (or during) subscribing isn't missed. Converts the edge-triggered
+    // `updated` notification into level-triggered "act on current state", and
+    // recovers updates missed across a restart. The reactive model acts on what
+    // the resource *is* now, so this is safe and idempotent.
+    let t0 = Instant::now();
+    for uri in owner.keys() {
+        if router.on_updated(uri, t0) {
+            log.info("reactive.initial_read", json!({"uri": uri}));
+        }
+    }
+
     loop {
         if signals::draining() {
+            for (uri, &i) in &owner {
+                let _ = servers[i].unsubscribe(uri); // best-effort
+            }
             log.info("proc.exit", json!({"reason": "drain", "mode": "reactive"}));
             return exit::SUCCESS;
         }

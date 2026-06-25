@@ -120,9 +120,20 @@ pub fn run_loop(
     let (mut tools, tool_to_server) = build_catalogue(servers)?;
     tools.extend(self_handler.tools());
 
+    // Resources: list = awareness (a compact catalogue injected as context),
+    // read = attention (the model pulls a body on demand via resource.read).
+    // RFC 0007 §resources.
+    let resources = collect_resources(servers);
+    if !resources.owner.is_empty() {
+        tools.push(resource_read_tool_def());
+    }
+
     let mut budget = Budget::new(input.max_steps, input.max_tokens, input.deadline);
 
     let mut messages = vec![Message::system(system_prompt(input.output_contract.as_deref()))];
+    if let Some(note) = resources.catalogue_note() {
+        messages.push(Message::system(note));
+    }
     for (role, content) in &input.seed {
         messages.push(seed_message(role, content));
     }
@@ -132,7 +143,7 @@ pub fn run_loop(
 
     log.info(
         "loop.start",
-        json!({"tools": tools.len(), "servers": servers.len(), "max_steps": input.max_steps}),
+        json!({"tools": tools.len(), "servers": servers.len(), "resources": resources.owner.len(), "max_steps": input.max_steps}),
     );
 
     loop {
@@ -179,9 +190,13 @@ pub fn run_loop(
 
             for tc in &tool_calls {
                 log.info("tool.call", json!({"tool": tc.name, "id": tc.id}));
-                let (content, is_error) = match self_handler.handle(&tc.name, &tc.arguments) {
-                    Some(r) => r, // a self-tool (e.g. subagent.spawn)
-                    None => dispatch_tool(servers, &tool_to_server, &tc.name, &tc.arguments),
+                let (content, is_error) = if tc.name == "resource.read" {
+                    read_resource_tool(servers, &resources.owner, &tc.arguments)
+                } else {
+                    match self_handler.handle(&tc.name, &tc.arguments) {
+                        Some(r) => r, // a self-tool (e.g. subagent.spawn)
+                        None => dispatch_tool(servers, &tool_to_server, &tc.name, &tc.arguments),
+                    }
                 };
                 log.info("tool.result", json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()}));
                 messages.push(Message::tool_result(&tc.id, content, is_error));
@@ -254,9 +269,136 @@ fn seed_message(role: &str, content: &str) -> Message {
     }
 }
 
+/// Cap on the injected resource catalogue (URIs only; bodies are pulled on
+/// demand). A server exposing thousands is truncated with a note.
+const RESOURCE_CAP: usize = 50;
+
+/// The compact resource awareness catalogue + a uri→owning-server map for
+/// `resource.read`. RFC 0007 §resources.
+struct ResourceCatalogue {
+    owner: HashMap<String, usize>,
+    entries: Vec<(String, String)>, // (uri, label)
+    truncated: bool,
+}
+
+impl ResourceCatalogue {
+    /// The system note listing readable resources (never their bodies).
+    fn catalogue_note(&self) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mut s = String::from(
+            "Available MCP resources — read the current content of any with the resource.read tool:\n",
+        );
+        for (uri, label) in &self.entries {
+            if label.is_empty() {
+                s.push_str(&format!("- {uri}\n"));
+            } else {
+                s.push_str(&format!("- {uri} — {label}\n"));
+            }
+        }
+        if self.truncated {
+            s.push_str(&format!("(… more than {RESOURCE_CAP} resources; list truncated)\n"));
+        }
+        Some(s)
+    }
+}
+
+/// List resources from every server (first owner wins for a duplicate URI),
+/// capped. `resources/list` is capability-gated in the client (empty if unsupported).
+fn collect_resources(servers: &[McpClient]) -> ResourceCatalogue {
+    let mut owner = HashMap::new();
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    'outer: for (i, s) in servers.iter().enumerate() {
+        let Ok(list) = s.list_resources() else { continue };
+        for r in list {
+            if entries.len() >= RESOURCE_CAP {
+                truncated = true;
+                break 'outer;
+            }
+            if !owner.contains_key(&r.uri) {
+                let label = r.title.or(r.name).or(r.description).unwrap_or_default();
+                owner.insert(r.uri.clone(), i);
+                entries.push((r.uri, label));
+            }
+        }
+    }
+    ResourceCatalogue { owner, entries, truncated }
+}
+
+fn resource_read_tool_def() -> ToolDef {
+    ToolDef {
+        name: "resource.read".into(),
+        description: "Read the current content of an available MCP resource by its uri (see the \
+            resource catalogue). Use this to pull a resource's body when you need it."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"uri": {"type": "string", "description": "the resource uri to read"}},
+            "required": ["uri"]
+        }),
+    }
+}
+
+/// Handle a `resource.read` call against the connected servers: read from the
+/// owning server (or try each), returning the text as the observation.
+fn read_resource_tool(servers: &[McpClient], owner: &HashMap<String, usize>, args: &Value) -> (String, bool) {
+    let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+    if uri.is_empty() {
+        return ("error: resource.read requires a 'uri'".into(), true);
+    }
+    let candidates: Vec<usize> = match owner.get(uri) {
+        Some(i) => vec![*i],
+        None => (0..servers.len()).collect(), // a templated/unlisted uri — try all
+    };
+    for i in candidates {
+        if let Ok(r) = servers[i].read_resource(uri) {
+            return (r.text(), false);
+        }
+    }
+    (format!("resource.read: no server could read '{uri}'"), true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_catalogue_note_lists_uris() {
+        let c = ResourceCatalogue {
+            owner: HashMap::new(),
+            entries: vec![
+                ("file:///a.json".into(), "inbox".into()),
+                ("db://orders".into(), String::new()),
+            ],
+            truncated: false,
+        };
+        let note = c.catalogue_note().unwrap();
+        assert!(note.contains("resource.read"));
+        assert!(note.contains("file:///a.json — inbox"));
+        assert!(note.contains("- db://orders\n"));
+    }
+
+    #[test]
+    fn empty_catalogue_is_no_note() {
+        let c = ResourceCatalogue { owner: HashMap::new(), entries: vec![], truncated: false };
+        assert!(c.catalogue_note().is_none());
+    }
+
+    #[test]
+    fn resource_read_rejects_missing_uri() {
+        let (msg, err) = read_resource_tool(&[], &HashMap::new(), &json!({}));
+        assert!(err);
+        assert!(msg.contains("uri"));
+    }
+
+    #[test]
+    fn resource_read_no_server_is_an_error_observation() {
+        let (msg, err) = read_resource_tool(&[], &HashMap::new(), &json!({"uri": "file:///x"}));
+        assert!(err);
+        assert!(msg.contains("file:///x"));
+    }
 
     #[test]
     fn system_prompt_appends_contract() {

@@ -49,25 +49,24 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M3 (reactivity) — the end-to-end reactive path is **live and
-  proven by observation**. Remaining M3 polish: read-after-subscribe,
-  list_changed, the subscribe/resource.read self-tools, warm sessions.
-- **Last completed:** the built-in **mock MCP server** (`mcp/mock.rs`, hidden
-  `--internal-mock-mcp`) + an **observe-to-validate E2E test** (`tests/
-  reactive_e2e.rs`): a real reactive agentd subscribes to the mock's resource,
-  receives its `updated`, reads it, and fires a reaction — all asserted from the
-  observed JSON-lines telemetry (`subscribe`→`resource.updated`→`trigger.fired`
-  →`subagent.spawn`). Fixed a latent `json::Incoming` ordering bug (Response was
-  swallowing server→client Requests). 101 unit + 7 integration tests, clippy
-  clean, default build still serde + libc only.
-- **Next action (finish M3):** the **`subscribe`/`unsubscribe`/`resource.read`
-  self-tools** (in `mcp/server.rs` / the `SelfHandler` path) so a running agent
-  can self-subscribe → **self-scheduling** (the signature recursion: an agent
-  arranges its own future wake). The supervisor auto-creates a `Continue(this
-  session)` route. Then **read-after-subscribe** on (re)connect (synthesize one
-  "possibly changed" per URI — recovers missed updates), `list_changed`
-  consumption, `unsubscribe` on drain, and warm `Continue` sessions. Then
-  `loop`/`schedule` modes + internal interval (M4). (M2 tail still open:
+- **Phase:** M3 (reactivity) — reactive path live + proven; resource awareness
+  now wired (catalogue + `resource.read`). Remaining: the self-`subscribe`
+  self-tool (self-scheduling), read-after-subscribe, list_changed, warm sessions.
+- **Last completed:** `resource.read` self-tool + **resource-catalogue
+  injection** in `runner.rs` — the loop lists every connected server's resources
+  (capped uri+label catalogue, injected as a system note = *awareness*) and adds
+  a `resource.read{uri}` tool so the model pulls a body on demand from the owning
+  server (= *attention*), RFC 0007 §resources. Closes the M1 "inject a resource
+  catalogue" follow-up. (Prior: the mock MCP server + reactive e2e.) 105 unit + 7
+  integration tests, clippy clean, default build still serde + libc only.
+- **Next action (finish M3):** **read-after-subscribe** in the reactive driver
+  (on connect, synthesize one "possibly changed" delivery per watched URI so a
+  change that happened before/while subscribing isn't missed — converts edge- to
+  level-triggering; mandatory per assessment §2.8) + `unsubscribe` on drain +
+  `list_changed` consumption. THEN the harder **self-`subscribe` self-tool +
+  warm `Continue` sessions** (self-scheduling — needs a control-channel upcall so
+  a running subagent asks the supervisor to subscribe + re-enter its session).
+  Then `loop`/`schedule` modes + internal interval (M4). (M2 tail still open:
   `restart.rs`, `--serve-mcp` listener, live stuck/orphan tests.)
 - **Active milestone:** M3 (reactivity).
 - **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
@@ -129,7 +128,8 @@ Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `s
 - [x] built-in **mock MCP server** (`mcp/mock.rs`, hidden `--internal-mock-mcp <uri>`): a tiny stdio MCP server advertising `resources.subscribe`, serving one resource, emitting one `updated` after subscribe — the fixture for live reactive tests + the M7 observe-suite. (Also fixed a latent codec bug: `json::Incoming` tried `Response` before `Request`, swallowing server→client requests; now `Request` first, regression-tested.)
 - [x] `triggers/router.rs` reactive routing (pure, unit-tested): exact-beats-glob + longest-prefix exactly-one-owner match, `Disposition::Spawn`/`Continue` as a route property, debounce + newest-wins coalesce, `on_updated`/`due`/`next_deadline`, dropped-counter for no-match
 - [ ] warm-session state in `tree.rs`
-- [ ] `subscribe`/`unsubscribe` + `resource.read` self-tools; self-subscribe → auto continue-route (self-scheduling)
+- [x] **`resource.read` self-tool + resource-catalogue injection** (`runner.rs`): list = awareness (a capped uri+label catalogue injected as a system note), read = attention (`resource.read{uri}` pulls a body on demand from the owning MCP server). Also closes the M1 "inject a resource catalogue" follow-up.
+- [ ] `subscribe`/`unsubscribe` self-tools; self-subscribe → auto continue-route (**self-scheduling**) — needs control-channel upcall + warm `Continue` sessions
 - [ ] async `subagent.spawn{async,detach}` + completion-as-self-resource
 - [ ] rebuild+reconcile (read-after-subscribe) on (re)start
 - **Acceptance:** `--mode reactive --subscribe file://…` idles near-zero CPU, wakes on `updated` then `resources/read`s; burst coalesces to one wake; no-route event dropped+counted; self-subscribing agent re-entered in same session; restart re-subscribes + read-after-subscribe re-fires missed change; async subagent returns handle, completion arrives as subscribable resource update.

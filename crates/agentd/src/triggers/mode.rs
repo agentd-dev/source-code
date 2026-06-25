@@ -42,7 +42,13 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
         match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60))
             .and_then(|mut c| c.initialize().map(|()| c))
         {
-            Ok(c) => servers.push(c),
+            Ok(c) => {
+                log.info(
+                    "mcp.connect",
+                    json!({"server": spec.name, "subscribe": c.capabilities().supports_subscribe()}),
+                );
+                servers.push(c);
+            }
             Err(e) => {
                 log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
                 eprintln!("agentd: MCP server '{}' failed: {e}", spec.name);
@@ -78,7 +84,10 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
             log.warn("subscribe.unsupported", json!({"uri": uri}));
         }
     }
-    log.info("reactive.armed", json!({"subscriptions": owner.len(), "servers": servers.len()}));
+    log.info(
+        "trigger.armed",
+        json!({"kind": "reactive", "subscriptions": owner.len(), "servers": servers.len()}),
+    );
 
     // Read-after-subscribe (mandatory, RFC 0008 / assessment §2.8): treat every
     // watched resource as possibly-changed at startup so a change that happened
@@ -92,6 +101,9 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
             log.info("reactive.initial_read", json!({"uri": uri}));
         }
     }
+
+    // Triggers armed, subscriptions live: the supervisor is now ready to react.
+    log.info("proc.ready", json!({"mode": "reactive"}));
 
     loop {
         crate::obs::health::tick();
@@ -148,9 +160,10 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
     let mut backoff = Duration::from_millis(500);
     let mut iteration: u64 = 0;
     log.info(
-        "schedule.armed",
-        json!({"mode": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64}),
+        "trigger.armed",
+        json!({"kind": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64}),
     );
+    log.info("proc.ready", json!({"mode": cfg.mode.as_str()}));
 
     loop {
         crate::obs::health::tick();

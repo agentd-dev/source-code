@@ -164,6 +164,14 @@ pub fn run_loop(
             });
         }
 
+        // Per-turn audit anchor (RFC 0010 §2.9 `loop.step`): the running budget
+        // snapshot at the head of each ReAct turn, distinct from the LLM-call
+        // event below.
+        log.debug(
+            "loop.step",
+            json!({"step": budget.steps(), "tokens": budget.tokens(), "messages": messages.len()}),
+        );
+
         let req = Request {
             model: model.clone(),
             messages: messages.clone(),

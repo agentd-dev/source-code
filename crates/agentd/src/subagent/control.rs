@@ -60,7 +60,11 @@ pub fn run() -> i32 {
     log.info("loop.start", serde_json::json!({"depth": payload.depth}));
 
     let intel = match IntelClient::from_parts(&payload.intelligence.uri, payload.intelligence.token.clone()) {
-        Ok(c) => c,
+        Ok(mut c) => {
+            // Outbound LLM calls join the run's distributed trace (RFC 0010).
+            c.set_trace_id(payload.telemetry.trace_id.clone());
+            c
+        }
         Err(e) => return fail(&up, &log, format!("intel: {e}"), crate::exit::INTEL_UNAVAILABLE),
     };
 
@@ -70,6 +74,7 @@ pub fn run() -> i32 {
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
             Ok(mut c) => {
+                log.info("mcp.connect", serde_json::json!({"server": spec.name}));
                 // Stamp the run id (retry dedup, RFC 0011) + a W3C traceparent
                 // (distributed tracing, RFC 0010) on every tool call.
                 let mut meta = serde_json::json!({"agentd/run_id": payload.telemetry.run_id});

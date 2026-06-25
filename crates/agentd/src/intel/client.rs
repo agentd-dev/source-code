@@ -69,6 +69,9 @@ pub struct IntelClient {
     token: Option<String>,
     provider: Provider,
     timeout: Duration,
+    /// The run's trace id; when set, every completion carries a `traceparent`
+    /// header so the LLM call joins the run's distributed trace (RFC 0010).
+    trace_id: Option<String>,
 }
 
 enum Transport {
@@ -98,15 +101,31 @@ impl IntelClient {
             provider,
             // Generous per-call ceiling; the run deadline is the real bound.
             timeout: Duration::from_secs(120),
+            trace_id: None,
         })
+    }
+
+    /// Stamp the run's trace id so each completion carries a `traceparent`
+    /// header (the LLM call joins the run's distributed trace, RFC 0010).
+    pub fn set_trace_id(&mut self, trace_id: Option<String>) {
+        self.trace_id = trace_id;
+    }
+
+    /// Append a fresh-span `traceparent` header when a trace id is set. Pure
+    /// (testable without a connection).
+    fn apply_trace_header(&self, headers: &mut Vec<(String, String)>) {
+        if let Some(tid) = &self.trace_id {
+            headers.push(("traceparent".into(), crate::obs::trace::outbound_traceparent(tid)));
+        }
     }
 
     /// One completion round-trip.
     pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
-        let (body, headers) = match self.provider {
+        let (body, mut headers) = match self.provider {
             Provider::OpenAiCompatible => openai::build_request(req, self.token.as_deref()),
             Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
         };
+        self.apply_trace_header(&mut headers);
         let header_refs: Vec<(&str, &str)> =
             headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -221,5 +240,25 @@ mod tests {
     fn resolve_vsock() {
         let (t, _p, _h) = resolve("vsock:2:8080", Provider::OpenAiCompatible).unwrap();
         assert!(matches!(t, Transport::Vsock { cid: 2, port: 8080 }));
+    }
+
+    #[test]
+    fn trace_header_appended_only_when_set() {
+        // Constructing the client does not connect, so this is a pure check of
+        // the outbound-trace wiring (RFC 0010).
+        let mut c = IntelClient::from_parts("unix:/run/intel.sock", None).unwrap();
+        let mut headers = vec![("authorization".to_string(), "Bearer x".to_string())];
+
+        c.apply_trace_header(&mut headers);
+        assert_eq!(headers.len(), 1, "no trace id set → no traceparent header");
+
+        let tid = "1234567890abcdef1234567890abcdef";
+        c.set_trace_id(Some(tid.to_string()));
+        c.apply_trace_header(&mut headers);
+        assert_eq!(headers.len(), 2);
+        let (k, v) = &headers[1];
+        assert_eq!(k, "traceparent");
+        assert!(v.contains(tid), "traceparent carries the run's trace id: {v}");
+        assert!(v.starts_with("00-") && v.ends_with("-01"), "well-formed traceparent: {v}");
     }
 }

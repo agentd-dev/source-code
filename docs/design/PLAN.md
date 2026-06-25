@@ -42,32 +42,34 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M2 in progress — pure foundations landed (control protocol +
-  supervision tree); process/signal plumbing next.
-- **Last completed:** M2 foundation, fully unit-tested (no risky process code
-  yet): `subagent/protocol.rs` — the length-framed control protocol
-  (`ControlMsg` down / `AgentMsg` up, `SpawnPayload` with output-contract +
-  narrowed seed + scoped MCP subset + limits + telemetry + supervisor-minted
-  depth); `supervisor/tree.rs` — the supervision tree (depth/path minting at
-  the spawn chokepoint, the fork-bomb `Caps` refused-as-tool-result,
-  hierarchical token rollup to the tree root + ceiling, one-way `draining`
-  flag, deepest-first teardown order); `sec/scope.rs` — capability scoping
-  (granted-MCP-subset `Scope`/`ToolScope` with monotonic-narrow intersection +
-  the Rule-of-Two trifecta check). Added serde to `config::McpServerSpec`.
-  72 tests green, clippy clean, default build still serde + libc only.
-- **Next action (M2 — process plumbing):** `supervisor/spawn.rs` (re-exec
-  `argv[0]` in subagent mode via `AGENTD_SUBAGENT`; `setpgid`; `pre_exec`
-  `PR_SET_PDEATHSIG` + rlimit; wire the length-framed stdio control channel) →
-  `subagent/control.rs` (child reads `SpawnPayload`, connects intel + scoped
-  MCP, runs `agentloop::runner`, answers `Ping`/`Pong` on a **separate thread**,
-  emits `Ready`/`Usage`/`Result`) → `main.rs` subagent dispatch → move once-mode
-  to spawn a root subagent. THEN `reap.rs` (SIGCHLD self-pipe + waitpid loop +
-  SUBREAPER) · `liveness.rs` (three detectors + EOF×pong) · `kill.rs` (ladder) ·
-  `restart.rs` · `reactor.rs` (merged mpsc) · `mcp/server.rs` self-MCP
-  `subagent.spawn/*` · `sec/scope.rs`.
+- **Phase:** M2 in progress — process plumbing landed and proven end to end;
+  supervision/liveness/self-MCP next.
+- **Last completed:** the subagent **process plumbing**, verified by a real
+  spawned-process integration test. `supervisor/spawn.rs` re-execs the binary
+  in subagent mode (`AGENTD_SUBAGENT`), `setpgid`'s each child into its own
+  group, delivers the `SpawnPayload`, and reads upward `AgentMsg`s on a thread;
+  `subagent/control.rs` is the child entry — installs `PR_SET_PDEATHSIG`, reads
+  the payload, emits `Ready`, connects intel + scoped MCP, runs `run_loop`, and
+  answers `Ping`/`Pong` + `Cancel` on a **thread separate from the loop**;
+  `main.rs` dispatches into it; `runner.rs` refactored to a reusable
+  `run_loop(LoopInput)` with a cooperative cancel flag; `IntelClient::from_parts`
+  added. `tests/subagent_spawn.rs` spawns a real subagent and asserts Ready→Failed
+  (intel unreachable), then reaps it. (Earlier this milestone: `protocol.rs`,
+  `tree.rs`, `sec/scope.rs`.) 73 unit + 1 integration test, clippy clean,
+  default build still serde + libc only. **once-mode still runs in-process**
+  (switch onto the subagent path once liveness/kill exist).
+- **Next action (M2 — supervision):** `supervisor/reap.rs` (SIGCHLD self-pipe +
+  `waitpid(-1,WNOHANG)` loop + `PR_SET_CHILD_SUBREAPER` + PID-1 detect) →
+  `supervisor/liveness.rs` (three detectors A/B/C + EOF×pong classifier; the
+  no-progress watchdog + ping/pong cadence) → `supervisor/kill.rs` (bounded
+  depth-first cancel→SIGTERM→SIGKILL ladder, drain budget, second-signal force)
+  → `supervisor/reactor.rs` (merged-mpsc loop hosting it all) → switch once-mode
+  to spawn the root subagent → `supervisor/restart.rs` → `mcp/server.rs` self-MCP
+  `subagent.spawn/*` (sync). (M1 follow-ups still pending: resource-catalogue
+  injection, https-without-`tls`→exit 2.)
 - **Active milestone:** M2 (subagent processes).
-- **Blockers:** none. (Process plumbing is the next wake's risk surface — keep
-  it behind unit-testable seams where possible. `net/tls.rs`/otel deferred.)
+- **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg are
+  Linux/Unix; agentd targets Linux for production.)
 
 _(The loop updates the lines above every iteration.)_
 
@@ -106,9 +108,9 @@ Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ m
 Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent/ mcp/server.rs sec/scope.rs`
 - [x] `supervisor/tree.rs` records (depth minting, caps chokepoint, token rollup, draining, deepest-first)
 - [ ] `supervisor/reactor.rs` merged-mpsc/recv_timeout loop
-- [ ] `supervisor/spawn.rs` re-exec subagent mode; setpgid; pre_exec rlimit + **PDEATHSIG**
+- [x] `supervisor/spawn.rs` re-exec subagent mode (`AGENTD_SUBAGENT`); `setpgid` via pre_exec; payload delivery + upward-event reader thread; immediate process-group kill (rlimit in pre_exec + graceful ladder deferred to kill.rs)
 - [x] `subagent/protocol.rs` control protocol (ControlMsg/AgentMsg/SpawnPayload), length-framed
-- [ ] `subagent/control.rs` child-side: read payload, run loop, ping/pong on a **separate thread**
+- [x] `subagent/control.rs` child-side: PDEATHSIG, read payload, Ready, connect intel+scoped MCP, run loop, **ping/pong on a separate thread** + cancel flag; `main.rs` subagent dispatch; e2e integration test (`tests/subagent_spawn.rs`)
 - [ ] `supervisor/reap.rs` SIGCHLD self-pipe + waitpid(-1,WNOHANG) loop + SUBREAPER + PID-1 detect
 - [ ] `supervisor/liveness.rs` three detectors + EOF×pong classifier
 - [ ] `supervisor/kill.rs` bounded depth-first ladder + drain budget + second-signal force

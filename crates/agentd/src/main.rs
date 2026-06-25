@@ -29,10 +29,9 @@ fn run() -> i32 {
 
     // Subagent re-exec dispatch (M2). The supervisor sets this in the child's
     // environment; the child reads its spawn payload over the control channel
-    // rather than from CLI/env config.
-    if std::env::var_os("AGENTD_SUBAGENT").is_some() {
-        eprintln!("agentd: subagent mode is not yet implemented (M2 — docs/design/PLAN.md)");
-        return exit::GENERIC;
+    // (stdin) rather than from CLI/env config.
+    if std::env::var_os(agentd::subagent::protocol::SUBAGENT_ENV).is_some() {
+        return agentd::subagent::control::run();
     }
 
     let env: Vec<(String, String)> = std::env::vars().collect();

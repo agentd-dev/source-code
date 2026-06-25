@@ -82,13 +82,19 @@ impl IntelClient {
     /// and well-formed by `Config::validate`.
     pub fn from_config(cfg: &Config) -> Result<IntelClient, IntelError> {
         let uri = cfg.intelligence.as_deref().unwrap_or_default();
-        let provider = Provider::OpenAiCompatible; // v1 default; anthropic select TBD
+        Self::from_parts(uri, cfg.intelligence_token.clone())
+    }
+
+    /// Build from explicit parts (the subagent path — the spawn payload, not
+    /// CLI `Config`). Provider is OpenAI-compatible by default (RFC 0006).
+    pub fn from_parts(uri: &str, token: Option<String>) -> Result<IntelClient, IntelError> {
+        let provider = Provider::OpenAiCompatible;
         let (transport, http_path, host_header) = resolve(uri, provider)?;
         Ok(IntelClient {
             transport,
             http_path,
             host_header,
-            token: cfg.intelligence_token.clone(),
+            token,
             provider,
             // Generous per-call ceiling; the run deadline is the real bound.
             timeout: Duration::from_secs(120),

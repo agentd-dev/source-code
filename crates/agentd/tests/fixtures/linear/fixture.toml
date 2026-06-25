@@ -1,7 +1,0 @@
-start = "main"
-
-[expected]
-status = "completed"
-last_node = "done"
-path = ["a", "b", "done"]
-path_exact = true

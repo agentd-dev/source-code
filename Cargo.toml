@@ -1,16 +1,18 @@
 # agentd workspace.
 #
-# `crates/agentd` is the runtime. Future members (conformance suite,
-# benchmarks) join here — keeping a workspace from day one means
-# their arrival never reshuffles paths.
+# `crates/agentd` is the runtime — a single binary that is CLI, daemon, and
+# subagent re-exec in one. The conformance suite (crates/agentd-conformance)
+# is reintroduced in M7 once the new surface stabilises; it is kept out of
+# the workspace members until then so the build tracks only the live crate.
 [workspace]
 resolver = "3"
-members = ["crates/agentd", "crates/agentd-conformance"]
+members = ["crates/agentd"]
 
-# Release profile tuned for a distributable single binary: size-
-# optimized, LTO'd, stripped, abort-on-panic (no unwinding machinery
-# — a workflow runtime has no recoverable-panic story; failures are
-# engine outcomes, not panics).
+# Release profile for a distributable single binary: size-optimized, LTO'd,
+# stripped, abort-on-panic. A panic is a bug, not a recoverable state — the
+# supervisor's job is to keep the *tree* healthy, and a panicking supervisor
+# should die loudly (its children are collapsed by PR_SET_PDEATHSIG; see
+# rfcs/0003) rather than limp on with corrupt state.
 [profile.release]
 opt-level = "s"
 lto = true

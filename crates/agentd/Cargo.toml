@@ -1,9 +1,9 @@
 [package]
 name = "agentd"
-version = "1.3.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Bounded workflow-driven agent runtime (RFC: rfcs/0001-bounded-workflow-runtime.md)"
+description = "Minimal, MCP-native, reactive agent runtime (rfcs/0001-mcp-native-agent-runtime.md)"
 license = "MIT"
 repository = "https://github.com/agentd-dev/source-code"
 publish = false
@@ -16,237 +16,51 @@ path = "src/lib.rs"
 name = "agentd"
 path = "src/main.rs"
 
+# Capability surface is compile-time. The default build is the minimalism
+# target: no async runtime, no TLS, no C/C++ toolchain — single-digit
+# first-party crates. Everything heavier is feature-gated and OFF by
+# default. See rfcs/0002 §dependency-budget.
 [features]
-# Default tool families match the RFC §10.2 base set minus HTTP/MCP.
-# `trigger-http` is on by default so serve mode Just Works; the
-# sealed-appliance build recipe turns it off so zero-egress
-# deployments stay egress-free by construction. `auth` ships in
-# default builds — HMAC-SHA256 is a basic need for any production
-# HTTP surface.
-default = [
-    "tools-fs",
-    "tools-env",
-    "tools-data",
-    "trigger-http",
-    "auth",
-]
-
-# Tool families (compile-time capability pruning, RFC §10.4).
-tools-fs = []
-tools-env = []
-tools-data = []
-tools-http = []
-# HTTPS for the `http_request` node (and the agent_loop http tool).
-# Pulls `ureq` (blocking, rustls — the same client stack intel-remote
-# uses; no async runtime enters the core). Without it, https:// URLs
-# fail loudly. Redirects are NOT followed — a redirect could bounce an
-# allowed URL to a non-allowed one, so the policy boundary stays exact.
-tools-http-tls = ["tools-http", "dep:ureq"]
-tools-shell = []
-tools-mcp = []
-
-# Trigger adapters.
-trigger-http = []
-trigger-mcp = []
-# Cron / interval trigger. Pulls `cron` (pure-Rust parser) only;
-# the scheduler thread is native std::thread + sleep.
-trigger-cron = ["dep:cron", "dep:chrono"]
-# Filesystem-watch trigger. Pulls `notify` (kqueue / inotify /
-# ReadDirectoryChangesW). Dedicated thread drains events into
-# the engine; debounce coalesces bursts.
-trigger-fs-watch = ["dep:notify"]
-
-# Policy-as-code (Rego) via regorus. Pure-Rust OPA evaluator.
-# Layered on top of the existing static allowlist — Rego is an
-# additional AND condition. Workflows that want Rego-only
-# evaluation leave static allowlists empty (defaults deny, so
-# Rego's `allow` decision becomes authoritative).
-policy-rego = ["dep:regorus"]
-
-# Full JSON-Schema enforcement on `llm_infer` outputs (RFC 0006). When
-# `output_schema` names a schema file, the parsed output is validated
-# against it; off, a file `output_schema` degrades to a JSON-only check.
-schema = ["dep:jsonschema"]
-
-# Secret sources beyond env/file ([[secrets]]). `secrets-exec` runs an
-# argv-declared command (1Password CLI, `vault kv get`, `pass`, …);
-# `secrets-oauth2` adds the client-credentials grant (ureq + rustls —
-# the same stack intel-remote ships). env + file sources are always
-# compiled; these two are opt-in capability surface like everything
-# else.
-secrets-exec = []
-secrets-oauth2 = ["dep:ureq"]
-
-# Intelligence transports.
-intel-unix = []
-intel-http = []
-# Remote LLM providers (Anthropic / OpenAI / Gemini /
-# openai-compatible) for `[[intelligence.backends]]`. Pulls `ureq`
-# (blocking, rustls) — no async runtime enters the core.
-intel-remote = ["dep:ureq"]
-
-# HTTP auth (bearer + HMAC webhook verification).
-auth = ["dep:sha2", "dep:hmac"]
-
-# In-process TLS termination + optional mTLS client-cert
-# verification. Pulls rustls and rustls-pemfile; implies `auth` so
-# the mTLS verifier is always reachable.
-server-tls = ["auth", "dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]
-
-# Signed workflow verification (RFC 0002). Ed25519 detached
-# signatures verified before the DAG validator runs. Pure-Rust
-# crypto; no native C. Off by default — opt-in for hardened
-# deployments.
-signing = ["dep:ed25519-dalek", "dep:base64"]
-
-# OIDC / JWT bearer auth. Validates iss/aud/exp/nbf
-# + RS256/ES256 signatures against an operator-supplied JWKS
-# (file or inline). Live JWKS fetch over HTTPS is deferred to
-# a v2 follow-up — operators rotate JWKS via external cron /
-# sidecar today. Implies `auth` so the verifier is always
-# reachable alongside bearer/HMAC/mTLS.
-auth-oidc = ["auth", "dep:jsonwebtoken", "dep:base64"]
-
-# Direct OTLP exporter for spans. Pulls tokio +
-# opentelemetry_sdk + opentelemetry-otlp + tracing-opentelemetry.
-# Substantial dep expansion (~50 crates) — accepted cost for
-# first-class OTLP export rather than the filelog-receiver
-# indirection (which still works and stays available via the
-# existing JSON log format + `[logging.audit]` sink).
-otel = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:tracing-opentelemetry",
-    "dep:tokio",
-]
+default = []
+# Direct https:// intelligence/MCP when TLS is not sidecar-terminated.
+# rustls with the `ring` provider (no cmake/C build dep) + bundled roots.
+tls = ["dep:rustls", "dep:webpki-roots"]
+# Enclave / microVM intelligence transport (AF_VSOCK).
+vsock = ["dep:vsock"]
+# poll/epoll listener for the high-fan-in served self-MCP only.
+serve-mcp = ["dep:mio"]
+# Optional cron-expression scheduling (internal time event source).
+cron = ["dep:croner", "dep:chrono"]
+# Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
+metrics = []
+# OTLP span export + GenAI semconv. The one feature allowed heavier deps;
+# wired in M6 (deps intentionally not declared yet to keep the scaffold's
+# dependency graph minimal and resolvable).
+otel = []
 
 [dependencies]
+# The one non-negotiable dependency: JSON is the MCP + LLM wire format.
+# Keep all wire types in one module (json/, wire/) so a swap to miniserde
+# stays mechanical (rfcs/0002).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
-toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
-tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "ansi", "json"] }
-tracing-appender = { version = "0.2", default-features = false }
-sha2 = { version = "0.10", default-features = false, optional = true }
-hmac = { version = "0.12", default-features = false, optional = true }
-# JSON-Schema validator for `llm_infer` output enforcement (`schema`
-# feature). Default features off to avoid the HTTP `$ref` resolver —
-# schemas are local files, validated offline.
-jsonschema = { version = "0.18", default-features = false, optional = true }
-# Atomic swap for hot-reload state (SIGHUP). Pure-Rust, no deps.
-# Readers see a consistent snapshot with no mutex contention;
-# writers replace the current value atomically.
-arc-swap = "1"
-rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "logging", "aws-lc-rs", "tls12"] }
-rustls-pemfile = { version = "2", optional = true }
-x509-parser = { version = "0.16", optional = true, default-features = false }
-ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "pkcs8", "pem"] }
-base64 = { version = "0.22", optional = true, default-features = false, features = ["std"] }
-jsonwebtoken = { version = "9", optional = true, default-features = false, features = ["use_pem"] }
-# Blocking HTTPS client for remote LLM providers (rustls-backed).
-ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
-# Pure-Rust cron expression parser + schedule iterator.
-cron = { version = "0.12", optional = true }
-chrono = { version = "0.4", optional = true, default-features = false, features = ["std", "clock"] }
-# Cross-platform filesystem event source (inotify on Linux).
-notify = { version = "6", optional = true }
-# OpenTelemetry stack (feature `otel`). Pinned to the 0.27
-# generation — matches the ecosystem's stable contract for
-# tracing-opentelemetry 0.28.
-opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["trace", "grpc-tonic"] }
-tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
-tokio = { version = "1", optional = true, default-features = false, features = ["rt-multi-thread", "macros"] }
-# Pure-Rust OPA/Rego evaluator. ~500KB of source; no transitive
-# runtime deps that fight the dep-light posture.
-regorus = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 
-# libc — Unix-only. Used for sigaction (signals.rs) and setrlimit
-# (budget.rs). Every call site is already `#[cfg(unix)]` gated, so
-# scoping the dep to Unix targets lets the crate compile on Windows
-# without carrying the unused dep there.
+# --- feature: tls ---
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+# --- feature: vsock ---
+vsock = { version = "0.5", optional = true }
+# --- feature: serve-mcp ---
+mio = { version = "1", features = ["os-poll", "net"], optional = true }
+# --- feature: cron ---
+croner = { version = "2", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+
+# Unix-only: signals (sigaction), process control (setpgid/killpg/waitpid),
+# prctl (PR_SET_CHILD_SUBREAPER / PR_SET_PDEATHSIG), setrlimit. Raw libc —
+# no signal-hook, no nix in the default build (rfcs/0002, rfcs/0003).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Windows ctrl-C / ctrl-break handler for the shutdown path. On
-# Unix we use raw `sigaction` via `libc`; Windows goes through
-# the small `ctrlc` crate (no signal concept on Windows, so this
-# wraps `SetConsoleCtrlHandler`).
-#
-# `windows-sys` provides the Job Objects bindings that replace
-# `setrlimit` for memory + CPU-time budgets (see `src/budget.rs`).
-# ctrlc already pulls it transitively; we pin the minimum feature
-# set we need explicitly so the dep tree stays audit-friendly.
-[target.'cfg(windows)'.dependencies]
-ctrlc = { version = "3", default-features = false }
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
-
 [dev-dependencies]
 tempfile = "3"
-# Generates self-signed server + client certs at test time so the
-# TLS integration tests don't need fixture files to maintain.
-rcgen = "0.13"
-
-# Unix-only dev dep mirroring the runtime one — tests that poke
-# signal handlers directly need libc even when the crate lib is
-# compiling on Windows.
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
-
-[build-dependencies]
-toml = { version = "0.8", default-features = false, features = ["parse"] }
-
-# ---------------------------------------------------------------------------
-# Distribution metadata — consumed by `cargo deb` and
-# `cargo generate-rpm`. Both are dev-only; they're invoked from CI
-# on tagged releases and attach the resulting .deb / .rpm to the
-# GitHub Release page. See packaging/README.md.
-# ---------------------------------------------------------------------------
-[package.metadata.deb]
-name = "agentd"
-maintainer = "Andrii Tsok <andrii@tsok.org>"
-copyright = "2026, Andrii Tsok"
-license-file = ["../../LICENSE", "0"]
-extended-description = """\
-Bounded workflow-driven runtime with compile-time constrained \
-capabilities. Executes a predeclared DAG of typed nodes authored in \
-TOML; never invents new tools or workflow paths at run time. \
-Docs: https://github.com/agentd-dev/source-code/tree/main/docs"""
-section = "utility"
-priority = "optional"
-assets = [
-    ["target/release/agentd", "usr/bin/", "755"],
-    ["../../packaging/systemd/agentd.service", "lib/systemd/system/", "644"],
-    ["../../packaging/systemd/agentd.env", "etc/default/agentd", "644"],
-    ["../../packaging/README.md", "usr/share/doc/agentd/", "644"],
-    ["../../docs/README.md", "usr/share/doc/agentd/docs/", "644"],
-]
-# Create /etc/agentd/ (empty; operator drops workflow.toml here).
-maintainer-scripts = "../../packaging/debian/"
-systemd-units = { enable = false, start = false }
-
-[package.metadata.generate-rpm]
-# `name` defaults to the crate name. Paths are resolved relative to
-# the cwd when `cargo generate-rpm` is invoked, not the Cargo.toml —
-# the CI job runs it from the workspace root, so paths are
-# workspace-relative.
-summary = "Bounded workflow-driven runtime"
-license = "MIT"
-url = "https://github.com/agentd-dev/source-code"
-assets = [
-    { source = "target/release/agentd", dest = "/usr/bin/agentd", mode = "0755" },
-    { source = "packaging/systemd/agentd.service", dest = "/usr/lib/systemd/system/agentd.service", mode = "0644", config = false, doc = false },
-    { source = "packaging/systemd/agentd.env", dest = "/etc/default/agentd", mode = "0644", config = true, doc = false },
-    { source = "packaging/README.md", dest = "/usr/share/doc/agentd/README.md", mode = "0644", doc = true },
-]
-# /etc/agentd/ — operator drops workflow.toml here post-install. RPM
-# scriptlet ensures the directory exists before file placement.
-post_install_script = "install -d -m 0755 /etc/agentd"

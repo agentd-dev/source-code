@@ -42,16 +42,28 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** RFC authoring (Workflow B) → then scaffold M1.
-- **Last completed:** retired old design; RFC 0001 draft; 10-agent
-  architecture assessment (`00-architecture-assessment.md`) + 10 `notes-*.md`;
-  launched Workflow B to author RFCs 0001–0013.
-- **Next action:** when RFCs land — commit them, then **scaffold** the crate
-  per assessment §4.0 and begin **M1**.
-- **Active milestone:** _M0 (planning) → M1 (skeleton)._
-- **Blockers:** none.
+- **Phase:** M1 in progress — foundation landed, network/loop layer next.
+- **Last completed:** RFCs 0001–0013 authored+reconciled+committed (`793e1d2`);
+  crate scaffolded (full module tree, minimal Cargo.toml, workspace trimmed to
+  the live crate, old `src/`+`tests/` removed); **M1 foundation** implemented &
+  committed: `config.rs` (precedence+validate→exit 2), `exit.rs` (exit-code
+  table + `once_exit`), `json/` (JSON-RPC 2.0 codec + NDJSON/length-prefix
+  framing), `obs/log.rs` (JSON-lines logger + dep-free RFC3339), `signals.rs`
+  (SIGTERM/INT/PIPE), `agentloop/stop.rs` (`TerminalStatus`). 22 tests green,
+  clippy `-D warnings` clean. CLI contract verified (help/version=0, bad
+  config=2, valid run logs+exit 1 scaffold notice).
+- **Next action (M1 remainder):** `wire/mcp.rs` + `wire/intel.rs` types →
+  `net/http.rs` hand-rolled HTTP/1.1(+SSE) client + `net/unixsock.rs` →
+  `intel/` (openai-compatible adapter, native tool-calling) over `unix:` &
+  `https://` → `mcp/client.rs` (one stdio server: reader-thread + pending-map,
+  tools/list+call, resources/list+read) → `agentloop/runner.rs` + `context.rs`
+  + `action.rs` (the ReAct loop wired to stop.rs) → `supervisor/budget.rs`.
+  Then run the M1 acceptance check.
+- **Active milestone:** M1 (skeleton).
+- **Blockers:** none. (TLS feature build deferred until `net/tls.rs` lands in
+  the `intel`/M1 https path; otel deps intentionally undeclared until M6.)
 
-_(The loop updates the four lines above every iteration.)_
+_(The loop updates the lines above every iteration.)_
 
 ---
 
@@ -60,26 +72,27 @@ _(The loop updates the four lines above every iteration.)_
 Acceptance criteria are condensed from assessment §4 (M1–M7). Tick items as
 they land; a milestone is **done** only when every acceptance bullet holds.
 
-### M0 — Planning & RFCs  _(in progress)_
+### M0 — Planning & RFCs  _(done)_
 - [x] Retire old design; draft RFC 0001
 - [x] Architecture assessment + research notes
-- [ ] RFCs 0001–0013 authored, reconciled, committed
-- [ ] `rfcs/README.md` index
-- [ ] This plan committed
+- [x] RFCs 0001–0013 authored, reconciled, committed
+- [x] `rfcs/README.md` index
+- [x] This plan committed
 
-### M1 — Skeleton: config, one-shot, one MCP server, the loop, budgets
-Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ mcp/{client,registry,config} loop/ supervisor/budget.rs obs/log.rs sec/secrets.rs signals.rs`
-- [ ] Scaffold workspace/crate/module tree (assessment §4.0); compiles empty
-- [ ] `config.rs` precedence (built-in<file<env<flag) + validate-at-startup → exit 2
-- [ ] `exit.rs` public exit-code table + terminal-status→code map
-- [ ] `json/` shared JSON-RPC 2.0 codec + `frame.rs` (NDJSON + length-prefix)
+### M1 — Skeleton: config, one-shot, one MCP server, the loop, budgets  _(in progress)_
+Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ mcp/{client,registry,config} agentloop/ supervisor/budget.rs obs/log.rs sec/secrets.rs signals.rs`
+> Note: the plan's `loop/` dir is `agentloop/` in code (`loop` is a Rust keyword).
+- [x] Scaffold workspace/crate/module tree (assessment §4.0); compiles
+- [x] `config.rs` precedence (built-in<env<flag; file layer deferred) + validate-at-startup → exit 2
+- [x] `exit.rs` public exit-code table + terminal-status→code map (`once_exit`)
+- [x] `json/` shared JSON-RPC 2.0 codec + `frame.rs` (NDJSON + length-prefix)
 - [ ] `wire/mcp.rs` (2025-11-25 types, capability map) + `wire/intel.rs` (+ tool-calling fields)
 - [ ] `net/http.rs` hand-rolled HTTP/1.1(+SSE) over Read+Write; `net/unixsock.rs`; `net/tls.rs` [tls]
 - [ ] `intel/` openai-compatible adapter + native tool-calling over `unix:` and `https://`
 - [ ] `mcp/client.rs` one stdio server (reader-thread + pending-map) tools/list+call, resources/list+read
-- [ ] `loop/` ReAct loop + `stop.rs` terminal-status disjunction
+- [ ] `agentloop/` ReAct loop (`runner.rs`/`context.rs`/`action.rs`) — `stop.rs` `TerminalStatus` done
 - [ ] `supervisor/budget.rs` token/step/deadline (salvage CAS tracker)
-- [ ] `obs/log.rs` JSON-lines logger + line schema; `signals.rs` SIGTERM/INT/PIPE
+- [x] `obs/log.rs` JSON-lines logger + line schema; `signals.rs` SIGTERM/INT/PIPE
 - **Acceptance:** `agentd --mode once --instruction … --intelligence https://… --mcp fs=…` → loop → real `tools/call` → result on stdout, JSON events on stderr; exit code maps terminal status; bad flag → exit 2 in <50ms; step/token/deadline cap → labeled partial not hang; `isError:true`→observation, JSON-RPC error→abort.
 
 ### M2 — Subagent processes: the supervised tree

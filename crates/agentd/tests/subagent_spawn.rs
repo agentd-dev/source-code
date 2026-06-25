@@ -1,15 +1,16 @@
 //! End-to-end test of the supervisor↔subagent process plumbing (M2).
 //!
 //! Launches a *real* `agentd` subagent process (re-exec of the built binary),
-//! delivers a `SpawnPayload` over the control channel, and asserts the round
-//! trip: the child emits `Ready`, then — because its intelligence endpoint is
-//! unreachable — a terminal `Failed`. This exercises re-exec + payload
-//! delivery + `main` dispatch + `subagent::control` without needing a live LLM.
+//! delivers a `SpawnPayload`, and asserts the round trip over the merged
+//! event channel: the child emits `Ready`, then — because its intelligence
+//! endpoint is unreachable — a terminal `Failed`. Exercises re-exec + payload
+//! delivery + `main` dispatch + `subagent::control` without a live LLM.
 
 use agentd::subagent::protocol::{AgentMsg, IntelConfig, Limits, SpawnPayload, Telemetry};
-use agentd::supervisor::spawn::{spawn, Terminal};
-use agentd::supervisor::tree::{Caps, Tree};
+use agentd::supervisor::spawn::spawn;
+use agentd::supervisor::tree::{Caps, NodeId, Tree};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn bogus_payload() -> SpawnPayload {
@@ -18,7 +19,6 @@ fn bogus_payload() -> SpawnPayload {
         output_contract: None,
         context_seed: Vec::new(),
         intelligence: IntelConfig {
-            // A unix socket that does not exist → the first model call fails.
             uri: "unix:/nonexistent/agentd-subagent-test.sock".into(),
             token: None,
             model: Some("test-model".into()),
@@ -36,22 +36,42 @@ fn bogus_payload() -> SpawnPayload {
     }
 }
 
+/// Read messages until a terminal one, or the deadline.
+fn drain_to_terminal(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, deadline: Instant) -> Vec<AgentMsg> {
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok((_node, msg)) => {
+                let terminal = matches!(msg, AgentMsg::Result { .. } | AgentMsg::Failed { .. });
+                seen.push(msg);
+                if terminal {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    seen
+}
+
 #[test]
 fn subagent_round_trips_ready_then_failed() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let mut tree = Tree::new(Caps::default());
     let node = tree.mint_root().unwrap();
 
-    let sub = spawn(Path::new(exe), &bogus_payload(), node).expect("spawn subagent");
+    let (tx, rx) = mpsc::channel();
+    let _sub = spawn(Path::new(exe), &bogus_payload(), node, tx).expect("spawn subagent");
 
-    // First frame up should be Ready (sent before the loop starts).
-    let first = sub.recv_timeout(Duration::from_secs(10)).expect("a Ready message");
-    assert!(matches!(first, AgentMsg::Ready), "expected Ready, got {first:?}");
+    let msgs = drain_to_terminal(&rx, Instant::now() + Duration::from_secs(20));
 
-    // Then a terminal Failed, because intelligence is unreachable.
-    match sub.wait_terminal(Instant::now() + Duration::from_secs(15)) {
-        Terminal::Failed(e) => assert!(e.contains("intel"), "expected an intel failure, got: {e}"),
-        other => panic!("expected Terminal::Failed, got {other:?}"),
+    assert!(matches!(msgs.first(), Some(AgentMsg::Ready)), "expected Ready first, got {msgs:?}");
+    match msgs.last() {
+        Some(AgentMsg::Failed { error }) => {
+            assert!(error.contains("intel"), "expected an intel failure, got: {error}")
+        }
+        other => panic!("expected terminal Failed, got {other:?}"),
     }
-    // Dropping `sub` kills + reaps the process group (no leak).
+    // Dropping `_sub` kills + reaps the process group (no leak).
 }

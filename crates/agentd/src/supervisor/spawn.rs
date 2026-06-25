@@ -4,49 +4,48 @@
 //! the one artifact is CLI, supervisor, and subagent. Each child is put in its
 //! own **process group** (`setpgid` in `pre_exec`) so the kill ladder can
 //! `killpg` a whole subtree (RFC 0003). The supervisor delivers the
-//! [`SpawnPayload`] as the first control frame and reads upward [`AgentMsg`]s
-//! on a dedicated thread.
+//! [`SpawnPayload`] as the first control frame; the child's upward
+//! [`AgentMsg`]s are read on a dedicated thread and forwarded — tagged with
+//! the child's [`NodeId`] — onto the reactor's single **merged channel**
+//! (RFC 0002 §reactor).
 //!
-//! This wake provides spawn + result-wait + immediate kill; the full
-//! three-detector liveness model and the graceful SIGTERM→SIGKILL ladder land
-//! in `liveness.rs`/`kill.rs`.
+//! Teardown is **reap-safe**: once the reactor has reaped a child via
+//! `waitpid(-1)` it calls [`Subagent::mark_reaped`], so `Drop` will not signal
+//! a possibly-reused pid.
 
-use crate::agentloop::stop::Outcome;
 use crate::json::frame;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SUBAGENT_ENV};
+use crate::supervisor::kill::kill_group;
 use crate::supervisor::tree::NodeId;
 use std::io;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
-/// How a subagent run ended, from the supervisor's view.
-#[derive(Debug)]
-pub enum Terminal {
-    Result(Outcome),
-    Failed(String),
-    /// The deadline passed with no terminal message (the child is wedged or
-    /// slow — the caller runs the kill ladder).
-    Timeout,
-}
-
-/// A handle to a running subagent process and its control channel.
+/// A handle to a running subagent process and the down side of its control
+/// channel. Upward messages arrive on the reactor's merged channel, not here.
 pub struct Subagent {
     pub node: NodeId,
     child: Child,
     writer: ChildStdin,
-    events: Receiver<AgentMsg>,
     /// Process-group id for `killpg` (== child pid; the child is its own group
     /// leader after `setpgid(0, 0)`).
     pgid: i32,
+    /// Set once the reactor has reaped this child — suppresses Drop signalling.
+    reaped: bool,
     _reader: JoinHandle<()>,
 }
 
 /// Spawn a subagent that re-execs `exe` (normally `std::env::current_exe()`),
-/// delivering `payload`. `node` is the supervisor-minted tree node.
-pub fn spawn(exe: &Path, payload: &SpawnPayload, node: NodeId) -> io::Result<Subagent> {
+/// delivering `payload`. Upward messages are forwarded to `events` tagged with
+/// `node`.
+pub fn spawn(
+    exe: &Path,
+    payload: &SpawnPayload,
+    node: NodeId,
+    events: Sender<(NodeId, AgentMsg)>,
+) -> io::Result<Subagent> {
     let mut cmd = Command::new(exe);
     cmd.env(SUBAGENT_ENV, "1")
         .stdin(Stdio::piped())
@@ -76,7 +75,6 @@ pub fn spawn(exe: &Path, payload: &SpawnPayload, node: NodeId) -> io::Result<Sub
     // Deliver the spawn payload as the first control frame.
     frame::write_frame(&mut writer, &ControlMsg::Spawn(Box::new(payload.clone())))?;
 
-    let (tx, events) = mpsc::channel();
     let reader = std::thread::Builder::new()
         .name(format!("subagent-events:{}", node.0))
         .spawn(move || {
@@ -85,8 +83,8 @@ pub fn spawn(exe: &Path, payload: &SpawnPayload, node: NodeId) -> io::Result<Sub
             while let Ok(Some(bytes)) = frame::read_frame(&mut r) {
                 match serde_json::from_slice::<AgentMsg>(&bytes) {
                     Ok(msg) => {
-                        if tx.send(msg).is_err() {
-                            break; // supervisor dropped the handle
+                        if events.send((node, msg)).is_err() {
+                            break; // reactor dropped the channel
                         }
                     }
                     Err(_) => { /* skip an unparseable frame */ }
@@ -94,12 +92,12 @@ pub fn spawn(exe: &Path, payload: &SpawnPayload, node: NodeId) -> io::Result<Sub
             }
         })?;
 
-    Ok(Subagent { node, child, writer, events, pgid, _reader: reader })
+    Ok(Subagent { node, child, writer, pgid, reaped: false, _reader: reader })
 }
 
 impl Subagent {
-    pub fn pid(&self) -> u32 {
-        self.child.id()
+    pub fn pid(&self) -> i32 {
+        self.child.id() as i32
     }
     pub fn pgid(&self) -> i32 {
         self.pgid
@@ -110,59 +108,31 @@ impl Subagent {
         frame::write_frame(&mut self.writer, msg)
     }
 
-    /// Receive the next upward message, if one arrives within `dur`.
-    pub fn recv_timeout(&self, dur: Duration) -> Option<AgentMsg> {
-        self.events.recv_timeout(dur).ok()
-    }
-
-    /// Block until the child reports a terminal status, the channel closes, or
-    /// `deadline` passes. Intermediate messages (Ready/Pong/Event/Usage) are
-    /// consumed; richer handling (no-progress watchdog, usage rollup) is the
-    /// reactor's job in a later wake.
-    pub fn wait_terminal(&self, deadline: Instant) -> Terminal {
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Terminal::Timeout;
-            }
-            let slice = (deadline - now).min(Duration::from_millis(250));
-            match self.events.recv_timeout(slice) {
-                Ok(AgentMsg::Result { outcome }) => return Terminal::Result(outcome),
-                Ok(AgentMsg::Failed { error }) => return Terminal::Failed(error),
-                Ok(_) => {} // Ready / Pong / Event / Usage — keep waiting
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Terminal::Failed("subagent channel closed without a result".into());
-                }
-            }
-        }
+    /// Mark that the reactor already reaped this child (via `waitpid(-1)`), so
+    /// teardown won't signal a possibly-reused pid.
+    pub fn mark_reaped(&mut self) {
+        self.reaped = true;
     }
 
     /// Immediate, unconditional teardown of the whole process group. The
-    /// graceful ladder (cancel → SIGTERM → SIGKILL) lands in `kill.rs`.
+    /// graceful ladder (cancel → SIGTERM → SIGKILL over time) is driven by the
+    /// reactor via `kill.rs`; this is the backstop.
     pub fn kill(&mut self) {
-        kill_group(self.pgid);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped {
+            kill_group(self.pgid);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
     }
 }
 
 impl Drop for Subagent {
     fn drop(&mut self) {
-        kill_group(self.pgid);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-#[cfg(unix)]
-fn kill_group(pgid: i32) {
-    if pgid > 1 {
-        unsafe {
-            libc::killpg(pgid, libc::SIGKILL);
+        if !self.reaped {
+            kill_group(self.pgid);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
-
-#[cfg(not(unix))]
-fn kill_group(_pgid: i32) {}

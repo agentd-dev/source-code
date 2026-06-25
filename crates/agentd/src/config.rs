@@ -79,6 +79,9 @@ pub struct Config {
     pub enable_exec: bool,
     pub serve_mcp: Option<String>,
     pub health_file: Option<String>,
+    /// Inbound W3C `traceparent` to continue (else a trace is minted from the
+    /// run id). RFC 0010 §context-propagation.
+    pub traceparent: Option<String>,
 }
 
 impl Default for Config {
@@ -102,6 +105,7 @@ impl Default for Config {
             enable_exec: false,
             serve_mcp: None,
             health_file: None,
+            traceparent: None,
         }
     }
 }
@@ -128,6 +132,7 @@ impl fmt::Debug for Config {
             .field("enable_exec", &self.enable_exec)
             .field("serve_mcp", &self.serve_mcp)
             .field("health_file", &self.health_file)
+            .field("traceparent", &self.traceparent)
             .finish()
     }
 }
@@ -199,6 +204,9 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
+        if let Some(v) = envmap.get("AGENTD_TRACEPARENT") {
+            c.traceparent = Some((*v).to_string());
+        }
 
         // --- flag layer (overrides env) ---
         let mut it = args.iter().peekable();
@@ -251,6 +259,7 @@ impl Config {
                 "--enable-exec" => c.enable_exec = true,
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
+                "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 other => return Err(usage(format!("unknown argument: {other}"))),
             }
         }

@@ -70,9 +70,13 @@ pub fn run() -> i32 {
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
             Ok(mut c) => {
-                // Stamp the run id on every tool call so backing services can
-                // dedupe retries of this run (RFC 0011 §idempotency).
-                c.set_tool_meta(serde_json::json!({"agentd/run_id": payload.telemetry.run_id}));
+                // Stamp the run id (retry dedup, RFC 0011) + a W3C traceparent
+                // (distributed tracing, RFC 0010) on every tool call.
+                let mut meta = serde_json::json!({"agentd/run_id": payload.telemetry.run_id});
+                if let Some(tid) = &payload.telemetry.trace_id {
+                    meta["traceparent"] = crate::obs::trace::outbound_traceparent(tid).into();
+                }
+                c.set_tool_meta(meta);
                 servers.push(c);
             }
             Err(e) => {

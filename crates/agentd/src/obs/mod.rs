@@ -6,8 +6,9 @@
 
 pub mod log;
 pub mod health;
-
-#[cfg(feature = "otel")]
+// W3C trace-context *propagation* is default-on and dependency-free (a few
+// formatted fields). Only span *export* (OTLP) is gated behind `otel` (added
+// inside `trace.rs`). RFC 0010 §context-propagation.
 pub mod trace;
 
 #[cfg(feature = "metrics")]

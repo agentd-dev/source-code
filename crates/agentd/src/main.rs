@@ -58,6 +58,9 @@ fn run() -> i32 {
     // Adopt orphaned grandchildren into our reaping domain (RFC 0003).
     let subreaper = agentd::supervisor::reap::set_child_subreaper();
 
+    // One trace id for the whole run (ingested from upstream or minted from the
+    // run id) — stamped on every log line + propagated to children (RFC 0010).
+    let trace_id = agentd::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id;
     let log = Logger::new(
         LogCtx {
             run_id: cfg.run_id.clone(),
@@ -65,7 +68,7 @@ fn run() -> i32 {
             agent_path: "0".into(),
             comp: Comp::Supervisor,
             pid: std::process::id(),
-            trace_id: None,
+            trace_id: Some(trace_id),
         },
         cfg.log_level,
     );
@@ -178,7 +181,9 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             run_id: cfg.run_id.clone(),
             agent_id: "0".into(),
             agent_path: "0".into(),
-            trace_id: None,
+            // Same trace id as the supervisor's logs → the whole tree correlates
+            // (resolve is deterministic for a given run id; RFC 0010).
+            trace_id: Some(agentd::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id),
             log_level: cfg.log_level.as_str().into(),
         },
         depth: 0,

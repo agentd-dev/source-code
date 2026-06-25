@@ -84,10 +84,13 @@ pub struct RpcError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Incoming {
-    // Order matters for untagged: Response and Request both have `id`, so try
-    // Response (result/error) first, then Request (method), then Notification.
-    Response(Response),
+    // Order matters for untagged. `Request` first: its `method` is a *required*
+    // field, so it only matches frames that actually have one — and a Response's
+    // optional `result`/`error` would otherwise let `Response` swallow a Request.
+    // A Response (id, no method) then falls through to `Response`; a Notification
+    // (method, no id) to `Notification`.
     Request(Request),
+    Response(Response),
     Notification(Notification),
 }
 
@@ -170,6 +173,17 @@ mod tests {
         match serde_json::from_str::<Incoming>(note).unwrap() {
             Incoming::Notification(n) => assert_eq!(n.method, "notifications/resources/updated"),
             other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incoming_parses_request_not_response() {
+        // Regression: a server→client request (has `method`) must parse as
+        // Request, not be swallowed by Response (whose fields are all optional).
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        match serde_json::from_str::<Incoming>(req).unwrap() {
+            Incoming::Request(r) => assert_eq!(r.method, "initialize"),
+            other => panic!("expected request, got {other:?}"),
         }
     }
 

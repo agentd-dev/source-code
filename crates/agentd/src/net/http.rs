@@ -121,7 +121,7 @@ pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpSt
 /// Issue one request over `stream` and read the full response. Adds `Host`,
 /// `Connection: close`, and `Content-Length`; the caller supplies any other
 /// headers (e.g. `Authorization`, `Content-Type`).
-pub fn send<S: Read + Write>(
+pub fn send<S: Read + Write + ?Sized>(
     stream: &mut S,
     host_header: &str,
     method: &str,

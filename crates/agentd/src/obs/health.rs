@@ -1,3 +1,3 @@
-//! MCP client: reader-thread + pending-request map + notification dispatch. RFC 0004.
+//! Health: heartbeat, --health-file, /healthz+/readyz. RFC 0010/0011.
 //!
 //! Stub — see docs/design/PLAN.md and the cited RFC. Implemented incrementally per milestone.

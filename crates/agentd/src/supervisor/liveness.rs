@@ -1,3 +1,3 @@
-//! MCP client: reader-thread + pending-request map + notification dispatch. RFC 0004.
+//! Deadline + no-progress + ping/pong; EOF x pong classifier. RFC 0003.
 //!
 //! Stub — see docs/design/PLAN.md and the cited RFC. Implemented incrementally per milestone.

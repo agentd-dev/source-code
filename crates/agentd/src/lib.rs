@@ -1,56 +1,36 @@
-//! `agentd`: a bounded, workflow-driven runtime.
+//! agentd — a minimal, MCP-native, reactive agent runtime.
 //!
-//! The runtime executes predeclared DAG workflows triggered by events,
-//! HTTP requests, or explicit start-node invocation. Capabilities are
-//! compile-time selected; intelligence is a bounded reasoning step,
-//! not the owner of control flow.
+//! One binary that is CLI, daemon, and subagent re-exec. A **supervisor**
+//! owns lifecycle, triggers, and the process tree but never reasons; the
+//! **agentic loop** lives only inside subagent processes. Tools come only
+//! from MCP servers; reactivity comes from MCP resource subscriptions;
+//! agentd is itself an MCP server so agents compose with one protocol.
 //!
-//! Full design: [`rfcs/0001-bounded-workflow-runtime.md`] at the
-//! workspace root.
+//! Architecture: `rfcs/0001-mcp-native-agent-runtime.md` (front door) and
+//! `rfcs/0002`–`0013`. Binding decisions: `docs/design/00-architecture-assessment.md`.
+//! Build order: `docs/design/PLAN.md`.
 //!
-//! # Module map
-//!
-//! | Module            | Role                                                   |
-//! |-------------------|--------------------------------------------------------|
-//! | [`embedded`]      | Optional build-time-baked workflow                     |
-//! | [`engine`]        | Execution engine + context + traversal                 |
-//! | [`error`]         | Runtime error type shared across subsystems            |
-//! | [`intelligence`]  | `IntelligenceClient` + Unix / mock transports          |
-//! | [`mcp`]           | `McpClient` + stdio transport + allowlist              |
-//! | [`observability`] | Tracing init + metrics counters                        |
-//! | [`policy`]        | `ManifestPolicy` and glob matchers                     |
-//! | [`runtime`]       | Single-entry-point driver used by `main.rs`            |
-//! | [`testing`]       | Fixture-driven test harness                            |
-//! | [`tools`]         | Foundational tool families (feature-gated)             |
-//! | [`triggers`]      | HTTP trigger server (feature-gated)                    |
-//! | [`workflow`]      | Workflow doc model + TOML parse + DAG validator        |
+//! Module map (assessment §4.0). `agentloop` is named to avoid the `loop`
+//! keyword.
 
-pub mod agent;
-#[cfg(feature = "auth")]
-pub mod auth;
-pub mod budget;
-pub mod embedded;
-pub mod engine;
-pub mod error;
-pub mod intelligence;
-pub mod mcp;
-pub mod observability;
-pub mod policy;
-pub mod ratelimit;
-pub mod runtime;
-pub mod secrets;
-pub mod server_config;
-pub mod signals;
-pub mod signing;
+// WIP scaffold: modules are filled in milestone-by-milestone (PLAN.md).
+// Removed in M7's minimalism/clippy audit.
+#![allow(dead_code)]
 
-// Re-export for integration tests + external consumers that want to
-// build a client against our TLS server without pulling rustls
-// directly.
-#[cfg(feature = "server-tls")]
-pub use rustls;
-pub mod testing;
-pub mod tools;
-pub mod triggers;
-pub mod workflow;
+pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup
+pub mod exit; // the public exit-code table + terminal-status -> code map
+pub mod json; // shared JSON-RPC 2.0 codec + framing (NDJSON + length-prefix)
+pub mod wire; // MCP + intelligence wire types
+pub mod net; // hand-rolled HTTP/1.1(+SSE), unix-socket, (tls/vsock gated)
+pub mod intel; // intelligence client + provider adapters
+pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
+pub mod agentloop; // the ReAct loop + terminal-status state machine
+pub mod supervisor; // the reactor, process tree, spawn/reap/liveness/kill/restart
+pub mod triggers; // execution modes + reactive routing + timers
+pub mod subagent; // supervisor<->subagent control protocol
+pub mod obs; // logging, health, tracing, metrics
+pub mod sec; // secrets, tool-scope, gated exec
+pub mod signals; // sigaction + self-pipe; SIGTERM/INT/CHLD/PIPE
 
-pub use error::{Error, Result};
+/// Crate version, surfaced in logs (`agentd_build_info`) and `--version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

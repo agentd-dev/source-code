@@ -1,3 +1,3 @@
-//! MCP client: reader-thread + pending-request map + notification dispatch. RFC 0004.
+//! VsockStream transport. RFC 0006. [feature: vsock]
 //!
 //! Stub — see docs/design/PLAN.md and the cited RFC. Implemented incrementally per milestone.

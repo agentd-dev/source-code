@@ -1,3 +1,3 @@
-//! MCP client: reader-thread + pending-request map + notification dispatch. RFC 0004.
+//! MCP wire types (JSON-RPC 2.0, MCP 2025-11-25). RFC 0004.
 //!
 //! Stub — see docs/design/PLAN.md and the cited RFC. Implemented incrementally per milestone.

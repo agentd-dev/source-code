@@ -1,3 +1,3 @@
-//! MCP client: reader-thread + pending-request map + notification dispatch. RFC 0004.
+//! Re-exec subagent spawn; setpgid; pre_exec rlimit+PDEATHSIG. RFC 0003/0009.
 //!
 //! Stub — see docs/design/PLAN.md and the cited RFC. Implemented incrementally per milestone.

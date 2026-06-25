@@ -14,7 +14,7 @@
 
 use crate::json::{self, frame, Id, Incoming, RpcError};
 use crate::wire::mcp::{
-    method, CallToolParams, CallToolResult, ClientCapabilities, Implementation, InitializeParams,
+    method, CallToolResult, ClientCapabilities, Implementation, InitializeParams,
     InitializeResult, ListResourcesResult, ListToolsResult, ReadResourceParams, ReadResourceResult,
     Resource, ServerCapabilities, SubscribeParams, Tool, PROTOCOL_VERSION,
 };
@@ -69,6 +69,10 @@ pub struct McpClient {
     next_id: AtomicI64,
     caps: ServerCapabilities,
     timeout: Duration,
+    /// Stamped into every `tools/call` request's `params._meta` (e.g.
+    /// `{"agentd/run_id": …}`) so backing services can dedupe retries
+    /// (RFC 0011 §idempotency).
+    tool_meta: Option<Value>,
     _reader: JoinHandle<()>,
 }
 
@@ -113,6 +117,7 @@ impl McpClient {
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
             timeout,
+            tool_meta: None,
             _reader: reader,
         })
     }
@@ -122,6 +127,12 @@ impl McpClient {
     }
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.caps
+    }
+
+    /// Set the `_meta` stamped onto every `tools/call` (e.g. the run id, for
+    /// retry dedup). Call after `initialize`. RFC 0011 §idempotency.
+    pub fn set_tool_meta(&mut self, meta: Value) {
+        self.tool_meta = Some(meta);
     }
 
     /// MCP lifecycle handshake: `initialize` → store capabilities →
@@ -171,8 +182,8 @@ impl McpClient {
         if !self.caps.supports_tools() {
             return Err(McpError::Capability(format!("server '{}' has no tools", self.name)));
         }
-        let params = CallToolParams { name: name.to_string(), arguments };
-        self.request_as(method::TOOLS_CALL, Some(to_value(&params)))
+        let params = build_call_params(name, arguments, self.tool_meta.as_ref());
+        self.request_as(method::TOOLS_CALL, Some(params))
     }
 
     pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
@@ -288,6 +299,20 @@ fn write_msg<T: Serialize>(w: &SharedWriter, msg: &T) -> std::io::Result<()> {
     frame::write_line(&mut *guard, msg)
 }
 
+/// Build `tools/call` params — `{name, arguments?, _meta?}` — injecting the
+/// client's `_meta` (run id, etc.) for retry dedup. Pure. RFC 0011 §idempotency.
+fn build_call_params(name: &str, arguments: Option<Value>, meta: Option<&Value>) -> Value {
+    let mut p = serde_json::Map::new();
+    p.insert("name".into(), Value::String(name.to_string()));
+    if let Some(args) = arguments {
+        p.insert("arguments".into(), args);
+    }
+    if let Some(m) = meta {
+        p.insert("_meta".into(), m.clone());
+    }
+    Value::Object(p)
+}
+
 fn to_value<T: Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
@@ -350,6 +375,21 @@ mod tests {
     fn id_num_extracts_numeric() {
         assert_eq!(id_num(&Id::Num(5)), Some(5));
         assert_eq!(id_num(&Id::Str("x".into())), None);
+    }
+
+    #[test]
+    fn call_params_inject_meta_for_idempotency() {
+        let meta = json!({"agentd/run_id": "r1"});
+        let p = build_call_params("send_email", Some(json!({"to": "x"})), Some(&meta));
+        assert_eq!(p["name"], "send_email");
+        assert_eq!(p["arguments"]["to"], "x");
+        assert_eq!(p["_meta"]["agentd/run_id"], "r1");
+
+        // no meta / no args → those keys are absent
+        let p2 = build_call_params("noop", None, None);
+        assert_eq!(p2["name"], "noop");
+        assert!(p2.get("_meta").is_none());
+        assert!(p2.get("arguments").is_none());
     }
 
     #[test]

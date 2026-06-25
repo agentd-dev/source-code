@@ -49,17 +49,18 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M4 mostly done; opportunistically started **M5 (cloud-native
-  hardening)** with the health-file because disk pressure (see Blockers) favours
-  no-new-dependency work over the vsock/cron features.
-- **Last completed:** **`--health-file` supervisor-heartbeat liveness**
-  (`obs/health.rs`) — a global `tick()` bumped by every supervisor hot loop
-  (reactor, daemon driver, interval sleep) reflects whether the *supervisor* is
-  making progress (idle healthy; a stuck subagent doesn't flip it). A 1s writer
-  thread atomically renders `{alive, supervisor_tick_age_ms, mode, draining, ts}`
-  for a K8s exec probe. e2e-proven (`tests/daemon_modes.rs`). (Prior: the gated
-  `exec` self-tool.) 113 unit + 10 integration tests, clippy clean, default
-  build still serde + libc only.
+- **Phase:** disk freed (52% used) — caught up on feature-build health + closed
+  several items: RUN_ID idempotency, the `https://` (tls) and vsock intelligence
+  transports, and verified **all feature builds compile + clippy-clean**.
+- **Last completed:** (1) **RUN_ID idempotency** — `McpClient::set_tool_meta`
+  stamps `{"agentd/run_id"}` on every `tools/call` `_meta` for retry dedup
+  (RFC 0011). (2) **`net/tls.rs`** — rustls/ring + bundled webpki-roots;
+  `https://` intelligence now does a real TLS handshake (verified) under
+  `--features tls` (was an unimplemented stub that didn't even compile). (3)
+  **`net/vsock.rs`** — the vsock intelligence transport. (4) Confirmed
+  `--features tls,vsock,serve-mcp,cron,metrics,otel` builds + clippy clean, and
+  the **default build is still exactly 3 deps** (serde/serde_json/libc).
+  (Prior: the `--health-file` heartbeat.) 114 unit + 10 integration tests.
 - **Next action:** pick from the remaining priority items — most valuable is the
   **gated `exec` self-tool** (`sec/exec.rs`, M4): a built-in MCP tool, off by
   default (`--enable-exec`), that runs a local command under the same
@@ -77,11 +78,9 @@ cargo clippy -p agentd -- -D warnings # keep clean
   `call_tool`, testable via the mock echoing `_meta`), then the full exit-code
   table polish + cgroup-v2 awareness. Defer vsock/cron (new crates) until disk
   frees. Deferred big item: self-scheduling.
-- **Blockers:** ENVIRONMENT — the host root fs is ~100% full (163G/168G), driven
-  by OTHER projects under /root (e.g. mcpg-dev ≈91G), not agentd (~1G). I freed
-  agentd's own `target/` (`cargo clean`, ~680M) to keep building; the gate works,
-  but the hourly loop may hit ENOSPC again. Operator may need to reclaim space.
-  (Code blockers: none. `net/tls.rs`/otel deferred; Unix-only syscalls as noted.)
+- **Blockers:** none — operator reclaimed disk (now 52% used, 79G free); feature
+  builds restored. (`otel` feature has no deps declared yet — wired in M6. Live
+  vsock + the `--serve-mcp` peer listener need a peer/microVM to exercise.)
 
 _(The loop updates the lines above every iteration.)_
 
@@ -107,7 +106,7 @@ Modules: `main.rs config.rs exit.rs json/ wire/ net/{http,unixsock,tls} intel/ m
 - [x] `exit.rs` public exit-code table + terminal-status→code map (`once_exit`)
 - [x] `json/` shared JSON-RPC 2.0 codec + `frame.rs` (NDJSON + length-prefix)
 - [x] `wire/mcp.rs` (2025-11-25 types, capability gating) + `wire/intel.rs` (neutral + tool-calling)
-- [x] `net/http.rs` hand-rolled HTTP/1.1 over Read+Write + `net/unixsock.rs` (SSE + `net/tls.rs` deferred until https path/M6)
+- [x] `net/http.rs` hand-rolled HTTP/1.1 over Read+Write + `net/unixsock.rs` + **`net/tls.rs`** (rustls/ring + bundled webpki-roots; `https://` intelligence works under `--features tls` — verified with a real TLS handshake). SSE deferred.
 - [x] `intel/` openai-compatible adapter + native tool-calling + anthropic adapter; client over `unix:` / `https:`(tls) / `vsock:`(feat)
 - [x] `mcp/client.rs` one stdio server (reader-thread + pending-map + timeouts) tools/list+call, resources/list+read, subscribe
 - [x] `agentloop/runner.rs` ReAct loop (catalogue→intel→tools→observe→stop); `stop.rs` `TerminalStatus` done. (`context.rs`/`action.rs` split + resource-catalogue injection = M1 follow-up)
@@ -149,7 +148,7 @@ Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `s
 ### M4 — Composition, transports, exec, schedule
 Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,timer}.rs`
 - [ ] serve self-MCP over `unix:` (`--serve-mcp unix:…`)
-- [ ] `net/vsock.rs` + vsock intelligence transport [vsock]
+- [x] `net/vsock.rs` + vsock intelligence transport [vsock] — `VsockStream::connect_with_cid_port` + timeouts, drops into the HTTP client like the other transports. Compiles under `--features vsock`; live verification needs a microVM peer (deferred).
 - [x] `sec/exec.rs` gated `exec` self-tool — off by default, advertised only with `--enable-exec` (propagated via the spawn payload, inherited by children). argv-style (no shell/PATH/interpolation), argv[0] = absolute path to an existing executable, scrubbed env, output capped (64 KiB), own process group `killpg`'d on a mandatory per-call timeout. Salvaged from the retired `shell.rs`. Validation/spawn failures are recoverable observations. (Budget/Rule-of-Two folding = later refinement.)
 - [x] `--mode loop`/`schedule` drivers (`triggers/mode.rs::run_scheduled`): interval-based re-run of the standing instruction (each fire = an independent supervised `once` run); `loop` re-enters back-to-back (interval default 0), `schedule` fires on `--interval`; SIGTERM → graceful drain → exit 0; fast-failing runs back off (capped) so they can't hot-spin. e2e-proven (`tests/daemon_modes.rs`). _Remaining: optional 5-field `cron` feature (croner)._
 - [ ] optional `cron` feature (croner) as a `triggers/timer.rs` event source [feature: cron]
@@ -160,7 +159,7 @@ Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.r
 - [ ] full drain choreography with `AGENTD_DRAIN_TIMEOUT` < grace
 - [x] `obs/health.rs` **supervisor-heartbeat liveness** + `--health-file`: a process-global `tick()` is bumped by every supervisor hot loop (reactor, daemon driver, interval sleep) so liveness reflects the *supervisor* making progress — idle is healthy, a busy/stuck *subagent* doesn't flip it. A 1s writer thread renders `{alive, supervisor_tick_age_ms, mode, draining, ts}` atomically (temp+rename); a K8s exec probe checks `alive`/tick-age freshness. e2e-proven (`tests/daemon_modes.rs`: loop mode writes a live health file). _Opt-in `/healthz`+`/readyz` HTTP surface: later._
 - [ ] complete exit-code table in `exit.rs`
-- [ ] RUN_ID propagation into MCP `_meta`
+- [x] RUN_ID propagation into MCP `_meta` — `McpClient::set_tool_meta` stamps `{"agentd/run_id": …}` onto every `tools/call` `params._meta` (set after initialize in the subagent) so backing services dedupe retries of a run (RFC 0011 §idempotency). Pure builder unit-tested.
 - [ ] cgroup-v2 awareness (read `memory.max`, optional child-cgroup + `cgroup.kill`, `memory.high` backpressure, never required)
 - **Acceptance:** SIGTERM drains within budget → exit **0** (not 143); second SIGTERM forces kill; health file goes stale only when the *supervisor* wedges; each exit code matches the table; stable RUN_ID retried run detects "already done" via backing MCP → exit 0 cheaply; cgroup-writable host → tree reaped by `cgroup.kill`.
 

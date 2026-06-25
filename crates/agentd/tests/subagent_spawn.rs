@@ -33,6 +33,7 @@ fn bogus_payload() -> SpawnPayload {
             log_level: "error".into(),
         },
         depth: 0,
+        enable_exec: false,
     }
 }
 

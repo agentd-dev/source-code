@@ -138,9 +138,11 @@ mod tests {
         assert!(!classify_status(signaled(libc::SIGKILL)).is_clean());
     }
 
-    #[test]
-    fn reap_pending_with_no_children_is_empty() {
-        // No children spawned in this unit test → ECHILD → empty, no hang.
-        let _ = reap_pending();
-    }
+    // NOTE: `reap_pending()` is intentionally NOT unit-tested here. It calls
+    // `waitpid(-1, WNOHANG)`, which in a multi-threaded test process would reap
+    // *other* tests' child processes (e.g. the `exec` tests' /bin/echo) before
+    // their own `Child::wait`, causing spurious ECHILD failures. In production
+    // it only runs inside the supervisor process, whose reaping domain is its
+    // own; it's covered end-to-end by the spawn/reactive integration tests,
+    // which run agentd in separate processes.
 }

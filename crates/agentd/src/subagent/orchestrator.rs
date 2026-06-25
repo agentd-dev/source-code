@@ -46,6 +46,7 @@ pub struct Orchestrator {
     trace_id: Option<String>,
     log_level: String,
     child_limits: Limits,
+    enable_exec: bool,
     drain_timeout: Duration,
     log: Logger,
 }
@@ -67,6 +68,9 @@ impl Orchestrator {
             log_level: payload.telemetry.log_level.clone(),
             // Children inherit the parent's per-run bounds (v1).
             child_limits: payload.limits.clone(),
+            // exec is inherited by children (scope only narrows; the Rule-of-Two
+            // tag check is a later refinement).
+            enable_exec: payload.enable_exec,
             drain_timeout,
             log,
         }
@@ -113,6 +117,7 @@ impl Orchestrator {
                 log_level: self.log_level.clone(),
             },
             depth: self.parent_depth + 1,
+            enable_exec: self.enable_exec,
         };
         self.child_count += 1;
         self.log.info(
@@ -143,16 +148,24 @@ impl Orchestrator {
 
 impl SelfHandler for Orchestrator {
     fn tools(&self) -> Vec<ToolDef> {
-        // Only advertise delegation when there is depth budget to use it.
-        if !self.can_nest() {
-            return Vec::new();
+        let mut t = Vec::new();
+        // Advertise delegation only when there is depth budget to use it.
+        if self.can_nest() {
+            t.push(spawn_tool_def());
         }
-        vec![spawn_tool_def()]
+        // The gated exec tool — only when --enable-exec was set (RFC 0012).
+        if self.enable_exec {
+            t.push(crate::sec::exec::tool_def());
+        }
+        t
     }
 
     fn handle(&mut self, name: &str, args: &Value) -> Option<(String, bool)> {
         match name {
             "subagent.spawn" => Some(self.spawn(args)),
+            "exec" if self.enable_exec => {
+                Some(crate::sec::exec::handle_call(args, crate::sec::exec::DEFAULT_TIMEOUT))
+            }
             _ => None,
         }
     }
@@ -240,7 +253,21 @@ mod tests {
                 log_level: "error".into(),
             },
             depth,
+            enable_exec: false,
         }
+    }
+
+    #[test]
+    fn exec_tool_is_gated_by_enable_exec() {
+        let mut p = payload(0, 4);
+        p.enable_exec = false;
+        let mut o = Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
+        assert!(!o.tools().iter().any(|t| t.name == "exec"), "exec must be off by default");
+        assert!(o.handle("exec", &json!({"argv": ["/bin/true"]})).is_none(), "exec must not run when disabled");
+
+        p.enable_exec = true;
+        let o = Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
+        assert!(o.tools().iter().any(|t| t.name == "exec"), "exec advertised when enabled");
     }
 
     #[test]

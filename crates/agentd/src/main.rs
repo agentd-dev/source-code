@@ -172,6 +172,7 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             log_level: cfg.log_level.as_str().into(),
         },
         depth: 0,
+        enable_exec: cfg.enable_exec,
     }
 }
 

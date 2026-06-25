@@ -259,6 +259,7 @@ mod tests {
                 log_level: "error".into(),
             },
             depth: 0,
+            enable_exec: false,
         }
     }
 

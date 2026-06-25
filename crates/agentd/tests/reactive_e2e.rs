@@ -64,6 +64,48 @@ fn reactive_observably_reacts_to_a_resource_update() {
 }
 
 #[test]
+fn trace_context_propagates_across_the_agent_tree() {
+    // Run with an upstream traceparent; its trace id must appear on BOTH the
+    // supervisor's and the spawned subagent's log lines — one auditable trace
+    // for the whole run (RFC 0010 §context-propagation).
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json");
+    let trace_id = "1234567890abcdef1234567890abcdef";
+    let traceparent = format!("00-{trace_id}-1111111111111111-01");
+
+    let mut child = Command::new(exe)
+        .args([
+            "--mode", "reactive", "--instruction", "react", "--intelligence",
+            "unix:/nonexistent.sock", "--subscribe", "file:///in.json", "--mcp", &mcp,
+            "--traceparent", &traceparent, "--log-level", "info",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd reactive");
+
+    let mut stderr = child.stderr.take().expect("stderr");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        stderr.read_to_string(&mut s).ok();
+        s
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = child.kill();
+    let _ = child.wait();
+    let out = reader.join().unwrap_or_default();
+
+    let tid_field = format!(r#""trace_id":"{trace_id}""#);
+    // present on supervisor-emitted lines
+    let on_supervisor =
+        out.lines().any(|l| l.contains(r#""comp":"supervisor""#) && l.contains(&tid_field));
+    // present on subagent-emitted lines
+    let on_agent = out.lines().any(|l| l.contains(r#""comp":"agent""#) && l.contains(&tid_field));
+    assert!(on_supervisor, "upstream trace id not on supervisor lines:\n{out}");
+    assert!(on_agent, "upstream trace id not propagated to subagent lines:\n{out}");
+}
+
+#[test]
 fn read_after_subscribe_reacts_without_an_emitted_update() {
     // `--no-emit`: the mock pushes NO update. The agent must still react to the
     // resource's current state on startup (read-after-subscribe, §2.8).

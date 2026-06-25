@@ -49,29 +49,28 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** disk freed (52% used) — caught up on feature-build health + closed
-  several items: RUN_ID idempotency, the `https://` (tls) and vsock intelligence
-  transports, and verified **all feature builds compile + clippy-clean**.
-- **Last completed:** (1) **RUN_ID idempotency** — `McpClient::set_tool_meta`
-  stamps `{"agentd/run_id"}` on every `tools/call` `_meta` for retry dedup
-  (RFC 0011). (2) **`net/tls.rs`** — rustls/ring + bundled webpki-roots;
-  `https://` intelligence now does a real TLS handshake (verified) under
-  `--features tls` (was an unimplemented stub that didn't even compile). (3)
-  **`net/vsock.rs`** — the vsock intelligence transport. (4) Confirmed
-  `--features tls,vsock,serve-mcp,cron,metrics,otel` builds + clippy clean, and
-  the **default build is still exactly 3 deps** (serde/serde_json/libc).
-  (Prior: the `--health-file` heartbeat.) 114 unit + 10 integration tests.
-- **Next action:** pick from the remaining priority items — most valuable is the
-  **gated `exec` self-tool** (`sec/exec.rs`, M4): a built-in MCP tool, off by
-  default (`--enable-exec`), that runs a local command under the same
-  deadline/kill regime — the one non-MCP capability, gated by binary presence
-  (salvage the retired `tools/shell.rs::run()`). Alternatives: the `cron` feature,
-  the `--serve-mcp` peer listener, or starting M5 (cloud-native hardening: full
-  exit-code table, health file, RUN_ID idempotency). Deferred big item:
-  self-scheduling (self-`subscribe` self-tool + warm `Continue` sessions). M2
-  tail: `restart.rs`, live stuck/orphan chaos tests.
-- **Active milestone:** M4 — schedule + exec done; `cron` feature, `net/vsock`,
-  the `--serve-mcp` peer listener next. (M3 core complete; self-scheduling deferred.)
+- **Phase:** M6 (observability depth) underway — **W3C trace-context
+  propagation** landed (the whole agent tree is one auditable trace), directly
+  serving the operator's traceability/audit requirement.
+- **Last completed:** **W3C trace propagation** (`obs/trace.rs`, default-on, no
+  new deps): a single `trace_id` per run — continued from an upstream
+  `--traceparent`/`AGENTD_TRACEPARENT` or minted deterministically from the run
+  id (FNV, so retries share it) — stamped on every supervisor + subagent log
+  line, carried in the spawn payload (children inherit), and emitted as
+  `_meta.traceparent` on MCP tool calls. Observe-proven (`tests/reactive_e2e.rs`:
+  the upstream trace id appears on both `comp:supervisor` and `comp:agent`
+  lines). (Prior: RUN_ID idempotency + tls/vsock transports.) 119 unit + 11
+  integration tests, clippy clean (default + all-features), default build = 3 deps.
+- **Next action (M6 cont.):** the **closed event-vocabulary audit** (ensure
+  every supervisor/agent event in §2.9 is emitted with the right fields — pure,
+  no deps, directly serves auditability) and the **`metrics` feature**
+  (hand-written Prometheus text from atomic counters on an opt-in surface — no
+  client lib). Then the LLM `traceparent` header (thread trace into the intel
+  client). Bigger items still open: the **`--serve-mcp` peer listener**
+  (composability), `cron` feature, self-scheduling, M2 tail (`restart.rs`,
+  stuck/orphan chaos tests), M7 (conformance + container).
+- **Active milestone:** M6 (observability depth). M4 mostly done (schedule, exec,
+  tls/vsock transports); `--serve-mcp`/`cron` remain there.
 - **Next action:** continue M5 no-new-dep hardening while disk is tight:
   **RUN_ID idempotency** (propagate `cfg.run_id` into every MCP tool-call
   `_meta` so backing services dedupe retries — small change in `mcp/client.rs`
@@ -165,7 +164,7 @@ Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.r
 
 ### M6 — Observability depth + security tags
 Modules: `obs/{trace,metrics}.rs`; extends `obs/log.rs sec/scope.rs net/http.rs`
-- [ ] W3C context propagation by default (`_meta`/HTTP header/spawn telemetry) in `obs/trace.rs`
+- [x] **W3C trace-context propagation** (default-on, dependency-free) in `obs/trace.rs`: one `trace_id` per run — ingested from an upstream `--traceparent`/`AGENTD_TRACEPARENT` or minted deterministically from the run id — stamped on every log line (supervisor + every subagent), carried in the spawn payload (children inherit), and emitted as `_meta.traceparent` on MCP tool calls. Only OTLP *export* is otel-gated. e2e-proven (`tests/reactive_e2e.rs`: the upstream trace id appears on both `comp:supervisor` and `comp:agent` lines). _LLM `traceparent` header: small follow-up (thread trace into the intel client)._
 - [ ] full closed event vocabulary emitted across supervisor + agent
 - [ ] `--aggregate-logs` (mode B) + `--log-content` (redaction-aware)
 - [ ] `sec/scope.rs` Rule-of-Two tag check (warn/refuse trifecta grants)

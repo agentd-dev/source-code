@@ -24,6 +24,13 @@
 - **Minimalism is the moat.** No new dependency without justification
   against the budget in assessment §2.2. Default build = single-digit
   first-party crates, no async runtime, no C toolchain, no TLS.
+- **Observability is a first-class, cross-cutting requirement** (operator
+  ask): the agent AND every subagent must be observable / traceable / logged /
+  auditable — full behaviour + performance. Every new behaviour emits a
+  canonical JSON-lines event with the `run_id` + `agent_path` tree correlation
+  (RFC 0010); the closed event vocabulary + W3C trace propagation deepen at M6.
+  **Post-core deliverable:** an E2E suite that validates capabilities by
+  *observing* agentd (asserting on its telemetry stream + outcomes), at M7.
 - **Binding decisions win.** If code and the assessment doc disagree, the
   assessment doc is right (or open an explicit deviation note here).
 - Small commits, one logical step each. Update this file in the same commit
@@ -42,34 +49,27 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M2 core complete — supervised process tree **and** model
-  self-orchestration both work end to end. Remaining M2 tail (restart governor,
-  the self-MCP peer-server listener, live stuck/orphan chaos tests) can trail
-  into later milestones; **next focus is M3 (reactivity)** — the signature
-  "listen for MCP resources, act when they appear" feature.
-- **Last completed:** **model self-orchestration** — the `subagent.spawn`
-  self-tool. `agentloop/action.rs` defines the `SelfHandler` seam (loop tries
-  self-tools before MCP); `subagent/orchestrator.rs` implements it: on
-  `subagent.spawn` it mints a child payload (depth+1, `agent_path` "p.N",
-  narrowed MCP scope, inherited intel), enforces depth/breadth caps **as
-  refused tool results**, and supervises the child synchronously via
-  `supervise_once` (a real nested child process). `reactor::reap` now reaps
-  every tick (flag-independent) so nested supervision works. `tests/
-  orchestrator_spawn.rs` drives `subagent.spawn` and confirms a real child
-  (`agent_path 0.0`) spawns, runs, and returns its result. (Prior: the reactor +
-  supervised once-mode.) 92 unit + 4 integration tests, clippy clean, default
-  build still serde + libc only.
-- **Next action (M3 — reactivity, the signature feature):** wire MCP resource
-  subscriptions end to end. In `mcp/client.rs`, surface `notifications/resources/
-  updated` (already drained into a queue) to the supervisor; add `resources/
-  subscribe`/`unsubscribe` calls (capability-gated). Build `triggers/router.rs`
-  (routes: match uri→glob, exactly-one-owner first-match, spawn-vs-continue as a
-  route property, debounce+coalesce, bounded queue) and `triggers/mode.rs`
-  (the `reactive` driver). Add the `subscribe`/`unsubscribe`/`resource.read`
-  self-tools so a running agent can self-subscribe (self-scheduling).
-  notify-then-read: on `updated{uri}`, `resources/read` the current state, then
-  spawn-or-continue per the route. Then `loop`/`schedule` modes + internal
-  interval. (M2 tail still open: `supervisor/restart.rs`, the `--serve-mcp` peer
+- **Phase:** M3 (reactivity) underway — the pure routing core is in; the
+  subscription wiring + reactive driver are next. (M2 core — supervised tree +
+  self-orchestration — complete; its tail trails later.)
+- **Last completed:** `triggers/router.rs` — the pure reactive-routing core
+  (RFC 0008): exact-beats-glob + longest-prefix **exactly-one-owner** matching,
+  `Spawn`/`Continue` as a route property, **debounce + newest-wins coalesce**
+  (`on_updated`/`due`/`next_deadline`), and a dropped counter for unmatched
+  updates. Fully unit-tested. Also recorded the **observability/audit
+  cross-cutting requirement** (ground rules + M7 observe-to-validate E2E item).
+  98 unit + 4 integration tests, clippy clean, default build still serde + libc.
+- **Next action (M3 — wire reactivity):** build the **reactive driver** that
+  hosts the router. A new supervisor entry (`supervise_reactive`) that: connects
+  the configured MCP servers, issues `resources/subscribe` for the configured
+  URIs (capability-gated; from `--subscribe`), then loops — drain
+  `mcp::client::drain_notifications` for `updated{uri}`, feed `router.on_updated`,
+  and on `router.due` do **notify-then-read** (`resources/read` the current
+  state) then `Spawn` a root subagent (templated from the event) or `Continue`
+  (warm session — stub to spawn-fresh for the first pass). Wire `--mode reactive`
+  in `triggers/mode.rs` + `main.rs`. THEN: the `subscribe`/`resource.read`
+  self-tools (self-scheduling), warm sessions, async subagents, then
+  `loop`/`schedule` modes. (M2 tail still open: `restart.rs`, `--serve-mcp`
   listener, live stuck/orphan tests.)
 - **Active milestone:** M2 (subagent processes).
 - **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
@@ -128,7 +128,7 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 ### M3 — Reactivity: subscriptions, routing, warm sessions, async subagents
 Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `supervisor/tree.rs`
 - [ ] notification dispatch wired to router; `resources/subscribe`/`unsubscribe` + consume `updated`/`list_changed` (cap-gated)
-- [ ] `triggers/router.rs` routes, exactly-one-owner first-match, spawn-vs-continue, debounce+coalesce, bounded queues, FIFO per session
+- [x] `triggers/router.rs` reactive routing (pure, unit-tested): exact-beats-glob + longest-prefix exactly-one-owner match, `Disposition::Spawn`/`Continue` as a route property, debounce + newest-wins coalesce, `on_updated`/`due`/`next_deadline`, dropped-counter for no-match
 - [ ] warm-session state in `tree.rs`
 - [ ] `subscribe`/`unsubscribe` + `resource.read` self-tools; self-subscribe → auto continue-route (self-scheduling)
 - [ ] async `subagent.spawn{async,detach}` + completion-as-self-resource
@@ -168,6 +168,7 @@ Modules: fills `agentd-conformance/`; finalizes feature matrix
 - [ ] `cargo tree -e normal` + `cargo audit`/`cargo deny` pass; cut unearned deps
 - [ ] revisit hand-roll-vs-`minreq`, `thiserror`-vs-hand-rolled, miniserde go/no-go
 - [ ] `agentd-conformance` MCP client+server conformance + supervisor behavior + record/replay tests
+- [ ] **observe-to-validate E2E suite** (operator ask): drive real agent/subagent runs and assert on the *observed* JSON-lines telemetry stream + outcomes — reconstruct the agent tree by `run_id`+`agent_path`, verify each capability/assumption (delegation, caps refusal, stuck-kill, drain, reactivity, scope narrowing) is visible and auditable in the event log
 - [ ] minimal container image (scratch/distroless, TLS-off default)
 - [ ] docs: exit-code table, config table, event vocabulary, trifecta guidance, deployment recipes (CLI / reactive Deployment / external CronJob)
 - **Acceptance:** default build links no async runtime, no TLS, no C toolchain, ≤ single-digit first-party crates; conformance passes against MCP reference servers + an agentd-as-server peer; stuck/orphan/fork-bomb chaos test leaks no process; runtime readable in an afternoon (size + module-count check).

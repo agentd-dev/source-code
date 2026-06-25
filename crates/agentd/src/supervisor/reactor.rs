@@ -203,9 +203,11 @@ impl Supervisor {
     }
 
     fn reap(&mut self) {
-        if !signals::take_child_exit() {
-            return;
-        }
+        // Reap every tick (cheap WNOHANG). The SIGCHLD flag/self-pipe is only a
+        // promptness optimization; correctness must not depend on it — a nested
+        // `supervise_once` runs inside a subagent that never installed the
+        // SIGCHLD handler, yet still needs to reap its own children.
+        signals::take_child_exit();
         for r in reap::reap_pending() {
             match self.pid_to_node.remove(&r.pid) {
                 Some(node) => {

@@ -19,8 +19,10 @@ use crate::intel::client::IntelClient;
 use crate::json::frame;
 use crate::mcp::client::McpClient;
 use crate::obs::log::{Comp, Level, LogCtx, Logger};
+use crate::subagent::orchestrator::Orchestrator;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use std::io::{self, BufReader, Stdin, Stdout};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,7 +87,12 @@ pub fn run() -> i32 {
         cancel: Some(Arc::clone(&cancel)),
     };
 
-    match run_loop(&intel, &servers, &input, &log) {
+    // Self-orchestration: the model can delegate subtasks via subagent.spawn,
+    // which spawns + supervises a child agent (depth + 1, scoped) from here.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentd"));
+    let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(25), log.clone());
+
+    match run_loop(&intel, &servers, &input, &mut orch, &log) {
         Ok(outcome) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
             send_up(&up, &AgentMsg::Result { outcome });

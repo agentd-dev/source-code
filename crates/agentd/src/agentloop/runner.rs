@@ -11,6 +11,7 @@
 //! M1 runs the **root** agent in-process. M2 moves this into a subagent
 //! process behind the control channel; the loop body is unchanged.
 
+use crate::agentloop::action::{NoopSelfHandler, SelfHandler};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::config::Config;
 use crate::intel::client::IntelClient;
@@ -103,18 +104,21 @@ pub fn run_root(
     cfg: &Config,
     log: &Logger,
 ) -> Result<Outcome, LoopAbort> {
-    run_loop(intel, servers, &LoopInput::from_config(cfg), log)
+    run_loop(intel, servers, &LoopInput::from_config(cfg), &mut NoopSelfHandler, log)
 }
 
-/// The agentic loop over explicit inputs. Used by once-mode (`run_root`) and
-/// by a subagent process (`subagent::control`).
+/// The agentic loop over explicit inputs. Used by once-mode (`run_root`) and by
+/// a subagent process (`subagent::control`). `self_handler` supplies agentd's
+/// in-process self-tools (e.g. `subagent.spawn`); the loop tries it before MCP.
 pub fn run_loop(
     intel: &IntelClient,
     servers: &[McpClient],
     input: &LoopInput,
+    self_handler: &mut dyn SelfHandler,
     log: &Logger,
 ) -> Result<Outcome, LoopAbort> {
-    let (tools, tool_to_server) = build_catalogue(servers)?;
+    let (mut tools, tool_to_server) = build_catalogue(servers)?;
+    tools.extend(self_handler.tools());
 
     let mut budget = Budget::new(input.max_steps, input.max_tokens, input.deadline);
 
@@ -175,7 +179,10 @@ pub fn run_loop(
 
             for tc in &tool_calls {
                 log.info("tool.call", json!({"tool": tc.name, "id": tc.id}));
-                let (content, is_error) = dispatch_tool(servers, &tool_to_server, &tc.name, &tc.arguments);
+                let (content, is_error) = match self_handler.handle(&tc.name, &tc.arguments) {
+                    Some(r) => r, // a self-tool (e.g. subagent.spawn)
+                    None => dispatch_tool(servers, &tool_to_server, &tc.name, &tc.arguments),
+                };
                 log.info("tool.result", json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()}));
                 messages.push(Message::tool_result(&tc.id, content, is_error));
             }

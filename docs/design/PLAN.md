@@ -42,32 +42,35 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M2 nearly complete — the reactor wires every primitive together
-  and **once-mode is now supervised** (spawn + supervise a root subagent).
-  Remaining: the self-MCP `subagent.spawn` tool (model self-orchestration),
-  restart governor, and a live stuck-kill test.
-- **Last completed:** `supervisor/reactor.rs` — the `Supervisor` loop (merged
-  mpsc + 200ms `recv_timeout` tick) owns the tree + `NodeId→Subagent` map +
-  per-child `Liveness`; processes events (Ready/Pong/Event/Usage/Result/Failed,
-  token rollup), reaps on SIGCHLD (reap-safe via `mark_reaped`), ticks the
-  liveness classifier, and drives the `kill::Ladder` (cancel→SIGTERM→SIGKILL,
-  deepest-first) on drain/stuck/deadline/tree-budget within the drain budget.
-  `main.rs` once-mode now calls `supervise_once` — it spawns + supervises a root
-  subagent and maps `SuperviseResult` → exit code; `set_child_subreaper()` wired
-  at startup. `spawn.rs` refactored to the merged channel + reap-safe teardown.
-  `Logger` made `Clone`. 87 unit + 3 integration tests (incl. `cli_once.rs`:
-  supervised once-mode → exit 4 on unreachable intel; bad-flag → exit 2), clippy
-  clean, default build still serde + libc only. **once-mode is now supervised.**
-- **Next action (finish M2):** `mcp/server.rs` — agentd's **self-MCP server**
-  (stdio) exposing `subagent.spawn/send/cancel/status`: this is where the model
-  *self-orchestrates* — it calls `subagent.spawn` to split its instruction into
-  delegated child agents; the supervisor enforces caps (`tree.mint_child` →
-  `SpawnRefused` as a tool result) + scope narrowing (`sec/scope`). Wire the
-  self-MCP into the loop's tool catalogue + route `subagent.*` calls to the
-  supervisor (needs the reactor to accept spawn requests from the running root —
-  a control-channel `spawn` upcall or an in-process broker). Then
-  `supervisor/restart.rs` (loop/reactive only) and a live stuck-kill test
-  (`kill -STOP` a child → Stuck → ladder → SIGKILL).
+- **Phase:** M2 core complete — supervised process tree **and** model
+  self-orchestration both work end to end. Remaining M2 tail (restart governor,
+  the self-MCP peer-server listener, live stuck/orphan chaos tests) can trail
+  into later milestones; **next focus is M3 (reactivity)** — the signature
+  "listen for MCP resources, act when they appear" feature.
+- **Last completed:** **model self-orchestration** — the `subagent.spawn`
+  self-tool. `agentloop/action.rs` defines the `SelfHandler` seam (loop tries
+  self-tools before MCP); `subagent/orchestrator.rs` implements it: on
+  `subagent.spawn` it mints a child payload (depth+1, `agent_path` "p.N",
+  narrowed MCP scope, inherited intel), enforces depth/breadth caps **as
+  refused tool results**, and supervises the child synchronously via
+  `supervise_once` (a real nested child process). `reactor::reap` now reaps
+  every tick (flag-independent) so nested supervision works. `tests/
+  orchestrator_spawn.rs` drives `subagent.spawn` and confirms a real child
+  (`agent_path 0.0`) spawns, runs, and returns its result. (Prior: the reactor +
+  supervised once-mode.) 92 unit + 4 integration tests, clippy clean, default
+  build still serde + libc only.
+- **Next action (M3 — reactivity, the signature feature):** wire MCP resource
+  subscriptions end to end. In `mcp/client.rs`, surface `notifications/resources/
+  updated` (already drained into a queue) to the supervisor; add `resources/
+  subscribe`/`unsubscribe` calls (capability-gated). Build `triggers/router.rs`
+  (routes: match uri→glob, exactly-one-owner first-match, spawn-vs-continue as a
+  route property, debounce+coalesce, bounded queue) and `triggers/mode.rs`
+  (the `reactive` driver). Add the `subscribe`/`unsubscribe`/`resource.read`
+  self-tools so a running agent can self-subscribe (self-scheduling).
+  notify-then-read: on `updated{uri}`, `resources/read` the current state, then
+  spawn-or-continue per the route. Then `loop`/`schedule` modes + internal
+  interval. (M2 tail still open: `supervisor/restart.rs`, the `--serve-mcp` peer
+  listener, live stuck/orphan tests.)
 - **Active milestone:** M2 (subagent processes).
 - **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
   prctl/waitpid are Linux/Unix; agentd targets Linux for production.)
@@ -117,7 +120,8 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 - [x] `supervisor/kill.rs` the pure `Ladder` escalation timer (Cancel→SIGTERM→SIGKILL, grace/kill-grace, force) + `killpg` primitives — fully unit-tested (reactor walks `deepest_first` + enforces the total drain budget)
 - [x] `signals.rs` SIGCHLD handler (SA_NOCLDSTOP) + self-pipe wakeup (`wakeup_fd`/`drain_wakeup`/`take_child_exit`) for the reactor
 - [ ] `supervisor/restart.rs` backoff+jitter+breaker+crash-on-spawn
-- [ ] `mcp/server.rs` self-MCP (stdio) `subagent.spawn/send/cancel/status` (sync)
+- [x] **`subagent.spawn` self-tool — the model self-orchestrates** (`agentloop/action.rs` `SelfHandler` + `subagent/orchestrator.rs`): builds a child payload (depth+1, narrowed MCP scope, inherited intel), enforces depth/breadth caps **refused as tool results**, and supervises the child synchronously via `supervise_once` (nested real processes). e2e test spawns a real child (`tests/orchestrator_spawn.rs`). `reactor::reap` made flag-independent (nested supervise works).
+- [ ] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) for peer composition + `subagent.send/cancel/status` (async) — deferred toward M3/M4
 - [x] `sec/scope.rs` tool-scope grant logic (granted-MCP-subset, monotonic narrow, Rule-of-Two) — wiring into the chokepoint pending `spawn.rs`. (depth/breadth/rate caps already in `tree.rs`)
 - **Acceptance:** parent spawns scoped child → child loop → distilled result up the channel; `kill -STOP` child → no-progress+missing-pongs → stuck → ladder to SIGKILL within budget; exited child reaped (no zombie); orphan grandchild reparents+reaped; killing supervisor collapses tree via PDEATHSIG; spawn past caps refused as tool result; crash-loop trips breaker.
 

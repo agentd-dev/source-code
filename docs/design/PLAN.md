@@ -49,29 +49,29 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M3 (reactivity) nearly complete — reactive path live, resource
-  awareness wired, **read-after-subscribe** done. Remaining: the harder
-  self-`subscribe` self-tool + warm `Continue` sessions (self-scheduling), then
-  `loop`/`schedule` modes (M4).
-- **Last completed:** **read-after-subscribe** + `unsubscribe`-on-drain in the
-  reactive driver (`triggers/mode.rs`): on startup it synthesizes one
-  "possibly-changed" delivery per watched URI so a change that happened
-  before/while subscribing isn't missed (edge→level; mandatory §2.8). Added a
-  `--no-emit` flag to the mock MCP server and a second observe-to-validate e2e
-  test proving the agent reacts via the *initial read* with no real notification
-  (asserts `reactive.initial_read`+`trigger.fired`, and **no** `resource.updated`).
-  (Prior: `resource.read` + catalogue.) 105 unit + 8 integration tests, clippy
-  clean, default build still serde + libc only.
-- **Next action:** decide M3 close-out vs the self-`subscribe` self-tool. The
-  self-tool needs a **control-channel upcall** (a running subagent asks its
-  supervisor to subscribe + open a `Continue(this-session)` route) **+ warm
-  `Continue` sessions** (deliver an event into a paused subagent and re-enter its
-  loop) — a sizeable slice (new control messages + session retention). Given M3's
-  core is proven, the safe path is to start `loop`/`schedule` modes (M4 — small,
-  reuse the timer-as-event-source pattern feeding the router) and tackle
-  self-scheduling as its own focused milestone. (M2 tail: `restart.rs`,
-  `--serve-mcp` listener, live stuck/orphan tests.)
-- **Active milestone:** M3 (reactivity).
+- **Phase:** **All four execution modes now work** (once / loop / reactive /
+  schedule). M3 reactive core + M4 loop/schedule drivers done; deferred-but-known
+  items (self-scheduling, exec, vsock, self-MCP-serving, restart governor) remain.
+- **Last completed:** the **`loop`/`schedule` daemon drivers**
+  (`triggers/mode.rs::run_scheduled`) — interval-based re-run of the standing
+  instruction (each fire = an independent supervised `once` run); `loop`
+  re-enters back-to-back, `schedule` on `--interval`; **SIGTERM → graceful drain
+  → exit 0**; fast-failing runs back off (capped) so they can't hot-spin. Wired
+  exhaustively in `main.rs`. e2e-proven (`tests/daemon_modes.rs`: loop fires runs
+  + exits 0 on SIGTERM). Added `libc` as a unix dev-dep (no new crate) to send
+  SIGTERM in tests. 105 unit + 9 integration tests, clippy clean, default build
+  still serde + libc only.
+- **Next action:** pick from the remaining priority items — most valuable is the
+  **gated `exec` self-tool** (`sec/exec.rs`, M4): a built-in MCP tool, off by
+  default (`--enable-exec`), that runs a local command under the same
+  deadline/kill regime — the one non-MCP capability, gated by binary presence
+  (salvage the retired `tools/shell.rs::run()`). Alternatives: the `cron` feature,
+  the `--serve-mcp` peer listener, or starting M5 (cloud-native hardening: full
+  exit-code table, health file, RUN_ID idempotency). Deferred big item:
+  self-scheduling (self-`subscribe` self-tool + warm `Continue` sessions). M2
+  tail: `restart.rs`, live stuck/orphan chaos tests.
+- **Active milestone:** M4 (composition, transports, exec, schedule) — schedule
+  done; exec/vsock/serve-mcp next. (M3 core complete; self-scheduling deferred.)
 - **Blockers:** none. (`net/tls.rs`/otel deferred. PDEATHSIG/setpgid/killpg/
   prctl/waitpid are Linux/Unix; agentd targets Linux for production.)
 
@@ -143,8 +143,8 @@ Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,ti
 - [ ] serve self-MCP over `unix:` (`--serve-mcp unix:…`)
 - [ ] `net/vsock.rs` + vsock intelligence transport [vsock]
 - [ ] `sec/exec.rs` gated `exec` self-tool folded into kill ladder + budgets + caps
-- [ ] `triggers/timer.rs` internal `--interval` + optional `cron` feature (croner) as router event sources
-- [ ] `--mode loop`/`schedule` drivers
+- [x] `--mode loop`/`schedule` drivers (`triggers/mode.rs::run_scheduled`): interval-based re-run of the standing instruction (each fire = an independent supervised `once` run); `loop` re-enters back-to-back (interval default 0), `schedule` fires on `--interval`; SIGTERM → graceful drain → exit 0; fast-failing runs back off (capped) so they can't hot-spin. e2e-proven (`tests/daemon_modes.rs`). _Remaining: optional 5-field `cron` feature (croner)._
+- [ ] optional `cron` feature (croner) as a `triggers/timer.rs` event source [feature: cron]
 - **Acceptance:** second agentd connects to served unix self-MCP, subscribes to `agentd://session/…`, reacts to first agent's progress; `--enable-exec` exposes exec only when binary exists, runs under deadline, killed+reaped by subtree ladder; `--mode loop --interval 5m` re-enters with idle backoff, terminates on global budget; vsock intelligence works in a microVM.
 
 ### M5 — Cloud-native hardening: drain, health, exit codes, idempotency

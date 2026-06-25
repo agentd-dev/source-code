@@ -1,0 +1,39 @@
+{
+  "//": "Illustrative MCP server config — the shape AGENTD_MCP_CONFIG points at.",
+  "//1": "Each server is launched over stdio (RFC 0004 §3.11): agentd spawns the",
+  "//2": "command, speaks JSON-RPC 2.0 / NDJSON on its stdin+stdout, and drains",
+  "//3": "stderr into structured logs. The launch argv is TRUSTED config and is",
+  "//4": "NEVER built from model- or server-controlled strings (RFC 0012).",
+  "//5": "On the CLI this same shape is expressed as --mcp name=command arg arg",
+  "//6": "(repeatable). The config-file layer carries the argv as an explicit array.",
+  "//7": "The optional `tools`/`resources` allowlists scope what a subagent may see",
+  "//8": "and call (RFC 0009/0012); omit a field to allow all from that server.",
+
+  "servers": [
+    {
+      "name": "fs",
+      "command": ["mcp-server-fs", "--root", "/data", "--read-only"],
+      "tools": ["read_file", "list_directory"],
+      "resources": ["file:///data/**"]
+    },
+    {
+      "name": "search",
+      "command": ["mcp-server-websearch"],
+      "env": {
+        "SEARCH_PROVIDER": "tavily"
+      },
+      "tools": ["web_search", "fetch_url"]
+    },
+    {
+      "name": "tickets",
+      "command": ["mcp-server-tickets", "--project", "OPS"],
+      "tools": ["create_ticket", "update_ticket", "search_tickets"]
+    },
+    {
+      "name": "inbox",
+      "command": ["mcp-server-inbox", "--queue", "/var/run/inbox"],
+      "//": "Exposes subscribable resources so reactive mode can wake on new items.",
+      "resources": ["inbox:///items/*"]
+    }
+  ]
+}

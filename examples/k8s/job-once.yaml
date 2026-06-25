@@ -1,0 +1,134 @@
+# A one-shot agentd run as a Kubernetes Job (mode `once`).
+#
+# The instruction IS the unit of work: agentd runs it to a terminal status
+# and exits with a code from the rfcs/0011 §5 table. `podFailurePolicy` maps
+# those codes to retriable vs terminal so the Job does the right thing.
+#
+# NOTE: the operator/scheduler is EXTERNAL and not part of agentd. This is a
+# plain Job — your cluster (or a higher-level operator that is NOT in this
+# project) owns scheduling, retries, and rollout. agentd only honors the
+# exit-code/signal contract (rfcs/0011 §1).
+#
+# Status: see docs/design/PLAN.md — the loop/supervisor/MCP client land in
+# M1–M3. Today the container validates config and prints a scaffold notice.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agentd-digest-once
+  labels:
+    app.kubernetes.io/name: agentd
+spec:
+  # backoffLimit governs how many retries the retriable exit codes get.
+  backoffLimit: 3
+  # Give the whole Job a hard ceiling independent of agentd's own --deadline.
+  activeDeadlineSeconds: 1800
+
+  # podFailurePolicy turns agentd's exit codes (rfcs/0011 §5) into Job actions.
+  # Requires the JobPodFailurePolicy feature (GA in modern clusters).
+  podFailurePolicy:
+    rules:
+      # Config/usage error — deterministic operator mistake. Don't retry.
+      - action: FailJob
+        onExitCodes:
+          containerName: agentd
+          operator: In
+          values: [2]
+      # Agent ran correctly but concluded the task cannot be done / refused.
+      # Deterministic — retrying will reach the same conclusion.
+      - action: FailJob
+        onExitCodes:
+          containerName: agentd
+          operator: In
+          values: [5]
+      # Transient/upstream classes — let backoffLimit retry them.
+      #   4 = intelligence endpoint unreachable/auth after retries
+      #   6 = required MCP server failed to connect/handshake or died
+      - action: Count
+        onExitCodes:
+          containerName: agentd
+          operator: In
+          values: [4, 6]
+      # Budget/partial — default retriable; flip to FailJob if your policy is
+      # "raise the budget, don't retry" (rfcs/0011 §5 calls this operator-tunable).
+      #   3 = usable partial result   7 = hit max-steps/tokens/deadline budget
+      - action: Count
+        onExitCodes:
+          containerName: agentd
+          operator: In
+          values: [3, 7]
+      # SIGTERM-without-clean-drain (143) — count as a normal retriable failure
+      # rather than ignore it; a clean drain returns 0, not 143 (rfcs/0011 §5).
+      - action: Count
+        onPodConditions:
+          - type: DisruptionTarget
+            status: "True"
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentd
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agentd
+          image: agentd:latest
+          args:
+            # MCP servers are stdio child processes — bundled in the image.
+            - --mcp
+            - fs=/usr/local/bin/mcp-server-fs --root /data
+          env:
+            # The instruction (the unit of work). Often projected from a
+            # ConfigMap; inline here for clarity.
+            - name: INSTRUCTION
+              value: >-
+                Read /data/report.txt, produce a one-paragraph digest, and
+                write it back via the fs MCP server. If the digest already
+                exists and is current, exit without rewriting.
+            # Intelligence endpoint. unix: here so the default (no-TLS) image
+            # works; a TLS-terminating sidecar owns the upstream connection.
+            - name: AGENTD_INTELLIGENCE
+              value: unix:/run/intel/intel.sock
+            - name: AGENTD_INTELLIGENCE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agentd-intelligence
+                  key: token
+            - name: AGENTD_MODEL
+              value: claude-sonnet-4-5
+            # Stable idempotency key per logical unit of work, so a Job retry
+            # dedupes side effects in the backing MCP service (rfcs/0011 §6).
+            - name: AGENTD_RUN_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AGENTD_LOG_LEVEL
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # OOM kill => exit 137 => "raise memory limit" (rfcs/0011 §5).
+              memory: 512Mi
+          volumeMounts:
+            - name: intel
+              mountPath: /run/intel
+            - name: data
+              mountPath: /data
+      volumes:
+        # The TLS-terminating intelligence sidecar's unix socket, shared in.
+        - name: intel
+          emptyDir: {}
+        - name: data
+          emptyDir: {}

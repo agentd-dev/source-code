@@ -1,0 +1,154 @@
+# Long-lived reactive agentd as a Kubernetes Deployment (mode `reactive`).
+#
+# Same binary, same loop, same config as the one-shot Job — only the exit
+# predicate differs (rfcs/0011 §7). A reactive daemon idles cheaply and wakes
+# on MCP resource updates; it exits only 0 (clean SIGTERM drain), 143 (SIGTERM
+# past the drain budget), or a fatal class (4 intelligence / 6 MCP / 137 OOM).
+# A rolled pod should look like a clean 0, not a 143 failure (rfcs/0011 §5) —
+# which is why the drain budget must fit inside the pod grace.
+#
+# v1 SCOPE: reactivity is stdio-only (no reactive-over-HTTP) — subscriptions
+# ride stdio MCP servers spawned by agentd. (roadmap: reactive over HTTP.)
+#
+# NOTE: the operator that schedules/replicates/rolls this Deployment is
+# EXTERNAL and not part of agentd (rfcs/0011 §1). agentd only honors the
+# signal/drain/exit contract below.
+#
+# Status: see docs/design/PLAN.md — reactive routing + the supervisor land
+# across M1–M3. Today the container validates config and prints a scaffold
+# notice for reactive mode.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentd-reactive
+  labels:
+    app.kubernetes.io/name: agentd
+spec:
+  # Reactive daemons are share-nothing and restart-safe (reconcile on start,
+  # rfcs/0011 §7); replicas are independent. Keep at 1 unless your
+  # subscriptions partition cleanly across instances.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentd
+    spec:
+      # MUST be > AGENTD_DRAIN_TIMEOUT (default 25s) so agentd finishes its
+      # bounded drain and exits 0 before the kubelet's own SIGKILL lands
+      # (rfcs/0011 §3.3 / §4.2). 30s grace vs 25s drain leaves headroom for
+      # the kill-ladder rungs + log flush. If you raise --drain-timeout, raise
+      # this in lockstep — keep grace strictly larger.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agentd
+          image: agentd:latest
+          args:
+            - --mode
+            - reactive
+            # Reactive mode requires >= 1 subscription. These are MCP resource
+            # URIs served by the stdio MCP servers declared below.
+            - --subscribe
+            - file:///data/inbox
+            # The supervisor writes this file every heartbeat (atomic rename):
+            #   {"status":"ready"|"draining","ts":"<RFC3339>","hb":N,...}
+            # (rfcs/0010 §3.7). The liveness/readiness probes read it.
+            - --health-file
+            - /run/agentd/health.json
+            # Keep the drain budget < terminationGracePeriodSeconds above.
+            - --drain-timeout
+            - 25s
+            # Tools are stdio MCP servers — bundled in the image.
+            - --mcp
+            - fs=/usr/local/bin/mcp-server-fs --root /data
+          env:
+            - name: INSTRUCTION
+              value: >-
+                For each new item under /data/inbox, classify it and route it
+                via the fs MCP server. Reconcile to desired state on each wake;
+                items already handled are a no-op.
+            - name: AGENTD_INTELLIGENCE
+              value: unix:/run/intel/intel.sock
+            - name: AGENTD_INTELLIGENCE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agentd-intelligence
+                  key: token
+            - name: AGENTD_MODEL
+              value: claude-sonnet-4-5
+            - name: AGENTD_LOG_LEVEL
+              value: info
+          # Liveness = the supervisor heartbeat is fresh. An EXEC probe reads
+          # the health file with a tiny shell expression — NOTE this needs a
+          # shell in the image, which the distroless runtime does NOT have. To
+          # use an exec probe, build a downstream image that adds a shell (or a
+          # small static health-check helper) and reference it here. For the
+          # default distroless image, prefer readiness via the same mechanism
+          # in a sidecar, or add the `serve-mcp`/HTTP health surface (roadmap)
+          # once available. The probe below documents the intended check.
+          #
+          # An idle reactive agent is HEALTHY (rfcs/0010 §3.7): liveness checks
+          # the supervisor's freshness, not whether work is flowing. A stuck
+          # subagent must NOT fail pod liveness — the supervisor kills it.
+          livenessProbe:
+            exec:
+              command:
+                - /busybox/sh
+                - -c
+                - >-
+                  test "$(grep -o '"status":"[a-z]*"' /run/agentd/health.json)" != "" &&
+                  test -f /run/agentd/health.json
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness = MCP connected AND every declared subscription
+          # reconciled (subscribed + read-after-subscribe) → health file
+          # status:"ready" (rfcs/0010 §3.7). On drain the supervisor flips the
+          # file to status:"draining" → not-ready → no new traffic routed.
+          readinessProbe:
+            exec:
+              command:
+                - /busybox/sh
+                - -c
+                - 'grep -q ''"status":"ready"'' /run/agentd/health.json'
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # OOM => 137 => raise this (rfcs/0011 §5).
+              memory: 512Mi
+          volumeMounts:
+            - name: health
+              mountPath: /run/agentd
+            - name: intel
+              mountPath: /run/intel
+            - name: data
+              mountPath: /data
+      volumes:
+        # Writable tmpfs for the health file (rootfs is read-only).
+        - name: health
+          emptyDir:
+            medium: Memory
+        - name: intel
+          emptyDir: {}
+        - name: data
+          emptyDir: {}

@@ -92,6 +92,16 @@ fn run() -> i32 {
                     return exit::GENERIC;
                 }
             };
+            // Daemon liveness: write a supervisor-heartbeat health file (RFC 0010).
+            if let Some(path) = &cfg.health_file {
+                agentd::obs::health::spawn_writer(
+                    path.into(),
+                    cfg.run_id.clone(),
+                    cfg.mode.as_str().into(),
+                    std::time::Duration::from_secs(5),
+                );
+                log.info("health.armed", json!({"file": path}));
+            }
             match cfg.mode {
                 Mode::Reactive => run_reactive(exe, root_payload(&cfg), &cfg, &log),
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule

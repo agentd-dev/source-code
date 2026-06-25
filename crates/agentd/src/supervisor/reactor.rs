@@ -120,6 +120,10 @@ impl Supervisor {
     /// Run until the root terminates and its subtree is reaped.
     fn run(mut self) -> SuperviseResult {
         loop {
+            // Prove the supervisor loop is making progress (RFC 0010 §health):
+            // this bumps liveness even while a subagent is busy, so a slow run
+            // doesn't read as a wedged supervisor.
+            crate::obs::health::tick();
             while let Ok((node, msg)) = self.events_rx.try_recv() {
                 self.handle_event(node, msg);
             }

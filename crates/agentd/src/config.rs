@@ -11,6 +11,7 @@
 //! stable surface.)
 
 use crate::obs::log::Level;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -49,7 +50,9 @@ impl Mode {
 }
 
 /// A declared MCP server: a name and the argv to spawn it (stdio transport).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serializable because it travels in the subagent spawn payload as the
+/// child's scoped server subset (RFC 0005, RFC 0009).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerSpec {
     pub name: String,
     pub command: Vec<String>,

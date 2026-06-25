@@ -1,0 +1,105 @@
+# Scheduled agentd via a Kubernetes CronJob → one-shot `once` per tick.
+#
+# This is the PREFERRED way to schedule agentd (rfcs/0011 §9): an external
+# CronJob fires `--mode once` per tick. It is more robust, observable, and
+# 12-factor than agentd's own internal --interval/--schedule clock (which
+# exists as a standalone convenience, not the recommended cluster pattern).
+# Each tick is an independent, idempotent unit of work.
+#
+# NOTE: the CronJob controller is part of Kubernetes, not agentd. agentd is
+# scheduler-agnostic; the operator that drives it is EXTERNAL to this project
+# (rfcs/0011 §1).
+#
+# Status: see docs/design/PLAN.md (loop/supervisor/MCP land in M1–M3).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentd-hourly-digest
+  labels:
+    app.kubernetes.io/name: agentd
+spec:
+  schedule: "0 * * * *"          # top of every hour (cluster TZ; agentd's own clock is UTC)
+  concurrencyPolicy: Forbid      # don't overlap ticks
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 900
+      # Same exit-code → action mapping as the standalone Job (rfcs/0011 §5).
+      podFailurePolicy:
+        rules:
+          - action: FailJob       # 2 = config/usage, 5 = refused/semantic — non-retriable
+            onExitCodes:
+              containerName: agentd
+              operator: In
+              values: [2, 5]
+          - action: Count         # 4 = intelligence, 6 = MCP — retriable/transient
+            onExitCodes:
+              containerName: agentd
+              operator: In
+              values: [4, 6]
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: agentd
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: agentd
+              image: agentd:latest
+              # Mode defaults to `once`; stated explicitly for clarity.
+              args:
+                - --mode
+                - once
+                - --mcp
+                - fs=/usr/local/bin/mcp-server-fs --root /data
+              env:
+                - name: INSTRUCTION
+                  value: >-
+                    Build the hourly digest from /data and publish it via the
+                    fs MCP server. If this hour's digest already exists, exit 0
+                    without redoing the work.
+                - name: AGENTD_INTELLIGENCE
+                  value: unix:/run/intel/intel.sock
+                - name: AGENTD_INTELLIGENCE_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: agentd-intelligence
+                      key: token
+                - name: AGENTD_MODEL
+                  value: claude-sonnet-4-5
+                # Deadline shorter than the Job's activeDeadlineSeconds so a
+                # hung run trips agentd's own --deadline (exit 124) first.
+                - name: AGENTD_DEADLINE
+                  value: 600s
+                - name: AGENTD_LOG_LEVEL
+                  value: info
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: intel
+                  mountPath: /run/intel
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: intel
+              emptyDir: {}
+            - name: data
+              emptyDir: {}

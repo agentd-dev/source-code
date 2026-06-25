@@ -21,6 +21,8 @@ use crate::wire::intel::{Message, Request, ToolDef};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Per-response token cap (distinct from the cumulative run budget).
@@ -51,32 +53,93 @@ impl fmt::Display for LoopAbort {
     }
 }
 
-/// Run the root agent loop to a terminal status.
+/// The explicit inputs the loop needs, independent of where they came from
+/// (CLI `Config` for once-mode, or a `SpawnPayload` for a subagent). This is
+/// the seam that lets the same loop body run in-process or in a child.
+pub struct LoopInput {
+    pub instruction: String,
+    pub output_contract: Option<String>,
+    /// Narrowed context seed as (role, content) pairs (role ∈
+    /// system|user|assistant|tool).
+    pub seed: Vec<(String, String)>,
+    pub model: String,
+    pub max_steps: u32,
+    pub max_tokens: u64,
+    pub deadline: Instant,
+    /// A cooperative cancel flag checked at each turn boundary (set by a
+    /// subagent's control thread on `ControlMsg::Cancel`). `None` for
+    /// in-process once-mode.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl LoopInput {
+    /// Build the once-mode input from CLI config.
+    pub fn from_config(cfg: &Config) -> LoopInput {
+        let deadline = cfg
+            .deadline
+            .map(|d| Instant::now() + d)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(10 * 365 * 24 * 3600));
+        LoopInput {
+            instruction: cfg.instruction.clone().unwrap_or_default(),
+            output_contract: None,
+            seed: Vec::new(),
+            model: cfg.model.clone().unwrap_or_default(),
+            max_steps: cfg.max_steps,
+            max_tokens: cfg.max_tokens,
+            deadline,
+            cancel: None,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+/// Run the agent loop to a terminal status (in-process, once-mode entry).
 pub fn run_root(
     intel: &IntelClient,
     servers: &[McpClient],
     cfg: &Config,
     log: &Logger,
 ) -> Result<Outcome, LoopAbort> {
+    run_loop(intel, servers, &LoopInput::from_config(cfg), log)
+}
+
+/// The agentic loop over explicit inputs. Used by once-mode (`run_root`) and
+/// by a subagent process (`subagent::control`).
+pub fn run_loop(
+    intel: &IntelClient,
+    servers: &[McpClient],
+    input: &LoopInput,
+    log: &Logger,
+) -> Result<Outcome, LoopAbort> {
     let (tools, tool_to_server) = build_catalogue(servers)?;
-    let model = cfg.model.clone().unwrap_or_default();
-    let instruction = cfg.instruction.clone().unwrap_or_default();
 
-    let deadline = cfg
-        .deadline
-        .map(|d| Instant::now() + d)
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(10 * 365 * 24 * 3600));
-    let mut budget = Budget::new(cfg.max_steps, cfg.max_tokens, deadline);
+    let mut budget = Budget::new(input.max_steps, input.max_tokens, input.deadline);
 
-    let mut messages = vec![Message::system(SYSTEM_PROMPT), Message::user(&instruction)];
+    let mut messages = vec![Message::system(system_prompt(input.output_contract.as_deref()))];
+    for (role, content) in &input.seed {
+        messages.push(seed_message(role, content));
+    }
+    messages.push(Message::user(&input.instruction));
     let mut last_text: Option<String> = None;
+    let model = input.model.clone();
 
     log.info(
         "loop.start",
-        json!({"tools": tools.len(), "servers": servers.len(), "max_steps": cfg.max_steps}),
+        json!({"tools": tools.len(), "servers": servers.len(), "max_steps": input.max_steps}),
     );
 
     loop {
+        if input.cancelled() {
+            log.warn("loop.final", json!({"status": "cancelled", "steps": budget.steps()}));
+            return Ok(Outcome {
+                status: TerminalStatus::Cancelled,
+                partial: last_text.is_some(),
+                result: json!(last_text.unwrap_or_default()),
+            });
+        }
         if let Some(status) = budget.exceeded() {
             log.warn("loop.final", json!({"status": status.as_str(), "steps": budget.steps(), "tokens": budget.tokens()}));
             return Ok(Outcome {
@@ -165,9 +228,36 @@ fn dispatch_tool(
     }
 }
 
+/// The system prompt, optionally appended with the delegation output contract
+/// (RFC 0009 §spawn-payload).
+fn system_prompt(contract: Option<&str>) -> String {
+    match contract {
+        Some(c) if !c.is_empty() => format!("{SYSTEM_PROMPT}\n\nOutput contract:\n{c}"),
+        _ => SYSTEM_PROMPT.to_string(),
+    }
+}
+
+/// Map a seed (role, content) pair to a loop message. A `tool` seed has no
+/// tool-call id to replay against, so it degrades to a user note.
+fn seed_message(role: &str, content: &str) -> Message {
+    match role {
+        "system" => Message::system(content),
+        "assistant" => Message::Assistant { text: Some(content.to_string()), tool_calls: Vec::new() },
+        _ => Message::user(content),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_appends_contract() {
+        let p = system_prompt(Some("Return JSON."));
+        assert!(p.contains("Output contract:"));
+        assert!(p.contains("Return JSON."));
+        assert_eq!(system_prompt(None), SYSTEM_PROMPT);
+    }
 
     #[test]
     fn dispatch_unknown_tool_is_error_observation() {

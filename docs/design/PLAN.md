@@ -52,7 +52,9 @@ cargo clippy -p agentd -- -D warnings # keep clean
   (SIGTERM/INT/PIPE), `agentloop/stop.rs` (`TerminalStatus`). 22 tests green,
   clippy `-D warnings` clean. CLI contract verified (help/version=0, bad
   config=2, valid run logs+exit 1 scaffold notice).
-- **Next action (M1 remainder):** `wire/mcp.rs` + `wire/intel.rs` types →
+- **Next action (M1 remainder):** `wire/intel.rs` DONE (neutral
+  Request/Response/Usage/ToolCall/ToolDef + StopReason). Next: `wire/mcp.rs`
+  (MCP 2025-11-25 types + capability map) →
   `net/http.rs` hand-rolled HTTP/1.1(+SSE) client + `net/unixsock.rs` →
   `intel/` (openai-compatible adapter, native tool-calling) over `unix:` &
   `https://` → `mcp/client.rs` (one stdio server: reader-thread + pending-map,

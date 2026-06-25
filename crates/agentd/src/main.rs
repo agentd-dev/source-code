@@ -15,6 +15,7 @@ use agentd::config::{Config, ConfigError, Mode};
 use agentd::obs::log::{Comp, LogCtx, Logger};
 use agentd::subagent::protocol::{IntelConfig, Limits, SpawnPayload, Telemetry};
 use agentd::supervisor::reactor::{supervise_once, KillReason, SuperviseResult};
+use agentd::triggers::mode::run_reactive;
 use agentd::{exit, signals};
 use serde_json::{json, Value};
 
@@ -73,13 +74,20 @@ fn run() -> i32 {
 
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
+        Mode::Reactive => match std::env::current_exe() {
+            Ok(exe) => run_reactive(exe, root_payload(&cfg), &cfg, &log),
+            Err(e) => {
+                log.error("proc.exit", json!({"err": format!("current_exe: {e}")}));
+                exit::GENERIC
+            }
+        },
         other => {
             log.warn(
                 "proc.exit",
                 json!({"reason": "not_implemented", "mode": other.as_str()}),
             );
             eprintln!(
-                "agentd {}: '{}' mode lands in M3-M4 (docs/design/PLAN.md); 'once' works now",
+                "agentd {}: '{}' mode lands in M4 (docs/design/PLAN.md); once + reactive work now",
                 agentd::VERSION,
                 other.as_str()
             );

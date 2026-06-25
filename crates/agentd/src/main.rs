@@ -82,6 +82,22 @@ fn run() -> i32 {
             "subreaper": subreaper,
         }),
     );
+    // The validated config/policy this run operates under (RFC 0010 §2.9
+    // closed vocabulary). Content-capture-off: lengths/schemes only, never the
+    // instruction body or the intelligence credential.
+    log.info(
+        "config.loaded",
+        json!({
+            "max_steps": cfg.max_steps,
+            "max_tokens": cfg.max_tokens,
+            "deadline_ms": cfg.deadline.map(|d| d.as_millis() as u64),
+            "max_depth": cfg.max_depth,
+            "enable_exec": cfg.enable_exec,
+            "serve_mcp": cfg.serve_mcp.is_some(),
+            "intel_scheme": cfg.intelligence.as_deref().and_then(|u| u.split(':').next()),
+            "instruction_len": cfg.instruction.as_deref().map_or(0, str::len),
+        }),
+    );
 
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),

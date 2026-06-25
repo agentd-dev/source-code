@@ -49,37 +49,36 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M6 (observability depth) underway — **W3C trace-context
-  propagation** landed (the whole agent tree is one auditable trace), directly
-  serving the operator's traceability/audit requirement.
-- **Last completed:** **W3C trace propagation** (`obs/trace.rs`, default-on, no
-  new deps): a single `trace_id` per run — continued from an upstream
-  `--traceparent`/`AGENTD_TRACEPARENT` or minted deterministically from the run
-  id (FNV, so retries share it) — stamped on every supervisor + subagent log
-  line, carried in the spawn payload (children inherit), and emitted as
-  `_meta.traceparent` on MCP tool calls. Observe-proven (`tests/reactive_e2e.rs`:
-  the upstream trace id appears on both `comp:supervisor` and `comp:agent`
-  lines). (Prior: RUN_ID idempotency + tls/vsock transports.) 119 unit + 11
-  integration tests, clippy clean (default + all-features), default build = 3 deps.
-- **Next action (M6 cont.):** the **closed event-vocabulary audit** (ensure
-  every supervisor/agent event in §2.9 is emitted with the right fields — pure,
-  no deps, directly serves auditability) and the **`metrics` feature**
-  (hand-written Prometheus text from atomic counters on an opt-in surface — no
-  client lib). Then the LLM `traceparent` header (thread trace into the intel
-  client). Bigger items still open: the **`--serve-mcp` peer listener**
-  (composability), `cron` feature, self-scheduling, M2 tail (`restart.rs`,
-  stuck/orphan chaos tests), M7 (conformance + container).
+- **Phase:** M6 (observability depth) underway — the **closed event-vocabulary
+  audit** + the **LLM `traceparent` header** landed, completing the
+  audit-trail and distributed-trace stories the operator requires.
+- **Last completed:** **event-vocabulary audit + LLM trace header** (pure, no
+  new deps). Closed the §2.9 gaps so the audit stream is complete: added
+  `config.loaded` (validated policy — lengths/schemes only, content-off),
+  `mcp.connect` success (was fail-only; emitted at both the supervisor's
+  subscription connect and the subagent's tool connect), `proc.ready`,
+  `loop.step` (per-turn budget anchor), `subagent.stuck` (the distinct liveness
+  verdict signal); aligned `reactive.armed`/`schedule.armed` → the canonical
+  `trigger.armed`. Threaded the run's `trace_id` into the intel client so every
+  LLM completion carries a fresh-span `traceparent` (the MCP `_meta` path
+  already did). Observe-proven: a live reactive run emits `config.loaded` /
+  `mcp.connect`×2 / `proc.ready` / `trigger.armed`, every line carrying
+  `trace_id`. (Prior: W3C trace propagation; RUN_ID idempotency; tls/vsock.)
+  120 unit + 11 integration tests, clippy clean (default + all-features),
+  default build = 3 deps.
+- **Next action (M6 cont.):** the **`metrics` feature** (hand-written Prometheus
+  text from atomic counters on an opt-in HTTP surface — no client lib; the
+  surface doubles as the `/healthz`+`/readyz` endpoint), then `--log-content`
+  (opt-in content capture, redaction-aware) and `--aggregate-logs` (forward
+  child telemetry up the control channel). Bigger items still open: the
+  **`--serve-mcp` peer listener** (composability), `cron` feature,
+  self-scheduling, M2 tail (`restart.rs`, stuck/orphan chaos tests), M7
+  (conformance suite + container).
 - **Active milestone:** M6 (observability depth). M4 mostly done (schedule, exec,
   tls/vsock transports); `--serve-mcp`/`cron` remain there.
-- **Next action:** continue M5 no-new-dep hardening while disk is tight:
-  **RUN_ID idempotency** (propagate `cfg.run_id` into every MCP tool-call
-  `_meta` so backing services dedupe retries — small change in `mcp/client.rs`
-  `call_tool`, testable via the mock echoing `_meta`), then the full exit-code
-  table polish + cgroup-v2 awareness. Defer vsock/cron (new crates) until disk
-  frees. Deferred big item: self-scheduling.
-- **Blockers:** none — operator reclaimed disk (now 52% used, 79G free); feature
-  builds restored. (`otel` feature has no deps declared yet — wired in M6. Live
-  vsock + the `--serve-mcp` peer listener need a peer/microVM to exercise.)
+- **Blockers:** none — disk healthy (73% used, 44G free). (`otel` feature has no
+  deps declared yet — wired later in M6. Live vsock + the `--serve-mcp` peer
+  listener need a peer/microVM to exercise.)
 
 _(The loop updates the lines above every iteration.)_
 
@@ -164,8 +163,9 @@ Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.r
 
 ### M6 — Observability depth + security tags
 Modules: `obs/{trace,metrics}.rs`; extends `obs/log.rs sec/scope.rs net/http.rs`
-- [x] **W3C trace-context propagation** (default-on, dependency-free) in `obs/trace.rs`: one `trace_id` per run — ingested from an upstream `--traceparent`/`AGENTD_TRACEPARENT` or minted deterministically from the run id — stamped on every log line (supervisor + every subagent), carried in the spawn payload (children inherit), and emitted as `_meta.traceparent` on MCP tool calls. Only OTLP *export* is otel-gated. e2e-proven (`tests/reactive_e2e.rs`: the upstream trace id appears on both `comp:supervisor` and `comp:agent` lines). _LLM `traceparent` header: small follow-up (thread trace into the intel client)._
-- [ ] full closed event vocabulary emitted across supervisor + agent
+- [x] **W3C trace-context propagation** (default-on, dependency-free) in `obs/trace.rs`: one `trace_id` per run — ingested from an upstream `--traceparent`/`AGENTD_TRACEPARENT` or minted deterministically from the run id — stamped on every log line (supervisor + every subagent), carried in the spawn payload (children inherit), and emitted as `_meta.traceparent` on MCP tool calls. Only OTLP *export* is otel-gated. e2e-proven (`tests/reactive_e2e.rs`: the upstream trace id appears on both `comp:supervisor` and `comp:agent` lines).
+- [x] **LLM `traceparent` header**: the run's `trace_id` threaded into the intel client (`set_trace_id`); every completion carries a fresh-span `traceparent` so the LLM call joins the run's trace (unit-tested `apply_trace_header`).
+- [x] **full closed event vocabulary emitted across supervisor + agent**: closed the §2.9 gaps — `config.loaded` (validated policy; content-off, lengths/schemes only), `mcp.connect` success (supervisor + subagent), `proc.ready`, `loop.step` (per-turn budget anchor), `subagent.stuck` (distinct liveness verdict); aligned `reactive.armed`/`schedule.armed` → canonical `trigger.armed`. Observe-proven in a live reactive run.
 - [ ] `--aggregate-logs` (mode B) + `--log-content` (redaction-aware)
 - [ ] `sec/scope.rs` Rule-of-Two tag check (warn/refuse trifecta grants)
 - [ ] SSRF guards in `net/http.rs`

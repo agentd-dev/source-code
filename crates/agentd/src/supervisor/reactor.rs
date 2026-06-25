@@ -252,6 +252,11 @@ impl Supervisor {
             }
         }
         if let Some((node, reason)) = verdict {
+            // A distinct, queryable signal that liveness classification (not a
+            // deadline) condemned the child (RFC 0010 §2.9 `subagent.stuck`).
+            if reason == KillReason::Stuck {
+                self.log.warn("subagent.stuck", json!({"node": node.0}));
+            }
             self.log.warn("subagent.teardown", json!({"node": node.0, "reason": format!("{reason:?}")}));
             self.begin_drain(reason);
         }

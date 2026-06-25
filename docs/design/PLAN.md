@@ -51,8 +51,10 @@ cargo clippy -p agentd -- -D warnings # keep clean
   depth); `supervisor/tree.rs` — the supervision tree (depth/path minting at
   the spawn chokepoint, the fork-bomb `Caps` refused-as-tool-result,
   hierarchical token rollup to the tree root + ceiling, one-way `draining`
-  flag, deepest-first teardown order). Added serde to `config::McpServerSpec`.
-  65 tests green, clippy clean, default build still serde + libc only.
+  flag, deepest-first teardown order); `sec/scope.rs` — capability scoping
+  (granted-MCP-subset `Scope`/`ToolScope` with monotonic-narrow intersection +
+  the Rule-of-Two trifecta check). Added serde to `config::McpServerSpec`.
+  72 tests green, clippy clean, default build still serde + libc only.
 - **Next action (M2 — process plumbing):** `supervisor/spawn.rs` (re-exec
   `argv[0]` in subagent mode via `AGENTD_SUBAGENT`; `setpgid`; `pre_exec`
   `PR_SET_PDEATHSIG` + rlimit; wire the length-framed stdio control channel) →
@@ -112,7 +114,7 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 - [ ] `supervisor/kill.rs` bounded depth-first ladder + drain budget + second-signal force
 - [ ] `supervisor/restart.rs` backoff+jitter+breaker+crash-on-spawn
 - [ ] `mcp/server.rs` self-MCP (stdio) `subagent.spawn/send/cancel/status` (sync)
-- [ ] `sec/scope.rs` tool-scope grant; depth/breadth/rate caps at the chokepoint (supervisor-minted depth)
+- [x] `sec/scope.rs` tool-scope grant logic (granted-MCP-subset, monotonic narrow, Rule-of-Two) — wiring into the chokepoint pending `spawn.rs`. (depth/breadth/rate caps already in `tree.rs`)
 - **Acceptance:** parent spawns scoped child → child loop → distilled result up the channel; `kill -STOP` child → no-progress+missing-pongs → stuck → ladder to SIGKILL within budget; exited child reaped (no zombie); orphan grandchild reparents+reaped; killing supervisor collapses tree via PDEATHSIG; spawn past caps refused as tool result; crash-loop trips breaker.
 
 ### M3 — Reactivity: subscriptions, routing, warm sessions, async subagents

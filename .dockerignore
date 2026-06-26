@@ -2,9 +2,9 @@
 # compiles from source, so ship sources only.
 target/
 .git/
+# The agentd image build (cargo build -p agentd) does not need the web app.
+web/
 **/node_modules/
-web/.next/
-web/out/
 dist/
 *.tar.gz
 *.zip

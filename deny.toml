@@ -1,0 +1,30 @@
+# cargo-deny: the minimalism + supply-chain gate (RFC 0002, assessment §4 M7).
+# `cargo deny check` enforces: no security advisories, no wildcard deps, and an
+# explicit license allow-list — so an "unearned" or unvetted dependency cannot
+# slip in unnoticed.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+# A wildcard version requirement is unpinned supply-chain risk.
+wildcards = "deny"
+# Several versions of one crate bloat the tree; warn (build-time proc-macro
+# graphs sometimes legitimately diverge).
+multiple-versions = "warn"
+
+[licenses]
+version = 2
+# Permissive-only. Adding a license here is a deliberate act — it documents
+# exactly what licences the (tiny) dependency set carries.
+# Exactly the licences the current dependency set carries (default + all
+# features) — verified by `cargo deny check` reporting no unmatched allowance.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]

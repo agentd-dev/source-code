@@ -66,8 +66,21 @@ impl TerminalStatus {
     }
 }
 
+/// A future wake-up an agent requested for itself via the `schedule` self-tool
+/// (RFC 0008 §self-scheduling). The reactive daemon arms it relative to now and
+/// re-invokes the agent with `instruction` when it fires — the agent setting its
+/// own next tick. Honoured only under a long-lived daemon (no "later" in once).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRequest {
+    /// Delay from the run's completion before the wake fires.
+    pub after_ms: u64,
+    /// The instruction the woken reaction runs.
+    pub instruction: String,
+}
+
 /// A finished run: its terminal status, whether the result body is partial,
-/// and the distilled result value. RFC 0007 / RFC 0009 §result.
+/// the distilled result value, and any self-scheduled future wake-ups.
+/// RFC 0007 / RFC 0009 §result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub status: TerminalStatus,
@@ -75,6 +88,10 @@ pub struct Outcome {
     /// satisfy the objective (drives exit code 3 in one-shot mode).
     pub partial: bool,
     pub result: serde_json::Value,
+    /// Future wake-ups the agent scheduled for itself (RFC 0008). Empty unless
+    /// the model called `schedule`; acted on only by a daemon supervisor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled: Vec<ScheduleRequest>,
 }
 
 #[cfg(test)]

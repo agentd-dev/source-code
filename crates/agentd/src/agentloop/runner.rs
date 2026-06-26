@@ -153,6 +153,7 @@ pub fn run_loop(
                 status: TerminalStatus::Cancelled,
                 partial: last_text.is_some(),
                 result: json!(last_text.unwrap_or_default()),
+                scheduled: self_handler.take_scheduled(),
             });
         }
         if let Some(status) = budget.exceeded() {
@@ -161,6 +162,7 @@ pub fn run_loop(
                 status,
                 partial: last_text.is_some(),
                 result: json!(last_text.unwrap_or_default()),
+                scheduled: self_handler.take_scheduled(),
             });
         }
 
@@ -226,7 +228,12 @@ pub fn run_loop(
         // No tool calls → the model's text is the final answer.
         let text = resp.text.clone().or(last_text).unwrap_or_default();
         log.info("loop.final", json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}));
-        return Ok(Outcome { status: TerminalStatus::Completed, partial: false, result: json!(text) });
+        return Ok(Outcome {
+            status: TerminalStatus::Completed,
+            partial: false,
+            result: json!(text),
+            scheduled: self_handler.take_scheduled(),
+        });
     }
 }
 

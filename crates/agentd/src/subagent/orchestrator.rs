@@ -19,6 +19,7 @@
 //! own children); per-child token/step/deadline limits still apply.
 
 use crate::agentloop::action::SelfHandler;
+use crate::agentloop::stop::ScheduleRequest;
 use crate::config::McpServerSpec;
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{IntelConfig, Limits, SeedMessage, SpawnPayload, Telemetry};
@@ -33,6 +34,11 @@ use std::time::Duration;
 const MAX_CHILDREN: u32 = 8;
 /// Cap on the distilled result handed back to the parent model (~chars).
 const DISTILL_CAP: usize = 8_000;
+/// Cap on self-scheduled wake-ups per run (bounds a runaway self-scheduler).
+const MAX_SCHEDULED: usize = 8;
+/// Bounds on a self-scheduled delay (≥ 1s; ≤ 30 days so `now + delay` is safe).
+const MIN_SCHEDULE_SECS: u64 = 1;
+const MAX_SCHEDULE_SECS: u64 = 30 * 24 * 3600;
 
 pub struct Orchestrator {
     exe: PathBuf,
@@ -48,6 +54,9 @@ pub struct Orchestrator {
     child_limits: Limits,
     enable_exec: bool,
     drain_timeout: Duration,
+    /// Future wake-ups the root agent requested via `schedule` this run; drained
+    /// into the run's `Outcome` for a daemon supervisor to arm (RFC 0008).
+    scheduled: Vec<ScheduleRequest>,
     log: Logger,
 }
 
@@ -72,8 +81,35 @@ impl Orchestrator {
             // tag check is a later refinement).
             enable_exec: payload.enable_exec,
             drain_timeout,
+            scheduled: Vec::new(),
             log,
         }
+    }
+
+    /// Queue a future self-wake-up (RFC 0008 §self-scheduling). Bounded; refused
+    /// as a tool result (never crashes). Effective only under a daemon — the
+    /// requests ride out on the run's `Outcome`.
+    fn schedule(&mut self, args: &Value) -> (String, bool) {
+        if self.scheduled.len() >= MAX_SCHEDULED {
+            return refused("maximum self-scheduled wake-ups reached for this run");
+        }
+        let after = match args.get("after_seconds").and_then(Value::as_u64) {
+            Some(s) if (MIN_SCHEDULE_SECS..=MAX_SCHEDULE_SECS).contains(&s) => s,
+            _ => {
+                return (
+                    format!("error: schedule needs 'after_seconds' in {MIN_SCHEDULE_SECS}..={MAX_SCHEDULE_SECS}"),
+                    true,
+                );
+            }
+        };
+        let instruction = args.get("instruction").and_then(Value::as_str).unwrap_or("").trim();
+        if instruction.is_empty() {
+            return ("error: schedule requires a non-empty 'instruction'".into(), true);
+        }
+        self.scheduled
+            .push(ScheduleRequest { after_ms: after.saturating_mul(1000), instruction: instruction.to_string() });
+        self.log.info("self.schedule", json!({"after_s": after, "queued": self.scheduled.len()}));
+        (format!("scheduled: a wake-up in {after}s will run the given instruction"), false)
     }
 
     fn can_nest(&self) -> bool {
@@ -155,6 +191,11 @@ impl SelfHandler for Orchestrator {
         if self.can_nest() {
             t.push(spawn_tool_def());
         }
+        // Self-scheduling is a root-agent capability: a nested child's request
+        // would be lost to its parent, which only distills the child's result.
+        if self.parent_depth == 0 {
+            t.push(schedule_tool_def());
+        }
         // The gated exec tool — only when --enable-exec was set (RFC 0012).
         if self.enable_exec {
             t.push(crate::sec::exec::tool_def());
@@ -165,11 +206,16 @@ impl SelfHandler for Orchestrator {
     fn handle(&mut self, name: &str, args: &Value) -> Option<(String, bool)> {
         match name {
             "subagent.spawn" => Some(self.spawn(args)),
+            "schedule" if self.parent_depth == 0 => Some(self.schedule(args)),
             "exec" if self.enable_exec => {
                 Some(crate::sec::exec::handle_call(args, crate::sec::exec::DEFAULT_TIMEOUT))
             }
             _ => None,
         }
+    }
+
+    fn take_scheduled(&mut self) -> Vec<ScheduleRequest> {
+        std::mem::take(&mut self.scheduled)
     }
 }
 
@@ -213,6 +259,25 @@ fn spawn_tool_def() -> ToolDef {
                 "servers": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"}
             },
             "required": ["instruction"]
+        }),
+    }
+}
+
+fn schedule_tool_def() -> ToolDef {
+    ToolDef {
+        name: "schedule".into(),
+        description: "Schedule a future wake-up of yourself. After 'after_seconds' have elapsed, \
+            agentd re-invokes you with 'instruction' as a fresh run. Use it to defer work, poll a \
+            slow resource later, or set your own next tick instead of blocking. Effective only when \
+            agentd runs as a long-lived daemon (reactive/loop/schedule); ignored in a one-shot run."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "after_seconds": {"type": "integer", "description": "delay in seconds before the wake-up fires"},
+                "instruction": {"type": "string", "description": "what the woken agent should do"}
+            },
+            "required": ["after_seconds", "instruction"]
         }),
     }
 }
@@ -285,10 +350,48 @@ mod tests {
 
     #[test]
     fn advertises_tool_with_depth_budget() {
+        // The root (depth 0) advertises delegation + self-scheduling.
         let o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
         let tools = o.tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "subagent.spawn");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"subagent.spawn"));
+        assert!(names.contains(&"schedule"));
+    }
+
+    #[test]
+    fn schedule_is_root_only_and_accumulates() {
+        // A nested child (depth 1) does NOT get `schedule` (its request would be
+        // lost to the parent), and handle() declines it.
+        let mut child = Orchestrator::from_payload("agentd".into(), &payload(1, 4), Duration::from_secs(5), logger());
+        assert!(!child.tools().iter().any(|t| t.name == "schedule"));
+        assert!(child.handle("schedule", &json!({"after_seconds": 5, "instruction": "x"})).is_none());
+
+        // The root accumulates valid requests, drained by take_scheduled.
+        let mut root = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let (_m, err) = root.handle("schedule", &json!({"after_seconds": 30, "instruction": "poll again"})).unwrap();
+        assert!(!err);
+        let drained = root.take_scheduled();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].after_ms, 30_000);
+        assert_eq!(drained[0].instruction, "poll again");
+        assert!(root.take_scheduled().is_empty(), "take_scheduled drains");
+    }
+
+    #[test]
+    fn schedule_validates_delay_and_instruction() {
+        let mut o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        // out-of-range / missing delay → error observation, nothing queued
+        assert!(o.schedule(&json!({"after_seconds": 0, "instruction": "x"})).1);
+        assert!(o.schedule(&json!({"instruction": "x"})).1);
+        // empty instruction → error
+        assert!(o.schedule(&json!({"after_seconds": 5, "instruction": "  "})).1);
+        assert!(o.take_scheduled().is_empty());
+        // cap is enforced
+        for _ in 0..MAX_SCHEDULED {
+            assert!(!o.schedule(&json!({"after_seconds": 5, "instruction": "x"})).1);
+        }
+        assert!(o.schedule(&json!({"after_seconds": 5, "instruction": "x"})).1, "over cap → refused");
+        assert_eq!(o.take_scheduled().len(), MAX_SCHEDULED);
     }
 
     #[test]

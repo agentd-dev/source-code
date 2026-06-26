@@ -169,13 +169,21 @@ fn run() -> i32 {
             }
             // Opt-in served self-MCP for composability (RFC 0005). Built only
             // with `--features serve-mcp`; otherwise `--serve-mcp` warns + is inert.
-            if let Some(spec) = &cfg.serve_mcp {
-                serve_self_mcp(spec, &exe, root_payload(&cfg), &cfg, &log);
-            }
-            match cfg.mode {
+            let serve_handle = cfg.serve_mcp.as_ref().and_then(|spec| serve_self_mcp(spec, &exe, root_payload(&cfg), &cfg, &log));
+            let code = match cfg.mode {
                 Mode::Reactive => run_reactive(exe, root_payload(&cfg), &cfg, &log),
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
+            };
+            // On shutdown, let in-flight served runs drain before we exit (their
+            // subtrees would otherwise be collapsed by PDEATHSIG at process exit).
+            #[cfg(feature = "serve-mcp")]
+            if let Some(h) = serve_handle {
+                h.drain(cfg.drain_timeout);
+                log.info("mcp.drained", json!({}));
             }
+            #[cfg(not(feature = "serve-mcp"))]
+            let _ = serve_handle;
+            code
         }
     }
 }
@@ -198,7 +206,13 @@ fn serve_metrics(addr: &str, log: &Logger) {
 /// The `status` tool reports `cfg`; `subagent.spawn` runs fresh agents from the
 /// daemon's root payload template (`base`).
 #[cfg(feature = "serve-mcp")]
-fn serve_self_mcp(spec: &str, exe: &std::path::Path, base: SpawnPayload, cfg: &Config, log: &Logger) {
+fn serve_self_mcp(
+    spec: &str,
+    exe: &std::path::Path,
+    base: SpawnPayload,
+    cfg: &Config,
+    log: &Logger,
+) -> Option<agentd::mcp::server::ServeHandle> {
     let path = spec.strip_prefix("unix:").unwrap_or(spec);
     let ctx = agentd::mcp::server::ServeCtx::new(
         cfg.run_id.clone(),
@@ -207,14 +221,19 @@ fn serve_self_mcp(spec: &str, exe: &std::path::Path, base: SpawnPayload, cfg: &C
         base,
         cfg.drain_timeout,
     );
-    if let Err(e) = agentd::mcp::server::serve(path, ctx, log.clone()) {
-        log.error("mcp.serve_fail", json!({"path": path, "err": e.to_string()}));
+    match agentd::mcp::server::serve(path, ctx, log.clone()) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log.error("mcp.serve_fail", json!({"path": path, "err": e.to_string()}));
+            None
+        }
     }
 }
 
 #[cfg(not(feature = "serve-mcp"))]
-fn serve_self_mcp(spec: &str, _exe: &std::path::Path, _base: SpawnPayload, _cfg: &Config, log: &Logger) {
+fn serve_self_mcp(spec: &str, _exe: &std::path::Path, _base: SpawnPayload, _cfg: &Config, log: &Logger) -> Option<()> {
     log.warn("mcp.serve_unavailable", json!({"spec": spec, "reason": "built without --features serve-mcp"}));
+    None
 }
 
 /// One-shot mode: spawn + supervise a root subagent that runs the agentic

@@ -146,10 +146,14 @@ cargo clippy -p agentd -- -D warnings # keep clean
   writer lock), subscribe **validates a running handle** (reject unknown/terminal/
   status → no leak, no late-subscribe gap), and notify **consumes** the
   subscription on its one event. `tests/serve_mcp.rs` proves a real subscribe →
-  cancel → pushed notification. **Still deferred:** served `subagent.send` (needs
-  served **warm** sessions) + a coordinated served-session drain on shutdown
-  (PDEATHSIG prevents leaks today); cgroup `cgroup.kill`/`memory.high` (cgroup-v2
-  host); a standalone `agentd-conformance` crate.
+  cancel → pushed notification. (12) **coordinated served-session drain on
+  shutdown**: `serve()` returns a `ServeHandle`; on daemon shutdown `main` cancels
+  in-flight served runs + waits (bounded by drain timeout) for them before exit,
+  so their subtrees drain gracefully rather than being PDEATHSIG-collapsed. **Still
+  deferred:** served `subagent.send` (needs served **warm** sessions — a served
+  spawn that stays alive accepting injects); cgroup `cgroup.kill`/`memory.high`
+  (infra-gated — no writable cgroup-v2 here); a standalone `agentd-conformance`
+  crate (non-essential reorg + external reference server).
 - **Active milestone:** M7 (complete). M1–M6 all complete with acceptance holding.
 - **Blockers:** none. **Build complete** — the hourly cron (`6885e804`) is
   disabled per the completion protocol. Infra-gated checks (real MCP reference
@@ -205,7 +209,7 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 - [x] `signals.rs` SIGCHLD handler (SA_NOCLDSTOP) + self-pipe wakeup (`wakeup_fd`/`drain_wakeup`/`take_child_exit`) for the reactor
 - [x] `supervisor/restart.rs` **restart governor** — pure backoff + capped jitter + circuit breaker + crash-on-spawn detection (hand-rolled jitter, no `rand`); `RestartGovernor::on_outcome → Backoff(d) | Tripped`. Wired into `run_scheduled`: failed fires back off via the governor, a crash-loop trips the breaker → `proc.exit{reason:"restart_breaker"}` + exit 1 (no hot-spin). 8 unit tests. _(Reactor-side per-child wiring for warm sessions: later, with M3 sessions.)_
 - [x] **`subagent.spawn` self-tool — the model self-orchestrates** (`agentloop/action.rs` `SelfHandler` + `subagent/orchestrator.rs`): builds a child payload (depth+1, narrowed MCP scope, inherited intel), enforces depth/breadth caps **refused as tool results**, and supervises the child synchronously via `supervise_once` (nested real processes). e2e test spawns a real child (`tests/orchestrator_spawn.rs`). `reactor::reap` made flag-independent (nested supervise works).
-- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + `subagent.spawn` (sync **and async**) + `subagent.status`/`subagent.cancel` + the `agentd://` resource surface landed** (`agentd://status` + per-run `agentd://subagent/<handle>`) **+ `resources/subscribe` push** (a peer subscribes to a run's resource and is pushed `notifications/resources/updated` on completion — the reactive loop closed); see M4/M5. _(Concurrency: the single-reaper refactor landed — served runs are truly concurrent with the daemon.) Remaining: `subagent.send` (needs served **warm** sessions) + a coordinated served-session drain on daemon shutdown (PDEATHSIG prevents leaks today)._
+- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + `subagent.spawn` (sync **and async**) + `subagent.status`/`subagent.cancel` + the `agentd://` resource surface landed** (`agentd://status` + per-run `agentd://subagent/<handle>`) **+ `resources/subscribe` push** (a peer subscribes to a run's resource and is pushed `notifications/resources/updated` on completion — the reactive loop closed); see M4/M5. _(Concurrency: the single-reaper refactor landed — served runs are truly concurrent with the daemon.) Remaining: `subagent.send` (needs served **warm** sessions). (A coordinated served-session drain on shutdown now lands too: the daemon waits for in-flight served runs before exiting.)_
 - [x] `sec/scope.rs` tool-scope grant logic (granted-MCP-subset, monotonic narrow, Rule-of-Two) — wiring into the chokepoint pending `spawn.rs`. (depth/breadth/rate caps already in `tree.rs`)
 - **Acceptance:** parent spawns scoped child → child loop → distilled result up the channel; `kill -STOP` child → no-progress+missing-pongs → stuck → ladder to SIGKILL within budget; exited child reaped (no zombie); orphan grandchild reparents+reaped; killing supervisor collapses tree via PDEATHSIG; spawn past caps refused as tool result; crash-loop trips breaker.
 

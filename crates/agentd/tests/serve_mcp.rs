@@ -238,6 +238,70 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
 }
 
 #[test]
+fn concurrent_async_runs_do_not_serialize() {
+    // Two async runs in flight at once. The second is cancelled and must drain
+    // PROMPTLY *while the first is still supervising its (hanging) run*. Before
+    // the single-reaper refactor, run 2's reactor would be blocked on the
+    // process-wide SUPERVISE_LOCK held by run 1's ~12s hang, so it could not even
+    // observe the cancel until run 1 finished — by which point run 1 would be done
+    // too. Run 2 finishing cancelled while run 1 is still running proves the two
+    // supervisors run concurrently.
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let llm_sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(exe, &llm_sock, "hang");
+    let sock = dir.path().join("agentd.sock");
+    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+
+    let stream = connect(&sock);
+    let mut write = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+
+    let spawn_async = |reader: &mut BufReader<UnixStream>, write: &mut UnixStream, id: u32| -> String {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"subagent.spawn","arguments":{{"instruction":"slow","async":true}}}}}}"#
+        );
+        let v = rpc(reader, write, &line);
+        v["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string()
+    };
+
+    let h1 = spawn_async(&mut reader, &mut write, 2);
+    let h2 = spawn_async(&mut reader, &mut write, 3);
+    assert_ne!(h1, h2);
+
+    // Let both runs reach their hanging model call, then cancel only run 2.
+    std::thread::sleep(Duration::from_millis(400));
+    rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{h2}"}}}}}}"#),
+    );
+
+    // Run 2 reaches a terminal "cancelled" promptly (drain ladder ~5-7s) —
+    // well inside the 12s hang of run 1.
+    let body2 = poll_until_done(&mut reader, &mut write, &h2, Instant::now() + Duration::from_secs(15));
+    assert_eq!(body2["status"], "cancelled", "run 2 drained: {body2}");
+
+    // ...and run 1 is STILL running at that moment (not blocked, not finished) —
+    // the two supervisors ran concurrently.
+    let status1 = rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{h1}"}}}}}}"#),
+    );
+    assert_eq!(
+        status1["result"]["structuredContent"]["done"], false,
+        "run 1 must still be running while run 2 was cancelled (concurrent supervision): {status1}"
+    );
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+    sigterm(child.id());
+    let _ = child.wait();
+}
+
+#[test]
 fn cancel_drains_a_live_async_run() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");

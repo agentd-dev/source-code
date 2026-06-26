@@ -347,16 +347,16 @@ fn spawn_result_response(id: Id, handle: &str, result: std::io::Result<Supervise
 /// Register an async run, launch it on a background thread (holding the permit +
 /// a per-run cancel flag), and return the handle to the peer immediately.
 ///
-/// **Concurrency note:** "async" means non-blocking *to the calling peer* — the
-/// run still serializes on the process-wide supervise lock (RFC 0003), so it runs
-/// after any in-flight supervised run (the daemon's own reactions / other served
-/// runs) finishes, and while it runs it blocks them in turn. So a slow run can
-/// head-of-line-block the daemon; a run is bounded by its payload deadline, and
-/// `subagent.cancel` breaks the head-of-line by draining it. (True concurrency
-/// awaits the single-reaper refactor.) On daemon shutdown the run's subtree
-/// collapses via `PR_SET_PDEATHSIG` (no orphan leak), not a graceful drain.
-/// Handles are shared across all peers on the socket (one trust domain — socket
-/// perms gate access) and confer no ownership.
+/// **Concurrency:** "async" is non-blocking to the calling peer, and the run now
+/// executes **truly concurrently** with the daemon's own reactions and other
+/// served runs — the process-global [`reaper`](crate::supervisor::reaper)
+/// dispatches each child's exit by pid, so supervisors no longer serialize on a
+/// lock (bounded only by `MAX_INFLIGHT_SPAWNS`). A run is bounded by its payload
+/// deadline; `subagent.cancel` drains it early. On daemon shutdown the run's
+/// subtree collapses via `PR_SET_PDEATHSIG` (no orphan leak), not a graceful
+/// drain — a coordinated served-session drain is a follow-on. Handles are shared
+/// across all peers on the socket (one trust domain — socket perms gate access)
+/// and confer no ownership.
 fn spawn_async(id: Id, ctx: &ServeCtx, log: &Logger, handle: String, payload: SpawnPayload, permit: SpawnGuard) -> Response {
     let cancel = Arc::new(AtomicBool::new(false));
     {

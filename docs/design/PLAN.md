@@ -59,33 +59,30 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M4/M2 — the served-MCP **`subagent.spawn` action tool** (a peer
-  delegates work to agentd) landed this wake, plus a real **concurrency-bug fix**
-  (`SUPERVISE_LOCK`). On top of the `--serve-mcp` transport, `cron`, M3 self-*,
-  M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
-- **Last completed (this wake):** the served-MCP **`subagent.spawn` tool** (RFC
-  0005 §3.2, sync) — a peer delegates work: agentd builds a fresh root run from
-  the daemon's payload template + request (instruction / `output_contract` /
-  `tool_scope` subset; depth minted, not requested), supervises it, returns
-  `{handle,status,result}`. Concurrency-capped (≤4, RAII); bad params → JSON-RPC
-  error, refusal/failure → `isError:true` result. **Found + fixed a real
-  concurrency bug:** a served spawn's `supervise_once` ran concurrently with the
-  daemon's mode-loop `supervise_once`; both reap `waitpid(-1)` → child-stealing
-  → hang. Fixed with a per-process `SUPERVISE_LOCK` serializing supervisors
-  (subreaper-orphan reaping intact; a single-reaper refactor for true
-  concurrency is the follow-up). Proven E2E (`tests/serve_mcp.rs` drives
-  `subagent.spawn` over the socket). (Prior wakes: serve-mcp transport; cron;
-  self-*; drain; cgroup; trifecta; metrics.) **No new deps — default + serve-mcp
-  both 3.** **183 default / 190 serve-mcp tests** green, clippy clean (default +
-  all-features).
-- **Next action:** open items — M3 warm `Continue` sessions + async
-  `subagent.spawn` (which would also let served spawns run truly concurrently via
-  the daemon's single reactor, retiring the `SUPERVISE_LOCK` serialization); the
-  `otel` feature (the one allowed heavier deps); **M7** (conformance + the
-  observe-suite + minimal container image + docs — the mock-LLM fixture there
-  unlocks live self-* firing tests); the served `subagent.send`/`cancel`/`status`
-  tools; M5 cgroup `cgroup.kill`/backpressure (needs a cgroup-v2 host). Most M1–M6
-  acceptance now holds — M7 (audit/conformance/container/docs) is the main gap.
+- **Phase:** M7 — the **observe-to-validate E2E suite** is seeded: a built-in
+  **mock LLM** now validates the real agentic loop, a tool-call ReAct cycle, and
+  self-scheduling end to end by observing agentd's telemetry. On top of the full
+  M1–M6 + served `subagent.spawn` feature set.
+- **Last completed (this wake):** the **observe-to-validate E2E suite** seed +
+  its enabler, a **built-in mock LLM**. `intel/mock.rs` (hidden
+  `--internal-mock-llm <socket> [final|read|schedule]`): OpenAI-compatible
+  `/chat/completions` over a unix socket, scripted (no deps). `tests/observe_e2e.rs`
+  drives real agentd against it (+ mock MCP) and asserts on the observed
+  telemetry + outcome — proving, for the first time, the actual agentic loop:
+  (1) the loop runs to a `completed` answer; (2) a full `resource.read` ReAct
+  tool-call cycle; (3) **self-scheduling fires end to end** (`self.schedule` →
+  `trigger.fired` kind:self_schedule). This closes the live self-* validation
+  deferred over the last several wakes. (Prior wakes: served `subagent.spawn` +
+  the `SUPERVISE_LOCK` race fix; serve-mcp transport; cron; self-*; drain;
+  cgroup; trifecta; metrics.) **No new deps, default build still 3.** **189
+  default tests** green, clippy clean (default + all-features).
+- **Next action:** finish M7 — the **minimal container image** (scratch/distroless,
+  TLS-off default) + the **`cargo tree`/`audit`/`deny` minimalism audit** + the
+  **docs** (exit-code table, config table, event vocabulary, trifecta + deployment
+  recipes). Then broaden the observe-suite (delegation / caps-refusal / drain /
+  scope-narrowing) into an `agentd-conformance` crate. Deferred features that
+  don't block M1–M7 acceptance: M3 warm sessions + async spawn, `otel`, served
+  `subagent.send`/`cancel`/`status`, cgroup `cgroup.kill` (infra-gated).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -194,7 +191,7 @@ Modules: fills `agentd-conformance/`; finalizes feature matrix
 - [ ] `cargo tree -e normal` + `cargo audit`/`cargo deny` pass; cut unearned deps
 - [ ] revisit hand-roll-vs-`minreq`, `thiserror`-vs-hand-rolled, miniserde go/no-go
 - [ ] `agentd-conformance` MCP client+server conformance + supervisor behavior + record/replay tests
-- [ ] **observe-to-validate E2E suite** (operator ask): drive real agent/subagent runs and assert on the *observed* JSON-lines telemetry stream + outcomes — reconstruct the agent tree by `run_id`+`agent_path`, verify each capability/assumption (delegation, caps refusal, stuck-kill, drain, reactivity, scope narrowing) is visible and auditable in the event log
+- [~] **observe-to-validate E2E suite** (operator ask) — **seeded + the agentic loop is now validated end to end.** New built-in **mock LLM** (`intel/mock.rs`, hidden `--internal-mock-llm <socket> [final|read|schedule]`): OpenAI-compatible `/chat/completions` over a unix socket with scripted turns (final answer / tool call → answer), no deps. `tests/observe_e2e.rs` drives *real* agentd against it (+ the mock MCP) and asserts on the observed telemetry + outcome: (1) once-mode runs the real loop to a `completed` answer; (2) a full ReAct tool-call cycle (`tool.call` `resource.read` → `tool.result` → final); (3) **self-scheduling fires end to end** (`self.schedule` → `trigger.armed/fired` kind:self_schedule) — closing the long-deferred live self-* validation. _Remaining: broaden to delegation / caps-refusal / stuck-kill / drain / scope-narrowing observations + tree reconstruction by `run_id`+`agent_path` (much is already covered piecemeal across `tests/`); fold into an `agentd-conformance` crate._
 - [ ] minimal container image (scratch/distroless, TLS-off default)
 - [ ] docs: exit-code table, config table, event vocabulary, trifecta guidance, deployment recipes (CLI / reactive Deployment / external CronJob)
 - **Acceptance:** default build links no async runtime, no TLS, no C toolchain, ≤ single-digit first-party crates; conformance passes against MCP reference servers + an agentd-as-server peer; stuck/orphan/fork-bomb chaos test leaks no process; runtime readable in an afternoon (size + module-count check).

@@ -59,27 +59,28 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M6 done bar `otel`; now picking up M5 — **cgroup-v2 memory
-  awareness (read-side)** landed this wake (startup `cgroup.detected` + `/metrics`
-  memory gauges). On top of trifecta enforcement, metrics, `--log-content`.
-- **Last completed (this wake):** **cgroup-v2 memory awareness (read-side)**.
-  New `supervisor/cgroup.rs` (no deps): best-effort `memory.max`/`current`/`high`
-  reads under `/sys/fs/cgroup`, degrading to `None` off-cgroup. Logged once at
-  startup as `cgroup.detected` (quiet when absent) and exposed as live
-  `agentd_memory_max_bytes` / `agentd_memory_current_bytes` gauges appended to
-  the `/metrics` render (kept out of the counter registry so the counter render
-  stays deterministic). Parse/read fixture-tested; graceful no-cgroup
-  degradation verified on this (cgroup-v1) host. (Prior wakes: trifecta
-  enforcement; metrics feature; `--log-content`; restart governor; SSRF; exit
-  table.) No new deps, default build still 3 deps. **175 default / 179 metrics
-  tests** green, clippy clean (default + metrics + all-features).
-- **Next action:** M5 **drain choreography** (`AGENTD_DRAIN_TIMEOUT`; SIGTERM →
-  drain within budget → exit 0, second SIGTERM forces) — mostly verify + tighten
-  existing reactor drain + a test. Then bigger features: **`--serve-mcp` peer
-  listener** (M2/M4 composability), M3 reactive depth (warm sessions /
-  async-spawn / **self-subscribe** — the signature capability), the `cron` and
-  `otel` features, M7 (conformance + observe-suite + container + docs). The
-  cgroup `cgroup.kill`/backpressure follow-ups remain on the M5 line.
+- **Phase:** M6 done bar `otel`; closing out M5 — **drain choreography** verified
+  + completed this wake (graceful SIGTERM→exit 0, `drain.timeout` audit signal,
+  reactive-path test). On top of cgroup-v2 awareness, trifecta enforcement,
+  metrics, `--log-content`.
+- **Last completed (this wake):** **drain choreography completed + verified**.
+  Resolved the stale "0 vs 143" decision in `main.rs` (a SIGTERM drain self-exits
+  0, never 143). Added a one-shot `drain.timeout` warn in the reactor when the
+  drain budget is exceeded (the forced-teardown boundary, distinct from the
+  per-node `subagent.sigkill`). Added a reactive-mode drain integration test
+  (`tests/daemon_modes.rs`: SIGTERM → `reason:drain` → exit 0), complementing the
+  existing loop-mode one. The Cancel→SIGTERM→SIGKILL ladder, the second-signal
+  force, and the `< pod grace` help guidance were already in place. (Prior wakes:
+  cgroup-v2 awareness; trifecta enforcement; metrics; `--log-content`; restart
+  governor; SSRF; exit table.) No new deps, default build still 3 deps. **176
+  default / 180 metrics tests** green, clippy clean (default + metrics + all).
+- **Next action:** the remaining work is the bigger features. Highest-value:
+  **M3 reactive depth** — `subscribe`/`unsubscribe` self-tools + **self-subscribe
+  → self-scheduling** (the signature capability: an agent schedules its own
+  future wake-ups), warm `Continue` sessions, async `subagent.spawn`. Also open:
+  **`--serve-mcp` peer listener** (M2/M4 composability), the `cron` + `otel`
+  features, M7 (conformance + observe-suite + container + docs), and the M5
+  cgroup `cgroup.kill`/backpressure follow-ups (need a cgroup-v2 host to exercise).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -163,7 +164,7 @@ Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,ti
 
 ### M5 — Cloud-native hardening: drain, health, exit codes, idempotency
 Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.rs`
-- [ ] full drain choreography with `AGENTD_DRAIN_TIMEOUT` < grace
+- [x] full drain choreography with `AGENTD_DRAIN_TIMEOUT` < grace — SIGTERM → stop accepting work → Cancel→SIGTERM→SIGKILL ladder over `deepest_first` within the `--drain-timeout`/`AGENTD_DRAIN_TIMEOUT` budget → **exit 0** (a graceful drain self-exits 0, never 143; 143 is OS-set, RFC 0011 §5.1). A second SIGTERM (`signals::force`) or an exceeded budget forces the ladder; the budget-exceeded boundary now emits a one-shot `drain.timeout` warn so an ungraceful teardown is auditable (help already guides `--drain-timeout < pod grace`). Observe-proven for both daemon paths: `loop` and **`reactive`** (`tests/daemon_modes.rs`: SIGTERM → `reason:drain` → exit 0).
 - [x] `obs/health.rs` **supervisor-heartbeat liveness** + `--health-file`: a process-global `tick()` is bumped by every supervisor hot loop (reactor, daemon driver, interval sleep) so liveness reflects the *supervisor* making progress — idle is healthy, a busy/stuck *subagent* doesn't flip it. A 1s writer thread renders `{alive, supervisor_tick_age_ms, mode, draining, ts}` atomically (temp+rename); a K8s exec probe checks `alive`/tick-age freshness. e2e-proven (`tests/daemon_modes.rs`: loop mode writes a live health file). The opt-in `/healthz`+`/readyz` HTTP surface now ships with the `metrics` feature (`obs/serve.rs`, bound by `--metrics-addr`); `/healthz` reuses this same supervisor-heartbeat liveness (200 when fresh + not draining, else 503).
 - [x] complete exit-code table in `exit.rs` — the full RFC 0011 §5 table (0 success, 1 generic, 2 usage, 3 partial, 4 intelligence, 5 semantic/refused, 6 MCP, 7 budget, 124 deadline; 137/143 documented as OS-set), `once_exit` total over every `TerminalStatus`, and tests asserting the mapping, pairwise-distinctness, documented bands, and "non-completed never looks like success". (The supervisor hard-deadline path maps `KillReason::Deadline → 124` in `main.rs`, distinct from the loop's soft budget `7`.)
 - [x] RUN_ID propagation into MCP `_meta` — `McpClient::set_tool_meta` stamps `{"agentd/run_id": …}` onto every `tools/call` `params._meta` (set after initialize in the subagent) so backing services dedupe retries of a run (RFC 0011 §idempotency). Pure builder unit-tested.

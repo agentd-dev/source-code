@@ -213,7 +213,12 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
             match reason {
                 KillReason::Deadline | KillReason::Stuck => exit::DEADLINE,
                 KillReason::TreeBudget => exit::BUDGET,
-                KillReason::Drain => exit::SUCCESS, // clean drain (M5 refines 0 vs 143)
+                // A SIGTERM-initiated drain is a graceful shutdown → exit 0, never
+                // 143 (RFC 0011 §5.1: we self-exit 0; 143 is OS-set when the
+                // kernel kills us). A drain that overran its budget still exits 0
+                // but logged `drain.timeout` + the SIGKILL ladder, so the
+                // ungraceful teardown is auditable.
+                KillReason::Drain => exit::SUCCESS,
             }
         }
         Err(e) => {

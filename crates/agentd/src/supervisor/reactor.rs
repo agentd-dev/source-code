@@ -61,6 +61,9 @@ struct Drain {
     reason: KillReason,
     ladder: Ladder,
     deadline: Instant,
+    /// Latched once the drain budget is exceeded, so `drain.timeout` is
+    /// announced exactly once (the forced-teardown boundary).
+    forced: bool,
 }
 
 pub struct Supervisor {
@@ -276,7 +279,8 @@ impl Supervisor {
             }
         }
         self.log.warn("subagent.drain", json!({"reason": format!("{reason:?}"), "live": self.live.len()}));
-        self.drain = Some(Drain { reason, ladder: Ladder::with_defaults(now), deadline: now + self.drain_timeout });
+        self.drain =
+            Some(Drain { reason, ladder: Ladder::with_defaults(now), deadline: now + self.drain_timeout, forced: false });
     }
 
     /// Advance the active teardown ladder. Returns the final result once the
@@ -284,7 +288,20 @@ impl Supervisor {
     fn drive_drain(&mut self) -> Option<SuperviseResult> {
         let now = Instant::now();
         let all_reaped = self.live.is_empty();
-        let force = signals::force() || self.drain.as_ref().is_some_and(|d| now >= d.deadline);
+        let budget_blown = self.drain.as_ref().is_some_and(|d| now >= d.deadline);
+        let force = signals::force() || budget_blown;
+        // One-shot: the drain budget was exceeded, so we force the kill ladder
+        // rather than wait. Ops should keep AGENTD_DRAIN_TIMEOUT below the pod's
+        // termination grace so this fires before the kubelet SIGKILLs us.
+        if budget_blown && self.drain.as_ref().is_some_and(|d| !d.forced) {
+            if let Some(d) = self.drain.as_mut() {
+                d.forced = true;
+            }
+            self.log.warn(
+                "drain.timeout",
+                json!({"live": self.live.len(), "drain_ms": self.drain_timeout.as_millis() as u64}),
+            );
+        }
         let action = match self.drain.as_mut() {
             Some(d) => d.ladder.poll(now, all_reaped, force),
             None => return None,

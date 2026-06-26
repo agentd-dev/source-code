@@ -1,57 +1,43 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// The site renders the repo's authoritative markdown directly — the
-// docs/ directory is the single source of truth; the site never
-// forks it.
+// The site renders the repo's authoritative markdown directly — the docs/ and
+// rfcs/ directories are the single source of truth; the site never forks them.
 const ROOT = path.join(process.cwd(), "..");
 
 export const DOCS = [
   { slug: "overview", file: "docs/README.md", title: "overview" },
-  { slug: "quickstart", file: "docs/quickstart.md", title: "quickstart" },
+  { slug: "getting-started", file: "docs/getting-started.md", title: "getting started" },
   { slug: "architecture", file: "docs/architecture.md", title: "architecture" },
-  { slug: "capabilities", file: "docs/capabilities.md", title: "capabilities" },
+  { slug: "mcp", file: "docs/mcp.md", title: "mcp surface" },
+  { slug: "modes-and-triggers", file: "docs/modes-and-triggers.md", title: "modes & triggers" },
+  { slug: "subagents", file: "docs/subagents.md", title: "subagents" },
+  { slug: "intelligence", file: "docs/intelligence.md", title: "intelligence" },
   { slug: "configuration", file: "docs/configuration.md", title: "configuration" },
-  { slug: "operations", file: "docs/operations.md", title: "operations" },
-  { slug: "maturity", file: "docs/maturity.md", title: "maturity" },
-  { slug: "samples", file: "docs/SAMPLES.md", title: "samples — a guided tour" },
-  {
-    slug: "conformance",
-    file: "docs/CONFORMANCE.md",
-    title: "conformance & benchmarks",
-  },
-  {
-    slug: "rfc-0001",
-    file: "rfcs/0001-bounded-workflow-runtime.md",
-    title: "rfc 0001 · bounded workflow runtime",
-  },
-  {
-    slug: "rfc-0002",
-    file: "rfcs/0002-signed-workflows.md",
-    title: "rfc 0002 · signed workflows",
-  },
-  {
-    slug: "rfc-0003",
-    file: "rfcs/0003-execution-model.md",
-    title: "rfc 0003 · the agent loop",
-  },
-  {
-    slug: "rfc-0004",
-    file: "rfcs/0004-multi-server-mcp.md",
-    title: "rfc 0004 · multi-server mcp",
-  },
-  {
-    slug: "rfc-0005",
-    file: "rfcs/0005-hot-reload.md",
-    title: "rfc 0005 · hot reload",
-  },
-  {
-    slug: "rfc-0006",
-    file: "rfcs/0006-dynamic-harness.md",
-    title: "rfc 0006 · the dynamic harness",
-  },
-  { slug: "roadmap", file: "docs/ROADMAP.md", title: "roadmap" },
+  { slug: "observability", file: "docs/observability.md", title: "observability" },
+  { slug: "security", file: "docs/security.md", title: "security" },
+  { slug: "deployment", file: "docs/deployment.md", title: "deployment" },
+  { slug: "rfc-0001", file: "rfcs/0001-mcp-native-agent-runtime.md", title: "rfc 0001 · runtime" },
+  { slug: "rfc-0002", file: "rfcs/0002-supervisor-reactor-and-concurrency.md", title: "rfc 0002 · supervisor & concurrency" },
+  { slug: "rfc-0003", file: "rfcs/0003-process-supervision-and-recovery.md", title: "rfc 0003 · supervision & recovery" },
+  { slug: "rfc-0004", file: "rfcs/0004-mcp-client-subset-and-codec.md", title: "rfc 0004 · mcp client & codec" },
+  { slug: "rfc-0005", file: "rfcs/0005-self-mcp-server-and-control-protocol.md", title: "rfc 0005 · self-mcp server" },
+  { slug: "rfc-0007", file: "rfcs/0007-agentic-loop-and-terminal-status.md", title: "rfc 0007 · agentic loop" },
+  { slug: "rfc-0008", file: "rfcs/0008-execution-modes-and-reactive-routing.md", title: "rfc 0008 · modes & reactivity" },
+  { slug: "rfc-0009", file: "rfcs/0009-subagent-process-model.md", title: "rfc 0009 · subagent model" },
+  { slug: "rfc-0011", file: "rfcs/0011-cloud-native-contract.md", title: "rfc 0011 · cloud-native contract" },
+  { slug: "rfc-0012", file: "rfcs/0012-security-posture.md", title: "rfc 0012 · security posture" },
 ];
+
+// docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so
+// inter-doc markdown links can be rewritten to on-site routes.
+const FILE_TO_SLUG = Object.fromEntries(
+  DOCS.map((d) => [d.file.split("/").pop(), d.slug])
+);
+
+export function slugForFile(name) {
+  return FILE_TO_SLUG[name] ?? null;
+}
 
 export function readDoc(slug) {
   const entry = DOCS.find((d) => d.slug === slug);

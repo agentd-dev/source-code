@@ -59,29 +59,29 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M4 — the hand-rolled, dependency-free **`cron` feature** (5-field
-  UTC schedule for `--mode schedule`) landed this wake. On top of M3 self-* (self
-  schedule/subscribe), M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
-- **Last completed (this wake):** the **`cron` feature** — a hand-rolled,
-  dependency-free 5-field UTC cron for `--mode schedule` (`triggers/timer.rs`,
-  gated; `cron = []` stays dep-free — chose hand-roll over RFC 0008's `croner`
-  per the minimalism moat). `CronExpr::parse` (`*`, `*/step`, ranges, lists) +
-  `next_after` (minute-step search, dom/dow OR semantics, reuses
-  `civil_from_days`). Wired into `run_scheduled` (`--cron`/`AGENTD_CRON`): cron
-  waits *until* its next instant before firing; bad expr → `config.invalid`/exit
-  2; default build warns `cron.unavailable` → interval fallback. Config rejects
-  `--cron` outside schedule mode. 6 cron + 1 config tests; observe-proven (arms +
-  waits, no immediate fire; bad expr rejected). (Prior wakes: self-subscribe;
-  self-scheduling; drain; cgroup; trifecta; metrics.) **No new deps, default
-  build still 3 deps.** **183 default / 188 cron / 186 metrics tests** green,
-  clippy clean (default + cron + metrics + all-features).
-- **Next action:** the **`--serve-mcp` peer listener** (M2/M4 composability — a
-  sizeable MCP-*server* build: agentd serves its own MCP over `unix:` so peers
-  compose with it). Other open items: M3 warm `Continue` sessions + async
-  `subagent.spawn`; the `otel` feature (the one allowed heavier deps); M7
-  (conformance + observe-suite + container + docs — the mock-LLM fixture there
-  unlocks live self-* firing tests); M5 cgroup `cgroup.kill`/backpressure (needs
-  a cgroup-v2 host).
+- **Phase:** M4/M2 — **`--serve-mcp`** (agentd serving its own MCP over a unix
+  socket — the composability feature) landed this wake: transport + protocol +
+  a `status` tool, dep-free, proven E2E by a peer. On top of the `cron` feature,
+  M3 self-*, M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
+- **Last completed (this wake):** **`--serve-mcp`** — agentd serving its own MCP
+  over a unix socket (composability, RFC 0005). `mcp/server.rs` (feature
+  `serve-mcp`, **made dep-free** — dropped the scaffold's `mio` per RFC §3.6's
+  blocking `UnixListener`): a thread-per-connection NDJSON JSON-RPC server
+  reusing the `json/` codec, answering `initialize`/`ping`/`tools/list`/
+  `tools/call`; v1 exposes a read-only `status` tool. Wired in `main.rs` for
+  daemon modes (`serve_self_mcp`, stale-socket cleanup; `--serve-mcp` warns
+  without the feature). **Composability proven E2E** (`tests/serve_mcp.rs`: a
+  peer connects → initialize/list/status/error). (Prior wakes: cron;
+  self-subscribe; self-scheduling; drain; cgroup; trifecta; metrics.) **No new
+  deps — default build 3, and `--features serve-mcp` is also exactly 3.**
+  **183 default / 188 serve-mcp tests** green, clippy clean (default + all-feats).
+- **Next action:** the served-MCP **`subagent.spawn` action tool** (the powerful
+  composability — a peer delegates work to agentd: build a spawn-payload from the
+  daemon's config + the request, `supervise_once`, return the outcome; with caps).
+  Other open items: M3 warm `Continue` sessions + async `subagent.spawn`; the
+  `otel` feature (the one allowed heavier deps); M7 (conformance + observe-suite
+  + container + docs — the mock-LLM fixture there unlocks live self-* firing
+  tests); M5 cgroup `cgroup.kill`/backpressure (needs a cgroup-v2 host).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -137,7 +137,7 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 - [x] `signals.rs` SIGCHLD handler (SA_NOCLDSTOP) + self-pipe wakeup (`wakeup_fd`/`drain_wakeup`/`take_child_exit`) for the reactor
 - [x] `supervisor/restart.rs` **restart governor** — pure backoff + capped jitter + circuit breaker + crash-on-spawn detection (hand-rolled jitter, no `rand`); `RestartGovernor::on_outcome → Backoff(d) | Tripped`. Wired into `run_scheduled`: failed fires back off via the governor, a crash-loop trips the breaker → `proc.exit{reason:"restart_breaker"}` + exit 1 (no hot-spin). 8 unit tests. _(Reactor-side per-child wiring for warm sessions: later, with M3 sessions.)_
 - [x] **`subagent.spawn` self-tool — the model self-orchestrates** (`agentloop/action.rs` `SelfHandler` + `subagent/orchestrator.rs`): builds a child payload (depth+1, narrowed MCP scope, inherited intel), enforces depth/breadth caps **refused as tool results**, and supervises the child synchronously via `supervise_once` (nested real processes). e2e test spawns a real child (`tests/orchestrator_spawn.rs`). `reactor::reap` made flag-independent (nested supervise works).
-- [ ] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) for peer composition + `subagent.send/cancel/status` (async) — deferred toward M3/M4
+- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + protocol landed** (see M4). _Remaining: the action tools `subagent.spawn`/`send`/`cancel`/`status` + the `agentd://` state resources (need warm sessions / async spawn first)._
 - [x] `sec/scope.rs` tool-scope grant logic (granted-MCP-subset, monotonic narrow, Rule-of-Two) — wiring into the chokepoint pending `spawn.rs`. (depth/breadth/rate caps already in `tree.rs`)
 - **Acceptance:** parent spawns scoped child → child loop → distilled result up the channel; `kill -STOP` child → no-progress+missing-pongs → stuck → ladder to SIGKILL within budget; exited child reaped (no zombie); orphan grandchild reparents+reaped; killing supervisor collapses tree via PDEATHSIG; spawn past caps refused as tool result; crash-loop trips breaker.
 
@@ -156,7 +156,7 @@ Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `s
 
 ### M4 — Composition, transports, exec, schedule
 Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,timer}.rs`
-- [ ] serve self-MCP over `unix:` (`--serve-mcp unix:…`)
+- [~] serve self-MCP over `unix:` (`--serve-mcp unix:…`) — **transport + protocol landed**, dep-free. `mcp/server.rs` (feature `serve-mcp`, made dep-free — dropped the scaffold's mio per RFC 0005 §3.6's blocking `UnixListener`): a thread-per-connection NDJSON JSON-RPC server reusing the `json/` codec, answering `initialize` (declares `tools`), `ping`, `tools/list`, `tools/call`. v1 exposes a read-only `status` tool (run_id/mode/version/pid/uptime). Wired in `main.rs` for daemon modes (`serve_self_mcp`, stale-socket cleanup); without the feature `--serve-mcp` warns `mcp.serve_unavailable`. **Composability proven E2E** (`tests/serve_mcp.rs`, gated: a peer connects to the socket → initialize/list/status/error). _Remaining: the `subagent.*` action tools (the powerful composability — delegate work to agentd; needs a spawn-payload template + caps + warm sessions/async)._
 - [x] `net/vsock.rs` + vsock intelligence transport [vsock] — `VsockStream::connect_with_cid_port` + timeouts, drops into the HTTP client like the other transports. Compiles under `--features vsock`; live verification needs a microVM peer (deferred).
 - [x] `sec/exec.rs` gated `exec` self-tool — off by default, advertised only with `--enable-exec` (propagated via the spawn payload, inherited by children). argv-style (no shell/PATH/interpolation), argv[0] = absolute path to an existing executable, scrubbed env, output capped (64 KiB), own process group `killpg`'d on a mandatory per-call timeout. Salvaged from the retired `shell.rs`. Validation/spawn failures are recoverable observations. (Budget/Rule-of-Two folding = later refinement.)
 - [x] `--mode loop`/`schedule` drivers (`triggers/mode.rs::run_scheduled`): interval-based re-run of the standing instruction (each fire = an independent supervised `once` run); `loop` re-enters back-to-back (interval default 0), `schedule` fires on `--interval`; SIGTERM → graceful drain → exit 0; fast-failing runs back off (capped) so they can't hot-spin. e2e-proven (`tests/daemon_modes.rs`). _Remaining: optional 5-field `cron` feature (croner)._

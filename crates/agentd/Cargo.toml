@@ -27,8 +27,9 @@ default = []
 tls = ["dep:rustls", "dep:webpki-roots"]
 # Enclave / microVM intelligence transport (AF_VSOCK).
 vsock = ["dep:vsock"]
-# poll/epoll listener for the high-fan-in served self-MCP only.
-serve-mcp = ["dep:mio"]
+# Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
+# (RFC 0005 §3.6) — no dep. (mio/epoll is a future high-fan-in optimisation.)
+serve-mcp = []
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
@@ -51,8 +52,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 webpki-roots = { version = "0.26", optional = true }
 # --- feature: vsock ---
 vsock = { version = "0.5", optional = true }
-# --- feature: serve-mcp ---
-mio = { version = "1", features = ["os-poll", "net"], optional = true }
+# --- feature: serve-mcp --- blocking std UnixListener; no dependency.
 # --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.
 
 # Unix-only: signals (sigaction), process control (setpgid/killpg/waitpid),

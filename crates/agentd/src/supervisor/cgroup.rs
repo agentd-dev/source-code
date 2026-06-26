@@ -49,6 +49,68 @@ static PARENT: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Per-run child-cgroup name counter (unique within this process).
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Hard resource limits to write onto each per-run leaf cgroup, set once at
+/// startup by [`configure`]. Empty (the default) → leaves get no limits, only the
+/// `cgroup.kill` teardown backstop. Applying limits needs the parent to delegate
+/// the `memory`/`pids` controllers (see [`enable_controllers`]); where it can't
+/// (e.g. `--cgroup auto` under a busy unit cgroup → `EBUSY`) the writes no-op and
+/// the run still gets atomic teardown.
+static LIMITS: OnceLock<Limits> = OnceLock::new();
+
+/// Normalised hard limits for a per-run leaf cgroup. Each field, when set, is the
+/// exact string written to the corresponding cgroup-v2 interface file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Value for `memory.max` (`"max"` or a byte count).
+    pub memory_max: Option<String>,
+    /// Value for `pids.max` (`"max"` or a count).
+    pub pids_max: Option<String>,
+}
+
+impl Limits {
+    /// Build from raw `--cgroup-memory-max` / `--cgroup-pids-max` specs; an
+    /// unparseable spec is dropped (the limit just isn't applied).
+    pub fn from_specs(memory_max: Option<&str>, pids_max: Option<&str>) -> Limits {
+        Limits {
+            memory_max: memory_max.and_then(normalize_bytes),
+            pids_max: pids_max.and_then(normalize_count),
+        }
+    }
+
+    /// No limits requested → skip controller delegation + per-leaf writes entirely.
+    pub fn is_empty(&self) -> bool {
+        self.memory_max.is_none() && self.pids_max.is_none()
+    }
+}
+
+/// Normalise a memory-size spec to the bytes string `memory.max` expects: `"max"`
+/// (unlimited), a plain byte count, or a `K`/`M`/`G`-suffixed (1024-based) size.
+/// `None` for anything unparseable.
+fn normalize_bytes(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("max") {
+        return Some("max".to_string());
+    }
+    let (digits, mult): (&str, u64) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, 1),
+        Some('K' | 'k') => (&s[..s.len() - 1], 1024),
+        Some('M' | 'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('G' | 'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => return None,
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    n.checked_mul(mult).map(|b| b.to_string())
+}
+
+/// Normalise a pid-count spec for `pids.max`: `"max"` or a non-negative integer.
+fn normalize_count(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("max") {
+        return Some("max".to_string());
+    }
+    s.parse::<u64>().ok().map(|n| n.to_string())
+}
+
 /// A point-in-time view of the unit's cgroup v2 memory interface.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemorySnapshot {
@@ -104,25 +166,68 @@ fn parse_mem(s: &str) -> Option<u64> {
 // Active enforcement: child-cgroup placement + `cgroup.kill` teardown backstop.
 // ---------------------------------------------------------------------------
 
-/// Resolve + probe the `--cgroup` spec ONCE at startup. `spec` is `"auto"`
-/// (derive `<own-cgroup>/agentd` from `/proc/self/cgroup`) or an absolute path
-/// under `/sys/fs/cgroup`. Returns the resolved, writable parent dir (and arms
-/// per-run child cgroups), or `None` when off / not writable (the feature then
-/// stays dormant). Idempotent — the first call wins. Logs nothing; the caller
-/// reports `cgroup.enabled` / `cgroup.unavailable`.
-pub fn configure(spec: Option<&str>) -> Option<PathBuf> {
+/// What [`configure`] settled on: the resolved parent dir (if armed) and whether
+/// requested hard limits will actually be enforced (controllers delegated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Configured {
+    /// The parent dir under which per-run leaves are created (feature is armed).
+    pub parent: PathBuf,
+    /// Limits that will be applied to each leaf (empty if none requested).
+    pub limits: Limits,
+    /// True when limits were requested but the controllers could **not** be
+    /// delegated (so the writes will no-op) — the caller should warn.
+    pub limits_unavailable: bool,
+}
+
+/// Resolve + probe the `--cgroup` spec ONCE at startup, arming per-run child
+/// cgroups. `spec` is `"auto"` (derive `<own-cgroup>/agentd` from
+/// `/proc/self/cgroup`) or an absolute path under `/sys/fs/cgroup`. Optional
+/// `memory_max`/`pids_max` specs request hard limits on each run's leaf; this
+/// best-effort delegates the controllers to the parent so the limits can take
+/// effect. Returns `None` when off / not writable (the feature stays dormant).
+/// Idempotent — the first call wins.
+pub fn configure(spec: Option<&str>, memory_max: Option<&str>, pids_max: Option<&str>) -> Option<Configured> {
     let resolved = spec.and_then(resolve_parent).filter(|p| ensure_writable(p));
-    // Reclaim any `run-*` cgroups orphaned by prior crashed/abandoned runs (a
-    // wedged D-state task can outlive its guard's Drop), so a long-lived daemon
-    // can't slowly accumulate stale child cgroups across restarts.
+    let limits = Limits::from_specs(memory_max, pids_max);
+    let mut limits_unavailable = false;
     if let Some(p) = &resolved {
+        // Reclaim any `run-*` cgroups orphaned by prior crashed/abandoned runs (a
+        // wedged D-state task can outlive its guard's Drop), so a long-lived
+        // daemon can't slowly accumulate stale child cgroups across restarts.
         sweep_stale(p);
+        // Delegate the controllers the requested limits need to the parent, so
+        // the per-run leaves get enforceable `memory.max`/`pids.max`. Fails
+        // (EBUSY) where the parent holds processes directly (e.g. `auto` under a
+        // busy unit cgroup) — limits then no-op, but teardown still works.
+        if !limits.is_empty() {
+            limits_unavailable = !enable_controllers(p, &limits);
+        }
     }
-    // OnceLock::set fails only if already set (first call wins). Return the value
-    // that actually governs `for_run`, so the caller's log never disagrees with
-    // what's stored even on an accidental second call.
+    // OnceLock::set fails only if already set (first call wins). Read back the
+    // stored values so the caller's log never disagrees with what governs runs.
     let _ = PARENT.set(resolved);
-    PARENT.get().cloned().flatten()
+    let _ = LIMITS.set(limits);
+    let parent = PARENT.get().cloned().flatten()?;
+    Some(Configured { parent, limits: LIMITS.get().cloned().unwrap_or_default(), limits_unavailable })
+}
+
+/// Delegate the `memory`/`pids` controllers (only those the requested limits
+/// need) to `parent` via its `cgroup.subtree_control`, so child leaves expose the
+/// matching interface files. Each controller is delegated with its OWN write: a
+/// `subtree_control` write is atomic, so a combined `+memory +pids` would fail
+/// wholesale when the parent can delegate only one (e.g. a `Delegate=pids` unit),
+/// needlessly dropping the achievable limit. Best-effort → returns whether
+/// **every requested** controller was delegated.
+fn enable_controllers(parent: &Path, limits: &Limits) -> bool {
+    let file = parent.join("cgroup.subtree_control");
+    let mut all_ok = true;
+    if limits.memory_max.is_some() {
+        all_ok &= write_cgroup(&file, "+memory");
+    }
+    if limits.pids_max.is_some() {
+        all_ok &= write_cgroup(&file, "+pids");
+    }
+    all_ok
 }
 
 /// Best-effort reclaim of stale per-run child cgroups under `parent`. Removes a
@@ -238,12 +343,17 @@ pub struct CgroupGuard {
 }
 
 impl CgroupGuard {
-    /// Create the per-run child cgroup under the configured parent, or `None`
-    /// when the feature is off / creation fails (best-effort, never an error).
+    /// Create the per-run child cgroup under the configured parent, applying the
+    /// configured hard limits, or `None` when the feature is off / creation fails
+    /// (best-effort, never an error).
     pub fn for_run() -> Option<CgroupGuard> {
         let parent = PARENT.get().and_then(|o| o.clone())?;
         let name = format!("run-{}-{}", std::process::id(), RUN_SEQ.fetch_add(1, Ordering::Relaxed));
-        Self::create(&parent, &name)
+        let guard = Self::create(&parent, &name)?;
+        if let Some(limits) = LIMITS.get() {
+            guard.apply_limits(limits);
+        }
+        Some(guard)
     }
 
     /// Create a child cgroup `parent/name` (best-effort). Shared by `for_run`
@@ -252,6 +362,22 @@ impl CgroupGuard {
         let dir = parent.join(name);
         std::fs::create_dir_all(&dir).ok()?;
         Some(CgroupGuard { dir })
+    }
+
+    /// Write the configured hard limits onto this leaf's `memory.max`/`pids.max`.
+    /// Best-effort: a write no-ops where the controller wasn't delegated (the
+    /// interface file is absent / read-only), so the run keeps `cgroup.kill`
+    /// teardown without the limit. Returns `(memory_ok, pids_ok)` for logging.
+    pub fn apply_limits(&self, limits: &Limits) -> (bool, bool) {
+        let memory_ok = match &limits.memory_max {
+            Some(v) => write_cgroup(&self.dir.join("memory.max"), v),
+            None => false,
+        };
+        let pids_ok = match &limits.pids_max {
+            Some(v) => write_cgroup(&self.dir.join("pids.max"), v),
+            None => false,
+        };
+        (memory_ok, pids_ok)
     }
 
     /// Move `pid` (and, by inheritance, its future descendants) into this
@@ -269,6 +395,14 @@ impl CgroupGuard {
     /// The cgroup directory (for logging).
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// The `oom_kill` count from this leaf's `memory.events` — how many of its
+    /// processes the kernel OOM-killed (i.e. hit `memory.max`). `None` when the
+    /// memory controller isn't active (no limit / not delegated). Lets the
+    /// supervisor report a `memory.max` kill plainly instead of as a generic exit.
+    pub fn oom_kills(&self) -> Option<u64> {
+        parse_oom_kills(&std::fs::read_to_string(self.dir.join("memory.events")).ok()?)
     }
 
     /// Remove the cgroup dir; succeeds only once every member process has been
@@ -297,6 +431,12 @@ impl Drop for CgroupGuard {
 /// controller, EACCES, EBUSY, off-cgroup) is swallowed → returns success.
 fn write_cgroup(path: &Path, value: &str) -> bool {
     std::fs::write(path, value).is_ok()
+}
+
+/// Parse the `oom_kill` counter from a `memory.events` body (one `key value`
+/// pair per line). `None` when the key is absent.
+fn parse_oom_kills(events: &str) -> Option<u64> {
+    events.lines().find_map(|l| l.strip_prefix("oom_kill "))?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -346,6 +486,143 @@ mod tests {
         assert!(over_threshold(Some(950), Some(1_000))); // exactly 95%
         assert!(over_threshold(Some(1_000), Some(1_000))); // at high
         assert!(over_threshold(Some(2_000), Some(1_000))); // over high
+    }
+
+    #[test]
+    fn normalize_bytes_handles_suffixes_max_and_garbage() {
+        assert_eq!(normalize_bytes("max").as_deref(), Some("max"));
+        assert_eq!(normalize_bytes("MAX").as_deref(), Some("max"));
+        assert_eq!(normalize_bytes("1048576").as_deref(), Some("1048576"));
+        assert_eq!(normalize_bytes("512M").as_deref(), Some((512 * 1024 * 1024).to_string().as_str()));
+        assert_eq!(normalize_bytes("2G").as_deref(), Some((2u64 * 1024 * 1024 * 1024).to_string().as_str()));
+        assert_eq!(normalize_bytes("64k").as_deref(), Some((64 * 1024).to_string().as_str()));
+        assert_eq!(normalize_bytes(""), None);
+        assert_eq!(normalize_bytes("M"), None); // no digits
+        assert_eq!(normalize_bytes("12T"), None); // unsupported suffix
+        assert_eq!(normalize_bytes("abc"), None);
+    }
+
+    #[test]
+    fn normalize_count_handles_max_and_integers() {
+        assert_eq!(normalize_count("max").as_deref(), Some("max"));
+        assert_eq!(normalize_count("128").as_deref(), Some("128"));
+        assert_eq!(normalize_count("0").as_deref(), Some("0"));
+        assert_eq!(normalize_count(""), None);
+        assert_eq!(normalize_count("-1"), None);
+        assert_eq!(normalize_count("lots"), None);
+    }
+
+    #[test]
+    fn parse_oom_kills_reads_the_counter() {
+        let events = "low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(parse_oom_kills(events), Some(2));
+        assert_eq!(parse_oom_kills("oom_kill 0\n"), Some(0));
+        assert_eq!(parse_oom_kills("low 0\nhigh 0\n"), None); // key absent
+        assert_eq!(parse_oom_kills(""), None);
+    }
+
+    #[test]
+    fn limits_from_specs_drops_unparseable() {
+        let l = Limits::from_specs(Some("256M"), Some("32"));
+        assert_eq!(l.memory_max.as_deref(), Some((256 * 1024 * 1024).to_string().as_str()));
+        assert_eq!(l.pids_max.as_deref(), Some("32"));
+        assert!(!l.is_empty());
+        assert!(Limits::from_specs(None, None).is_empty());
+        assert!(Limits::from_specs(Some("nonsense"), None).is_empty()); // dropped
+    }
+
+    /// Live proof that hard limits are both applied and enforced: build a manager
+    /// cgroup that delegates the pids controller, create a leaf via the real
+    /// `CgroupGuard` path, set `pids.max=1`, and confirm a process inside the leaf
+    /// cannot `fork` (kernel `EAGAIN`). Skips cleanly where controller delegation
+    /// isn't available (limits are best-effort).
+    #[test]
+    fn limits_are_applied_and_pids_max_is_enforced() {
+        let mgr = Path::new(CGROUP_ROOT).join(format!("agentd-test-limits-{}", std::process::id()));
+        if std::fs::create_dir(&mgr).is_err() {
+            eprintln!("skip: cannot create a cgroup under {CGROUP_ROOT}");
+            return;
+        }
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _mgr_cleanup = Cleanup(mgr.clone());
+
+        let limits = Limits::from_specs(Some("32M"), Some("1"));
+        if !enable_controllers(&mgr, &limits) {
+            eprintln!("skip: parent cannot delegate memory/pids controllers");
+            return;
+        }
+        let guard = CgroupGuard::create(&mgr, "leaf").expect("create leaf cgroup");
+        let (mem_ok, pids_ok) = guard.apply_limits(&limits);
+        assert!(pids_ok, "pids.max applied");
+        assert_eq!(std::fs::read_to_string(guard.dir.join("pids.max")).unwrap().trim(), "1");
+        if mem_ok {
+            assert_eq!(
+                std::fs::read_to_string(guard.dir.join("memory.max")).unwrap().trim(),
+                (32 * 1024 * 1024).to_string()
+            );
+        }
+
+        // Functional enforcement: a process migrated INTO the leaf is the 1 task
+        // pids.max=1 allows, so its own `fork` must be refused. Sync via a pipe so
+        // the probe only forks after it has been placed in the cgroup.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (rfd, wfd) = (fds[0], fds[1]);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork probe");
+        if pid == 0 {
+            // Child: async-signal-safe calls only.
+            unsafe {
+                libc::close(wfd);
+                let mut b = [0u8; 1];
+                libc::read(rfd, b.as_mut_ptr() as *mut libc::c_void, 1); // wait until placed
+                let g = libc::fork();
+                if g == 0 {
+                    libc::_exit(0); // grandchild (only reached if enforcement failed)
+                }
+                if g < 0 {
+                    libc::_exit(0); // EXPECTED: fork refused with EAGAIN
+                }
+                let mut s = 0;
+                libc::waitpid(g, &mut s, 0);
+                libc::_exit(1); // fork unexpectedly succeeded
+            }
+        }
+        // SIGKILL + reap the probe even if an assertion below panics first, so a
+        // failing run never leaks the blocked-on-read child / a busy leaf cgroup.
+        struct ProbeGuard(Option<i32>);
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        let mut s = 0;
+                        libc::waitpid(pid, &mut s, 0);
+                    }
+                }
+            }
+        }
+        let mut probe = ProbeGuard(Some(pid));
+
+        unsafe { libc::close(rfd) };
+        assert!(guard.place(pid), "migrate the probe into the leaf");
+        unsafe {
+            libc::write(wfd, b"x".as_ptr() as *const libc::c_void, 1);
+            libc::close(wfd);
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "reap probe");
+        probe.0 = None; // reaped — disarm the guard (avoid waitpid on a reused pid)
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a fork inside the pids.max=1 cgroup must be refused (status={status})"
+        );
     }
 
     #[test]

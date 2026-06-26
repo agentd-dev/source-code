@@ -104,7 +104,17 @@ pub struct Config {
     /// or an absolute path under `/sys/fs/cgroup`. Each run gets a child cgroup
     /// for atomic `cgroup.kill` teardown. Best-effort — disabled if not writable;
     /// agentd stays cgroup-aware, never cgroup-requiring. RFC 0010, assessment §2.3.
+    /// Note: if hard limits are requested and the path points at a shared/existing
+    /// cgroup, delegating its controllers also enables them for its other children.
     pub cgroup: Option<String>,
+    /// Optional hard `memory.max` for each run's cgroup (`max` or a size like
+    /// `512M`/`2G`/bytes). Needs `--cgroup` + a parent that can delegate the
+    /// `memory` controller; otherwise it no-ops (teardown still works).
+    pub cgroup_memory_max: Option<String>,
+    /// Optional hard `pids.max` for each run's cgroup (`max` or a count). Counts
+    /// *threads*, not just processes, so set it generously (the root subagent is
+    /// multi-threaded). Same delegation requirement as `cgroup_memory_max`.
+    pub cgroup_pids_max: Option<String>,
     /// Allow a lethal-trifecta grant (all three capability legs in one agent)
     /// instead of refusing at startup (RFC 0012 §3.2). Process-global operator
     /// override — deliberately NOT carried in the spawn payload.
@@ -141,6 +151,8 @@ impl Default for Config {
             log_content: false,
             metrics_addr: None,
             cgroup: None,
+            cgroup_memory_max: None,
+            cgroup_pids_max: None,
             allow_trifecta: false,
             cron: None,
         }
@@ -174,6 +186,8 @@ impl fmt::Debug for Config {
             .field("log_content", &self.log_content)
             .field("metrics_addr", &self.metrics_addr)
             .field("cgroup", &self.cgroup)
+            .field("cgroup_memory_max", &self.cgroup_memory_max)
+            .field("cgroup_pids_max", &self.cgroup_pids_max)
             .field("allow_trifecta", &self.allow_trifecta)
             .field("cron", &self.cron)
             .finish()
@@ -253,6 +267,12 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_CGROUP") {
             c.cgroup = Some((*v).to_string());
         }
+        if let Some(v) = envmap.get("AGENTD_CGROUP_MEMORY_MAX") {
+            c.cgroup_memory_max = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_CGROUP_PIDS_MAX") {
+            c.cgroup_pids_max = Some((*v).to_string());
+        }
         if let Some(v) = envmap.get("AGENTD_ALLOW_TRIFECTA") {
             c.allow_trifecta = truthy(v);
         }
@@ -325,6 +345,8 @@ impl Config {
                 "--mcp-tags" => mcp_tags.push(parse_mcp_tags(&take("--mcp-tags")?)?),
                 "--metrics-addr" => c.metrics_addr = Some(take("--metrics-addr")?),
                 "--cgroup" => c.cgroup = Some(take("--cgroup")?),
+                "--cgroup-memory-max" => c.cgroup_memory_max = Some(take("--cgroup-memory-max")?),
+                "--cgroup-pids-max" => c.cgroup_pids_max = Some(take("--cgroup-pids-max")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
@@ -396,6 +418,21 @@ impl Config {
         }
         if self.cron.is_some() && self.mode != Mode::Schedule {
             return Err(usage("--cron is only valid with --mode schedule".into()));
+        }
+        // The per-run limits do nothing without a cgroup to apply them to, so a
+        // limit set alone is a misconfiguration (the operator believes the run is
+        // bounded when it isn't) — surface it, like --cron/--continue.
+        if (self.cgroup_memory_max.is_some() || self.cgroup_pids_max.is_some()) && self.cgroup.is_none() {
+            return Err(usage("--cgroup-memory-max/--cgroup-pids-max require --cgroup".into()));
+        }
+        // A zero limit can never let the agent run: pids.max=0 refuses placement
+        // (the run loses both limits and the cgroup.kill backstop) and memory.max=0
+        // OOM-kills instantly. Reject it outright (use a real value or `max`).
+        if self.cgroup_pids_max.as_deref().map(str::trim) == Some("0") {
+            return Err(usage("--cgroup-pids-max must be > 0 (it counts threads, not just processes) or 'max'".into()));
+        }
+        if self.cgroup_memory_max.as_deref().map(str::trim) == Some("0") {
+            return Err(usage("--cgroup-memory-max must be > 0 or 'max'".into()));
         }
         Ok(())
     }
@@ -534,6 +571,8 @@ fn help_text() -> String {
          \x20 --health-file <PATH>        liveness heartbeat file\n\
          \x20 --metrics-addr <ADDR>       serve /metrics+/healthz+/readyz (needs --features metrics)\n\
          \x20 --cgroup <auto|PATH>        per-run cgroup for atomic cgroup.kill teardown (best-effort)\n\
+         \x20 --cgroup-memory-max <SIZE>  per-run memory.max (max|512M|2G|bytes; needs --cgroup + delegation)\n\
+         \x20 --cgroup-pids-max <N>       per-run pids.max (max|count of THREADS; needs --cgroup + delegation)\n\
          \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
@@ -582,6 +621,29 @@ mod tests {
         let bad_tag =
             Config::load(&args(&["--mcp", "fs=cmd", "--mcp-tags", "fs=bogus"]), &base_env()).unwrap_err();
         assert!(matches!(bad_tag, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn cgroup_limits_require_cgroup_and_reject_zero() {
+        // A limit without --cgroup is a misconfiguration (silently unbounded run).
+        let e =
+            Config::load(&args(&["--cgroup-memory-max", "512M"]), &base_env()).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+        let e2 = Config::load(&args(&["--cgroup-pids-max", "64"]), &base_env()).unwrap_err();
+        assert!(matches!(e2, ConfigError::Usage(_)));
+        // With --cgroup, the limits validate.
+        let c = Config::load(
+            &args(&["--cgroup", "auto", "--cgroup-memory-max", "512M", "--cgroup-pids-max", "64"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.cgroup_memory_max.as_deref(), Some("512M"));
+        assert_eq!(c.cgroup_pids_max.as_deref(), Some("64"));
+        // A zero limit can never let the agent run → rejected.
+        let z = Config::load(&args(&["--cgroup", "auto", "--cgroup-pids-max", "0"]), &base_env()).unwrap_err();
+        assert!(matches!(z, ConfigError::Usage(_)));
+        let zm = Config::load(&args(&["--cgroup", "auto", "--cgroup-memory-max", "0"]), &base_env()).unwrap_err();
+        assert!(matches!(zm, ConfigError::Usage(_)));
     }
 
     #[test]

@@ -100,3 +100,78 @@ fn once_mode_places_the_root_in_a_cgroup_and_removes_it_on_exit() {
         "the per-run cgroup {cgroup_path} should be removed on exit"
     );
 }
+
+/// Whether a manager cgroup directly under the cgroup-v2 root can delegate the
+/// `pids` controller (the precondition for enforceable per-run limits). Probes +
+/// cleans up. Returns the manager path to reuse, or `None` to skip.
+fn root_delegating_manager() -> Option<PathBuf> {
+    let mgr = Path::new("/sys/fs/cgroup").join(format!("agentd-e2e-limits-{}", std::process::id()));
+    std::fs::create_dir(&mgr).ok()?;
+    if std::fs::write(mgr.join("cgroup.subtree_control"), "+pids").is_err() {
+        let _ = std::fs::remove_dir(&mgr);
+        return None;
+    }
+    Some(mgr)
+}
+
+#[test]
+fn once_mode_applies_hard_limits_when_the_parent_delegates_controllers() {
+    let Some(mgr) = root_delegating_manager() else {
+        eprintln!("skip: no cgroup parent that delegates controllers on this host");
+        return;
+    };
+    // Ensure the manager dir is removed even if an assertion fails.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(mgr.clone());
+
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let llm_sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(exe, &llm_sock);
+
+    let out = Command::new(exe)
+        .args([
+            "--instruction",
+            "do a thing",
+            "--intelligence",
+            &format!("unix:{}", llm_sock.display()),
+            "--model",
+            "m",
+            "--cgroup",
+            mgr.to_str().unwrap(),
+            "--cgroup-pids-max",
+            "64",
+            "--cgroup-memory-max",
+            "256M",
+            "--log-level",
+            "info",
+        ])
+        .output()
+        .expect("run agentd");
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "run completed cleanly; stderr:\n{stderr}");
+
+    // The limits were accepted, normalized, and (since the parent delegates the
+    // controllers) actually engaged — no `cgroup.limits_unavailable` warning.
+    let enabled = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event"] == "cgroup.enabled")
+        .expect("a cgroup.enabled event");
+    assert_eq!(enabled["pids_max"], "64", "pids.max normalized: {enabled}");
+    assert_eq!(enabled["memory_max"], (256 * 1024 * 1024).to_string(), "memory.max normalized: {enabled}");
+    assert!(
+        !stderr.contains("cgroup.limits_unavailable"),
+        "controllers delegate here, so limits must engage; stderr:\n{stderr}"
+    );
+}

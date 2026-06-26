@@ -24,7 +24,7 @@ use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::cgroup::CgroupGuard;
 use crate::supervisor::kill::{kill_group, term_group, Ladder, LadderAction};
 use crate::supervisor::liveness::{Health, Liveness, LivenessConfig};
-use crate::supervisor::reap::Reaped;
+use crate::supervisor::reap::{Reaped, WaitOutcome};
 use crate::supervisor::reaper;
 use crate::supervisor::spawn::{spawn, Subagent};
 use crate::supervisor::tree::{Caps, NodeId, NodeStatus, Tree};
@@ -171,10 +171,15 @@ impl Supervisor {
         // LLM round-trip long before it could nest, so the window is empty.)
         if let Some(cg) = &self.cgroup {
             let placed = cg.place(sub.pid());
-            self.log.info(
-                "cgroup.placed",
-                json!({"node": node.0, "pid": sub.pid(), "cgroup": cg.path().display().to_string(), "ok": placed}),
-            );
+            let body = json!({"node": node.0, "pid": sub.pid(), "cgroup": cg.path().display().to_string(), "ok": placed});
+            if placed {
+                self.log.info("cgroup.placed", body);
+            } else {
+                // Placement failed (e.g. pids.max=0 refuses the move): the root
+                // runs in the PARENT cgroup, so this run silently loses both the
+                // limits AND the cgroup.kill teardown backstop — make it auditable.
+                self.log.warn("cgroup.placed", body);
+            }
         }
         self.pid_to_node.insert(sub.pid(), node);
         self.live.insert(node, sub);
@@ -340,7 +345,22 @@ impl Supervisor {
                     // arrives — otherwise the real reason (e.g. intel-unavailable →
                     // exit 4) would be masked as a generic exit 1.
                     if node == self.root && self.root_terminal.is_none() && self.drain.is_none() {
-                        self.root_exited_at.get_or_insert_with(Instant::now);
+                        // A SIGKILL with a non-zero cgroup OOM count means
+                        // `memory.max` killed the root — surface that plainly
+                        // instead of letting RESULT_GRACE conclude a generic
+                        // "exited without a result" that hides the operator's limit.
+                        let oom = matches!(r.outcome, WaitOutcome::Signaled(s) if s == libc::SIGKILL)
+                            && self.cgroup.as_ref().and_then(|c| c.oom_kills()).is_some_and(|n| n > 0);
+                        if oom {
+                            self.log.warn(
+                                "cgroup.oom_kill",
+                                json!({"node": node.0, "cgroup": self.cgroup.as_ref().map(|c| c.path().display().to_string())}),
+                            );
+                            self.root_terminal =
+                                Some(SuperviseResult::Failed("subagent killed by cgroup memory limit (OOM)".into()));
+                        } else {
+                            self.root_exited_at.get_or_insert_with(Instant::now);
+                        }
                     }
                 }
                 None => self.log.debug(

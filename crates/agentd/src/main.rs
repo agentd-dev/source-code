@@ -140,11 +140,27 @@ fn run() -> i32 {
         );
     }
     // Opt-in cgroup-v2 active enforcement (`--cgroup auto|<path>`): arm per-run
-    // child cgroups for atomic `cgroup.kill` teardown. Best-effort — silently
-    // dormant if the tree isn't writable (no delegation / off-cgroup).
+    // child cgroups for atomic `cgroup.kill` teardown, plus optional hard limits
+    // (`--cgroup-memory-max`/`--cgroup-pids-max`). Best-effort — silently dormant
+    // if the tree isn't writable (no delegation / off-cgroup).
     if let Some(spec) = cfg.cgroup.as_deref() {
-        match agentd::supervisor::cgroup::configure(Some(spec)) {
-            Some(parent) => log.info("cgroup.enabled", json!({"parent": parent.display().to_string()})),
+        match agentd::supervisor::cgroup::configure(
+            Some(spec),
+            cfg.cgroup_memory_max.as_deref(),
+            cfg.cgroup_pids_max.as_deref(),
+        ) {
+            Some(c) => {
+                log.info(
+                    "cgroup.enabled",
+                    json!({"parent": c.parent.display().to_string(), "memory_max": c.limits.memory_max, "pids_max": c.limits.pids_max}),
+                );
+                if c.limits_unavailable {
+                    // Limits were requested but the controllers couldn't be
+                    // delegated (e.g. `auto` under a busy unit cgroup) — teardown
+                    // still works, but the limits won't be enforced.
+                    log.warn("cgroup.limits_unavailable", json!({"parent": c.parent.display().to_string()}));
+                }
+            }
             None => log.warn("cgroup.unavailable", json!({"spec": spec})),
         }
     }

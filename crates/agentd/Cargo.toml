@@ -30,7 +30,8 @@ vsock = ["dep:vsock"]
 # poll/epoll listener for the high-fan-in served self-MCP only.
 serve-mcp = ["dep:mio"]
 # Optional cron-expression scheduling (internal time event source).
-cron = ["dep:croner", "dep:chrono"]
+# Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
+cron = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
 # OTLP span export + GenAI semconv. The one feature allowed heavier deps;
@@ -52,9 +53,7 @@ webpki-roots = { version = "0.26", optional = true }
 vsock = { version = "0.5", optional = true }
 # --- feature: serve-mcp ---
 mio = { version = "1", features = ["os-poll", "net"], optional = true }
-# --- feature: cron ---
-croner = { version = "2", optional = true }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+# --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.
 
 # Unix-only: signals (sigaction), process control (setpgid/killpg/waitpid),
 # prctl (PR_SET_CHILD_SUBREAPER / PR_SET_PDEATHSIG), setrlimit. Raw libc —

@@ -9,6 +9,7 @@
 
 use crate::obs::log::Logger;
 use serde_json::json;
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -19,14 +20,25 @@ use std::time::Duration;
 const STALE_AFTER_MS: u64 = 5_000;
 
 /// Bind `addr` and serve probes on a background thread. Returns the bind error
-/// (so the caller decides whether a failed bind is fatal). RFC 0010.
+/// (so the caller decides whether a failed bind is fatal). Accepts the bare
+/// `:port` form (all interfaces) as well as an explicit `host:port`. RFC 0010.
 pub fn spawn(addr: &str, log: Logger) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr)?;
-    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string());
+    let listener = TcpListener::bind(normalize_bind_addr(addr).as_ref())?;
+    let local = listener.local_addr().ok();
+    let bound = local.map(|a| a.to_string()).unwrap_or_else(|| addr.to_string());
     log.info(
         "metrics.serving",
         json!({"addr": bound, "endpoints": ["/metrics", "/healthz", "/readyz"]}),
     );
+    // Make all-interfaces exposure visible in the logs, not just inferable from
+    // the address. The surface is read-only + secret-free, but an operator who
+    // typed `:port` should see that it is reachable off-host.
+    if local.is_some_and(|a| a.ip().is_unspecified()) {
+        log.warn(
+            "metrics.bound_all_interfaces",
+            json!({"addr": bound, "note": "read-only probe surface reachable on all interfaces; restrict via firewall/NetworkPolicy or bind 127.0.0.1:PORT"}),
+        );
+    }
     thread::Builder::new()
         .name("metrics-http".into())
         .spawn(move || {
@@ -36,6 +48,21 @@ pub fn spawn(addr: &str, log: Logger) -> std::io::Result<()> {
             }
         })?;
     Ok(())
+}
+
+/// Expand a bare `:port` to `0.0.0.0:port` — the "all interfaces, this port"
+/// convention most servers accept, which `TcpListener::bind` otherwise rejects
+/// (an empty host fails to resolve). `0.0.0.0` is all *IPv4* interfaces (the
+/// conservative pick for an unauthenticated surface; it does not silently widen
+/// to IPv6 — pass `[::]:port` for that). An explicit `host:port` (incl. a
+/// bracketed IPv6 `[::]:port`) is passed through untouched, so it only ever
+/// *adds* a host where one is missing.
+fn normalize_bind_addr(addr: &str) -> Cow<'_, str> {
+    if addr.starts_with(':') {
+        Cow::Owned(format!("0.0.0.0{addr}"))
+    } else {
+        Cow::Borrowed(addr)
+    }
 }
 
 fn handle(mut stream: TcpStream) -> std::io::Result<()> {
@@ -103,6 +130,27 @@ mod tests {
 
         let (s, _, _) = route("/nope");
         assert!(s.starts_with("404"));
+    }
+
+    #[test]
+    fn normalize_bind_addr_expands_bare_port_only() {
+        // Bare :port → all interfaces.
+        assert_eq!(normalize_bind_addr(":9090"), "0.0.0.0:9090");
+        // Explicit hosts pass through untouched.
+        assert_eq!(normalize_bind_addr("0.0.0.0:9090"), "0.0.0.0:9090");
+        assert_eq!(normalize_bind_addr("127.0.0.1:9090"), "127.0.0.1:9090");
+        assert_eq!(normalize_bind_addr("localhost:9090"), "localhost:9090");
+        // IPv6 all-interfaces keeps its bracketed host (does not start with ':').
+        assert_eq!(normalize_bind_addr("[::]:9090"), "[::]:9090");
+    }
+
+    #[test]
+    fn bare_port_actually_binds() {
+        // The regression: TcpListener::bind(":0") fails to resolve, but the
+        // normalized form binds. Port 0 → an ephemeral port, so the test is
+        // self-contained and never collides.
+        let l = TcpListener::bind(normalize_bind_addr(":0").as_ref());
+        assert!(l.is_ok(), "bare :port must bind after normalisation: {l:?}");
     }
 
     #[test]

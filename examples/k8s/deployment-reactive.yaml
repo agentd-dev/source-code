@@ -59,10 +59,10 @@ spec:
             - file:///data/inbox
             # Serve /healthz + /readyz (+ /metrics) for the k8s probes below.
             # The scratch image has no shell, so HTTP probes — not exec — are
-            # the way to health-check it (rfcs/0010 §3.7). Bind 0.0.0.0 (not
-            # localhost) so the kubelet can reach it at the pod IP.
+            # the way to health-check it (rfcs/0010 §3.7). The bare `:port` form
+            # binds all IPv4 interfaces, so the kubelet reaches it at the pod IP.
             - --metrics-addr
-            - 0.0.0.0:9090
+            - :9090
             # Keep the drain budget < terminationGracePeriodSeconds above.
             - --drain-timeout
             - 25s

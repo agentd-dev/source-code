@@ -12,6 +12,11 @@
 //! up the control channel. Nested subagents keep their own (process-local)
 //! counters, still visible in their logs; cross-process metric rollup is a
 //! deliberate non-goal for v1 (same boundary as the tree token ceiling).
+//!
+//! Keep this surface **label-free** (bare aggregate counters/gauges, no run-id /
+//! model / path / error labels): `/metrics` is unauthenticated and may be bound
+//! on all interfaces, and labels are where a Prometheus exporter starts leaking
+//! identifiers or content.
 
 /// Terminal disposition of one supervised run.
 #[derive(Debug, Clone, Copy)]

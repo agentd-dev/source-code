@@ -176,6 +176,11 @@ impl Orchestrator {
         if self.child_count >= MAX_CHILDREN {
             return refused("maximum number of child subagents reached for this agent");
         }
+        // Memory backpressure: refuse nesting when the unit is at its memory.high
+        // soft limit (best-effort; never fires off-cgroup). The model adapts.
+        if crate::supervisor::cgroup::under_memory_pressure() {
+            return refused("memory pressure (cgroup at memory.high); do this step yourself or retry");
+        }
         let instruction = args.get("instruction").and_then(Value::as_str).unwrap_or("").trim();
         if instruction.is_empty() {
             return ("error: subagent.spawn requires a non-empty 'instruction'".into(), true);

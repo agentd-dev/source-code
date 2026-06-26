@@ -100,6 +100,11 @@ pub struct Config {
     /// Opt-in HTTP probe/scrape surface (`/metrics` + `/healthz` + `/readyz`).
     /// Off unless set; only honoured in `--features metrics` builds. RFC 0010.
     pub metrics_addr: Option<String>,
+    /// Opt-in cgroup-v2 active enforcement: `auto` (derive `<own-cgroup>/agentd`)
+    /// or an absolute path under `/sys/fs/cgroup`. Each run gets a child cgroup
+    /// for atomic `cgroup.kill` teardown. Best-effort — disabled if not writable;
+    /// agentd stays cgroup-aware, never cgroup-requiring. RFC 0010, assessment §2.3.
+    pub cgroup: Option<String>,
     /// Allow a lethal-trifecta grant (all three capability legs in one agent)
     /// instead of refusing at startup (RFC 0012 §3.2). Process-global operator
     /// override — deliberately NOT carried in the spawn payload.
@@ -135,6 +140,7 @@ impl Default for Config {
             traceparent: None,
             log_content: false,
             metrics_addr: None,
+            cgroup: None,
             allow_trifecta: false,
             cron: None,
         }
@@ -167,6 +173,7 @@ impl fmt::Debug for Config {
             .field("traceparent", &self.traceparent)
             .field("log_content", &self.log_content)
             .field("metrics_addr", &self.metrics_addr)
+            .field("cgroup", &self.cgroup)
             .field("allow_trifecta", &self.allow_trifecta)
             .field("cron", &self.cron)
             .finish()
@@ -243,6 +250,9 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_METRICS_ADDR") {
             c.metrics_addr = Some((*v).to_string());
         }
+        if let Some(v) = envmap.get("AGENTD_CGROUP") {
+            c.cgroup = Some((*v).to_string());
+        }
         if let Some(v) = envmap.get("AGENTD_ALLOW_TRIFECTA") {
             c.allow_trifecta = truthy(v);
         }
@@ -314,6 +324,7 @@ impl Config {
                 "--allow-trifecta" => c.allow_trifecta = true,
                 "--mcp-tags" => mcp_tags.push(parse_mcp_tags(&take("--mcp-tags")?)?),
                 "--metrics-addr" => c.metrics_addr = Some(take("--metrics-addr")?),
+                "--cgroup" => c.cgroup = Some(take("--cgroup")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
@@ -522,6 +533,7 @@ fn help_text() -> String {
          \x20 --drain-timeout <dur>       graceful drain budget (default 25s; < pod grace)\n\
          \x20 --health-file <PATH>        liveness heartbeat file\n\
          \x20 --metrics-addr <ADDR>       serve /metrics+/healthz+/readyz (needs --features metrics)\n\
+         \x20 --cgroup <auto|PATH>        per-run cgroup for atomic cgroup.kill teardown (best-effort)\n\
          \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION

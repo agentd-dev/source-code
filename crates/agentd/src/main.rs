@@ -139,6 +139,15 @@ fn run() -> i32 {
             json!({"memory_max": mem.max, "memory_current": mem.current, "memory_high": mem.high}),
         );
     }
+    // Opt-in cgroup-v2 active enforcement (`--cgroup auto|<path>`): arm per-run
+    // child cgroups for atomic `cgroup.kill` teardown. Best-effort — silently
+    // dormant if the tree isn't writable (no delegation / off-cgroup).
+    if let Some(spec) = cfg.cgroup.as_deref() {
+        match agentd::supervisor::cgroup::configure(Some(spec)) {
+            Some(parent) => log.info("cgroup.enabled", json!({"parent": parent.display().to_string()})),
+            None => log.warn("cgroup.unavailable", json!({"spec": spec})),
+        }
+    }
 
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),

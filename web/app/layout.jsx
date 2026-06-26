@@ -1,62 +1,111 @@
 import "./globals.css";
 import Link from "next/link";
-import ResourcesMenu from "./resources-menu";
 
 export const metadata = {
-  title: "agentd — spin up an AI agent that works on its own",
+  metadataBase: new URL("https://agentd.dev"),
+  title: "agentd — a small, cloud-native AI agent daemon, MCP-native",
   description:
-    "Spin up an AI agent that works on its own. Give it a task, a goal, or a " +
-    "whole workflow — agentd runs as a daemon (or a one-shot), calls tools, " +
-    "and self-corrects, with every step governed, observable, and audited.",
+    "agentd is a minimal, MCP-native, reactive agent runtime: one static binary " +
+    "that takes an instruction and tools from MCP servers and runs the agentic " +
+    "loop — as a one-shot, a daemon, or a reactive service. Supervised, bounded, " +
+    "observable. ~1.3 MB, 3 dependencies, k8s-ready.",
+  keywords: [
+    "agentd",
+    "MCP",
+    "Model Context Protocol",
+    "AI agent",
+    "agent runtime",
+    "cloud native",
+    "kubernetes",
+    "daemon",
+    "Rust",
+  ],
+  openGraph: {
+    title: "agentd — a small, cloud-native AI agent daemon",
+    description:
+      "An instruction + tools from MCP + one static binary. Run the agentic loop as a one-shot, a daemon, or a reactive service.",
+    type: "website",
+    url: "https://agentd.dev",
+  },
 };
+
+function Nav() {
+  return (
+    <header className="sticky top-0 z-40 border-b border-[var(--line)] bg-[var(--bg)]/80 backdrop-blur">
+      <nav aria-label="primary" className="mx-auto flex max-w-5xl items-center gap-6 px-4 py-3 text-sm">
+        <Link href="/" className="font-bold text-[var(--fg-strong)]">
+          agentd<span className="text-[var(--dim)]">@</span>
+          <span className="text-[var(--green)]">~</span>
+        </Link>
+        <Link href="/#mcp" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          mcp
+        </Link>
+        <Link href="/#capabilities" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          capabilities
+        </Link>
+        <Link href="/#run" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          run it
+        </Link>
+        <Link href="/docs/overview/" className="text-[var(--dim)] hover:text-[var(--fg-strong)]">
+          docs
+        </Link>
+        <a
+          href="https://github.com/agentd-dev/source-code"
+          className="ml-auto text-[var(--dim)] hover:text-[var(--green)]"
+        >
+          github ↗
+        </a>
+      </nav>
+    </header>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="mt-24 border-t border-[var(--line)]">
+      <div className="mx-auto flex max-w-5xl flex-col gap-4 px-4 py-10 text-xs text-[var(--dim)] sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <span className="text-[var(--green)]">$</span>{" "}
+          <span className="text-[var(--fg)]">agentd</span> — a minimal, MCP-native, reactive agent
+          runtime · MIT
+        </div>
+        <div className="flex gap-5">
+          <Link href="/docs/overview/" className="hover:text-[var(--fg-strong)]">
+            docs
+          </Link>
+          <Link href="/docs/rfc-0001/" className="hover:text-[var(--fg-strong)]">
+            rfcs
+          </Link>
+          <a
+            href="https://github.com/agentd-dev/source-code"
+            className="hover:text-[var(--green)]"
+          >
+            github
+          </a>
+          <a
+            href="https://modelcontextprotocol.io"
+            className="hover:text-[var(--fg-strong)]"
+          >
+            mcp ↗
+          </a>
+        </div>
+      </div>
+    </footer>
+  );
+}
 
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <body className="crt min-h-screen">
-        <header className="frame border-x-0 border-t-0 sticky top-0 z-40 backdrop-blur bg-[var(--bg)]/90">
-          <nav className="mx-auto flex max-w-5xl items-center gap-6 px-4 py-3 text-sm">
-            <Link href="/" className="text-[var(--accent)] font-bold">
-              agentd<span className="text-[var(--dim)]">@~</span>
-              <span className="cursor" />
-            </Link>
-            {/* Mobile: rfcs / use cases / inspect group under one
-                dropdown; docs and [github] stay directly tappable. */}
-            <ResourcesMenu />
-            <Link
-              href="/use-cases/"
-              className="hidden md:inline text-[var(--dim)] hover:text-[var(--accent)]"
-            >
-              use cases
-            </Link>
-            <Link href="/docs/overview/" className="text-[var(--dim)] hover:text-[var(--accent)]">
-              docs
-            </Link>
-            <Link
-              href="/docs/rfc-0001/"
-              className="hidden md:inline text-[var(--dim)] hover:text-[var(--accent)]"
-            >
-              rfcs
-            </Link>
-            <Link
-              href="/inspect/"
-              className="hidden md:inline text-[var(--dim)] hover:text-[var(--accent)]"
-            >
-              inspect
-            </Link>
-            <a
-              href="https://github.com/agentd-dev/source-code"
-              className="ml-auto text-[var(--dim)] hover:text-[var(--accent)]"
-            >
-              [github]
-            </a>
-          </nav>
-        </header>
-        {children}
-        <footer className="mx-auto max-w-5xl px-4 py-10 text-xs text-[var(--dim)]">
-          <span className="text-[var(--accent)]">$</span> echo "MIT licensed · built with a
-          predeclared DAG, like everything else here"
-        </footer>
+      <body className="min-h-screen">
+        <a href="#content" className="skip">
+          Skip to content
+        </a>
+        <Nav />
+        <div id="content" tabIndex={-1}>
+          {children}
+        </div>
+        <Footer />
       </body>
     </html>
   );

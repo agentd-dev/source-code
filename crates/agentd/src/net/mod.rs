@@ -4,6 +4,7 @@
 //! feature-gated tls/vsock transports. RFC 0006 §transports.
 
 pub mod http;
+pub mod ssrf;
 pub mod unixsock;
 
 #[cfg(feature = "tls")]

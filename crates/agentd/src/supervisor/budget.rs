@@ -39,6 +39,10 @@ impl Budget {
     pub fn steps(&self) -> u32 {
         self.steps
     }
+    /// The configured step ceiling (for an informational `loop.start` field).
+    pub fn max_steps(&self) -> u32 {
+        self.max_steps
+    }
 
     /// The terminal status for whichever bound is hit, if any. Checked at the
     /// top of each turn so the loop stops *before* spending more. Deadline is

@@ -101,6 +101,27 @@ fn run() -> i32 {
         }),
     );
 
+    // Rule of Two (RFC 0012 §3.2): refuse a grant that co-locates all three
+    // lethal capability legs (untrusted input + sensitive data + egress) in one
+    // agent, unless --allow-trifecta. Scope narrows monotonically (RFC 0009), so
+    // enforcing on the root grant bounds the entire subagent tree.
+    use agentd::sec::scope::{check_trifecta, TrifectaVerdict};
+    match check_trifecta(cfg.trifecta_grant_tags(), cfg.allow_trifecta) {
+        TrifectaVerdict::Ok => {}
+        TrifectaVerdict::AllowedWithWarning => {
+            log.warn("scope.trifecta_grant", json!({"allowed": true, "legs": ["untrusted_input", "sensitive", "egress"]}));
+        }
+        TrifectaVerdict::RefusedTrifecta => {
+            log.error("scope.trifecta_refused", json!({"legs": ["untrusted_input", "sensitive", "egress"]}));
+            eprintln!(
+                "agentd: refused — this grant gives one agent all three lethal-trifecta legs \
+                 (untrusted input + sensitive data + egress). Split the capabilities across \
+                 subagents, or relaunch with --allow-trifecta."
+            );
+            return exit::USAGE;
+        }
+    }
+
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
         // The long-lived modes all re-exec a root subagent, so they need our

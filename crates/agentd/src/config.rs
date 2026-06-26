@@ -11,6 +11,7 @@
 //! stable surface.)
 
 use crate::obs::log::Level;
+use crate::sec::scope::TrifectaTag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -56,6 +57,12 @@ impl Mode {
 pub struct McpServerSpec {
     pub name: String,
     pub command: Vec<String>,
+    /// Operator-declared capability tags (`--mcp-tags`) for the Rule-of-Two
+    /// trifecta check (RFC 0012 §3.1). Travels in the spawn payload so a child's
+    /// narrowed grant carries the same tags. Empty = untagged (the check treats
+    /// an untagged server conservatively as `untrusted_input`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<TrifectaTag>,
 }
 
 /// The fully-resolved, validated configuration.
@@ -89,6 +96,10 @@ pub struct Config {
     /// Opt-in HTTP probe/scrape surface (`/metrics` + `/healthz` + `/readyz`).
     /// Off unless set; only honoured in `--features metrics` builds. RFC 0010.
     pub metrics_addr: Option<String>,
+    /// Allow a lethal-trifecta grant (all three capability legs in one agent)
+    /// instead of refusing at startup (RFC 0012 §3.2). Process-global operator
+    /// override — deliberately NOT carried in the spawn payload.
+    pub allow_trifecta: bool,
 }
 
 impl Default for Config {
@@ -115,6 +126,7 @@ impl Default for Config {
             traceparent: None,
             log_content: false,
             metrics_addr: None,
+            allow_trifecta: false,
         }
     }
 }
@@ -144,6 +156,7 @@ impl fmt::Debug for Config {
             .field("traceparent", &self.traceparent)
             .field("log_content", &self.log_content)
             .field("metrics_addr", &self.metrics_addr)
+            .field("allow_trifecta", &self.allow_trifecta)
             .finish()
     }
 }
@@ -218,6 +231,9 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_METRICS_ADDR") {
             c.metrics_addr = Some((*v).to_string());
         }
+        if let Some(v) = envmap.get("AGENTD_ALLOW_TRIFECTA") {
+            c.allow_trifecta = truthy(v);
+        }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
@@ -226,6 +242,9 @@ impl Config {
         }
 
         // --- flag layer (overrides env) ---
+        // `--mcp-tags` may precede or follow its `--mcp`; collect and apply once
+        // every server is known.
+        let mut mcp_tags: Vec<(String, Vec<TrifectaTag>)> = Vec::new();
         let mut it = args.iter().peekable();
         while let Some(arg) = it.next() {
             let mut take = |name: &str| -> Result<String, ConfigError> {
@@ -275,6 +294,8 @@ impl Config {
                 "--drain-timeout" => c.drain_timeout = parse_duration(&take("--drain-timeout")?).map_err(usage)?,
                 "--enable-exec" => c.enable_exec = true,
                 "--log-content" => c.log_content = true,
+                "--allow-trifecta" => c.allow_trifecta = true,
+                "--mcp-tags" => mcp_tags.push(parse_mcp_tags(&take("--mcp-tags")?)?),
                 "--metrics-addr" => c.metrics_addr = Some(take("--metrics-addr")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
@@ -283,11 +304,40 @@ impl Config {
             }
         }
 
+        // Apply collected `--mcp-tags` to their servers (order-independent).
+        for (name, tags) in mcp_tags {
+            match c.mcp_servers.iter_mut().find(|s| s.name == name) {
+                Some(s) => s.tags = tags,
+                None => return Err(usage(format!("--mcp-tags references unknown server '{name}'"))),
+            }
+        }
+
         if c.run_id.is_empty() {
             c.run_id = generate_run_id();
         }
         c.validate()?;
         Ok(c)
+    }
+
+    /// The capability-tag union of the root agent's grant, for the Rule-of-Two
+    /// trifecta check (RFC 0012 §3.1). An untagged MCP server contributes
+    /// `untrusted_input` (the conservative default); `--enable-exec` contributes
+    /// `egress` (exec moves data / changes external state). Because scope narrows
+    /// monotonically (RFC 0009), enforcing on this root union bounds the whole
+    /// subagent tree.
+    pub fn trifecta_grant_tags(&self) -> Vec<TrifectaTag> {
+        let mut tags = Vec::new();
+        for s in &self.mcp_servers {
+            if s.tags.is_empty() {
+                tags.push(TrifectaTag::UntrustedInput);
+            } else {
+                tags.extend(s.tags.iter().copied());
+            }
+        }
+        if self.enable_exec {
+            tags.push(TrifectaTag::Egress);
+        }
+        tags
     }
 
     /// Reject inconsistent config before any side effect (RFC 0011 §2).
@@ -341,7 +391,26 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     if name.is_empty() || command.is_empty() {
         return Err(usage(format!("--mcp '{spec}' has empty name or command")));
     }
-    Ok(McpServerSpec { name: name.to_string(), command })
+    Ok(McpServerSpec { name: name.to_string(), command, tags: Vec::new() })
+}
+
+/// Parse `--mcp-tags name=tag,tag` into (server-name, tags). Tags are the
+/// snake-case capability legs (RFC 0012 §3.1).
+fn parse_mcp_tags(spec: &str) -> Result<(String, Vec<TrifectaTag>), ConfigError> {
+    let (name, list) = spec
+        .split_once('=')
+        .ok_or_else(|| usage(format!("--mcp-tags must be name=tag,tag (got: {spec})")))?;
+    if name.is_empty() {
+        return Err(usage(format!("--mcp-tags '{spec}' has an empty server name")));
+    }
+    let mut tags = Vec::new();
+    for t in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let tag = TrifectaTag::parse(t).ok_or_else(|| {
+            usage(format!("unknown trifecta tag '{t}' (want: untrusted_input|sensitive|egress)"))
+        })?;
+        tags.push(tag);
+    }
+    Ok((name.to_string(), tags))
 }
 
 fn read_file(path: &str) -> Result<String, ConfigError> {
@@ -407,6 +476,8 @@ fn help_text() -> String {
          \x20 --mcp name=command          declare an MCP server (repeatable; stdio)\n\
          \x20 --serve-mcp <unix:/path>    serve agentd's own MCP\n\
          \x20 --enable-exec               expose the gated exec tool\n\
+         \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
+         \x20 --allow-trifecta            permit all three capability legs in one agent\n\
          \n\
          MODE / TRIGGERS:\n\
          \x20 --mode once|loop|reactive|schedule   (default once)\n\
@@ -448,6 +519,40 @@ mod tests {
         let c = Config::load(&args(&["--instruction", "from-flag"]), &env).unwrap();
         assert_eq!(c.instruction.as_deref(), Some("from-flag"));
         assert_eq!(c.intelligence.as_deref(), Some("unix:/run/intel.sock"));
+    }
+
+    fn base_env() -> Vec<(String, String)> {
+        vec![("INSTRUCTION".into(), "x".into()), ("AGENTD_INTELLIGENCE".into(), "unix:/x".into())]
+    }
+
+    #[test]
+    fn mcp_tags_attach_to_their_server_order_independent() {
+        // --mcp-tags before its --mcp still resolves.
+        let c = Config::load(
+            &args(&["--mcp-tags", "fs=sensitive,egress", "--mcp", "fs=mcp-fs"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.mcp_servers[0].tags, vec![TrifectaTag::Sensitive, TrifectaTag::Egress]);
+    }
+
+    #[test]
+    fn mcp_tags_unknown_server_or_tag_is_usage_error() {
+        let bad_server =
+            Config::load(&args(&["--mcp", "fs=cmd", "--mcp-tags", "ghost=egress"]), &base_env()).unwrap_err();
+        assert!(matches!(bad_server, ConfigError::Usage(_)));
+        let bad_tag =
+            Config::load(&args(&["--mcp", "fs=cmd", "--mcp-tags", "fs=bogus"]), &base_env()).unwrap_err();
+        assert!(matches!(bad_tag, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn trifecta_grant_tags_defaults_untagged_to_untrusted_and_exec_to_egress() {
+        let c = Config::load(&args(&["--mcp", "fs=cmd", "--enable-exec"]), &base_env()).unwrap();
+        let tags = c.trifecta_grant_tags();
+        assert!(tags.contains(&TrifectaTag::UntrustedInput)); // untagged server
+        assert!(tags.contains(&TrifectaTag::Egress)); // --enable-exec
+        assert!(!tags.contains(&TrifectaTag::Sensitive)); // two legs → not a trifecta
     }
 
     #[test]

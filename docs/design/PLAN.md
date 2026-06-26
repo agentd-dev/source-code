@@ -59,30 +59,28 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M6 observability depth — the **`metrics` feature** (dependency-free
-  Prometheus counters + an opt-in `/metrics`+`/healthz`+`/readyz` HTTP surface)
-  landed this wake, on top of `--log-content` and the prior hardening pass
-  (restart governor, lethal-trifecta check, SSRF classifier, exit-code table).
-- **Last completed (this wake):** the **`metrics` feature**. `obs/metrics.rs` is
-  always compiled but its `record_*` fns are no-ops without `--features metrics`
-  (registry + `render_prometheus` gated) — clean call sites, zero default cost,
-  default build still 3 deps. Counters increment at the supervisor chokepoints
-  (`supervise_once` start/outcome, the `Usage` token handler, `trigger.fired`,
-  the restart-breaker trip). `obs/serve.rs` (gated) serves `/metrics` +
-  `/healthz` + `/readyz` on one blocking-accept thread bound by `--metrics-addr`
-  (+`AGENTD_METRICS_ADDR`); `/healthz` reuses the supervisor-heartbeat liveness.
-  Live-proven via curl (valid Prometheus; 200/`ok`/503/404 routing). This also
-  closes M5's opt-in HTTP health surface. (Prior wakes: `--log-content`; restart
-  governor; trifecta + SSRF checks; exit-code table.) **172 tests** under
-  `--features metrics` (169 default), clippy clean (default + metrics + all).
-- **Next action:** wire the **trifecta chokepoint** (`orchestrator.rs` +
-  `--allow-trifecta` + tool→tag source — design Q: how the process-global flag
-  reaches the in-subagent orchestrator without enabling self-escalation), or
-  `--aggregate-logs` (forward child telemetry up the control channel), or the
-  **`--serve-mcp` peer listener**. Remaining M6: `otel` feature (the one feature
-  allowed heavier deps). Bigger items: `cron` feature, M3 warm
-  sessions/async-spawn/self-subscribe, M5 drain choreography + cgroup-v2, M7
-  (conformance + observe-suite + container + docs).
+- **Phase:** M6 observability + security tags — the **lethal-trifecta check is
+  now wired and enforcing** (`--mcp-tags` + `--allow-trifecta`, refused at root
+  startup); `--aggregate-logs` resolved as satisfied-by-design (stderr
+  inheritance). On top of metrics, `--log-content`, and the prior hardening pass.
+- **Last completed (this wake):** **trifecta enforcement wired** + the
+  `--aggregate-logs` deviation. Tag source `--mcp-tags name=tag,tag` (carried in
+  the spawn payload); untagged → `untrusted_input`, `--enable-exec` → `egress`.
+  `Config::trifecta_grant_tags()` feeds `check_trifecta` **once at root startup**
+  (`main.rs`): refuse → exit 2 + `scope.trifecta_refused`; `--allow-trifecta` →
+  proceed + `scope.trifecta_grant` warn. Root enforcement bounds the tree
+  (monotonic narrowing, RFC 0009) — no per-spawn check, no flag-in-payload.
+  `--aggregate-logs` resolved as satisfied-by-design (child stderr is
+  `Stdio::inherit()` → already single-stream). Observe-proven via CLI (exit
+  2 / warn+proceed / silent). (Prior wakes: metrics feature; `--log-content`;
+  restart governor; SSRF classifier; exit-code table.) No new deps, default
+  build still 3 deps. **172 tests** green, clippy clean (default + all-features).
+- **Next action:** M6's only remaining code item is the **`otel` feature** (OTLP
+  + GenAI semconv — the one feature allowed heavier deps; a bigger lift, defer
+  unless prioritized). Otherwise advance to: the **`--serve-mcp` peer listener**
+  (M2/M4 composability), the `cron` feature (M4), M3 reactive depth (warm
+  sessions / async-spawn / self-subscribe — the signature capability), M5 drain
+  choreography + cgroup-v2, M7 (conformance + observe-suite + container + docs).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -179,8 +177,8 @@ Modules: `obs/{trace,metrics}.rs`; extends `obs/log.rs sec/scope.rs net/http.rs`
 - [x] **LLM `traceparent` header**: the run's `trace_id` threaded into the intel client (`set_trace_id`); every completion carries a fresh-span `traceparent` so the LLM call joins the run's trace (unit-tested `apply_trace_header`).
 - [x] **full closed event vocabulary emitted across supervisor + agent**: closed the §2.9 gaps — `config.loaded` (validated policy; content-off, lengths/schemes only), `mcp.connect` success (supervisor + subagent), `proc.ready`, `loop.step` (per-turn budget anchor), `subagent.stuck` (distinct liveness verdict); aligned `reactive.armed`/`schedule.armed` → canonical `trigger.armed`. Observe-proven in a live reactive run.
 - [x] `--log-content` (content capture, opt-in) — off by default (telemetry logs lengths only); `--log-content`/`AGENTD_LOG_CONTENT` adds the truncated tool args/results. Rides in the `Telemetry` block so it propagates to every child; `config.loaded` reports the policy; `Logger::content_capture()` gates the `tool.call`/`tool.result` content. Observe-proven (live run shows `log_content:true`). _(Redaction allowlist for secret-bearing tool args: a follow-up.)_
-- [ ] `--aggregate-logs` (mode B) — forward child telemetry up the control channel for single-stream environments
-- [~] `sec/scope.rs` Rule-of-Two tag check — **pure check landed**: `TrifectaTag` (untrusted-input / sensitive-data / egress) + `check_trifecta(tags, allow) → Ok | RefusedTrifecta | AllowedWithWarning` (any two legs ok; all three refused unless `allow_trifecta`), 9 unit tests. _Remaining to close acceptance: the operator tool→tag source (MCP server config), the chokepoint call in `subagent/orchestrator.rs::spawn` (refuse as tool-result + `scope.trifecta_grant` warn event), and the process-global `--allow-trifecta` flag (must NOT propagate into child payloads)._
+- [x] `--aggregate-logs` (mode B) — **satisfied by design / deviation noted.** The child's stderr is `Stdio::inherit()` (`spawn.rs`), so all subagent JSON telemetry already lands on the supervisor's single stderr stream by fd inheritance — the single-stream outcome mode B targets, without the control-channel forwarding machinery. An explicit forwarding path would only matter where a child's stderr is deliberately separated (uncommon for this deployment shape); deferred as redundant for v1 rather than built. Correlation fields are never rewritten (each process self-logs pre-correlated).
+- [x] `sec/scope.rs` Rule-of-Two tag check — **wired and enforcing**. `TrifectaTag` (untrusted-input / sensitive-data / egress) + `check_trifecta`. Tag source: `--mcp-tags name=tag,tag` attaches operator tags to a server (carried in the spawn payload); untagged → `untrusted_input` (conservative default); `--enable-exec` → `egress`. Enforced **once at root startup** (`main.rs`): `Config::trifecta_grant_tags()` → refuse with exit 2 + `scope.trifecta_refused` unless `--allow-trifecta` (then proceed + `scope.trifecta_grant` warn). **Design note / deviation from RFC's per-spawn chokepoint:** because scope narrows monotonically (RFC 0009) a child's tags ⊆ the root's, so the single root check bounds the whole tree — no in-subagent orchestrator check, hence no process-global-flag-propagation problem. `--allow-trifecta` stays out of the payload. Observe-proven (refuse→exit 2, allow→warn+proceed, two-legs→silent).
 - [~] SSRF guard — **pure classifier landed** in `net/ssrf.rs`: `is_global(IpAddr)` + `guard_host(host, allow_private)` reject loopback / RFC-1918 / link-local / ULA / unspecified / multicast / IPv4-mapped equivalents, 18 unit tests. _Not wired to a default-on call site: agentd's only HTTP client path is the operator-configured (trusted) intelligence endpoint, frequently localhost — blocking it would be wrong. The guard is ready for any future model/agent-supplied-URL fetcher, which MUST route through `guard_host` (acceptance "refuses RFC-1918 by default" applies there)._
 - [x] `metrics` feature (Prometheus text) — **dependency-free**: `obs/metrics.rs` is always compiled but its `record_*` fns are no-ops unless `--features metrics` (the atomic registry + `render_prometheus` are gated), so default call sites stay clean and cost nothing. Counters (runs started/completed/failed/killed, reactions, in/out tokens, restart-breaker trips) increment at the supervisor chokepoints (`supervise_once`, the `Usage` handler, `trigger.fired`, breaker trip). `obs/serve.rs` (gated) serves `/metrics` + `/healthz` + `/readyz` on a single blocking-accept thread bound by `--metrics-addr` (opt-in). Live-proven via curl (valid Prometheus, 200/503/404 routing). Per-process scope documented (same boundary as the tree token ceiling).
 - [ ] `otel` feature (OTLP + GenAI semconv, HTTP exporter)

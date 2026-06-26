@@ -11,6 +11,16 @@
 > (never push), (6) tick the checkbox and update **Current status**. Keep
 > changes small and always leave the tree compiling + tests green. If a
 > milestone's acceptance criteria are all met, advance to the next.
+>
+> **Completion protocol (operator instruction, 2026-06-26):** when **every
+> milestone M1–M7 is complete and its acceptance holds**, the build is done —
+> stop changing code, report completion, **and disable the hourly build cron**:
+> `CronDelete` job **`6885e804`** (the operator asked for the loop to be turned
+> off once everything is completed). Do not disable it before then. If some
+> items are permanently infra-gated (live-vsock microVM peer, container image
+> build, an external MCP peer), treat the milestone as code-complete once the
+> code + tests are in and the only gap is external infrastructure — record that
+> explicitly in Current status before disabling.
 
 ---
 

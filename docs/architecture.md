@@ -258,7 +258,7 @@ crates/agentd/src/
   triggers/
     mode.rs            once/loop/reactive/schedule drivers (exit predicates)
     router.rs          reactive routing: exactly-one-owner, debounce/coalesce, queues
-    timer.rs           interval + cron event source             [cron via croner: feature]
+    timer.rs           interval + cron event source             [cron: hand-rolled 5-field UTC parser, feature]
   subagent/
     control.rs         control-channel reader thread (decoupled from loop) + ping/pong
     protocol.rs        spawn payload, control messages, upward events, result
@@ -446,9 +446,9 @@ updates.
 > - **Self-MCP serving is stdio/unix-socket only in v1.** A real Streamable HTTP
 >   server (sessions, Origin checks, SSE upgrade, resumability) is **deferred
 >   (roadmap)**.
-> - **Async subagents land in M3.** v1 `subagent.spawn` is **synchronous** — it
->   blocks the parent's turn and returns the distilled result. `{async}` /
->   `{detach}` spawns and completion-as-self-resource are **roadmap (M3)**.
+> - **`subagent.spawn` defaults to synchronous** — it blocks the parent's turn
+>   and returns the distilled result. `{async}` / `{detach}` spawns and
+>   completion-as-self-resource (`agentd://subagent/<handle>`) also ship.
 > - **MCP tasks, sampling, and roots are deferred** to v2 (RFC 0013). v1
 >   declares no client capabilities; it answers `roots/list` with `{"roots":[]}`
 >   and rejects an unsolicited `sampling/createMessage`.

@@ -1,6 +1,6 @@
 # RFC 0001: MCP-native agent runtime — core architecture
 
-**Status:** Draft
+**Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
@@ -422,8 +422,7 @@ exceeding any cap is refused as a tool result** (the parent's model adapts), nev
 a crash (RFC 0009). Subagents are **sync-default**: `subagent.spawn` blocks the
 parent's turn (simplest, deterministic; the parent is cheaply paused between
 turns). Async (`{async:true}` handle / completion-as-self-resource) and detached
-(`{detach:true}`) spawns are specified but **land in M3 alongside reactivity** —
-**v1 ships sync-only** (RFC 0009).
+(`{detach:true}`) spawns **shipped in M3 alongside reactivity** (RFC 0009).
 
 ---
 
@@ -535,8 +534,8 @@ to it — composing agents without any new protocol.
 **Tools the self-MCP exposes** (v1; names illustrative):
 
 - `subagent.spawn(instruction, output_contract, context_seed?, tool_scope?, limits?)`
-  — create a child agent process; **sync (blocking) in v1**; returns the distilled
-  result. Async/detach land in M3.
+  — create a child agent process; **sync (blocking) by default**; returns the distilled
+  result. Async/detach shipped in M3.
 - `subagent.send(handle, message)` / `subagent.cancel(handle)` /
   `subagent.status(handle)` — inject, control, introspect.
 - `subscribe(resource_uri)` / `unsubscribe(resource_uri)` — register/clear interest

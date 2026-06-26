@@ -40,7 +40,7 @@ pub struct ExecResult {
     pub timed_out: bool,
 }
 
-/// Run `argv` (argv[0] = absolute path) with a timeout. Returns `Err` for a
+/// Run `argv` (its first element is the absolute path) with a timeout. Returns `Err` for a
 /// validation/spawn failure (a recoverable observation); `Ok` for a command
 /// that *ran* — its exit code is data the model interprets.
 pub fn run(argv: &[String], timeout: Duration) -> Result<ExecResult, String> {

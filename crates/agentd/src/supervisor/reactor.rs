@@ -4,17 +4,20 @@
 //! One thread owns the `Tree`, the `NodeId → Subagent` handle map, and a
 //! per-child `Liveness`. It blocks on the merged event channel (every
 //! subagent's reader thread forwards `(NodeId, AgentMsg)` here) with a short
-//! `recv_timeout` tick that doubles as the timer; each tick it reaps exited
-//! children (`reap::reap_pending` on the SIGCHLD flag), classifies liveness,
-//! and — on a drain signal or a stuck/deadline/budget verdict — drives the
-//! bounded `kill::Ladder` over `tree.deepest_first()`.
+//! `recv_timeout` tick that doubles as the timer; each tick it drains the
+//! process-global reaper (`reaper::reap_and_dispatch`, which routes each reaped
+//! pid to its owning supervisor), classifies liveness, and — on a drain signal
+//! or a stuck/deadline/budget verdict — drives the bounded `kill::Ladder` over
+//! `tree.deepest_first()`.
 //!
-//! M2 supervises a single **root** subagent (once-mode). Nested children
-//! arrive via the self-MCP `subagent.spawn` tool (later in M2/M3); the loop is
-//! already written to tear down a multi-node tree deepest-first.
+//! This reactor supervises a single **root** subagent to completion
+//! (once-mode). Nested children are spawned by the running subagent via the
+//! self-MCP `subagent.spawn` tool (`subagent/orchestrator.rs`), each supervised
+//! by its own recursively-spawned `Supervisor`; this loop's deepest-first
+//! teardown over a multi-node `Tree` is exercised when a tree is built locally.
 //!
 //! The signal self-pipe (`signals::wakeup_fd`) is built for sub-tick
-//! promptness; v1's short tick already bounds signal/deadline latency, so the
+//! promptness; the short tick already bounds signal/deadline latency, so the
 //! reactor polls the flags each tick and just drains the pipe for hygiene.
 
 use crate::agentloop::stop::Outcome;

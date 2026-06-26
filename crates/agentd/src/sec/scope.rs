@@ -10,8 +10,9 @@
 //!    `egress`; granting one subagent all three legs of the lethal trifecta is
 //!    refused unless explicitly overridden (`--allow-trifecta`).
 //!
-//! This is pure logic; it is wired into the spawn chokepoint (with
-//! `supervisor/tree.rs`) and the self-MCP grant path in later M2 steps.
+//! This is pure logic; the trifecta check (`check_trifecta`) runs at the root
+//! grant in `main.rs` and scope narrowing runs at the `subagent.spawn`
+//! chokepoint in `subagent/orchestrator.rs`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

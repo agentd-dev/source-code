@@ -10,11 +10,14 @@
 //! one, so `PDEATHSIG` + the subreaper keep the nested tree in the reaping
 //! domain (RFC 0003).
 //!
-//! v1 is **synchronous**: the parent's agentic loop blocks while the child
-//! runs (its control thread keeps answering pings, so the grandparent sees it
-//! as busy, not stuck). Async delegation lands in M3.
+//! By default delegation is **synchronous**: the parent's agentic loop blocks
+//! on the nested supervisor while the child runs (its control thread keeps
+//! answering pings, so the grandparent sees it as busy, not stuck). `async=true`
+//! instead returns a handle immediately and the parent collects the result later
+//! via `subagent.await` / `subagent.status` / `agentd://subagent/<handle>` (see
+//! `spawn_async`); `detach=true` is fire-and-forget.
 //!
-//! Known v1 limitation: the tree-wide token ceiling is enforced per *local*
+//! Known limitation: the tree-wide token ceiling is enforced per *local*
 //! supervisor, not globally across the nested tree (each subagent bounds its
 //! own children); per-child token/step/deadline limits still apply.
 
@@ -57,6 +60,10 @@ const AWAIT_MAX: Duration = Duration::from_secs(30);
 /// and `Subagent`'s Drop kills + reaps it when the orchestrator is dropped, so
 /// no async child outlives the parent's tree (RFC 0009 §async).
 struct AsyncChild {
+    /// Held only for its `Drop` (kills + reaps the child) — never read directly,
+    /// but dropping it early would tear the child down, so it must outlive the
+    /// entry. `#[allow(dead_code)]` makes that RAII intent explicit.
+    #[allow(dead_code)]
     sub: Subagent,
     rx: Receiver<(NodeId, AgentMsg)>,
     /// `Some((distilled, is_error))` once a terminal `Result`/`Failed` (or the
@@ -496,8 +503,8 @@ fn status_tool_def() -> ToolDef {
     ToolDef {
         name: "subagent.status".into(),
         description: "Check on an async child you spawned (by 'handle'). Returns 'still running', or \
-            — once it has finished — its distilled result (after which the handle is consumed). \
-            Non-blocking."
+            — once it has finished — its distilled result (repeatable: the handle is not consumed, so \
+            you can check again). Non-blocking."
             .into(),
         input_schema: json!({
             "type": "object",

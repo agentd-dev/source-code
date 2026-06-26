@@ -1,6 +1,6 @@
 # RFC 0012: Security posture
 
-**Status:** Draft
+**Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001

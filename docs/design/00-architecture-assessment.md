@@ -83,9 +83,9 @@ Scale check: ~8 MCP servers + 1–50 subagents + 1 intelligence ≈ 60–65 thre
 | `tls` | `rustls` (**`ring`** provider, not `aws-lc-rs`) + `webpki-roots` | Direct `https://` intelligence/MCP when TLS is not sidecar-terminated. `ring` avoids the cmake/C build dep; `webpki-roots` for hermetic scratch images. The recommended container shape terminates TLS at a sidecar → most builds link no TLS. |
 | `vsock` | `vsock` (blocking, `VsockStream`/`VsockListener`) | Enclave/microVM intelligence transport. ~5 small crates; drops into thread-per-fd. **Never `tokio-vsock`.** |
 | `serve-mcp` | `mio` or raw `libc::poll` | High-fan-in served self-MCP listener only. |
-| `cron` | `croner` (adds only `chrono`) | Optional cron-expression scheduling. |
+| `cron` | `croner`(+`chrono`) originally selected; **shipped hand-rolled, zero-dep** (minimalism moat, see PLAN M4) | Optional cron-expression scheduling. |
 | `metrics` | none (hand-written Prometheus text) | `/metrics` on the opt-in HTTP/socket surface. |
-| `otel` | `tracing` + `tracing-opentelemetry` + `opentelemetry-otlp` (**HTTP exporter, not grpc-tonic**) | OTLP export + GenAI semconv. The one feature allowed to link heavier deps; HTTP exporter keeps tokio out (or accepts it strictly inside the gate). |
+| `otel` | originally `tracing`+`opentelemetry-otlp`; **shipped hand-rolled OTLP-over-HTTP/JSON, dependency-free** (PLAN M6) | OTLP export + GenAI semconv. |
 
 **Explicitly OUT:** tokio/async-std/smol; hyper/reqwest; `url` + its ICU/IDNA stack; `aws-lc-rs`/`aws-lc-sys`; native-tls/OpenSSL; `signal-hook`; `tokio-vsock`; the retired regorus/jsonschema/ed25519-dalek/jsonwebtoken/x509/OTLP-grpc/arc_swap/notify/toml stacks.
 
@@ -170,7 +170,7 @@ Scale check: ~8 MCP servers + 1–50 subagents + 1 intelligence ≈ 60–65 thre
 - **Same binary re-exec'd** (`argv[0]` in subagent mode) — one artifact, instant `SIGKILL`, OS isolation, the process tree *is* the agent tree.
 - **Spawn payload (rich, not minimal):** instruction + **output contract** (objective + required output format + tool/source guidance + boundaries — bare instruction strings reproduce Anthropic's vague-delegation failure) + **narrowed context seed** (only the slices the parent chooses, never the full transcript — context-hygiene *and* injection-firewall win) + tool scope (subset of parent's MCP endpoints/tools; narrows monotonically down the tree) + limits + the `telemetry` block (§2.11). Depth is **minted by the supervisor from the caller's handle, never trusted from the child's request.**
 - **Result:** a distilled, structured value (~1–2k tokens) + terminal status + usage. Large outputs use store-and-reference (child writes to a resource, returns a handle). The parent appends the distillate, never the child's raw transcript.
-- **Sync-default, async-opt-in:** `subagent.spawn` blocks the parent's turn by default (simplest, deterministic, parent is cheaply paused between turns). `{async:true}` returns a handle (`subagent.status`/`await`, or completion-as-self-resource the parent subscribes to — closing the loop with §2.6). `{detach:true}` fire-and-forget, still budget/depth-counted and reaped. v1 ships **sync-only**; async lands in M3 alongside reactivity (shares the subscribe/notify machinery).
+- **Sync-default, async-opt-in:** `subagent.spawn` blocks the parent's turn by default (simplest, deterministic, parent is cheaply paused between turns). `{async:true}` returns a handle (`subagent.status`/`await`, or completion-as-self-resource the parent subscribes to — closing the loop with §2.6). `{detach:true}` fire-and-forget, still budget/depth-counted and reaped. **Sync is the default; `{async}`/`{detach}` shipped in M3** (they share the subscribe/notify machinery).
 - **Nesting via the self-MCP only:** a child creates children only by calling back into the supervisor-owned `subagent.spawn` — **exactly one unforgeable chokepoint** for all caps.
 - **Caps (finite, conservative defaults — enforced at the chokepoint):** `max_depth` (3–5), `max_children` per node, `max_total_subagents` tree-wide, spawn-rate token-bucket, tree-wide token ceiling. A spawn exceeding any cap is **refused as a tool result** (the parent's model adapts), never a crash.
 - **`exec` children are folded into the same regime:** mandatory deadline, process-group kill via the §2.9 ladder, counted against subtree budget + breadth/rate caps. `exec` has no control channel, so only the deadline+kill detectors apply (not ping/pong). Reference implementation: the retired `tools/shell.rs::run()` (reader-threads + try_wait + timeout-kill + signal-extract).
@@ -265,12 +265,12 @@ One-shot maps the root subagent's terminal status to a code (completed→0, refu
 ### 2.12 Summary of decisions (bullet list)
 
 - **Concurrency:** thread-per-fd + blocking I/O + `std::sync::mpsc`; one supervisor reactor on `recv_timeout`; signals via self-pipe. tokio rejected. `mio`/`poll` only behind `serve-mcp`.
-- **Dependencies:** core = `serde`/`serde_json` + raw `libc` + `std` + hand-rolled (logger, HTTP/1.1+SSE client, framing). Feature-gated: `tls` (rustls/ring/webpki-roots), `vsock`, `serve-mcp`, `cron` (croner), `metrics`, `otel`. No async runtime, no C toolchain, no `url`/ICU in default.
+- **Dependencies:** core = `serde`/`serde_json` + raw `libc` + `std` + hand-rolled (logger, HTTP/1.1+SSE client, framing). Feature-gated: `tls` (rustls/ring/webpki-roots), `vsock`, `serve-mcp`, `cron` (hand-rolled, zero-dep), `metrics`, `otel` (hand-rolled OTLP-over-HTTP/JSON, dependency-free). No async runtime, no C toolchain, no `url`/ICU in default.
 - **Control protocol:** minimal JSON-RPC sibling (not literal MCP), length-framed, shared codec; control reader on a thread separate from the agentic loop.
 - **Intelligence:** OpenAI-compatible `/chat/completions` + native tool-calling canonical; exactly two in-binary adapters (openai-compatible + anthropic); JSON-action fallback; transports unix/https(tls)/vsock; creds env/flag only.
 - **MCP:** target 2025-11-25, capability-gated, cursor-paginated; client + self-server minimal subset; reactivity on stdio only in v1; notify-then-read; item-vs-list distinct; no template subscribe; defer tasks/sampling/roots/HTTP-serving.
 - **Modes:** one loop, three exit predicates (once/loop/reactive/schedule); time-schedule external-by-default; reactive routing = exactly-one-owner first-match routes, spawn-vs-continue as a route property, debounce+coalesce, bounded queues, at-least-once + re-read-current-state; self-subscribe = self-scheduling.
-- **Subagents:** same-binary re-exec; rich spawn payload (output contract + narrowed seed + scope + limits + telemetry); distilled result; sync-default/async-opt-in (async in M3); nesting only via supervisor-owned `subagent.spawn`; finite depth/breadth/rate/tree-token caps refused as tool results; depth minted by supervisor.
+- **Subagents:** same-binary re-exec; rich spawn payload (output contract + narrowed seed + scope + limits + telemetry); distilled result; sync-default/async-opt-in (async shipped in M3); nesting only via supervisor-owned `subagent.spawn`; finite depth/breadth/rate/tree-token caps refused as tool results; depth minted by supervisor.
 - **Reliability:** three-detector dead/stuck (deadline + no-progress + ping/pong) + EOF×pong classifier; PID-1 subreaper + waitpid loop; PDEATHSIG on every child; SIGPIPE ignored; bounded depth-first kill ladder, drain < grace, second-signal force; restart governor (backoff+breaker+fast-fail); rebuild+reconcile (read-after-subscribe mandatory); hierarchical token accounting to root; cgroup-aware not cgroup-required.
 - **Observability:** default = hand-rolled JSON-lines to stderr + exit code + health file; closed event vocabulary + correlation tuple (`run_id`/`agent_path`/`pid`); context propagation (W3C `_meta`/header/spawn) on by default; metrics-from-logs default, Prometheus/`otel` gated.
 - **Config/signals/exit:** precedence built-in<file<env<flag; validate-at-startup→exit 2; bounded drain; public exit-code table; clean drain = 0; RUN_ID idempotency into `_meta`.
@@ -352,7 +352,7 @@ crates/
       triggers/
         mode.rs                # once/loop/reactive/schedule drivers (exit predicates)
         router.rs              # reactive routing: routes, exactly-one-owner, debounce/coalesce, queues
-        timer.rs               # interval + cron event source                [cron via croner: feature]
+        timer.rs               # interval + cron event source                [cron: hand-rolled, feature]
       subagent/
         control.rs             # control-channel reader thread (decoupled from loop) + ping/pong
         protocol.rs            # spawn payload, control messages, upward events, result
@@ -391,7 +391,7 @@ Cargo features: `default = []`; `tls`, `vsock`, `serve-mcp`, `cron`, `metrics`, 
 
 ### M4 — Composition, transports, exec, schedule
 
-**Deliverables:** serve the self-MCP over `unix:` (`--serve-mcp unix:…`) for peer/parent clients (stdio already works); `net/vsock.rs` + vsock intelligence transport (feature); `sec/exec.rs` gated `exec` self-tool folded into the kill ladder + budgets + caps; `triggers/timer.rs` internal interval (`--interval`) + optional `cron` feature (croner) as router event sources; `--mode loop`/`schedule` drivers.
+**Deliverables:** serve the self-MCP over `unix:` (`--serve-mcp unix:…`) for peer/parent clients (stdio already works); `net/vsock.rs` + vsock intelligence transport (feature); `sec/exec.rs` gated `exec` self-tool folded into the kill ladder + budgets + caps; `triggers/timer.rs` internal interval (`--interval`) + optional `cron` feature (shipped hand-rolled, zero-dep) as router event sources; `--mode loop`/`schedule` drivers.
 **Module layout created:** `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,timer}.rs`.
 **Acceptance:** a second agentd connects to the served unix self-MCP, subscribes to an `agentd://session/…` resource, and reacts to the first agent's progress; `--enable-exec` exposes `exec` only when the binary exists, runs under a mandatory deadline, and is killed+reaped by the subtree ladder; `--mode loop --interval 5m` re-enters on the timer with idle backoff and terminates on the global budget; vsock intelligence works inside a microVM.
 

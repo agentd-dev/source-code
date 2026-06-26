@@ -89,10 +89,9 @@ capability).
 The tag set is a **budget, not an allow/deny rule**. It bounds what a single isolation unit
 (one subagent process) may *simultaneously* hold.
 
-> **Status (roadmap, M6).** Per-tool tagging via MCP server config and the Rule-of-Two check
-> below land in milestone M6 (see PLAN.md). The tags JSON below and `--allow-trifecta` are the
-> intended v1-target surface; they are **not** in the current CLI. The flags that exist today
-> are listed in §8.
+> **Status.** Per-tool tagging via MCP server config (`--mcp-tags`) and the Rule-of-Two check
+> below are implemented (`sec/scope.rs`). The tags JSON below and `--allow-trifecta` are on the
+> CLI today; the full flag set is listed in §8.
 
 Intended config shape (tags attach by tool-name glob, longest-glob-wins, so one server can be
 split into e.g. a `read_*` subset that is `sensitive` but not `egress`):
@@ -245,9 +244,9 @@ any future HTTP-MCP). Guards apply **after DNS resolution and on every redirect 
 These are a few tens of lines of checks, not a library — consistent with the no-`url`-crate /
 no-ICU dependency stance.
 
-> **Status (roadmap, M6).** The SSRF guards land in M6 (PLAN.md). The HTTPS/private-range policy
-> knobs described in RFC 0012 (e.g. allowing localhost/plaintext for dev) are part of the
-> v1-target client and are not yet exposed as CLI flags.
+> **Status.** The SSRF guards are implemented (`net/ssrf.rs`). The HTTPS/private-range policy
+> knobs described in RFC 0012 (e.g. allowing localhost/plaintext for dev) are not yet exposed
+> as CLI flags.
 
 ---
 
@@ -295,15 +294,13 @@ Secrets are config, never model/server data, and never durable agentd state.
   `AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`). Secrets resolve through a single
   `resolve(name)` front door. **The config file is never a secret source.** The retired
   `command` / `oauth2` resolvers are dropped.
-- **The carrier is a `Secret` newtype.** Its `Debug` and `Display` both print `***`, and it has
-  **no `Serialize`**, so a secret cannot accidentally enter the JSON-lines log, a spawn payload,
-  an MCP `_meta` block, or a checkpoint. The logger uses a **field allowlist**: secret-bearing
-  fields are simply absent from the schema, so even content-logging cannot emit them.
-- **Use sites.** The intelligence credential, and config-declared headers on the intelligence
-  HTTP transport via `{{secret:NAME}}` interpolation. This is an *operator-declared* header on
-  the LLM endpoint — **not** a built-in `http_request` MCP tool — so the no-built-in-tools
-  invariant holds. The raw secret is materialized only at the instant of writing the wire bytes
-  (after CR/LF validation, §5) and is not retained longer than the request.
+- **The carrier is `Config.intelligence_token`.** The `Config` `Debug` impl maps it to `***`,
+  so a secret cannot accidentally enter the JSON-lines log, a spawn payload, an MCP `_meta`
+  block, or a checkpoint. The logger uses a **field allowlist**: secret-bearing fields are
+  simply absent from the schema, so even content-logging cannot emit them.
+- **Use site.** The intelligence credential is materialized only at the instant of writing the
+  wire bytes (after CR/LF validation, §5) — set on the LLM endpoint's authorization / `x-api-key`
+  header — and is not retained longer than the request.
 - **Never persisted, never in a transcript.** A secret value never appears in a tool-call
   transcript fed back to the model, in a distilled return, or on disk.
 
@@ -320,13 +317,14 @@ agentd --instruction "…" --intelligence https://api.example/v1 --model my-mode
 
 ## 8. The actual v1 flag surface
 
-Only these security-relevant knobs exist in the binary today
-(`crates/agentd/src/config.rs`). Everything tagged "(roadmap)" above is the intended v1 target,
-not the current CLI.
+These security-relevant knobs exist in the binary today
+(`crates/agentd/src/config.rs`).
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|
 | `--enable-exec` | `AGENTD_ENABLE_EXEC` | off | register the gated `exec` self-tool |
+| `--allow-trifecta` | — | off | permit all three capability legs in one subagent (audited override) |
+| `--mcp-tags name=tag,tag` | — | — | tag a server's tools `untrusted_input` / `sensitive` / `egress` for the Rule-of-Two |
 | `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | — | bearer/key for the intelligence endpoint (redacted in logs) |
 | `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | — | `unix:/path`, `https://host/…`, or `vsock:cid:port` (validated; `http://` is dev-only and warns) |
 | `--serve-mcp <unix:/path>` | `AGENTD_SERVE_MCP` | off | serve agentd's own MCP over a unix socket (stdio always available) |
@@ -339,9 +337,8 @@ not the current CLI.
 The intelligence-URI validator rejects anything outside `unix:` / `https://` / `vsock:` /
 `http://` and exits **2** on a bad value — before any side effect, including any LLM round-trip.
 
-**Not yet flags** (roadmap, RFC 0012): `--allow-trifecta`, per-tool tags, the SSRF policy knobs,
-and self-MCP-over-HTTP. They are documented above as the v1 target so the posture is reviewable
-now.
+**Not yet flags** (RFC 0012): the SSRF policy override knobs and self-MCP-over-HTTP. They are
+documented above as the target so the posture is reviewable now.
 
 ---
 
@@ -390,6 +387,6 @@ Stated plainly so you size the surrounding environment correctly:
 2. Treat every `--mcp` server as code you execute at agentd's privilege. Vet it.
 3. Keep `exec` off unless you need it; when you do, never co-locate it with an
    untrusted-content reader.
-4. Tag your tools and split trifecta tasks into reader/actor subagents (roadmap M6;
-   `--allow-trifecta` to override with an audit log).
+4. Tag your tools and split trifecta tasks into reader/actor subagents
+   (`--allow-trifecta` to override with an audit log).
 5. Pass secrets via env/flag only; they never touch logs, transcripts, the config file, or disk.

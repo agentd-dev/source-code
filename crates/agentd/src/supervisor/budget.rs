@@ -1,9 +1,11 @@
 //! Per-run budget: step / token / wall-clock bounds. RFC 0007 §budgets.
 //!
-//! v1 enforces a single run's budget inside the loop. The *hierarchical*
-//! accounting to a tree root (each subagent reporting usage up to the
-//! supervisor) lands in M2/M3 (RFC 0003); the shape here — record usage, ask
-//! "is a bound hit?" — is what that builds on.
+//! This is the *per-run* budget enforced inside one agent loop (step / token /
+//! wall-clock). The *hierarchical* tree-token accounting — each subagent's
+//! usage rolled up to the tree root and bounded by a tree-wide ceiling — lives
+//! separately in `tree.rs` (`charge_tokens`) and is driven by the reactor
+//! (`KillReason::TreeBudget`); this type is the per-run primitive that records
+//! usage and answers "is a bound hit?".
 
 use crate::agentloop::stop::TerminalStatus;
 use crate::wire::intel::Usage;

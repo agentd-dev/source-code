@@ -6,9 +6,10 @@
 //! is newline-delimited; the control channel is length-prefixed. RFC 0004,
 //! RFC 0005.
 //!
-//! Keeping every wire type behind `serde` in this module is deliberate: it is
-//! the one swap-to-miniserde isolation point if the M7 audit rejects the
-//! proc-macro compile weight (rfcs/0002 §dependency-budget).
+//! Keeping every wire type behind `serde` in this one module is deliberate: it
+//! is the single isolation point from which the codec could be swapped to a
+//! lighter encoder (e.g. miniserde) without touching call sites, should the
+//! proc-macro compile weight ever need to go (rfcs/0002 §dependency-budget).
 
 pub mod frame;
 

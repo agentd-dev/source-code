@@ -13,16 +13,12 @@
 //! Module map (assessment §4.0). `agentloop` is named to avoid the `loop`
 //! keyword.
 
-// WIP scaffold: modules are filled in milestone-by-milestone (PLAN.md).
-// Removed in M7's minimalism/clippy audit.
-#![allow(dead_code)]
-
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup
 pub mod exit; // the public exit-code table + terminal-status -> code map
 pub mod json; // shared JSON-RPC 2.0 codec + framing (NDJSON + length-prefix)
 pub mod wire; // MCP + intelligence wire types
 pub mod agentd_uri; // the agentd:// resource scheme (self-state + async completion)
-pub mod net; // hand-rolled HTTP/1.1(+SSE), unix-socket, (tls/vsock gated)
+pub mod net; // hand-rolled HTTP/1.1 (non-streaming), unix-socket, (tls/vsock gated)
 pub mod intel; // intelligence client + provider adapters
 pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
 pub mod agentloop; // the ReAct loop + terminal-status state machine

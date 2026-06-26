@@ -1,6 +1,6 @@
 # RFC 0008: Execution modes, triggers & reactive routing
 
-**Status:** Draft
+**Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
@@ -500,7 +500,7 @@ events into the same router. No second scheduling subsystem.
 pub enum ClockSource {
     Interval { period: Duration, next: Instant },     // --interval D (D=0 => immediate)
     #[cfg(feature = "cron")]
-    Cron { expr: CronExpr, next: Instant },           // 5-field, UTC, croner
+    Cron { expr: CronExpr, next: Instant },           // 5-field, UTC, hand-rolled (no dep)
 }
 impl ClockSource {
     /// the reactor folds next_fire() into its recv_timeout min(); on fire it
@@ -514,8 +514,9 @@ impl ClockSource {
 - **`--interval D`** (`D=0` = re-enter immediately): a periodic internal event.
   Routed exactly like a resource update — to a `Spawn` route (fresh root per fire)
   or a `Continue` route (one warm session ticked).
-- **`--cron "<min hour dom mon dow>"`** (behind the `cron` feature, `croner`,
-  which adds only `chrono` — §2.2): monotonic next-fire computed in **UTC**. The
+- **`--cron "<min hour dom mon dow>"`** (behind the `cron` feature — **hand-rolled
+  5-field UTC parser, zero-dep**, a deliberate deviation from the original `croner`
+  choice for the minimalism moat — §2.2): monotonic next-fire computed in **UTC**. The
   timer thread/source emits one `Timer` event per fire into the router.
 
 **No calendars, no DST gymnastics, no job store, no per-fire persistence in core.**

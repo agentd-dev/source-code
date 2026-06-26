@@ -51,16 +51,3 @@ pub trait SelfHandler {
         Vec::new()
     }
 }
-
-/// The default: no self-tools (used by the in-process once-mode loop, which
-/// does not delegate). Subagents use a real `Orchestrator`.
-pub struct NoopSelfHandler;
-
-impl SelfHandler for NoopSelfHandler {
-    fn tools(&self) -> Vec<ToolDef> {
-        Vec::new()
-    }
-    fn handle(&mut self, _name: &str, _args: &Value) -> Option<(String, bool)> {
-        None
-    }
-}

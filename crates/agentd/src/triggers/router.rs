@@ -105,8 +105,9 @@ impl Router {
         Router { routes, pending: HashMap::new(), dropped: 0 }
     }
 
-    /// Number of unmatched updates dropped (a no-route counter, surfaced in
-    /// metrics/logs — never silently lost).
+    /// Number of unmatched updates dropped (a no-route counter; `on_updated`
+    /// returns false on a miss so the caller can log/count it). Currently only
+    /// readable via this accessor in tests; not yet surfaced in a log or metric.
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -151,7 +152,9 @@ impl Router {
         }
     }
 
-    /// The earliest pending fire time — the reactor arms its timer to this.
+    /// The earliest pending fire time. Intended for a timer-armed reactor; the
+    /// shipped `run_reactive` instead polls on a fixed `TICK` and calls
+    /// `due(now)` each tick, so this is currently used only in unit tests.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.pending.values().map(|(at, _)| *at).min()
     }

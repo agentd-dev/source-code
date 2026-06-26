@@ -33,8 +33,8 @@ pub enum ControlMsg {
     Ping { seq: u64 },
     /// Ask the child to wind down at the next turn boundary (graceful).
     Cancel { reason: String },
-    /// Inject a message into the child's running session (parent `send` /
-    /// reactive continue, M3).
+    /// Inject a message into the child's running warm session (parent `send` /
+    /// reactive continue); forwarded to the loop by the control reader thread.
     Inject { message: String },
 }
 

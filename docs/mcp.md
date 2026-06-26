@@ -89,7 +89,7 @@ On connect, before anything else, agentd runs the MCP lifecycle. It pins
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agentd","title":"agentd","version":"1.x"}
+    "clientInfo":{"name":"agentd","title":"agentd","version":"0.1.0"}
 }}
 // server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
@@ -303,7 +303,7 @@ nothing else:
       "tools":     { "listChanged": true },
       "resources": { "subscribe": true, "listChanged": true }
     },
-    "serverInfo":{ "name":"agentd","title":"agentd","version":"1.x" },
+    "serverInfo":{ "name":"agentd","title":"agentd","version":"0.1.0" },
     "instructions":"agentd self-MCP: spawn/steer subagents, read+subscribe agentd:// state."
 }}
 ```
@@ -321,7 +321,7 @@ No `prompts`, `logging`, `completions`, or `tasks`. It answers `ping`, accepts
 
 | Tool | Purpose | Mode |
 |---|---|---|
-| `subagent.spawn` | create a child subagent from a rich spawn payload | sync (async/detach = **roadmap**, M3) |
+| `subagent.spawn` | create a child subagent from a rich spawn payload | sync \| async \| detach |
 | `subagent.send` | inject an instruction/event into a warm subagent session | sync ack |
 | `subagent.cancel` | request graceful cancel of a subtree (→ kill ladder) | sync ack |
 | `subagent.status` | read a handle's status + usage snapshot | sync |
@@ -342,14 +342,14 @@ No `prompts`, `logging`, `completions`, or `tasks`. It answers `ping`, accepts
       "context_seed":   {"type":"array","items":{"type":"object"}},
       "tool_scope":     {"type":"array","items":{"type":"string"}},
       "limits":         {"type":"object"},
-      "async":          {"type":"boolean","default":false},   // roadmap (M3)
-      "detach":         {"type":"boolean","default":false}    // roadmap (M3)
+      "async":          {"type":"boolean","default":false},   // return a handle immediately
+      "detach":         {"type":"boolean","default":false}    // outlive the parent's turn
     },
     "required":["instruction"],
     "additionalProperties":false }}
 ```
 
-A **sync** spawn (v1) blocks and returns the distilled result, terminal status,
+A **sync** spawn blocks and returns the distilled result, terminal status,
 and usage:
 
 ```jsonc
@@ -380,10 +380,10 @@ model adapts), while a malformed `tools/call` (unknown tool, bad params) is a
 JSON-RPC `error` (`-32601`/`-32602`) — the same distinction agentd honors as a
 client (§1.4).
 
-> **Async / detached spawn is (roadmap), M3.** v1 ships `subagent.spawn`
-> sync-only. The resource/notify machinery below is built now so M3 is purely
-> additive — an async spawn will return immediately with a handle plus a
-> `result_resource` URI the caller subscribes to.
+> **Async / detached spawn ships.** `subagent.spawn` defaults to sync; an
+> `{async}` spawn returns immediately with a handle plus a `result_resource` URI
+> the caller subscribes to, and `{detach}` lets the child outlive the parent's
+> turn. The resource/notify machinery below carries the result.
 
 The `exec` tool appears in `tools/list` **only when** `--enable-exec` is set (and
 the target binary exists). Absent that flag it is simply not listed — capability
@@ -496,15 +496,15 @@ about the child's internal steps; it gets a clean, bounded answer.
 the child. When the child reaches a terminal status, the child emits
 `notifications/resources/updated` on that URI; the parent (woken by its reactive
 router) `resources/read`s it to collect the distillate. This is exactly how an
-**async** subagent will close the loop in M3 — the same notify-then-read
-machinery, just across a process boundary.
+**async** subagent closes the loop — the same notify-then-read machinery, just
+across a process boundary.
 
 A worked picture of the reactive close-the-loop:
 
 ```
 parent agentd                              child agentd (self-MCP, unix:/run/rev.sock)
   │  tools/call subagent.spawn{async}  ──▶
-  │  ◀── result_resource: agentd://subagent/0.2/result   (roadmap, M3; sync in v1)
+  │  ◀── result_resource: agentd://subagent/0.2/result
   │  resources/subscribe{uri:.../0.2/result}  ──▶
   │                                            … child works …
   │  ◀── notifications/resources/updated{uri:.../0.2/result}

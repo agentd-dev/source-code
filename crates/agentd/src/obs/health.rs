@@ -12,7 +12,8 @@
 //! flips to false — even though the writer keeps writing.
 //!
 //! Default surface = exit code + `--health-file`. The opt-in `/healthz`+`/readyz`
-//! HTTP surface is a later add (it reuses the hand-rolled HTTP server).
+//! HTTP surface (feature `metrics`, `obs::serve`) reuses this same heartbeat
+//! liveness over the hand-rolled HTTP server.
 
 use crate::obs::log::rfc3339_millis;
 use serde_json::json;

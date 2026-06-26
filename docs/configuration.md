@@ -210,7 +210,7 @@ $ agentd --instruction 'emit hourly digest' \
 
 > **v1 scope.** Reactivity is **stdio-only** in v1 — reactive-over-HTTP is
 > roadmap. Self-MCP serving (`--serve-mcp`) is **stdio/unix only**; HTTP serving
-> is roadmap. Async subagents land in **M3** (v1 spawn is sync). MCP
+> is roadmap. Subagent spawn defaults to sync; `{async}`/`{detach}` also ship. MCP
 > tasks/sampling/roots are deferred (RFC 0013). For time-scheduling at scale,
 > prefer an external `CronJob` firing `--mode once` per tick (RFC 0011 §9); the
 > built-in `--interval` is a standalone convenience.

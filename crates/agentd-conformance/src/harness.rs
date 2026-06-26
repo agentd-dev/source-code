@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A self-cleaning scratch directory (no `tempfile` dependency — the suite stays
-/// to a single dev-dep, `serde_json`).
+/// A self-cleaning scratch directory (no `tempfile` dependency — the suite keeps
+/// to just `serde_json` + `libc`).
 pub struct TempDir {
     path: PathBuf,
 }

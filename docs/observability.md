@@ -223,7 +223,7 @@ The default logs **hashes and lengths only** — never raw content:
 - `*_hash` is the first 8 hex chars of a fast non-cryptographic digest — a
   stable correlation aid, **not** a security primitive.
 
-`--log-content` (env `AGENTD_LOG_CONTENT`) (roadmap) opts in to capturing
+`--log-content` (env `AGENTD_LOG_CONTENT`) opts in to capturing
 prompt / tool-arg / result bodies. It is loud, gated, and redaction-aware. It is
 a debug/non-prod switch.
 
@@ -335,8 +335,8 @@ the pod is not "ready", so an orchestrator won't route work to it.
    already on, expose a trivial `health` / `ready` line on a sibling unix
    socket — reuses existing socket machinery, no new TCP surface.
 
-4. **HTTP `/healthz` + `/readyz` (opt-in, roadmap).** Only when an orchestrator
-   wants real HTTP probes, served by the same hand-rolled blocking HTTP code on
+4. **HTTP `/healthz` + `/readyz` (opt-in, `--features metrics`).** When an orchestrator
+   wants real HTTP probes, served on `--metrics-addr` by the same hand-rolled blocking HTTP code on
    one thread — no new dependency. `/healthz` = liveness (heartbeat fresh → 200,
    stale → 503); `/readyz` = readiness (ready + subs reconciled → 200, else
    503). Side-effect-free.
@@ -345,11 +345,11 @@ the pod is not "ready", so an orchestrator won't route work to it.
 run — a pure CLI invocation carries zero health machinery. HTTP and socket
 surfaces are opt-in and never on for a one-shot.
 
-> `--health-file`, `--log-level` (plus `AGENTD_LOG_LEVEL`), and `--serve-mcp`
-> are all live; see [`config.rs`](../crates/agentd/src/config.rs) for the
-> authoritative flag/env list. `--log-content`, `--aggregate-logs`,
-> `--health-http`, and the `metrics`/`otel` features remain roadmap items tracked
-> in [`docs/design/PLAN.md`](design/PLAN.md).
+> `--health-file`, `--log-level` (plus `AGENTD_LOG_LEVEL`), `--log-content`,
+> `--serve-mcp`, and `--metrics-addr` (behind `metrics`) are all live; see
+> [`config.rs`](../crates/agentd/src/config.rs) for the authoritative flag/env
+> list. `--aggregate-logs` and `--health-http` remain roadmap items tracked in
+> [`docs/design/PLAN.md`](design/PLAN.md).
 
 ---
 
@@ -393,19 +393,20 @@ the features below):
 and live in logs/traces only. Labels use bounded values only: `server`, `tool`,
 `model`, `kind`, `route`, `status`, `limit`, `signal`, `reason`, `type`.
 
-### `metrics` feature — Prometheus text (roadmap)
+### `metrics` feature — Prometheus text (`--features metrics`)
 
 A tiny in-process table of atomic counters/gauges feeds a hand-written
 **Prometheus 0.0.4 text exposition** (`# HELP` / `# TYPE` + `name{labels} value`)
 served on the already-opt-in surface (`/metrics`). **No `prometheus` or `metrics`
 crate** — it is plain text, no async, no SDK.
 
-### `otel` feature — OTLP export + GenAI semconv (roadmap)
+### `otel` feature — OTLP export + GenAI semconv (`--features otel`)
 
-The one feature allowed to link heavier deps (`tracing` +
-`tracing-opentelemetry` + `opentelemetry-otlp`, HTTP exporter — not grpc-tonic,
-to keep tokio out of the default build). It maps the event taxonomy onto the
-OTel GenAI semantic conventions:
+The `otel` feature exports spans without adding dependencies — hand-rolled
+OTLP-over-HTTP/JSON over the existing HTTP client + `serde_json` + the run's
+trace ids (no `opentelemetry`/`tracing` crates, no protobuf). It POSTs one batch
+per finished run to `OTEL_EXPORTER_OTLP_ENDPOINT`, mapping the event taxonomy
+onto the OTel GenAI semantic conventions:
 
 | agentd event/span | `gen_ai.operation.name` | Key attributes |
 |---|---|---|

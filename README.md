@@ -70,11 +70,13 @@ prefer an external scheduler firing `--mode once`.)
 
 ## Status
 
-agentd is **under active rewrite.** The foundation — config parse + validate,
-exit codes, JSON-lines logging, signal handling — is live; the supervisor
-reactor, MCP client, intelligence client, and the agentic loop land across
-milestones. A run today validates config, logs, and exits with a scaffold
-notice. Track progress in **[docs/design/PLAN.md](docs/design/PLAN.md)**.
+agentd is **implemented and shipped.** Config parse + validate, exit codes,
+JSON-lines logging, signal handling, the supervisor reactor, the MCP client, the
+intelligence client, the agentic loop, all four run modes, the reactive router,
+subagents (sync + async/detach), and the served self-MCP all run today. The
+default build holds a 3-dependency minimalism moat; `tls`/`vsock`/`serve-mcp`/
+`cron`/`metrics`/`otel` are feature-gated. See
+**[docs/design/PLAN.md](docs/design/PLAN.md)**.
 
 ## Links
 

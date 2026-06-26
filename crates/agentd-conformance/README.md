@@ -18,8 +18,8 @@ cargo run  -p agentd-conformance -- --json   # machine-readable conformance reco
 ```
 
 The suite builds the agentd binary itself, so no prior `cargo build` is needed.
-Checks that require capabilities the host lacks (none today) skip rather than
-fail — conformance is judged against the spec, never the environment.
+Every check is host-independent — conformance is judged against the spec, never
+the environment — so there are no capability-gated checks to skip.
 
 ## Families
 

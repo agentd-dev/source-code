@@ -1,4 +1,5 @@
-//! Two framings over a byte stream, sharing the codec above.
+//! Two framings over a byte stream, sharing the JSON-RPC codec in the parent
+//! module (`crate::json`).
 //!
 //! - **NDJSON** (`read_line` / `write_line`): one JSON value per line,
 //!   no embedded newlines. The MCP stdio transport framing (RFC 0004).

@@ -12,8 +12,9 @@ use agentd::obs::log::{Comp, Level, LogCtx, Logger};
 use agentd::subagent::orchestrator::Orchestrator;
 use agentd::subagent::protocol::{IntelConfig, Limits, SpawnPayload, Telemetry};
 use serde_json::json;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn logger() -> Logger {
     Logger::new(
@@ -53,6 +54,58 @@ fn parent_payload() -> SpawnPayload {
         enable_exec: false,
         warm: false,
     }
+}
+
+fn start_mock_llm(socket: &Path) -> Child {
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--internal-mock-llm", socket.to_str().unwrap(), "final"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mock-llm");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "mock-llm never bound");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+}
+
+#[test]
+fn async_spawn_returns_a_handle_then_await_collects_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(&sock);
+
+    let mut payload = parent_payload();
+    payload.intelligence.uri = format!("unix:{}", sock.display());
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
+
+    // The collection tools ride alongside spawn at a depth-budgeted node.
+    let names: Vec<String> = orch.tools().iter().map(|t| t.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "subagent.await"), "subagent.await should be advertised");
+    assert!(names.iter().any(|n| n == "subagent.status"), "subagent.status should be advertised");
+
+    // async=true returns a handle immediately (non-blocking), NOT the result.
+    let (ack, is_error) = orch
+        .handle("subagent.spawn", &json!({"instruction": "do a focused subtask", "async": true}))
+        .expect("subagent.spawn is a self-tool");
+    assert!(!is_error, "async spawn should succeed: {ack}");
+    assert!(ack.contains("handle=0.0"), "expected the child handle in the ack, got: {ack}");
+
+    // await collects the real child's distilled result (mock LLM → "mock-llm done").
+    let (result, is_error) = orch.handle("subagent.await", &json!({"handle": "0.0"})).expect("await is a self-tool");
+    assert!(!is_error, "the child should complete, got error: {result}");
+    assert!(result.contains("mock-llm done"), "expected the distilled child result, got: {result}");
+
+    // The handle is consumed once collected.
+    let (again, is_error) = orch.handle("subagent.status", &json!({"handle": "0.0"})).expect("status is a self-tool");
+    assert!(is_error && again.contains("no async subagent"), "the handle should be consumed: {again}");
+
+    let _ = llm.kill();
+    let _ = llm.wait();
 }
 
 #[test]

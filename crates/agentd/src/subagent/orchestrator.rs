@@ -22,12 +22,16 @@ use crate::agentloop::action::SelfHandler;
 use crate::agentloop::stop::{ScheduleRequest, SubscriptionAction, SubscriptionRequest};
 use crate::config::McpServerSpec;
 use crate::obs::log::Logger;
-use crate::subagent::protocol::{IntelConfig, Limits, SeedMessage, SpawnPayload, Telemetry};
+use crate::subagent::protocol::{AgentMsg, IntelConfig, Limits, SeedMessage, SpawnPayload, Telemetry};
 use crate::supervisor::reactor::{supervise_once, SuperviseResult};
+use crate::supervisor::spawn::{spawn, Subagent};
+use crate::supervisor::tree::NodeId;
 use crate::wire::intel::ToolDef;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 /// Conservative per-node breadth cap (depth comes from the payload's
 /// `max_depth`). RFC 0009.
@@ -41,6 +45,25 @@ const MIN_SCHEDULE_SECS: u64 = 1;
 const MAX_SCHEDULE_SECS: u64 = 30 * 24 * 3600;
 /// Cap on resource (un)subscriptions an agent may request per run.
 const MAX_SUBSCRIPTIONS: usize = 16;
+/// Poll granularity while awaiting an async child.
+const AWAIT_POLL: Duration = Duration::from_millis(50);
+/// Bounded `subagent.await` window: a single call blocks at most this long, then
+/// hands control back ("still running") so the loop stays responsive to cancel.
+const AWAIT_MAX: Duration = Duration::from_secs(30);
+
+/// A backgrounded child from `subagent.spawn{async|detach}`: its handle's
+/// process + control channel, and its distilled outcome once it reports a
+/// terminal frame. The parent supervises it lazily — draining on status/await —
+/// and `Subagent`'s Drop kills + reaps it when the orchestrator is dropped, so
+/// no async child outlives the parent's tree (RFC 0009 §async).
+struct AsyncChild {
+    sub: Subagent,
+    rx: Receiver<(NodeId, AgentMsg)>,
+    /// `Some((distilled, is_error))` once a terminal `Result`/`Failed` (or the
+    /// channel disconnecting) was seen.
+    outcome: Option<(String, bool)>,
+    detached: bool,
+}
 
 pub struct Orchestrator {
     exe: PathBuf,
@@ -61,6 +84,9 @@ pub struct Orchestrator {
     scheduled: Vec<ScheduleRequest>,
     /// Resource (un)subscriptions the root agent requested this run (RFC 0008).
     subscriptions: Vec<SubscriptionRequest>,
+    /// Backgrounded children from `subagent.spawn{async|detach}`, keyed by handle
+    /// (= the child's agent_path). Drained on status/await; reaped on Drop.
+    async_children: HashMap<String, AsyncChild>,
     log: Logger,
 }
 
@@ -87,6 +113,7 @@ impl Orchestrator {
             drain_timeout,
             scheduled: Vec::new(),
             subscriptions: Vec::new(),
+            async_children: HashMap::new(),
             log,
         }
     }
@@ -182,17 +209,113 @@ impl Orchestrator {
             enable_exec: self.enable_exec,
             warm: false, // a delegated subagent is a one-shot distilled subtask
         };
+        let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+        let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
         self.child_count += 1;
         self.log.info(
             "subagent.delegate",
-            json!({"child": child_path, "depth": payload.depth, "servers": payload.mcp_servers.len()}),
+            json!({"child": child_path, "depth": payload.depth, "servers": payload.mcp_servers.len(), "async": is_async || detach}),
         );
+
+        // Async / detach: spawn in the background and return a handle now (RFC
+        // 0009 §async). Default is synchronous: block on the nested supervisor.
+        if is_async || detach {
+            return self.spawn_async(payload, child_path, detach);
+        }
 
         match supervise_once(self.exe.clone(), &payload, self.drain_timeout, self.log.clone()) {
             Ok(SuperviseResult::Completed(outcome)) => (distill(&outcome.result), false),
             Ok(SuperviseResult::Failed(e)) => (format!("subagent failed: {e}"), true),
             Ok(SuperviseResult::Killed(r)) => (format!("subagent terminated ({r:?})"), true),
             Err(e) => (format!("subagent could not start: {e}"), true),
+        }
+    }
+
+    /// Spawn a backgrounded child and return its handle immediately — the parent
+    /// keeps working while it runs. The result is collected later via
+    /// `subagent.await` / `subagent.status`; if never collected it is reaped when
+    /// the orchestrator drops (no async child outlives the parent's tree).
+    fn spawn_async(&mut self, payload: SpawnPayload, handle: String, detach: bool) -> (String, bool) {
+        let (tx, rx) = mpsc::channel();
+        let node = NodeId(u64::from(self.child_count));
+        match spawn(&self.exe, &payload, node, tx) {
+            Ok(sub) => {
+                self.async_children.insert(handle.clone(), AsyncChild { sub, rx, outcome: None, detached: detach });
+                self.log.info("subagent.spawn_async", json!({"handle": handle, "detach": detach}));
+                if detach {
+                    (format!("spawned detached subagent (handle={handle}); fire-and-forget — it runs independently and is reaped on completion"), false)
+                } else {
+                    (format!("spawned async subagent (handle={handle}); keep working, then collect its result with subagent.await or subagent.status using this handle"), false)
+                }
+            }
+            Err(e) => {
+                self.async_children.remove(&handle);
+                (format!("subagent could not start: {e}"), true)
+            }
+        }
+    }
+
+    /// Pull any pending frames for one async child, recording its terminal
+    /// outcome (idempotent once terminal).
+    fn drain_child(child: &mut AsyncChild) {
+        if child.outcome.is_some() {
+            return;
+        }
+        loop {
+            match child.rx.try_recv() {
+                Ok((_, AgentMsg::Result { outcome })) => {
+                    child.outcome = Some((distill(&outcome.result), false));
+                    return;
+                }
+                Ok((_, AgentMsg::Failed { error })) => {
+                    child.outcome = Some((format!("subagent failed: {error}"), true));
+                    return;
+                }
+                Ok(_) => {} // Ready / Turn / Pong / Event / Usage — progress
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    child.outcome = Some(("subagent exited without a result".into(), true));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `subagent.status` — non-blocking peek. Reports "still running", or hands
+    /// back (and reaps) the distilled result once the child has finished.
+    fn status(&mut self, args: &Value) -> (String, bool) {
+        let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let Some(child) = self.async_children.get_mut(&handle) else {
+            return (format!("error: no async subagent with handle '{handle}'"), true);
+        };
+        Self::drain_child(child);
+        if child.outcome.is_none() {
+            return (format!("subagent {handle} is still running"), false);
+        }
+        // Terminal: hand back the result and reap the handle.
+        self.async_children.remove(&handle).unwrap().outcome.unwrap()
+    }
+
+    /// `subagent.await` — block (bounded by [`AWAIT_MAX`]) until the child
+    /// finishes, then hand back (and reap) its distilled result. On timeout
+    /// returns "still running" so the loop regains control (await again).
+    fn await_child(&mut self, args: &Value) -> (String, bool) {
+        let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if !self.async_children.contains_key(&handle) {
+            return (format!("error: no async subagent with handle '{handle}'"), true);
+        }
+        let deadline = Instant::now() + AWAIT_MAX;
+        loop {
+            if let Some(child) = self.async_children.get_mut(&handle) {
+                Self::drain_child(child);
+                if child.outcome.is_some() {
+                    return self.async_children.remove(&handle).unwrap().outcome.unwrap();
+                }
+            }
+            if Instant::now() >= deadline {
+                return (format!("subagent {handle} is still running (awaited {}s); await again or check status", AWAIT_MAX.as_secs()), false);
+            }
+            std::thread::sleep(AWAIT_POLL);
         }
     }
 
@@ -212,9 +335,12 @@ impl Orchestrator {
 impl SelfHandler for Orchestrator {
     fn tools(&self) -> Vec<ToolDef> {
         let mut t = Vec::new();
-        // Advertise delegation only when there is depth budget to use it.
+        // Advertise delegation only when there is depth budget to use it. The
+        // async-collection tools ride alongside (status/await on returned handles).
         if self.can_nest() {
             t.push(spawn_tool_def());
+            t.push(status_tool_def());
+            t.push(await_tool_def());
         }
         // Self-scheduling + self-subscription are root-agent capabilities: a
         // nested child's request would be lost to its parent, which only
@@ -234,6 +360,10 @@ impl SelfHandler for Orchestrator {
     fn handle(&mut self, name: &str, args: &Value) -> Option<(String, bool)> {
         match name {
             "subagent.spawn" => Some(self.spawn(args)),
+            // Collection tools accept a handle regardless of depth budget — an
+            // agent at its breadth cap still needs to await its in-flight children.
+            "subagent.status" => Some(self.status(args)),
+            "subagent.await" => Some(self.await_child(args)),
             "schedule" if self.parent_depth == 0 => Some(self.schedule(args)),
             "subscribe" if self.parent_depth == 0 => {
                 Some(self.subscription(SubscriptionAction::Subscribe, args))
@@ -254,6 +384,21 @@ impl SelfHandler for Orchestrator {
 
     fn take_subscriptions(&mut self) -> Vec<SubscriptionRequest> {
         std::mem::take(&mut self.subscriptions)
+    }
+}
+
+impl Drop for Orchestrator {
+    fn drop(&mut self) {
+        // Async children that were never collected die with the parent — no
+        // orphan outlives the tree (each `Subagent` reaps on its own Drop). Just
+        // record what was force-reaped (and how many were detached).
+        if !self.async_children.is_empty() {
+            let detached = self.async_children.values().filter(|c| c.detached).count();
+            self.log.info(
+                "subagent.async_reaped",
+                json!({"uncollected": self.async_children.len(), "detached": detached}),
+            );
+        }
     }
 }
 
@@ -280,13 +425,15 @@ fn distill(result: &Value) -> String {
 fn spawn_tool_def() -> ToolDef {
     ToolDef {
         name: "subagent.spawn".into(),
-        description: "Delegate a focused subtask to a fresh child agent that runs independently and \
-            returns its result. Give a clear 'instruction' and (strongly recommended) an \
-            'output_contract' stating exactly what the child should return. Optionally pass \
+        description: "Delegate a focused subtask to a fresh child agent. By DEFAULT the call BLOCKS \
+            until the child finishes and returns its distilled result. Pass async=true to instead \
+            get a handle back immediately and keep working — then collect the result later with \
+            subagent.await (blocks) or subagent.status (peek). Pass detach=true for fire-and-forget \
+            (you will not collect a result). Give a clear 'instruction' and (strongly recommended) \
+            an 'output_contract' stating exactly what the child should return. Optionally pass \
             'context' (only the facts the child needs — it does not see your conversation) and \
-            'servers' (a subset of tool-server names to grant it). Use this to split a large task \
-            into smaller independent pieces. The call blocks until the child finishes and returns \
-            its distilled result."
+            'servers' (a subset of tool-server names to grant it). Use async to run independent \
+            subtasks in parallel."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -294,9 +441,41 @@ fn spawn_tool_def() -> ToolDef {
                 "instruction": {"type": "string", "description": "the subtask for the child agent"},
                 "output_contract": {"type": "string", "description": "exactly what the child should return"},
                 "context": {"type": "string", "description": "only the facts the child needs"},
-                "servers": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"}
+                "servers": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"},
+                "async": {"type": "boolean", "description": "return a handle immediately instead of blocking (collect later)"},
+                "detach": {"type": "boolean", "description": "fire-and-forget; do not collect a result"}
             },
             "required": ["instruction"]
+        }),
+    }
+}
+
+fn status_tool_def() -> ToolDef {
+    ToolDef {
+        name: "subagent.status".into(),
+        description: "Check on an async child you spawned (by 'handle'). Returns 'still running', or \
+            — once it has finished — its distilled result (after which the handle is consumed). \
+            Non-blocking."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"handle": {"type": "string", "description": "the handle returned by subagent.spawn async=true"}},
+            "required": ["handle"]
+        }),
+    }
+}
+
+fn await_tool_def() -> ToolDef {
+    ToolDef {
+        name: "subagent.await".into(),
+        description: "Wait for an async child you spawned (by 'handle') to finish and return its \
+            distilled result. Blocks until it completes; if it is taking a while it returns 'still \
+            running' so you can do other work and await again."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"handle": {"type": "string", "description": "the handle returned by subagent.spawn async=true"}},
+            "required": ["handle"]
         }),
     }
 }
@@ -482,6 +661,23 @@ mod tests {
         }
         assert!(o.schedule(&json!({"after_seconds": 5, "instruction": "x"})).1, "over cap → refused");
         assert_eq!(o.take_scheduled().len(), MAX_SCHEDULED);
+    }
+
+    #[test]
+    fn status_and_await_reject_unknown_handles() {
+        let mut o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let (msg, err) = o.status(&json!({"handle": "0.7"}));
+        assert!(err && msg.contains("no async subagent"), "status on an unknown handle errors: {msg}");
+        let (msg, err) = o.await_child(&json!({"handle": "0.7"}));
+        assert!(err && msg.contains("no async subagent"), "await on an unknown handle errors: {msg}");
+    }
+
+    #[test]
+    fn spawn_schema_advertises_async_and_detach() {
+        let def = spawn_tool_def();
+        let props = &def.input_schema["properties"];
+        assert!(props.get("async").is_some(), "spawn schema must offer async");
+        assert!(props.get("detach").is_some(), "spawn schema must offer detach");
     }
 
     #[test]

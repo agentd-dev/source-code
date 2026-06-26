@@ -21,3 +21,8 @@ pub mod metrics;
 // one piece that needs a listener thread, so it is gated with the registry.
 #[cfg(feature = "metrics")]
 pub mod serve;
+
+// OTLP span export (GenAI semconv). Always compiled, but `export_run_span` is a
+// no-op unless built `--features otel` (the OTLP encoder + HTTP export are
+// gated) — clean loop call sites, zero default cost. Hand-rolled, dep-free.
+pub mod otel;

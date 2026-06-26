@@ -89,7 +89,8 @@ fn trace_id_from(run_id: &str) -> String {
 }
 
 /// A fresh 8-byte (16-hex) span id, unique per call (time ⊕ pid ⊕ counter).
-fn new_span_id() -> String {
+/// Public so the `otel` span export can mint child span ids under the run trace.
+pub fn new_span_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);

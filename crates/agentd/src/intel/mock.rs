@@ -92,6 +92,8 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         ("read", true) => final_answer("read complete"),
         ("schedule", false) => tool_call("schedule", r#"{"after_seconds":1,"instruction":"follow up"}"#),
         ("schedule", true) => final_answer("scheduled a follow-up"),
+        ("subscribe", false) => tool_call("subscribe", r#"{"uri":"file:///watch.json"}"#),
+        ("subscribe", true) => final_answer("now watching the resource"),
         _ => final_answer("mock-llm done"),
     }
 }
@@ -149,5 +151,14 @@ mod tests {
         let turn1 = openai::parse_response(response_json("schedule", false).as_bytes()).unwrap();
         assert_eq!(turn1.tool_calls[0].name, "schedule");
         assert_eq!(turn1.tool_calls[0].arguments["after_seconds"], 1);
+    }
+
+    #[test]
+    fn subscribe_script_calls_the_subscribe_tool() {
+        let turn1 = openai::parse_response(response_json("subscribe", false).as_bytes()).unwrap();
+        assert_eq!(turn1.tool_calls[0].name, "subscribe");
+        assert_eq!(turn1.tool_calls[0].arguments["uri"], "file:///watch.json");
+        let turn2 = openai::parse_response(response_json("subscribe", true).as_bytes()).unwrap();
+        assert!(!turn2.wants_tools());
     }
 }

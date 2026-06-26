@@ -135,3 +135,48 @@ fn reactive_self_scheduling_fires_a_wake() {
     );
     assert!(out.contains(r#""event":"trigger.fired""#), "no trigger fired:\n{out}");
 }
+
+#[test]
+fn reactive_self_subscribe_arms_a_warm_continue_route() {
+    // A reaction's model calls the `subscribe` self-tool for a NEW uri; the daemon
+    // must arm it as a WARM continue route (RFC 0008 §self-subscribe = continue),
+    // not a fresh-spawn route — so future events re-enter one live session.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(&sock, "subscribe");
+
+    let intel = format!("unix:{}", sock.display());
+    let mcp = format!("mock={} --internal-mock-mcp file:///in.json --no-emit", exe());
+    let mut child = Command::new(exe())
+        .args([
+            "--mode", "reactive", "--instruction", "react", "--intelligence", &intel, "--subscribe",
+            "file:///in.json", "--mcp", &mcp, "--log-level", "info",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn reactive agentd");
+
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        stderr.read_to_string(&mut s).ok();
+        s
+    });
+
+    // read-after-subscribe → reaction → the model self-subscribes to file:///watch.json.
+    std::thread::sleep(Duration::from_millis(2000));
+    let _ = child.kill();
+    let _ = child.wait();
+    sigterm(llm.id());
+    let _ = llm.wait();
+    let out = reader.join().unwrap_or_default();
+
+    assert!(out.contains(r#""event":"self.subscribe""#), "model never called subscribe:\n{out}");
+    assert!(out.contains(r#""kind":"self_subscribe""#), "no self-subscription armed:\n{out}");
+    // The new route is a WARM continue, not a Spawn (the signature capability).
+    assert!(
+        out.contains(r#""disposition":"continue""#),
+        "self-subscribe must arm a continue (warm) route:\n{out}"
+    );
+}

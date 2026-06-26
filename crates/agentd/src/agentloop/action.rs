@@ -21,6 +21,14 @@ pub trait SelfHandler {
     /// Handle a tool call. Returns `Some((observation, is_error))` if `name` is
     /// one of this handler's self-tools; `None` to fall through to MCP.
     fn handle(&mut self, name: &str, args: &Value) -> Option<(String, bool)>;
+
+    /// Drain any future wake-ups the agent scheduled for itself this run
+    /// (RFC 0008 §self-scheduling). Default: none. The loop attaches these to
+    /// the run's [`Outcome`](crate::agentloop::stop::Outcome) so a daemon
+    /// supervisor can arm them.
+    fn take_scheduled(&mut self) -> Vec<crate::agentloop::stop::ScheduleRequest> {
+        Vec::new()
+    }
 }
 
 /// The default: no self-tools (used by the in-process once-mode loop, which

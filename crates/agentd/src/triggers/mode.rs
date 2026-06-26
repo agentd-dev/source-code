@@ -12,6 +12,7 @@
 //! at a time) and treats every route as `Spawn`; warm `Continue` sessions and
 //! concurrent reactions land later this milestone.
 
+use crate::agentloop::stop::ScheduleRequest;
 use crate::config::Config;
 use crate::exit;
 use crate::mcp::client::McpClient;
@@ -106,6 +107,11 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     // Triggers armed, subscriptions live: the supervisor is now ready to react.
     log.info("proc.ready", json!({"mode": "reactive"}));
 
+    // Self-scheduled wake-ups (RFC 0008 §self-scheduling): (fire-at, instruction)
+    // an agent requested for itself via the `schedule` self-tool. The daemon owns
+    // them — a reaction can set its own next tick.
+    let mut wakes: Vec<(Instant, String)> = Vec::new();
+
     loop {
         crate::obs::health::tick();
         if signals::draining() {
@@ -138,9 +144,21 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                     let payload = reactive_payload(&base, &delivery.uri, &content);
                     log.info("trigger.fired", json!({"uri": delivery.uri, "bytes": content.len()}));
                     crate::obs::metrics::record_reaction();
-                    react(&exe, &payload, cfg.drain_timeout, log);
+                    let scheduled = react(&exe, &payload, cfg.drain_timeout, log);
+                    arm_wakes(&mut wakes, scheduled, Instant::now(), log);
                 }
             }
+        }
+
+        // Fire due self-scheduled wake-ups: each runs its own instruction as a
+        // fresh reaction, and may schedule further wake-ups (a self-sustaining
+        // agent, bounded by the daemon lifetime + per-run budgets).
+        for instruction in drain_due_wakes(&mut wakes, now) {
+            let payload = scheduled_payload(&base, &instruction);
+            log.info("trigger.fired", json!({"kind": "self_schedule", "instruction_len": instruction.len()}));
+            crate::obs::metrics::record_reaction();
+            let scheduled = react(&exe, &payload, cfg.drain_timeout, log);
+            arm_wakes(&mut wakes, scheduled, Instant::now(), log);
         }
 
         std::thread::sleep(TICK);
@@ -247,16 +265,51 @@ fn sleep_interruptible(dur: Duration) {
     }
 }
 
-/// Spawn + supervise one reaction synchronously, logging the outcome.
-fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) {
+/// Spawn + supervise one reaction synchronously, logging the outcome and
+/// returning any future wake-ups the reaction scheduled for itself (RFC 0008).
+fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) -> Vec<ScheduleRequest> {
     match supervise_once(exe.to_path_buf(), payload, drain, log.clone()) {
         Ok(SuperviseResult::Completed(o)) => {
-            log.info("reactive.handled", json!({"status": o.status.as_str()}))
+            log.info("reactive.handled", json!({"status": o.status.as_str()}));
+            o.scheduled
         }
-        Ok(SuperviseResult::Failed(e)) => log.error("reactive.failed", json!({"err": e})),
-        Ok(SuperviseResult::Killed(r)) => log.warn("reactive.killed", json!({"reason": format!("{r:?}")})),
-        Err(e) => log.error("reactive.spawn_fail", json!({"err": e.to_string()})),
+        Ok(SuperviseResult::Failed(e)) => {
+            log.error("reactive.failed", json!({"err": e}));
+            Vec::new()
+        }
+        Ok(SuperviseResult::Killed(r)) => {
+            log.warn("reactive.killed", json!({"reason": format!("{r:?}")}));
+            Vec::new()
+        }
+        Err(e) => {
+            log.error("reactive.spawn_fail", json!({"err": e.to_string()}));
+            Vec::new()
+        }
     }
+}
+
+/// Arm self-scheduled wake-ups relative to `base_time`, logging each (RFC 0008).
+fn arm_wakes(wakes: &mut Vec<(Instant, String)>, reqs: Vec<ScheduleRequest>, base_time: Instant, log: &Logger) {
+    for r in reqs {
+        let at = base_time + Duration::from_millis(r.after_ms);
+        log.info("trigger.armed", json!({"kind": "self_schedule", "after_ms": r.after_ms}));
+        wakes.push((at, r.instruction));
+    }
+}
+
+/// Remove and return the instructions of every wake-up now due (fire-at ≤ now),
+/// retaining the rest. Pure (drains `wakes` in place).
+fn drain_due_wakes(wakes: &mut Vec<(Instant, String)>, now: Instant) -> Vec<String> {
+    let mut due = Vec::new();
+    wakes.retain(|(at, instruction)| {
+        if *at <= now {
+            due.push(instruction.clone());
+            false
+        } else {
+            true
+        }
+    });
+    due
 }
 
 /// Build the payload for one reaction: the standing instruction plus the
@@ -267,6 +320,15 @@ pub fn reactive_payload(base: &SpawnPayload, uri: &str, content: &str) -> SpawnP
         role: "user".into(),
         content: format!("The resource {uri} changed. Its current content is:\n\n{content}"),
     }];
+    p
+}
+
+/// Build the payload for a self-scheduled wake-up: the agent's own deferred
+/// `instruction` replaces the standing one; no resource context. Pure.
+fn scheduled_payload(base: &SpawnPayload, instruction: &str) -> SpawnPayload {
+    let mut p = base.clone();
+    p.instruction = instruction.to_string();
+    p.context_seed = Vec::new();
     p
 }
 
@@ -319,5 +381,50 @@ mod tests {
         assert_eq!(updated_uri(&Some(json!({"uri": "file://a"}))), Some("file://a".into()));
         assert_eq!(updated_uri(&Some(json!({"title": "x"}))), None);
         assert_eq!(updated_uri(&None), None);
+    }
+
+    fn test_logger() -> Logger {
+        use crate::obs::log::{Comp, Level, LogCtx};
+        Logger::new(
+            LogCtx {
+                run_id: "t".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: 0,
+                trace_id: None,
+            },
+            Level::Error,
+        )
+    }
+
+    #[test]
+    fn scheduled_payload_replaces_instruction_and_clears_seed() {
+        let mut b = base();
+        b.context_seed = vec![SeedMessage { role: "user".into(), content: "stale".into() }];
+        let p = scheduled_payload(&b, "do the deferred thing");
+        assert_eq!(p.instruction, "do the deferred thing"); // the agent's own follow-up
+        assert!(p.context_seed.is_empty()); // no resource context on a time wake
+    }
+
+    #[test]
+    fn arm_and_drain_wakes_fire_past_due_keep_future() {
+        let now = Instant::now();
+        let mut wakes: Vec<(Instant, String)> = Vec::new();
+        arm_wakes(
+            &mut wakes,
+            vec![
+                ScheduleRequest { after_ms: 0, instruction: "now".into() },
+                ScheduleRequest { after_ms: 60_000, instruction: "later".into() },
+            ],
+            now,
+            &test_logger(),
+        );
+        assert_eq!(wakes.len(), 2);
+        // Slightly after `now`: the 0ms wake is due, the 60s one is not.
+        let due = drain_due_wakes(&mut wakes, now + Duration::from_millis(1));
+        assert_eq!(due, vec!["now".to_string()]);
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].1, "later");
     }
 }

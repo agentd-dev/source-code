@@ -59,8 +59,10 @@ fn subagent_spawn_runs_a_real_child() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
     let mut orch = Orchestrator::from_payload(exe, &parent_payload(), Duration::from_secs(15), logger());
 
-    // The parent (depth 0, max_depth 4) can delegate, so the tool is advertised.
-    assert_eq!(orch.tools().len(), 1, "subagent.spawn should be advertised");
+    // The root (depth 0, max_depth 4) can delegate and self-schedule.
+    let tool_names: Vec<String> = orch.tools().iter().map(|t| t.name.clone()).collect();
+    assert!(tool_names.iter().any(|n| n == "subagent.spawn"), "subagent.spawn should be advertised");
+    assert!(tool_names.iter().any(|n| n == "schedule"), "schedule should be advertised at the root");
 
     let (content, is_error) = orch
         .handle("subagent.spawn", &json!({"instruction": "do a focused subtask"}))

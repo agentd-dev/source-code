@@ -195,6 +195,7 @@ mod tests {
                 status: TerminalStatus::Completed,
                 partial: false,
                 result: json!("done"),
+                scheduled: Vec::new(),
             },
         };
         let s = serde_json::to_string(&result).unwrap();

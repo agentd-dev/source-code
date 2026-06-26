@@ -59,28 +59,31 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M6 done bar `otel`; closing out M5 — **drain choreography** verified
-  + completed this wake (graceful SIGTERM→exit 0, `drain.timeout` audit signal,
-  reactive-path test). On top of cgroup-v2 awareness, trifecta enforcement,
-  metrics, `--log-content`.
-- **Last completed (this wake):** **drain choreography completed + verified**.
-  Resolved the stale "0 vs 143" decision in `main.rs` (a SIGTERM drain self-exits
-  0, never 143). Added a one-shot `drain.timeout` warn in the reactor when the
-  drain budget is exceeded (the forced-teardown boundary, distinct from the
-  per-node `subagent.sigkill`). Added a reactive-mode drain integration test
-  (`tests/daemon_modes.rs`: SIGTERM → `reason:drain` → exit 0), complementing the
-  existing loop-mode one. The Cancel→SIGTERM→SIGKILL ladder, the second-signal
-  force, and the `< pod grace` help guidance were already in place. (Prior wakes:
-  cgroup-v2 awareness; trifecta enforcement; metrics; `--log-content`; restart
-  governor; SSRF; exit table.) No new deps, default build still 3 deps. **176
-  default / 180 metrics tests** green, clippy clean (default + metrics + all).
-- **Next action:** the remaining work is the bigger features. Highest-value:
-  **M3 reactive depth** — `subscribe`/`unsubscribe` self-tools + **self-subscribe
-  → self-scheduling** (the signature capability: an agent schedules its own
-  future wake-ups), warm `Continue` sessions, async `subagent.spawn`. Also open:
-  **`--serve-mcp` peer listener** (M2/M4 composability), the `cron` + `otel`
-  features, M7 (conformance + observe-suite + container + docs), and the M5
-  cgroup `cgroup.kill`/backpressure follow-ups (need a cgroup-v2 host to exercise).
+- **Phase:** M3 reactive depth — **self-scheduling** (the signature capability:
+  an agent schedules its own future wake-ups via the `schedule` self-tool) landed
+  this wake. On top of M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
+- **Last completed (this wake):** **self-scheduling** — the standout reactive
+  capability. New `schedule` self-tool on the root `Orchestrator`
+  (`{after_seconds, instruction}`, bounded ≤8/run, 1s–30d, root-only since a
+  nested child's request would be lost). Requests ride out on a new
+  `Outcome.scheduled` field (flowing up the existing `AgentMsg::Result` path — no
+  control-channel upcall needed); `run_reactive` arms them as `(fire-at,
+  instruction)` wakes and fires each as a fresh reaction that can itself schedule
+  again (a self-sustaining agent, bounded by daemon lifetime + per-run budgets).
+  Shared `ScheduleRequest` type + `SelfHandler::take_scheduled`; pure
+  `arm_wakes`/`drain_due_wakes`/`scheduled_payload` + the tool are unit-tested.
+  (Prior wakes: drain choreography; cgroup-v2; trifecta; metrics;
+  `--log-content`.) No new deps, default build still 3 deps. **180 default / 184
+  metrics tests** green, clippy clean (default + metrics + all-features). _Live
+  end-to-end firing (model actually calls `schedule`) needs a mock-LLM fixture —
+  deferred to the M7 observe-suite._
+- **Next action:** continue M3 reactive depth — resource `subscribe`/`unsubscribe`
+  self-tools (let an agent self-subscribe to an MCP resource) + warm `Continue`
+  sessions + async `subagent.spawn{async,detach}`. Then **`--serve-mcp` peer
+  listener** (M2/M4 composability), the `cron` + `otel` features, M7 (conformance
+  + observe-suite + container + docs — the observe-suite needs a mock-LLM fixture
+  that also unlocks the live self-scheduling test), and the M5 cgroup
+  `cgroup.kill`/backpressure follow-ups (need a cgroup-v2 host).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -148,7 +151,7 @@ Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `s
 - [x] `triggers/router.rs` reactive routing (pure, unit-tested): exact-beats-glob + longest-prefix exactly-one-owner match, `Disposition::Spawn`/`Continue` as a route property, debounce + newest-wins coalesce, `on_updated`/`due`/`next_deadline`, dropped-counter for no-match
 - [ ] warm-session state in `tree.rs`
 - [x] **`resource.read` self-tool + resource-catalogue injection** (`runner.rs`): list = awareness (a capped uri+label catalogue injected as a system note), read = attention (`resource.read{uri}` pulls a body on demand from the owning MCP server). Also closes the M1 "inject a resource catalogue" follow-up.
-- [ ] `subscribe`/`unsubscribe` self-tools; self-subscribe → auto continue-route (**self-scheduling**) — needs control-channel upcall + warm `Continue` sessions
+- [~] **self-scheduling landed** (the signature capability): a root agent calls the `schedule` self-tool (`{after_seconds, instruction}`, bounded: ≤8/run, 1s–30d, root-only) to set its own future wake-up. Requests ride out on `Outcome.scheduled` (no control-channel upcall needed — they flow up the existing Result path); the reactive daemon arms them as `(fire-at, instruction)` wakes and fires each as a fresh reaction (which may schedule again — a self-sustaining agent, bounded by daemon lifetime + per-run budgets). Pure helpers (`arm_wakes`/`drain_due_wakes`/`scheduled_payload`) + the orchestrator tool are unit-tested; events `self.schedule` / `trigger.armed`+`trigger.fired` (kind:self_schedule). _Remaining on this line: resource `subscribe`/`unsubscribe` self-tools (self-subscribe to an MCP resource) + warm `Continue` sessions; and the live end-to-end firing test needs a mock-LLM fixture (M7)._
 - [ ] async `subagent.spawn{async,detach}` + completion-as-self-resource
 - [ ] rebuild+reconcile (read-after-subscribe) on (re)start
 - **Acceptance:** `--mode reactive --subscribe file://…` idles near-zero CPU, wakes on `updated` then `resources/read`s; burst coalesces to one wake; no-route event dropped+counted; self-subscribing agent re-entered in same session; restart re-subscribes + read-after-subscribe re-fires missed change; async subagent returns handle, completion arrives as subscribable resource update.

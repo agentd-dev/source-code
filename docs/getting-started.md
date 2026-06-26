@@ -29,10 +29,10 @@ dependency-light: no async runtime, no TLS, no C/C++ toolchain.
 ```console
 $ git clone <repo> agentd && cd agentd
 $ cargo build -p agentd --release
-   Compiling agentd v0.1.0
+   Compiling agentd v2.0.0
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
-agentd 0.1.0
+agentd 2.0.0
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops
@@ -151,7 +151,7 @@ On stderr you get one JSON object per line. The run threads a
 with the same `run_id`, `agent_id`, `agent_path`, and `comp` correlation tuple:
 
 ```jsonc
-{"ts":"2026-06-25T11:18:02.796Z","level":"info","event":"proc.start","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1741188,"version":"0.1.0","mode":"once","mcp_servers":1,"subscribe":0}
+{"ts":"2026-06-25T11:18:02.796Z","level":"info","event":"proc.start","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1741188,"version":"2.0.0","mode":"once","mcp_servers":1,"subscribe":0}
 {"ts":"...","level":"info","event":"mcp.connect","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"mcp","server":"fs"}
 {"ts":"...","level":"info","event":"tool.call","run_id":"19efe80512c1a9184","agent_id":"a1","agent_path":"0.1","comp":"agent","server":"fs","tool":"read_file"}
 {"ts":"...","level":"info","event":"tool.call","run_id":"19efe80512c1a9184","agent_id":"a1","agent_path":"0.1","comp":"agent","server":"fs","tool":"write_file"}

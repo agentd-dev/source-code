@@ -89,7 +89,7 @@ line. The canonical fields are
 `ts level event run_id agent_id agent_path comp pid …` (RFC 0010):
 
 ```json
-{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"0197f3c4a01abcd","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"0.1.0","mode":"once","mcp_servers":2,"subscribe":0}
+{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"0197f3c4a01abcd","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"2.0.0","mode":"once","mcp_servers":2,"subscribe":0}
 ```
 
 Because stdout is the result and stderr is telemetry, you compose with ordinary
@@ -339,7 +339,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: agentd
-          image: ghcr.io/example/agentd:0.1.0
+          image: ghcr.io/example/agentd:2.0.0
           args:
             - --mode=once
             - --instruction-file=/etc/agentd/task.txt
@@ -376,7 +376,7 @@ spec:
           terminationGracePeriodSeconds: 30
           containers:
             - name: agentd
-              image: ghcr.io/example/agentd:0.1.0
+              image: ghcr.io/example/agentd:2.0.0
               args:
                 - --mode=once
                 - --instruction-file=/etc/agentd/nightly.txt
@@ -403,7 +403,7 @@ spec:
       terminationGracePeriodSeconds: 30   # > --drain-timeout
       containers:
         - name: agentd
-          image: ghcr.io/example/agentd:0.1.0
+          image: ghcr.io/example/agentd:2.0.0
           args:
             - --mode=reactive
             - --instruction-file=/etc/agentd/triage.txt

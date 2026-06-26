@@ -89,7 +89,7 @@ On connect, before anything else, agentd runs the MCP lifecycle. It pins
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agentd","title":"agentd","version":"0.1.0"}
+    "clientInfo":{"name":"agentd","title":"agentd","version":"2.0.0"}
 }}
 // server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
@@ -303,7 +303,7 @@ nothing else:
       "tools":     { "listChanged": true },
       "resources": { "subscribe": true, "listChanged": true }
     },
-    "serverInfo":{ "name":"agentd","title":"agentd","version":"0.1.0" },
+    "serverInfo":{ "name":"agentd","title":"agentd","version":"2.0.0" },
     "instructions":"agentd self-MCP: spawn/steer subagents, read+subscribe agentd:// state."
 }}
 ```

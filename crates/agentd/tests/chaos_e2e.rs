@@ -9,6 +9,7 @@
 //! integration tests; the SIGTERM drain ladder by `daemon_modes`.)
 #![cfg(target_os = "linux")]
 
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -118,4 +119,62 @@ fn killing_the_supervisor_collapses_the_subagent_no_orphan() {
     let _ = llm.wait();
 
     assert!(collapsed, "subagent {sub_pid} kept running after its supervisor died — PDEATHSIG leaked a process");
+}
+
+#[test]
+fn a_wedged_subagent_is_detected_stuck_and_force_killed_within_budget() {
+    // Short liveness timeouts (env knobs) + a short drain budget so a frozen
+    // subagent is classified Stuck and force-killed within a couple of seconds
+    // instead of the production 120 s. The slow LLM keeps the subagent in its
+    // model call; SIGSTOP then freezes its control thread too, so it stops
+    // answering pings — the genuine "wedged, not busy" condition.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("llm.sock");
+    let mut llm = start_slow_llm(&sock);
+
+    let intel = format!("unix:{}", sock.display());
+    let mut sup = Command::new(exe())
+        .args(["--mode", "once", "--instruction", "x", "--intelligence", &intel, "--drain-timeout", "1s", "--log-level", "info"])
+        .env("AGENTD_PROGRESS_TIMEOUT_MS", "400")
+        .env("AGENTD_PONG_TIMEOUT_MS", "400")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd supervisor");
+    let sup_pid = sup.id();
+    let mut err = sup.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        err.read_to_string(&mut s).ok();
+        s
+    });
+
+    // Find the live subagent, then freeze it (control thread included).
+    let mut sub_pid = 0u32;
+    let found = poll_until(Duration::from_secs(3), || match children_of(sup_pid).first() {
+        Some(&p) => {
+            sub_pid = p;
+            running(p)
+        }
+        None => false,
+    });
+    assert!(found, "no live subagent appeared under the supervisor");
+    signal(sub_pid, libc::SIGSTOP);
+
+    // The supervisor must classify it Stuck (no pongs) and force the kill ladder
+    // within the drain budget — i.e. agentd *exits* rather than hang forever.
+    let exited = poll_until(Duration::from_secs(8), || sup.try_wait().ok().flatten().is_some());
+    let status = sup.try_wait().ok().flatten();
+    let sub_gone = !running(sub_pid);
+
+    signal(sub_pid, libc::SIGKILL); // cleanup if anything is still around
+    signal(llm.id(), libc::SIGKILL);
+    let _ = llm.wait();
+    let out = reader.join().unwrap_or_default();
+
+    assert!(exited, "supervisor hung on a wedged subagent instead of force-killing it:\n{out}");
+    assert!(out.contains(r#""event":"subagent.stuck""#), "the wedged subagent was not classified Stuck:\n{out}");
+    assert!(sub_gone, "the wedged subagent was not killed");
+    // KillReason::Stuck maps to exit 124 (the deadline/stuck class).
+    assert_eq!(status.and_then(|s| s.code()), Some(124), "a stuck-killed run should exit 124:\n{out}");
 }

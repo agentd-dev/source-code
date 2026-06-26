@@ -251,7 +251,13 @@ impl Supervisor {
                         l.on_eof();
                     }
                     self.log.info("subagent.exit", json!({"node": node.0, "outcome": format!("{:?}", r.outcome)}));
-                    if node == self.root && self.root_terminal.is_none() {
+                    // The root exited without reporting a result. Only treat that
+                    // as an unexpected failure when we are NOT tearing the tree
+                    // down: during a drain/stuck/deadline/budget teardown the root
+                    // dying is the *expected* consequence, so the teardown reason
+                    // (Killed(..)) must stand — not a synthetic "exited without a
+                    // result" that would mask a stuck-kill as a generic failure.
+                    if node == self.root && self.root_terminal.is_none() && self.drain.is_none() {
                         self.root_terminal =
                             Some(SuperviseResult::Failed("subagent exited without a result".into()));
                     }

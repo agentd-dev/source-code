@@ -329,15 +329,16 @@ parent.
 
 ---
 
-## 8. Sync by default (async/detach are roadmap)
+## 8. Sync by default; async and detach also ship
 
-`subagent.spawn` takes a disposition. **v1 ships sync-only.**
+`subagent.spawn` takes a disposition. **Sync is the default; async and detach
+also ship.**
 
 ```rust
 enum Disposition { Sync, Async, Detach } // default = Sync
 ```
 
-- **`Sync` (default, v1).** The tool call blocks the parent's *turn* until the
+- **`Sync` (default).** The tool call blocks the parent's *turn* until the
   child reaches a terminal status, then returns the `SubagentResult`. The
   parent's loop is between turns, so the parent process is cheaply paused — no
   orphan management, a deterministic mental model. (Implementation note: the
@@ -346,18 +347,18 @@ enum Disposition { Sync, Async, Detach } // default = Sync
   returns whatever terminal status the kill produced (`deadline`, `cancelled`,
   `crashed`).
 
-- **`Async` (roadmap, M3).** Returns a handle immediately
+- **`Async`.** Returns a handle immediately
   (`{ handle, resource_uri }`); the parent keeps reasoning and later calls
   `subagent.status` / `subagent.await`, or subscribes to `resource_uri` — the
   child's completion *is* an `agentd://` resource update. Bounded by
   `max_inflight` (default 4).
 
-- **`Detach` (roadmap, M3).** Fire-and-forget. The child **still** counts
+- **`Detach`.** Fire-and-forget. The child **still** counts
   against the tree budget, depth cap, and breadth/rate caps, and is **still
   reaped**. Use sparingly.
 
-Async and detach share the subscribe/notify machinery with reactivity, so they
-land in **M3** together — not before. Streaming a child's partial output into
+Async and detach reuse the subscribe/notify machinery they share with
+reactivity — the same machinery is built and live. Streaming a child's partial output into
 the parent's reasoning is out of scope for v1: the child always streams loop
 events up the control channel for *supervision and observability*, but those
 partials never enter the parent's context — only the final distillate does.

@@ -1,6 +1,6 @@
 # RFC 0005: Self-MCP server & supervisor↔subagent control protocol
 
-**Status:** Draft
+**Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
@@ -670,9 +670,6 @@ where the control protocol must agree.)
   separation (assessment §2.3, §5 risk 10).
 - **MCP lifecycle on the control channel** — deliberately absent. No
   `initialize`, no capability negotiation on the private pipe.
-- **async / detach subagents** land in **M3** (assessment §2.7); v1 ships
-  `subagent.spawn` sync-only, but the resource/notify machinery (§3.3, §3.4) is
-  built now so M3 is additive.
 
 ---
 

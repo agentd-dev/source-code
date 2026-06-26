@@ -194,9 +194,11 @@ replayable — the log records the owning route id per event (RFC 0010).
 The glob matcher is a tiny hand-rolled one over the URI string (`*` within a path
 segment, `**` across segments, `?` single char) — no `regex`/`glob` crate.
 
-> **Explicit per-route declaration** (`--route match=>spawn|continue:sid[,debounce=ms,cap=N,overflow=…]`,
-> RFC 0008 §3.8) is **(roadmap)** — not yet on the CLI surface. In v1 each
-> `--subscribe`d URI defaults to a single `spawn` route in `reactive`/`schedule`.
+> The full `--route match=>spawn|continue:sid[,debounce=ms,cap=N,overflow=…]`
+> mini-DSL (RFC 0008 §3.8) is still **(roadmap)**. The two shipped per-URI route
+> declarations are `--subscribe` (a `spawn` route) and `--continue` (a warm
+> `continue` route); a `--subscribe`d URI defaults to a single `spawn` route in
+> `reactive`/`schedule`.
 
 ### spawn vs continue — a route property, not a per-event guess
 
@@ -369,11 +371,11 @@ agentd \
 limit class.
 
 > **Internal cron.** A 5-field cron expression (`--mode schedule --cron
-> "<min hour dom mon dow>"`, UTC, behind the `cron` build feature, RFC 0008 §3.6)
-> is **(roadmap)** — the feature exists in the build matrix but the `--cron` flag
-> is not yet on the CLI surface in
-> [`config.rs`](../crates/agentd/src/config.rs). Use external CronJob → `once`,
-> or `--interval`, in v1.
+> "<min hour dom mon dow>"`, UTC, RFC 0008 §3.6) ships behind the `cron` build
+> feature. The `--cron` flag is on the CLI surface today
+> ([`config.rs`](../crates/agentd/src/config.rs)); build with `--features cron`
+> to enable it. For production, prefer an external CronJob → `once`, or
+> `--interval`.
 
 ---
 
@@ -388,6 +390,7 @@ side effect** (a bad config exits `2` in milliseconds, RFC 0011).
 |---|---|---|---|---|
 | Mode | `--mode once\|loop\|reactive\|schedule` | `AGENTD_MODE` | `once` | the driver |
 | Subscribe | `--subscribe <uri>` (repeatable) | — | none | required for `reactive` |
+| Continue | `--continue <uri>` (repeatable) | — | none | subscribe an MCP resource, routed to one warm `continue` session |
 | Interval | `--interval <dur>` | — | unset | `loop`/`schedule`; required for `schedule` |
 | Instruction | `--instruction <TEXT>` / `--instruction-file <PATH>` | `INSTRUCTION` | — | required |
 | Intelligence | `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | — | `unix:` / `https://` / `vsock:` |

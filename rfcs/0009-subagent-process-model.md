@@ -1,6 +1,6 @@
 # RFC 0009: Subagent process model & nesting
 
-**Status:** Draft
+**Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
@@ -19,7 +19,7 @@ This RFC covers assessment **§2.7** in full. It is the authority on:
 - the **rich** spawn payload (output contract + narrowed context seed + tool scope + limits + telemetry);
 - supervisor-minted depth (never trusted from the child);
 - the distilled structured result + store-and-reference;
-- sync-default / async-opt-in / detach (v1 sync-only; async in M3);
+- sync-default / async-opt-in / detach (sync is the default; async/detach shipped in M3);
 - nesting **only** via the supervisor-owned `subagent.spawn` chokepoint;
 - the caps enforced at that chokepoint, refused as **tool results**, never crashes;
 - folding `exec` children into the same regime.
@@ -34,7 +34,7 @@ It does **not** respecify the process-tree mechanics (process groups, PDEATHSIG,
 2. **The spawn payload is rich, not minimal.** It carries an **output contract** (objective + required output format + tool/source guidance + boundaries), a **narrowed context seed** (only chosen slices — never the full transcript), a **tool scope** (a subset of the parent's, narrowing monotonically), **limits**, and a **telemetry** block. A bare instruction string is rejected at the chokepoint as malformed.
 3. **Depth is minted by the supervisor** from the caller's handle. The child cannot assert its own depth, parent edge, or budget grant — those fields, if present in the request, are ignored.
 4. **The result is a distilled, structured value** (~1–2k tokens) + a terminal status + usage. Large outputs use store-and-reference (the child writes a resource, returns a handle). The parent appends the **distillate**, never the child's raw transcript.
-5. **Sync-default, async-opt-in, detach-rare.** `subagent.spawn` blocks the parent's turn by default. `{async:true}` returns a handle; `{detach:true}` is fire-and-forget but still budgeted, depth-counted, and reaped. **v1 ships sync-only; async/detach land in M3** alongside reactivity (they share the subscribe/notify machinery — RFC 0008).
+5. **Sync-default, async-opt-in, detach-rare.** `subagent.spawn` blocks the parent's turn by default. `{async:true}` returns a handle; `{detach:true}` is fire-and-forget but still budgeted, depth-counted, and reaped. **Sync is the default; async/detach shipped in M3** alongside reactivity (they share the subscribe/notify machinery — RFC 0008).
 6. **Nesting happens only through the supervisor-owned `subagent.spawn` self-tool** — exactly one unforgeable chokepoint for every cap.
 7. **Caps are enforced at the chokepoint** (`max_depth`, `max_children`, `max_total_subagents`, spawn-rate token-bucket, tree-token ceiling) and a violation is **refused as a tool result**, never a crash.
 8. **`exec` children are folded into the same regime** (mandatory deadline, process-group kill, subtree budget, breadth/rate caps) — but with no control channel, only the deadline + kill detectors apply, not ping/pong.
@@ -272,13 +272,13 @@ enum Disposition { Sync, Async, Detach }   // default = Sync
 
 - **`Sync` (default, v1).** The handler blocks the parent's *tool call* until the child reaches a terminal status, then returns `SubagentResult` as the tool result. The parent's loop is between turns, so the parent process is cheaply paused — no orphan management, deterministic mental model (notes §6.3; Anthropic's lead-agent default). Concretely: the supervisor does not return the JSON-RPC response for the `subagent.spawn` request until the child's result frame arrives (or the child is killed, in which case it returns the terminal status that the kill produced, e.g. `deadline`/`cancelled`/`crashed`).
 
-- **`Async` (M3).** Returns a **handle** immediately: `{ handle, resource_uri }`. The parent keeps reasoning and later calls `subagent.status(handle)` / `subagent.await(handle)`, **or** subscribes to `resource_uri` — the child's completion *is* an `agentd://` resource update the parent reacts to (closing the loop with the reactive router, RFC 0008). Bounded by the route/parent `max_inflight` (default 4).
+- **`Async` (shipped in M3).** Returns a **handle** immediately: `{ handle, resource_uri }`. The parent keeps reasoning and later calls `subagent.status(handle)` / `subagent.await(handle)`, **or** subscribes to `resource_uri` — the child's completion *is* an `agentd://` resource update the parent reacts to (closing the loop with the reactive router, RFC 0008). Bounded by the route/parent `max_inflight` (default 4).
 
-- **`Detach` (M3).** Fire-and-forget: returns a handle, the parent does not await. The child **still** counts against the tree budget, the depth cap, and the breadth/rate caps, and is **still reaped** by the supervisor (notes §6.3). It reports to logs and an `agentd://` resource. Use sparingly.
+- **`Detach` (shipped in M3).** Fire-and-forget: returns a handle, the parent does not await. The child **still** counts against the tree budget, the depth cap, and the breadth/rate caps, and is **still reaped** by the supervisor (notes §6.3). It reports to logs and an `agentd://` resource. Use sparingly.
 
 **Streaming partials into the parent's reasoning is out of scope for v1** (notes §6.3): it complicates the parent's context management. The child always streams loop events up the control channel for *observability and supervision* (RFC 0003/0005), but those partials do not enter the parent's context — only the final distillate does. The async-handle + await/subscribe covers the real fan-out need.
 
-The v1 sync-only stance is deliberate (notes §11.3, assessment §2.7): async shares the subscribe/notify machinery, so it lands in **M3** with reactivity, not before.
+The sync default is deliberate (notes §11.3, assessment §2.7): async shares the subscribe/notify machinery, so it **shipped in M3** with reactivity, not before.
 
 ### 3.8 `exec` children folded into the same regime
 
@@ -308,7 +308,6 @@ Because `exec` is the strongest trifecta leg, the security posture (RFC 0012) re
 
 ## 5. Non-goals / Deferred
 
-- **Async & detach dispositions are deferred to M3** (assessment §2.7). v1 ships **sync-only**. The `Disposition` enum and `subagent.status`/`await` tools are reserved but not implemented in v1.
 - **Streaming partial results into the parent's reasoning** is out of scope for v1 (notes §6.3); only the final distillate enters the parent's context.
 - **Supervisor-crash session checkpointing** (serializing the spawn-payload map + routing table to disk) is a deferred v2 extension (RFC 0013, assessment §2.8). v1 retains the spawn payload in supervisor memory only as the minimum recoverable unit for bounded restart; warm sessions are lost on supervisor crash and recovered by idempotent re-trigger.
 - **Aggregate subtree *memory* enforcement** is explicitly *not* in-binary (assessment §2.8): only the *token* ceiling and per-child `RLIMIT_AS`/`RLIMIT_CPU` are. Aggregate memory needs cgroups v2 (deployment layer, RFC 0003/0011). Stated here so the caps table is not read as a memory guarantee.

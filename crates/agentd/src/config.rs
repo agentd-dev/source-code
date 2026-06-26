@@ -1,14 +1,13 @@
 //! Configuration: precedence + validate-at-startup. RFC 0011 §2-§3.
 //!
-//! Precedence, top wins: `built-in default < config file < env var < CLI
-//! flag`. Everything is env-settable (12-factor); the file is only for
-//! verbose structural bits (MCP server lists) and **never for secrets**
-//! (env/flag only). The whole config is validated **before any side effect**
-//! — a bad config exits `2` in milliseconds, not after an LLM round-trip.
+//! Precedence, top wins: `built-in default < env var < CLI flag`. Everything
+//! is env-settable (12-factor). The whole config is validated **before any
+//! side effect** — a bad config exits `2` in milliseconds, not after an LLM
+//! round-trip.
 //!
-//! (M1 implements `default < env < flag`; the optional config-file layer is a
-//! later milestone and slots between default and env. Flag/env names are the
-//! stable surface.)
+//! A config-file layer (which would slot between default and env) is
+//! intentionally not built — env/flag are the complete, stable surface, and
+//! secrets are env/flag only.
 
 use crate::obs::log::Level;
 use crate::sec::scope::TrifectaTag;
@@ -213,7 +212,7 @@ impl fmt::Display for ConfigError {
 }
 
 impl Config {
-    /// Resolve config from CLI args (excluding argv[0]) and the environment,
+    /// Resolve config from CLI args (excluding the leading program name) and the environment,
     /// applying precedence (env then flags over defaults) and validating.
     pub fn load(args: &[String], env: &[(String, String)]) -> Result<Config, ConfigError> {
         let envmap: HashMap<&str, &str> =
@@ -452,8 +451,9 @@ fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     }
 }
 
-/// Parse `--mcp name=cmd arg arg`. The command is whitespace-split into argv
-/// (M1 simplification; the config-file layer carries argv arrays verbatim).
+/// Parse `--mcp name=cmd arg arg`. The command is whitespace-split into argv;
+/// quoting/escaping is not supported (declare such servers via a wrapper
+/// script).
 fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     let (name, cmd) = spec
         .split_once('=')

@@ -6,8 +6,10 @@
 //! returns a scripted assistant turn — a final answer or a tool call — switching
 //! to a final answer once a tool result appears in the transcript (so the ReAct
 //! cycle closes). Scripts: `final` (answer at once), `read` (call `resource.read`
-//! then answer), `schedule` (call the `schedule` self-tool then answer). Small
-//! enough to ship; it makes the loop + self-* tools observable end to end.
+//! then answer), `schedule` (call the `schedule` self-tool then answer),
+//! `subscribe` (call the `subscribe` self-tool then answer); `slow`/`hang` hold
+//! the response to exercise the stuck/deadline detectors. Small enough to ship;
+//! it makes the loop + self-* tools observable end to end.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

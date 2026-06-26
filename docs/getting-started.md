@@ -268,8 +268,8 @@ runtime is built around.
 > **v1 scope (roadmap notes).** Reactivity is **stdio-only** in v1 — only stdio
 > MCP servers deliver notifications; reactive-over-HTTP is deferred (roadmap).
 > Serving agentd's own MCP (`--serve-mcp`) is **stdio/unix-socket only**;
-> HTTP serving is deferred (roadmap). Subagent spawning is **synchronous** in
-> v1; async/detached spawns land in **M3** (roadmap). MCP
+> HTTP serving is deferred (roadmap). Subagent spawning defaults to
+> **synchronous**; `{async}`/`{detach}` dispositions also ship. MCP
 > tasks/sampling/roots are deferred ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).
 
 ---

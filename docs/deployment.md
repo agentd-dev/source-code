@@ -61,8 +61,7 @@ warns). Config is validated **before any side effect** — a typo'd flag exits `
 in milliseconds, not after an LLM round-trip.
 
 > **Roadmap markers.** v1 reactivity is **stdio-only** (no reactive-over-HTTP);
-> self-MCP serving is **stdio/unix only** (HTTP serving deferred); async
-> subagents land in **M3** (v1 `subagent.spawn` is synchronous); MCP
+> self-MCP serving is **stdio/unix only** (HTTP serving deferred); MCP
 > tasks/sampling/roots are deferred (RFC 0013). Items below are tagged
 > **(roadmap)** where they do not ship in v1.
 
@@ -235,9 +234,9 @@ inside the pod, TLS at the boundary**:
 - Point `--intelligence` at a **`unix:` socket** shared with a sidecar (or the
   host) that terminates TLS to the real endpoint, or
 - Use **`vsock:cid:port`** to reach an intelligence endpoint on the host /
-  enclave **(roadmap; `vsock` feature)**, or
-- Build with `--features tls` only if agentd must dial `https://` directly
-  (rustls + bundled roots; adds the one heavier dependency) **(roadmap)**.
+  enclave (build with **`--features vsock`**), or
+- Build with **`--features tls`** to dial `https://` directly (rustls + bundled
+  roots; adds the one heavier dependency).
 
 ```bash
 # In-pod: agentd talks plaintext over a unix socket to a TLS-terminating sidecar.

@@ -1,6 +1,7 @@
-//! Observability. The default build ships exactly two things: a hand-rolled
-//! JSON-lines logger to stderr + a tiny health surface. Everything heavier
-//! (metrics, OTLP) is feature-gated. RFC 0010.
+//! Observability. The default build ships three dependency-free things: a
+//! hand-rolled JSON-lines logger to stderr, a tiny health surface, and W3C
+//! trace-context propagation. Only the heavier surfaces (metrics, OTLP export)
+//! are feature-gated. RFC 0010.
 //!
 //! Invariant: **stdout is the agent's result; stderr is all telemetry.**
 

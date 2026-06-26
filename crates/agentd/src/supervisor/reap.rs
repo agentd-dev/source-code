@@ -5,10 +5,12 @@
 //!    grandchildren orphaned by a dying subagent reparent to *us*, not host
 //!    init — so the whole tree stays in agentd's reaping domain. When agentd
 //!    *is* PID 1 (a bare container), the same applies natively.
-//! 2. **Reaping.** `SIGCHLD` (delivered via the self-pipe in `signals.rs`)
-//!    wakes the reactor, which calls [`reap_pending`] — a `waitpid(-1,
-//!    WNOHANG)` **loop**, because SIGCHLD does not queue: one signal may cover
-//!    several exits.
+//! 2. **Reaping.** Each active `Supervisor` tick drains the process-global
+//!    reaper (`reaper::reap_and_dispatch`), whose `reap_pending` here is the
+//!    single `waitpid(-1, WNOHANG)` **loop** — looped because SIGCHLD does not
+//!    queue, so one signal may cover several exits. The SIGCHLD self-pipe
+//!    (`signals.rs`) is only a promptness hint; correctness does not depend on
+//!    it.
 //!
 //! The exit-status decode ([`classify_status`]) is pure and unit-tested; the
 //! `waitpid` loop itself is a thin libc wrapper exercised by the reactor.

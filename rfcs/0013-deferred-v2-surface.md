@@ -1,6 +1,6 @@
 # RFC 0013: Deferred v2 Surface — tasks, sampling, roots, Streamable HTTP serving, session checkpointing
 
-**Status:** Draft
+**Status:** Accepted (v2 surface, deferred)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
@@ -393,8 +393,9 @@ scope (RFC 0001 §2).
 
 **v1 FALLBACK** (assessment §2.6; RFC 0008). Internal time-scheduling is a
 **standalone convenience**: `--interval D` (`D=0` = re-enter immediately) and
-an optional **5-field cron** behind the `cron` feature (`croner`, which adds
-only `chrono`; assessment §2.2). Both are implemented as **internal time
+an optional **5-field cron** behind the `cron` feature (**hand-rolled 5-field UTC
+parser, zero-dep**, a deliberate deviation from the original `croner` choice for
+the minimalism moat; assessment §2.2). Both are implemented as **internal time
 events fed into the same reactive router** ("a clock is just another event
 source") — no second scheduling subsystem. **Default TZ = UTC; no
 calendars/DST/job-store/catch-up in core** (assessment §2.6). A missed tick

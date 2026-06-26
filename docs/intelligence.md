@@ -28,7 +28,7 @@ ships no async runtime and no `url`/ICU stack.
 |---|---|---|---|
 | `unix:/path/to.sock` | Unix-domain socket | sidecar **gateway** on the same host/pod | core (always on) |
 | `https://host[:port]/path` | TCP + TLS | direct provider or a remote gateway | feature `tls` |
-| `vsock:<cid>:<port>` | AF_VSOCK | LLM service on the **host** from inside an enclave/microVM | feature `vsock` (roadmap, M4) |
+| `vsock:<cid>:<port>` | AF_VSOCK | LLM service on the **host** from inside an enclave/microVM | feature `vsock` |
 
 The URI is validated **at startup**, before any side effect. A scheme that
 isn't `unix:`, `https://`, or `vsock:` exits `2` in milliseconds:
@@ -72,7 +72,7 @@ agentd \
 TLS is rustls with the `ring` provider and `webpki-roots` — no C toolchain, no
 cmake. SNI is the parsed host.
 
-### `vsock:` — enclave / microVM (feature `vsock`, roadmap M4)
+### `vsock:` — enclave / microVM (feature `vsock`)
 
 ```bash
 agentd \
@@ -82,8 +82,9 @@ agentd \
 ```
 
 `vsock:<cid>:<port>` connects to a host-side LLM service from inside an enclave.
-The `vsock` transport lands in M4; the URI is parsed and validated today, but
-the dial path is roadmap.
+The `vsock` transport ships behind the `vsock` feature; build with
+`--features vsock` to dial it (`net/vsock.rs`). The URI is parsed and validated
+even in default builds, which return a clear "requires --features vsock" error.
 
 ---
 
@@ -213,7 +214,7 @@ Example of the redaction (the token is set but never echoed):
 ```jsonc
 // proc.start — note: no token field exists anywhere in the log stream
 {"ts":"2026-06-25T12:00:00Z","level":"info","event":"proc.start",
- "version":"1.3.0","mode":"once","mcp_servers":1,"subscribe":0}
+ "version":"0.1.0","mode":"once","mcp_servers":1,"subscribe":0}
 ```
 
 ---

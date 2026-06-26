@@ -35,9 +35,9 @@ serve-mcp = []
 cron = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
-# OTLP span export + GenAI semconv. The one feature allowed heavier deps;
-# wired in M6 (deps intentionally not declared yet to keep the scaffold's
-# dependency graph minimal and resolvable).
+# OTLP span export + GenAI semconv. Hand-rolled OTLP-over-HTTP/JSON over the
+# existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
+# `--features otel` stays dependency-free (3 deps).
 otel = []
 
 [dependencies]

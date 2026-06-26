@@ -1,15 +1,12 @@
 //! agentd entry point.
 //!
 //! Dispatches between three roles of the one binary: the **supervisor** (the
-//! normal CLI/daemon path), the **subagent** re-exec (M2), and the early-exit
+//! normal CLI/daemon path), the **subagent** re-exec, and the early-exit
 //! `--help`/`--version`. The supervisor parses + validates config, installs
-//! signal handlers, sets up logging, then drives the configured mode.
-//!
-//! M1 status: config/exit/logging/signals foundation is live; the supervisor
-//! reactor, MCP client, intelligence client, and the agentic loop land across
-//! M1–M3 (see docs/design/PLAN.md). Until then a validated run logs and exits
-//! with a clear "scaffold only" notice — but `--help`, `--version`, and config
-//! validation (exit 2) already behave per the contract.
+//! signal handlers and the subreaper, sets up logging/tracing, optionally arms
+//! health/metrics/cgroups, enforces the Rule-of-Two trifecta gate, then drives
+//! the configured mode (once / loop / reactive / schedule), supervising a root
+//! subagent.
 
 use agentd::config::{Config, ConfigError, Mode};
 use agentd::obs::log::{Comp, LogCtx, Logger};
@@ -34,7 +31,7 @@ fn run() -> i32 {
         return agentd::mcp::mock::run(uri, emit);
     }
 
-    // Hidden built-in mock LLM (M7 observe-suite):
+    // Hidden built-in mock LLM (tests / observe-suite):
     // `--internal-mock-llm <socket> [final|read|schedule]`.
     if argv.get(1).map(String::as_str) == Some("--internal-mock-llm") {
         let socket = argv.get(2).map(String::as_str).unwrap_or("/tmp/agentd-mock-llm.sock");
@@ -42,7 +39,7 @@ fn run() -> i32 {
         return agentd::intel::mock::run(socket, script);
     }
 
-    // Subagent re-exec dispatch (M2). The supervisor sets this in the child's
+    // Subagent re-exec dispatch. The supervisor sets this in the child's
     // environment; the child reads its spawn payload over the control channel
     // (stdin) rather than from CLI/env config.
     if std::env::var_os(agentd::subagent::protocol::SUBAGENT_ENV).is_some() {

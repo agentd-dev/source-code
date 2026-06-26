@@ -4,9 +4,10 @@
 //! against `--serve-mcp unix:PATH` and calls agentd's tools. Transport per RFC
 //! §3.6: a **blocking `UnixListener`, thread-per-connection** (no async, no
 //! mio) speaking the same NDJSON JSON-RPC codec as the MCP *client* (`json/`,
-//! RFC 0004). v1 exposes a read-only `status` tool; the action tools
-//! (`subagent.spawn` sync/async, `subagent.send/cancel/status`, RFC §3.2) build
-//! on this transport next.
+//! RFC 0004). It exposes a read-only `status` tool and the action tools
+//! `subagent.spawn` (sync / async / warm), `subagent.send`, `subagent.status`,
+//! and `subagent.cancel` (RFC §3.2), plus the agentd:// resource scheme with
+//! resources/subscribe push.
 
 use crate::json::{self, frame, Id, Incoming, Notification, Request, Response};
 use crate::obs::log::Logger;
@@ -285,7 +286,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
     let listener = UnixListener::bind(path)?;
     log.info(
         "mcp.serving",
-        json!({"path": path, "tools": ["status", "subagent.spawn"], "resources": ["agentd://status"]}),
+        json!({"path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status"]}),
     );
     let handle = ServeHandle {
         sessions: Arc::clone(&ctx.sessions),
@@ -681,9 +682,11 @@ fn spawn_result_response(id: Id, handle: &str, result: std::io::Result<Supervise
 /// served runs — the process-global [`reaper`](crate::supervisor::reaper)
 /// dispatches each child's exit by pid, so supervisors no longer serialize on a
 /// lock (bounded only by `MAX_INFLIGHT_SPAWNS`). A run is bounded by its payload
-/// deadline; `subagent.cancel` drains it early. On daemon shutdown the run's
-/// subtree collapses via `PR_SET_PDEATHSIG` (no orphan leak), not a graceful
-/// drain — a coordinated served-session drain is a follow-on. Handles are shared
+/// deadline; `subagent.cancel` drains it early. On daemon shutdown
+/// `ServeHandle::drain` (wired in `main.rs`) asks in-flight served runs to cancel
+/// and waits, bounded by the drain timeout, for their subtrees to drain
+/// gracefully; `PR_SET_PDEATHSIG` is the backstop against orphan leak if the
+/// drain window elapses. Handles are shared
 /// across all peers on the socket (one trust domain — socket perms gate access)
 /// and confer no ownership.
 fn spawn_async(id: Id, ctx: &ServeCtx, log: &Logger, handle: String, payload: SpawnPayload, permit: SpawnGuard) -> Response {

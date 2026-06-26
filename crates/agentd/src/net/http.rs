@@ -5,11 +5,13 @@
 //! carries the intelligence wire over TCP, TLS, unix sockets, and vsock
 //! alike — the transport is just the stream.
 //!
-//! v1 does non-streaming request/response (`Connection: close`, content-length
-//! or chunked). SSE streaming (for MCP-over-HTTP) is deferred (RFC 0013).
-//! SSRF hardening of `connect_tcp` lands in M6 (RFC 0012); v1's HTTP client
-//! only ever calls the *operator-configured* intelligence endpoint, which the
-//! model cannot influence.
+//! This client does non-streaming request/response only (`Connection: close`,
+//! content-length or chunked); it does not implement SSE streaming.
+//! `connect_tcp` is intentionally unguarded: agentd's HTTP client only ever
+//! dials the *operator-configured* intelligence endpoint, which the model
+//! cannot influence. The SSRF classifier (`net::ssrf`) exists for any future
+//! model/agent-supplied URL surface and is composed at the call site that
+//! needs it.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -103,8 +105,9 @@ impl Response {
     }
 }
 
-/// Connect a plain TCP stream with connect + read/write timeouts. (SSRF
-/// guarding lands in M6 — RFC 0012.)
+/// Connect a plain TCP stream with connect + read/write timeouts. Intentionally
+/// unguarded — the only caller dials the operator-configured endpoint; the SSRF
+/// classifier (`net::ssrf`) is composed at any model/agent-supplied URL surface.
 pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
     let addr = (host, port)

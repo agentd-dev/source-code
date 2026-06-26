@@ -35,7 +35,8 @@ const RESTART_CAP: Duration = Duration::from_secs(30);
 /// Sliding-window length for the breaker's failure count (§3.7 `RESTART_WINDOW`).
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 /// Weighted failures within `window` — or consecutive — that open the breaker
-/// (§3.7 `BREAKER_THRESHOLD`). Conservative; M2 chaos may tune it.
+/// (§3.7 `BREAKER_THRESHOLD`). Conservative default; overridable per-handle via
+/// `RestartConfig::threshold`.
 const BREAKER_THRESHOLD: u32 = 5;
 /// A run shorter than this never reached `ctrl/ready` (§3.6) — crash-on-spawn.
 const SPAWN_READY: Duration = Duration::from_secs(2);

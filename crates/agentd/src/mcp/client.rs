@@ -7,7 +7,7 @@
 //! block on a per-request channel with a timeout (the OLD runtime had *no*
 //! MCP timeouts — a hung server wedged the node; we fix that here).
 //!
-//! v1 connects one server and implements the client subset from RFC 0004:
+//! Each client connects one server and implements the client subset from RFC 0004:
 //! initialize + capability store, tools (list+call), resources (list+read),
 //! subscribe/unsubscribe, ping. We declare **no** client capabilities and
 //! answer server→client `ping`/`roots/list` minimally, rejecting `sampling`.
@@ -87,7 +87,7 @@ impl McpClient {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null()) // server logs go nowhere in v1; capture in M-later
+            .stderr(Stdio::null()) // discarded by design — servers own their logging; capture is deferred v2 surface
             .spawn()
             .map_err(McpError::Spawn)?;
 
@@ -227,8 +227,8 @@ impl McpClient {
     }
 
     /// Drain any notifications the reader thread has queued (e.g.
-    /// `notifications/resources/updated`). The reactive router consumes these
-    /// in M3; v1 callers may ignore them.
+    /// `notifications/resources/updated`). The reactive router
+    /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
     pub fn drain_notifications(&self) -> Vec<json::Notification> {
         let rx = self.notifications.lock().unwrap();
         rx.try_iter().collect()
@@ -284,9 +284,10 @@ impl McpClient {
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // Closing stdin (drop the writer's inner) signals shutdown; killing is
-        // the backstop. The reader thread sees stdout EOF and exits. (The full
-        // close-stdin → SIGTERM → SIGKILL ladder lands in M2/RFC 0003.)
+        // Closing stdin signals shutdown; child.kill() is the backstop. The
+        // reader thread sees stdout EOF and exits. (MCP server children are
+        // reaped here directly; the supervisor kill-ladder in supervisor/kill.rs
+        // governs subagent process groups, not these stdio servers.)
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -317,6 +318,10 @@ fn to_value<T: Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
+// Safe because agentd only ever mints numeric ids (`next_id: AtomicI64`): a
+// string-id response cannot match a pending request and is dropped (the caller
+// times out), which cannot happen for our own requests. A server echoing a
+// non-numeric id is out of spec.
 fn id_num(id: &Id) -> Option<i64> {
     match id {
         Id::Num(n) => Some(*n),

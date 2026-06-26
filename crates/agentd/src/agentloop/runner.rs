@@ -4,16 +4,17 @@
 //! scoped tool catalogue) → call intelligence → if the model requested tools,
 //! run them via MCP and feed the results back as observations; otherwise the
 //! text is the final answer. Stopping is a disjunction of cheap checks, each
-//! with a distinct [`TerminalStatus`] (RFC 0007 §3.4); v1 enforces the
+//! with a distinct [`TerminalStatus`] (RFC 0007 §3.4); the loop enforces the
 //! step/token/deadline budget. `stalled`/`loop_detected` detectors and context
-//! compaction land in later milestones.
+//! compaction are deferred (v2); the `Stalled`/`LoopDetected` statuses are
+//! defined but not yet produced.
 //!
-//! M1 runs the **root** agent in-process. M2 moves this into a subagent
-//! process behind the control channel; the loop body is unchanged.
+//! The root agent runs as a subagent process behind the control channel
+//! (spawned by `main::run_once` via `supervise_once`); the loop body here is
+//! identical whether driven by the root or a nested child.
 
-use crate::agentloop::action::{NoopSelfHandler, SelfHandler};
+use crate::agentloop::action::SelfHandler;
 use crate::agentloop::stop::{Outcome, TerminalStatus};
-use crate::config::Config;
 use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Per-response token cap (distinct from the cumulative run budget).
 const PER_CALL_MAX_TOKENS: u32 = 4096;
@@ -68,39 +69,9 @@ pub struct LoopInput {
     pub max_tokens: u64,
     pub deadline: Instant,
     /// A cooperative cancel flag checked at each turn boundary (set by a
-    /// subagent's control thread on `ControlMsg::Cancel`). `None` for
-    /// in-process once-mode.
+    /// subagent's control thread on `ControlMsg::Cancel`). `None` for a run with
+    /// no external canceller.
     pub cancel: Option<Arc<AtomicBool>>,
-}
-
-impl LoopInput {
-    /// Build the once-mode input from CLI config.
-    pub fn from_config(cfg: &Config) -> LoopInput {
-        let deadline = cfg
-            .deadline
-            .map(|d| Instant::now() + d)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(10 * 365 * 24 * 3600));
-        LoopInput {
-            instruction: cfg.instruction.clone().unwrap_or_default(),
-            output_contract: None,
-            seed: Vec::new(),
-            model: cfg.model.clone().unwrap_or_default(),
-            max_steps: cfg.max_steps,
-            max_tokens: cfg.max_tokens,
-            deadline,
-            cancel: None,
-        }
-    }
-}
-
-/// Run the agent loop to a terminal status (in-process, once-mode entry).
-pub fn run_root(
-    intel: &IntelClient,
-    servers: &[McpClient],
-    cfg: &Config,
-    log: &Logger,
-) -> Result<Outcome, LoopAbort> {
-    run_loop(intel, servers, &LoopInput::from_config(cfg), &mut NoopSelfHandler, log)
 }
 
 /// The durable state of an agent session: the scoped tool catalogue, the
@@ -353,8 +324,7 @@ fn build_catalogue(servers: &[McpClient]) -> Result<(Vec<ToolDef>, HashMap<Strin
 
 /// Route one tool call to its owning server. A transport error is returned as
 /// an error *observation* (is_error = true), not an abort — the model can
-/// adapt; a wedged server is caught by the budget. (M2/M3 refine the
-/// abort-vs-observe policy per RFC 0004 §isError.)
+/// adapt; a wedged server is caught by the budget (RFC 0004 §isError).
 fn dispatch_tool(
     servers: &[McpClient],
     routing: &HashMap<String, usize>,

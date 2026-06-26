@@ -2,9 +2,11 @@
 //!
 //! A *pure* address classifier plus a DNS-resolving host guard. The
 //! acceptance bar from assessment §4 M6 is blunt: "HTTP client refuses
-//! RFC-1918 / link-local by default". This module is the mechanism;
-//! the policy decision of *where* to wire it lives at the call sites
-//! (see the module comment on [`crate::net`]).
+//! RFC-1918 / link-local by default". This module is the mechanism; it is
+//! complete and tested but currently has no call site, because the only
+//! outbound HTTP (`intel/client.rs`) targets the operator-configured endpoint
+//! and is exempt. It exists to guard any future model/agent-supplied URL,
+//! composed at the call site that introduces one.
 //!
 //! ## What "non-global" means here
 //!

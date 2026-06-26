@@ -7,7 +7,7 @@
 //! behind a process-wide `SUPERVISE_LOCK` to keep a single `waitpid(-1)` caller.
 //!
 //! This module replaces that lock with **dispatch by pid**: one place drains
-//! `waitpid(-1)` and routes each reaped pid to the owning [`Supervisor`]'s
+//! `waitpid(-1)` and routes each reaped pid to the owning `Supervisor`'s
 //! channel, so any number of Supervisors run **concurrently** without stealing.
 //!
 //! Two operations, both under a global pid→route registry mutex:

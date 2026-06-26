@@ -2,15 +2,16 @@
 //!
 //! `once` is `main::run_once` (spawn + supervise one root). This module hosts
 //! the long-lived **`reactive`** driver — the signature "listen for MCP
-//! resources, act when they appear" mode. `loop`/`schedule` follow in M4.
+//! resources, act when they appear" mode — and the `loop`/`schedule` driver
+//! (`run_scheduled`).
 //!
 //! The reactive driver: the *supervisor* connects the configured MCP servers
 //! and owns the long-lived **subscriptions**; on a `notifications/resources/
 //! updated{uri}` it does **notify-then-read** (`resources/read` the current
-//! state, RFC 0004) and, per the [`Router`] disposition, spawns a fresh root
-//! subagent templated from the event. v1 reacts **synchronously** (one event
-//! at a time) and treats every route as `Spawn`; warm `Continue` sessions and
-//! concurrent reactions land later this milestone.
+//! state, RFC 0004) and, per the [`Router`] disposition, either `Spawn`s a
+//! fresh root subagent templated from the event or `Continue`s a daemon-held
+//! warm session (`warm.rs`). Events are processed serially on a single thread;
+//! warm sessions are supervised non-blocking.
 
 use crate::agentloop::stop::{Outcome, ScheduleRequest, SubscriptionAction};
 use crate::config::Config;

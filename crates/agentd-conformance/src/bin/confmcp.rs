@@ -31,7 +31,7 @@ fn main() {
 
         let result = match method {
             "initialize" => json!({
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {"resources": {"subscribe": true, "listChanged": true}, "tools": {}},
                 "serverInfo": {"name": "confmcp", "version": "1.0.0"}
             }),

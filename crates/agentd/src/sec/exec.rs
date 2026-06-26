@@ -81,9 +81,13 @@ pub fn run(argv: &[String], timeout: Duration) -> Result<ExecResult, String> {
     let err_h = thread::spawn(move || read_capped(err_pipe));
 
     let mut timed_out = false;
-    loop {
+    // Capture the exit status from `try_wait` itself — no redundant final
+    // `child.wait()`, which would error with ECHILD if anything else in the
+    // process reaped the child first (defensive: exec runs on a subagent's single
+    // loop thread today, with no concurrent reaper, but this keeps it robust).
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     kill_group(pgid); // SIGKILL the whole group
@@ -94,8 +98,7 @@ pub fn run(argv: &[String], timeout: Duration) -> Result<ExecResult, String> {
             }
             Err(e) => return Err(format!("exec: wait: {e}")),
         }
-    }
-    let status = child.wait().map_err(|e| format!("exec: final wait: {e}"))?;
+    };
 
     let (stdout, out_trunc) = out_h.join().unwrap_or_else(|_| (Vec::new(), false));
     let (stderr, err_trunc) = err_h.join().unwrap_or_else(|_| (Vec::new(), false));

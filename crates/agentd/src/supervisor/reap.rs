@@ -107,7 +107,11 @@ mod imp {
     }
 }
 
-pub use imp::{classify_status, is_init, reap_pending, set_child_subreaper};
+pub use imp::{classify_status, is_init, set_child_subreaper};
+// `reap_pending` is the one process-global `waitpid(-1)`; it must be called ONLY
+// from `reaper::reap_and_dispatch` (under the routes lock), so a stray caller
+// can't reopen the reap-before-register race or steal another reactor's child.
+pub(in crate::supervisor) use imp::reap_pending;
 
 #[cfg(all(test, unix))]
 mod tests {

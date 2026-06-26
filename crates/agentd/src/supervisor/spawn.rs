@@ -119,6 +119,7 @@ impl Subagent {
     /// reactor via `kill.rs`; this is the backstop.
     pub fn kill(&mut self) {
         if !self.reaped {
+            crate::supervisor::reaper::deregister(self.pid());
             kill_group(self.pgid);
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -130,6 +131,11 @@ impl Subagent {
 impl Drop for Subagent {
     fn drop(&mut self) {
         if !self.reaped {
+            // Drop a never-dispatched route (an abandoned run), then tear down +
+            // reap the child ourselves. `child.wait()` tolerates ECHILD if the
+            // global reaper collected it first; deregistering first means it sees
+            // this pid as foreign rather than routing a stale exit.
+            crate::supervisor::reaper::deregister(self.pid());
             kill_group(self.pgid);
             let _ = self.child.kill();
             let _ = self.child.wait();

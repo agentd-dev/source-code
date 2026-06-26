@@ -23,7 +23,8 @@ use crate::signals;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::kill::{kill_group, term_group, Ladder, LadderAction};
 use crate::supervisor::liveness::{Health, Liveness, LivenessConfig};
-use crate::supervisor::reap;
+use crate::supervisor::reap::Reaped;
+use crate::supervisor::reaper;
 use crate::supervisor::spawn::{spawn, Subagent};
 use crate::supervisor::tree::{Caps, NodeId, NodeStatus, Tree};
 use serde_json::json;
@@ -38,6 +39,10 @@ use std::time::{Duration, Instant};
 const TICK: Duration = Duration::from_millis(200);
 /// How long to wait for a *completed* root's stragglers to exit before draining.
 const FINISH_GRACE: Duration = Duration::from_secs(5);
+/// Grace past the drain deadline after which a still-unreaped subtree is
+/// *abandoned* (its handles' `Drop` is suppressed and the teardown returns), so
+/// `drive_drain` can never spin forever on a reap that doesn't arrive.
+const ABANDON_GRACE: Duration = Duration::from_secs(3);
 
 /// Why a subtree was torn down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +81,11 @@ pub struct Supervisor {
     pid_to_node: HashMap<i32, NodeId>,
     events_tx: Sender<(NodeId, AgentMsg)>,
     events_rx: Receiver<(NodeId, AgentMsg)>,
+    /// Child-exit events for THIS supervisor's pids, dispatched by the global
+    /// reaper ([`crate::supervisor::reaper`]) — replaces a private `waitpid(-1)`,
+    /// so supervisors run concurrently without stealing each other's children.
+    reap_tx: Sender<Reaped>,
+    reap_rx: Receiver<Reaped>,
     root: NodeId,
     root_terminal: Option<SuperviseResult>,
     finishing_since: Option<Instant>,
@@ -94,6 +104,7 @@ pub struct Supervisor {
 impl Supervisor {
     fn new(exe: PathBuf, drain_timeout: Duration, log: Logger) -> Supervisor {
         let (events_tx, events_rx) = mpsc::channel();
+        let (reap_tx, reap_rx) = mpsc::channel();
         Supervisor {
             exe,
             tree: Tree::new(Caps::default()),
@@ -102,6 +113,8 @@ impl Supervisor {
             pid_to_node: HashMap::new(),
             events_tx,
             events_rx,
+            reap_tx,
+            reap_rx,
             root: NodeId(0),
             root_terminal: None,
             finishing_since: None,
@@ -126,7 +139,10 @@ impl Supervisor {
         let backstop =
             Duration::from_millis(payload.limits.deadline_ms).saturating_add(Duration::from_secs(60));
         self.liveness.insert(node, Liveness::new(now, now + backstop, self.liveness_cfg));
-        let sub = spawn(&self.exe, payload, node, self.events_tx.clone())?;
+        // Register the pid → this supervisor's reap channel ATOMICALLY with the
+        // fork (under the global reaper lock), so the reaper can't waitpid the
+        // child before it is tracked.
+        let sub = reaper::spawn_tracked(&self.reap_tx, || spawn(&self.exe, payload, node, self.events_tx.clone()))?;
         self.pid_to_node.insert(sub.pid(), node);
         self.live.insert(node, sub);
         self.log.info("subagent.spawn", json!({"node": node.0, "depth": payload.depth}));
@@ -259,7 +275,13 @@ impl Supervisor {
         // `supervise_once` runs inside a subagent that never installed the
         // SIGCHLD handler, yet still needs to reap its own children.
         signals::take_child_exit();
-        for r in reap::reap_pending() {
+        // The global reaper drains `waitpid(-1)` and routes each reaped pid to
+        // the owning supervisor; we then drain OUR pids' exits. Any tick of any
+        // live supervisor drives reaping for the whole process — no private
+        // `waitpid(-1)`, so concurrent supervisors never steal each other's
+        // children.
+        reaper::reap_and_dispatch();
+        while let Ok(r) = self.reap_rx.try_recv() {
             match self.pid_to_node.remove(&r.pid) {
                 Some(node) => {
                     if let Some(mut h) = self.live.remove(&node) {
@@ -351,6 +373,21 @@ impl Supervisor {
                 json!({"live": self.live.len(), "drain_ms": self.drain_timeout.as_millis() as u64}),
             );
         }
+        // Hard escape: completion is otherwise gated solely on `live` emptying,
+        // which depends on every child's exit being reaped + dispatched. If the
+        // budget is exceeded by a further grace and the subtree STILL isn't reaped
+        // (a wedged-uninterruptible child, or — defensively — a reap that never
+        // arrived), give up rather than spin: mark the stragglers reaped so their
+        // `Drop` won't block, log the leak, and return the teardown reason. This
+        // guarantees `drive_drain` always terminates.
+        if !all_reaped && self.drain.as_ref().is_some_and(|d| now >= d.deadline + ABANDON_GRACE) {
+            let reason = self.drain.as_ref().map(|d| d.reason).unwrap_or(KillReason::Drain);
+            self.log.warn("drain.abandon", json!({"live": self.live.len(), "reason": format!("{reason:?}")}));
+            for h in self.live.values_mut() {
+                h.mark_reaped(); // already SIGKILL'd; don't let Drop block waiting on it
+            }
+            return Some(self.root_terminal.take().unwrap_or(SuperviseResult::Killed(reason)));
+        }
         let action = match self.drain.as_mut() {
             Some(d) => d.ladder.poll(now, all_reaped, force),
             None => return None,
@@ -380,19 +417,15 @@ impl Supervisor {
     }
 }
 
-/// Serializes `supervise_once` *within a process*. A process may run several
-/// supervisors over its lifetime — the daemon's mode loop AND served-MCP
-/// `subagent.spawn` calls (RFC 0005) — but they must not run **concurrently**:
-/// each reactor reaps via `waitpid(-1)` (which also collects `PR_SET_CHILD_
-/// SUBREAPER` orphans, RFC 0003), so two concurrent reactors would steal each
-/// other's children and hang the robbed one. Serializing keeps orphan reaping
-/// intact without a process-wide reaper. The lock is per-process, so nested
-/// supervise in a *separate* subagent process never contends. (A single-reaper
-/// refactor that allows true concurrency is a throughput follow-up.)
-static SUPERVISE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Supervise one root subagent to completion (once-mode entry). The handle
 /// map's `Drop` backstops any leak on early return.
+///
+/// **Concurrency:** multiple supervisors may now run **concurrently** in one
+/// process (the daemon's mode loop, served-MCP `subagent.spawn` runs, nested
+/// orchestration). They no longer serialize on a lock — the process-global
+/// [`reaper`] owns the single `waitpid(-1)` and dispatches each reaped pid to its
+/// owning supervisor by pid, so concurrent reactors never steal each other's
+/// children (RFC 0003, RFC 0005 §3.2).
 pub fn supervise_once(
     exe: PathBuf,
     payload: &SpawnPayload,
@@ -412,7 +445,6 @@ pub fn supervise_cancellable(
     log: Logger,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<SuperviseResult> {
-    let _serialize = SUPERVISE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.cancel = cancel;

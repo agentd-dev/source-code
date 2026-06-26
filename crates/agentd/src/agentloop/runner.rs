@@ -140,6 +140,10 @@ pub fn run_loop(
     messages.push(Message::user(&input.instruction));
     let mut last_text: Option<String> = None;
     let model = input.model.clone();
+    // otel `invoke_agent` span: start stamp + cumulative token split. Both feed
+    // `export_run_span`, which is a no-op without `--features otel`.
+    let run_start = crate::obs::otel::now_unix_nanos();
+    let (mut tok_in, mut tok_out) = (0u64, 0u64);
 
     log.info(
         "loop.start",
@@ -149,6 +153,7 @@ pub fn run_loop(
     loop {
         if input.cancelled() {
             log.warn("loop.final", json!({"status": "cancelled", "steps": budget.steps()}));
+            crate::obs::otel::export_run_span(log.ctx().trace_id.as_deref(), &model, tok_in, tok_out, false, run_start);
             return Ok(Outcome {
                 status: TerminalStatus::Cancelled,
                 partial: last_text.is_some(),
@@ -159,6 +164,7 @@ pub fn run_loop(
         }
         if let Some(status) = budget.exceeded() {
             log.warn("loop.final", json!({"status": status.as_str(), "steps": budget.steps(), "tokens": budget.tokens()}));
+            crate::obs::otel::export_run_span(log.ctx().trace_id.as_deref(), &model, tok_in, tok_out, false, run_start);
             return Ok(Outcome {
                 status,
                 partial: last_text.is_some(),
@@ -188,6 +194,8 @@ pub fn run_loop(
         let resp = intel.complete(&req).map_err(|e| LoopAbort::Intel(e.to_string()))?;
         budget.record_usage(resp.usage);
         budget.record_step();
+        tok_in += resp.usage.input_tokens;
+        tok_out += resp.usage.output_tokens;
         log.debug(
             "intel.result",
             json!({"tool_calls": resp.tool_calls.len(), "tokens_in": resp.usage.input_tokens, "tokens_out": resp.usage.output_tokens}),
@@ -230,6 +238,7 @@ pub fn run_loop(
         // No tool calls → the model's text is the final answer.
         let text = resp.text.clone().or(last_text).unwrap_or_default();
         log.info("loop.final", json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}));
+        crate::obs::otel::export_run_span(log.ctx().trace_id.as_deref(), &model, tok_in, tok_out, true, run_start);
         return Ok(Outcome {
             status: TerminalStatus::Completed,
             partial: false,

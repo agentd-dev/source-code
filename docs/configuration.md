@@ -5,13 +5,11 @@ network config, ever (RFC 0011 §1). The whole configuration is assembled and
 **validated before any side effect**: a bad flag or a missing endpoint exits `2`
 in milliseconds, not after an LLM round-trip or an MCP handshake.
 
-> **Build status.** The configuration layer (this page) is implemented and live:
-> `agentd` parses and validates flags/env today. The run modes themselves
-> (the agentic loop, supervisor, MCP client) land across milestones M1–M3 — see
-> [`docs/design/PLAN.md`](design/PLAN.md). The binary currently validates config,
-> emits logs, and exits with a scaffold notice for the run modes. The flag/env
-> surface documented here is the stable v1 surface; example runs below describe
-> the **intended** v1 behavior.
+> **Build status.** The runtime is implemented: config validation, the agentic
+> loop, the supervisor + subagent tree, the MCP client, all four run modes, the
+> reactive router + self-scheduling, and the served self-MCP are live (see
+> [`docs/design/PLAN.md`](design/PLAN.md)). The flag/env surface below is the
+> stable v1 surface, derived verbatim from the binary's `--help` + `Config`.
 
 ---
 
@@ -97,27 +95,33 @@ means the setting is **flag-only** in v1 (no environment equivalent is wired up)
 | `--mcp name=command` | — | *(none)* | Declare an MCP server (stdio). Repeatable. See §5. |
 | `--serve-mcp <unix:/path>` | `AGENTD_SERVE_MCP` | *(off)* | Serve agentd's own MCP so agents compose. stdio/unix only in v1 (HTTP serving is roadmap). |
 | `--enable-exec` | `AGENTD_ENABLE_EXEC` | `false` | Expose the gated `exec` tool (off by default; RFC 0012). Env accepts `1`/`true`/`yes`/`on`. |
+| `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server. Repeatable. |
+| `--allow-trifecta` | `AGENTD_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
 | `--mode once\|loop\|reactive\|schedule` | `AGENTD_MODE` | `once` | Selects the exit predicate (RFC 0008). See §6. |
 | `--subscribe <uri>` | — | *(none)* | Subscribe to an MCP resource (reactive mode). Repeatable. |
 | `--interval <dur>` | — | *(none)* | loop/schedule interval (duration syntax, §7). |
+| `--cron <5-field>` | `AGENTD_CRON` | *(none)* | UTC cron schedule for `--mode schedule` (needs `--features cron`; §6). |
 | `--max-steps <N>` | `AGENTD_MAX_STEPS` | `50` | Per-run step cap. Must be > 0. |
 | `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | `200000` | Token budget for the run. |
 | `--deadline <dur>` | `AGENTD_DEADLINE` | `600s` | Wall-clock deadline (duration syntax, §7). |
 | `--max-depth <N>` | — | `4` | Subagent tree depth cap (RFC 0009). |
 | `--run-id <ID>` | `AGENTD_RUN_ID` | *(auto)* | Idempotency key (§8). Default: a per-process id (time+pid). |
 | `--log-level <L>` | `AGENTD_LOG_LEVEL` | `info` | `trace`\|`debug`\|`info`\|`warn`\|`error`. |
+| `--log-content` | `AGENTD_LOG_CONTENT` | `false` | Log tool args/results, not just lengths (RFC 0010 §2.9). Off by default (content-capture-off); propagates to children. |
 | `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | `25s` | Graceful drain budget. Keep **< pod `terminationGracePeriodSeconds`** (RFC 0011 §3.3). |
 | `--health-file <PATH>` | — | *(none)* | Liveness heartbeat file (exec-probe target; RFC 0010). |
+| `--metrics-addr <ADDR>` | `AGENTD_METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr (needs `--features metrics`). |
+| `--traceparent <W3C>` | `AGENTD_TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id (RFC 0010). |
 | `-h`, `--help` | — | — | Print help and exit `0`. |
 | `-V`, `--version` | — | — | Print version and exit `0`. |
 
 > **Not yet wired.** RFC 0011 §3.2 sketches a broader surface
-> (`--log-format`/`AGENTD_LOG_FORMAT`, `--health-addr`/`AGENTD_HEALTH_ADDR`,
-> `RUST_LOG`, `AGENTD_INTERVAL`/`AGENTD_SUBSCRIBE`/`AGENTD_MAX_DEPTH`,
-> `AGENTD_MCP_CONFIG`/`--mcp-config`, `--cron`, a tree-token budget,
-> `--pod-grace`/`AGENTD_POD_GRACE_SECONDS`, a `--budget-exit-code`). **None of
-> these exist in the binary today** — do not rely on them. Only the table above
-> is real.
+> (`--log-format`/`AGENTD_LOG_FORMAT`, `--health-addr`/`AGENTD_HEALTH_ADDR` —
+> `/healthz` is instead served by the `metrics` feature on `--metrics-addr`,
+> `RUST_LOG`, env equivalents for `--interval`/`--subscribe`/`--max-depth`,
+> `AGENTD_MCP_CONFIG`/`--mcp-config`, `--pod-grace`/`AGENTD_POD_GRACE_SECONDS`,
+> a `--budget-exit-code`). **None of these exist in the binary today** — do not
+> rely on them. Only the table above is real.
 
 ---
 
@@ -188,7 +192,7 @@ across modes.
 | `once` *(default)* | Run the instruction once to a terminal status, then exit. | — |
 | `loop` | Keep working until a bound (steps/deadline/token) or signal. | — |
 | `reactive` | Idle; wake on MCP resource updates. Exits only on signal/fatal. | ≥1 `--subscribe <uri>` |
-| `schedule` | Per-fire identical to `once`, driven by an internal interval. | `--interval <dur>` |
+| `schedule` | Per-fire identical to `once`, driven by an internal timer. | `--interval <dur>` or `--cron <5-field>` (`cron` feature) |
 
 ```console
 # reactive: requires at least one subscription (stdio-only in v1)
@@ -281,7 +285,7 @@ restart to reconfigure (RFC 0011 §4.1).
 
 ## 10. Observability of config
 
-On startup agentd validates and (intended v1 behavior) emits structured
+On startup agentd validates and emits structured
 JSON-lines telemetry on stderr; the credential is always redacted. Example
 shapes:
 
@@ -290,12 +294,13 @@ shapes:
 ```
 
 ```json
-{"level":"info","event":"config.loaded","mode":"once","run_id":"018f...","intelligence":"unix:/run/intel.sock","intelligence_token":"***","max_steps":50,"max_tokens":200000,"deadline":"600s","drain_timeout":"25s"}
+{"level":"info","event":"config.loaded","max_steps":50,"max_tokens":200000,"deadline_ms":600000,"max_depth":4,"enable_exec":false,"log_content":false,"serve_mcp":false,"intel_scheme":"unix","instruction_len":42}
 ```
 
-The exact log schema is owned by RFC 0010. Today the binary validates config,
-logs, and exits with a scaffold notice for the run modes; the loop/supervisor/MCP
-client land across M1–M3 (see [`docs/design/PLAN.md`](design/PLAN.md)).
+Content-capture stays **off**: `config.loaded` reports the instruction as a
+length and the intelligence endpoint as a scheme only — never the instruction
+body or the credential. The exact log schema is owned by RFC 0010 (see
+[`observability.md`](observability.md)).
 
 ---
 

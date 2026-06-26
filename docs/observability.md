@@ -21,12 +21,9 @@ stderr (no `tracing`, no metrics SDK, no OTLP) and a tiny health surface (exit
 code + an optional `--health-file`). Everything heavier is feature-gated. Full
 rationale is in [RFC 0010](../rfcs/0010-observability-health-telemetry.md).
 
-> **Status.** The config/logging/exit/signal foundation is live (M1); the
-> supervisor reactor, MCP client, intelligence client, and the agentic loop —
-> and therefore most of the events below — land across M1–M3. Today a validated
-> run emits `proc.start`, then logs a `proc.exit` scaffold notice and exits.
-> Examples here describe the **intended v1 behaviour**; see
-> [`docs/design/PLAN.md`](design/PLAN.md) for what is wired up now.
+> **Status.** The runtime is implemented: the supervisor reactor, MCP client,
+> intelligence client, the agentic loop, all four run modes, and therefore the
+> events below are all live. The examples here describe real behaviour.
 
 ---
 
@@ -93,8 +90,8 @@ allocation — below-level calls cost essentially nothing.
 
 The `event` string is the backbone — what you filter, count, and alert on. It is
 a small, **closed**, dotted set. Adding an event later is cheap; renaming one
-breaks dashboards. This is the complete v1 list: 19 supervisor events + 8 agent
-events = 27 names.
+breaks dashboards. The supervisor/lifecycle and agentic-loop events below are
+the v1 set (build-gated surfaces add a few more, noted inline).
 
 ### Supervisor / lifecycle (`comp:"supervisor"`)
 
@@ -113,12 +110,19 @@ events = 27 names.
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |
 | `resource.updated` | `resource_uri`, `server` — the reactive "heartbeat of meaning" |
-| `subagent.spawn` | `child_agent_id`, `child_path`, `instruction_hash`, `tool_scope`, `limits`, `depth`, `pid` |
-| `subagent.exit` | `child_agent_id`, `code`, `result_status`, `dur_ms` |
-| `subagent.signal` | `child_agent_id`, `action` (`pause`/`resume`/`cancel`/`inject`) |
-| `subagent.stuck` | `child_agent_id`, `last_event_age_ms`, `proc_state`, `action` (`sigterm`/`sigkill`) |
-| `subagent.restart` | `child_agent_id`, `reason`, `restarts_total` |
-| `limit.exceeded` | `limit` (`steps`/`tokens`/`deadline`/`depth`/`tree_tokens`/`restart_storm`/`spawn_rate`), `value`, `cap` |
+| `subagent.spawn` | `node`, `depth` (the child re-exec'd) |
+| `subagent.ready` / `subagent.result` / `subagent.failed` / `subagent.exit` | the child's lifecycle: `Ready` → `Result`/`Failed` → reaped (`node`, `status`/`err`/`outcome`) |
+| `subagent.stuck` | `node` — liveness classification (not a deadline) condemned the child |
+| `subagent.drain` / `subagent.sigterm` / `subagent.sigkill` / `subagent.teardown` | the bounded kill ladder (`reason`, `live`) |
+| `drain.timeout` | `live`, `drain_ms` — the drain budget was exceeded; the ladder is forced |
+| `limit.exceeded` | `limit` (`tree_tokens`/…) — a tree budget tripped |
+| `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning (RFC 0012) |
+| `cgroup.detected` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
+| `mcp.serving` | `path`, `tools` — the served self-MCP is bound (`--serve-mcp`, RFC 0005) |
+| `mcp.spawn` | `handle`, `servers` — a peer delegated a run via served `subagent.spawn` |
+| `schedule.fired` · `run.completed`/`run.failed`/`run.killed` | the `loop`/`schedule` driver's per-fire run + outcome |
+| `reactive.handled`/`reactive.failed`/`reactive.killed` | one reaction's outcome (reactive mode) |
+| `health.armed` | `file` — the health-file heartbeat writer started |
 
 ### Agentic loop (`comp:"agent"`; `intel.*` carry `comp:"intel"`)
 
@@ -130,12 +134,23 @@ events = 27 names.
 | `loop.error` | `err`, `step` |
 | `intel.call` | `model`, `tokens_in` (estimated) |
 | `intel.result` | `model`, `tokens_in`, `tokens_out`, `finish_reason`, `dur_ms` |
-| `tool.call` | `server`, `tool`, `call_id`, `args_hash` (`args` only with content capture on) |
-| `tool.result` | `server`, `tool`, `call_id`, `ok`, `dur_ms`, `result_bytes` (`result` only with content capture on) |
+| `tool.call` | `tool`, `id`, (`args` only with content capture on) |
+| `tool.result` | `tool`, `is_error`, `bytes` (`content` only with content capture on) |
+| `self.schedule` | `after_s`, `queued` — the agent scheduled a future self-wake-up (RFC 0008) |
+| `self.subscribe` | `action` (`subscribe`/`unsubscribe`), `uri` — the agent changed its own subscriptions |
 
 `comp:"mcp"` is used for transport-level lines folded from MCP
 `notifications/message`; it reuses these event names (e.g. `mcp.disconnect`) and
 introduces **no** new `event` strings.
+
+> **Emission notes (vocabulary vs wire).** A graceful shutdown is
+> `proc.exit{reason:"drain"}` (there is no separate `proc.shutdown`); the
+> restart-governor breaker tripping is `proc.exit{reason:"restart_breaker"}`; the
+> child kill path is the `subagent.drain → sigterm → sigkill` ladder above (no
+> generic `subagent.signal`/`subagent.restart`). The reactive self-tools emit
+> the canonical `trigger.armed`/`trigger.fired` with `kind:"self_schedule"` /
+> `kind:"self_subscribe"`. Build-gated surfaces also emit `metrics.*` /
+> `cron.unavailable` / `mcp.serve_unavailable` when a flag needs a feature.
 
 ---
 
@@ -196,9 +211,7 @@ discovery, no join-key negotiation.
   correlation fields. Consumers sort by `ts` + `span_id`, never by arrival order
   (forwarded lines can arrive out of order).
 
-> Async subagents (and therefore deep trees) land in M3; v1 spawn is
-> synchronous. The correlation scheme above is the v1 target and is identical
-> for sync and async spawns.
+> The correlation scheme above is identical for sync and async spawns.
 
 ---
 
@@ -332,10 +345,10 @@ the pod is not "ready", so an orchestrator won't route work to it.
 run — a pure CLI invocation carries zero health machinery. HTTP and socket
 surfaces are opt-in and never on for a one-shot.
 
-> The CLI surface that exists today is `--health-file` and `--log-level`
-> (plus `AGENTD_LOG_LEVEL`); see [`config.rs`](../crates/agentd/src/config.rs)
-> for the authoritative flag/env list. `--log-content`, `--aggregate-logs`,
-> `--health-http`, and the `metrics`/`otel` features are roadmap items tracked
+> `--health-file`, `--log-level` (plus `AGENTD_LOG_LEVEL`), and `--serve-mcp`
+> are all live; see [`config.rs`](../crates/agentd/src/config.rs) for the
+> authoritative flag/env list. `--log-content`, `--aggregate-logs`,
+> `--health-http`, and the `metrics`/`otel` features remain roadmap items tracked
 > in [`docs/design/PLAN.md`](design/PLAN.md).
 
 ---

@@ -15,16 +15,11 @@ unit of work (`once`) goes empty-and-final and exits; a reactive daemon
 (`reactive`) idles on a subscription stream and exits only on signal or a fatal
 class.
 
-> **Build status.** agentd is mid-build (v0.1.0). The foundation is live —
-> config precedence + validate-at-startup (exit `2`), the exit-code table,
-> JSON-lines logging, and signal handlers. The supervisor, agentic loop, and MCP
-> client land across milestones **M1–M3** (see
-> [`docs/design/PLAN.md`](design/PLAN.md)). **Today**, a validated run logs
-> `proc.start`, then logs `proc.exit reason=not_implemented` and exits with a
-> "scaffold only" notice. `--help`, `--version`, and config validation already
-> behave per the contract below. The examples here describe the **intended v1
-> behaviour**; where a run is shown, treat its result as the target, not as
-> something that completes work today.
+> **Build status.** The runtime is implemented — config precedence +
+> validate-at-startup (exit `2`), the agentic loop, the supervisor + subagent
+> process tree, the MCP client, all four run modes (`once`/`loop`/`reactive`/
+> `schedule`), reactive routing, and the served self-MCP all ship. The examples
+> below describe real behaviour.
 
 Every flag and env var on this page is taken verbatim from
 [`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agentd --help`).

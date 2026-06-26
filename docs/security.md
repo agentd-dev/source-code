@@ -2,7 +2,7 @@
 
 > Spec: [RFC 0012 — Security posture](../rfcs/0012-security-posture.md). Binding
 > decisions: [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md).
-> Build status / milestones: [`docs/design/PLAN.md`](design/PLAN.md).
+> Milestones: [`docs/design/PLAN.md`](design/PLAN.md).
 
 agentd connects an LLM-driven loop to *arbitrary, operator-declared* MCP servers and an
 optional `exec` capability. That is, by construction, the worst-case shape for the one
@@ -282,8 +282,8 @@ agentd \
 ```
 
 > **Status.** `--enable-exec` parses today and defaults off (see `crates/agentd/src/config.rs`).
-> The `exec` tool body and startup capability check land in M4 (PLAN.md). The current binary
-> validates config, logs, and exits with a scaffold notice for run modes.
+> The runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the
+> MCP client, and all four run modes — is implemented.
 
 ---
 

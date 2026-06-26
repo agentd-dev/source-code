@@ -11,14 +11,13 @@ agentic loop, …) and the binding decisions in
 [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md).
 Where this overview simplifies, those win.
 
-> **Build status (2026-06):** agentd is mid-build. The foundation —
-> config, exit codes, JSON-RPC codec, the JSON-lines logger, signal
-> handling, and the `TerminalStatus` enum — is implemented. The supervisor
-> reactor, MCP client, intelligence client, and the agentic loop land across
-> milestones **M1–M3** in [`docs/design/PLAN.md`](design/PLAN.md). Today a
-> validated run logs and exits with a "scaffold only" notice; `--help`,
-> `--version`, and config validation (exit 2) already behave per the
-> contract. The example runs below describe the **intended v1 behavior**.
+> **Build status (2026-06):** the agentd runtime is implemented — config
+> validation, the agentic ReAct loop, the supervisor + subagent process tree
+> (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all four
+> run modes (once/loop/reactive/schedule), the reactive router, the
+> self-scheduling/self-subscribe self-tools, and the served self-MCP
+> (`--serve-mcp`), with the tls/vsock/serve-mcp/cron/metrics surfaces feature-gated.
+> The example runs below describe live behavior.
 
 ---
 
@@ -208,7 +207,7 @@ magnitude inside default Linux limits. At 50 subagents the dominant cost is the
 
 The one sanctioned exception to thread-per-fd is the optional `serve-mcp`
 listener, where many *idle* peer connections would waste a thread each; there a
-`mio`/`libc::poll` loop is allowed behind the `serve-mcp` feature **(roadmap)**.
+`mio`/`libc::poll` loop is allowed behind the `serve-mcp` feature.
 The core supervision path stays thread-per-fd unconditionally.
 
 ---
@@ -371,7 +370,7 @@ stalled · loop_detected · cancelled · crashed
   tool result is an observation fed to the model; a JSON-RPC `error` is a
   transport failure handled by retry/abort policy.
 
-### Example run (intended v1 behavior)
+### Example run
 
 ```console
 $ agentd \
@@ -400,9 +399,8 @@ superpower: a collector reassembles the whole tree by `run_id` and queries any
 subtree by `agent_path` prefix (`0`, `0.2`, `0.2.1`) with no backend join, and
 `pid` joins the log tree to the free OS `pstree` (RFC 0010).
 
-> **Status:** the flow above is the v1 target. Today, steps 1 (config/validate/
-> exit-2) and the logging/signal scaffolding are live; CONNECT, SPAWN, LOOP, and
-> RESULT land across M1–M3. See [`docs/design/PLAN.md`](design/PLAN.md).
+All five steps above — CONFIG, CONNECT, SPAWN, LOOP, RESULT — are implemented.
+See [`docs/design/PLAN.md`](design/PLAN.md).
 
 ---
 

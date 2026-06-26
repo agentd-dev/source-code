@@ -59,30 +59,32 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M7 nearly done — the **minimalism audit** (cargo tree/audit/deny,
-  all clean) and the **minimal `scratch` container image** (static 1.1 MB musl
-  binary) landed this wake, on top of the observe-suite + mock LLM. Only the
-  reference **docs** + broadening the conformance suite remain.
-- **Last completed (this wake):** the **M7 minimalism audit + container image**.
-  Audit (verified): default = exactly 3 direct first-party crates, no async / no
-  TLS / no C toolchain (M7 acceptance ✓); `cargo audit` clean; new `deny.toml` +
-  `cargo deny check` passes; the hand-roll-vs-dep revisit confirms keeping the
-  hand-rolled HTTP/errors + `serde_json` (no minreq/thiserror/miniserde).
-  Container: `Dockerfile` rewritten to a `rust:alpine` → **static musl →
-  `FROM scratch`** image (default TLS-off build, ~1.1 MB, nonroot, no
-  shell/libc), replacing a stale `--all-features`/distroless/cmake one;
-  `.dockerignore` tightened; the static release build verified locally. (Prior
-  wakes: observe-suite + mock LLM; served `subagent.spawn` + race fix; serve-mcp;
-  cron; self-*; drain; cgroup; trifecta; metrics.) No code changed → **189
-  default tests** still green, clippy clean (default + all-features).
-- **Next action:** the last M7 items — **verify/refresh the reference docs**
-  (exit-code table vs `exit.rs`, config table vs `config.rs`, event vocabulary vs
-  the emitted set, trifecta + deployment recipes; the docs exist but predate
-  several features) and **broaden the observe-suite** (delegation / caps-refusal /
-  drain / scope-narrowing) toward an `agentd-conformance` crate. After that, M1–M7
-  acceptance holds → **stop + disable the cron**. Deferred non-blocking features:
-  M3 warm sessions + async spawn, `otel`, served `subagent.send`/`cancel`/`status`,
-  cgroup `cgroup.kill` (infra-gated).
+- **Phase:** M7 — the **reference docs** were reconciled to the implemented
+  runtime this wake (config/event tables vs code; a 10-file Workflow de-staled
+  the whole `docs/` set). On top of the minimalism audit, container image,
+  observe-suite + mock LLM. Only the conformance-crate broadening + explicit
+  chaos tests remain before M1–M7 completion.
+- **Last completed (this wake):** the **M7 docs reconciliation**.
+  `configuration.md` flag/env table rewritten to match `--help` exactly (added 6
+  real flags incl. `--cron`/`--metrics-addr`/`--allow-trifecta`/`--mcp-tags`/
+  `--log-content`/`--traceparent`; dropped never-built aspirational flags; fixed
+  the `config.loaded` example). `observability.md` event vocabulary extended with
+  the self-* / served-MCP / cgroup / drain / security / daemon events + a
+  vocabulary-vs-wire note. A 10-file Workflow fan-out (one agent per doc, minimal
+  edits) removed the stale "mid-build / scaffold-only / lands across M1–M3"
+  caveats across the entire `docs/` set — it now describes a working runtime,
+  keeping genuine roadmap notes. Added `--traceparent` to `--help` (the one code
+  change). (Prior wakes: minimalism audit + container; observe-suite + mock LLM;
+  served `subagent.spawn` + race fix; serve-mcp; cron; self-*; …) **189 default
+  tests** green, clippy clean (default + all-features).
+- **Next action:** the final M7 acceptance bullets — **explicit chaos tests**
+  (stuck-kill within budget, orphan reparent+reap, spawn-cap/fork-bomb refused →
+  "leaks no process") and **broadening the observe-suite** toward an
+  `agentd-conformance` crate (delegation / caps-refusal / drain / scope-narrowing,
+  tree reconstruction by `run_id`+`agent_path`). When those hold, **M1–M7 is
+  complete → stop + `CronDelete 6885e804`** per the completion protocol. Deferred
+  non-blocking features: M3 warm sessions + async spawn, `otel`, served
+  `subagent.send`/`cancel`/`status`, cgroup `cgroup.kill` (infra-gated).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -193,7 +195,7 @@ Modules: fills `agentd-conformance/`; finalizes feature matrix
 - [ ] `agentd-conformance` MCP client+server conformance + supervisor behavior + record/replay tests
 - [~] **observe-to-validate E2E suite** (operator ask) — **seeded + the agentic loop is now validated end to end.** New built-in **mock LLM** (`intel/mock.rs`, hidden `--internal-mock-llm <socket> [final|read|schedule]`): OpenAI-compatible `/chat/completions` over a unix socket with scripted turns (final answer / tool call → answer), no deps. `tests/observe_e2e.rs` drives *real* agentd against it (+ the mock MCP) and asserts on the observed telemetry + outcome: (1) once-mode runs the real loop to a `completed` answer; (2) a full ReAct tool-call cycle (`tool.call` `resource.read` → `tool.result` → final); (3) **self-scheduling fires end to end** (`self.schedule` → `trigger.armed/fired` kind:self_schedule) — closing the long-deferred live self-* validation. _Remaining: broaden to delegation / caps-refusal / stuck-kill / drain / scope-narrowing observations + tree reconstruction by `run_id`+`agent_path` (much is already covered piecemeal across `tests/`); fold into an `agentd-conformance` crate._
 - [x] minimal container image (scratch/distroless, TLS-off default) — `Dockerfile` rewritten to the minimalism target: a `rust:1.88-alpine` builder compiles the **default** (TLS-off) build to a **fully static musl binary** shipped `FROM scratch` (no shell, no libc, no package manager), nonroot uid, optional `--build-arg FEATURES=…` for heavier surfaces. Verified: the static release build links cleanly (`x86_64-unknown-linux-musl`, **statically linked, ~1.1 MB**). (Replaced a stale `--all-features`/distroless/cmake Dockerfile that referenced an aws-lc-rs path no longer used.) `docs/deployment.md` already documents this image; `.dockerignore` tightened. _The `docker build` itself is infra-gated (no daemon here), but the Dockerfile + static build are verified._
-- [ ] docs: exit-code table, config table, event vocabulary, trifecta guidance, deployment recipes (CLI / reactive Deployment / external CronJob)
+- [x] docs: exit-code table, config table, event vocabulary, trifecta guidance, deployment recipes — **reconciled to the implemented runtime.** `configuration.md` flag/env table now matches `--help` exactly (added `--log-content`/`--metrics-addr`/`--allow-trifecta`/`--mcp-tags`/`--cron`/`--traceparent`, dropped the never-built aspirational flags + the stale `config.loaded` shape); `observability.md` event vocabulary extended with the self-* / served-MCP / cgroup / drain / security / daemon-run events + a vocabulary-vs-wire note. A 10-file Workflow fan-out removed the stale "mid-build / scaffold-only / lands across M1–M3" caveats across the whole `docs/` set (now describes a working runtime; genuine roadmap caveats kept). Added the missing `--traceparent` line to `--help`. exit-code table (deployment.md) verified against `exit.rs` (0–7, 124, OS 137/143).
 - **Acceptance:** default build links no async runtime, no TLS, no C toolchain, ≤ single-digit first-party crates; conformance passes against MCP reference servers + an agentd-as-server peer; stuck/orphan/fork-bomb chaos test leaks no process; runtime readable in an afternoon (size + module-count check).
 
 ---

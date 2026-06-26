@@ -21,11 +21,10 @@ Authorities: **RFC 0009** (subagent process model & nesting) and **RFC 0003**
 owns the *spawn-boundary payload and grant-time policy*; RFC 0003 owns the
 *runtime syscalls, detection, and teardown*.
 
-> **Build status.** This describes the **v1 target**. The binary today
-> validates config, logs, and exits with a scaffold notice for run modes — the
-> foundation (M1) is in place; the supervisor process tree lands in **M2** and
-> async subagents in **M3**. See `docs/design/PLAN.md` for the milestone map.
-> Example runs below are framed as intended v1 behavior.
+> **Build status.** This is implemented. The runtime ships config validation,
+> the agentic ReAct loop, the supervisor + subagent process tree
+> (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, and all
+> four run modes.
 
 ---
 
@@ -72,8 +71,7 @@ $ agentd \
     --mode once
 ```
 
-Status: see `docs/design/PLAN.md` (M1 in progress; the loop + supervisor land
-across M1–M2).
+The loop and supervisor process tree are implemented.
 
 ---
 

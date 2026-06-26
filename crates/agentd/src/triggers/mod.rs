@@ -1,5 +1,6 @@
 pub mod mode;
 pub mod router;
+pub mod warm;
 
 // The 5-field cron schedule source is a standalone convenience (RFC 0008); the
 // production path is an external CronJob → `--mode once`. Feature-gated, no deps.

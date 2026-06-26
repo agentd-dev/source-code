@@ -2,19 +2,23 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, rewrite/mcp-native-agent]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  # Format, lint, and the full test suite. agentd is a Linux-native daemon
+  # (PR_SET_PDEATHSIG, the subreaper, waitpid, cgroups, unix sockets), so CI is
+  # Linux-only — there is no macOS/Windows runtime target. `--all-features` so the
+  # feature-gated modules (tls/vsock/serve-mcp/cron/metrics/otel) are linted and
+  # tested too; without it a gated module can rot unseen.
+  gate:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,32 +26,29 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      # --all-features so feature-gated modules are linted too — a
-      # default-features lint pass let a gated module rot twice.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
+      # The whole workspace under all features: agentd's feature-gated tests
+      # (serve_mcp / otel_e2e / …) and the black-box agentd-conformance suite,
+      # which builds + drives the real binary, both run here.
+      - run: cargo test --workspace --all-features
 
-  # The capability-pruning story, proven in CI: every feature
-  # combination an operator is likely to ship must build and test
-  # clean on its own.
+  # The capability-pruning story, proven in CI: every feature combination an
+  # operator is likely to ship must build + test clean on its own (feature
+  # unification under `--all-features` can hide a broken solo build).
   features:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         features:
-          - "--no-default-features"
-          - "--no-default-features --features tools-fs,tools-data,trigger-http,auth,server-tls"
-          - "--features tools-http,tools-shell"
-          # TLS client WITHOUT server-tls: the single-crypto-provider
-          # build (ureq/ring only) that --all-features can't exercise.
-          - "--features tools-http-tls"
-          # Secrets sources standalone (oauth2 pulls ureq without the
-          # other ureq features; exec has no deps at all).
-          - "--features secrets-oauth2,secrets-exec"
-          - "--features trigger-cron,trigger-fs-watch"
-          - "--features signing,auth-oidc,policy-rego,schema"
-          - "--features intel-unix,intel-http,intel-remote"
+          - "" # default (the 3-dep minimalism build)
+          - "--features serve-mcp"
+          - "--features cron"
+          - "--features metrics"
+          - "--features otel"
+          - "--features tls"
+          - "--features vsock"
+          - "--features metrics,serve-mcp,cron,otel" # the image's cloud-native set
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
@@ -55,62 +56,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p agentd ${{ matrix.features }}
 
-  # Run the conformance corpus as a visible gate: pass^k, capability
-  # coverage, fault tolerance, security denials, and cost-per-success
-  # print to the log. `cargo test --workspace` already gates it; this
-  # surfaces the headline numbers.
-  conformance:
+  # Minimalism is the moat: the DEFAULT build must stay at exactly three direct
+  # dependencies (serde, serde_json, libc) — no async runtime, no TLS, no C. This
+  # fails the build if an unearned dependency sneaks in.
+  minimalism:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo run -p agentd-conformance --release -- crates/agentd-conformance/corpus
-      - name: Compile benchmarks
-        run: cargo bench -p agentd-conformance --no-run
-
-  # The TypeScript authoring SDK: prove its emitted TOML is accepted by
-  # the real runtime, not just well-shaped.
-  sdk:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: cargo build -p agentd
-      - name: SDK tests (round-trip through agentd --validate-only)
-        run: node --test
-        working-directory: sdk/typescript
-        env:
-          AGENTD_BIN: ${{ github.workspace }}/target/debug/agentd
-
-  # Every showcased example workflow must stay valid against the real
-  # binary, so a docs example can never silently rot. Built --all-features
-  # so every node kind / trigger / provider an example uses resolves.
-  examples:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p agentd --all-features
-      - name: Validate every example workflow
+      - name: Assert the default build has exactly 3 direct deps
         run: |
-          bin=target/debug/agentd
-          fail=0
-          for f in examples/*.toml examples/reference/*.toml examples/use-cases/*.toml; do
-            case "$f" in
-              # self-planning-agent.toml is an instruction file, not a
-              # workflow — it has its own mode, not --validate-only.
-              *self-planning-agent.toml) echo "skip $f (instruction file)"; continue ;;
-            esac
-            if "$bin" --config "$f" --validate-only >/dev/null; then
-              echo "ok   $f"
-            else
-              echo "FAIL $f"; "$bin" --config "$f" --validate-only || true; fail=1
-            fi
-          done
-          exit $fail
+          deps=$(cargo tree -p agentd --depth 1 --edges normal | grep -cE '^[├└]')
+          echo "direct deps: $deps"
+          if [ "$deps" -ne 3 ]; then
+            echo "::error::default build must have exactly 3 direct deps (serde, serde_json, libc); found $deps"
+            cargo tree -p agentd --depth 1 --edges normal
+            exit 1
+          fi
+
+  # Build the OCI image from the Dockerfile (single-arch smoke build, no push) and
+  # prove the static binary runs — so a Dockerfile or static-link regression is
+  # caught on every PR, not at release time.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (amd64, load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: agentd:ci
+      - name: Smoke-test the image
+        run: |
+          docker run --rm agentd:ci --version
+          docker run --rm agentd:ci --help | grep -q -- '--metrics-addr'

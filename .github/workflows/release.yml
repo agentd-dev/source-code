@@ -1,99 +1,58 @@
 name: release
 
+# Cut a release by pushing a tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`.
+# Produces: static Linux binaries (amd64 + arm64), a multi-arch OCI image on GHCR
+# (cosign-signed, SBOM-attested), and a SHA256SUMS. (For a Debian/systemd host,
+# `packaging/` ships a hardened unit + env for a manual install.)
 on:
   push:
     tags: ["v*"]
 
-# Least privilege per job; the container job adds packages + id-token.
+# Least privilege per job; the container job adds packages + id-token for GHCR
+# push + keyless signing.
 permissions:
   contents: read
 
+# All release artifacts ship the dependency-free cloud-native feature set: the
+# /healthz+/readyz+/metrics probe surface, served MCP, UTC-cron, and OTLP — still
+# a fully static, 3-dependency binary. (Need tls/vsock? build from source; the
+# default reaches intelligence over unix: to a TLS-terminating sidecar.)
+env:
+  FEATURES: "metrics,serve-mcp,cron,otel"
+
 jobs:
+  # Static Linux binaries for the two cloud architectures, cross-compiled in
+  # docker via `cross` so amd64 and arm64 both produce a fully static musl ELF.
   binaries:
     permissions:
       contents: write
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p agentd --target ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross build --release --locked -p agentd --target ${{ matrix.target }} --features "$FEATURES"
       - name: Package
-        shell: bash
         run: |
-          bin=agentd
-          [[ "${{ matrix.target }}" == *windows* ]] && bin=agentd.exe
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$bin" dist/
+          cp "target/${{ matrix.target }}/release/agentd" dist/
           cd dist
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            7z a "agentd-${{ github.ref_name }}-${{ matrix.target }}.zip" "$bin"
-          else
-            tar czf "agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" "$bin"
-          fi
-          rm "$bin"
+          tar czf "agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" agentd
+          rm agentd
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
 
-  linux-packages:
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-deb cargo-generate-rpm
-      - run: cargo build --release -p agentd
-      - run: cargo deb -p agentd --no-build
-      - run: cargo generate-rpm -p crates/agentd
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            target/debian/*.deb
-            target/generate-rpm/*.rpm
-
-  # Aggregate SHA256 checksums over every release artifact, after the
-  # binaries + packages are uploaded. One SHA256SUMS file to verify them.
-  checksums:
-    needs: [binaries, linux-packages]
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p dist && cd dist
-          gh release download "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --pattern 'agentd-*' --pattern '*.deb' --pattern '*.rpm'
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/SHA256SUMS
-
-  # Multi-arch distroless image → GHCR, cosign-signed (keyless OIDC) with
-  # an SPDX SBOM attestation. See docs/operations.md §8.4.
+  # Multi-arch OCI image → GHCR, cosign-signed (keyless OIDC) with an SPDX SBOM
+  # attestation. The Dockerfile defaults FEATURES to the cloud-native set.
   container:
     permissions:
       contents: read
@@ -112,7 +71,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/agentd-dev/agentd
+          images: ghcr.io/${{ github.repository_owner }}/agentd
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -126,22 +85,46 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # metadata-action's labels (applied above) own the canonical
+          # org.opencontainers.image.* set, including `created`; these args just
+          # fill the Dockerfile's local-build defaults.
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
       - uses: sigstore/cosign-installer@v3
       - name: Sign image (keyless)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/agentd-dev/agentd@${DIGEST}"
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/agentd@${DIGEST}"
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/agentd-dev/agentd@${{ steps.build.outputs.digest }}
+          image: ghcr.io/${{ github.repository_owner }}/agentd@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
-          # We attest the SBOM to the image with cosign (next step); we
-          # don't attach it to the GitHub Release, which would need
-          # `contents: write` this least-privilege job deliberately omits.
           upload-release-assets: false
       - name: Attest SBOM
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/agentd-dev/agentd@${DIGEST}"
+        run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/${{ github.repository_owner }}/agentd@${DIGEST}"
+
+  # Aggregate SHA256 checksums over the released binaries, after they upload.
+  checksums:
+    needs: [binaries]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist && cd dist
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'agentd-*'
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SHA256SUMS

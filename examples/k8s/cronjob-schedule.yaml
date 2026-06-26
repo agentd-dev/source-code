@@ -9,8 +9,6 @@
 # NOTE: the CronJob controller is part of Kubernetes, not agentd. agentd is
 # scheduler-agnostic; the operator that drives it is EXTERNAL to this project
 # (rfcs/0011 §1).
-#
-# Status: see docs/design/PLAN.md (loop/supervisor/MCP land in M1–M3).
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -54,7 +52,8 @@ spec:
               type: RuntimeDefault
           containers:
             - name: agentd
-              image: agentd:latest
+              # Pin a version tag (or a digest) in production rather than :latest.
+              image: ghcr.io/agentd-dev/agentd:latest
               # Mode defaults to `once`; stated explicitly for clarity.
               args:
                 - --mode
@@ -75,7 +74,7 @@ spec:
                       name: agentd-intelligence
                       key: token
                 - name: AGENTD_MODEL
-                  value: claude-sonnet-4-5
+                  value: claude-sonnet-4-6
                 # Deadline shorter than the Job's activeDeadlineSeconds so a
                 # hung run trips agentd's own --deadline (exit 124) first.
                 - name: AGENTD_DEADLINE

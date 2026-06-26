@@ -1,5 +1,5 @@
 [Unit]
-Description=Bounded workflow runtime (agentd)
+Description=MCP-native agent runtime (agentd)
 Documentation=https://github.com/agentd-dev/source-code/tree/main/docs
 After=network-online.target
 Wants=network-online.target
@@ -11,9 +11,9 @@ ExecStart=/usr/bin/agentd $AGENTD_ARGS
 Restart=on-failure
 RestartSec=5s
 
-# Graceful shutdown. TimeoutStopSec MUST exceed the workflow's
-# --drain-timeout-secs (default 30) or systemd will SIGKILL
-# mid-drain and in-flight requests will error.
+# Graceful shutdown. TimeoutStopSec MUST exceed agentd's --drain-timeout
+# (default 25s) or systemd will SIGKILL mid-drain and in-flight work errors;
+# a clean drain exits 0, an overrun is the OS-set 143 (rfcs/0011 §5).
 KillSignal=SIGTERM
 TimeoutStopSec=60s
 
@@ -42,14 +42,16 @@ ReadOnlyPaths=/etc/agentd
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
-ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 
-# No executable pages except what ld.so needs at startup.
+# Note: agentd forks + supervises subagent processes (PR_SET_CHILD_SUBREAPER,
+# PR_SET_PDEATHSIG, process-group kills). The @system-service set + the
+# restrictions below permit that. Do NOT add ProtectControlGroups=yes if you use
+# --cgroup (active enforcement needs cgroup-fs writes).
 MemoryDenyWriteExecute=yes
 
 # Syscall allowlist. @system-service is the standard set.
@@ -57,8 +59,9 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
-# Networking: UNIX for intel socket; INET / INET6 for HTTP. No
-# raw sockets, no netlink.
+# Networking: AF_UNIX for the intel/served-MCP sockets; INET/INET6 for an
+# https:// intelligence endpoint (tls build) and the /metrics+/healthz surface.
+# No raw sockets, no netlink. Add AF_VSOCK only for the vsock build.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 # Drop all capabilities. The runtime never needs any.
@@ -66,7 +69,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
 
-# If a workflow needs to bind to port <1024, enable via drop-in:
+# If the /metrics+/healthz surface must bind a port <1024, enable via drop-in:
 #   systemctl edit agentd
 # and add: CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # + AmbientCapabilities=CAP_NET_BIND_SERVICE under [Service].

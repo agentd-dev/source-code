@@ -59,31 +59,29 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M3 reactive depth — **self-subscribe** (`subscribe`/`unsubscribe`
-  self-tools that mutate the daemon's live subscriptions) landed this wake,
-  completing the self-* capability alongside last wake's self-scheduling. On top
-  of M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
-- **Last completed (this wake):** **self-subscribe** — `subscribe`/`unsubscribe`
-  self-tools (root-only, ≤16/run) let an agent change what wakes it. New
-  `SubscriptionRequest`/`SubscriptionAction` types + `Outcome.subscriptions` +
-  `SelfHandler::take_subscriptions`; the orchestrator accumulates requests and
-  `run_reactive::apply_effects` applies them to the live router + server
-  subscriptions (added `Router::{has_exact,add_route,remove_exact}` for runtime
-  routing; `react` now returns the completed `Outcome`). Router dynamics + the
-  orchestrator tools are unit-tested; existing reactive tests confirm no
-  regression. Pairs with last wake's self-scheduling to complete the self-*
-  capability. (Prior wakes: self-scheduling; drain; cgroup-v2; trifecta;
-  metrics.) No new deps, default build still 3 deps. **182 default / 186 metrics
-  tests** green, clippy clean (default + metrics + all-features). _Live
-  model-driven firing needs a mock-LLM fixture — deferred to the M7 observe-suite._
-- **Next action:** the remaining M3 items are heavier — **warm `Continue`
-  sessions** (`tree.rs` session state + the `Continue` disposition: keep a
-  subagent warm across reactions) and **async `subagent.spawn{async,detach}`**
-  (non-blocking delegation + completion-as-self-resource). Or pivot to the
-  **`--serve-mcp` peer listener** (M2/M4 composability — a sizeable MCP-server
-  build), the `cron`/`otel` features, or M7 (conformance + observe-suite +
-  container + docs — the mock-LLM fixture there also unlocks live self-*
-  firing tests). M5 cgroup `cgroup.kill`/backpressure needs a cgroup-v2 host.
+- **Phase:** M4 — the hand-rolled, dependency-free **`cron` feature** (5-field
+  UTC schedule for `--mode schedule`) landed this wake. On top of M3 self-* (self
+  schedule/subscribe), M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
+- **Last completed (this wake):** the **`cron` feature** — a hand-rolled,
+  dependency-free 5-field UTC cron for `--mode schedule` (`triggers/timer.rs`,
+  gated; `cron = []` stays dep-free — chose hand-roll over RFC 0008's `croner`
+  per the minimalism moat). `CronExpr::parse` (`*`, `*/step`, ranges, lists) +
+  `next_after` (minute-step search, dom/dow OR semantics, reuses
+  `civil_from_days`). Wired into `run_scheduled` (`--cron`/`AGENTD_CRON`): cron
+  waits *until* its next instant before firing; bad expr → `config.invalid`/exit
+  2; default build warns `cron.unavailable` → interval fallback. Config rejects
+  `--cron` outside schedule mode. 6 cron + 1 config tests; observe-proven (arms +
+  waits, no immediate fire; bad expr rejected). (Prior wakes: self-subscribe;
+  self-scheduling; drain; cgroup; trifecta; metrics.) **No new deps, default
+  build still 3 deps.** **183 default / 188 cron / 186 metrics tests** green,
+  clippy clean (default + cron + metrics + all-features).
+- **Next action:** the **`--serve-mcp` peer listener** (M2/M4 composability — a
+  sizeable MCP-*server* build: agentd serves its own MCP over `unix:` so peers
+  compose with it). Other open items: M3 warm `Continue` sessions + async
+  `subagent.spawn`; the `otel` feature (the one allowed heavier deps); M7
+  (conformance + observe-suite + container + docs — the mock-LLM fixture there
+  unlocks live self-* firing tests); M5 cgroup `cgroup.kill`/backpressure (needs
+  a cgroup-v2 host).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -162,7 +160,7 @@ Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,ti
 - [x] `net/vsock.rs` + vsock intelligence transport [vsock] — `VsockStream::connect_with_cid_port` + timeouts, drops into the HTTP client like the other transports. Compiles under `--features vsock`; live verification needs a microVM peer (deferred).
 - [x] `sec/exec.rs` gated `exec` self-tool — off by default, advertised only with `--enable-exec` (propagated via the spawn payload, inherited by children). argv-style (no shell/PATH/interpolation), argv[0] = absolute path to an existing executable, scrubbed env, output capped (64 KiB), own process group `killpg`'d on a mandatory per-call timeout. Salvaged from the retired `shell.rs`. Validation/spawn failures are recoverable observations. (Budget/Rule-of-Two folding = later refinement.)
 - [x] `--mode loop`/`schedule` drivers (`triggers/mode.rs::run_scheduled`): interval-based re-run of the standing instruction (each fire = an independent supervised `once` run); `loop` re-enters back-to-back (interval default 0), `schedule` fires on `--interval`; SIGTERM → graceful drain → exit 0; fast-failing runs back off (capped) so they can't hot-spin. e2e-proven (`tests/daemon_modes.rs`). _Remaining: optional 5-field `cron` feature (croner)._
-- [ ] optional `cron` feature (croner) as a `triggers/timer.rs` event source [feature: cron]
+- [x] optional `cron` feature as a `triggers/timer.rs` event source [feature: cron] — **hand-rolled, zero deps** (deviation from RFC 0008's `croner` mention, justified by the minimalism moat rfcs/0002; `cron = []` stays dep-free). A 5-field UTC `CronExpr::parse` (`*`, `*/step`, `a`, `a-b`, `a-b/step`, lists) + a minute-stepping `next_after` with day-of-month/day-of-week OR semantics (reuses `civil_from_days`). Wired into `run_scheduled` (`--cron`/`AGENTD_CRON`, requires `--mode schedule`): cron waits *until* its next instant before firing (vs interval's run-then-wait). Config rejects `--cron` outside schedule mode; the feature build fails fast on a bad expr (`config.invalid`→exit 2); the default build warns `cron.unavailable` and falls back to interval. 6 cron unit tests; observe-proven (arms + waits, no immediate fire). _Production path remains an external CronJob → `--mode once` (RFC 0008)._
 - **Acceptance:** second agentd connects to served unix self-MCP, subscribes to `agentd://session/…`, reacts to first agent's progress; `--enable-exec` exposes exec only when binary exists, runs under deadline, killed+reaped by subtree ladder; `--mode loop --interval 5m` re-enters with idle backoff, terminates on global budget; vsock intelligence works in a microVM.
 
 ### M5 — Cloud-native hardening: drain, health, exit codes, idempotency

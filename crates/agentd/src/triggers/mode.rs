@@ -193,10 +193,28 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         spawn_ready: Duration::from_millis(50),
         ..RestartConfig::default()
     });
+    // Parse the optional cron schedule (feature-gated; a bad expr fails fast).
+    // Without the feature `--cron` is inert — warned once, falls back to interval.
+    #[cfg(feature = "cron")]
+    let cron: Option<crate::triggers::timer::CronExpr> = match &cfg.cron {
+        Some(expr) => match crate::triggers::timer::CronExpr::parse(expr) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log.error("config.invalid", json!({"cron": expr, "err": e}));
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(feature = "cron"))]
+    if cfg.cron.is_some() {
+        log.warn("cron.unavailable", json!({"reason": "built without --features cron"}));
+    }
+
     let mut iteration: u64 = 0;
     log.info(
         "trigger.armed",
-        json!({"kind": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64}),
+        json!({"kind": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64, "cron": cfg.cron}),
     );
     log.info("proc.ready", json!({"mode": cfg.mode.as_str()}));
 
@@ -206,6 +224,27 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
             log.info("proc.exit", json!({"reason": "drain", "mode": cfg.mode.as_str()}));
             return exit::SUCCESS;
         }
+
+        // cron fires *at* its instants, so the wait precedes the run (vs interval,
+        // whose spacing is applied after the run below).
+        #[cfg(feature = "cron")]
+        let cron_active = cron.is_some();
+        #[cfg(not(feature = "cron"))]
+        let cron_active = false;
+        #[cfg(feature = "cron")]
+        if let Some(c) = &cron {
+            let now = now_unix_secs();
+            let wait = c
+                .next_after(now)
+                .map(|t| Duration::from_secs(t.saturating_sub(now)))
+                .unwrap_or(Duration::from_secs(60));
+            sleep_interruptible(wait);
+            if signals::draining() {
+                log.info("proc.exit", json!({"reason": "drain", "mode": cfg.mode.as_str()}));
+                return exit::SUCCESS;
+            }
+        }
+
         iteration += 1;
         log.info("schedule.fired", json!({"iteration": iteration}));
 
@@ -237,10 +276,14 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         // backs off (capped + jittered, never below the interval) or, on a
         // tripped breaker, ends the daemon rather than respawn into a known-bad
         // loop. RFC 0003 §3.7 / assessment §4 M2 "crash-loop trips breaker".
+        // cron's spacing is the pre-run wait above, so a successful cron fire has
+        // no post-wait; interval mode waits its interval here. A failed run still
+        // backs off (capped + jittered) regardless of the schedule source.
+        let post_wait = if cron_active { Duration::ZERO } else { interval };
         let now = Instant::now();
         match governor.on_outcome(ok, now.duration_since(started), now) {
-            _ if ok => sleep_interruptible(interval),
-            RestartAction::Backoff(d) => sleep_interruptible(d.max(interval)),
+            _ if ok => sleep_interruptible(post_wait),
+            RestartAction::Backoff(d) => sleep_interruptible(d.max(post_wait)),
             RestartAction::Tripped => {
                 crate::obs::metrics::record_restart_tripped();
                 log.warn("proc.exit", json!({"reason": "restart_breaker", "iteration": iteration}));
@@ -248,6 +291,15 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
             }
         }
     }
+}
+
+/// Current UTC unix seconds — the clock the cron source matches against.
+#[cfg(feature = "cron")]
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Sleep up to `dur`, returning early if a drain is requested (so SIGTERM

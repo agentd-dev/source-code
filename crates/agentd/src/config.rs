@@ -86,6 +86,9 @@ pub struct Config {
     /// hashes/lengths only; `--log-content` adds the actual tool args/results
     /// (truncated). Propagates to children via the telemetry block.
     pub log_content: bool,
+    /// Opt-in HTTP probe/scrape surface (`/metrics` + `/healthz` + `/readyz`).
+    /// Off unless set; only honoured in `--features metrics` builds. RFC 0010.
+    pub metrics_addr: Option<String>,
 }
 
 impl Default for Config {
@@ -111,6 +114,7 @@ impl Default for Config {
             health_file: None,
             traceparent: None,
             log_content: false,
+            metrics_addr: None,
         }
     }
 }
@@ -139,6 +143,7 @@ impl fmt::Debug for Config {
             .field("health_file", &self.health_file)
             .field("traceparent", &self.traceparent)
             .field("log_content", &self.log_content)
+            .field("metrics_addr", &self.metrics_addr)
             .finish()
     }
 }
@@ -210,6 +215,9 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_LOG_CONTENT") {
             c.log_content = truthy(v);
         }
+        if let Some(v) = envmap.get("AGENTD_METRICS_ADDR") {
+            c.metrics_addr = Some((*v).to_string());
+        }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
@@ -267,6 +275,7 @@ impl Config {
                 "--drain-timeout" => c.drain_timeout = parse_duration(&take("--drain-timeout")?).map_err(usage)?,
                 "--enable-exec" => c.enable_exec = true,
                 "--log-content" => c.log_content = true,
+                "--metrics-addr" => c.metrics_addr = Some(take("--metrics-addr")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
@@ -416,6 +425,7 @@ fn help_text() -> String {
          \x20 --log-content               log tool args/results, not just lengths (opt-in)\n\
          \x20 --drain-timeout <dur>       graceful drain budget (default 25s; < pod grace)\n\
          \x20 --health-file <PATH>        liveness heartbeat file\n\
+         \x20 --metrics-addr <ADDR>       serve /metrics+/healthz+/readyz (needs --features metrics)\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
     )

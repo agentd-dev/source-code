@@ -22,7 +22,13 @@ pub struct Budget {
 
 impl Budget {
     pub fn new(max_steps: u32, max_tokens: u64, deadline: Instant) -> Budget {
-        Budget { max_steps, max_tokens, deadline, steps: 0, tokens: 0 }
+        Budget {
+            max_steps,
+            max_tokens,
+            deadline,
+            steps: 0,
+            tokens: 0,
+        }
     }
 
     /// Count one completed loop turn.
@@ -83,7 +89,10 @@ mod tests {
     #[test]
     fn token_bound() {
         let mut b = Budget::new(100, 50, far());
-        b.record_usage(Usage { input_tokens: 40, output_tokens: 20 });
+        b.record_usage(Usage {
+            input_tokens: 40,
+            output_tokens: 20,
+        });
         assert_eq!(b.exceeded(), Some(TerminalStatus::ExhaustedTokens));
     }
 

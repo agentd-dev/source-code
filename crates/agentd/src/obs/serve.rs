@@ -25,7 +25,9 @@ const STALE_AFTER_MS: u64 = 5_000;
 pub fn spawn(addr: &str, log: Logger) -> std::io::Result<()> {
     let listener = TcpListener::bind(normalize_bind_addr(addr).as_ref())?;
     let local = listener.local_addr().ok();
-    let bound = local.map(|a| a.to_string()).unwrap_or_else(|| addr.to_string());
+    let bound = local
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| addr.to_string());
     log.info(
         "metrics.serving",
         json!({"addr": bound, "endpoints": ["/metrics", "/healthz", "/readyz"]}),
@@ -83,7 +85,11 @@ fn route(path: &str) -> (&'static str, &'static str, String) {
     // Strip any `?query` — probes are path-only.
     let path = path.split('?').next().unwrap_or(path);
     match path {
-        "/metrics" => ("200 OK", "text/plain; version=0.0.4", super::metrics::render_prometheus()),
+        "/metrics" => (
+            "200 OK",
+            "text/plain; version=0.0.4",
+            super::metrics::render_prometheus(),
+        ),
         "/healthz" => health_response(),
         // Readiness: the surface is only bound after the daemon has initialized,
         // so reaching it means the process is up and serving.
@@ -98,7 +104,11 @@ fn health_response() -> (&'static str, &'static str, String) {
     if !draining && age < STALE_AFTER_MS {
         ("200 OK", "text/plain", format!("ok tick_age_ms={age}\n"))
     } else {
-        ("503 Service Unavailable", "text/plain", format!("unhealthy draining={draining} tick_age_ms={age}\n"))
+        (
+            "503 Service Unavailable",
+            "text/plain",
+            format!("unhealthy draining={draining} tick_age_ms={age}\n"),
+        )
     }
 }
 

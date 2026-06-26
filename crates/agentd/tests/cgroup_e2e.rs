@@ -21,7 +21,9 @@ fn own_cgroup_dir() -> Option<PathBuf> {
 
 /// Can we actually create + remove a child cgroup here? If not, skip the test.
 fn cgroup_writable() -> bool {
-    let Some(dir) = own_cgroup_dir() else { return false };
+    let Some(dir) = own_cgroup_dir() else {
+        return false;
+    };
     let probe = dir.join(format!(".e2e-probe-{}", std::process::id()));
     match std::fs::create_dir(&probe) {
         Ok(()) => {
@@ -78,10 +80,17 @@ fn once_mode_places_the_root_in_a_cgroup_and_removes_it_on_exit() {
     let _ = llm.wait();
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "run completed cleanly; stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "run completed cleanly; stderr:\n{stderr}"
+    );
 
     // The feature armed (parent cgroup resolved + writable)…
-    assert!(stderr.contains("\"cgroup.enabled\""), "expected cgroup.enabled; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("\"cgroup.enabled\""),
+        "expected cgroup.enabled; stderr:\n{stderr}"
+    );
 
     // …and the root subagent was placed in its per-run child cgroup. Parse the
     // event to recover the exact cgroup path so we can assert it was cleaned up.
@@ -92,7 +101,10 @@ fn once_mode_places_the_root_in_a_cgroup_and_removes_it_on_exit() {
         .expect("a cgroup.placed event");
     assert_eq!(placed["ok"], true, "root placed into the cgroup: {placed}");
     let cgroup_path = placed["cgroup"].as_str().expect("cgroup path in the event");
-    assert!(cgroup_path.contains("/run-"), "per-run cgroup name: {cgroup_path}");
+    assert!(
+        cgroup_path.contains("/run-"),
+        "per-run cgroup name: {cgroup_path}"
+    );
 
     // RAII cleanup: the per-run cgroup dir is gone once the supervisor dropped.
     assert!(
@@ -159,7 +171,11 @@ fn once_mode_applies_hard_limits_when_the_parent_delegates_controllers() {
     let _ = llm.wait();
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "run completed cleanly; stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "run completed cleanly; stderr:\n{stderr}"
+    );
 
     // The limits were accepted, normalized, and (since the parent delegates the
     // controllers) actually engaged — no `cgroup.limits_unavailable` warning.
@@ -169,7 +185,11 @@ fn once_mode_applies_hard_limits_when_the_parent_delegates_controllers() {
         .find(|v| v["event"] == "cgroup.enabled")
         .expect("a cgroup.enabled event");
     assert_eq!(enabled["pids_max"], "64", "pids.max normalized: {enabled}");
-    assert_eq!(enabled["memory_max"], (256 * 1024 * 1024).to_string(), "memory.max normalized: {enabled}");
+    assert_eq!(
+        enabled["memory_max"],
+        (256 * 1024 * 1024).to_string(),
+        "memory.max normalized: {enabled}"
+    );
     assert!(
         !stderr.contains("cgroup.limits_unavailable"),
         "controllers delegate here, so limits must engage; stderr:\n{stderr}"

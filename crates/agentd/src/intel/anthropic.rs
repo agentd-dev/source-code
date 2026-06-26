@@ -6,7 +6,7 @@
 //! arguments are a JSON object (not a stringified one).
 
 use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 pub const DEFAULT_PATH: &str = "/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -23,7 +23,11 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let messages: Vec<Value> = req.messages.iter().filter_map(message_to_anthropic).collect();
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .filter_map(message_to_anthropic)
+        .collect();
 
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
@@ -47,7 +51,10 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
     let bytes = serde_json::to_vec(&Value::Object(body)).unwrap_or_default();
     let mut headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
-        ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+        (
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string(),
+        ),
     ];
     if let Some(tok) = token {
         headers.push(("x-api-key".to_string(), tok.to_string()));
@@ -69,7 +76,11 @@ fn message_to_anthropic(m: &Message) -> Option<Value> {
             }
             Some(json!({"role": "assistant", "content": blocks}))
         }
-        Message::ToolResult { id, content, is_error } => Some(json!({
+        Message::ToolResult {
+            id,
+            content,
+            is_error,
+        } => Some(json!({
             "role": "user",
             "content": [{
                 "type": "tool_result",
@@ -82,7 +93,8 @@ fn message_to_anthropic(m: &Message) -> Option<Value> {
 }
 
 pub fn parse_response(body: &[u8]) -> Result<Response, String> {
-    let v: Value = serde_json::from_slice(body).map_err(|e| format!("intel: bad JSON response: {e}"))?;
+    let v: Value =
+        serde_json::from_slice(body).map_err(|e| format!("intel: bad JSON response: {e}"))?;
 
     if v.get("type").and_then(Value::as_str) == Some("error") {
         let msg = v
@@ -105,8 +117,16 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
                 }
                 Some("tool_use") => {
                     tool_calls.push(ToolCall {
-                        id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-                        name: b.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                        id: b
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: b
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                         arguments: b.get("input").cloned().unwrap_or(Value::Null),
                     });
                 }
@@ -127,8 +147,17 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
         output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
     });
 
-    let text = if text_parts.is_empty() { None } else { Some(text_parts.join("")) };
-    Ok(Response { text, tool_calls, stop_reason, usage: usage.unwrap_or_default() })
+    let text = if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(""))
+    };
+    Ok(Response {
+        text,
+        tool_calls,
+        stop_reason,
+        usage: usage.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -141,7 +170,11 @@ mod tests {
         let req = Request {
             model: "claude-x".into(),
             messages: vec![Message::system("be terse"), Message::user("hi")],
-            tools: vec![ToolDef { name: "t".into(), description: "d".into(), input_schema: json!({}) }],
+            tools: vec![ToolDef {
+                name: "t".into(),
+                description: "d".into(),
+                input_schema: json!({}),
+            }],
             max_tokens: 100,
             temperature: None,
         };
@@ -150,7 +183,11 @@ mod tests {
         assert_eq!(v["system"], "be terse");
         assert_eq!(v["messages"][0]["role"], "user");
         assert_eq!(v["tools"][0]["name"], "t");
-        assert!(headers.iter().any(|(k, val)| k == "x-api-key" && val == "sk-ant"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, val)| k == "x-api-key" && val == "sk-ant")
+        );
         assert!(headers.iter().any(|(k, _)| k == "anthropic-version"));
     }
 

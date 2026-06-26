@@ -66,7 +66,10 @@ pub struct ToolScope {
 impl ToolScope {
     /// The root agent's scope — everything the operator configured.
     pub fn all() -> ToolScope {
-        ToolScope { servers: Scope::All, tools: Scope::All }
+        ToolScope {
+            servers: Scope::All,
+            tools: Scope::All,
+        }
     }
 
     pub fn allows_server(&self, server: &str) -> bool {
@@ -186,9 +189,18 @@ impl TrifectaTag {
     /// in exactly one place (`Trifecta::merge`).
     pub fn as_trifecta(self) -> Trifecta {
         match self {
-            TrifectaTag::UntrustedInput => Trifecta { untrusted_input: true, ..Default::default() },
-            TrifectaTag::Sensitive => Trifecta { sensitive: true, ..Default::default() },
-            TrifectaTag::Egress => Trifecta { egress: true, ..Default::default() },
+            TrifectaTag::UntrustedInput => Trifecta {
+                untrusted_input: true,
+                ..Default::default()
+            },
+            TrifectaTag::Sensitive => Trifecta {
+                sensitive: true,
+                ..Default::default()
+            },
+            TrifectaTag::Egress => Trifecta {
+                egress: true,
+                ..Default::default()
+            },
         }
     }
 }
@@ -283,7 +295,10 @@ mod tests {
 
     #[test]
     fn tool_scope_requires_both_dimensions() {
-        let scope = ToolScope { servers: Scope::only(["fs"]), tools: Scope::only(["read_file"]) };
+        let scope = ToolScope {
+            servers: Scope::only(["fs"]),
+            tools: Scope::only(["read_file"]),
+        };
         assert!(scope.allows("fs", "read_file"));
         assert!(!scope.allows("github", "read_file")); // wrong server
         assert!(!scope.allows("fs", "write_file")); // wrong tool
@@ -291,8 +306,14 @@ mod tests {
 
     #[test]
     fn tool_scope_narrow_intersects_both() {
-        let parent = ToolScope { servers: Scope::only(["fs", "db"]), tools: Scope::All };
-        let child = ToolScope { servers: Scope::only(["fs", "net"]), tools: Scope::only(["read"]) };
+        let parent = ToolScope {
+            servers: Scope::only(["fs", "db"]),
+            tools: Scope::All,
+        };
+        let child = ToolScope {
+            servers: Scope::only(["fs", "net"]),
+            tools: Scope::only(["read"]),
+        };
         let n = parent.narrow(&child);
         assert_eq!(n.servers, Scope::only(["fs"]));
         assert_eq!(n.tools, Scope::only(["read"]));
@@ -300,9 +321,17 @@ mod tests {
 
     #[test]
     fn rule_of_two() {
-        let two = Trifecta { untrusted_input: true, sensitive: true, egress: false };
+        let two = Trifecta {
+            untrusted_input: true,
+            sensitive: true,
+            egress: false,
+        };
         assert_eq!(evaluate(two, false), RuleOfTwo::Ok);
-        let three = Trifecta { untrusted_input: true, sensitive: true, egress: true };
+        let three = Trifecta {
+            untrusted_input: true,
+            sensitive: true,
+            egress: true,
+        };
         assert_eq!(evaluate(three, false), RuleOfTwo::Refuse);
         assert_eq!(evaluate(three, true), RuleOfTwo::Warn);
         assert_eq!(three.legs(), 3);
@@ -310,8 +339,14 @@ mod tests {
 
     #[test]
     fn trifecta_merge_accumulates() {
-        let a = Trifecta { untrusted_input: true, ..Default::default() };
-        let b = Trifecta { egress: true, ..Default::default() };
+        let a = Trifecta {
+            untrusted_input: true,
+            ..Default::default()
+        };
+        let b = Trifecta {
+            egress: true,
+            ..Default::default()
+        };
         assert_eq!(a.merge(b).legs(), 2);
     }
 

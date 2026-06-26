@@ -7,7 +7,7 @@
 //! JSON → neutral [`Response`]. No I/O (that's `intel/client.rs`).
 
 use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// The default endpoint path when the intelligence URI is a bare socket
 /// (`unix:`/`vsock:`) rather than a full `https://…` URL.
@@ -94,11 +94,15 @@ fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
 /// [`StopReason::Other`]; tool-call arguments that aren't valid JSON are
 /// wrapped as `{"_raw": "…"}` rather than dropped.
 pub fn parse_response(body: &[u8]) -> Result<Response, String> {
-    let v: Value = serde_json::from_slice(body).map_err(|e| format!("intel: bad JSON response: {e}"))?;
+    let v: Value =
+        serde_json::from_slice(body).map_err(|e| format!("intel: bad JSON response: {e}"))?;
 
     // Surface an OpenAI-style error object clearly.
     if let Some(err) = v.get("error") {
-        let msg = err.get("message").and_then(Value::as_str).unwrap_or("unknown");
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         return Err(format!("intel: provider error: {msg}"));
     }
 
@@ -117,13 +121,28 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
-            let id = c.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = c
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let func = c.get("function").unwrap_or(&Value::Null);
-            let name = func.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-            let raw_args = func.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+            let name = func
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let raw_args = func
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
             let arguments =
                 serde_json::from_str(raw_args).unwrap_or_else(|_| json!({ "_raw": raw_args }));
-            tool_calls.push(ToolCall { id, name, arguments });
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
         }
     }
 
@@ -136,10 +155,18 @@ pub fn parse_response(body: &[u8]) -> Result<Response, String> {
 
     let usage = v.get("usage").map(|u| Usage {
         input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-        output_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output_tokens: u
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     });
 
-    Ok(Response { text, tool_calls, stop_reason, usage: usage.unwrap_or_default() })
+    Ok(Response {
+        text,
+        tool_calls,
+        stop_reason,
+        usage: usage.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -168,7 +195,11 @@ mod tests {
         assert_eq!(v["model"], "gpt-x");
         assert_eq!(v["tools"][0]["function"]["name"], "read_file");
         assert_eq!(v["tool_choice"], "auto");
-        assert!(headers.iter().any(|(k, val)| k == "authorization" && val == "Bearer sk-test"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, val)| k == "authorization" && val == "Bearer sk-test")
+        );
     }
 
     #[test]
@@ -194,6 +225,10 @@ mod tests {
     #[test]
     fn parse_provider_error() {
         let body = br#"{"error":{"message":"invalid api key"}}"#;
-        assert!(parse_response(body).unwrap_err().contains("invalid api key"));
+        assert!(
+            parse_response(body)
+                .unwrap_err()
+                .contains("invalid api key")
+        );
     }
 }

@@ -26,7 +26,10 @@ impl CronExpr {
     pub fn parse(expr: &str) -> Result<CronExpr, String> {
         let f: Vec<&str> = expr.split_whitespace().collect();
         if f.len() != 5 {
-            return Err(format!("cron needs exactly 5 fields (min hour dom month dow), got {}", f.len()));
+            return Err(format!(
+                "cron needs exactly 5 fields (min hour dom month dow), got {}",
+                f.len()
+            ));
         }
         Ok(CronExpr {
             minute: parse_field(f[0], 0, 59)?,
@@ -82,7 +85,11 @@ fn parse_field(field: &str, lo: u64, hi: u64) -> Result<u64, String> {
     let mut mask = 0u64;
     for term in field.split(',') {
         let (range, step) = match term.split_once('/') {
-            Some((r, s)) => (r, s.parse::<u64>().map_err(|_| format!("bad step in '{term}'"))?),
+            Some((r, s)) => (
+                r,
+                s.parse::<u64>()
+                    .map_err(|_| format!("bad step in '{term}'"))?,
+            ),
             None => (term, 1),
         };
         if step == 0 {
@@ -91,11 +98,17 @@ fn parse_field(field: &str, lo: u64, hi: u64) -> Result<u64, String> {
         let (start, end) = if range == "*" {
             (lo, hi)
         } else if let Some((a, b)) = range.split_once('-') {
-            let s = a.parse::<u64>().map_err(|_| format!("bad range '{range}'"))?;
-            let e = b.parse::<u64>().map_err(|_| format!("bad range '{range}'"))?;
+            let s = a
+                .parse::<u64>()
+                .map_err(|_| format!("bad range '{range}'"))?;
+            let e = b
+                .parse::<u64>()
+                .map_err(|_| format!("bad range '{range}'"))?;
             (s, e)
         } else {
-            let v = range.parse::<u64>().map_err(|_| format!("bad value '{range}'"))?;
+            let v = range
+                .parse::<u64>()
+                .map_err(|_| format!("bad value '{range}'"))?;
             (v, v)
         };
         if start < lo || end > hi || start > end {
@@ -143,7 +156,10 @@ mod tests {
     #[test]
     fn decompose_known_instant() {
         let tm = decompose(MON_2024_01_01);
-        assert_eq!((tm.minute, tm.hour, tm.dom, tm.month, tm.dow), (0, 0, 1, 1, 1)); // Monday
+        assert_eq!(
+            (tm.minute, tm.hour, tm.dom, tm.month, tm.dow),
+            (0, 0, 1, 1, 1)
+        ); // Monday
     }
 
     #[test]
@@ -172,7 +188,10 @@ mod tests {
     fn weekday_nine_am_skips_weekend() {
         // 0 9 * * 1-5 — 2024-01-01 is Monday, so 09:00 the same day.
         let c = CronExpr::parse("0 9 * * 1-5").unwrap();
-        assert_eq!(c.next_after(MON_2024_01_01), Some(MON_2024_01_01 + 9 * 3600));
+        assert_eq!(
+            c.next_after(MON_2024_01_01),
+            Some(MON_2024_01_01 + 9 * 3600)
+        );
         // From Fri 2024-01-05 10:00 → next is Mon 2024-01-08 09:00.
         let fri_10 = MON_2024_01_01 + 4 * 86_400 + 10 * 3600;
         let mon_9 = MON_2024_01_01 + 7 * 86_400 + 9 * 3600;
@@ -182,8 +201,14 @@ mod tests {
     #[test]
     fn step_and_list_fields() {
         let c = CronExpr::parse("0 */6 * * *").unwrap(); // 00:00, 06:00, 12:00, 18:00
-        assert_eq!(c.next_after(MON_2024_01_01), Some(MON_2024_01_01 + 6 * 3600));
+        assert_eq!(
+            c.next_after(MON_2024_01_01),
+            Some(MON_2024_01_01 + 6 * 3600)
+        );
         let c2 = CronExpr::parse("0 0 1,15 * *").unwrap(); // 1st and 15th at 00:00
-        assert_eq!(c2.next_after(MON_2024_01_01), Some(MON_2024_01_01 + 14 * 86_400));
+        assert_eq!(
+            c2.next_after(MON_2024_01_01),
+            Some(MON_2024_01_01 + 14 * 86_400)
+        );
     }
 }

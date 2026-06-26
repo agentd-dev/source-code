@@ -54,21 +54,34 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn pass() -> Outcome {
-        Outcome { passed: true, detail: String::new() }
+        Outcome {
+            passed: true,
+            detail: String::new(),
+        }
     }
 
     pub fn note(detail: impl Into<String>) -> Outcome {
-        Outcome { passed: true, detail: detail.into() }
+        Outcome {
+            passed: true,
+            detail: detail.into(),
+        }
     }
 
     pub fn fail(detail: impl Into<String>) -> Outcome {
-        Outcome { passed: false, detail: detail.into() }
+        Outcome {
+            passed: false,
+            detail: detail.into(),
+        }
     }
 
     /// Assert `cond`, failing with `detail` otherwise. Lets a check read as a
     /// sequence of `require(...)?`-style guards via [`Outcome::and`].
     pub fn require(cond: bool, detail: impl Into<String>) -> Outcome {
-        if cond { Outcome::pass() } else { Outcome::fail(detail) }
+        if cond {
+            Outcome::pass()
+        } else {
+            Outcome::fail(detail)
+        }
     }
 
     /// Chain: if `self` passed, evaluate `next`; else keep the first failure.
@@ -89,7 +102,7 @@ pub struct Check {
 /// Run one check, converting a panic (a failed harness `expect`, a spawn error)
 /// into a check failure rather than aborting the whole suite.
 pub fn run_check(h: &Harness, check: &Check) -> Outcome {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     match catch_unwind(AssertUnwindSafe(|| (check.run)(h))) {
         Ok(o) => o,
         Err(e) => {

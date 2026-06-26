@@ -20,11 +20,11 @@ use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
 use crate::supervisor::budget::Budget;
 use crate::wire::intel::{Message, Request, ToolDef};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Per-response token cap (distinct from the cumulative run budget).
@@ -108,7 +108,9 @@ impl<'a> Session<'a> {
         if !resources.owner.is_empty() || self_handler.serves_self_resources() {
             tools.push(resource_read_tool_def());
         }
-        let mut messages = vec![Message::system(system_prompt(input.output_contract.as_deref()))];
+        let mut messages = vec![Message::system(system_prompt(
+            input.output_contract.as_deref(),
+        ))];
         if let Some(note) = resources.catalogue_note() {
             messages.push(Message::system(note));
         }
@@ -116,7 +118,14 @@ impl<'a> Session<'a> {
             messages.push(seed_message(role, content));
         }
         messages.push(Message::user(&input.instruction));
-        Ok(Session { servers, tools, tool_to_server, resources, model: input.model.clone(), messages })
+        Ok(Session {
+            servers,
+            tools,
+            tool_to_server,
+            resources,
+            model: input.model.clone(),
+            messages,
+        })
     }
 
     /// Append the next event as a new user turn — the delivery point for a warm
@@ -154,7 +163,10 @@ impl<'a> Session<'a> {
 
         loop {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                log.warn("loop.final", json!({"status": "cancelled", "steps": budget.steps()}));
+                log.warn(
+                    "loop.final",
+                    json!({"status": "cancelled", "steps": budget.steps()}),
+                );
                 run_span.finish(&self.model, tok_in, tok_out, false);
                 return Ok(Outcome {
                     status: TerminalStatus::Cancelled,
@@ -192,14 +204,25 @@ impl<'a> Session<'a> {
                 temperature: Some(0.0),
             };
 
-            log.debug("intel.call", json!({"step": budget.steps(), "messages": self.messages.len()}));
+            log.debug(
+                "intel.call",
+                json!({"step": budget.steps(), "messages": self.messages.len()}),
+            );
             let chat_start = crate::obs::otel::now_unix_nanos();
-            let resp = intel.complete(&req).map_err(|e| LoopAbort::Intel(e.to_string()))?;
+            let resp = intel
+                .complete(&req)
+                .map_err(|e| LoopAbort::Intel(e.to_string()))?;
             budget.record_usage(resp.usage);
             budget.record_step();
             tok_in += resp.usage.input_tokens;
             tok_out += resp.usage.output_tokens;
-            run_span.record_chat(&self.model, resp.usage.input_tokens, resp.usage.output_tokens, true, chat_start);
+            run_span.record_chat(
+                &self.model,
+                resp.usage.input_tokens,
+                resp.usage.output_tokens,
+                true,
+                chat_start,
+            );
             log.debug(
                 "intel.result",
                 json!({"tool_calls": resp.tool_calls.len(), "tokens_in": resp.usage.input_tokens, "tokens_out": resp.usage.output_tokens}),
@@ -210,7 +233,10 @@ impl<'a> Session<'a> {
                     last_text = Some(t.to_string());
                 }
                 let tool_calls = resp.tool_calls.clone();
-                self.messages.push(Message::Assistant { text: resp.text, tool_calls: tool_calls.clone() });
+                self.messages.push(Message::Assistant {
+                    text: resp.text,
+                    tool_calls: tool_calls.clone(),
+                });
 
                 for tc in &tool_calls {
                     let mut call = json!({"tool": tc.name, "id": tc.id});
@@ -226,27 +252,39 @@ impl<'a> Session<'a> {
                         // An `agentd://` URI reads agentd's own state (e.g. an
                         // async child's completion) via the self-handler; any
                         // other URI is an MCP-server resource.
-                        let uri = tc.arguments.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+                        let uri = tc
+                            .arguments
+                            .get("uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
                         if crate::agentd_uri::is_agentd(uri) {
-                            self_handler
-                                .read_resource(uri)
-                                .unwrap_or_else(|| (format!("unknown agentd resource: {uri}"), true))
+                            self_handler.read_resource(uri).unwrap_or_else(|| {
+                                (format!("unknown agentd resource: {uri}"), true)
+                            })
                         } else {
                             read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
                         }
                     } else {
                         match self_handler.handle(&tc.name, &tc.arguments) {
                             Some(r) => r, // a self-tool (e.g. subagent.spawn)
-                            None => dispatch_tool(self.servers, &self.tool_to_server, &tc.name, &tc.arguments),
+                            None => dispatch_tool(
+                                self.servers,
+                                &self.tool_to_server,
+                                &tc.name,
+                                &tc.arguments,
+                            ),
                         }
                     };
                     run_span.record_tool(&tc.name, !is_error, tool_start);
-                    let mut result = json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()});
+                    let mut result =
+                        json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()});
                     if log.content_capture() {
                         result["content"] = json!(truncate_for_log(&content));
                     }
                     log.info("tool.result", result);
-                    self.messages.push(Message::tool_result(&tc.id, content, is_error));
+                    self.messages
+                        .push(Message::tool_result(&tc.id, content, is_error));
                 }
                 continue;
             }
@@ -255,8 +293,14 @@ impl<'a> Session<'a> {
             // Record it in the transcript so a warm session's next turn sees its
             // own prior reply (invisible to once-mode, which discards the session).
             let text = resp.text.clone().or(last_text).unwrap_or_default();
-            self.messages.push(Message::Assistant { text: Some(text.clone()), tool_calls: Vec::new() });
-            log.info("loop.final", json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}));
+            self.messages.push(Message::Assistant {
+                text: Some(text.clone()),
+                tool_calls: Vec::new(),
+            });
+            log.info(
+                "loop.final",
+                json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}),
+            );
             run_span.finish(&self.model, tok_in, tok_out, true);
             return Ok(Outcome {
                 status: TerminalStatus::Completed,
@@ -298,18 +342,25 @@ fn truncate_for_log(s: &str) -> String {
         return s.to_string();
     }
     let mut t: String = s.chars().take(CONTENT_LOG_CAP).collect();
-    t.push_str(&format!("…(+{} more bytes)", s.len().saturating_sub(t.len())));
+    t.push_str(&format!(
+        "…(+{} more bytes)",
+        s.len().saturating_sub(t.len())
+    ));
     t
 }
 
 /// Build the model's tool catalogue from every connected server, plus a
 /// name→server-index routing map. On a name collision the first server wins
 /// (logged at call time as "unknown" only if truly absent). RFC 0004.
-fn build_catalogue(servers: &[McpClient]) -> Result<(Vec<ToolDef>, HashMap<String, usize>), LoopAbort> {
+fn build_catalogue(
+    servers: &[McpClient],
+) -> Result<(Vec<ToolDef>, HashMap<String, usize>), LoopAbort> {
     let mut tools = Vec::new();
     let mut routing = HashMap::new();
     for (i, server) in servers.iter().enumerate() {
-        let listed = server.list_tools().map_err(|e| LoopAbort::Mcp(e.to_string()))?;
+        let listed = server
+            .list_tools()
+            .map_err(|e| LoopAbort::Mcp(e.to_string()))?;
         for t in listed {
             routing.entry(t.name.clone()).or_insert(i);
             tools.push(ToolDef {
@@ -354,7 +405,10 @@ fn system_prompt(contract: Option<&str>) -> String {
 fn seed_message(role: &str, content: &str) -> Message {
     match role {
         "system" => Message::system(content),
-        "assistant" => Message::Assistant { text: Some(content.to_string()), tool_calls: Vec::new() },
+        "assistant" => Message::Assistant {
+            text: Some(content.to_string()),
+            tool_calls: Vec::new(),
+        },
         _ => Message::user(content),
     }
 }
@@ -388,7 +442,9 @@ impl ResourceCatalogue {
             }
         }
         if self.truncated {
-            s.push_str(&format!("(… more than {RESOURCE_CAP} resources; list truncated)\n"));
+            s.push_str(&format!(
+                "(… more than {RESOURCE_CAP} resources; list truncated)\n"
+            ));
         }
         Some(s)
     }
@@ -401,7 +457,9 @@ fn collect_resources(servers: &[McpClient]) -> ResourceCatalogue {
     let mut entries = Vec::new();
     let mut truncated = false;
     'outer: for (i, s) in servers.iter().enumerate() {
-        let Ok(list) = s.list_resources() else { continue };
+        let Ok(list) = s.list_resources() else {
+            continue;
+        };
         for r in list {
             if entries.len() >= RESOURCE_CAP {
                 truncated = true;
@@ -414,7 +472,11 @@ fn collect_resources(servers: &[McpClient]) -> ResourceCatalogue {
             }
         }
     }
-    ResourceCatalogue { owner, entries, truncated }
+    ResourceCatalogue {
+        owner,
+        entries,
+        truncated,
+    }
 }
 
 fn resource_read_tool_def() -> ToolDef {
@@ -433,7 +495,11 @@ fn resource_read_tool_def() -> ToolDef {
 
 /// Handle a `resource.read` call against the connected servers: read from the
 /// owning server (or try each), returning the text as the observation.
-fn read_resource_tool(servers: &[McpClient], owner: &HashMap<String, usize>, args: &Value) -> (String, bool) {
+fn read_resource_tool(
+    servers: &[McpClient],
+    owner: &HashMap<String, usize>,
+    args: &Value,
+) -> (String, bool) {
     let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
     if uri.is_empty() {
         return ("error: resource.read requires a 'uri'".into(), true);
@@ -472,7 +538,11 @@ mod tests {
 
     #[test]
     fn empty_catalogue_is_no_note() {
-        let c = ResourceCatalogue { owner: HashMap::new(), entries: vec![], truncated: false };
+        let c = ResourceCatalogue {
+            owner: HashMap::new(),
+            entries: vec![],
+            truncated: false,
+        };
         assert!(c.catalogue_note().is_none());
     }
 
@@ -518,7 +588,11 @@ mod tests {
         let big = "x".repeat(CONTENT_LOG_CAP + 500);
         let out = truncate_for_log(&big);
         assert!(out.len() < big.len());
-        assert!(out.contains("more bytes"), "truncation is marked: {}", &out[out.len() - 32..]);
+        assert!(
+            out.contains("more bytes"),
+            "truncation is marked: {}",
+            &out[out.len() - 32..]
+        );
         // multi-byte safety: never panics on a char boundary
         let multi = "é".repeat(CONTENT_LOG_CAP + 10);
         let _ = truncate_for_log(&multi);

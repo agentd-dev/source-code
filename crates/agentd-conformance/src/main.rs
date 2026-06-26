@@ -3,7 +3,7 @@
 //! non-zero if any check fails (so it doubles as a CI gate).
 
 use agentd_conformance::report::Record;
-use agentd_conformance::{all_checks, run_check, Harness, Report};
+use agentd_conformance::{Harness, Report, all_checks, run_check};
 
 fn main() {
     let json_mode = std::env::args().any(|a| a == "--json");
@@ -19,13 +19,21 @@ fn main() {
                 let mark = if outcome.passed { "ok  " } else { "FAIL" };
                 eprintln!("  [{mark}] {}", check.id);
             }
-            Record { id: check.id, category: check.category, desc: check.desc, outcome }
+            Record {
+                id: check.id,
+                category: check.category,
+                desc: check.desc,
+                outcome,
+            }
         })
         .collect();
 
     let report = Report::new(records);
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&report.to_json()).expect("json"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json()).expect("json")
+        );
     } else {
         print!("{}", report.render_text());
     }

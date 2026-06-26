@@ -51,7 +51,12 @@ pub struct Caps {
 
 impl Default for Caps {
     fn default() -> Self {
-        Caps { max_depth: 4, max_children: 8, max_total: 64, tree_token_ceiling: 2_000_000 }
+        Caps {
+            max_depth: 4,
+            max_children: 8,
+            max_total: 64,
+            tree_token_ceiling: 2_000_000,
+        }
     }
 }
 
@@ -92,7 +97,14 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(caps: Caps) -> Tree {
-        Tree { nodes: HashMap::new(), next_id: 0, root: None, draining: false, total_tokens: 0, caps }
+        Tree {
+            nodes: HashMap::new(),
+            next_id: 0,
+            root: None,
+            draining: false,
+            total_tokens: 0,
+            caps,
+        }
     }
 
     pub fn caps(&self) -> Caps {
@@ -163,7 +175,15 @@ impl Tree {
         self.next_id += 1;
         self.nodes.insert(
             id,
-            Node { id, parent, depth, agent_path, status: NodeStatus::Spawning, tokens: 0, children: Vec::new() },
+            Node {
+                id,
+                parent,
+                depth,
+                agent_path,
+                status: NodeStatus::Spawning,
+                tokens: 0,
+                children: Vec::new(),
+            },
         );
         id
     }
@@ -232,7 +252,10 @@ mod tests {
 
     #[test]
     fn depth_cap_refuses() {
-        let caps = Caps { max_depth: 2, ..Caps::default() };
+        let caps = Caps {
+            max_depth: 2,
+            ..Caps::default()
+        };
         let mut t = Tree::new(caps);
         let root = t.mint_root().unwrap(); // depth 0
         let a = t.mint_child(root).unwrap(); // depth 1
@@ -242,7 +265,10 @@ mod tests {
 
     #[test]
     fn children_cap_refuses() {
-        let caps = Caps { max_children: 2, ..Caps::default() };
+        let caps = Caps {
+            max_children: 2,
+            ..Caps::default()
+        };
         let mut t = Tree::new(caps);
         let root = t.mint_root().unwrap();
         t.mint_child(root).unwrap();
@@ -252,7 +278,11 @@ mod tests {
 
     #[test]
     fn total_cap_refuses() {
-        let caps = Caps { max_total: 2, max_children: 10, ..Caps::default() };
+        let caps = Caps {
+            max_total: 2,
+            max_children: 10,
+            ..Caps::default()
+        };
         let mut t = Tree::new(caps);
         let root = t.mint_root().unwrap(); // count 1
         t.mint_child(root).unwrap(); // count 2
@@ -269,7 +299,10 @@ mod tests {
 
     #[test]
     fn token_accounting_rolls_to_root_and_trips_ceiling() {
-        let caps = Caps { tree_token_ceiling: 100, ..Caps::default() };
+        let caps = Caps {
+            tree_token_ceiling: 100,
+            ..Caps::default()
+        };
         let mut t = Tree::new(caps);
         let root = t.mint_root().unwrap();
         let c = t.mint_child(root).unwrap();

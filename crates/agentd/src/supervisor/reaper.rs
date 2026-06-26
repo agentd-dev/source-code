@@ -49,7 +49,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 /// pid → the owning Supervisor's reap channel. Holds only LIVE (unreaped)
 /// supervised pids; an entry leaves when its pid is reaped (dispatched) or when
 /// its handle is dropped unreaped ([`deregister`]).
-static ROUTES: LazyLock<Mutex<HashMap<i32, Sender<Reaped>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static ROUTES: LazyLock<Mutex<HashMap<i32, Sender<Reaped>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn routes() -> MutexGuard<'static, HashMap<i32, Sender<Reaped>>> {
     ROUTES.lock().unwrap_or_else(|e| e.into_inner())
@@ -120,11 +121,17 @@ mod tests {
         routes().insert(pid, tx);
         // Simulate dispatch (what reap_and_dispatch does on a real exit).
         if let Some(tx) = routes().remove(&pid) {
-            let _ = tx.send(Reaped { pid, outcome: WaitOutcome::Exited(0) });
+            let _ = tx.send(Reaped {
+                pid,
+                outcome: WaitOutcome::Exited(0),
+            });
         }
         let got = rx.try_recv().expect("the route received the reap");
         assert_eq!(got.pid, pid);
         assert!(got.outcome.is_clean());
-        assert!(routes().get(&pid).is_none(), "the route is removed on dispatch");
+        assert!(
+            routes().get(&pid).is_none(),
+            "the route is removed on dispatch"
+        );
     }
 }

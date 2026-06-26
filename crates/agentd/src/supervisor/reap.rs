@@ -62,7 +62,10 @@ mod imp {
             let mut status: libc::c_int = 0;
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid > 0 {
-                reaped.push(Reaped { pid, outcome: classify_status(status) });
+                reaped.push(Reaped {
+                    pid,
+                    outcome: classify_status(status),
+                });
             } else {
                 // 0 = children exist but none have exited; -1 = ECHILD/error.
                 break;
@@ -139,8 +142,14 @@ mod tests {
 
     #[test]
     fn classify_signal_death() {
-        assert_eq!(classify_status(signaled(libc::SIGKILL)), WaitOutcome::Signaled(9));
-        assert_eq!(classify_status(signaled(libc::SIGTERM)), WaitOutcome::Signaled(15));
+        assert_eq!(
+            classify_status(signaled(libc::SIGKILL)),
+            WaitOutcome::Signaled(9)
+        );
+        assert_eq!(
+            classify_status(signaled(libc::SIGTERM)),
+            WaitOutcome::Signaled(15)
+        );
         assert!(!classify_status(signaled(libc::SIGKILL)).is_clean());
     }
 

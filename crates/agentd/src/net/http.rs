@@ -58,12 +58,18 @@ impl Url {
         let (host, port) = match authority.rsplit_once(':') {
             // ':' only counts as a port separator if what follows is numeric
             // (guards against IPv6 literals, which we don't expect here).
-            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-                (h.to_string(), p.parse().map_err(|_| format!("bad port in {s}"))?)
-            }
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (
+                h.to_string(),
+                p.parse().map_err(|_| format!("bad port in {s}"))?,
+            ),
             _ => (authority.to_string(), default_port),
         };
-        Ok(Url { scheme, host, port, path: path.to_string() })
+        Ok(Url {
+            scheme,
+            host,
+            port,
+            path: path.to_string(),
+        })
     }
 
     pub fn is_tls(&self) -> bool {
@@ -93,7 +99,10 @@ impl Response {
     /// Case-insensitive header lookup (header names are stored lowercased).
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
-        self.headers.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     pub fn is_success(&self) -> bool {
@@ -110,10 +119,12 @@ impl Response {
 /// classifier (`net::ssrf`) is composed at any model/agent-supplied URL surface.
 pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
-    let addr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("cannot resolve {host}:{port}")))?;
+    let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot resolve {host}:{port}"),
+        )
+    })?;
     let stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -139,7 +150,10 @@ pub fn send<S: Read + Write + ?Sized>(
     for (k, v) in headers {
         // Reject CR/LF injection in caller-supplied headers (RFC 0012).
         if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "CR/LF in header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CR/LF in header",
+            ));
         }
         write!(req, "{k}: {v}\r\n")?;
     }
@@ -189,7 +203,11 @@ fn read_response<R: BufRead>(r: &mut R) -> io::Result<Response> {
         read_to_end_capped(r)?
     };
 
-    Ok(Response { status, headers, body })
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn parse_status(line: &str) -> io::Result<u16> {
@@ -197,12 +215,20 @@ fn parse_status(line: &str) -> io::Result<u16> {
     line.split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("bad status line: {line:?}")))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad status line: {line:?}"),
+            )
+        })
 }
 
 fn read_exact_capped<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
     if n > MAX_RESPONSE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "response exceeds cap"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeds cap",
+        ));
     }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
@@ -213,7 +239,10 @@ fn read_to_end_capped<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     r.take(MAX_RESPONSE as u64 + 1).read_to_end(&mut buf)?;
     if buf.len() > MAX_RESPONSE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "response exceeds cap"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeds cap",
+        ));
     }
     Ok(buf)
 }
@@ -239,7 +268,10 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
             break;
         }
         if body.len() + size > MAX_RESPONSE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "chunked response exceeds cap"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked response exceeds cap",
+            ));
         }
         let mut chunk = vec![0u8; size];
         r.read_exact(&mut chunk)?;

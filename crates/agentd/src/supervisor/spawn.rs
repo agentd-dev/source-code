@@ -14,7 +14,7 @@
 //! a possibly-reused pid.
 
 use crate::json::frame;
-use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SUBAGENT_ENV};
+use crate::subagent::protocol::{AgentMsg, ControlMsg, SUBAGENT_ENV, SpawnPayload};
 use crate::supervisor::kill::kill_group;
 use crate::supervisor::tree::NodeId;
 use std::io;
@@ -69,8 +69,14 @@ pub fn spawn(
 
     let mut child = cmd.spawn()?;
     let pgid = child.id() as i32;
-    let mut writer = child.stdin.take().ok_or_else(|| io::Error::other("no child stdin"))?;
-    let stdout = child.stdout.take().ok_or_else(|| io::Error::other("no child stdout"))?;
+    let mut writer = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("no child stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("no child stdout"))?;
 
     // Deliver the spawn payload as the first control frame.
     frame::write_frame(&mut writer, &ControlMsg::Spawn(Box::new(payload.clone())))?;
@@ -92,7 +98,14 @@ pub fn spawn(
             }
         })?;
 
-    Ok(Subagent { node, child, writer, pgid, reaped: false, _reader: reader })
+    Ok(Subagent {
+        node,
+        child,
+        writer,
+        pgid,
+        reaped: false,
+        _reader: reader,
+    })
 }
 
 impl Subagent {

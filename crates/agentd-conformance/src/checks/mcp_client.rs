@@ -9,14 +9,30 @@ use std::time::{Duration, Instant};
 
 pub fn checks() -> Vec<Check> {
     vec![
-        Check { id: "mcp-client/initialize-sent", category: Category::McpClient,
-            desc: "the client opens with initialize carrying protocolVersion + clientInfo", run: initialize_sent },
-        Check { id: "mcp-client/initialized-notification", category: Category::McpClient,
-            desc: "the client sends notifications/initialized after the handshake", run: initialized_notification },
-        Check { id: "mcp-client/tools-list-discovered", category: Category::McpClient,
-            desc: "the client discovers server tools via tools/list", run: tools_list_discovered },
-        Check { id: "mcp-client/subscribe-sent", category: Category::McpClient,
-            desc: "a reactive client subscribes to the resource it watches", run: subscribe_sent },
+        Check {
+            id: "mcp-client/initialize-sent",
+            category: Category::McpClient,
+            desc: "the client opens with initialize carrying protocolVersion + clientInfo",
+            run: initialize_sent,
+        },
+        Check {
+            id: "mcp-client/initialized-notification",
+            category: Category::McpClient,
+            desc: "the client sends notifications/initialized after the handshake",
+            run: initialized_notification,
+        },
+        Check {
+            id: "mcp-client/tools-list-discovered",
+            category: Category::McpClient,
+            desc: "the client discovers server tools via tools/list",
+            run: tools_list_discovered,
+        },
+        Check {
+            id: "mcp-client/subscribe-sent",
+            category: Category::McpClient,
+            desc: "a reactive client subscribes to the resource it watches",
+            run: subscribe_sent,
+        },
     ]
 }
 
@@ -86,26 +102,52 @@ fn find<'a>(reqs: &'a [Value], method: &str) -> Option<&'a Value> {
 fn initialize_sent(h: &Harness) -> Outcome {
     let reqs = records(h);
     let Some(init) = find(reqs, "initialize") else {
-        return Outcome::fail(format!("no initialize sent; recorded {} requests", reqs.len()));
+        return Outcome::fail(format!(
+            "no initialize sent; recorded {} requests",
+            reqs.len()
+        ));
     };
     let p = &init["params"];
-    Outcome::require(p["protocolVersion"].is_string(), format!("initialize without protocolVersion: {init}"))
-        .and(|| Outcome::require(p["clientInfo"].is_object(), format!("initialize without clientInfo: {init}")))
-        .and(|| Outcome::require(p["capabilities"].is_object(), format!("initialize without capabilities: {init}")))
+    Outcome::require(
+        p["protocolVersion"].is_string(),
+        format!("initialize without protocolVersion: {init}"),
+    )
+    .and(|| {
+        Outcome::require(
+            p["clientInfo"].is_object(),
+            format!("initialize without clientInfo: {init}"),
+        )
+    })
+    .and(|| {
+        Outcome::require(
+            p["capabilities"].is_object(),
+            format!("initialize without capabilities: {init}"),
+        )
+    })
 }
 
 fn initialized_notification(h: &Harness) -> Outcome {
     let reqs = records(h);
     let note = find(reqs, "notifications/initialized");
-    Outcome::require(note.is_some(), "client never sent notifications/initialized".to_string()).and(|| {
+    Outcome::require(
+        note.is_some(),
+        "client never sent notifications/initialized".to_string(),
+    )
+    .and(|| {
         // A notification carries no id.
-        Outcome::require(note.unwrap().get("id").is_none(), "notifications/initialized carried an id".to_string())
+        Outcome::require(
+            note.unwrap().get("id").is_none(),
+            "notifications/initialized carried an id".to_string(),
+        )
     })
 }
 
 fn tools_list_discovered(h: &Harness) -> Outcome {
     let reqs = records(h);
-    Outcome::require(find(reqs, "tools/list").is_some(), "client never sent tools/list".to_string())
+    Outcome::require(
+        find(reqs, "tools/list").is_some(),
+        "client never sent tools/list".to_string(),
+    )
 }
 
 fn subscribe_sent(h: &Harness) -> Outcome {

@@ -21,8 +21,15 @@ fn sigterm(pid: u32) {
 fn start_idle_daemon(exe: &str, intel: &str, sock: &Path) -> Child {
     Command::new(exe)
         .args([
-            "--mode", "reactive", "--subscribe", "file:///noop", "--instruction", "stand by",
-            "--intelligence", intel, "--serve-mcp",
+            "--mode",
+            "reactive",
+            "--subscribe",
+            "file:///noop",
+            "--instruction",
+            "stand by",
+            "--intelligence",
+            intel,
+            "--serve-mcp",
         ])
         .arg(format!("unix:{}", sock.display()))
         .args(["--log-level", "warn"])
@@ -49,7 +56,12 @@ fn start_mock_llm(exe: &str, sock: &Path, script: &str) -> Child {
 }
 
 /// Poll `subagent.status` for `handle` until the run is `done`, or the deadline.
-fn poll_until_done(reader: &mut BufReader<UnixStream>, write: &mut UnixStream, handle: &str, deadline: Instant) -> serde_json::Value {
+fn poll_until_done(
+    reader: &mut BufReader<UnixStream>,
+    write: &mut UnixStream,
+    handle: &str,
+    deadline: Instant,
+) -> serde_json::Value {
     let line = format!(
         r#"{{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
     );
@@ -72,14 +84,21 @@ fn connect(path: &std::path::Path) -> UnixStream {
             return s;
         }
         if Instant::now() >= deadline {
-            panic!("served MCP socket never became connectable: {}", path.display());
+            panic!(
+                "served MCP socket never became connectable: {}",
+                path.display()
+            );
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
 /// Send one JSON-RPC line and read the one-line response.
-fn rpc(reader: &mut BufReader<UnixStream>, write: &mut UnixStream, line: &str) -> serde_json::Value {
+fn rpc(
+    reader: &mut BufReader<UnixStream>,
+    write: &mut UnixStream,
+    line: &str,
+) -> serde_json::Value {
     writeln!(write, "{line}").expect("write rpc");
     write.flush().ok();
     let mut buf = String::new();
@@ -97,8 +116,15 @@ fn a_peer_initializes_lists_and_calls_status() {
     // but the daemon stays up and keeps serving the socket).
     let mut child = Command::new(exe)
         .args([
-            "--mode", "loop", "--interval", "10s", "--instruction", "x", "--intelligence",
-            "unix:/nonexistent.sock", "--serve-mcp",
+            "--mode",
+            "loop",
+            "--interval",
+            "10s",
+            "--instruction",
+            "x",
+            "--intelligence",
+            "unix:/nonexistent.sock",
+            "--serve-mcp",
         ])
         .arg(format!("unix:{}", sock.display()))
         .args(["--log-level", "warn"])
@@ -117,12 +143,22 @@ fn a_peer_initializes_lists_and_calls_status() {
         &mut write,
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
     );
-    assert_eq!(init["result"]["serverInfo"]["name"], "agentd", "init: {init}");
+    assert_eq!(
+        init["result"]["serverInfo"]["name"], "agentd",
+        "init: {init}"
+    );
     assert!(init["result"]["capabilities"]["tools"].is_object());
-    assert!(init["result"]["capabilities"]["resources"].is_object(), "resources capability: {init}");
+    assert!(
+        init["result"]["capabilities"]["resources"].is_object(),
+        "resources capability: {init}"
+    );
 
     // tools/list advertises `status`
-    let list = rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    let list = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
     assert_eq!(list["result"]["tools"][0]["name"], "status", "list: {list}");
 
     // tools/call status returns this daemon's live state
@@ -151,9 +187,15 @@ fn a_peer_initializes_lists_and_calls_status() {
         &mut write,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing"}}}"#,
     );
-    assert_eq!(spawn["result"]["isError"], true, "spawn (unreachable intel) is a tool error: {spawn}");
+    assert_eq!(
+        spawn["result"]["isError"], true,
+        "spawn (unreachable intel) is a tool error: {spawn}"
+    );
     assert!(
-        spawn["result"]["content"][0]["text"].as_str().unwrap_or("").contains("intel"),
+        spawn["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("intel"),
         "spawn error should mention intel: {spawn}"
     );
 
@@ -163,11 +205,21 @@ fn a_peer_initializes_lists_and_calls_status() {
         &mut write,
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{}}}"#,
     );
-    assert!(bad_spawn["error"].is_object(), "missing instruction → JSON-RPC error: {bad_spawn}");
+    assert!(
+        bad_spawn["error"].is_object(),
+        "missing instruction → JSON-RPC error: {bad_spawn}"
+    );
 
     // resources/list advertises the agentd:// surface
-    let res_list = rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#);
-    assert_eq!(res_list["result"]["resources"][0]["uri"], "agentd://status", "resources/list: {res_list}");
+    let res_list = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#,
+    );
+    assert_eq!(
+        res_list["result"]["resources"][0]["uri"], "agentd://status",
+        "resources/list: {res_list}"
+    );
 
     // resources/read agentd://status returns a contents body with the live state
     let res_read = rpc(
@@ -176,10 +228,17 @@ fn a_peer_initializes_lists_and_calls_status() {
         r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"agentd://status"}}"#,
     );
     let entry = &res_read["result"]["contents"][0];
-    assert_eq!(entry["uri"], "agentd://status", "resources/read: {res_read}");
+    assert_eq!(
+        entry["uri"], "agentd://status",
+        "resources/read: {res_read}"
+    );
     assert_eq!(entry["mimeType"], "application/json");
-    let body: serde_json::Value = serde_json::from_str(entry["text"].as_str().expect("text")).expect("json body");
-    assert_eq!(body["mode"], "loop", "served status body reflects the daemon mode: {body}");
+    let body: serde_json::Value =
+        serde_json::from_str(entry["text"].as_str().expect("text")).expect("json body");
+    assert_eq!(
+        body["mode"], "loop",
+        "served status body reflects the daemon mode: {body}"
+    );
 
     // an unknown agentd:// uri is a JSON-RPC error
     let bad_read = rpc(
@@ -187,7 +246,10 @@ fn a_peer_initializes_lists_and_calls_status() {
         &mut write,
         r#"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"agentd://ghost"}}"#,
     );
-    assert!(bad_read["error"].is_object(), "unknown resource → JSON-RPC error: {bad_read}");
+    assert!(
+        bad_read["error"].is_object(),
+        "unknown resource → JSON-RPC error: {bad_read}"
+    );
 
     sigterm(child.id());
     let _ = child.wait();
@@ -205,7 +267,11 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
-    rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
 
     // async spawn → a handle immediately, status running (NON-blocking).
     let spawn = rpc(
@@ -219,19 +285,36 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let handle = sc["handle"].as_str().expect("handle").to_string();
 
     // poll the registry until the run terminates → failed (intel unreachable)
-    let body = poll_until_done(&mut reader, &mut write, &handle, Instant::now() + Duration::from_secs(20));
-    assert_eq!(body["status"], "failed", "intel-unreachable async run → failed: {body}");
+    let body = poll_until_done(
+        &mut reader,
+        &mut write,
+        &handle,
+        Instant::now() + Duration::from_secs(20),
+    );
+    assert_eq!(
+        body["status"], "failed",
+        "intel-unreachable async run → failed: {body}"
+    );
 
     // the same run is readable as an agentd:// resource
     let read = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{{"uri":"agentd://subagent/{handle}"}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{{"uri":"agentd://subagent/{handle}"}}}}"#
+        ),
     );
-    let rbody: serde_json::Value =
-        serde_json::from_str(read["result"]["contents"][0]["text"].as_str().expect("text")).expect("json");
+    let rbody: serde_json::Value = serde_json::from_str(
+        read["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
     assert_eq!(rbody["handle"], handle.as_str());
-    assert_eq!(rbody["status"], "failed", "resource read matches status: {rbody}");
+    assert_eq!(
+        rbody["status"], "failed",
+        "resource read matches status: {rbody}"
+    );
 
     sigterm(child.id());
     let _ = child.wait();
@@ -239,7 +322,11 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
 
 /// Read lines until a `notifications/resources/updated` for `uri` arrives (or the
 /// deadline). Skips replies/other notifications interleaved on the stream.
-fn read_until_resource_updated(reader: &mut BufReader<UnixStream>, uri: &str, deadline: Instant) -> bool {
+fn read_until_resource_updated(
+    reader: &mut BufReader<UnixStream>,
+    uri: &str,
+    deadline: Instant,
+) -> bool {
     while Instant::now() < deadline {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -273,28 +360,42 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
-    let init = rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
-    assert_eq!(init["result"]["capabilities"]["resources"]["subscribe"], true, "subscribe advertised: {init}");
+    let init = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    assert_eq!(
+        init["result"]["capabilities"]["resources"]["subscribe"], true,
+        "subscribe advertised: {init}"
+    );
 
     let spawn = rpc(
         &mut reader,
         &mut write,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"slow","async":true}}}"#,
     );
-    let handle = spawn["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string();
+    let handle = spawn["result"]["structuredContent"]["handle"]
+        .as_str()
+        .expect("handle")
+        .to_string();
     let uri = format!("agentd://subagent/{handle}");
 
     // subscribe to the run's resource, then cancel it so it terminates.
     let sub = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"resources/subscribe","params":{{"uri":"{uri}"}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"resources/subscribe","params":{{"uri":"{uri}"}}}}"#
+        ),
     );
     assert!(sub["error"].is_null(), "subscribe ok: {sub}");
     rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
+        ),
     );
 
     // The run drains (~5-7s) → its resource changed → we are pushed an update.
@@ -310,17 +411,28 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
 }
 
 /// Poll `subagent.status` until the warm session has run at least `target` turns.
-fn poll_warm_turns(reader: &mut BufReader<UnixStream>, write: &mut UnixStream, handle: &str, target: u64, deadline: Instant) -> u64 {
+fn poll_warm_turns(
+    reader: &mut BufReader<UnixStream>,
+    write: &mut UnixStream,
+    handle: &str,
+    target: u64,
+    deadline: Instant,
+) -> u64 {
     let line = format!(
         r#"{{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
     );
     loop {
         let v = rpc(reader, write, &line);
-        let turns = v["result"]["structuredContent"]["turns"].as_u64().unwrap_or(0);
+        let turns = v["result"]["structuredContent"]["turns"]
+            .as_u64()
+            .unwrap_or(0);
         if turns >= target {
             return turns;
         }
-        assert!(Instant::now() < deadline, "warm session never reached {target} turns: {v}");
+        assert!(
+            Instant::now() < deadline,
+            "warm session never reached {target} turns: {v}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -339,7 +451,11 @@ fn a_warm_session_runs_a_turn_per_send() {
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
-    rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
 
     // warm spawn → a live session (turn 1 runs from the instruction).
     let spawn = rpc(
@@ -347,42 +463,81 @@ fn a_warm_session_runs_a_turn_per_send() {
         &mut write,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"hello","warm":true}}}"#,
     );
-    assert_eq!(spawn["result"]["structuredContent"]["warm"], true, "warm session: {spawn}");
-    let handle = spawn["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string();
+    assert_eq!(
+        spawn["result"]["structuredContent"]["warm"], true,
+        "warm session: {spawn}"
+    );
+    let handle = spawn["result"]["structuredContent"]["handle"]
+        .as_str()
+        .expect("handle")
+        .to_string();
 
-    let t1 = poll_warm_turns(&mut reader, &mut write, &handle, 1, Instant::now() + Duration::from_secs(15));
+    let t1 = poll_warm_turns(
+        &mut reader,
+        &mut write,
+        &handle,
+        1,
+        Instant::now() + Duration::from_secs(15),
+    );
     assert!(t1 >= 1, "the warm session runs turn 1 from the instruction");
 
     // send another message → a SECOND turn over the same live session.
     let sent = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.send","arguments":{{"handle":"{handle}","message":"and again"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.send","arguments":{{"handle":"{handle}","message":"and again"}}}}}}"#
+        ),
     );
-    assert_eq!(sent["result"]["structuredContent"]["delivered"], true, "send delivered: {sent}");
+    assert_eq!(
+        sent["result"]["structuredContent"]["delivered"], true,
+        "send delivered: {sent}"
+    );
     // The peer is told which turn index to wait for (turn 1 already drained by the
     // status polls above, so this send produces turn 2).
-    assert_eq!(sent["result"]["structuredContent"]["awaiting_turn"], 2, "send reports the awaited turn: {sent}");
+    assert_eq!(
+        sent["result"]["structuredContent"]["awaiting_turn"], 2,
+        "send reports the awaited turn: {sent}"
+    );
 
-    let t2 = poll_warm_turns(&mut reader, &mut write, &handle, 2, Instant::now() + Duration::from_secs(15));
-    assert!(t2 >= 2, "the SAME session ran a second turn from the injected message");
+    let t2 = poll_warm_turns(
+        &mut reader,
+        &mut write,
+        &handle,
+        2,
+        Instant::now() + Duration::from_secs(15),
+    );
+    assert!(
+        t2 >= 2,
+        "the SAME session ran a second turn from the injected message"
+    );
 
     // Once the turn completes the session reads idle (not busy) — the peer's signal
     // that last_result is fresh and it is safe to send again.
     let status = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
+        ),
     );
-    assert_eq!(status["result"]["structuredContent"]["busy"], false, "idle after the turn drains: {status}");
+    assert_eq!(
+        status["result"]["structuredContent"]["busy"], false,
+        "idle after the turn drains: {status}"
+    );
 
     // end it.
     let cancel = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
+        ),
     );
-    assert_eq!(cancel["result"]["structuredContent"]["cancelled"], true, "warm session cancelled: {cancel}");
+    assert_eq!(
+        cancel["result"]["structuredContent"]["cancelled"], true,
+        "warm session cancelled: {cancel}"
+    );
 
     let _ = llm.kill();
     let _ = llm.wait();
@@ -409,14 +564,24 @@ fn concurrent_async_runs_do_not_serialize() {
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
-    rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
 
-    let spawn_async = |reader: &mut BufReader<UnixStream>, write: &mut UnixStream, id: u32| -> String {
+    let spawn_async = |reader: &mut BufReader<UnixStream>,
+                       write: &mut UnixStream,
+                       id: u32|
+     -> String {
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"subagent.spawn","arguments":{{"instruction":"slow","async":true}}}}}}"#
         );
         let v = rpc(reader, write, &line);
-        v["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string()
+        v["result"]["structuredContent"]["handle"]
+            .as_str()
+            .expect("handle")
+            .to_string()
     };
 
     let h1 = spawn_async(&mut reader, &mut write, 2);
@@ -428,12 +593,19 @@ fn concurrent_async_runs_do_not_serialize() {
     rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{h2}"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{h2}"}}}}}}"#
+        ),
     );
 
     // Run 2 reaches a terminal "cancelled" promptly (drain ladder ~5-7s) —
     // well inside the 12s hang of run 1.
-    let body2 = poll_until_done(&mut reader, &mut write, &h2, Instant::now() + Duration::from_secs(15));
+    let body2 = poll_until_done(
+        &mut reader,
+        &mut write,
+        &h2,
+        Instant::now() + Duration::from_secs(15),
+    );
     assert_eq!(body2["status"], "cancelled", "run 2 drained: {body2}");
 
     // ...and run 1 is STILL running at that moment (not blocked, not finished) —
@@ -441,7 +613,9 @@ fn concurrent_async_runs_do_not_serialize() {
     let status1 = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{h1}"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{h1}"}}}}}}"#
+        ),
     );
     assert_eq!(
         status1["result"]["structuredContent"]["done"], false,
@@ -469,28 +643,48 @@ fn cancel_drains_a_live_async_run() {
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
-    rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
 
     let spawn = rpc(
         &mut reader,
         &mut write,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a slow thing","async":true}}}"#,
     );
-    let handle = spawn["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string();
+    let handle = spawn["result"]["structuredContent"]["handle"]
+        .as_str()
+        .expect("handle")
+        .to_string();
 
     // Let the run reach its (hanging) model call, then cancel it.
     std::thread::sleep(Duration::from_millis(400));
     let cancel = rpc(
         &mut reader,
         &mut write,
-        &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
+        ),
     );
-    assert_eq!(cancel["result"]["structuredContent"]["cancelled"], true, "cancel accepted: {cancel}");
+    assert_eq!(
+        cancel["result"]["structuredContent"]["cancelled"], true,
+        "cancel accepted: {cancel}"
+    );
 
     // It reaches a terminal "cancelled" state well before the 30s hang → the
     // reactor's per-run cancel token drained the live subtree.
-    let body = poll_until_done(&mut reader, &mut write, &handle, Instant::now() + Duration::from_secs(20));
-    assert_eq!(body["status"], "cancelled", "a cancelled live run is reported cancelled: {body}");
+    let body = poll_until_done(
+        &mut reader,
+        &mut write,
+        &handle,
+        Instant::now() + Duration::from_secs(20),
+    );
+    assert_eq!(
+        body["status"], "cancelled",
+        "a cancelled live run is reported cancelled: {body}"
+    );
 
     let _ = llm.kill();
     let _ = llm.wait();

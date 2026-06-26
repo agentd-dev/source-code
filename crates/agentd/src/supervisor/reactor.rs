@@ -25,18 +25,18 @@ use crate::obs::log::Logger;
 use crate::signals;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::cgroup::CgroupGuard;
-use crate::supervisor::kill::{kill_group, term_group, Ladder, LadderAction};
+use crate::supervisor::kill::{Ladder, LadderAction, kill_group, term_group};
 use crate::supervisor::liveness::{Health, Liveness, LivenessConfig};
 use crate::supervisor::reap::{Reaped, WaitOutcome};
 use crate::supervisor::reaper;
-use crate::supervisor::spawn::{spawn, Subagent};
+use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::{Caps, NodeId, NodeStatus, Tree};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Reactor tick. Bounds signal/deadline detection latency without a poll loop.
@@ -159,13 +159,16 @@ impl Supervisor {
         let now = Instant::now();
         // Supervisor deadline is a backstop *behind* the child's own deadline
         // (Detector A): the child should hit its budget and wrap up first.
-        let backstop =
-            Duration::from_millis(payload.limits.deadline_ms).saturating_add(Duration::from_secs(60));
-        self.liveness.insert(node, Liveness::new(now, now + backstop, self.liveness_cfg));
+        let backstop = Duration::from_millis(payload.limits.deadline_ms)
+            .saturating_add(Duration::from_secs(60));
+        self.liveness
+            .insert(node, Liveness::new(now, now + backstop, self.liveness_cfg));
         // Register the pid → this supervisor's reap channel ATOMICALLY with the
         // fork (under the global reaper lock), so the reaper can't waitpid the
         // child before it is tracked.
-        let sub = reaper::spawn_tracked(&self.reap_tx, || spawn(&self.exe, payload, node, self.events_tx.clone()))?;
+        let sub = reaper::spawn_tracked(&self.reap_tx, || {
+            spawn(&self.exe, payload, node, self.events_tx.clone())
+        })?;
         // Place the root in the per-run cgroup; descendants it forks AFTER this
         // inherit membership, so the subtree becomes `cgroup.kill`-able at once.
         // (A grandchild forked in the sub-ms window before this write inherits the
@@ -186,7 +189,10 @@ impl Supervisor {
         }
         self.pid_to_node.insert(sub.pid(), node);
         self.live.insert(node, sub);
-        self.log.info("subagent.spawn", json!({"node": node.0, "depth": payload.depth}));
+        self.log.info(
+            "subagent.spawn",
+            json!({"node": node.0, "depth": payload.depth}),
+        );
         Ok(())
     }
 
@@ -217,7 +223,10 @@ impl Supervisor {
 
             // Tear down on a process SIGTERM *or* this run's own cancel flag (a
             // served async run cancelled by handle). Both drain gracefully.
-            let cancelled = self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            let cancelled = self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed));
             if (signals::draining() || cancelled) && self.drain.is_none() {
                 self.begin_drain(KillReason::Drain);
             }
@@ -225,7 +234,9 @@ impl Supervisor {
             self.maybe_send_pings(Instant::now());
             self.tick_liveness();
 
-            if self.drain.is_some() && let Some(result) = self.drive_drain() {
+            if self.drain.is_some()
+                && let Some(result) = self.drive_drain()
+            {
                 return result;
             }
 
@@ -258,7 +269,8 @@ impl Supervisor {
                 self.on_event(node, now);
                 crate::obs::metrics::record_tokens(u.input_tokens, u.output_tokens);
                 if self.tree.charge_tokens(node, u.total()) && self.drain.is_none() {
-                    self.log.warn("limit.exceeded", json!({"limit": "tree_tokens"}));
+                    self.log
+                        .warn("limit.exceeded", json!({"limit": "tree_tokens"}));
                     self.begin_drain(KillReason::TreeBudget);
                 }
             }
@@ -268,18 +280,25 @@ impl Supervisor {
                 // daemon is — so here a turn is just progress: reset liveness and
                 // log it, never terminal. RFC 0008 §spawn-vs-continue.
                 self.on_event(node, now);
-                self.log.info("subagent.turn", json!({"node": node.0, "status": outcome.status.as_str()}));
+                self.log.info(
+                    "subagent.turn",
+                    json!({"node": node.0, "status": outcome.status.as_str()}),
+                );
             }
             AgentMsg::Result { outcome } => {
                 self.tree.set_status(node, NodeStatus::Done);
-                self.log.info("subagent.result", json!({"node": node.0, "status": outcome.status.as_str()}));
+                self.log.info(
+                    "subagent.result",
+                    json!({"node": node.0, "status": outcome.status.as_str()}),
+                );
                 if node == self.root && self.root_terminal.is_none() {
                     self.root_terminal = Some(SuperviseResult::Completed(outcome));
                 }
             }
             AgentMsg::Failed { error } => {
                 self.tree.set_status(node, NodeStatus::Failed);
-                self.log.error("subagent.failed", json!({"node": node.0, "err": error}));
+                self.log
+                    .error("subagent.failed", json!({"node": node.0, "err": error}));
                 if node == self.root && self.root_terminal.is_none() {
                     self.root_terminal = Some(SuperviseResult::Failed(error));
                 }
@@ -300,7 +319,9 @@ impl Supervisor {
     /// `pong_timeout` of silence it crosses into `Stuck`. Suspended during a
     /// drain (the kill ladder owns the child then).
     fn maybe_send_pings(&mut self, now: Instant) {
-        if self.drain.is_some() || now.duration_since(self.last_ping) < self.liveness_cfg.ping_interval {
+        if self.drain.is_some()
+            || now.duration_since(self.last_ping) < self.liveness_cfg.ping_interval
+        {
             return;
         }
         self.last_ping = now;
@@ -332,7 +353,10 @@ impl Supervisor {
                     if let Some(l) = self.liveness.get_mut(&node) {
                         l.on_eof();
                     }
-                    self.log.info("subagent.exit", json!({"node": node.0, "outcome": format!("{:?}", r.outcome)}));
+                    self.log.info(
+                        "subagent.exit",
+                        json!({"node": node.0, "outcome": format!("{:?}", r.outcome)}),
+                    );
                     // The root exited without reporting a result. Only treat that
                     // as an unexpected failure when we are NOT tearing the tree
                     // down: during a drain/stuck/deadline/budget teardown the root
@@ -353,14 +377,19 @@ impl Supervisor {
                         // instead of letting RESULT_GRACE conclude a generic
                         // "exited without a result" that hides the operator's limit.
                         let oom = matches!(r.outcome, WaitOutcome::Signaled(s) if s == libc::SIGKILL)
-                            && self.cgroup.as_ref().and_then(|c| c.oom_kills()).is_some_and(|n| n > 0);
+                            && self
+                                .cgroup
+                                .as_ref()
+                                .and_then(|c| c.oom_kills())
+                                .is_some_and(|n| n > 0);
                         if oom {
                             self.log.warn(
                                 "cgroup.oom_kill",
                                 json!({"node": node.0, "cgroup": self.cgroup.as_ref().map(|c| c.path().display().to_string())}),
                             );
-                            self.root_terminal =
-                                Some(SuperviseResult::Failed("subagent killed by cgroup memory limit (OOM)".into()));
+                            self.root_terminal = Some(SuperviseResult::Failed(
+                                "subagent killed by cgroup memory limit (OOM)".into(),
+                            ));
                         } else {
                             self.root_exited_at.get_or_insert_with(Instant::now);
                         }
@@ -382,9 +411,13 @@ impl Supervisor {
         if self.root_terminal.is_some() || self.drain.is_some() {
             return;
         }
-        if self.root_exited_at.is_some_and(|t| t.elapsed() > RESULT_GRACE) {
-            self.root_terminal =
-                Some(SuperviseResult::Failed("subagent exited without a result".into()));
+        if self
+            .root_exited_at
+            .is_some_and(|t| t.elapsed() > RESULT_GRACE)
+        {
+            self.root_terminal = Some(SuperviseResult::Failed(
+                "subagent exited without a result".into(),
+            ));
         }
     }
 
@@ -410,7 +443,10 @@ impl Supervisor {
             if reason == KillReason::Stuck {
                 self.log.warn("subagent.stuck", json!({"node": node.0}));
             }
-            self.log.warn("subagent.teardown", json!({"node": node.0, "reason": format!("{reason:?}")}));
+            self.log.warn(
+                "subagent.teardown",
+                json!({"node": node.0, "reason": format!("{reason:?}")}),
+            );
             self.begin_drain(reason);
         }
     }
@@ -424,12 +460,21 @@ impl Supervisor {
         // Graceful first: ask every live child to wind down, deepest-first.
         for node in self.tree.deepest_first() {
             if let Some(h) = self.live.get_mut(&node) {
-                let _ = h.send(&ControlMsg::Cancel { reason: format!("{reason:?}") });
+                let _ = h.send(&ControlMsg::Cancel {
+                    reason: format!("{reason:?}"),
+                });
             }
         }
-        self.log.warn("subagent.drain", json!({"reason": format!("{reason:?}"), "live": self.live.len()}));
-        self.drain =
-            Some(Drain { reason, ladder: Ladder::with_defaults(now), deadline: now + self.drain_timeout, forced: false });
+        self.log.warn(
+            "subagent.drain",
+            json!({"reason": format!("{reason:?}"), "live": self.live.len()}),
+        );
+        self.drain = Some(Drain {
+            reason,
+            ladder: Ladder::with_defaults(now),
+            deadline: now + self.drain_timeout,
+            forced: false,
+        });
     }
 
     /// Advance the active teardown ladder. Returns the final result once the
@@ -458,19 +503,35 @@ impl Supervisor {
         // arrived), give up rather than spin: mark the stragglers reaped so their
         // `Drop` won't block, log the leak, and return the teardown reason. This
         // guarantees `drive_drain` always terminates.
-        if !all_reaped && self.drain.as_ref().is_some_and(|d| now >= d.deadline + ABANDON_GRACE) {
-            let reason = self.drain.as_ref().map(|d| d.reason).unwrap_or(KillReason::Drain);
+        if !all_reaped
+            && self
+                .drain
+                .as_ref()
+                .is_some_and(|d| now >= d.deadline + ABANDON_GRACE)
+        {
+            let reason = self
+                .drain
+                .as_ref()
+                .map(|d| d.reason)
+                .unwrap_or(KillReason::Drain);
             // Last word before abandoning: `cgroup.kill` SIGKILLs the entire
             // subtree atomically — including any process that escaped the group
             // and would survive the killpg above (the whole point of the cgroup).
             if let Some(cg) = &self.cgroup {
                 cg.kill_all();
             }
-            self.log.warn("drain.abandon", json!({"live": self.live.len(), "reason": format!("{reason:?}")}));
+            self.log.warn(
+                "drain.abandon",
+                json!({"live": self.live.len(), "reason": format!("{reason:?}")}),
+            );
             for h in self.live.values_mut() {
                 h.mark_reaped(); // already SIGKILL'd; don't let Drop block waiting on it
             }
-            return Some(self.root_terminal.take().unwrap_or(SuperviseResult::Killed(reason)));
+            return Some(
+                self.root_terminal
+                    .take()
+                    .unwrap_or(SuperviseResult::Killed(reason)),
+            );
         }
         let action = match self.drain.as_mut() {
             Some(d) => d.ladder.poll(now, all_reaped, force),
@@ -482,7 +543,8 @@ impl Supervisor {
                 for h in self.live.values() {
                     term_group(h.pgid());
                 }
-                self.log.warn("subagent.sigterm", json!({"live": self.live.len()}));
+                self.log
+                    .warn("subagent.sigterm", json!({"live": self.live.len()}));
                 None
             }
             LadderAction::Kill => {
@@ -495,13 +557,22 @@ impl Supervisor {
                 if let Some(cg) = &self.cgroup {
                     cg.kill_all();
                 }
-                self.log.warn("subagent.sigkill", json!({"live": self.live.len()}));
+                self.log
+                    .warn("subagent.sigkill", json!({"live": self.live.len()}));
                 None
             }
             LadderAction::Done => {
-                let reason = self.drain.as_ref().map(|d| d.reason).unwrap_or(KillReason::Drain);
+                let reason = self
+                    .drain
+                    .as_ref()
+                    .map(|d| d.reason)
+                    .unwrap_or(KillReason::Drain);
                 // Prefer a real terminal the root produced; else the teardown reason.
-                Some(self.root_terminal.take().unwrap_or(SuperviseResult::Killed(reason)))
+                Some(
+                    self.root_terminal
+                        .take()
+                        .unwrap_or(SuperviseResult::Killed(reason)),
+                )
             }
         }
     }

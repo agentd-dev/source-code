@@ -94,7 +94,11 @@ static STDERR_LOCK: Mutex<()> = Mutex::new(());
 
 impl Logger {
     pub fn new(ctx: LogCtx, min: Level) -> Self {
-        Logger { ctx, min, log_content: false }
+        Logger {
+            ctx,
+            min,
+            log_content: false,
+        }
     }
 
     /// Opt into content capture (RFC 0010 §2.9): callers that log tool
@@ -121,12 +125,18 @@ impl Logger {
             return;
         }
         let mut m = Map::new();
-        m.insert("ts".into(), Value::String(rfc3339_millis(SystemTime::now())));
+        m.insert(
+            "ts".into(),
+            Value::String(rfc3339_millis(SystemTime::now())),
+        );
         m.insert("level".into(), Value::String(level.as_str().into()));
         m.insert("event".into(), Value::String(event.into()));
         m.insert("run_id".into(), Value::String(self.ctx.run_id.clone()));
         m.insert("agent_id".into(), Value::String(self.ctx.agent_id.clone()));
-        m.insert("agent_path".into(), Value::String(self.ctx.agent_path.clone()));
+        m.insert(
+            "agent_path".into(),
+            Value::String(self.ctx.agent_path.clone()),
+        );
         m.insert("comp".into(), Value::String(self.ctx.comp.as_str().into()));
         m.insert("pid".into(), Value::Number(self.ctx.pid.into()));
         if let Some(tid) = &self.ctx.trace_id {

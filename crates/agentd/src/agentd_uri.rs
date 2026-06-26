@@ -62,9 +62,18 @@ mod tests {
 
     #[test]
     fn parses_status_and_subagent() {
-        assert_eq!(AgentdResource::parse("agentd://status"), Some(AgentdResource::Status));
-        assert_eq!(AgentdResource::parse("agentd://status/"), Some(AgentdResource::Status));
-        assert_eq!(AgentdResource::parse("agentd://subagent/0.1"), Some(AgentdResource::Subagent("0.1".into())));
+        assert_eq!(
+            AgentdResource::parse("agentd://status"),
+            Some(AgentdResource::Status)
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://status/"),
+            Some(AgentdResource::Status)
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://subagent/0.1"),
+            Some(AgentdResource::Subagent("0.1".into()))
+        );
         assert_eq!(subagent_uri("0.2"), "agentd://subagent/0.2");
     }
 

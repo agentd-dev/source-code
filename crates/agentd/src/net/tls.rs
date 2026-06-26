@@ -23,7 +23,12 @@ pub type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 /// against the bundled roots for `host` (which must be the SNI / cert name).
 pub fn connect(tcp: TcpStream, host: &str) -> io::Result<TlsStream> {
     let server_name = ServerName::try_from(host)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid TLS server name: {host}")))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid TLS server name: {host}"),
+            )
+        })?
         .to_owned();
     let conn = ClientConnection::new(client_config(), server_name)
         .map_err(|e| io::Error::other(format!("tls: {e}")))?;
@@ -37,11 +42,13 @@ fn client_config() -> Arc<ClientConfig> {
         .get_or_init(|| {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("ring provides TLS 1.2 + 1.3")
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring provides TLS 1.2 + 1.3")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
             Arc::new(config)
         })
         .clone()

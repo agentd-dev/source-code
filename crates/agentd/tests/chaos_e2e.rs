@@ -32,19 +32,31 @@ fn running(pid: u32) -> bool {
         return false; // gone (reaped)
     };
     // "pid (comm) state ppid …" — comm may contain ')', so read after the last one.
-    let Some((_, after)) = stat.rsplit_once(')') else { return false };
+    let Some((_, after)) = stat.rsplit_once(')') else {
+        return false;
+    };
     after.split_whitespace().next().unwrap_or("Z") != "Z"
 }
 
 /// PIDs whose parent (PPID = `/proc/<pid>/stat` field after `comm`) is `parent`.
 fn children_of(parent: u32) -> Vec<u32> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else { return out };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for e in entries.flatten() {
-        let Some(name) = e.file_name().to_str().map(str::to_owned) else { continue };
-        let Ok(pid) = name.parse::<u32>() else { continue };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
-        let Some((_, after)) = stat.rsplit_once(')') else { continue };
+        let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((_, after)) = stat.rsplit_once(')') else {
+            continue;
+        };
         let f: Vec<&str> = after.split_whitespace().collect();
         // f = [state, ppid, …]
         if f.get(1).and_then(|p| p.parse::<u32>().ok()) == Some(parent) {
@@ -74,7 +86,10 @@ fn start_slow_llm(socket: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn slow mock-llm");
-    assert!(poll_until(Duration::from_secs(3), || socket.exists()), "mock-llm never bound");
+    assert!(
+        poll_until(Duration::from_secs(3), || socket.exists()),
+        "mock-llm never bound"
+    );
     c
 }
 
@@ -88,7 +103,16 @@ fn killing_the_supervisor_collapses_the_subagent_no_orphan() {
     // once-mode: the root subagent connects intelligence and then blocks ~5s
     // reading the slow model response — alive and supervised the whole time.
     let mut sup = Command::new(exe())
-        .args(["--mode", "once", "--instruction", "x", "--intelligence", &intel, "--log-level", "error"])
+        .args([
+            "--mode",
+            "once",
+            "--instruction",
+            "x",
+            "--intelligence",
+            &intel,
+            "--log-level",
+            "error",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -97,12 +121,14 @@ fn killing_the_supervisor_collapses_the_subagent_no_orphan() {
 
     // Wait for the root subagent (a child process of the supervisor) to come up.
     let mut sub_pid = 0u32;
-    let found = poll_until(Duration::from_secs(3), || match children_of(sup_pid).first() {
-        Some(&p) => {
-            sub_pid = p;
-            running(p)
+    let found = poll_until(Duration::from_secs(3), || {
+        match children_of(sup_pid).first() {
+            Some(&p) => {
+                sub_pid = p;
+                running(p)
+            }
+            None => false,
         }
-        None => false,
     });
     assert!(found, "no live subagent appeared under the supervisor");
 
@@ -118,7 +144,10 @@ fn killing_the_supervisor_collapses_the_subagent_no_orphan() {
     signal(llm.id(), libc::SIGKILL);
     let _ = llm.wait();
 
-    assert!(collapsed, "subagent {sub_pid} kept running after its supervisor died — PDEATHSIG leaked a process");
+    assert!(
+        collapsed,
+        "subagent {sub_pid} kept running after its supervisor died — PDEATHSIG leaked a process"
+    );
 }
 
 #[test]
@@ -134,7 +163,18 @@ fn a_wedged_subagent_is_detected_stuck_and_force_killed_within_budget() {
 
     let intel = format!("unix:{}", sock.display());
     let mut sup = Command::new(exe())
-        .args(["--mode", "once", "--instruction", "x", "--intelligence", &intel, "--drain-timeout", "1s", "--log-level", "info"])
+        .args([
+            "--mode",
+            "once",
+            "--instruction",
+            "x",
+            "--intelligence",
+            &intel,
+            "--drain-timeout",
+            "1s",
+            "--log-level",
+            "info",
+        ])
         .env("AGENTD_PROGRESS_TIMEOUT_MS", "400")
         .env("AGENTD_PONG_TIMEOUT_MS", "400")
         .stdout(Stdio::null())
@@ -151,19 +191,23 @@ fn a_wedged_subagent_is_detected_stuck_and_force_killed_within_budget() {
 
     // Find the live subagent, then freeze it (control thread included).
     let mut sub_pid = 0u32;
-    let found = poll_until(Duration::from_secs(3), || match children_of(sup_pid).first() {
-        Some(&p) => {
-            sub_pid = p;
-            running(p)
+    let found = poll_until(Duration::from_secs(3), || {
+        match children_of(sup_pid).first() {
+            Some(&p) => {
+                sub_pid = p;
+                running(p)
+            }
+            None => false,
         }
-        None => false,
     });
     assert!(found, "no live subagent appeared under the supervisor");
     signal(sub_pid, libc::SIGSTOP);
 
     // The supervisor must classify it Stuck (no pongs) and force the kill ladder
     // within the drain budget — i.e. agentd *exits* rather than hang forever.
-    let exited = poll_until(Duration::from_secs(8), || sup.try_wait().ok().flatten().is_some());
+    let exited = poll_until(Duration::from_secs(8), || {
+        sup.try_wait().ok().flatten().is_some()
+    });
     let status = sup.try_wait().ok().flatten();
     let sub_gone = !running(sub_pid);
 
@@ -172,9 +216,19 @@ fn a_wedged_subagent_is_detected_stuck_and_force_killed_within_budget() {
     let _ = llm.wait();
     let out = reader.join().unwrap_or_default();
 
-    assert!(exited, "supervisor hung on a wedged subagent instead of force-killing it:\n{out}");
-    assert!(out.contains(r#""event":"subagent.stuck""#), "the wedged subagent was not classified Stuck:\n{out}");
+    assert!(
+        exited,
+        "supervisor hung on a wedged subagent instead of force-killing it:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"subagent.stuck""#),
+        "the wedged subagent was not classified Stuck:\n{out}"
+    );
     assert!(sub_gone, "the wedged subagent was not killed");
     // KillReason::Stuck maps to exit 124 (the deadline/stuck class).
-    assert_eq!(status.and_then(|s| s.code()), Some(124), "a stuck-killed run should exit 124:\n{out}");
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(124),
+        "a stuck-killed run should exit 124:\n{out}"
+    );
 }

@@ -164,7 +164,10 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("instruction", &self.instruction.as_deref().map(|_| "<set>"))
             .field("intelligence", &self.intelligence)
-            .field("intelligence_token", &self.intelligence_token.as_ref().map(|_| "***"))
+            .field(
+                "intelligence_token",
+                &self.intelligence_token.as_ref().map(|_| "***"),
+            )
             .field("model", &self.model)
             .field("mcp_servers", &self.mcp_servers)
             .field("mode", &self.mode)
@@ -236,11 +239,14 @@ impl Config {
             c.mode = Mode::parse(v).ok_or_else(|| usage(format!("invalid AGENTD_MODE: {v}")))?;
         }
         if let Some(v) = envmap.get("AGENTD_MAX_STEPS") {
-            c.max_steps = v.parse().map_err(|_| usage(format!("invalid AGENTD_MAX_STEPS: {v}")))?;
+            c.max_steps = v
+                .parse()
+                .map_err(|_| usage(format!("invalid AGENTD_MAX_STEPS: {v}")))?;
         }
         if let Some(v) = envmap.get("AGENTD_MAX_TOKENS") {
-            c.max_tokens =
-                v.parse().map_err(|_| usage(format!("invalid AGENTD_MAX_TOKENS: {v}")))?;
+            c.max_tokens = v
+                .parse()
+                .map_err(|_| usage(format!("invalid AGENTD_MAX_TOKENS: {v}")))?;
         }
         if let Some(v) = envmap.get("AGENTD_DEADLINE") {
             c.deadline = Some(parse_duration(v).map_err(usage)?);
@@ -249,7 +255,8 @@ impl Config {
             c.run_id = (*v).to_string();
         }
         if let Some(v) = envmap.get("AGENTD_LOG_LEVEL") {
-            c.log_level = Level::parse(v).ok_or_else(|| usage(format!("invalid AGENTD_LOG_LEVEL: {v}")))?;
+            c.log_level =
+                Level::parse(v).ok_or_else(|| usage(format!("invalid AGENTD_LOG_LEVEL: {v}")))?;
         }
         if let Some(v) = envmap.get("AGENTD_DRAIN_TIMEOUT") {
             c.drain_timeout = parse_duration(v).map_err(usage)?;
@@ -292,7 +299,9 @@ impl Config {
         let mut it = args.iter().peekable();
         while let Some(arg) = it.next() {
             let mut take = |name: &str| -> Result<String, ConfigError> {
-                it.next().cloned().ok_or_else(|| usage(format!("{name} requires a value")))
+                it.next()
+                    .cloned()
+                    .ok_or_else(|| usage(format!("{name} requires a value")))
             };
             match arg.as_str() {
                 "-h" | "--help" => return Err(ConfigError::Help(help_text())),
@@ -305,7 +314,9 @@ impl Config {
                     c.instruction = Some(read_file(&p)?);
                 }
                 "--intelligence" => c.intelligence = Some(take("--intelligence")?),
-                "--intelligence-token" => c.intelligence_token = Some(take("--intelligence-token")?),
+                "--intelligence-token" => {
+                    c.intelligence_token = Some(take("--intelligence-token")?)
+                }
                 "--model" => c.model = Some(take("--model")?),
                 "--mcp" => {
                     let spec = take("--mcp")?;
@@ -313,31 +324,45 @@ impl Config {
                 }
                 "--mode" => {
                     let v = take("--mode")?;
-                    c.mode = Mode::parse(&v).ok_or_else(|| usage(format!("invalid --mode: {v}")))?;
+                    c.mode =
+                        Mode::parse(&v).ok_or_else(|| usage(format!("invalid --mode: {v}")))?;
                 }
                 "--subscribe" => c.subscribe.push(take("--subscribe")?),
                 "--continue" => c.continue_subscribe.push(take("--continue")?),
-                "--interval" => c.interval = Some(parse_duration(&take("--interval")?).map_err(usage)?),
+                "--interval" => {
+                    c.interval = Some(parse_duration(&take("--interval")?).map_err(usage)?)
+                }
                 "--cron" => c.cron = Some(take("--cron")?),
                 "--max-steps" => {
                     let v = take("--max-steps")?;
-                    c.max_steps = v.parse().map_err(|_| usage(format!("invalid --max-steps: {v}")))?;
+                    c.max_steps = v
+                        .parse()
+                        .map_err(|_| usage(format!("invalid --max-steps: {v}")))?;
                 }
                 "--max-tokens" => {
                     let v = take("--max-tokens")?;
-                    c.max_tokens = v.parse().map_err(|_| usage(format!("invalid --max-tokens: {v}")))?;
+                    c.max_tokens = v
+                        .parse()
+                        .map_err(|_| usage(format!("invalid --max-tokens: {v}")))?;
                 }
-                "--deadline" => c.deadline = Some(parse_duration(&take("--deadline")?).map_err(usage)?),
+                "--deadline" => {
+                    c.deadline = Some(parse_duration(&take("--deadline")?).map_err(usage)?)
+                }
                 "--max-depth" => {
                     let v = take("--max-depth")?;
-                    c.max_depth = v.parse().map_err(|_| usage(format!("invalid --max-depth: {v}")))?;
+                    c.max_depth = v
+                        .parse()
+                        .map_err(|_| usage(format!("invalid --max-depth: {v}")))?;
                 }
                 "--run-id" => c.run_id = take("--run-id")?,
                 "--log-level" => {
                     let v = take("--log-level")?;
-                    c.log_level = Level::parse(&v).ok_or_else(|| usage(format!("invalid --log-level: {v}")))?;
+                    c.log_level = Level::parse(&v)
+                        .ok_or_else(|| usage(format!("invalid --log-level: {v}")))?;
                 }
-                "--drain-timeout" => c.drain_timeout = parse_duration(&take("--drain-timeout")?).map_err(usage)?,
+                "--drain-timeout" => {
+                    c.drain_timeout = parse_duration(&take("--drain-timeout")?).map_err(usage)?
+                }
                 "--enable-exec" => c.enable_exec = true,
                 "--log-content" => c.log_content = true,
                 "--allow-trifecta" => c.allow_trifecta = true,
@@ -357,7 +382,11 @@ impl Config {
         for (name, tags) in mcp_tags {
             match c.mcp_servers.iter_mut().find(|s| s.name == name) {
                 Some(s) => s.tags = tags,
-                None => return Err(usage(format!("--mcp-tags references unknown server '{name}'"))),
+                None => {
+                    return Err(usage(format!(
+                        "--mcp-tags references unknown server '{name}'"
+                    )));
+                }
             }
         }
 
@@ -391,29 +420,51 @@ impl Config {
 
     /// Reject inconsistent config before any side effect (RFC 0011 §2).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.instruction.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            return Err(usage("missing instruction (INSTRUCTION env or --instruction)".into()));
+        if self
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(usage(
+                "missing instruction (INSTRUCTION env or --instruction)".into(),
+            ));
         }
         if self.intelligence.as_deref().unwrap_or("").is_empty() {
-            return Err(usage("missing intelligence endpoint (AGENTD_INTELLIGENCE or --intelligence)".into()));
+            return Err(usage(
+                "missing intelligence endpoint (AGENTD_INTELLIGENCE or --intelligence)".into(),
+            ));
         }
         validate_intelligence_uri(self.intelligence.as_deref().unwrap())?;
         for s in &self.mcp_servers {
             if s.name.is_empty() || s.command.is_empty() {
-                return Err(usage(format!("mcp server '{}' has empty name or command", s.name)));
+                return Err(usage(format!(
+                    "mcp server '{}' has empty name or command",
+                    s.name
+                )));
             }
         }
         if self.max_steps == 0 {
             return Err(usage("--max-steps must be > 0".into()));
         }
-        if self.mode == Mode::Reactive && self.subscribe.is_empty() && self.continue_subscribe.is_empty() {
-            return Err(usage("--mode reactive requires at least one --subscribe or --continue <uri>".into()));
+        if self.mode == Mode::Reactive
+            && self.subscribe.is_empty()
+            && self.continue_subscribe.is_empty()
+        {
+            return Err(usage(
+                "--mode reactive requires at least one --subscribe or --continue <uri>".into(),
+            ));
         }
         if !self.continue_subscribe.is_empty() && self.mode != Mode::Reactive {
-            return Err(usage("--continue is only valid with --mode reactive".into()));
+            return Err(usage(
+                "--continue is only valid with --mode reactive".into(),
+            ));
         }
         if self.mode == Mode::Schedule && self.interval.is_none() && self.cron.is_none() {
-            return Err(usage("--mode schedule requires --interval <dur> or --cron <expr>".into()));
+            return Err(usage(
+                "--mode schedule requires --interval <dur> or --cron <expr>".into(),
+            ));
         }
         if self.cron.is_some() && self.mode != Mode::Schedule {
             return Err(usage("--cron is only valid with --mode schedule".into()));
@@ -421,14 +472,21 @@ impl Config {
         // The per-run limits do nothing without a cgroup to apply them to, so a
         // limit set alone is a misconfiguration (the operator believes the run is
         // bounded when it isn't) — surface it, like --cron/--continue.
-        if (self.cgroup_memory_max.is_some() || self.cgroup_pids_max.is_some()) && self.cgroup.is_none() {
-            return Err(usage("--cgroup-memory-max/--cgroup-pids-max require --cgroup".into()));
+        if (self.cgroup_memory_max.is_some() || self.cgroup_pids_max.is_some())
+            && self.cgroup.is_none()
+        {
+            return Err(usage(
+                "--cgroup-memory-max/--cgroup-pids-max require --cgroup".into(),
+            ));
         }
         // A zero limit can never let the agent run: pids.max=0 refuses placement
         // (the run loses both limits and the cgroup.kill backstop) and memory.max=0
         // OOM-kills instantly. Reject it outright (use a real value or `max`).
         if self.cgroup_pids_max.as_deref().map(str::trim) == Some("0") {
-            return Err(usage("--cgroup-pids-max must be > 0 (it counts threads, not just processes) or 'max'".into()));
+            return Err(usage(
+                "--cgroup-pids-max must be > 0 (it counts threads, not just processes) or 'max'"
+                    .into(),
+            ));
         }
         if self.cgroup_memory_max.as_deref().map(str::trim) == Some("0") {
             return Err(usage("--cgroup-memory-max must be > 0 or 'max'".into()));
@@ -462,7 +520,11 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     if name.is_empty() || command.is_empty() {
         return Err(usage(format!("--mcp '{spec}' has empty name or command")));
     }
-    Ok(McpServerSpec { name: name.to_string(), command, tags: Vec::new() })
+    Ok(McpServerSpec {
+        name: name.to_string(),
+        command,
+        tags: Vec::new(),
+    })
 }
 
 /// Parse `--mcp-tags name=tag,tag` into (server-name, tags). Tags are the
@@ -472,12 +534,16 @@ fn parse_mcp_tags(spec: &str) -> Result<(String, Vec<TrifectaTag>), ConfigError>
         .split_once('=')
         .ok_or_else(|| usage(format!("--mcp-tags must be name=tag,tag (got: {spec})")))?;
     if name.is_empty() {
-        return Err(usage(format!("--mcp-tags '{spec}' has an empty server name")));
+        return Err(usage(format!(
+            "--mcp-tags '{spec}' has an empty server name"
+        )));
     }
     let mut tags = Vec::new();
     for t in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
         let tag = TrifectaTag::parse(t).ok_or_else(|| {
-            usage(format!("unknown trifecta tag '{t}' (want: untrusted_input|sensitive|egress)"))
+            usage(format!(
+                "unknown trifecta tag '{t}' (want: untrusted_input|sensitive|egress)"
+            ))
         })?;
         tags.push(tag);
     }
@@ -522,7 +588,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 /// override with `--run-id`/`AGENTD_RUN_ID` for idempotent retries (RFC 0011
 /// §idempotency). A proper ULID can replace this without changing the surface.
 fn generate_run_id() -> String {
-    let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     let pid = std::process::id();
     format!("{millis:011x}{pid:04x}")
 }
@@ -599,7 +668,10 @@ mod tests {
     }
 
     fn base_env() -> Vec<(String, String)> {
-        vec![("INSTRUCTION".into(), "x".into()), ("AGENTD_INTELLIGENCE".into(), "unix:/x".into())]
+        vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ]
     }
 
     #[test]
@@ -610,39 +682,62 @@ mod tests {
             &base_env(),
         )
         .unwrap();
-        assert_eq!(c.mcp_servers[0].tags, vec![TrifectaTag::Sensitive, TrifectaTag::Egress]);
+        assert_eq!(
+            c.mcp_servers[0].tags,
+            vec![TrifectaTag::Sensitive, TrifectaTag::Egress]
+        );
     }
 
     #[test]
     fn mcp_tags_unknown_server_or_tag_is_usage_error() {
-        let bad_server =
-            Config::load(&args(&["--mcp", "fs=cmd", "--mcp-tags", "ghost=egress"]), &base_env()).unwrap_err();
+        let bad_server = Config::load(
+            &args(&["--mcp", "fs=cmd", "--mcp-tags", "ghost=egress"]),
+            &base_env(),
+        )
+        .unwrap_err();
         assert!(matches!(bad_server, ConfigError::Usage(_)));
-        let bad_tag =
-            Config::load(&args(&["--mcp", "fs=cmd", "--mcp-tags", "fs=bogus"]), &base_env()).unwrap_err();
+        let bad_tag = Config::load(
+            &args(&["--mcp", "fs=cmd", "--mcp-tags", "fs=bogus"]),
+            &base_env(),
+        )
+        .unwrap_err();
         assert!(matches!(bad_tag, ConfigError::Usage(_)));
     }
 
     #[test]
     fn cgroup_limits_require_cgroup_and_reject_zero() {
         // A limit without --cgroup is a misconfiguration (silently unbounded run).
-        let e =
-            Config::load(&args(&["--cgroup-memory-max", "512M"]), &base_env()).unwrap_err();
+        let e = Config::load(&args(&["--cgroup-memory-max", "512M"]), &base_env()).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
         let e2 = Config::load(&args(&["--cgroup-pids-max", "64"]), &base_env()).unwrap_err();
         assert!(matches!(e2, ConfigError::Usage(_)));
         // With --cgroup, the limits validate.
         let c = Config::load(
-            &args(&["--cgroup", "auto", "--cgroup-memory-max", "512M", "--cgroup-pids-max", "64"]),
+            &args(&[
+                "--cgroup",
+                "auto",
+                "--cgroup-memory-max",
+                "512M",
+                "--cgroup-pids-max",
+                "64",
+            ]),
             &base_env(),
         )
         .unwrap();
         assert_eq!(c.cgroup_memory_max.as_deref(), Some("512M"));
         assert_eq!(c.cgroup_pids_max.as_deref(), Some("64"));
         // A zero limit can never let the agent run → rejected.
-        let z = Config::load(&args(&["--cgroup", "auto", "--cgroup-pids-max", "0"]), &base_env()).unwrap_err();
+        let z = Config::load(
+            &args(&["--cgroup", "auto", "--cgroup-pids-max", "0"]),
+            &base_env(),
+        )
+        .unwrap_err();
         assert!(matches!(z, ConfigError::Usage(_)));
-        let zm = Config::load(&args(&["--cgroup", "auto", "--cgroup-memory-max", "0"]), &base_env()).unwrap_err();
+        let zm = Config::load(
+            &args(&["--cgroup", "auto", "--cgroup-memory-max", "0"]),
+            &base_env(),
+        )
+        .unwrap_err();
         assert!(matches!(zm, ConfigError::Usage(_)));
     }
 
@@ -650,13 +745,24 @@ mod tests {
     fn cron_requires_schedule_mode() {
         // --cron with the wrong mode → usage error
         let e = Config::load(
-            &args(&["--mode", "reactive", "--subscribe", "x://y", "--cron", "* * * * *"]),
+            &args(&[
+                "--mode",
+                "reactive",
+                "--subscribe",
+                "x://y",
+                "--cron",
+                "* * * * *",
+            ]),
             &base_env(),
         )
         .unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
         // --mode schedule --cron validates (the expr itself is parsed by the cron feature)
-        let c = Config::load(&args(&["--mode", "schedule", "--cron", "0 9 * * 1-5"]), &base_env()).unwrap();
+        let c = Config::load(
+            &args(&["--mode", "schedule", "--cron", "0 9 * * 1-5"]),
+            &base_env(),
+        )
+        .unwrap();
         assert_eq!(c.cron.as_deref(), Some("0 9 * * 1-5"));
         // schedule mode with neither interval nor cron → usage error
         let e2 = Config::load(&args(&["--mode", "schedule"]), &base_env()).unwrap_err();
@@ -694,7 +800,11 @@ mod tests {
         let e = Config::load(&args(&["--mode", "reactive"]), &env).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
         // with a subscription it validates
-        let c = Config::load(&args(&["--mode", "reactive", "--subscribe", "file://a"]), &env).unwrap();
+        let c = Config::load(
+            &args(&["--mode", "reactive", "--subscribe", "file://a"]),
+            &env,
+        )
+        .unwrap();
         assert_eq!(c.mode, Mode::Reactive);
     }
 
@@ -707,7 +817,10 @@ mod tests {
         let c = Config::load(&args(&["--mcp", "fs=mcp-server-fs --root /data"]), &env).unwrap();
         assert_eq!(c.mcp_servers.len(), 1);
         assert_eq!(c.mcp_servers[0].name, "fs");
-        assert_eq!(c.mcp_servers[0].command, vec!["mcp-server-fs", "--root", "/data"]);
+        assert_eq!(
+            c.mcp_servers[0].command,
+            vec!["mcp-server-fs", "--root", "/data"]
+        );
     }
 
     #[test]
@@ -731,7 +844,10 @@ mod tests {
     fn token_redacted_in_debug() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://api.example/v1".into()),
+            (
+                "AGENTD_INTELLIGENCE".into(),
+                "https://api.example/v1".into(),
+            ),
             ("AGENTD_INTELLIGENCE_TOKEN".into(), "super-secret".into()),
         ];
         let c = Config::load(&[], &env).unwrap();

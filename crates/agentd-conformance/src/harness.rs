@@ -2,13 +2,13 @@
 //! as a peer would — a served-MCP JSON-RPC client, a once-mode runner, the mock
 //! LLM / mock MCP helpers — with no link against the agentd library.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -52,8 +52,16 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
         let dir = target_dir();
         let agentd = dir.join("agentd");
         let confmcp = dir.join("confmcp");
-        assert!(agentd.exists(), "agentd binary not found at {}", agentd.display());
-        assert!(confmcp.exists(), "confmcp binary not found at {}", confmcp.display());
+        assert!(
+            agentd.exists(),
+            "agentd binary not found at {}",
+            agentd.display()
+        );
+        assert!(
+            confmcp.exists(),
+            "confmcp binary not found at {}",
+            confmcp.display()
+        );
         (agentd, confmcp)
     })
 }
@@ -93,7 +101,10 @@ impl Default for Harness {
 impl Harness {
     pub fn new() -> Harness {
         let (agentd, confmcp) = binaries();
-        Harness { agentd: agentd.clone(), confmcp: confmcp.clone() }
+        Harness {
+            agentd: agentd.clone(),
+            confmcp: confmcp.clone(),
+        }
     }
 
     pub fn agentd(&self) -> &Path {
@@ -111,7 +122,10 @@ impl Harness {
 
     /// Run agentd to completion with `args`; capture the exit code + streams.
     pub fn run(&self, args: &[&str]) -> RunResult {
-        let out = Command::new(&self.agentd).args(args).output().expect("spawn agentd");
+        let out = Command::new(&self.agentd)
+            .args(args)
+            .output()
+            .expect("spawn agentd");
         RunResult {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -130,7 +144,11 @@ impl Harness {
             .spawn()
             .expect("spawn mock-llm");
         wait_for(&sock, Duration::from_secs(5));
-        MockLlm { child, uri: format!("unix:{}", sock.display()), _tmp: tmp }
+        MockLlm {
+            child,
+            uri: format!("unix:{}", sock.display()),
+            _tmp: tmp,
+        }
     }
 
     /// The `--mcp` spec for the built-in mock MCP server serving `uri`.
@@ -175,7 +193,11 @@ impl Harness {
             .spawn()
             .expect("spawn served daemon");
         let client = Client::connect(&sock, Duration::from_secs(5));
-        Served { child, client, _tmp: tmp }
+        Served {
+            child,
+            client,
+            _tmp: tmp,
+        }
     }
 }
 
@@ -202,7 +224,9 @@ impl Daemon {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return status.code(),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
                 _ => {
                     let _ = child.kill();
                     return child.wait().ok().and_then(|s| s.code());
@@ -256,7 +280,10 @@ impl RunResult {
     /// Parse the stderr JSON-lines telemetry into events (best-effort: skips
     /// non-JSON lines).
     pub fn events(&self) -> Vec<Value> {
-        self.stderr.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect()
+        self.stderr
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
     }
 
     /// Whether any telemetry event has `event == name`.
@@ -311,13 +338,23 @@ impl Client {
             if let Ok(s) = UnixStream::connect(sock) {
                 break s;
             }
-            assert!(Instant::now() < deadline, "served socket never connectable: {}", sock.display());
+            assert!(
+                Instant::now() < deadline,
+                "served socket never connectable: {}",
+                sock.display()
+            );
             std::thread::sleep(Duration::from_millis(25));
         };
         // A read timeout so notification / no-response checks can't block forever.
-        stream.set_read_timeout(Some(Duration::from_secs(3))).expect("set read timeout");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
         let reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut c = Client { reader, writer: stream, id: 0 };
+        let mut c = Client {
+            reader,
+            writer: stream,
+            id: 0,
+        };
         // Every served session opens with the MCP handshake.
         let _ = c.call("initialize", json!({}));
         c
@@ -331,9 +368,11 @@ impl Client {
     /// Send a JSON-RPC request and return the parsed response object.
     pub fn call(&mut self, method: &str, params: Value) -> Value {
         self.id += 1;
-        let line = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params}).to_string();
+        let line = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params})
+            .to_string();
         self.send(&line);
-        self.read_value().unwrap_or_else(|| panic!("no response to {method}"))
+        self.read_value()
+            .unwrap_or_else(|| panic!("no response to {method}"))
     }
 
     /// Send a raw line verbatim (for malformed-input / framing checks) and return
@@ -362,7 +401,11 @@ impl Client {
 fn wait_for(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
-        assert!(Instant::now() < deadline, "{} never appeared", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }

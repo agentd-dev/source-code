@@ -61,7 +61,11 @@ pub struct SsrfError {
 
 impl std::fmt::Display for SsrfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "host `{}` rejected by SSRF guard: {}", self.host, self.reason)
+        write!(
+            f,
+            "host `{}` rejected by SSRF guard: {}",
+            self.host, self.reason
+        )
     }
 }
 

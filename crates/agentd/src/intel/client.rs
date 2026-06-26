@@ -115,7 +115,10 @@ impl IntelClient {
     /// (testable without a connection).
     fn apply_trace_header(&self, headers: &mut Vec<(String, String)>) {
         if let Some(tid) = &self.trace_id {
-            headers.push(("traceparent".into(), crate::obs::trace::outbound_traceparent(tid)));
+            headers.push((
+                "traceparent".into(),
+                crate::obs::trace::outbound_traceparent(tid),
+            ));
         }
     }
 
@@ -126,8 +129,10 @@ impl IntelClient {
             Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
         };
         self.apply_trace_header(&mut headers);
-        let header_refs: Vec<(&str, &str)> =
-            headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let mut stream = self.transport.connect(self.timeout)?;
         let resp = http::send(
@@ -155,31 +160,59 @@ impl IntelClient {
 /// Parse the intelligence URI into (transport, http-path, host-header).
 fn resolve(uri: &str, provider: Provider) -> Result<(Transport, String, String), IntelError> {
     if let Some(path) = uri.strip_prefix("unix:") {
-        return Ok((Transport::Unix(path.to_string()), provider.default_path().into(), "localhost".into()));
+        return Ok((
+            Transport::Unix(path.to_string()),
+            provider.default_path().into(),
+            "localhost".into(),
+        ));
     }
     if let Some(rest) = uri.strip_prefix("vsock:") {
         let (cid, port) = rest
             .split_once(':')
             .and_then(|(c, p)| Some((c.parse().ok()?, p.parse().ok()?)))
-            .ok_or_else(|| IntelError::Unsupported(format!("bad vsock URI (want vsock:cid:port): {uri}")))?;
-        return Ok((Transport::Vsock { cid, port }, provider.default_path().into(), "localhost".into()));
+            .ok_or_else(|| {
+                IntelError::Unsupported(format!("bad vsock URI (want vsock:cid:port): {uri}"))
+            })?;
+        return Ok((
+            Transport::Vsock { cid, port },
+            provider.default_path().into(),
+            "localhost".into(),
+        ));
     }
     // http(s)
     let url = Url::parse(uri).map_err(IntelError::Unsupported)?;
-    let http_path = if url.path == "/" { provider.default_path().to_string() } else { url.path.clone() };
+    let http_path = if url.path == "/" {
+        provider.default_path().to_string()
+    } else {
+        url.path.clone()
+    };
     let host_header = url.host_header();
     let tls = url.is_tls();
-    Ok((Transport::Tcp { host: url.host, port: url.port, tls }, http_path, host_header))
+    Ok((
+        Transport::Tcp {
+            host: url.host,
+            port: url.port,
+            tls,
+        },
+        http_path,
+        host_header,
+    ))
 }
 
 impl Transport {
     fn connect(&self, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
         match self {
             Transport::Unix(path) => Ok(Box::new(crate::net::unixsock::connect(path, timeout)?)),
-            Transport::Tcp { host, port, tls: false } => {
-                Ok(Box::new(http::connect_tcp(host, *port, timeout)?))
-            }
-            Transport::Tcp { host, port, tls: true } => connect_tls(host, *port, timeout),
+            Transport::Tcp {
+                host,
+                port,
+                tls: false,
+            } => Ok(Box::new(http::connect_tcp(host, *port, timeout)?)),
+            Transport::Tcp {
+                host,
+                port,
+                tls: true,
+            } => connect_tls(host, *port, timeout),
             Transport::Vsock { cid, port } => connect_vsock(*cid, *port, timeout),
         }
     }
@@ -188,7 +221,9 @@ impl Transport {
 #[cfg(feature = "tls")]
 fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
     let tcp = http::connect_tcp(host, port, timeout)?;
-    Ok(Box::new(crate::net::tls::connect(tcp, host).map_err(IntelError::Transport)?))
+    Ok(Box::new(
+        crate::net::tls::connect(tcp, host).map_err(IntelError::Transport)?,
+    ))
 }
 
 #[cfg(not(feature = "tls"))]
@@ -200,12 +235,16 @@ fn connect_tls(_host: &str, _port: u16, _timeout: Duration) -> Result<Box<dyn St
 
 #[cfg(feature = "vsock")]
 fn connect_vsock(cid: u32, port: u32, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
-    Ok(Box::new(crate::net::vsock::connect(cid, port, timeout).map_err(IntelError::Transport)?))
+    Ok(Box::new(
+        crate::net::vsock::connect(cid, port, timeout).map_err(IntelError::Transport)?,
+    ))
 }
 
 #[cfg(not(feature = "vsock"))]
 fn connect_vsock(_cid: u32, _port: u32, _timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
-    Err(IntelError::Unsupported("vsock:// intelligence requires building with --features vsock".into()))
+    Err(IntelError::Unsupported(
+        "vsock:// intelligence requires building with --features vsock".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -222,9 +261,19 @@ mod tests {
 
     #[test]
     fn resolve_https_full_url() {
-        let (t, path, host) =
-            resolve("https://api.openai.com/v1/chat/completions", Provider::OpenAiCompatible).unwrap();
-        assert!(matches!(t, Transport::Tcp { tls: true, port: 443, .. }));
+        let (t, path, host) = resolve(
+            "https://api.openai.com/v1/chat/completions",
+            Provider::OpenAiCompatible,
+        )
+        .unwrap();
+        assert!(matches!(
+            t,
+            Transport::Tcp {
+                tls: true,
+                port: 443,
+                ..
+            }
+        ));
         assert_eq!(path, "/v1/chat/completions");
         assert_eq!(host, "api.openai.com");
     }
@@ -258,7 +307,13 @@ mod tests {
         assert_eq!(headers.len(), 2);
         let (k, v) = &headers[1];
         assert_eq!(k, "traceparent");
-        assert!(v.contains(tid), "traceparent carries the run's trace id: {v}");
-        assert!(v.starts_with("00-") && v.ends_with("-01"), "well-formed traceparent: {v}");
+        assert!(
+            v.contains(tid),
+            "traceparent carries the run's trace id: {v}"
+        );
+        assert!(
+            v.starts_with("00-") && v.ends_with("-01"),
+            "well-formed traceparent: {v}"
+        );
     }
 }

@@ -55,10 +55,23 @@ fn loop_mode_fires_runs_then_drains_to_exit_0_on_sigterm() {
     let out = reader.join().unwrap_or_default();
 
     // Graceful drain → exit 0 (not 143), and the daemon fired supervised runs.
-    assert_eq!(status.code(), Some(0), "expected graceful exit 0; stderr:\n{out}");
-    assert!(out.contains(r#""event":"schedule.fired""#), "no schedule.fired:\n{out}");
-    assert!(out.contains(r#""event":"subagent.spawn""#), "no run subagent.spawn:\n{out}");
-    assert!(out.contains(r#""reason":"drain""#), "no graceful drain logged:\n{out}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected graceful exit 0; stderr:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"schedule.fired""#),
+        "no schedule.fired:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"subagent.spawn""#),
+        "no run subagent.spawn:\n{out}"
+    );
+    assert!(
+        out.contains(r#""reason":"drain""#),
+        "no graceful drain logged:\n{out}"
+    );
 }
 
 #[test]
@@ -70,9 +83,18 @@ fn reactive_mode_drains_to_exit_0_on_sigterm() {
     let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
     let mut child = Command::new(exe)
         .args([
-            "--mode", "reactive", "--instruction", "react", "--intelligence",
-            "unix:/nonexistent.sock", "--subscribe", "file:///in.json", "--mcp", &mcp,
-            "--log-level", "info",
+            "--mode",
+            "reactive",
+            "--instruction",
+            "react",
+            "--intelligence",
+            "unix:/nonexistent.sock",
+            "--subscribe",
+            "file:///in.json",
+            "--mcp",
+            &mcp,
+            "--log-level",
+            "info",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -92,8 +114,15 @@ fn reactive_mode_drains_to_exit_0_on_sigterm() {
     let status = child.wait().expect("wait for agentd");
     let out = reader.join().unwrap_or_default();
 
-    assert_eq!(status.code(), Some(0), "expected graceful exit 0; stderr:\n{out}");
-    assert!(out.contains(r#""event":"proc.ready""#), "reactive never became ready:\n{out}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected graceful exit 0; stderr:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"proc.ready""#),
+        "reactive never became ready:\n{out}"
+    );
     assert!(
         out.contains(r#""reason":"drain""#) && out.contains(r#""mode":"reactive""#),
         "no reactive graceful drain logged:\n{out}"
@@ -138,7 +167,16 @@ fn daemon_writes_a_live_health_file() {
     // A live supervisor: alive=true, the right mode, and a fresh tick age
     // (string-asserted to avoid a serde_json dev-dep).
     // alive=true already means the tick was fresh (age < stale window) at write.
-    assert!(body.contains(r#""alive":true"#), "health file not alive:\n{body}");
-    assert!(body.contains(r#""mode":"loop""#), "wrong mode in health file:\n{body}");
-    assert!(body.contains(r#""supervisor_tick_age_ms""#), "no tick age:\n{body}");
+    assert!(
+        body.contains(r#""alive":true"#),
+        "health file not alive:\n{body}"
+    );
+    assert!(
+        body.contains(r#""mode":"loop""#),
+        "wrong mode in health file:\n{body}"
+    );
+    assert!(
+        body.contains(r#""supervisor_tick_age_ms""#),
+        "no tick age:\n{body}"
+    );
 }

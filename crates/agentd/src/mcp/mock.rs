@@ -8,8 +8,8 @@
 //! has something to react to. Small enough to ship; invaluable for validating
 //! reactivity by observation (RFC 0010, the M7 observe-suite).
 
-use crate::json::{self, frame, Incoming, Request, Response};
-use crate::wire::mcp::{method, PROTOCOL_VERSION};
+use crate::json::{self, Incoming, Request, Response, frame};
+use crate::wire::mcp::{PROTOCOL_VERSION, method};
 use serde_json::json;
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
@@ -47,9 +47,10 @@ fn handle(out: &Out, req: Request, uri: &str, emit: bool) {
         ),
         "ping" => reply(out, Response::ok(req.id, json!({}))),
         "tools/list" => reply(out, Response::ok(req.id, json!({"tools": []}))),
-        "resources/list" => {
-            reply(out, Response::ok(req.id, json!({"resources": [{"uri": uri, "name": "mock"}]})))
-        }
+        "resources/list" => reply(
+            out,
+            Response::ok(req.id, json!({"resources": [{"uri": uri, "name": "mock"}]})),
+        ),
         "resources/read" => reply(
             out,
             Response::ok(
@@ -76,7 +77,14 @@ fn handle(out: &Out, req: Request, uri: &str, emit: bool) {
                 });
             }
         }
-        other => reply(out, Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported: {other}"))),
+        other => reply(
+            out,
+            Response::err(
+                req.id,
+                json::METHOD_NOT_FOUND,
+                format!("unsupported: {other}"),
+            ),
+        ),
     }
 }
 

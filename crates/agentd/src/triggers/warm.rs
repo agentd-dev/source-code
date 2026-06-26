@@ -21,7 +21,7 @@
 use crate::agentloop::stop::Outcome;
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
-use crate::supervisor::spawn::{spawn, Subagent};
+use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
 use serde_json::json;
 use std::collections::HashMap;
@@ -64,8 +64,13 @@ impl WarmRegistry {
         log: &Logger,
     ) -> io::Result<bool> {
         if let Some(w) = self.sessions.get_mut(session_id) {
-            w.sub.send(&ControlMsg::Inject { message: event.to_string() })?;
-            log.info("warm.inject", json!({"session": session_id, "bytes": event.len()}));
+            w.sub.send(&ControlMsg::Inject {
+                message: event.to_string(),
+            })?;
+            log.info(
+                "warm.inject",
+                json!({"session": session_id, "bytes": event.len()}),
+            );
             return Ok(false);
         }
         payload.warm = true;
@@ -73,8 +78,12 @@ impl WarmRegistry {
         self.next_node += 1;
         let (tx, rx) = mpsc::channel();
         let sub = spawn(exe, &payload, node, tx)?;
-        self.sessions.insert(session_id.to_string(), Warm { sub, rx });
-        log.info("warm.spawned", json!({"session": session_id, "node": node.0}));
+        self.sessions
+            .insert(session_id.to_string(), Warm { sub, rx });
+        log.info(
+            "warm.spawned",
+            json!({"session": session_id, "node": node.0}),
+        );
         Ok(true)
     }
 
@@ -89,7 +98,10 @@ impl WarmRegistry {
             loop {
                 match w.rx.try_recv() {
                     Ok((_, AgentMsg::Turn { outcome })) => {
-                        log.info("warm.turn", json!({"session": id, "status": outcome.status.as_str()}));
+                        log.info(
+                            "warm.turn",
+                            json!({"session": id, "status": outcome.status.as_str()}),
+                        );
                         turns.push((id.clone(), outcome));
                     }
                     Ok((_, AgentMsg::Result { .. })) | Ok((_, AgentMsg::Failed { .. })) => {
@@ -118,7 +130,9 @@ impl WarmRegistry {
     /// (collected by a subsequent [`WarmRegistry::drain`] or by [`Self::clear`]).
     pub fn cancel_all(&mut self, log: &Logger) {
         for (id, w) in self.sessions.iter_mut() {
-            let _ = w.sub.send(&ControlMsg::Cancel { reason: "drain".into() });
+            let _ = w.sub.send(&ControlMsg::Cancel {
+                reason: "drain".into(),
+            });
             log.info("warm.cancel", json!({"session": id}));
         }
     }

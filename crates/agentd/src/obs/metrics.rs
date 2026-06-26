@@ -57,7 +57,9 @@ pub fn record_tokens(input: u64, output: u64) {
 /// The restart governor's circuit breaker tripped.
 pub fn record_restart_tripped() {
     #[cfg(feature = "metrics")]
-    imp::REGISTRY.restarts_tripped.fetch_add(1, Ordering::Relaxed);
+    imp::REGISTRY
+        .restarts_tripped
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
@@ -121,14 +123,54 @@ mod imp {
         pub(super) fn render(&self) -> String {
             let mut s = String::new();
             let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
-            counter(&mut s, "agentd_runs_started_total", "Supervised runs started", g(&self.runs_started));
-            counter(&mut s, "agentd_runs_completed_total", "Supervised runs that completed", g(&self.runs_completed));
-            counter(&mut s, "agentd_runs_failed_total", "Supervised runs that failed on infra", g(&self.runs_failed));
-            counter(&mut s, "agentd_runs_killed_total", "Supervised runs torn down by the supervisor", g(&self.runs_killed));
-            counter(&mut s, "agentd_reactions_total", "Reactive triggers fired", g(&self.reactions));
-            counter(&mut s, "agentd_tokens_input_total", "Input tokens reported by direct children", g(&self.tokens_input));
-            counter(&mut s, "agentd_tokens_output_total", "Output tokens reported by direct children", g(&self.tokens_output));
-            counter(&mut s, "agentd_restarts_tripped_total", "Restart-governor breaker trips", g(&self.restarts_tripped));
+            counter(
+                &mut s,
+                "agentd_runs_started_total",
+                "Supervised runs started",
+                g(&self.runs_started),
+            );
+            counter(
+                &mut s,
+                "agentd_runs_completed_total",
+                "Supervised runs that completed",
+                g(&self.runs_completed),
+            );
+            counter(
+                &mut s,
+                "agentd_runs_failed_total",
+                "Supervised runs that failed on infra",
+                g(&self.runs_failed),
+            );
+            counter(
+                &mut s,
+                "agentd_runs_killed_total",
+                "Supervised runs torn down by the supervisor",
+                g(&self.runs_killed),
+            );
+            counter(
+                &mut s,
+                "agentd_reactions_total",
+                "Reactive triggers fired",
+                g(&self.reactions),
+            );
+            counter(
+                &mut s,
+                "agentd_tokens_input_total",
+                "Input tokens reported by direct children",
+                g(&self.tokens_input),
+            );
+            counter(
+                &mut s,
+                "agentd_tokens_output_total",
+                "Output tokens reported by direct children",
+                g(&self.tokens_output),
+            );
+            counter(
+                &mut s,
+                "agentd_restarts_tripped_total",
+                "Restart-governor breaker trips",
+                g(&self.restarts_tripped),
+            );
             s
         }
     }
@@ -152,10 +194,20 @@ mod imp {
     pub(super) fn memory_gauges(mem: crate::supervisor::cgroup::MemorySnapshot) -> String {
         let mut s = String::new();
         if let Some(v) = mem.max {
-            gauge(&mut s, "agentd_memory_max_bytes", "cgroup v2 memory.max hard limit (bytes)", v);
+            gauge(
+                &mut s,
+                "agentd_memory_max_bytes",
+                "cgroup v2 memory.max hard limit (bytes)",
+                v,
+            );
         }
         if let Some(v) = mem.current {
-            gauge(&mut s, "agentd_memory_current_bytes", "cgroup v2 memory.current usage (bytes)", v);
+            gauge(
+                &mut s,
+                "agentd_memory_current_bytes",
+                "cgroup v2 memory.current usage (bytes)",
+                v,
+            );
         }
         s
     }
@@ -187,7 +239,11 @@ mod imp {
         fn memory_gauges_emit_only_present_fields() {
             use crate::supervisor::cgroup::MemorySnapshot;
             // a limited cgroup → two gauge families
-            let g = memory_gauges(MemorySnapshot { max: Some(1024), current: Some(512), high: None });
+            let g = memory_gauges(MemorySnapshot {
+                max: Some(1024),
+                current: Some(512),
+                high: None,
+            });
             assert!(g.contains("# TYPE agentd_memory_max_bytes gauge"));
             assert!(g.contains("agentd_memory_max_bytes 1024"));
             assert!(g.contains("agentd_memory_current_bytes 512"));

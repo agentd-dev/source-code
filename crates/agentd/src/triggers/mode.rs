@@ -402,8 +402,12 @@ fn apply_effects(
                 let armed = servers.iter().enumerate().any(|(i, s)| {
                     if s.capabilities().supports_subscribe() && s.subscribe(&req.uri).is_ok() {
                         owner.insert(req.uri.clone(), i);
-                        router.add_route(Route::new(&req.uri, Disposition::Spawn, DEBOUNCE));
-                        log.info("trigger.armed", json!({"kind": "self_subscribe", "uri": req.uri, "server": s.name()}));
+                        // Self-subscribe = self-scheduling into a WARM session
+                        // (RFC 0008 §self-subscribe): the agent re-enters one live
+                        // continue-session per event (session keyed by the URI),
+                        // rather than a fresh spawn each time.
+                        router.add_route(Route::new(&req.uri, Disposition::Continue(req.uri.clone()), DEBOUNCE));
+                        log.info("trigger.armed", json!({"kind": "self_subscribe", "uri": req.uri, "server": s.name(), "disposition": "continue"}));
                         true
                     } else {
                         false

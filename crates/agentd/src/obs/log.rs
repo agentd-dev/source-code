@@ -86,6 +86,7 @@ pub struct LogCtx {
 pub struct Logger {
     ctx: LogCtx,
     min: Level,
+    log_content: bool,
 }
 
 // One lock so concurrent threads in a process don't interleave partial lines.
@@ -93,7 +94,19 @@ static STDERR_LOCK: Mutex<()> = Mutex::new(());
 
 impl Logger {
     pub fn new(ctx: LogCtx, min: Level) -> Self {
-        Logger { ctx, min }
+        Logger { ctx, min, log_content: false }
+    }
+
+    /// Opt into content capture (RFC 0010 §2.9): callers that log tool
+    /// args/results consult [`Logger::content_capture`]. Off by default.
+    pub fn with_content(mut self, on: bool) -> Self {
+        self.log_content = on;
+        self
+    }
+
+    /// Whether this logger may record tool args/results (not just lengths).
+    pub fn content_capture(&self) -> bool {
+        self.log_content
     }
 
     pub fn ctx(&self) -> &LogCtx {

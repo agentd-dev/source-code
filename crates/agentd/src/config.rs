@@ -82,6 +82,10 @@ pub struct Config {
     /// Inbound W3C `traceparent` to continue (else a trace is minted from the
     /// run id). RFC 0010 §context-propagation.
     pub traceparent: Option<String>,
+    /// Opt-in content capture (RFC 0010 §2.9). Off by default: telemetry logs
+    /// hashes/lengths only; `--log-content` adds the actual tool args/results
+    /// (truncated). Propagates to children via the telemetry block.
+    pub log_content: bool,
 }
 
 impl Default for Config {
@@ -106,6 +110,7 @@ impl Default for Config {
             serve_mcp: None,
             health_file: None,
             traceparent: None,
+            log_content: false,
         }
     }
 }
@@ -133,6 +138,7 @@ impl fmt::Debug for Config {
             .field("serve_mcp", &self.serve_mcp)
             .field("health_file", &self.health_file)
             .field("traceparent", &self.traceparent)
+            .field("log_content", &self.log_content)
             .finish()
     }
 }
@@ -201,6 +207,9 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_ENABLE_EXEC") {
             c.enable_exec = truthy(v);
         }
+        if let Some(v) = envmap.get("AGENTD_LOG_CONTENT") {
+            c.log_content = truthy(v);
+        }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
@@ -257,6 +266,7 @@ impl Config {
                 }
                 "--drain-timeout" => c.drain_timeout = parse_duration(&take("--drain-timeout")?).map_err(usage)?,
                 "--enable-exec" => c.enable_exec = true,
+                "--log-content" => c.log_content = true,
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
@@ -403,6 +413,7 @@ fn help_text() -> String {
          RUNTIME:\n\
          \x20 --run-id <ID>               idempotency key (or AGENTD_RUN_ID)\n\
          \x20 --log-level <L>             trace|debug|info|warn|error (default info)\n\
+         \x20 --log-content               log tool args/results, not just lengths (opt-in)\n\
          \x20 --drain-timeout <dur>       graceful drain budget (default 25s; < pod grace)\n\
          \x20 --health-file <PATH>        liveness heartbeat file\n\
          \x20 -h, --help / -V, --version\n",

@@ -132,6 +132,10 @@ pub struct Telemetry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     pub log_level: String,
+    /// Content-capture policy (RFC 0010 §2.9): when true the child logs tool
+    /// args/results, not just lengths. Inherited from the parent's `--log-content`.
+    #[serde(default)]
+    pub log_content: bool,
 }
 
 #[cfg(test)]
@@ -160,6 +164,7 @@ mod tests {
                 agent_path: "0.1".into(),
                 trace_id: None,
                 log_level: "info".into(),
+                log_content: false,
             },
             depth: 1,
             enable_exec: false,

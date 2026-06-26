@@ -462,6 +462,7 @@ mod tests {
             },
             depth: 0,
             enable_exec: false,
+            warm: false,
         }
     }
 

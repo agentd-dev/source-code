@@ -54,6 +54,12 @@ pub enum AgentMsg {
     Event { event: String, fields: Value },
     /// Incremental token/step usage for hierarchical accounting (RFC 0003).
     Usage(Usage),
+    /// A **warm session** finished one turn (its reaction to one delivered
+    /// event) and stays alive for the next. Carries that turn's distilled
+    /// outcome; unlike [`AgentMsg::Result`] it is **not** terminal (RFC 0008
+    /// §spawn-vs-continue). The supervisor applies the turn's self-schedule /
+    /// self-subscribe effects and may then `Inject` the next event.
+    Turn { outcome: Outcome },
     /// Terminal: the distilled result + final status. Sent exactly once.
     Result { outcome: Outcome },
     /// Terminal: a fatal infrastructure failure (intel/mcp unreachable).
@@ -92,6 +98,13 @@ pub struct SpawnPayload {
     /// keeps older frames parseable.
     #[serde(default)]
     pub enable_exec: bool,
+    /// Run as a **warm continue-session**: after each turn, stay alive and wait
+    /// for the next injected event ([`ControlMsg::Inject`]) instead of exiting,
+    /// continuing the same transcript (RFC 0008 §spawn-vs-continue). Default
+    /// (false) = a one-shot per-event run. `#[serde(default)]` keeps older frames
+    /// parseable.
+    #[serde(default)]
+    pub warm: bool,
 }
 
 /// A single seed message — a minimal {role, content} pair. Roles mirror the
@@ -168,6 +181,7 @@ mod tests {
             },
             depth: 1,
             enable_exec: false,
+            warm: false,
         }
     }
 

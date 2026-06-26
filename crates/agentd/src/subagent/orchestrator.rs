@@ -180,6 +180,7 @@ impl Orchestrator {
             },
             depth: self.parent_depth + 1,
             enable_exec: self.enable_exec,
+            warm: false, // a delegated subagent is a one-shot distilled subtask
         };
         self.child_count += 1;
         self.log.info(
@@ -388,6 +389,7 @@ mod tests {
             },
             depth,
             enable_exec: false,
+            warm: false,
         }
     }
 

@@ -298,6 +298,7 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         },
         depth: 0,
         enable_exec: cfg.enable_exec,
+        warm: false, // root runs are one-shot; warm continue-sessions are daemon-minted
     }
 }
 

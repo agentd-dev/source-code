@@ -569,7 +569,7 @@ fn help_text() -> String {
          \x20 --log-content               log tool args/results, not just lengths (opt-in)\n\
          \x20 --drain-timeout <dur>       graceful drain budget (default 25s; < pod grace)\n\
          \x20 --health-file <PATH>        liveness heartbeat file\n\
-         \x20 --metrics-addr <ADDR>       serve /metrics+/healthz+/readyz (needs --features metrics)\n\
+         \x20 --metrics-addr <host:port>  serve /metrics+/healthz+/readyz (`:port` = all IPv4 ifaces; needs --features metrics)\n\
          \x20 --cgroup <auto|PATH>        per-run cgroup for atomic cgroup.kill teardown (best-effort)\n\
          \x20 --cgroup-memory-max <SIZE>  per-run memory.max (max|512M|2G|bytes; needs --cgroup + delegation)\n\
          \x20 --cgroup-pids-max <N>       per-run pids.max (max|count of THREADS; needs --cgroup + delegation)\n\

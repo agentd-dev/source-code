@@ -110,7 +110,7 @@ means the setting is **flag-only** in v1 (no environment equivalent is wired up)
 | `--log-content` | `AGENTD_LOG_CONTENT` | `false` | Log tool args/results, not just lengths (RFC 0010 §2.9). Off by default (content-capture-off); propagates to children. |
 | `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | `25s` | Graceful drain budget. Keep **< pod `terminationGracePeriodSeconds`** (RFC 0011 §3.3). |
 | `--health-file <PATH>` | — | *(none)* | Liveness heartbeat file (exec-probe target; RFC 0010). |
-| `--metrics-addr <ADDR>` | `AGENTD_METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr (needs `--features metrics`). |
+| `--metrics-addr <ADDR>` | `AGENTD_METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr — `host:port`, or `:port` for all IPv4 interfaces (read-only; restrict via firewall/NetworkPolicy if exposed). Needs `--features metrics`. |
 | `--traceparent <W3C>` | `AGENTD_TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id (RFC 0010). |
 | `-h`, `--help` | — | — | Print help and exit `0`. |
 | `-V`, `--version` | — | — | Print version and exit `0`. |

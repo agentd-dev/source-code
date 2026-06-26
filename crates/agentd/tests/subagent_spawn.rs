@@ -6,10 +6,11 @@
 //! endpoint is unreachable — a terminal `Failed`. Exercises re-exec + payload
 //! delivery + `main` dispatch + `subagent::control` without a live LLM.
 
-use agentd::subagent::protocol::{AgentMsg, IntelConfig, Limits, SpawnPayload, Telemetry};
+use agentd::subagent::protocol::{AgentMsg, ControlMsg, IntelConfig, Limits, SpawnPayload, Telemetry};
 use agentd::supervisor::spawn::spawn;
 use agentd::supervisor::tree::{Caps, NodeId, Tree};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ fn bogus_payload() -> SpawnPayload {
         },
         depth: 0,
         enable_exec: false,
+        warm: false,
     }
 }
 
@@ -55,6 +57,94 @@ fn drain_to_terminal(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, deadline: Instant)
         }
     }
     seen
+}
+
+/// Start the built-in mock LLM (`final` script) on a unix socket; wait until it
+/// binds. The subagent's intel calls then succeed without a live model.
+fn start_mock_llm(exe: &str, socket: &Path) -> Child {
+    let child = Command::new(exe)
+        .args(["--internal-mock-llm", socket.to_str().unwrap(), "final"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mock-llm");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "mock-llm never bound");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+}
+
+/// Scan upward frames (ignoring Ready/Pong/Event/Usage) until one of `kind`
+/// (`turn`|`result`|`failed`) arrives, or the deadline. Returns the kind seen.
+fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok((_, msg)) => {
+                let m = match &msg {
+                    AgentMsg::Ready => "ready",
+                    AgentMsg::Pong { .. } => "pong",
+                    AgentMsg::Event { .. } => "event",
+                    AgentMsg::Usage(_) => "usage",
+                    AgentMsg::Turn { .. } => "turn",
+                    AgentMsg::Result { .. } => "result",
+                    AgentMsg::Failed { .. } => "failed",
+                };
+                if m == kind {
+                    return true;
+                }
+                if m == "failed" {
+                    return false; // an unexpected terminal failure
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    false
+}
+
+#[test]
+fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(exe, &sock);
+
+    let mut payload = bogus_payload();
+    payload.intelligence.uri = format!("unix:{}", sock.display());
+    payload.warm = true;
+
+    let mut tree = Tree::new(Caps::default());
+    let node = tree.mint_root().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut sub = spawn(Path::new(exe), &payload, node, tx).expect("spawn warm subagent");
+
+    // Turn 1 reacts to the payload's instruction, completes, and the session
+    // stays warm (no terminal yet).
+    assert!(
+        recv_kind(&rx, "turn", Instant::now() + Duration::from_secs(20)),
+        "expected a Turn after the first (payload) event"
+    );
+
+    // Deliver a second event → a second turn over the SAME live session.
+    sub.send(&ControlMsg::Inject { message: "now the second thing".into() }).expect("inject");
+    assert!(
+        recv_kind(&rx, "turn", Instant::now() + Duration::from_secs(20)),
+        "expected a second Turn after Inject (warm re-entry)"
+    );
+
+    // Cancel → the warm session winds down with a terminal Result.
+    sub.send(&ControlMsg::Cancel { reason: "test done".into() }).expect("cancel");
+    assert!(
+        recv_kind(&rx, "result", Instant::now() + Duration::from_secs(20)),
+        "expected a terminal Result after Cancel"
+    );
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+    // Dropping `sub` kills + reaps the (already-exiting) subagent group.
 }
 
 #[test]

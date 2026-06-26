@@ -14,16 +14,19 @@
 //! child's JSON telemetry (inherited to the parent). stdin carries
 //! [`ControlMsg`] down.
 
-use crate::agentloop::runner::{run_loop, LoopAbort, LoopInput};
+use crate::agentloop::runner::{run_loop, LoopAbort, LoopInput, Session};
+use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::intel::client::IntelClient;
 use crate::json::frame;
 use crate::mcp::client::McpClient;
 use crate::obs::log::{Comp, Level, LogCtx, Logger};
 use crate::subagent::orchestrator::Orchestrator;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
+use crate::supervisor::budget::Budget;
 use std::io::{self, BufReader, Stdin, Stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,12 +55,16 @@ pub fn run() -> i32 {
     let log = build_logger(&payload);
     let cancel = Arc::new(AtomicBool::new(false));
 
+    // For a warm continue-session, the control thread forwards each `Inject`
+    // event to the loop over this channel; a one-shot run never reads it.
+    let (inject_tx, inject_rx) = std::sync::mpsc::channel::<String>();
+
     // The control reader runs on its own thread and owns stdin from here on,
     // so Ping/Pong keeps flowing while the loop is busy.
-    spawn_control_thread(stdin, Arc::clone(&up), Arc::clone(&cancel), log.ctx().clone());
+    spawn_control_thread(stdin, Arc::clone(&up), Arc::clone(&cancel), inject_tx, log.ctx().clone());
 
     send_up(&up, &AgentMsg::Ready);
-    log.info("loop.start", serde_json::json!({"depth": payload.depth}));
+    log.info("loop.start", serde_json::json!({"depth": payload.depth, "warm": payload.warm}));
 
     let intel = match IntelClient::from_parts(&payload.intelligence.uri, payload.intelligence.token.clone()) {
         Ok(mut c) => {
@@ -106,6 +113,11 @@ pub fn run() -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentd"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(25), log.clone());
 
+    // A warm continue-session lives across many events; a one-shot runs once.
+    if payload.warm {
+        return run_warm(&intel, &servers, &input, &payload, &mut orch, &cancel, &inject_rx, &up, &log);
+    }
+
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
         Ok(outcome) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
@@ -114,6 +126,93 @@ pub fn run() -> i32 {
         }
         Err(LoopAbort::Intel(m)) => fail(&up, &log, format!("intel: {m}"), crate::exit::INTEL_UNAVAILABLE),
         Err(LoopAbort::Mcp(m)) => fail(&up, &log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN),
+    }
+}
+
+/// Drive a **warm continue-session** (RFC 0008 §spawn-vs-continue): prepare the
+/// session once, then run one turn per delivered event over the *same*
+/// transcript, emitting [`AgentMsg::Turn`] after each. The process and its
+/// conversation stay warm between events until the supervisor cancels it or
+/// closes the control channel, at which point a terminal [`AgentMsg::Result`]
+/// marks closure. Each turn gets a fresh per-event budget (steps/tokens/deadline)
+/// so one reaction can't starve the session.
+#[allow(clippy::too_many_arguments)]
+fn run_warm(
+    intel: &IntelClient,
+    servers: &[McpClient],
+    input: &LoopInput,
+    payload: &SpawnPayload,
+    orch: &mut Orchestrator,
+    cancel: &Arc<AtomicBool>,
+    inject_rx: &Receiver<String>,
+    up: &Up,
+    log: &Logger,
+) -> i32 {
+    let mut session = match Session::prepare(servers, input, orch) {
+        Ok(s) => s,
+        Err(LoopAbort::Intel(m)) => return fail(up, log, format!("intel: {m}"), crate::exit::INTEL_UNAVAILABLE),
+        Err(LoopAbort::Mcp(m)) => return fail(up, log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN),
+    };
+    let limits = &payload.limits;
+    loop {
+        // One turn over the persistent transcript, bounded by a fresh per-event
+        // budget (a new deadline each turn, so the session isn't globally capped).
+        let deadline = Instant::now() + Duration::from_millis(limits.deadline_ms.max(1));
+        let mut budget = Budget::new(limits.max_steps, limits.max_tokens, deadline);
+        let outcome = match session.run_turn(intel, orch, log, &mut budget, Some(cancel)) {
+            Ok(o) => o,
+            Err(LoopAbort::Intel(m)) => return fail(up, log, format!("intel: {m}"), crate::exit::INTEL_UNAVAILABLE),
+            Err(LoopAbort::Mcp(m)) => return fail(up, log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN),
+        };
+        // Cancellation during a turn ends the session (terminal Result below);
+        // any other terminal is just this reaction's turn — the session lives on.
+        if outcome.status == TerminalStatus::Cancelled {
+            break;
+        }
+        send_up(up, &AgentMsg::Turn { outcome });
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        // Block for the next event (single-consumer, in-order FIFO).
+        match wait_for_inject(inject_rx, cancel) {
+            Some(message) => {
+                log.info("subagent.inject", serde_json::json!({"bytes": message.len()}));
+                session.deliver(&message);
+            }
+            None => break, // cancelled, or the supervisor closed the control channel
+        }
+    }
+    // Session closed: a single terminal Result so the supervisor sees closure.
+    let status = if cancel.load(Ordering::Relaxed) { TerminalStatus::Cancelled } else { TerminalStatus::Completed };
+    let code = crate::exit::once_exit(status, false);
+    send_up(
+        up,
+        &AgentMsg::Result {
+            outcome: Outcome {
+                status,
+                partial: false,
+                result: serde_json::Value::Null,
+                scheduled: Vec::new(),
+                subscriptions: Vec::new(),
+            },
+        },
+    );
+    code
+}
+
+/// Block until the next event is injected, the supervisor closes the control
+/// channel (its `Inject` sender drops → `Disconnected`), or a cancel is
+/// requested — polled so cancellation between events stays prompt.
+fn wait_for_inject(rx: &Receiver<String>, cancel: &AtomicBool) -> Option<String> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(message) => return Some(message),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -157,10 +256,17 @@ fn send_up(up: &Up, msg: &AgentMsg) {
     }
 }
 
-/// The control reader thread. Owns stdin, answers `Ping` with `Pong`, flips
-/// the cancel flag on `Cancel`. Exits on EOF (the supervisor closed the
-/// channel) or a read error.
-fn spawn_control_thread(mut stdin: BufReader<Stdin>, up: Up, cancel: Arc<AtomicBool>, ctx: LogCtx) {
+/// The control reader thread. Owns stdin, answers `Ping` with `Pong`, flips the
+/// cancel flag on `Cancel`, and forwards each `Inject` event to a warm session's
+/// loop over `inject_tx`. Exits on EOF (the supervisor closed the channel) or a
+/// read error — which drops `inject_tx`, unblocking a warm session's wait.
+fn spawn_control_thread(
+    mut stdin: BufReader<Stdin>,
+    up: Up,
+    cancel: Arc<AtomicBool>,
+    inject_tx: Sender<String>,
+    ctx: LogCtx,
+) {
     let log = Logger::new(ctx, Level::Debug);
     std::thread::Builder::new()
         .name("subagent-control".into())
@@ -173,7 +279,11 @@ fn spawn_control_thread(mut stdin: BufReader<Stdin>, up: Up, cancel: Arc<AtomicB
                         log.info("subagent.cancel", serde_json::json!({"reason": reason}));
                         cancel.store(true, Ordering::Relaxed);
                     }
-                    Ok(ControlMsg::Inject { .. }) => { /* M3: deliver into the session */ }
+                    // Deliver into the warm session; a one-shot run never reads
+                    // the receiver, so the send is simply dropped there.
+                    Ok(ControlMsg::Inject { message }) => {
+                        let _ = inject_tx.send(message);
+                    }
                     Ok(ControlMsg::Spawn(_)) | Err(_) => { /* unexpected/garbage — ignore */ }
                 }
             }

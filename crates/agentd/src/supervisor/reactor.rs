@@ -194,6 +194,14 @@ impl Supervisor {
                     self.begin_drain(KillReason::TreeBudget);
                 }
             }
+            AgentMsg::Turn { outcome } => {
+                // A warm session's per-turn completion. The blocking reactor
+                // (supervise_once) is not the warm-session driver — the reactive
+                // daemon is — so here a turn is just progress: reset liveness and
+                // log it, never terminal. RFC 0008 §spawn-vs-continue.
+                self.on_event(node, now);
+                self.log.info("subagent.turn", json!({"node": node.0, "status": outcome.status.as_str()}));
+            }
             AgentMsg::Result { outcome } => {
                 self.tree.set_status(node, NodeStatus::Done);
                 self.log.info("subagent.result", json!({"node": node.0, "status": outcome.status.as_str()}));

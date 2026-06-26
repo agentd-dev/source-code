@@ -51,6 +51,7 @@ fn parent_payload() -> SpawnPayload {
         },
         depth: 0,
         enable_exec: false,
+        warm: false,
     }
 }
 

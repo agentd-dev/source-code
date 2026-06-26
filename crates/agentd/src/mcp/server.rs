@@ -11,14 +11,15 @@
 use crate::json::{self, frame, Id, Incoming, Request, Response};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::SpawnPayload;
-use crate::supervisor::reactor::{supervise_once, SuperviseResult};
+use crate::supervisor::reactor::{supervise_cancellable, supervise_once, SuperviseResult};
 use crate::wire::mcp::PROTOCOL_VERSION;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,52 @@ use std::time::{Duration, Instant};
 const MAX_INFLIGHT_SPAWNS: usize = 4;
 /// Cap on the result text returned to the peer (~chars).
 const RESULT_CAP: usize = 4096;
+/// Cap on tracked served async sessions (running + finished). When exceeded, the
+/// oldest *finished* session is evicted so a long-lived daemon can't grow without
+/// bound; live sessions are never evicted (they are bounded by the permit cap).
+const MAX_SESSIONS: usize = 64;
+
+/// The lifecycle of a served **async** run, tracked by handle so a peer can poll
+/// `subagent.status` / read `agentd://subagent/<handle>` / `subagent.cancel` it.
+enum ServedStatus {
+    Running,
+    Done { status: String, partial: bool, result: Value },
+    Failed(String),
+    Cancelled,
+}
+
+impl ServedStatus {
+    fn is_terminal(&self) -> bool {
+        !matches!(self, ServedStatus::Running)
+    }
+}
+
+/// One tracked served async run: its state, its per-run cancel flag, and when it
+/// started (for age reporting + oldest-first eviction).
+struct ServedSession {
+    status: ServedStatus,
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+}
+
+/// Handle → tracked session. Shared (Arc<Mutex>) across the accept/connection
+/// threads and each async run's background thread.
+type Registry = Arc<Mutex<HashMap<String, ServedSession>>>;
+
+/// The structured state body for one session (shared by the `subagent.status`
+/// tool and the `agentd://subagent/<handle>` resource).
+fn session_body(handle: &str, s: &ServedSession) -> Value {
+    match &s.status {
+        ServedStatus::Running => {
+            json!({"handle": handle, "status": "running", "done": false, "age_ms": s.started.elapsed().as_millis() as u64})
+        }
+        ServedStatus::Done { status, partial, result } => {
+            json!({"handle": handle, "status": status, "done": true, "partial": partial, "result": result})
+        }
+        ServedStatus::Failed(e) => json!({"handle": handle, "status": "failed", "done": true, "error": e}),
+        ServedStatus::Cancelled => json!({"handle": handle, "status": "cancelled", "done": true}),
+    }
+}
 
 /// Context for the served tools. `run_id`/`mode`/`started` back `status`; the
 /// rest back `subagent.spawn` (a peer delegating work). Shared across
@@ -40,6 +87,8 @@ pub struct ServeCtx {
     drain_timeout: Duration,
     inflight: Arc<AtomicUsize>,
     counter: Arc<AtomicU64>,
+    /// Tracked served async runs, by handle.
+    sessions: Registry,
 }
 
 impl ServeCtx {
@@ -53,6 +102,7 @@ impl ServeCtx {
             drain_timeout,
             inflight: Arc::new(AtomicUsize::new(0)),
             counter: Arc::new(AtomicU64::new(0)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -151,9 +201,10 @@ fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             }),
         ),
         "ping" => Response::ok(req.id, json!({})),
-        "tools/list" => {
-            Response::ok(req.id, json!({"tools": [status_tool_def(), spawn_tool_def()]}))
-        }
+        "tools/list" => Response::ok(
+            req.id,
+            json!({"tools": [status_tool_def(), spawn_tool_def(), session_status_tool_def(), session_cancel_tool_def()]}),
+        ),
         "tools/call" => tools_call(req, ctx, log),
         "resources/list" => Response::ok(req.id, json!({"resources": resource_list()})),
         "resources/read" => resources_read(req, ctx),
@@ -161,9 +212,13 @@ fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     }
 }
 
-/// The agentd:// resources this server exposes. v1: `agentd://status` (agentd's
-/// own state). Per-served-subagent resources need a tracked async-spawn registry
-/// (served spawns are sync today) — a follow-on.
+/// The agentd:// resources this server *lists*: just `agentd://status`. The
+/// per-run `agentd://subagent/<handle>` resources are **read**able (the peer
+/// learns a handle from its `subagent.spawn async` reply) but deliberately NOT
+/// listed — they appear and vanish (eviction) and this reply-only transport has
+/// no `resources/list_changed` to announce that, so a listed handle could 404 on
+/// read. Listing only the stable `agentd://status` avoids advertising vanishing
+/// resources.
 fn resource_list() -> Value {
     json!([{
         "uri": "agentd://status",
@@ -184,9 +239,20 @@ fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
                 "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.status_body().to_string()}]
             }),
         ),
-        // agentd://subagent/<handle> needs a tracked async-spawn registry (served
-        // spawns are sync) — not available yet.
-        _ => Response::err(req.id, json::INVALID_PARAMS, format!("unknown resource: {uri}")),
+        // agentd://subagent/<handle> — a served async run's status / result.
+        Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
+            let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match reg.get(&handle) {
+                Some(s) => Response::ok(
+                    req.id,
+                    json!({
+                        "contents": [{"uri": uri, "mimeType": "application/json", "text": session_body(&handle, s).to_string()}]
+                    }),
+                ),
+                None => Response::err(req.id, json::RESOURCE_NOT_FOUND, format!("resource not found: {uri}")),
+            }
+        }
+        None => Response::err(req.id, json::RESOURCE_NOT_FOUND, format!("resource not found: {uri}")),
     }
 }
 
@@ -206,20 +272,26 @@ fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             )
         }
         "subagent.spawn" => handle_spawn(req, ctx, log),
+        "subagent.status" | "subagent.cancel" => {
+            let args = req.params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+            handle_session_tool(req.id, ctx, name, &args)
+        }
         other => Response::err(req.id, json::INVALID_PARAMS, format!("unknown tool: {other}")),
     }
 }
 
-/// A peer delegates a task to agentd (RFC 0005 §3.2, sync). Build a fresh root
-/// run from the daemon's payload template + the request, supervise it, and
-/// return the distilled outcome. Bad params → a JSON-RPC error; a cap/scope
-/// refusal or a run failure → `isError:true` inside a successful result (so the
-/// caller's model adapts), never a crash.
+/// A peer delegates a task to agentd (RFC 0005 §3.2). Build a fresh root run from
+/// the daemon's payload template + the request and supervise it. **Sync** (default)
+/// blocks and returns the distilled outcome; **`async: true`** returns a handle
+/// immediately and runs in the background — the peer then polls `subagent.status`,
+/// reads `agentd://subagent/<handle>`, or `subagent.cancel`s it. Bad params → a
+/// JSON-RPC error; a cap/scope refusal or a run failure → `isError:true` inside a
+/// successful result (so the caller's model adapts), never a crash.
 ///
-/// **Trust boundary:** anyone able to connect to the `--serve-mcp` socket can
-/// run instructions with this agentd's intelligence + tool scope. The operator
-/// gates access via the socket's filesystem permissions; `async`/`detach` and
-/// the spawn-payload's `limits`/`context_seed` overrides land with M3.
+/// **Trust boundary:** anyone able to connect to the `--serve-mcp` socket can run
+/// instructions with this agentd's intelligence + tool scope. The operator gates
+/// access via the socket's filesystem permissions. (`subagent.send` — injecting
+/// into a live served session — needs served *warm* sessions, a follow-on.)
 fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let id = req.id.clone();
     let args = req.params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
@@ -228,8 +300,9 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         // Malformed call (missing required param) → JSON-RPC error (RFC §3.2).
         return Response::err(id, json::INVALID_PARAMS, "subagent.spawn requires a non-empty 'instruction'");
     }
-    // Concurrency cap → refused as a tool result, never a crash.
-    let _permit = match SpawnGuard::acquire(&ctx.inflight, MAX_INFLIGHT_SPAWNS) {
+    // Concurrency cap → refused as a tool result, never a crash. For async the
+    // permit is held by the background run thread (so it bounds live runs).
+    let permit = match SpawnGuard::acquire(&ctx.inflight, MAX_INFLIGHT_SPAWNS) {
         Some(g) => g,
         None => {
             return tool_error(id, format!("spawn refused: {MAX_INFLIGHT_SPAWNS} concurrent served spawns in flight"));
@@ -238,14 +311,29 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
     let handle = format!("served.{n}");
     let payload = build_served_payload(&ctx.base, &args, &handle);
-    log.info("mcp.spawn", json!({"handle": handle, "servers": payload.mcp_servers.len()}));
-    match supervise_once(ctx.exe.clone(), &payload, ctx.drain_timeout, log.clone()) {
+    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+    log.info("mcp.spawn", json!({"handle": handle, "servers": payload.mcp_servers.len(), "async": is_async}));
+
+    if is_async {
+        return spawn_async(id, ctx, log, handle, payload, permit);
+    }
+
+    // Sync: block this connection thread on the run.
+    let result = supervise_once(ctx.exe.clone(), &payload, ctx.drain_timeout, log.clone());
+    spawn_result_response(id, &handle, result)
+}
+
+/// Map a finished sync run to the tool result the peer gets inline.
+fn spawn_result_response(id: Id, handle: &str, result: std::io::Result<SuperviseResult>) -> Response {
+    match result {
         Ok(SuperviseResult::Completed(o)) => Response::ok(
             id,
             json!({
                 "content": [{"type": "text", "text": distill(&o.result)}],
+                // `done:true` keeps the structuredContent shape unified with the
+                // async ack ({handle,status,done,…}) so a peer parses one schema.
                 "structuredContent": {
-                    "handle": handle, "status": o.status.as_str(), "partial": o.partial, "result": o.result
+                    "handle": handle, "status": o.status.as_str(), "done": true, "partial": o.partial, "result": o.result
                 },
                 "isError": false
             }),
@@ -253,6 +341,117 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         Ok(SuperviseResult::Failed(e)) => tool_error(id, format!("subagent failed: {e}")),
         Ok(SuperviseResult::Killed(r)) => tool_error(id, format!("subagent terminated: {r:?}")),
         Err(e) => tool_error(id, format!("subagent could not start: {e}")),
+    }
+}
+
+/// Register an async run, launch it on a background thread (holding the permit +
+/// a per-run cancel flag), and return the handle to the peer immediately.
+///
+/// **Concurrency note:** "async" means non-blocking *to the calling peer* — the
+/// run still serializes on the process-wide supervise lock (RFC 0003), so it runs
+/// after any in-flight supervised run (the daemon's own reactions / other served
+/// runs) finishes, and while it runs it blocks them in turn. So a slow run can
+/// head-of-line-block the daemon; a run is bounded by its payload deadline, and
+/// `subagent.cancel` breaks the head-of-line by draining it. (True concurrency
+/// awaits the single-reaper refactor.) On daemon shutdown the run's subtree
+/// collapses via `PR_SET_PDEATHSIG` (no orphan leak), not a graceful drain.
+/// Handles are shared across all peers on the socket (one trust domain — socket
+/// perms gate access) and confer no ownership.
+fn spawn_async(id: Id, ctx: &ServeCtx, log: &Logger, handle: String, payload: SpawnPayload, permit: SpawnGuard) -> Response {
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        evict_if_full(&mut reg);
+        reg.insert(handle.clone(), ServedSession { status: ServedStatus::Running, cancel: Arc::clone(&cancel), started: Instant::now() });
+    }
+    let (exe, drain, sessions, log2, h) =
+        (ctx.exe.clone(), ctx.drain_timeout, Arc::clone(&ctx.sessions), log.clone(), handle.clone());
+    let spawned = thread::Builder::new()
+        .name(format!("served-run:{handle}"))
+        .spawn(move || {
+            let _permit = permit; // held for the run's lifetime → bounds live runs
+            let result = supervise_cancellable(exe, &payload, drain, log2, Some(Arc::clone(&cancel)));
+            // Write the terminal status and re-read the cancel flag UNDER the same
+            // lock the cancel tool uses, so a cancel that lands while we finish is
+            // never lost: either its store happens-before this load (→ a killed run
+            // reads Cancelled) or after this write (→ the tool sees terminal + no-ops).
+            let mut reg = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = reg.get_mut(&h) {
+                s.status = run_to_status(result, cancel.load(Ordering::Relaxed));
+            }
+        });
+    if spawned.is_err() {
+        ctx.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
+        return tool_error(id, "subagent could not start: thread spawn failed".to_string());
+    }
+    let body = json!({"handle": handle, "status": "running", "done": false});
+    Response::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": format!("spawned async (handle={handle}); poll subagent.status or read agentd://subagent/{handle}")}],
+            "structuredContent": body,
+            "isError": false
+        }),
+    )
+}
+
+/// Map a finished async run + whether its cancel was requested to a
+/// [`ServedStatus`]. A run that produced a result **finished before any cancel
+/// took effect**, so its real outcome is surfaced (not discarded as "cancelled");
+/// `Cancelled` is reported only when the run was actually torn down.
+fn run_to_status(result: std::io::Result<SuperviseResult>, cancel_requested: bool) -> ServedStatus {
+    match result {
+        Ok(SuperviseResult::Completed(o)) => {
+            ServedStatus::Done { status: o.status.as_str().to_string(), partial: o.partial, result: o.result }
+        }
+        Ok(SuperviseResult::Killed(_)) if cancel_requested => ServedStatus::Cancelled,
+        Ok(SuperviseResult::Killed(r)) => ServedStatus::Failed(format!("terminated: {r:?}")),
+        Ok(SuperviseResult::Failed(e)) => ServedStatus::Failed(e),
+        Err(e) => ServedStatus::Failed(format!("could not start: {e}")),
+    }
+}
+
+/// Evict the oldest *finished* session when the registry is at capacity. Running
+/// sessions are never evicted (bounded by the permit cap).
+fn evict_if_full(reg: &mut HashMap<String, ServedSession>) {
+    if reg.len() < MAX_SESSIONS {
+        return;
+    }
+    if let Some(oldest) = reg
+        .iter()
+        .filter(|(_, s)| s.status.is_terminal())
+        .min_by_key(|(_, s)| s.started)
+        .map(|(k, _)| k.clone())
+    {
+        reg.remove(&oldest);
+    }
+}
+
+/// `subagent.status{handle}` / `subagent.cancel{handle}` over the served registry.
+fn handle_session_tool(id: Id, ctx: &ServeCtx, name: &str, args: &Value) -> Response {
+    let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(session) = reg.get_mut(&handle) else {
+        return tool_error(id, format!("no async subagent with handle '{handle}'"));
+    };
+    match name {
+        "subagent.cancel" => {
+            let (text, body) = if session.status.is_terminal() {
+                (
+                    format!("subagent {handle} already finished; nothing to cancel"),
+                    json!({"handle": handle, "cancelled": false, "reason": "already finished"}),
+                )
+            } else {
+                session.cancel.store(true, Ordering::Relaxed);
+                (format!("cancel requested for {handle}; it is draining — poll subagent.status for the outcome"), json!({"handle": handle, "cancelled": true}))
+            };
+            Response::ok(id, json!({"content": [{"type": "text", "text": text}], "structuredContent": body, "isError": false}))
+        }
+        // "subagent.status"
+        _ => {
+            let body = session_body(&handle, session);
+            Response::ok(id, json!({"content": [{"type": "text", "text": body.to_string()}], "structuredContent": body, "isError": false}))
+        }
     }
 }
 
@@ -308,16 +507,46 @@ fn spawn_tool_def() -> Value {
         "name": "subagent.spawn",
         "description": "Delegate a task to this agentd: it runs a fresh agent (its own intelligence \
             + tool scope) and returns the distilled result. Give an 'instruction' and optionally an \
-            'output_contract' and a 'tool_scope' (a subset of this agentd's MCP server names). Sync: \
-            the call blocks until the run finishes.",
+            'output_contract' and a 'tool_scope' (a subset of this agentd's MCP server names). By \
+            default the call blocks until the run finishes; pass async=true to get a 'handle' back \
+            immediately and then poll subagent.status / read agentd://subagent/<handle> / \
+            subagent.cancel.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "instruction": {"type": "string", "description": "the task for the spawned agent"},
                 "output_contract": {"type": "string", "description": "exactly what the agent should return"},
-                "tool_scope": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"}
+                "tool_scope": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"},
+                "async": {"type": "boolean", "description": "return a handle immediately and run in the background"}
             },
             "required": ["instruction"]
+        }
+    })
+}
+
+fn session_status_tool_def() -> Value {
+    json!({
+        "name": "subagent.status",
+        "description": "Check on an async run you started with subagent.spawn async=true, by 'handle'. \
+            Returns 'done' (bool) and a 'status' string — 'running' while in flight, else the run's \
+            terminal status (e.g. completed / failed / cancelled) plus its result. Non-blocking.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"handle": {"type": "string", "description": "the handle from subagent.spawn async=true"}},
+            "required": ["handle"]
+        }
+    })
+}
+
+fn session_cancel_tool_def() -> Value {
+    json!({
+        "name": "subagent.cancel",
+        "description": "Cancel a still-running async run (by 'handle'): agentd drains its subtree \
+            gracefully. A run that already finished is left as-is.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"handle": {"type": "string", "description": "the handle from subagent.spawn async=true"}},
+            "required": ["handle"]
         }
     })
 }
@@ -437,6 +666,119 @@ mod tests {
         assert!(r.error.is_some(), "unknown agentd:// uri → JSON-RPC error");
         let bad = dispatch(req("resources/read", Some(json!({"uri": "file:///x"}))), &ctx(), &log());
         assert!(bad.error.is_some(), "non-agentd uri → JSON-RPC error");
+    }
+
+    #[test]
+    fn tools_list_advertises_async_session_tools() {
+        let r = dispatch(req("tools/list", None), &ctx(), &log());
+        let tools = r.result.expect("ok")["tools"].clone();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"subagent.status"), "{names:?}");
+        assert!(names.contains(&"subagent.cancel"), "{names:?}");
+    }
+
+    #[test]
+    fn spawn_schema_advertises_async() {
+        let v = spawn_tool_def();
+        assert!(v["inputSchema"]["properties"].get("async").is_some(), "spawn schema offers async");
+    }
+
+    #[test]
+    fn status_and_cancel_of_unknown_handle_are_tool_errors() {
+        for tool in ["subagent.status", "subagent.cancel"] {
+            let r = dispatch(
+                req("tools/call", Some(json!({"name": tool, "arguments": {"handle": "served.9"}}))),
+                &ctx(),
+                &log(),
+            );
+            let v = r.result.expect("ok");
+            assert_eq!(v["isError"], true, "{tool} unknown handle → isError");
+            assert!(v["content"][0]["text"].as_str().unwrap().contains("no async subagent"));
+        }
+    }
+
+    #[test]
+    fn resources_read_unknown_session_is_an_error() {
+        let r = dispatch(
+            req("resources/read", Some(json!({"uri": "agentd://subagent/served.404"}))),
+            &ctx(),
+            &log(),
+        );
+        assert!(r.error.is_some(), "unknown session uri → JSON-RPC error");
+    }
+
+    #[test]
+    fn run_to_status_maps_outcome_and_cancel() {
+        use crate::agentloop::stop::{Outcome, TerminalStatus};
+        use crate::supervisor::reactor::KillReason;
+        let outcome = || Outcome {
+            status: TerminalStatus::Completed,
+            partial: false,
+            result: json!("r"),
+            scheduled: Vec::new(),
+            subscriptions: Vec::new(),
+        };
+        assert!(matches!(run_to_status(Ok(SuperviseResult::Completed(outcome())), false), ServedStatus::Done { .. }));
+        // a run that COMPLETED keeps its real result even if a cancel raced in
+        // late — it finished before the cancel could tear it down.
+        assert!(matches!(run_to_status(Ok(SuperviseResult::Completed(outcome())), true), ServedStatus::Done { .. }));
+        // a run that was actually torn down + cancel requested → Cancelled.
+        assert!(matches!(run_to_status(Ok(SuperviseResult::Killed(KillReason::Drain)), true), ServedStatus::Cancelled));
+        // killed without a cancel request (e.g. SIGTERM drain) → failed/terminated.
+        assert!(matches!(run_to_status(Ok(SuperviseResult::Killed(KillReason::Drain)), false), ServedStatus::Failed(_)));
+        assert!(matches!(run_to_status(Ok(SuperviseResult::Failed("e".into())), false), ServedStatus::Failed(_)));
+    }
+
+    #[test]
+    fn session_body_reports_running_then_done() {
+        let s = ServedSession {
+            status: ServedStatus::Running,
+            cancel: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+        };
+        let b = session_body("served.0", &s);
+        assert_eq!(b["status"], "running");
+        assert_eq!(b["done"], false);
+
+        let s = ServedSession {
+            status: ServedStatus::Done { status: "completed".into(), partial: false, result: json!("done") },
+            cancel: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
+        };
+        let b = session_body("served.0", &s);
+        assert_eq!(b["status"], "completed");
+        assert_eq!(b["done"], true);
+        assert_eq!(b["result"], "done");
+    }
+
+    #[test]
+    fn evict_drops_oldest_terminal_never_running() {
+        let mut reg: HashMap<String, ServedSession> = HashMap::new();
+        for i in 0..MAX_SESSIONS {
+            let status = if i == 0 {
+                ServedStatus::Done { status: "completed".into(), partial: false, result: json!(i) }
+            } else {
+                ServedStatus::Running
+            };
+            reg.insert(
+                format!("served.{i}"),
+                ServedSession { status, cancel: Arc::new(AtomicBool::new(false)), started: Instant::now() },
+            );
+        }
+        evict_if_full(&mut reg);
+        assert_eq!(reg.len(), MAX_SESSIONS - 1, "one terminal session evicted at cap");
+        assert!(!reg.contains_key("served.0"), "the (only) terminal session was evicted, not a running one");
+
+        // all-running at cap → nothing evicted (live runs are never dropped)
+        let mut all_running: HashMap<String, ServedSession> = HashMap::new();
+        for i in 0..MAX_SESSIONS {
+            all_running.insert(
+                format!("r.{i}"),
+                ServedSession { status: ServedStatus::Running, cancel: Arc::new(AtomicBool::new(false)), started: Instant::now() },
+            );
+        }
+        evict_if_full(&mut all_running);
+        assert_eq!(all_running.len(), MAX_SESSIONS, "running sessions are never evicted");
     }
 
     #[test]

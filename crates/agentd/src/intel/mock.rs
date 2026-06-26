@@ -34,14 +34,23 @@ fn handle(mut stream: UnixStream, script: &str) {
     // A `role:tool` message means the model already called a tool, so the next
     // turn is a final answer.
     let saw_tool_result = body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\"");
-    // `slow`: hold the response so the calling subagent stays alive in the
-    // model call — used by the chaos suite to catch a live subagent before
-    // collapsing the tree.
-    let script = if script == "slow" {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        "final"
-    } else {
-        script
+    // `slow`/`hang`: hold the response so the calling subagent stays alive in the
+    // model call — `slow` (5s) lets the chaos suite catch a live subagent before
+    // collapsing the tree; `hang` (long) keeps a run alive so a cancel/drain test
+    // proves it was the teardown (not natural completion) that ended it.
+    let script = match script {
+        "slow" => {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            "final"
+        }
+        "hang" => {
+            // Long enough to outlive a cancel/drain (kill ladder ~7s) so a test
+            // proves the teardown ended it — but bounded so a *leaked* (uncancelled)
+            // hang run can't pin the process-wide supervise lock for long.
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            "final"
+        }
+        other => other,
     };
     let payload = response_json(script, saw_tool_result);
     let resp = format!(

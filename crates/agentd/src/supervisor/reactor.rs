@@ -43,6 +43,15 @@ const FINISH_GRACE: Duration = Duration::from_secs(5);
 /// *abandoned* (its handles' `Drop` is suppressed and the teardown returns), so
 /// `drive_drain` can never spin forever on a reap that doesn't arrive.
 const ABANDON_GRACE: Duration = Duration::from_secs(3);
+/// After the root process is reaped *without* having reported a terminal on the
+/// events channel, wait this long for the channel to flush before concluding it
+/// "exited without a result". The reap (`waitpid`) and the final `Result`/`Failed`
+/// frame travel on independent channels, so the reap can win the race even though
+/// the child wrote its result to stdout just before exiting; without this grace a
+/// real reason (e.g. an intel-unavailable `Failed` → exit 4) would be masked as a
+/// generic exit 1. Only affects the rare genuinely-no-result path (e.g. a SIGKILL
+/// or segfault), which then takes this much longer to conclude.
+const RESULT_GRACE: Duration = Duration::from_millis(500);
 
 /// Why a subtree was torn down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +97,9 @@ pub struct Supervisor {
     reap_rx: Receiver<Reaped>,
     root: NodeId,
     root_terminal: Option<SuperviseResult>,
+    /// When the root was reaped without a terminal — starts the `RESULT_GRACE`
+    /// window for the events channel to deliver its trailing `Result`/`Failed`.
+    root_exited_at: Option<Instant>,
     finishing_since: Option<Instant>,
     drain: Option<Drain>,
     drain_timeout: Duration,
@@ -117,6 +129,7 @@ impl Supervisor {
             reap_rx,
             root: NodeId(0),
             root_terminal: None,
+            root_exited_at: None,
             finishing_since: None,
             drain: None,
             drain_timeout,
@@ -160,6 +173,7 @@ impl Supervisor {
                 self.handle_event(node, msg);
             }
             self.reap();
+            self.maybe_finalize_root_exit();
 
             // Terminal: the root reported a result/failure. Wait for the whole
             // subtree to exit; escalate only if stragglers linger past a grace.
@@ -297,9 +311,16 @@ impl Supervisor {
                     // dying is the *expected* consequence, so the teardown reason
                     // (Killed(..)) must stand — not a synthetic "exited without a
                     // result" that would mask a stuck-kill as a generic failure.
+                    //
+                    // Don't synthesize the failure *here*: the child may have
+                    // written its real `Result`/`Failed` frame to stdout just
+                    // before exiting, and that frame races this reap on an
+                    // independent channel. Start the `RESULT_GRACE` window instead
+                    // and let `maybe_finalize_root_exit` conclude only if nothing
+                    // arrives — otherwise the real reason (e.g. intel-unavailable →
+                    // exit 4) would be masked as a generic exit 1.
                     if node == self.root && self.root_terminal.is_none() && self.drain.is_none() {
-                        self.root_terminal =
-                            Some(SuperviseResult::Failed("subagent exited without a result".into()));
+                        self.root_exited_at.get_or_insert_with(Instant::now);
                     }
                 }
                 None => self.log.debug(
@@ -307,6 +328,20 @@ impl Supervisor {
                     json!({"pid": r.pid, "outcome": format!("{:?}", r.outcome)}),
                 ),
             }
+        }
+    }
+
+    /// Once the root has been reaped without a terminal (`root_exited_at` set),
+    /// grant `RESULT_GRACE` for its trailing `Result`/`Failed` frame to arrive on
+    /// the events channel before concluding it "exited without a result". If the
+    /// frame lands first, `handle_event` sets `root_terminal` and this never fires.
+    fn maybe_finalize_root_exit(&mut self) {
+        if self.root_terminal.is_some() || self.drain.is_some() {
+            return;
+        }
+        if self.root_exited_at.is_some_and(|t| t.elapsed() > RESULT_GRACE) {
+            self.root_terminal =
+                Some(SuperviseResult::Failed("subagent exited without a result".into()));
         }
     }
 

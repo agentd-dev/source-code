@@ -309,6 +309,87 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
     let _ = child.wait();
 }
 
+/// Poll `subagent.status` until the warm session has run at least `target` turns.
+fn poll_warm_turns(reader: &mut BufReader<UnixStream>, write: &mut UnixStream, handle: &str, target: u64, deadline: Instant) -> u64 {
+    let line = format!(
+        r#"{{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
+    );
+    loop {
+        let v = rpc(reader, write, &line);
+        let turns = v["result"]["structuredContent"]["turns"].as_u64().unwrap_or(0);
+        if turns >= target {
+            return turns;
+        }
+        assert!(Instant::now() < deadline, "warm session never reached {target} turns: {v}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_warm_session_runs_a_turn_per_send() {
+    // Bidirectional composability: subagent.spawn warm=true keeps the agent alive;
+    // each subagent.send runs another turn over the SAME conversation.
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let llm_sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(exe, &llm_sock, "final"); // each turn completes at once
+    let sock = dir.path().join("agentd.sock");
+    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+
+    let stream = connect(&sock);
+    let mut write = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+
+    // warm spawn → a live session (turn 1 runs from the instruction).
+    let spawn = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"hello","warm":true}}}"#,
+    );
+    assert_eq!(spawn["result"]["structuredContent"]["warm"], true, "warm session: {spawn}");
+    let handle = spawn["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string();
+
+    let t1 = poll_warm_turns(&mut reader, &mut write, &handle, 1, Instant::now() + Duration::from_secs(15));
+    assert!(t1 >= 1, "the warm session runs turn 1 from the instruction");
+
+    // send another message → a SECOND turn over the same live session.
+    let sent = rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.send","arguments":{{"handle":"{handle}","message":"and again"}}}}}}"#),
+    );
+    assert_eq!(sent["result"]["structuredContent"]["delivered"], true, "send delivered: {sent}");
+    // The peer is told which turn index to wait for (turn 1 already drained by the
+    // status polls above, so this send produces turn 2).
+    assert_eq!(sent["result"]["structuredContent"]["awaiting_turn"], 2, "send reports the awaited turn: {sent}");
+
+    let t2 = poll_warm_turns(&mut reader, &mut write, &handle, 2, Instant::now() + Duration::from_secs(15));
+    assert!(t2 >= 2, "the SAME session ran a second turn from the injected message");
+
+    // Once the turn completes the session reads idle (not busy) — the peer's signal
+    // that last_result is fresh and it is safe to send again.
+    let status = rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#),
+    );
+    assert_eq!(status["result"]["structuredContent"]["busy"], false, "idle after the turn drains: {status}");
+
+    // end it.
+    let cancel = rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#),
+    );
+    assert_eq!(cancel["result"]["structuredContent"]["cancelled"], true, "warm session cancelled: {cancel}");
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+    sigterm(child.id());
+    let _ = child.wait();
+}
+
 #[test]
 fn concurrent_async_runs_do_not_serialize() {
     // Two async runs in flight at once. The second is cancelled and must drain

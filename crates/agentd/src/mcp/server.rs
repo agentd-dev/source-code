@@ -10,8 +10,10 @@
 
 use crate::json::{self, frame, Id, Incoming, Notification, Request, Response};
 use crate::obs::log::Logger;
-use crate::subagent::protocol::SpawnPayload;
+use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::reactor::{supervise_cancellable, supervise_once, SuperviseResult};
+use crate::supervisor::spawn::{spawn, Subagent};
+use crate::supervisor::tree::NodeId;
 use crate::wire::mcp::{method, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -19,6 +21,7 @@ use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +35,75 @@ const RESULT_CAP: usize = 4096;
 /// oldest *finished* session is evicted so a long-lived daemon can't grow without
 /// bound; live sessions are never evicted (they are bounded by the permit cap).
 const MAX_SESSIONS: usize = 64;
+/// Cap on concurrent served **warm** sessions (each is a live subagent process the
+/// peer drives with `subagent.send`). Bounded independently of the async permit so
+/// long-lived warm sessions can't starve one-shot `subagent.spawn` runs; a peer
+/// that hits the cap must `subagent.cancel` an idle one.
+const MAX_WARM_SESSIONS: usize = 8;
+
+/// A served **warm** session: a live subagent the peer drives turn-by-turn with
+/// `subagent.send`. Held by the server (not reactor-managed); drained lazily on
+/// send/status — each `AgentMsg::Turn` is one reply, death is the channel
+/// disconnecting. `Subagent`'s Drop kills + reaps it when the session is removed.
+struct WarmServed {
+    sub: Subagent,
+    rx: Receiver<(NodeId, AgentMsg)>,
+    /// The most recent completed turn's distilled `(result, is_error)`.
+    last: Option<(String, bool)>,
+    /// Turns observed-complete (drained `AgentMsg::Turn`s).
+    turns: u32,
+    /// Turns queued-or-running but not yet observed complete: the instruction's
+    /// first turn (1 at spawn) plus one per `subagent.send`, minus one per drained
+    /// `Turn`. `> 0` means a turn is in flight — the peer's `busy` signal.
+    pending: u32,
+    done: bool,
+    started: Instant,
+}
+
+/// Handle → live warm session.
+type WarmRegistry = Arc<Mutex<HashMap<String, WarmServed>>>;
+
+/// Drain a warm session's channel: record completed turns + detect end. Idempotent.
+fn drain_warm(w: &mut WarmServed) {
+    if w.done {
+        return;
+    }
+    loop {
+        match w.rx.try_recv() {
+            Ok((_, AgentMsg::Turn { outcome })) => {
+                w.turns += 1;
+                w.pending = w.pending.saturating_sub(1); // a queued turn completed
+                w.last = Some((distill(&outcome.result), !matches!(outcome.status, crate::agentloop::stop::TerminalStatus::Completed)));
+            }
+            Ok((_, AgentMsg::Result { .. })) | Ok((_, AgentMsg::Failed { .. })) => {
+                w.done = true;
+                return;
+            }
+            Ok(_) => {} // Ready / Pong / Event / Usage
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                w.done = true;
+                return;
+            }
+        }
+    }
+}
+
+/// The structured state body for a warm session (the `subagent.status` reply).
+fn warm_body(handle: &str, w: &WarmServed) -> Value {
+    let (result, is_error) = match &w.last {
+        Some((r, e)) => (json!(r), *e),
+        None => (Value::Null, false),
+    };
+    json!({
+        "handle": handle, "warm": true, "alive": !w.done, "done": w.done,
+        // `busy` lets a peer distinguish "a turn is running" from "idle, last_result
+        // is fresh" without remembering the pre-send turn count: poll until !busy.
+        "busy": !w.done && w.pending > 0,
+        "turns": w.turns, "last_result": result, "last_is_error": is_error,
+        "age_ms": w.started.elapsed().as_millis() as u64,
+    })
+}
 
 /// The lifecycle of a served **async** run, tracked by handle so a peer can poll
 /// `subagent.status` / read `agentd://subagent/<handle>` / `subagent.cancel` it.
@@ -105,6 +177,8 @@ pub struct ServeCtx {
     counter: Arc<AtomicU64>,
     /// Tracked served async runs, by handle.
     sessions: Registry,
+    /// Live warm sessions (driven by `subagent.send`), by handle.
+    warm: WarmRegistry,
     /// Resource subscriptions, by uri → subscribers (for push notifications).
     subscriptions: SubRegistry,
     /// Monotonic per-connection id (to scope + clean up subscriptions).
@@ -123,6 +197,7 @@ impl ServeCtx {
             inflight: Arc::new(AtomicUsize::new(0)),
             counter: Arc::new(AtomicU64::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            warm: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             conn_counter: Arc::new(AtomicU64::new(0)),
         }
@@ -169,13 +244,25 @@ impl Drop for SpawnGuard {
 /// subtrees at `process::exit`).
 pub struct ServeHandle {
     sessions: Registry,
+    warm: WarmRegistry,
     inflight: Arc<AtomicUsize>,
 }
 
 impl ServeHandle {
     /// Ask every in-flight served run to cancel, then wait (bounded by `timeout`)
-    /// for them to finish so their subtrees drain gracefully.
+    /// for them to finish so their subtrees drain gracefully. Warm sessions are
+    /// cancelled + dropped (their `Subagent` Drop kills + reaps the subtree).
     pub fn drain(&self, timeout: Duration) {
+        if let Ok(mut warm) = self.warm.lock() {
+            for w in warm.values_mut() {
+                let _ = w.sub.send(&ControlMsg::Cancel { reason: "drain".into() });
+            }
+            // Take the sessions out and drop them after releasing the lock, so the N
+            // Subagent Drops (SIGKILL + waitpid each) don't run holding the registry.
+            let drained = std::mem::take(&mut *warm);
+            drop(warm);
+            drop(drained);
+        }
         if let Ok(reg) = self.sessions.lock() {
             for s in reg.values() {
                 s.cancel.store(true, Ordering::Relaxed);
@@ -199,7 +286,11 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
         "mcp.serving",
         json!({"path": path, "tools": ["status", "subagent.spawn"], "resources": ["agentd://status"]}),
     );
-    let handle = ServeHandle { sessions: Arc::clone(&ctx.sessions), inflight: Arc::clone(&ctx.inflight) };
+    let handle = ServeHandle {
+        sessions: Arc::clone(&ctx.sessions),
+        warm: Arc::clone(&ctx.warm),
+        inflight: Arc::clone(&ctx.inflight),
+    };
     let ctx = Arc::new(ctx);
     thread::Builder::new()
         .name("serve-mcp".into())
@@ -264,7 +355,7 @@ fn dispatch(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn: u64, log:
         "ping" => Response::ok(req.id, json!({})),
         "tools/list" => Response::ok(
             req.id,
-            json!({"tools": [status_tool_def(), spawn_tool_def(), session_status_tool_def(), session_cancel_tool_def()]}),
+            json!({"tools": [status_tool_def(), spawn_tool_def(), send_tool_def(), session_status_tool_def(), session_cancel_tool_def()]}),
         ),
         "tools/call" => tools_call(req, ctx, log),
         "resources/list" => Response::ok(req.id, json!({"resources": resource_list()})),
@@ -409,6 +500,10 @@ fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             )
         }
         "subagent.spawn" => handle_spawn(req, ctx, log),
+        "subagent.send" => {
+            let args = req.params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+            handle_send(req.id, ctx, &args)
+        }
         "subagent.status" | "subagent.cancel" => {
             let args = req.params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
             handle_session_tool(req.id, ctx, name, &args)
@@ -427,8 +522,8 @@ fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
 ///
 /// **Trust boundary:** anyone able to connect to the `--serve-mcp` socket can run
 /// instructions with this agentd's intelligence + tool scope. The operator gates
-/// access via the socket's filesystem permissions. (`subagent.send` — injecting
-/// into a live served session — needs served *warm* sessions, a follow-on.)
+/// access via the socket's filesystem permissions. **`warm: true`** keeps the run
+/// alive as a session the peer drives with `subagent.send`.
 fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let id = req.id.clone();
     let args = req.params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
@@ -437,6 +532,19 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         // Malformed call (missing required param) → JSON-RPC error (RFC §3.2).
         return Response::err(id, json::INVALID_PARAMS, "subagent.spawn requires a non-empty 'instruction'");
     }
+    let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
+    let handle = format!("served.{n}");
+    let payload = build_served_payload(&ctx.base, &args, &handle);
+    let is_warm = args.get("warm").and_then(Value::as_bool).unwrap_or(false);
+    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+    log.info("mcp.spawn", json!({"handle": handle, "servers": payload.mcp_servers.len(), "warm": is_warm, "async": is_async}));
+
+    // Warm: a live session driven by subagent.send — bounded by its own cap, not
+    // the async permit (so long-lived warm sessions can't starve one-shot runs).
+    if is_warm {
+        return spawn_warm(id, ctx, log, handle, payload);
+    }
+
     // Concurrency cap → refused as a tool result, never a crash. For async the
     // permit is held by the background run thread (so it bounds live runs).
     let permit = match SpawnGuard::acquire(&ctx.inflight, MAX_INFLIGHT_SPAWNS) {
@@ -445,12 +553,6 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             return tool_error(id, format!("spawn refused: {MAX_INFLIGHT_SPAWNS} concurrent served spawns in flight"));
         }
     };
-    let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
-    let handle = format!("served.{n}");
-    let payload = build_served_payload(&ctx.base, &args, &handle);
-    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
-    log.info("mcp.spawn", json!({"handle": handle, "servers": payload.mcp_servers.len(), "async": is_async}));
-
     if is_async {
         return spawn_async(id, ctx, log, handle, payload, permit);
     }
@@ -458,6 +560,87 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     // Sync: block this connection thread on the run.
     let result = supervise_once(ctx.exe.clone(), &payload, ctx.drain_timeout, log.clone());
     spawn_result_response(id, &handle, result)
+}
+
+/// Spawn a **warm** session: a live subagent (warm mode) the peer drives with
+/// `subagent.send`. Held by the server and drained lazily (no supervision thread);
+/// `subagent.cancel` ends it. Bounded by `MAX_WARM_SESSIONS`.
+fn spawn_warm(id: Id, ctx: &ServeCtx, log: &Logger, handle: String, mut payload: SpawnPayload) -> Response {
+    payload.warm = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Hold the registry lock across sweep + cap-check + spawn + insert so the cap is
+    // enforced atomically (no check-then-insert TOCTOU that could overshoot it). The
+    // hold is bounded by child startup (fork + a small framed payload write + the
+    // reader-thread spawn); warm spawns are rare, so briefly blocking concurrent
+    // status/send is acceptable.
+    let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+    // Reclaim finished-but-unpolled sessions first: drain_warm marks done ones, and a
+    // peer that spawns-and-forgets would otherwise pin their slots forever (the only
+    // other removal is on a per-handle send/status). Their children are already dead,
+    // so the retain's Drops reap instantly (ECHILD).
+    for w in warm.values_mut() {
+        drain_warm(w);
+    }
+    warm.retain(|_, w| !w.done);
+    if warm.len() >= MAX_WARM_SESSIONS {
+        return tool_error(id, format!("warm refused: {MAX_WARM_SESSIONS} warm sessions live; cancel one"));
+    }
+    match spawn(&ctx.exe, &payload, NodeId(0), tx) {
+        Ok(sub) => {
+            warm.insert(
+                handle.clone(),
+                // pending: 1 — the instruction's first turn is already in flight.
+                WarmServed { sub, rx, last: None, turns: 0, pending: 1, done: false, started: Instant::now() },
+            );
+            drop(warm); // release before logging + building the reply
+            log.info("mcp.spawn_warm", json!({"handle": handle}));
+            let body = json!({"handle": handle, "warm": true, "alive": true});
+            Response::ok(
+                id,
+                json!({
+                    "content": [{"type": "text", "text": format!("started warm session (handle={handle}); drive it with subagent.send, read it with subagent.status, end it with subagent.cancel")}],
+                    "structuredContent": body,
+                    "isError": false
+                }),
+            )
+        }
+        Err(e) => tool_error(id, format!("subagent could not start: {e}")),
+    }
+}
+
+/// `subagent.send{handle, message}`: inject the next user message into a live warm
+/// session (it runs another turn over the same conversation). Drains any completed
+/// turns first; reports its current state.
+fn handle_send(id: Id, ctx: &ServeCtx, args: &Value) -> Response {
+    let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let message = args.get("message").and_then(Value::as_str).unwrap_or("").trim();
+    if message.is_empty() {
+        return Response::err(id, json::INVALID_PARAMS, "subagent.send requires a non-empty 'message'");
+    }
+    let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(w) = warm.get_mut(&handle) else {
+        return tool_error(id, format!("no such warm session '{handle}'"));
+    };
+    drain_warm(w);
+    if w.done {
+        warm.remove(&handle); // ended — reap it
+        return tool_error(id, format!("warm session '{handle}' has ended"));
+    }
+    match w.sub.send(&ControlMsg::Inject { message: message.to_string() }) {
+        Ok(()) => {
+            w.pending += 1; // a new turn is now queued
+            // The turn index this send (or the latest still-queued send) will produce.
+            // `delivered` means "queued to the child", not "ran" — the peer confirms by
+            // polling subagent.status until `turns` reaches `awaiting_turn`.
+            let awaiting_turn = w.turns + w.pending;
+            let body = json!({"handle": handle, "delivered": true, "turns": w.turns, "awaiting_turn": awaiting_turn});
+            Response::ok(id, json!({"content": [{"type": "text", "text": format!("delivered to {handle}; poll subagent.status until turns reaches {awaiting_turn}")}], "structuredContent": body, "isError": false}))
+        }
+        Err(e) => {
+            warm.remove(&handle);
+            tool_error(id, format!("warm session '{handle}' send failed: {e}"))
+        }
+    }
 }
 
 /// Map a finished sync run to the tool result the peer gets inline.
@@ -575,9 +758,38 @@ fn evict_if_full(reg: &mut HashMap<String, ServedSession>) {
     }
 }
 
-/// `subagent.status{handle}` / `subagent.cancel{handle}` over the served registry.
+/// `subagent.status{handle}` / `subagent.cancel{handle}` — works on a **warm**
+/// session (checked first) or an **async** run.
 fn handle_session_tool(id: Id, ctx: &ServeCtx, name: &str, args: &Value) -> Response {
     let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // Warm session?
+    {
+        let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = warm.get_mut(&handle) {
+            drain_warm(w);
+            return match name {
+                "subagent.cancel" => {
+                    let _ = w.sub.send(&ControlMsg::Cancel { reason: "cancel".into() });
+                    // Take it out, then release the registry lock *before* dropping it:
+                    // Subagent::Drop does SIGKILL + waitpid on a still-live child (a brief
+                    // stall), and no other warm op should block on that.
+                    let removed = warm.remove(&handle);
+                    drop(warm);
+                    drop(removed); // kill + reap, now unlocked
+                    let body = json!({"handle": handle, "cancelled": true, "warm": true});
+                    Response::ok(id, json!({"content": [{"type": "text", "text": format!("ended warm session {handle}")}], "structuredContent": body, "isError": false}))
+                }
+                _ => {
+                    let body = warm_body(&handle, w);
+                    let done = w.done;
+                    if done {
+                        warm.remove(&handle);
+                    }
+                    Response::ok(id, json!({"content": [{"type": "text", "text": body.to_string()}], "structuredContent": body, "isError": false}))
+                }
+            };
+        }
+    }
     let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
     let Some(session) = reg.get_mut(&handle) else {
         return tool_error(id, format!("no async subagent with handle '{handle}'"));
@@ -658,16 +870,38 @@ fn spawn_tool_def() -> Value {
             'output_contract' and a 'tool_scope' (a subset of this agentd's MCP server names). By \
             default the call blocks until the run finishes; pass async=true to get a 'handle' back \
             immediately and then poll subagent.status / read agentd://subagent/<handle> / \
-            subagent.cancel.",
+            subagent.cancel. Pass warm=true to keep the agent ALIVE as a session you drive with \
+            subagent.send (a multi-turn conversation); end it with subagent.cancel.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "instruction": {"type": "string", "description": "the task for the spawned agent"},
                 "output_contract": {"type": "string", "description": "exactly what the agent should return"},
                 "tool_scope": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"},
-                "async": {"type": "boolean", "description": "return a handle immediately and run in the background"}
+                "async": {"type": "boolean", "description": "return a handle immediately and run in the background"},
+                "warm": {"type": "boolean", "description": "keep the agent alive as a session you drive with subagent.send"}
             },
             "required": ["instruction"]
+        }
+    })
+}
+
+fn send_tool_def() -> Value {
+    json!({
+        "name": "subagent.send",
+        "description": "Send another message into a warm session you started with subagent.spawn \
+            warm=true (by 'handle'). The agent runs another turn over the SAME conversation. Returns \
+            'awaiting_turn' (the turn index this message will produce); poll subagent.status until its \
+            'turns' reaches that value (and 'busy' is false) to read the result. 'delivered' means \
+            queued to the agent, not that the turn ran — if a later status shows done=true before \
+            'turns' advances, the message was lost (the session ended).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "the handle from subagent.spawn warm=true"},
+                "message": {"type": "string", "description": "the next message for the warm agent"}
+            },
+            "required": ["handle", "message"]
         }
     })
 }
@@ -675,9 +909,11 @@ fn spawn_tool_def() -> Value {
 fn session_status_tool_def() -> Value {
     json!({
         "name": "subagent.status",
-        "description": "Check on an async run you started with subagent.spawn async=true, by 'handle'. \
-            Returns 'done' (bool) and a 'status' string — 'running' while in flight, else the run's \
-            terminal status (e.g. completed / failed / cancelled) plus its result. Non-blocking.",
+        "description": "Check on a run you started with subagent.spawn, by 'handle'. For an async run \
+            (async=true): returns 'done' (bool) and a 'status' string — 'running' while in flight, else \
+            the terminal status (completed / failed / cancelled) plus its result. For a warm session \
+            (warm=true): returns 'turns' (completed turn count), 'busy' (a turn is in flight), \
+            'last_result' / 'last_is_error', and 'done'/'alive'. Non-blocking.",
         "inputSchema": {
             "type": "object",
             "properties": {"handle": {"type": "string", "description": "the handle from subagent.spawn async=true"}},
@@ -829,6 +1065,26 @@ mod tests {
         assert!(r.error.is_some(), "unknown agentd:// uri → JSON-RPC error");
         let bad = dispatch(req("resources/read", Some(json!({"uri": "file:///x"}))), &ctx(), &writer(), 0, &log());
         assert!(bad.error.is_some(), "non-agentd uri → JSON-RPC error");
+    }
+
+    #[test]
+    fn tools_list_advertises_send_and_spawn_schema_has_warm() {
+        let r = dispatch(req("tools/list", None), &ctx(), &writer(), 0, &log());
+        let tools = r.result.expect("ok")["tools"].clone();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"subagent.send"), "{names:?}");
+        assert!(spawn_tool_def()["inputSchema"]["properties"].get("warm").is_some(), "spawn offers warm");
+    }
+
+    #[test]
+    fn send_validates_message_and_handle() {
+        let ctx = ctx();
+        // missing/empty message → JSON-RPC error
+        assert!(handle_send(Id::Num(1), &ctx, &json!({"handle": "served.0"})).error.is_some());
+        assert!(handle_send(Id::Num(1), &ctx, &json!({"handle": "served.0", "message": "  "})).error.is_some());
+        // unknown warm handle → tool error (isError result)
+        let r = handle_send(Id::Num(1), &ctx, &json!({"handle": "served.9", "message": "hi"}));
+        assert_eq!(r.result.unwrap()["isError"], true);
     }
 
     #[test]

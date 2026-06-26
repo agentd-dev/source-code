@@ -80,6 +80,8 @@ pub struct Supervisor {
     drain: Option<Drain>,
     drain_timeout: Duration,
     liveness_cfg: LivenessConfig,
+    last_ping: Instant,
+    ping_seq: u64,
     log: Logger,
 }
 
@@ -99,7 +101,11 @@ impl Supervisor {
             finishing_since: None,
             drain: None,
             drain_timeout,
-            liveness_cfg: LivenessConfig::default(),
+            // Liveness timeouts are tunable via env (a niche knob); the ping
+            // cadence is derived so Detector C (ping/pong) is actually active.
+            liveness_cfg: LivenessConfig::from_env(),
+            last_ping: Instant::now(),
+            ping_seq: 0,
             log,
         }
     }
@@ -148,6 +154,7 @@ impl Supervisor {
                 self.begin_drain(KillReason::Drain);
             }
 
+            self.maybe_send_pings(Instant::now());
             self.tick_liveness();
 
             if self.drain.is_some() && let Some(result) = self.drive_drain() {
@@ -207,6 +214,24 @@ impl Supervisor {
     fn on_event(&mut self, node: NodeId, now: Instant) {
         if let Some(l) = self.liveness.get_mut(&node) {
             l.on_event(now);
+        }
+    }
+
+    /// Ping every live child at the configured cadence so Detector C (ping/pong)
+    /// is actually exercised. A *responsive* child answers from its control
+    /// thread regardless of what its loop is doing (so a long model call reads
+    /// `Busy`, not `Stuck`); a frozen/wedged child cannot, and after
+    /// `pong_timeout` of silence it crosses into `Stuck`. Suspended during a
+    /// drain (the kill ladder owns the child then).
+    fn maybe_send_pings(&mut self, now: Instant) {
+        if self.drain.is_some() || now.duration_since(self.last_ping) < self.liveness_cfg.ping_interval {
+            return;
+        }
+        self.last_ping = now;
+        self.ping_seq += 1;
+        let seq = self.ping_seq;
+        for h in self.live.values_mut() {
+            let _ = h.send(&ControlMsg::Ping { seq });
         }
     }
 

@@ -65,7 +65,31 @@ mod tests {
         assert_eq!(once_exit(Completed, true), PARTIAL);
         assert_eq!(once_exit(Refused, false), REFUSED);
         assert_eq!(once_exit(ExhaustedSteps, false), BUDGET);
+        assert_eq!(once_exit(ExhaustedTokens, false), BUDGET);
         assert_eq!(once_exit(Deadline, false), BUDGET);
         assert_eq!(once_exit(Stalled, false), PARTIAL);
+        assert_eq!(once_exit(LoopDetected, false), PARTIAL);
+        assert_eq!(once_exit(Cancelled, false), GENERIC);
+        assert_eq!(once_exit(Crashed, false), GENERIC);
+    }
+
+    #[test]
+    fn codes_are_distinct_and_in_documented_bands() {
+        let table = [SUCCESS, GENERIC, USAGE, PARTIAL, INTEL_UNAVAILABLE, REFUSED, MCP_REQUIRED_DOWN, BUDGET, DEADLINE];
+        // pairwise distinct — a collision would make a podFailurePolicy ambiguous
+        for (i, a) in table.iter().enumerate() {
+            for b in &table[i + 1..] {
+                assert_ne!(a, b, "exit codes must be distinct");
+            }
+        }
+        // every code is POSIX-portable (0..=125) except the OS-mnemonic 124
+        assert!(table.iter().all(|&c| (0..=124).contains(&c)));
+    }
+
+    #[test]
+    fn once_exit_never_returns_success_for_a_non_completed_status() {
+        for s in [Refused, ExhaustedSteps, ExhaustedTokens, Deadline, Stalled, LoopDetected, Cancelled, Crashed] {
+            assert_ne!(once_exit(s, false), SUCCESS, "{s:?} must not look like success");
+        }
     }
 }

@@ -59,36 +59,39 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M6 (observability depth) underway — the **closed event-vocabulary
-  audit** + the **LLM `traceparent` header** landed, completing the
-  audit-trail and distributed-trace stories the operator requires.
-- **Last completed:** **event-vocabulary audit + LLM trace header** (pure, no
-  new deps). Closed the §2.9 gaps so the audit stream is complete: added
-  `config.loaded` (validated policy — lengths/schemes only, content-off),
-  `mcp.connect` success (was fail-only; emitted at both the supervisor's
-  subscription connect and the subagent's tool connect), `proc.ready`,
-  `loop.step` (per-turn budget anchor), `subagent.stuck` (the distinct liveness
-  verdict signal); aligned `reactive.armed`/`schedule.armed` → the canonical
-  `trigger.armed`. Threaded the run's `trace_id` into the intel client so every
-  LLM completion carries a fresh-span `traceparent` (the MCP `_meta` path
-  already did). Observe-proven: a live reactive run emits `config.loaded` /
-  `mcp.connect`×2 / `proc.ready` / `trigger.armed`, every line carrying
-  `trace_id`. (Prior: W3C trace propagation; RUN_ID idempotency; tls/vsock.)
-  120 unit + 11 integration tests, clippy clean (default + all-features),
-  default build = 3 deps.
-- **Next action (M6 cont.):** the **`metrics` feature** (hand-written Prometheus
-  text from atomic counters on an opt-in HTTP surface — no client lib; the
-  surface doubles as the `/healthz`+`/readyz` endpoint), then `--log-content`
-  (opt-in content capture, redaction-aware) and `--aggregate-logs` (forward
-  child telemetry up the control channel). Bigger items still open: the
-  **`--serve-mcp` peer listener** (composability), `cron` feature,
-  self-scheduling, M2 tail (`restart.rs`, stuck/orphan chaos tests), M7
-  (conformance suite + container).
-- **Active milestone:** M6 (observability depth). M4 mostly done (schedule, exec,
-  tls/vsock transports); `--serve-mcp`/`cron` remain there.
-- **Blockers:** none — disk healthy (73% used, 44G free). (`otel` feature has no
-  deps declared yet — wired later in M6. Live vsock + the `--serve-mcp` peer
-  listener need a peer/microVM to exercise.)
+- **Phase:** parallel hardening pass across M2/M5/M6 — a Workflow fan-out (4
+  isolated worktree slices, each adversarially verified) landed the **restart
+  governor**, the **lethal-trifecta check**, the **SSRF classifier**, and
+  confirmed/strengthened the **exit-code table**.
+- **Last completed (this wake):** reconciled the verified worktree slices onto
+  the branch. **(1) Restart governor** (`supervisor/restart.rs`, M2): pure
+  backoff + capped jitter + circuit breaker + crash-on-spawn, wired into
+  `run_scheduled` (crash-loop → `proc.exit{reason:"restart_breaker"}` + exit 1).
+  **(2) Lethal-trifecta check** (`sec/scope.rs`, M6): pure
+  `check_trifecta(tags, allow)` — chokepoint wiring + `--allow-trifecta` flag +
+  tool→tag source still to wire. **(3) SSRF classifier** (`net/ssrf.rs`, M6):
+  pure `guard_host`/`is_global`; ready for a future model-supplied-URL fetcher
+  (agentd's only HTTP path today is the trusted intel endpoint). **(4) Exit
+  table** (`exit.rs`, M5): the full RFC 0011 §5 table is present; strengthened
+  the tests (distinctness/bands/total mapping) and ticked it. Two of four
+  slices' implementers were caught by the verifiers building against the wrong
+  base branch (`main`, the retired web tree) — only verified-correct code was
+  lifted. No new deps; **168 tests** green, clippy clean (default + all-feats).
+- **Next action:** the **`metrics` feature** (hand-written Prometheus text on an
+  opt-in HTTP surface that doubles as `/healthz`+`/readyz`), then wire the
+  **trifecta chokepoint** (`orchestrator.rs` + `--allow-trifecta` + tool-tag
+  source) to close M6 trifecta acceptance, and `--log-content`/`--aggregate-logs`.
+  Bigger items: **`--serve-mcp` peer listener**, `cron` feature, M3 warm
+  sessions/async-spawn/self-subscribe, M5 drain choreography + cgroup-v2, M7
+  (conformance + observe-suite + container + docs).
+- **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
+  done. M4 still owes `--serve-mcp`/`cron`.
+- **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
+  `isolation: worktree` agents branch from `main` (the retired web tree), NOT
+  the current `rewrite/mcp-native-agent` HEAD; future fan-outs must instruct
+  agents to `git reset --hard rewrite/mcp-native-agent` first (2 of 4 did,
+  unprompted; 2 didn't and were rejected). Live vsock + `--serve-mcp` need a
+  peer/microVM to exercise.
 
 _(The loop updates the lines above every iteration.)_
 
@@ -166,7 +169,7 @@ Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,ti
 Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.rs`
 - [ ] full drain choreography with `AGENTD_DRAIN_TIMEOUT` < grace
 - [x] `obs/health.rs` **supervisor-heartbeat liveness** + `--health-file`: a process-global `tick()` is bumped by every supervisor hot loop (reactor, daemon driver, interval sleep) so liveness reflects the *supervisor* making progress — idle is healthy, a busy/stuck *subagent* doesn't flip it. A 1s writer thread renders `{alive, supervisor_tick_age_ms, mode, draining, ts}` atomically (temp+rename); a K8s exec probe checks `alive`/tick-age freshness. e2e-proven (`tests/daemon_modes.rs`: loop mode writes a live health file). _Opt-in `/healthz`+`/readyz` HTTP surface: later._
-- [ ] complete exit-code table in `exit.rs`
+- [x] complete exit-code table in `exit.rs` — the full RFC 0011 §5 table (0 success, 1 generic, 2 usage, 3 partial, 4 intelligence, 5 semantic/refused, 6 MCP, 7 budget, 124 deadline; 137/143 documented as OS-set), `once_exit` total over every `TerminalStatus`, and tests asserting the mapping, pairwise-distinctness, documented bands, and "non-completed never looks like success". (The supervisor hard-deadline path maps `KillReason::Deadline → 124` in `main.rs`, distinct from the loop's soft budget `7`.)
 - [x] RUN_ID propagation into MCP `_meta` — `McpClient::set_tool_meta` stamps `{"agentd/run_id": …}` onto every `tools/call` `params._meta` (set after initialize in the subagent) so backing services dedupe retries of a run (RFC 0011 §idempotency). Pure builder unit-tested.
 - [ ] cgroup-v2 awareness (read `memory.max`, optional child-cgroup + `cgroup.kill`, `memory.high` backpressure, never required)
 - **Acceptance:** SIGTERM drains within budget → exit **0** (not 143); second SIGTERM forces kill; health file goes stale only when the *supervisor* wedges; each exit code matches the table; stable RUN_ID retried run detects "already done" via backing MCP → exit 0 cheaply; cgroup-writable host → tree reaped by `cgroup.kill`.

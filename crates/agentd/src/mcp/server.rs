@@ -8,11 +8,11 @@
 //! (`subagent.spawn` sync/async, `subagent.send/cancel/status`, RFC §3.2) build
 //! on this transport next.
 
-use crate::json::{self, frame, Id, Incoming, Request, Response};
+use crate::json::{self, frame, Id, Incoming, Notification, Request, Response};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::SpawnPayload;
 use crate::supervisor::reactor::{supervise_cancellable, supervise_once, SuperviseResult};
-use crate::wire::mcp::PROTOCOL_VERSION;
+use crate::wire::mcp::{method, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -60,6 +60,22 @@ struct ServedSession {
 /// threads and each async run's background thread.
 type Registry = Arc<Mutex<HashMap<String, ServedSession>>>;
 
+/// A connection's shared write half — both replies and pushed notifications go
+/// through it, serialized by the Mutex (a reply and a notification can't interleave
+/// bytes).
+type SharedWriter = Arc<Mutex<UnixStream>>;
+
+/// A peer subscribed to an `agentd://` resource: which connection, and the writer
+/// to push a `notifications/resources/updated` to.
+struct Subscriber {
+    conn: u64,
+    writer: SharedWriter,
+}
+
+/// uri → its subscribers. Pushed when a served session's resource changes (a run
+/// reaches a terminal status). Arc-shared with each async run's background thread.
+type SubRegistry = Arc<Mutex<HashMap<String, Vec<Subscriber>>>>;
+
 /// The structured state body for one session (shared by the `subagent.status`
 /// tool and the `agentd://subagent/<handle>` resource).
 fn session_body(handle: &str, s: &ServedSession) -> Value {
@@ -89,6 +105,10 @@ pub struct ServeCtx {
     counter: Arc<AtomicU64>,
     /// Tracked served async runs, by handle.
     sessions: Registry,
+    /// Resource subscriptions, by uri → subscribers (for push notifications).
+    subscriptions: SubRegistry,
+    /// Monotonic per-connection id (to scope + clean up subscriptions).
+    conn_counter: Arc<AtomicU64>,
 }
 
 impl ServeCtx {
@@ -103,6 +123,8 @@ impl ServeCtx {
             inflight: Arc::new(AtomicUsize::new(0)),
             counter: Arc::new(AtomicU64::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            conn_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -169,34 +191,46 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<()> {
 }
 
 fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {
-    let mut write = match stream.try_clone() {
-        Ok(w) => w,
+    // The write half is shared (Arc<Mutex>) so a run thread can push a
+    // notification on it concurrently with this thread writing a reply. A write
+    // timeout bounds a stalled-but-alive peer so it can't pin the writer Mutex
+    // (and a run thread's notification) forever — matching the rest of the crate's
+    // sockets.
+    let writer: SharedWriter = match stream.try_clone() {
+        Ok(w) => {
+            let _ = w.set_write_timeout(Some(ctx.drain_timeout));
+            Arc::new(Mutex::new(w))
+        }
         Err(_) => return,
     };
-    log.info("mcp.connect", json!({"peer": "unix"}));
+    let conn = ctx.conn_counter.fetch_add(1, Ordering::Relaxed);
+    log.info("mcp.connect", json!({"peer": "unix", "conn": conn}));
     let mut reader = BufReader::new(stream);
     while let Ok(Some(bytes)) = frame::read_line(&mut reader) {
         // Requests get a reply; notifications (initialized, …) do not.
         if let Ok(Incoming::Request(req)) = serde_json::from_slice::<Incoming>(&bytes) {
-            let resp = dispatch(req, ctx, log);
-            if frame::write_line(&mut write, &resp).is_err() {
+            let resp = dispatch(req, ctx, &writer, conn, log);
+            let wrote = writer.lock().is_ok_and(|mut w| frame::write_line(&mut *w, &resp).is_ok());
+            if !wrote {
                 break; // peer hung up mid-reply
             }
         }
     }
-    log.debug("mcp.disconnect", json!({"peer": "unix"}));
+    remove_conn_subscriptions(ctx, conn); // don't push to a dead socket
+    log.debug("mcp.disconnect", json!({"peer": "unix", "conn": conn}));
 }
 
-/// Route one JSON-RPC request to a response.
-fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
+/// Route one JSON-RPC request to a response. `writer`/`conn` identify the calling
+/// connection so `resources/subscribe` can register a push target.
+fn dispatch(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn: u64, log: &Logger) -> Response {
     match req.method.as_str() {
         "initialize" => Response::ok(
             req.id,
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                // `resources: {}` (no subscribe yet) advertises the agentd://
-                // read-only resource surface; presence is what a client gates on.
-                "capabilities": {"tools": {}, "resources": {}},
+                // `resources.subscribe` advertises that a peer can subscribe to an
+                // agentd:// resource and be pushed updates (e.g. a run completing).
+                "capabilities": {"tools": {}, "resources": {"subscribe": true}},
                 "serverInfo": {"name": "agentd", "version": crate::VERSION}
             }),
         ),
@@ -208,7 +242,83 @@ fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         "tools/call" => tools_call(req, ctx, log),
         "resources/list" => Response::ok(req.id, json!({"resources": resource_list()})),
         "resources/read" => resources_read(req, ctx),
+        "resources/subscribe" => subscribe_resource(req, ctx, writer, conn),
+        "resources/unsubscribe" => unsubscribe_resource(req, ctx, conn),
         other => Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported method: {other}")),
+    }
+}
+
+/// `resources/subscribe`: register this connection to be pushed a
+/// `notifications/resources/updated` when `uri`'s state changes. Only a
+/// **running** `agentd://subagent/<handle>` is subscribable — its resource
+/// changes exactly once (on completion). An unknown / already-finished handle (or
+/// the read-only `agentd://status`) is rejected so the peer `resources/read`s it
+/// instead; this also avoids storing a subscription that would never fire.
+fn subscribe_resource(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn: u64) -> Response {
+    let uri = req.params.as_ref().and_then(|p| p.get("uri")).and_then(Value::as_str).unwrap_or("");
+    let handle = match crate::agentd_uri::AgentdResource::parse(uri) {
+        Some(crate::agentd_uri::AgentdResource::Subagent(h)) => h,
+        _ => return Response::err(req.id, json::RESOURCE_NOT_FOUND, format!("not a subscribable resource: {uri}")),
+    };
+    {
+        let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match reg.get(&handle) {
+            None => return Response::err(req.id, json::RESOURCE_NOT_FOUND, format!("no such run: {uri}")),
+            Some(s) if s.status.is_terminal() => {
+                return Response::err(req.id, json::RESOURCE_NOT_FOUND, format!("run already finished; resources/read {uri}"));
+            }
+            Some(_) => {} // running → subscribable
+        }
+    } // release the sessions lock before taking the subscriptions lock
+    let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+    let list = subs.entry(uri.to_string()).or_default();
+    if !list.iter().any(|s| s.conn == conn) {
+        list.push(Subscriber { conn, writer: Arc::clone(writer) });
+    }
+    Response::ok(req.id, json!({}))
+}
+
+/// `resources/unsubscribe`: drop this connection's subscription to `uri`.
+fn unsubscribe_resource(req: Request, ctx: &ServeCtx, conn: u64) -> Response {
+    let uri = req.params.as_ref().and_then(|p| p.get("uri")).and_then(Value::as_str).unwrap_or("");
+    let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(list) = subs.get_mut(uri) {
+        list.retain(|s| s.conn != conn);
+        if list.is_empty() {
+            subs.remove(uri);
+        }
+    }
+    Response::ok(req.id, json!({}))
+}
+
+/// Drop every subscription held by a (now-closed) connection.
+fn remove_conn_subscriptions(ctx: &ServeCtx, conn: u64) {
+    let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+    subs.retain(|_uri, list| {
+        list.retain(|s| s.conn != conn);
+        !list.is_empty()
+    });
+}
+
+/// Push `notifications/resources/updated{uri}` to every current subscriber of
+/// `uri`. Best-effort: a write to a dead peer fails and is cleaned up when that
+/// connection's reader loop ends. The subscriptions lock is released before
+/// writing, so a slow/blocked peer can't stall other notifications.
+fn notify_resource_updated(subs: &SubRegistry, uri: &str) {
+    let writers: Vec<SharedWriter> = {
+        let mut g = subs.lock().unwrap_or_else(|e| e.into_inner());
+        // A subagent resource changes exactly once (terminal), so CONSUME the
+        // subscriptions as we fire them — no entry lingers after its one event.
+        match g.remove(uri) {
+            Some(list) => list.into_iter().map(|s| s.writer).collect(),
+            None => return,
+        }
+    };
+    let note = Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({"uri": uri})));
+    for w in writers {
+        if let Ok(mut wl) = w.lock() {
+            let _ = frame::write_line(&mut *wl, &note);
+        }
     }
 }
 
@@ -364,8 +474,14 @@ fn spawn_async(id: Id, ctx: &ServeCtx, log: &Logger, handle: String, payload: Sp
         evict_if_full(&mut reg);
         reg.insert(handle.clone(), ServedSession { status: ServedStatus::Running, cancel: Arc::clone(&cancel), started: Instant::now() });
     }
-    let (exe, drain, sessions, log2, h) =
-        (ctx.exe.clone(), ctx.drain_timeout, Arc::clone(&ctx.sessions), log.clone(), handle.clone());
+    let (exe, drain, sessions, subs, log2, h) = (
+        ctx.exe.clone(),
+        ctx.drain_timeout,
+        Arc::clone(&ctx.sessions),
+        Arc::clone(&ctx.subscriptions),
+        log.clone(),
+        handle.clone(),
+    );
     let spawned = thread::Builder::new()
         .name(format!("served-run:{handle}"))
         .spawn(move || {
@@ -375,10 +491,15 @@ fn spawn_async(id: Id, ctx: &ServeCtx, log: &Logger, handle: String, payload: Sp
             // lock the cancel tool uses, so a cancel that lands while we finish is
             // never lost: either its store happens-before this load (→ a killed run
             // reads Cancelled) or after this write (→ the tool sees terminal + no-ops).
-            let mut reg = sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(s) = reg.get_mut(&h) {
-                s.status = run_to_status(result, cancel.load(Ordering::Relaxed));
+            {
+                let mut reg = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(s) = reg.get_mut(&h) {
+                    s.status = run_to_status(result, cancel.load(Ordering::Relaxed));
+                }
             }
+            // The run finished → its `agentd://subagent/<handle>` resource changed;
+            // push to any subscribers (outside the sessions lock).
+            notify_resource_updated(&subs, &crate::agentd_uri::subagent_uri(&h));
         });
     if spawned.is_err() {
         ctx.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
@@ -605,9 +726,24 @@ mod tests {
         Request::new(Id::Num(1), method, params)
     }
 
+    /// A throwaway connection writer for unit-dispatching (its peer end is
+    /// dropped; the unit tests never push to it, so no write occurs).
+    fn writer() -> SharedWriter {
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        Arc::new(Mutex::new(a))
+    }
+
+    /// Insert a Running session so `subscribe_resource` accepts its handle.
+    fn insert_running(ctx: &ServeCtx, handle: &str) {
+        ctx.sessions.lock().unwrap().insert(
+            handle.to_string(),
+            ServedSession { status: ServedStatus::Running, cancel: Arc::new(AtomicBool::new(false)), started: Instant::now() },
+        );
+    }
+
     #[test]
     fn initialize_declares_tools_capability() {
-        let r = dispatch(req("initialize", None), &ctx(), &log());
+        let r = dispatch(req("initialize", None), &ctx(), &writer(), 0, &log());
         let v = r.result.expect("ok");
         assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
         assert!(v["capabilities"]["tools"].is_object());
@@ -616,7 +752,7 @@ mod tests {
 
     #[test]
     fn tools_list_advertises_status_and_spawn() {
-        let r = dispatch(req("tools/list", None), &ctx(), &log());
+        let r = dispatch(req("tools/list", None), &ctx(), &writer(), 0, &log());
         let tools = r.result.expect("ok")["tools"].clone();
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"status"));
@@ -625,7 +761,7 @@ mod tests {
 
     #[test]
     fn status_call_returns_structured_state() {
-        let r = dispatch(req("tools/call", Some(json!({"name": "status"}))), &ctx(), &log());
+        let r = dispatch(req("tools/call", Some(json!({"name": "status"}))), &ctx(), &writer(), 0, &log());
         let v = r.result.expect("ok");
         assert_eq!(v["isError"], false);
         assert_eq!(v["structuredContent"]["run_id"], "r1");
@@ -634,14 +770,14 @@ mod tests {
 
     #[test]
     fn initialize_declares_resources_capability() {
-        let r = dispatch(req("initialize", None), &ctx(), &log());
+        let r = dispatch(req("initialize", None), &ctx(), &writer(), 0, &log());
         let v = r.result.expect("ok");
         assert!(v["capabilities"]["resources"].is_object(), "resources capability advertised");
     }
 
     #[test]
     fn resources_list_advertises_agentd_status() {
-        let r = dispatch(req("resources/list", None), &ctx(), &log());
+        let r = dispatch(req("resources/list", None), &ctx(), &writer(), 0, &log());
         let resources = r.result.expect("ok")["resources"].clone();
         let uris: Vec<&str> = resources.as_array().unwrap().iter().filter_map(|x| x["uri"].as_str()).collect();
         assert!(uris.contains(&"agentd://status"), "agentd://status listed: {uris:?}");
@@ -649,7 +785,7 @@ mod tests {
 
     #[test]
     fn resources_read_status_returns_a_contents_body() {
-        let r = dispatch(req("resources/read", Some(json!({"uri": "agentd://status"}))), &ctx(), &log());
+        let r = dispatch(req("resources/read", Some(json!({"uri": "agentd://status"}))), &ctx(), &writer(), 0, &log());
         let v = r.result.expect("ok");
         let entry = &v["contents"][0];
         assert_eq!(entry["uri"], "agentd://status");
@@ -662,15 +798,15 @@ mod tests {
 
     #[test]
     fn resources_read_unknown_uri_is_an_error() {
-        let r = dispatch(req("resources/read", Some(json!({"uri": "agentd://ghost"}))), &ctx(), &log());
+        let r = dispatch(req("resources/read", Some(json!({"uri": "agentd://ghost"}))), &ctx(), &writer(), 0, &log());
         assert!(r.error.is_some(), "unknown agentd:// uri → JSON-RPC error");
-        let bad = dispatch(req("resources/read", Some(json!({"uri": "file:///x"}))), &ctx(), &log());
+        let bad = dispatch(req("resources/read", Some(json!({"uri": "file:///x"}))), &ctx(), &writer(), 0, &log());
         assert!(bad.error.is_some(), "non-agentd uri → JSON-RPC error");
     }
 
     #[test]
     fn tools_list_advertises_async_session_tools() {
-        let r = dispatch(req("tools/list", None), &ctx(), &log());
+        let r = dispatch(req("tools/list", None), &ctx(), &writer(), 0, &log());
         let tools = r.result.expect("ok")["tools"].clone();
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"subagent.status"), "{names:?}");
@@ -689,6 +825,8 @@ mod tests {
             let r = dispatch(
                 req("tools/call", Some(json!({"name": tool, "arguments": {"handle": "served.9"}}))),
                 &ctx(),
+                &writer(),
+                0,
                 &log(),
             );
             let v = r.result.expect("ok");
@@ -702,6 +840,8 @@ mod tests {
         let r = dispatch(
             req("resources/read", Some(json!({"uri": "agentd://subagent/served.404"}))),
             &ctx(),
+            &writer(),
+            0,
             &log(),
         );
         assert!(r.error.is_some(), "unknown session uri → JSON-RPC error");
@@ -782,10 +922,75 @@ mod tests {
     }
 
     #[test]
+    fn initialize_declares_subscribe_capability() {
+        let r = dispatch(req("initialize", None), &ctx(), &writer(), 0, &log());
+        assert_eq!(r.result.unwrap()["capabilities"]["resources"]["subscribe"], true);
+    }
+
+    #[test]
+    fn subscribe_registers_and_notify_pushes_to_the_peer() {
+        use std::io::{BufRead, BufReader};
+        let ctx = ctx();
+        insert_running(&ctx, "served.0");
+        // A connected pair: `a` is the peer's write target (what subscribe stores);
+        // `b` is the peer's read end, where the pushed notification lands.
+        let (a, b) = UnixStream::pair().unwrap();
+        let w: SharedWriter = Arc::new(Mutex::new(a));
+        let uri = "agentd://subagent/served.0";
+        assert!(subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7).error.is_none());
+        // dedup: a second subscribe from the same conn doesn't double-register.
+        subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7);
+        assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 1);
+
+        notify_resource_updated(&ctx.subscriptions, uri);
+        let mut reader = BufReader::new(b);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], "notifications/resources/updated");
+        assert_eq!(v["params"]["uri"], uri);
+    }
+
+    #[test]
+    fn unsubscribe_and_conn_cleanup_drop_subscriptions() {
+        let ctx = ctx();
+        let uri = "agentd://subagent/served.1";
+        insert_running(&ctx, "served.1");
+        subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &writer(), 3);
+        subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &writer(), 4);
+        assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 2);
+        unsubscribe_resource(req("unsub", Some(json!({"uri": uri}))), &ctx, 3);
+        assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 1);
+        remove_conn_subscriptions(&ctx, 4); // conn 4 disconnects
+        assert!(ctx.subscriptions.lock().unwrap().get(uri).is_none(), "uri pruned when empty");
+    }
+
+    #[test]
+    fn subscribe_rejects_non_subscribable_uris() {
+        let ctx = ctx();
+        // non-agentd, agentd://status (read-only), and an unknown handle all reject.
+        for uri in ["file:///x", "agentd://status", "agentd://subagent/served.999"] {
+            let r = subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &writer(), 0);
+            assert!(r.error.is_some(), "{uri} must not be subscribable");
+        }
+        // an already-finished run is not subscribable either (read it instead).
+        ctx.sessions.lock().unwrap().insert(
+            "served.5".into(),
+            ServedSession {
+                status: ServedStatus::Done { status: "completed".into(), partial: false, result: json!("ok") },
+                cancel: Arc::new(AtomicBool::new(false)),
+                started: Instant::now(),
+            },
+        );
+        let r = subscribe_resource(req("sub", Some(json!({"uri": "agentd://subagent/served.5"}))), &ctx, &writer(), 0);
+        assert!(r.error.is_some(), "a terminal run is not subscribable");
+    }
+
+    #[test]
     fn unknown_tool_and_method_are_errors() {
-        let bad_tool = dispatch(req("tools/call", Some(json!({"name": "ghost"}))), &ctx(), &log());
+        let bad_tool = dispatch(req("tools/call", Some(json!({"name": "ghost"}))), &ctx(), &writer(), 0, &log());
         assert!(bad_tool.error.is_some());
-        let bad_method = dispatch(req("frobnicate", None), &ctx(), &log());
+        let bad_method = dispatch(req("frobnicate", None), &ctx(), &writer(), 0, &log());
         assert!(bad_method.error.is_some());
     }
 
@@ -805,6 +1010,8 @@ mod tests {
         let r = dispatch(
             req("tools/call", Some(json!({"name": "subagent.spawn", "arguments": {}}))),
             &ctx(),
+            &writer(),
+            0,
             &log(),
         );
         assert!(r.error.is_some(), "missing instruction → JSON-RPC error");

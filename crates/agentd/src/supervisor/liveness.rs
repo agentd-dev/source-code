@@ -51,14 +51,39 @@ impl Health {
 pub struct LivenessConfig {
     pub progress_timeout: Duration,
     pub pong_timeout: Duration,
+    /// How often the supervisor pings each live child. Kept well below
+    /// `pong_timeout` so a *responsive* child answers within the window (its
+    /// control thread replies regardless of what the loop is doing) and stays
+    /// `Busy` rather than reading `Stuck`. Derived, not configured directly.
+    pub ping_interval: Duration,
 }
 
 impl Default for LivenessConfig {
     fn default() -> Self {
-        LivenessConfig {
-            progress_timeout: Duration::from_secs(120),
-            pong_timeout: Duration::from_secs(10),
-        }
+        Self::new(Duration::from_secs(120), Duration::from_secs(10))
+    }
+}
+
+impl LivenessConfig {
+    /// Build from the two timeouts, deriving a ping cadence (≈ a third of the
+    /// pong window, clamped to a sane band).
+    pub fn new(progress_timeout: Duration, pong_timeout: Duration) -> LivenessConfig {
+        let ping_interval = (pong_timeout / 3).clamp(Duration::from_millis(50), Duration::from_secs(5));
+        LivenessConfig { progress_timeout, pong_timeout, ping_interval }
+    }
+
+    /// Optional operator/test tuning via `AGENTD_PROGRESS_TIMEOUT_MS` /
+    /// `AGENTD_PONG_TIMEOUT_MS` (a niche knob — defaults are the production
+    /// values). Used by the chaos suite to exercise stuck-kill quickly.
+    pub fn from_env() -> LivenessConfig {
+        let d = LivenessConfig::default();
+        let ms = |k: &str, fallback: Duration| {
+            std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis).unwrap_or(fallback)
+        };
+        LivenessConfig::new(
+            ms("AGENTD_PROGRESS_TIMEOUT_MS", d.progress_timeout),
+            ms("AGENTD_PONG_TIMEOUT_MS", d.pong_timeout),
+        )
     }
 }
 
@@ -124,7 +149,20 @@ mod tests {
     use super::*;
 
     fn cfg() -> LivenessConfig {
-        LivenessConfig { progress_timeout: Duration::from_secs(100), pong_timeout: Duration::from_secs(10) }
+        LivenessConfig::new(Duration::from_secs(100), Duration::from_secs(10))
+    }
+
+    #[test]
+    fn ping_interval_is_derived_below_the_pong_window_and_clamped() {
+        // ~ a third of the pong window, so a responsive child answers in time.
+        assert_eq!(LivenessConfig::new(Duration::from_secs(100), Duration::from_secs(9)).ping_interval, Duration::from_secs(3));
+        // clamped low: a tiny pong window still pings no faster than 50ms.
+        assert_eq!(LivenessConfig::new(Duration::from_secs(1), Duration::from_millis(30)).ping_interval, Duration::from_millis(50));
+        // clamped high: a huge pong window still pings at least every 5s.
+        assert_eq!(LivenessConfig::new(Duration::from_secs(600), Duration::from_secs(60)).ping_interval, Duration::from_secs(5));
+        // the production default keeps the ping interval under the pong window.
+        let d = LivenessConfig::default();
+        assert!(d.ping_interval < d.pong_timeout);
     }
 
     #[test]

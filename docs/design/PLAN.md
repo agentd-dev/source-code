@@ -72,16 +72,19 @@ cargo clippy -p agentd -- -D warnings # keep clean
   refusals are unit/integration-covered; the live kill path also by the drain
   tests.) **190 default tests** green, clippy clean (default + all-features),
   default build = 3 deps. The full milestone history is in the checklists below.
-- **Next action:** **none — the build is complete; the hourly cron is being
-  disabled per the completion protocol.** What remains is explicitly
-  **deferred-non-blocking scope**, available on request, not part of M1–M7
-  acceptance: M3 warm `Continue` sessions + async `subagent.spawn{async,detach}`;
-  served `subagent.send`/`cancel`/`status` + `agentd://` state resources; the
-  `otel` feature (OTLP export — the one feature allowed heavier deps); cgroup
-  `cgroup.kill`/`memory.high` backpressure (needs a cgroup-v2 host); a standalone
-  `agentd-conformance` crate (reorganises existing e2e coverage); a single-reaper
-  refactor to retire the `SUPERVISE_LOCK` serialization; test-only liveness knobs
-  for a fast live stuck→kill test.
+- **Post-completion (operator asked to work the deferred scope):** **done so far
+  —** (1) **activated the ping/pong liveness detector (Detector C)**: the reactor
+  now pings live children at a derived cadence, so a long model call reads `Busy`
+  (not falsely `Stuck` at 120s) and a frozen child crosses to `Stuck`; (2) added
+  **liveness env knobs** + the **live stuck→kill chaos test** (`chaos_e2e.rs`:
+  SIGSTOP a subagent → `subagent.stuck` → force-kill within budget → exit 124);
+  (3) **fixed a real bug** — a root killed *during* a teardown was misreported as
+  a generic failure (synthetic "exited without a result") instead of the teardown
+  reason, so a stuck-kill now correctly exits 124, not 1. **Still deferred:** M3
+  warm `Continue` sessions + async `subagent.spawn{async,detach}`; served
+  `subagent.send`/`cancel`/`status` + `agentd://` resources; the `otel` feature;
+  cgroup `cgroup.kill`/`memory.high` (cgroup-v2 host); a standalone
+  `agentd-conformance` crate; a single-reaper refactor to retire `SUPERVISE_LOCK`.
 - **Active milestone:** M7 (complete). M1–M6 all complete with acceptance holding.
 - **Blockers:** none. **Build complete** — the hourly cron (`6885e804`) is
   disabled per the completion protocol. Infra-gated checks (real MCP reference

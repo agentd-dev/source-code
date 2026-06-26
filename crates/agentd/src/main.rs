@@ -71,7 +71,8 @@ fn run() -> i32 {
             trace_id: Some(trace_id),
         },
         cfg.log_level,
-    );
+    )
+    .with_content(cfg.log_content);
     log.info(
         "proc.start",
         json!({
@@ -93,6 +94,7 @@ fn run() -> i32 {
             "deadline_ms": cfg.deadline.map(|d| d.as_millis() as u64),
             "max_depth": cfg.max_depth,
             "enable_exec": cfg.enable_exec,
+            "log_content": cfg.log_content,
             "serve_mcp": cfg.serve_mcp.is_some(),
             "intel_scheme": cfg.intelligence.as_deref().and_then(|u| u.split(':').next()),
             "instruction_len": cfg.instruction.as_deref().map_or(0, str::len),
@@ -201,6 +203,7 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             // (resolve is deterministic for a given run id; RFC 0010).
             trace_id: Some(agentd::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id),
             log_level: cfg.log_level.as_str().into(),
+            log_content: cfg.log_content,
         },
         depth: 0,
         enable_exec: cfg.enable_exec,

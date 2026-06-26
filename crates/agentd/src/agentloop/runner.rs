@@ -197,7 +197,14 @@ pub fn run_loop(
             messages.push(Message::Assistant { text: resp.text, tool_calls: tool_calls.clone() });
 
             for tc in &tool_calls {
-                log.info("tool.call", json!({"tool": tc.name, "id": tc.id}));
+                let mut call = json!({"tool": tc.name, "id": tc.id});
+                // Content capture is opt-in (RFC 0010 §2.9): default logs only
+                // the tool name + length; `--log-content` adds the (truncated)
+                // arguments/result body for debugging.
+                if log.content_capture() {
+                    call["args"] = json!(truncate_for_log(&tc.arguments.to_string()));
+                }
+                log.info("tool.call", call);
                 let (content, is_error) = if tc.name == "resource.read" {
                     read_resource_tool(servers, &resources.owner, &tc.arguments)
                 } else {
@@ -206,7 +213,11 @@ pub fn run_loop(
                         None => dispatch_tool(servers, &tool_to_server, &tc.name, &tc.arguments),
                     }
                 };
-                log.info("tool.result", json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()}));
+                let mut result = json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()});
+                if log.content_capture() {
+                    result["content"] = json!(truncate_for_log(&content));
+                }
+                log.info("tool.result", result);
                 messages.push(Message::tool_result(&tc.id, content, is_error));
             }
             continue;
@@ -217,6 +228,22 @@ pub fn run_loop(
         log.info("loop.final", json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}));
         return Ok(Outcome { status: TerminalStatus::Completed, partial: false, result: json!(text) });
     }
+}
+
+/// Max characters of tool content recorded under `--log-content`. Bounds a log
+/// line so a large tool body can't bloat the telemetry stream; the full body
+/// still flows to the model as the observation.
+const CONTENT_LOG_CAP: usize = 4096;
+
+/// Truncate a body for content-capture logging, appending a byte-count marker
+/// when clipped. Char-based so a multi-byte boundary is never split.
+fn truncate_for_log(s: &str) -> String {
+    if s.chars().count() <= CONTENT_LOG_CAP {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(CONTENT_LOG_CAP).collect();
+    t.push_str(&format!("…(+{} more bytes)", s.len().saturating_sub(t.len())));
+    t
 }
 
 /// Build the model's tool catalogue from every connected server, plus a
@@ -427,5 +454,18 @@ mod tests {
     #[test]
     fn loop_abort_display() {
         assert!(LoopAbort::Intel("down".into()).to_string().contains("down"));
+    }
+
+    #[test]
+    fn truncate_for_log_caps_and_marks() {
+        let short = "{\"a\":1}";
+        assert_eq!(truncate_for_log(short), short); // under the cap: verbatim
+        let big = "x".repeat(CONTENT_LOG_CAP + 500);
+        let out = truncate_for_log(&big);
+        assert!(out.len() < big.len());
+        assert!(out.contains("more bytes"), "truncation is marked: {}", &out[out.len() - 32..]);
+        // multi-byte safety: never panics on a char boundary
+        let multi = "é".repeat(CONTENT_LOG_CAP + 10);
+        let _ = truncate_for_log(&multi);
     }
 }

@@ -59,10 +59,9 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** parallel hardening pass across M2/M5/M6 — a Workflow fan-out (4
-  isolated worktree slices, each adversarially verified) landed the **restart
-  governor**, the **lethal-trifecta check**, the **SSRF classifier**, and
-  confirmed/strengthened the **exit-code table**.
+- **Phase:** M6 observability depth — **`--log-content`** (opt-in content
+  capture) landed this wake, on top of the prior parallel hardening pass
+  (restart governor, lethal-trifecta check, SSRF classifier, exit-code table).
 - **Last completed (this wake):** reconciled the verified worktree slices onto
   the branch. **(1) Restart governor** (`supervisor/restart.rs`, M2): pure
   backoff + capped jitter + circuit breaker + crash-on-spawn, wired into
@@ -80,10 +79,11 @@ cargo clippy -p agentd -- -D warnings # keep clean
 - **Next action:** the **`metrics` feature** (hand-written Prometheus text on an
   opt-in HTTP surface that doubles as `/healthz`+`/readyz`), then wire the
   **trifecta chokepoint** (`orchestrator.rs` + `--allow-trifecta` + tool-tag
-  source) to close M6 trifecta acceptance, and `--log-content`/`--aggregate-logs`.
-  Bigger items: **`--serve-mcp` peer listener**, `cron` feature, M3 warm
-  sessions/async-spawn/self-subscribe, M5 drain choreography + cgroup-v2, M7
-  (conformance + observe-suite + container + docs).
+  source — note the design Q: how the process-global flag reaches the
+  in-subagent orchestrator without enabling self-escalation), then
+  `--aggregate-logs`. Bigger items: **`--serve-mcp` peer listener**, `cron`
+  feature, M3 warm sessions/async-spawn/self-subscribe, M5 drain choreography +
+  cgroup-v2, M7 (conformance + observe-suite + container + docs).
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -179,7 +179,8 @@ Modules: `obs/{trace,metrics}.rs`; extends `obs/log.rs sec/scope.rs net/http.rs`
 - [x] **W3C trace-context propagation** (default-on, dependency-free) in `obs/trace.rs`: one `trace_id` per run — ingested from an upstream `--traceparent`/`AGENTD_TRACEPARENT` or minted deterministically from the run id — stamped on every log line (supervisor + every subagent), carried in the spawn payload (children inherit), and emitted as `_meta.traceparent` on MCP tool calls. Only OTLP *export* is otel-gated. e2e-proven (`tests/reactive_e2e.rs`: the upstream trace id appears on both `comp:supervisor` and `comp:agent` lines).
 - [x] **LLM `traceparent` header**: the run's `trace_id` threaded into the intel client (`set_trace_id`); every completion carries a fresh-span `traceparent` so the LLM call joins the run's trace (unit-tested `apply_trace_header`).
 - [x] **full closed event vocabulary emitted across supervisor + agent**: closed the §2.9 gaps — `config.loaded` (validated policy; content-off, lengths/schemes only), `mcp.connect` success (supervisor + subagent), `proc.ready`, `loop.step` (per-turn budget anchor), `subagent.stuck` (distinct liveness verdict); aligned `reactive.armed`/`schedule.armed` → canonical `trigger.armed`. Observe-proven in a live reactive run.
-- [ ] `--aggregate-logs` (mode B) + `--log-content` (redaction-aware)
+- [x] `--log-content` (content capture, opt-in) — off by default (telemetry logs lengths only); `--log-content`/`AGENTD_LOG_CONTENT` adds the truncated tool args/results. Rides in the `Telemetry` block so it propagates to every child; `config.loaded` reports the policy; `Logger::content_capture()` gates the `tool.call`/`tool.result` content. Observe-proven (live run shows `log_content:true`). _(Redaction allowlist for secret-bearing tool args: a follow-up.)_
+- [ ] `--aggregate-logs` (mode B) — forward child telemetry up the control channel for single-stream environments
 - [~] `sec/scope.rs` Rule-of-Two tag check — **pure check landed**: `TrifectaTag` (untrusted-input / sensitive-data / egress) + `check_trifecta(tags, allow) → Ok | RefusedTrifecta | AllowedWithWarning` (any two legs ok; all three refused unless `allow_trifecta`), 9 unit tests. _Remaining to close acceptance: the operator tool→tag source (MCP server config), the chokepoint call in `subagent/orchestrator.rs::spawn` (refuse as tool-result + `scope.trifecta_grant` warn event), and the process-global `--allow-trifecta` flag (must NOT propagate into child payloads)._
 - [~] SSRF guard — **pure classifier landed** in `net/ssrf.rs`: `is_global(IpAddr)` + `guard_host(host, allow_private)` reject loopback / RFC-1918 / link-local / ULA / unspecified / multicast / IPv4-mapped equivalents, 18 unit tests. _Not wired to a default-on call site: agentd's only HTTP client path is the operator-configured (trusted) intelligence endpoint, frequently localhost — blocking it would be wrong. The guard is ready for any future model/agent-supplied-URL fetcher, which MUST route through `guard_host` (acceptance "refuses RFC-1918 by default" applies there)._
 - [ ] `metrics` feature (Prometheus text); `otel` feature (OTLP + GenAI semconv, HTTP exporter)

@@ -147,6 +147,7 @@ fn build_logger(payload: &SpawnPayload) -> Logger {
         },
         level,
     )
+    .with_content(t.log_content)
 }
 
 fn send_up(up: &Up, msg: &AgentMsg) {

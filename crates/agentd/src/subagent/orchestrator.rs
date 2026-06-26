@@ -115,6 +115,8 @@ impl Orchestrator {
                 agent_path: child_path.clone(),
                 trace_id: self.trace_id.clone(),
                 log_level: self.log_level.clone(),
+                // Content-capture policy flows down the tree (RFC 0010 §2.9).
+                log_content: self.log.content_capture(),
             },
             depth: self.parent_depth + 1,
             enable_exec: self.enable_exec,
@@ -251,6 +253,7 @@ mod tests {
                 agent_path: "0".into(),
                 trace_id: None,
                 log_level: "error".into(),
+                log_content: false,
             },
             depth,
             enable_exec: false,

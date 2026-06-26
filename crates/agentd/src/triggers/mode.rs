@@ -296,6 +296,7 @@ mod tests {
                 agent_path: "0".into(),
                 trace_id: None,
                 log_level: "error".into(),
+                log_content: false,
             },
             depth: 0,
             enable_exec: false,

@@ -7,7 +7,6 @@ name = "agentd"
 version = "0.1.0"
 dependencies = [
  "libc",
- "mio",
  "rustls",
  "serde",
  "serde_json",
@@ -196,18 +195,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "mio"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
-dependencies = [
- "libc",
- "log",
- "wasi",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

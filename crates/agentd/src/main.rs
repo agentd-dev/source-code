@@ -159,6 +159,11 @@ fn run() -> i32 {
             if let Some(addr) = &cfg.metrics_addr {
                 serve_metrics(addr, &log);
             }
+            // Opt-in served self-MCP for composability (RFC 0005). Built only
+            // with `--features serve-mcp`; otherwise `--serve-mcp` warns + is inert.
+            if let Some(spec) = &cfg.serve_mcp {
+                serve_self_mcp(spec, &cfg, &log);
+            }
             match cfg.mode {
                 Mode::Reactive => run_reactive(exe, root_payload(&cfg), &cfg, &log),
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
@@ -179,6 +184,25 @@ fn serve_metrics(addr: &str, log: &Logger) {
 #[cfg(not(feature = "metrics"))]
 fn serve_metrics(addr: &str, log: &Logger) {
     log.warn("metrics.unavailable", json!({"addr": addr, "reason": "built without --features metrics"}));
+}
+
+/// Start the served self-MCP (composability, RFC 0005), or warn this build can't.
+#[cfg(feature = "serve-mcp")]
+fn serve_self_mcp(spec: &str, cfg: &Config, log: &Logger) {
+    let path = spec.strip_prefix("unix:").unwrap_or(spec);
+    let ctx = agentd::mcp::server::ServeCtx {
+        run_id: cfg.run_id.clone(),
+        mode: cfg.mode.as_str().to_string(),
+        started: std::time::Instant::now(),
+    };
+    if let Err(e) = agentd::mcp::server::serve(path, ctx, log.clone()) {
+        log.error("mcp.serve_fail", json!({"path": path, "err": e.to_string()}));
+    }
+}
+
+#[cfg(not(feature = "serve-mcp"))]
+fn serve_self_mcp(spec: &str, _cfg: &Config, log: &Logger) {
+    log.warn("mcp.serve_unavailable", json!({"spec": spec, "reason": "built without --features serve-mcp"}));
 }
 
 /// One-shot mode: spawn + supervise a root subagent that runs the agentic

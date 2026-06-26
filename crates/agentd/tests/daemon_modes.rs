@@ -63,6 +63,45 @@ fn loop_mode_fires_runs_then_drains_to_exit_0_on_sigterm() {
 
 #[test]
 #[cfg(unix)]
+fn reactive_mode_drains_to_exit_0_on_sigterm() {
+    // The reactive daemon must, on SIGTERM, stop accepting work, unsubscribe,
+    // and exit 0 — the same cloud-native drain contract as loop/schedule.
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
+    let mut child = Command::new(exe)
+        .args([
+            "--mode", "reactive", "--instruction", "react", "--intelligence",
+            "unix:/nonexistent.sock", "--subscribe", "file:///in.json", "--mcp", &mcp,
+            "--log-level", "info",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd reactive");
+
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        stderr.read_to_string(&mut s).ok();
+        s
+    });
+
+    // Let it subscribe + reach readiness, then request a graceful shutdown.
+    std::thread::sleep(Duration::from_millis(900));
+    sigterm(child.id());
+    let status = child.wait().expect("wait for agentd");
+    let out = reader.join().unwrap_or_default();
+
+    assert_eq!(status.code(), Some(0), "expected graceful exit 0; stderr:\n{out}");
+    assert!(out.contains(r#""event":"proc.ready""#), "reactive never became ready:\n{out}");
+    assert!(
+        out.contains(r#""reason":"drain""#) && out.contains(r#""mode":"reactive""#),
+        "no reactive graceful drain logged:\n{out}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn daemon_writes_a_live_health_file() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");

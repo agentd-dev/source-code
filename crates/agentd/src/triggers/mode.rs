@@ -22,6 +22,7 @@ use crate::subagent::protocol::{SeedMessage, SpawnPayload};
 use crate::supervisor::reactor::{supervise_once, SuperviseResult};
 use crate::supervisor::restart::{RestartAction, RestartConfig, RestartGovernor};
 use crate::triggers::router::{Disposition, Route, Router};
+use crate::triggers::warm::WarmRegistry;
 use crate::wire::mcp::method;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -59,15 +60,22 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
         }
     }
 
-    // v1: every subscription routes to a fresh Spawn. Continue/warm sessions later.
-    let routes: Vec<Route> =
+    // `--subscribe` URIs route to a fresh Spawn per event; `--continue` URIs
+    // route to one warm session (Disposition::Continue, session_id = the URI),
+    // RFC 0008 §spawn-vs-continue.
+    let mut routes: Vec<Route> =
         cfg.subscribe.iter().map(|u| Route::new(u, Disposition::Spawn, DEBOUNCE)).collect();
+    routes.extend(
+        cfg.continue_subscribe.iter().map(|u| Route::new(u, Disposition::Continue(u.clone()), DEBOUNCE)),
+    );
     let mut router = Router::new(routes);
+    let mut warm = WarmRegistry::default();
 
-    // Subscribe each URI on the first connected server that supports it; track
-    // which server owns each URI so we read it back from the same place.
+    // Subscribe each URI (spawn + continue alike) on the first connected server
+    // that supports it; track which server owns each URI so we read it back from
+    // the same place.
     let mut owner: HashMap<String, usize> = HashMap::new();
-    for uri in &cfg.subscribe {
+    for uri in cfg.subscribe.iter().chain(&cfg.continue_subscribe) {
         let mut armed = false;
         for (i, s) in servers.iter().enumerate() {
             if s.capabilities().supports_subscribe() {
@@ -115,6 +123,16 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     loop {
         crate::obs::health::tick();
         if signals::draining() {
+            // Wind down warm sessions gracefully (cancel → let them emit a
+            // terminal Result + exit, bounded by the drain timeout), then drop
+            // any stragglers (kill + reap).
+            warm.cancel_all(log);
+            let deadline = Instant::now() + cfg.drain_timeout;
+            while !warm.is_empty() && Instant::now() < deadline {
+                let _ = warm.drain(log);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            warm.clear();
             for (uri, &i) in &owner {
                 let _ = servers[i].unsubscribe(uri); // best-effort
             }
@@ -139,16 +157,37 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
         // Fire due (debounced) deliveries: notify-then-read, then react.
         for delivery in router.due(now) {
             let content = read_current(&servers, &owner, &delivery.uri).unwrap_or_default();
+            crate::obs::metrics::record_reaction();
             match delivery.disposition {
-                Disposition::Spawn | Disposition::Continue(_) => {
+                Disposition::Spawn => {
+                    // A fresh, independent reaction per event (synchronous v1).
                     let payload = reactive_payload(&base, &delivery.uri, &content);
                     log.info("trigger.fired", json!({"uri": delivery.uri, "bytes": content.len()}));
-                    crate::obs::metrics::record_reaction();
                     if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
                         apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
                     }
                 }
+                Disposition::Continue(session_id) => {
+                    // Deliver into the one warm session for this route (spawn it
+                    // on the first event, inject thereafter). Non-blocking — the
+                    // session's turn outcomes are drained below.
+                    let payload = reactive_payload(&base, &delivery.uri, &content);
+                    let event = changed_message(&delivery.uri, &content);
+                    log.info(
+                        "trigger.fired",
+                        json!({"uri": delivery.uri, "bytes": content.len(), "session": session_id}),
+                    );
+                    if let Err(e) = warm.deliver(&exe, &session_id, payload, &event, log) {
+                        log.error("warm.spawn_fail", json!({"session": session_id, "err": e.to_string()}));
+                    }
+                }
             }
+        }
+
+        // Drain any warm continue-sessions: each completed turn may itself
+        // self-schedule / self-subscribe, applied like a Spawn reaction's.
+        for (_session, outcome) in warm.drain(log) {
+            apply_effects(outcome, &mut wakes, &mut router, &mut owner, &servers, log);
         }
 
         // Fire due self-scheduled wake-ups: each runs its own instruction as a
@@ -410,14 +449,18 @@ fn drain_due_wakes(wakes: &mut Vec<(Instant, String)>, now: Instant) -> Vec<Stri
     due
 }
 
+/// The "resource changed" event message — the user turn a reaction acts on. Used
+/// as a fresh spawn's seed and as a warm session's inject body, so both
+/// dispositions react to the identical event framing. Pure.
+pub fn changed_message(uri: &str, content: &str) -> String {
+    format!("The resource {uri} changed. Its current content is:\n\n{content}")
+}
+
 /// Build the payload for one reaction: the standing instruction plus the
 /// changed resource's current state as context. Pure.
 pub fn reactive_payload(base: &SpawnPayload, uri: &str, content: &str) -> SpawnPayload {
     let mut p = base.clone();
-    p.context_seed = vec![SeedMessage {
-        role: "user".into(),
-        content: format!("The resource {uri} changed. Its current content is:\n\n{content}"),
-    }];
+    p.context_seed = vec![SeedMessage { role: "user".into(), content: changed_message(uri, content) }];
     p
 }
 

@@ -75,6 +75,10 @@ pub struct Config {
     pub mcp_servers: Vec<McpServerSpec>,
     pub mode: Mode,
     pub subscribe: Vec<String>,
+    /// Subscriptions routed to a **warm continue-session** rather than a fresh
+    /// spawn per event: all events on the URI re-enter one live session, in
+    /// order (RFC 0008 §spawn-vs-continue). Repeatable `--continue <uri>`.
+    pub continue_subscribe: Vec<String>,
     pub interval: Option<Duration>,
     pub max_steps: u32,
     pub max_tokens: u64,
@@ -116,6 +120,7 @@ impl Default for Config {
             mcp_servers: Vec::new(),
             mode: Mode::Once,
             subscribe: Vec::new(),
+            continue_subscribe: Vec::new(),
             interval: None,
             max_steps: 50,
             max_tokens: 200_000,
@@ -147,6 +152,7 @@ impl fmt::Debug for Config {
             .field("mcp_servers", &self.mcp_servers)
             .field("mode", &self.mode)
             .field("subscribe", &self.subscribe)
+            .field("continue_subscribe", &self.continue_subscribe)
             .field("interval", &self.interval)
             .field("max_steps", &self.max_steps)
             .field("max_tokens", &self.max_tokens)
@@ -281,6 +287,7 @@ impl Config {
                     c.mode = Mode::parse(&v).ok_or_else(|| usage(format!("invalid --mode: {v}")))?;
                 }
                 "--subscribe" => c.subscribe.push(take("--subscribe")?),
+                "--continue" => c.continue_subscribe.push(take("--continue")?),
                 "--interval" => c.interval = Some(parse_duration(&take("--interval")?).map_err(usage)?),
                 "--cron" => c.cron = Some(take("--cron")?),
                 "--max-steps" => {
@@ -367,8 +374,11 @@ impl Config {
         if self.max_steps == 0 {
             return Err(usage("--max-steps must be > 0".into()));
         }
-        if self.mode == Mode::Reactive && self.subscribe.is_empty() {
-            return Err(usage("--mode reactive requires at least one --subscribe <uri>".into()));
+        if self.mode == Mode::Reactive && self.subscribe.is_empty() && self.continue_subscribe.is_empty() {
+            return Err(usage("--mode reactive requires at least one --subscribe or --continue <uri>".into()));
+        }
+        if !self.continue_subscribe.is_empty() && self.mode != Mode::Reactive {
+            return Err(usage("--continue is only valid with --mode reactive".into()));
         }
         if self.mode == Mode::Schedule && self.interval.is_none() && self.cron.is_none() {
             return Err(usage("--mode schedule requires --interval <dur> or --cron <expr>".into()));
@@ -495,6 +505,7 @@ fn help_text() -> String {
          MODE / TRIGGERS:\n\
          \x20 --mode once|loop|reactive|schedule   (default once)\n\
          \x20 --subscribe <uri>           subscribe to an MCP resource (repeatable)\n\
+         \x20 --continue <uri>            subscribe, routed to one warm session (repeatable)\n\
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
          \x20 --cron <5-field>           schedule on a UTC cron expr (needs --features cron)\n\
          \n\

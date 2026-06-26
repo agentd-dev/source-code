@@ -1,38 +1,41 @@
 # syntax=docker/dockerfile:1
 #
-# agentd appliance image — distroless, nonroot, no shell.
+# agentd minimal appliance image — a fully static musl binary on `scratch`.
 #
-# Built with --all-features (the broadest capability surface) to match
-# docs/operations.md §8.4. A production deployment that needs a narrower
-# surface should compile out the capabilities it doesn't use and build a
-# purpose-built image — the default build already drops outbound HTTP and
-# shell. See docs/configuration.md (Build modes).
+# RFC 0001 / assessment §4 M7: the *default* build is the minimalism target
+# (no async runtime, no TLS, no C toolchain — just serde/serde_json + libc),
+# so it links statically against musl and ships on an empty base: ~1 MB, no
+# shell, no libc, no package manager — nothing to attack or patch.
+#
+# Need a heavier capability surface? Pass FEATURES at build time, e.g.
+#   docker build --build-arg FEATURES=tls,vsock,metrics,serve-mcp .
+# (the rustls `ring` provider stays pure-Rust, no cmake). Reaching the
+# intelligence endpoint over `unix:` to a TLS-terminating sidecar keeps the
+# default, TLS-free, fully static image.
 
 # ---- builder -------------------------------------------------------------
-FROM rust:1.88-bookworm AS builder
-
-# Everything in --all-features is pure Rust except aws-lc-rs (the rustls
-# crypto provider pulled in by `server-tls`), whose C library builds with
-# cmake. GitHub runners ship cmake; this minimal image does not.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends cmake \
- && rm -rf /var/lib/apt/lists/*
-
+FROM rust:1.88-alpine AS builder
+ARG FEATURES=""
+# Alpine's host target IS x86_64-unknown-linux-musl, so the release binary is
+# static. musl-dev supplies the static C runtime stubs the linker references;
+# the build itself is pure Rust (libc *bindings* only — no C is compiled in the
+# default build).
+RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY . .
+# Release profile (workspace Cargo.toml): LTO'd, stripped, size-optimized,
+# panic=abort. Optional features are opt-in via the build arg.
+RUN if [ -n "$FEATURES" ]; then \
+      cargo build --release -p agentd --features "$FEATURES"; \
+    else \
+      cargo build --release -p agentd; \
+    fi
 
-# The release profile (workspace Cargo.toml) is size-optimized, LTO'd,
-# stripped, and panic=abort.
-RUN cargo build --release -p agentd --all-features
-
-# ---- runtime -------------------------------------------------------------
-# distroless/cc — glibc + libgcc, no shell, no package manager. `:nonroot`
-# runs as uid:gid 65532:65532. Same debian12 base as the builder, so the
-# glibc the binary links against matches.
-FROM gcr.io/distroless/cc-debian12:nonroot
-
-COPY --from=builder /build/target/release/agentd /usr/local/bin/agentd
-
+# ---- runtime: scratch ----------------------------------------------------
+FROM scratch
+COPY --from=builder /build/target/release/agentd /agentd
+# Non-root by uid (scratch has no /etc/passwd; the kernel just uses the number).
 USER 65532:65532
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/agentd"]
+# agentd needs INSTRUCTION + an intelligence endpoint (env/flags); an external
+# scheduler (e.g. a k8s operator) drives lifecycle. See docs/deployment.md.
+ENTRYPOINT ["/agentd"]

@@ -1,221 +1,115 @@
-//! Conformance, reliability, and cost suite for the agentd runtime.
+//! Black-box conformance suite for the agentd runtime.
 //!
-//! A *scenario* ([`Scenario`]) declares a workflow, its trigger, canned
-//! intelligence responses, an optional enforced policy, and the
-//! expected outcome / trace / cost. [`run_scenario`] drives the real
-//! engine — see [`harness`] — once per trial and aggregates the trials
-//! into a [`ScenarioReport`].
-//!
-//! The suite is the executable form of the runtime's promises: a
-//! corpus that passes is a runtime that still does what the RFCs say.
-//! Scenarios are tagged against a capability matrix, so corpus
-//! coverage doubles as goal tracking.
+//! The suite is a flat list of named [`Check`]s grouped into [`Category`]
+//! families. Each check drives the real `agentd` binary through a [`Harness`]
+//! and returns an [`Outcome`] — pass, or fail with a diagnostic. The same checks
+//! back both the `#[test]` integration tests (so `cargo test` enforces
+//! conformance) and the `agentd-conformance` runner binary (which renders a
+//! PASS/FAIL report). Nothing here links the agentd library: conformance is
+//! judged against the MCP / JSON-RPC spec and the documented exit-code table,
+//! not against agentd's own types.
 
-pub mod capability;
+pub mod checks;
 pub mod harness;
 pub mod report;
-pub mod scenario;
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+pub use harness::Harness;
+pub use report::Report;
 
-pub use capability::Coverage;
-pub use harness::{Cost, TrialOutcome};
-pub use report::SuiteReport;
-pub use scenario::Scenario;
+/// The conformance families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    /// agentd as an MCP **server** (`--serve-mcp`): the JSON-RPC 2.0 + MCP
+    /// protocol it must speak to peers.
+    McpServer,
+    /// agentd as an MCP **client**: the requests it sends a backing server.
+    McpClient,
+    /// The supervisor contract: the exit-code table, drain, fail-fast.
+    Supervisor,
+    /// The agentic ReAct loop end-to-end: tool calls → execution → final answer.
+    AgentLoop,
+    /// Security posture: trifecta refusal, secret redaction, tool scoping.
+    Security,
+}
 
-/// Aggregate result of running every trial of one scenario.
+impl Category {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Category::McpServer => "mcp-server",
+            Category::McpClient => "mcp-client",
+            Category::Supervisor => "supervisor",
+            Category::AgentLoop => "agent-loop",
+            Category::Security => "security",
+        }
+    }
+}
+
+/// The result of one conformance check.
 #[derive(Debug, Clone)]
-pub struct ScenarioReport {
-    pub name: String,
-    pub capabilities: Vec<String>,
-    pub trials: u32,
-    pub passed_trials: u32,
-    /// The reliability bar this scenario declared, if any (min pass_rate).
-    pub min_pass_rate: Option<f64>,
-    /// One line per failed assertion, prefixed with its trial index.
-    pub failures: Vec<String>,
-    /// Representative per-run cost (trial 0).
-    pub cost: Cost,
-    /// Cost summed across every trial — the denominator-aware figure
-    /// for cost-per-success.
-    pub total_cost: Cost,
-    /// Wall-clock summed across all trials.
-    pub total_latency: Duration,
-    /// Set if the scenario could not be loaded / built / validated —
-    /// distinct from a trial assertion failure.
-    pub load_error: Option<String>,
+pub struct Outcome {
+    pub passed: bool,
+    /// On failure, why; on pass, an optional one-line note.
+    pub detail: String,
 }
 
-impl ScenarioReport {
-    /// Whether the scenario met its contract. With a declared
-    /// `min_pass_rate`, the contract is "≥ that fraction of trials
-    /// passed" (tolerated flakiness); without one it is the strict
-    /// "every trial passed". A load error always fails.
-    pub fn passed(&self) -> bool {
-        if self.load_error.is_some() || self.trials == 0 {
-            return false;
-        }
-        match self.min_pass_rate {
-            Some(floor) => self.pass_rate() + 1e-9 >= floor,
-            None => self.passed_trials == self.trials,
-        }
+impl Outcome {
+    pub fn pass() -> Outcome {
+        Outcome { passed: true, detail: String::new() }
     }
 
-    /// pass^k for this scenario: the strict tau-bench metric — 1.0 iff
-    /// *every* trial passed, else 0.0 — regardless of any tolerated
-    /// `min_pass_rate`. Always the honest reliability number.
-    pub fn pass_k(&self) -> f64 {
-        if self.load_error.is_none() && self.trials > 0 && self.passed_trials == self.trials {
-            1.0
-        } else {
-            0.0
-        }
+    pub fn note(detail: impl Into<String>) -> Outcome {
+        Outcome { passed: true, detail: detail.into() }
     }
 
-    /// The fraction of trials that passed — a *continuous* reliability
-    /// score (unlike all-or-nothing pass^k), used by the reliability
-    /// gate. A scenario that failed to load scores 0.
-    pub fn pass_rate(&self) -> f64 {
-        if self.load_error.is_some() || self.trials == 0 {
-            return 0.0;
-        }
-        self.passed_trials as f64 / self.trials as f64
+    pub fn fail(detail: impl Into<String>) -> Outcome {
+        Outcome { passed: false, detail: detail.into() }
     }
 
-    /// Tokens spent per *passing* trial — the reliability-adjusted cost
-    /// the research calls for. A workflow that burns tokens on trials
-    /// that then fail has a higher cost-per-success than its raw
-    /// per-run cost suggests. `None` when no trial passed (cost bought
-    /// nothing).
-    pub fn cost_per_success(&self) -> Option<f64> {
-        if self.passed_trials == 0 {
-            return None;
-        }
-        Some(self.total_cost.llm_tokens as f64 / self.passed_trials as f64)
+    /// Assert `cond`, failing with `detail` otherwise. Lets a check read as a
+    /// sequence of `require(...)?`-style guards via [`Outcome::and`].
+    pub fn require(cond: bool, detail: impl Into<String>) -> Outcome {
+        if cond { Outcome::pass() } else { Outcome::fail(detail) }
     }
 
-    /// Mean wall-clock per trial.
-    pub fn mean_latency(&self) -> Duration {
-        let n = self.trials.max(1);
-        self.total_latency / n
+    /// Chain: if `self` passed, evaluate `next`; else keep the first failure.
+    pub fn and(self, next: impl FnOnce() -> Outcome) -> Outcome {
+        if self.passed { next() } else { self }
     }
 }
 
-/// Run every trial of an already-parsed scenario and aggregate.
-pub fn run_scenario(scenario: &Scenario) -> ScenarioReport {
-    let mut report = ScenarioReport {
-        name: scenario.name.clone(),
-        capabilities: scenario.capabilities.clone(),
-        trials: scenario.trials.max(1),
-        passed_trials: 0,
-        min_pass_rate: scenario.min_pass_rate,
-        failures: Vec::new(),
-        cost: Cost::default(),
-        total_cost: Cost::default(),
-        total_latency: Duration::ZERO,
-        load_error: None,
-    };
+/// One conformance check: a stable id, its family, what contract it proves, and
+/// the function that drives the harness to verify it.
+pub struct Check {
+    pub id: &'static str,
+    pub category: Category,
+    pub desc: &'static str,
+    pub run: fn(&Harness) -> Outcome,
+}
 
-    let doc = match scenario.workflow_doc() {
-        Ok(d) => d,
+/// Run one check, converting a panic (a failed harness `expect`, a spawn error)
+/// into a check failure rather than aborting the whole suite.
+pub fn run_check(h: &Harness, check: &Check) -> Outcome {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    match catch_unwind(AssertUnwindSafe(|| (check.run)(h))) {
+        Ok(o) => o,
         Err(e) => {
-            report.load_error = Some(e);
-            return report;
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panicked".to_string());
+            Outcome::fail(format!("panicked: {msg}"))
         }
-    };
-
-    // A malformed workflow is a scenario failure, surfaced like the
-    // daemon would (validation before any execution).
-    let vr = agentd::workflow::validate(&doc);
-    if !vr.ok() {
-        let issues = vr
-            .issues
-            .iter()
-            .map(|i| format!("[{}] {}", i.code, i.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        report.load_error = Some(format!("workflow invalid: {issues}"));
-        return report;
-    }
-
-    let start = match scenario.start_name(&doc) {
-        Ok(s) => s,
-        Err(e) => {
-            report.load_error = Some(e);
-            return report;
-        }
-    };
-
-    for trial in 0..report.trials {
-        match harness::run_trial(scenario, &doc, &start, trial) {
-            Ok(o) => {
-                report.total_latency += o.latency;
-                report.total_cost.add(&o.cost);
-                if trial == 0 {
-                    report.cost = o.cost;
-                }
-                if o.passed {
-                    report.passed_trials += 1;
-                } else {
-                    for f in o.failures {
-                        report.failures.push(format!("trial {trial}: {f}"));
-                    }
-                }
-            }
-            Err(e) => report.failures.push(format!("trial {trial}: {e}")),
-        }
-    }
-
-    report
-}
-
-/// Load a scenario file and run it.
-pub fn run_scenario_file(path: &Path) -> ScenarioReport {
-    match Scenario::load(path) {
-        Ok(s) => run_scenario(&s),
-        Err(e) => ScenarioReport {
-            name: path.display().to_string(),
-            capabilities: Vec::new(),
-            trials: 0,
-            passed_trials: 0,
-            min_pass_rate: None,
-            failures: Vec::new(),
-            cost: Cost::default(),
-            total_cost: Cost::default(),
-            total_latency: Duration::ZERO,
-            load_error: Some(e),
-        },
     }
 }
 
-/// Discover and run every scenario under `root`, aggregating into a
-/// [`SuiteReport`].
-pub fn run_corpus(root: &Path) -> std::io::Result<SuiteReport> {
-    let files = discover_scenarios(root)?;
-    let scenarios = files.iter().map(|p| run_scenario_file(p)).collect();
-    Ok(SuiteReport::new(scenarios))
-}
-
-/// Recursively collect scenario `*.toml` files under `root`, sorted.
-pub fn discover_scenarios(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    collect(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            out.push(path);
-        }
-    }
-    Ok(())
+/// Every conformance check across all families, in a stable order.
+pub fn all_checks() -> Vec<Check> {
+    let mut v = Vec::new();
+    v.extend(checks::mcp_server::checks());
+    v.extend(checks::mcp_client::checks());
+    v.extend(checks::supervisor::checks());
+    v.extend(checks::agent_loop::checks());
+    v.extend(checks::security::checks());
+    v
 }

@@ -1,12 +1,12 @@
 # agentd workspace.
 #
 # `crates/agentd` is the runtime — a single binary that is CLI, daemon, and
-# subagent re-exec in one. The conformance suite (crates/agentd-conformance)
-# is reintroduced in M7 once the new surface stabilises; it is kept out of
-# the workspace members until then so the build tracks only the live crate.
+# subagent re-exec in one. `crates/agentd-conformance` is the black-box
+# conformance suite: it drives the real binary (MCP client/server, supervisor,
+# the ReAct loop) and asserts each contract, never linking the agentd library.
 [workspace]
 resolver = "3"
-members = ["crates/agentd"]
+members = ["crates/agentd", "crates/agentd-conformance"]
 
 # Release profile for a distributable single binary: size-optimized, LTO'd,
 # stripped, abort-on-panic. A panic is a bug, not a recoverable state — the

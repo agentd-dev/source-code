@@ -1,12 +1,24 @@
+# agentd conformance suite.
+#
+# A BLACK-BOX validator of the agentd runtime: it knows agentd only as a binary
+# plus the MCP / JSON-RPC 2.0 spec, never linking the agentd library — so it can
+# catch real protocol/behaviour regressions instead of agreeing with the
+# implementation's own types. It drives the real binary (served self-MCP, the
+# backing-MCP client, the supervisor, the ReAct loop) and asserts each contract.
+#
+# Run it two ways:
+#   cargo test -p agentd-conformance      # every check as a #[test]
+#   cargo run  -p agentd-conformance      # the same checks → a PASS/FAIL report
 [package]
 name = "agentd-conformance"
 version = "1.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Conformance, reliability, and benchmark suite for the agentd runtime"
+description = "Black-box conformance suite for the agentd runtime (MCP client/server + supervisor + agent loop)"
 license = "MIT"
-repository = "https://github.com/agentd-dev/source-code"
 publish = false
+# `cargo run -p agentd-conformance` → the report runner (not the confmcp helper).
+default-run = "agentd-conformance"
 
 [lib]
 name = "agentd_conformance"
@@ -16,21 +28,13 @@ path = "src/lib.rs"
 name = "agentd-conformance"
 path = "src/main.rs"
 
+# A minimal recording MCP reference server, used by the MCP-client conformance
+# family to capture exactly what agentd sends a backing server.
+[[bin]]
+name = "confmcp"
+path = "src/bin/confmcp.rs"
+
 [dependencies]
-# The runtime under test. `tools-http` is enabled so the corpus can
-# exercise the http_request node (the exfil-denial scenario). We do NOT
-# pull tools-shell / tools-mcp: workspace feature unification would then
-# run agentd's Unix-only shell tests under `cargo test --workspace` on
-# macOS / Windows, where they don't apply. Those families are exercised
-# by the agentd feature-matrix job instead.
-agentd = { path = "../agentd", features = ["tools-http"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = { version = "0.8", default-features = false, features = ["parse"] }
-
-[dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-
-[[bench]]
-name = "engine"
-harness = false
+# Only for SIGTERM (graceful daemon drain) + reaping in the harness.
+libc = "0.2"

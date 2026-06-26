@@ -78,9 +78,26 @@ pub struct ScheduleRequest {
     pub instruction: String,
 }
 
-/// A finished run: its terminal status, whether the result body is partial,
-/// the distilled result value, and any self-scheduled future wake-ups.
-/// RFC 0007 / RFC 0009 §result.
+/// A resource (un)subscription an agent requested for itself via the
+/// `subscribe`/`unsubscribe` self-tools (RFC 0008 §self-scheduling). The
+/// reactive daemon applies it to its live subscriptions + router after the run,
+/// so an agent can widen or narrow what wakes it. Honoured only under a daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionRequest {
+    pub uri: String,
+    pub action: SubscriptionAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionAction {
+    Subscribe,
+    Unsubscribe,
+}
+
+/// A finished run: its terminal status, whether the result body is partial, the
+/// distilled result value, and any self-requested future wake-ups / resource
+/// (un)subscriptions. RFC 0007 / RFC 0009 §result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub status: TerminalStatus,
@@ -92,6 +109,10 @@ pub struct Outcome {
     /// the model called `schedule`; acted on only by a daemon supervisor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled: Vec<ScheduleRequest>,
+    /// Resource (un)subscriptions the agent requested for itself (RFC 0008).
+    /// Empty unless the model called `subscribe`/`unsubscribe`; daemon-applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<SubscriptionRequest>,
 }
 
 #[cfg(test)]

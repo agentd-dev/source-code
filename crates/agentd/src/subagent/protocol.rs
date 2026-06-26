@@ -196,6 +196,7 @@ mod tests {
                 partial: false,
                 result: json!("done"),
                 scheduled: Vec::new(),
+                subscriptions: Vec::new(),
             },
         };
         let s = serde_json::to_string(&result).unwrap();

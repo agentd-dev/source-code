@@ -12,7 +12,7 @@
 //! at a time) and treats every route as `Spawn`; warm `Continue` sessions and
 //! concurrent reactions land later this milestone.
 
-use crate::agentloop::stop::ScheduleRequest;
+use crate::agentloop::stop::{Outcome, ScheduleRequest, SubscriptionAction};
 use crate::config::Config;
 use crate::exit;
 use crate::mcp::client::McpClient;
@@ -144,8 +144,9 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                     let payload = reactive_payload(&base, &delivery.uri, &content);
                     log.info("trigger.fired", json!({"uri": delivery.uri, "bytes": content.len()}));
                     crate::obs::metrics::record_reaction();
-                    let scheduled = react(&exe, &payload, cfg.drain_timeout, log);
-                    arm_wakes(&mut wakes, scheduled, Instant::now(), log);
+                    if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
+                        apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
+                    }
                 }
             }
         }
@@ -157,8 +158,9 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
             let payload = scheduled_payload(&base, &instruction);
             log.info("trigger.fired", json!({"kind": "self_schedule", "instruction_len": instruction.len()}));
             crate::obs::metrics::record_reaction();
-            let scheduled = react(&exe, &payload, cfg.drain_timeout, log);
-            arm_wakes(&mut wakes, scheduled, Instant::now(), log);
+            if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
+                apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
+            }
         }
 
         std::thread::sleep(TICK);
@@ -266,24 +268,68 @@ fn sleep_interruptible(dur: Duration) {
 }
 
 /// Spawn + supervise one reaction synchronously, logging the outcome and
-/// returning any future wake-ups the reaction scheduled for itself (RFC 0008).
-fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) -> Vec<ScheduleRequest> {
+/// returning its `Outcome` (only when it completed) so the daemon can apply the
+/// agent's self-scheduling / self-subscription requests (RFC 0008).
+fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) -> Option<Outcome> {
     match supervise_once(exe.to_path_buf(), payload, drain, log.clone()) {
         Ok(SuperviseResult::Completed(o)) => {
             log.info("reactive.handled", json!({"status": o.status.as_str()}));
-            o.scheduled
+            Some(o)
         }
         Ok(SuperviseResult::Failed(e)) => {
             log.error("reactive.failed", json!({"err": e}));
-            Vec::new()
+            None
         }
         Ok(SuperviseResult::Killed(r)) => {
             log.warn("reactive.killed", json!({"reason": format!("{r:?}")}));
-            Vec::new()
+            None
         }
         Err(e) => {
             log.error("reactive.spawn_fail", json!({"err": e.to_string()}));
-            Vec::new()
+            None
+        }
+    }
+}
+
+/// Apply a completed reaction's self-requests: arm its scheduled wake-ups and
+/// add/remove its resource subscriptions on the live router + servers (RFC 0008).
+fn apply_effects(
+    o: Outcome,
+    wakes: &mut Vec<(Instant, String)>,
+    router: &mut Router,
+    owner: &mut HashMap<String, usize>,
+    servers: &[McpClient],
+    log: &Logger,
+) {
+    arm_wakes(wakes, o.scheduled, Instant::now(), log);
+    for req in o.subscriptions {
+        match req.action {
+            SubscriptionAction::Subscribe => {
+                if router.has_exact(&req.uri) {
+                    continue; // already watched
+                }
+                let armed = servers.iter().enumerate().any(|(i, s)| {
+                    if s.capabilities().supports_subscribe() && s.subscribe(&req.uri).is_ok() {
+                        owner.insert(req.uri.clone(), i);
+                        router.add_route(Route::new(&req.uri, Disposition::Spawn, DEBOUNCE));
+                        log.info("trigger.armed", json!({"kind": "self_subscribe", "uri": req.uri, "server": s.name()}));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !armed {
+                    log.warn("subscribe.unsupported", json!({"uri": req.uri, "kind": "self_subscribe"}));
+                }
+            }
+            SubscriptionAction::Unsubscribe => {
+                if let Some(i) = owner.remove(&req.uri) {
+                    let _ = servers[i].unsubscribe(&req.uri);
+                }
+                if router.remove_exact(&req.uri) > 0 {
+                    log.info("unsubscribe", json!({"uri": req.uri, "kind": "self_subscribe"}));
+                }
+            }
         }
     }
 }

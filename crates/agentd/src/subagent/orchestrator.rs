@@ -19,7 +19,7 @@
 //! own children); per-child token/step/deadline limits still apply.
 
 use crate::agentloop::action::SelfHandler;
-use crate::agentloop::stop::ScheduleRequest;
+use crate::agentloop::stop::{ScheduleRequest, SubscriptionAction, SubscriptionRequest};
 use crate::config::McpServerSpec;
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{IntelConfig, Limits, SeedMessage, SpawnPayload, Telemetry};
@@ -39,6 +39,8 @@ const MAX_SCHEDULED: usize = 8;
 /// Bounds on a self-scheduled delay (≥ 1s; ≤ 30 days so `now + delay` is safe).
 const MIN_SCHEDULE_SECS: u64 = 1;
 const MAX_SCHEDULE_SECS: u64 = 30 * 24 * 3600;
+/// Cap on resource (un)subscriptions an agent may request per run.
+const MAX_SUBSCRIPTIONS: usize = 16;
 
 pub struct Orchestrator {
     exe: PathBuf,
@@ -57,6 +59,8 @@ pub struct Orchestrator {
     /// Future wake-ups the root agent requested via `schedule` this run; drained
     /// into the run's `Outcome` for a daemon supervisor to arm (RFC 0008).
     scheduled: Vec<ScheduleRequest>,
+    /// Resource (un)subscriptions the root agent requested this run (RFC 0008).
+    subscriptions: Vec<SubscriptionRequest>,
     log: Logger,
 }
 
@@ -82,8 +86,28 @@ impl Orchestrator {
             enable_exec: payload.enable_exec,
             drain_timeout,
             scheduled: Vec::new(),
+            subscriptions: Vec::new(),
             log,
         }
+    }
+
+    /// Request a resource (un)subscription for the daemon to apply after this
+    /// run (RFC 0008). Bounded; refused-as-tool-result, never crashes.
+    fn subscription(&mut self, action: SubscriptionAction, args: &Value) -> (String, bool) {
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
+            return refused("maximum self-subscription changes reached for this run");
+        }
+        let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+        if uri.is_empty() {
+            return ("error: subscribe/unsubscribe requires a non-empty 'uri'".into(), true);
+        }
+        let verb = match action {
+            SubscriptionAction::Subscribe => "subscribe",
+            SubscriptionAction::Unsubscribe => "unsubscribe",
+        };
+        self.subscriptions.push(SubscriptionRequest { uri: uri.to_string(), action });
+        self.log.info("self.subscribe", json!({"action": verb, "uri": uri}));
+        (format!("requested: the daemon will {verb} {uri} after this run"), false)
     }
 
     /// Queue a future self-wake-up (RFC 0008 §self-scheduling). Bounded; refused
@@ -191,10 +215,13 @@ impl SelfHandler for Orchestrator {
         if self.can_nest() {
             t.push(spawn_tool_def());
         }
-        // Self-scheduling is a root-agent capability: a nested child's request
-        // would be lost to its parent, which only distills the child's result.
+        // Self-scheduling + self-subscription are root-agent capabilities: a
+        // nested child's request would be lost to its parent, which only
+        // distills the child's result.
         if self.parent_depth == 0 {
             t.push(schedule_tool_def());
+            t.push(subscribe_tool_def());
+            t.push(unsubscribe_tool_def());
         }
         // The gated exec tool — only when --enable-exec was set (RFC 0012).
         if self.enable_exec {
@@ -207,6 +234,12 @@ impl SelfHandler for Orchestrator {
         match name {
             "subagent.spawn" => Some(self.spawn(args)),
             "schedule" if self.parent_depth == 0 => Some(self.schedule(args)),
+            "subscribe" if self.parent_depth == 0 => {
+                Some(self.subscription(SubscriptionAction::Subscribe, args))
+            }
+            "unsubscribe" if self.parent_depth == 0 => {
+                Some(self.subscription(SubscriptionAction::Unsubscribe, args))
+            }
             "exec" if self.enable_exec => {
                 Some(crate::sec::exec::handle_call(args, crate::sec::exec::DEFAULT_TIMEOUT))
             }
@@ -216,6 +249,10 @@ impl SelfHandler for Orchestrator {
 
     fn take_scheduled(&mut self) -> Vec<ScheduleRequest> {
         std::mem::take(&mut self.scheduled)
+    }
+
+    fn take_subscriptions(&mut self) -> Vec<SubscriptionRequest> {
+        std::mem::take(&mut self.subscriptions)
     }
 }
 
@@ -278,6 +315,35 @@ fn schedule_tool_def() -> ToolDef {
                 "instruction": {"type": "string", "description": "what the woken agent should do"}
             },
             "required": ["after_seconds", "instruction"]
+        }),
+    }
+}
+
+fn subscribe_tool_def() -> ToolDef {
+    ToolDef {
+        name: "subscribe".into(),
+        description: "Subscribe yourself to an MCP resource by uri. When that resource changes, \
+            agentd wakes you with its current content — so you can watch something and react to it \
+            later instead of polling. Effective only when agentd runs as a long-lived daemon."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"uri": {"type": "string", "description": "the resource uri to watch"}},
+            "required": ["uri"]
+        }),
+    }
+}
+
+fn unsubscribe_tool_def() -> ToolDef {
+    ToolDef {
+        name: "unsubscribe".into(),
+        description: "Stop watching an MCP resource you previously subscribed to (by uri). Use this \
+            when you no longer need to react to its changes."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"uri": {"type": "string", "description": "the resource uri to stop watching"}},
+            "required": ["uri"]
         }),
     }
 }
@@ -350,12 +416,34 @@ mod tests {
 
     #[test]
     fn advertises_tool_with_depth_budget() {
-        // The root (depth 0) advertises delegation + self-scheduling.
+        // The root (depth 0) advertises delegation + self-scheduling + self-subscribe.
         let o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
         let tools = o.tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"subagent.spawn"));
         assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"subscribe"));
+        assert!(names.contains(&"unsubscribe"));
+    }
+
+    #[test]
+    fn subscribe_is_root_only_and_accumulates() {
+        // A nested child does not get the self-subscription tools.
+        let mut child = Orchestrator::from_payload("agentd".into(), &payload(1, 4), Duration::from_secs(5), logger());
+        assert!(!child.tools().iter().any(|t| t.name == "subscribe"));
+        assert!(child.handle("subscribe", &json!({"uri": "file:///x"})).is_none());
+
+        // The root accumulates subscribe/unsubscribe requests, drained by take.
+        let mut root = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        assert!(!root.handle("subscribe", &json!({"uri": "file:///watch"})).unwrap().1);
+        assert!(!root.handle("unsubscribe", &json!({"uri": "file:///old"})).unwrap().1);
+        assert!(root.handle("subscribe", &json!({"uri": "  "})).unwrap().1, "empty uri → error");
+        let drained = root.take_subscriptions();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].uri, "file:///watch");
+        assert_eq!(drained[0].action, SubscriptionAction::Subscribe);
+        assert_eq!(drained[1].action, SubscriptionAction::Unsubscribe);
+        assert!(root.take_subscriptions().is_empty(), "take drains");
     }
 
     #[test]

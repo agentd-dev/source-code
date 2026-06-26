@@ -76,6 +76,12 @@ impl Route {
     pub fn new(pattern: &str, disposition: Disposition, debounce: Duration) -> Route {
         Route { matcher: Match::parse(pattern), disposition, debounce }
     }
+
+    /// Whether this route is an exact match for `uri` — used for dynamic
+    /// self-subscribe dedup + unsubscribe (RFC 0008 §self-scheduling).
+    fn is_exact(&self, uri: &str) -> bool {
+        matches!(&self.matcher, Match::Exact(u) if u == uri)
+    }
 }
 
 /// A debounced, ready-to-act delivery.
@@ -103,6 +109,26 @@ impl Router {
     /// metrics/logs — never silently lost).
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Whether an exact route for `uri` already exists (dedup a self-subscribe).
+    pub fn has_exact(&self, uri: &str) -> bool {
+        self.routes.iter().any(|r| r.is_exact(uri))
+    }
+
+    /// Add a route at runtime — an agent self-subscribing to a resource
+    /// (RFC 0008). The caller dedups via [`Router::has_exact`].
+    pub fn add_route(&mut self, route: Route) {
+        self.routes.push(route);
+    }
+
+    /// Remove every exact route for `uri` (a self-unsubscribe) plus any pending
+    /// delivery for it. Returns the number of routes removed.
+    pub fn remove_exact(&mut self, uri: &str) -> usize {
+        let before = self.routes.len();
+        self.routes.retain(|r| !r.is_exact(uri));
+        self.pending.remove(uri);
+        before - self.routes.len()
     }
 
     /// Record a `notifications/resources/updated` for `uri`. Returns true if a
@@ -231,5 +257,30 @@ mod tests {
         r.on_updated("db://a", t0);
         r.on_updated("db://b", t0 + ms(30));
         assert_eq!(r.next_deadline(), Some(t0 + ms(100))); // from the first event
+    }
+
+    #[test]
+    fn dynamic_self_subscribe_routes_then_unsubscribes() {
+        let mut r = Router::new(vec![]);
+        let t0 = Instant::now();
+        // an unrouted update is dropped
+        assert!(!r.on_updated("file:///watch.json", t0));
+        assert_eq!(r.dropped(), 1);
+
+        // a self-subscribe adds an exact route (deduped)
+        assert!(!r.has_exact("file:///watch.json"));
+        r.add_route(Route::new("file:///watch.json", Disposition::Spawn, ms(0)));
+        assert!(r.has_exact("file:///watch.json"));
+
+        // now the same update is owned + delivers
+        assert!(r.on_updated("file:///watch.json", t0));
+        assert_eq!(r.due(t0).len(), 1);
+
+        // a self-unsubscribe removes the route + any pending; later updates drop
+        r.on_updated("file:///watch.json", t0); // arm a pending
+        assert_eq!(r.remove_exact("file:///watch.json"), 1);
+        assert!(!r.has_exact("file:///watch.json"));
+        assert!(r.due(t0).is_empty(), "pending dropped on unsubscribe");
+        assert!(!r.on_updated("file:///watch.json", t0));
     }
 }

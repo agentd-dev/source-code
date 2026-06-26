@@ -55,10 +55,12 @@ pub fn record_restart_tripped() {
     imp::REGISTRY.restarts_tripped.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Render the current counters as Prometheus text exposition format.
+/// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
-    imp::REGISTRY.render()
+    let mut s = imp::REGISTRY.render();
+    s.push_str(&imp::memory_gauges(crate::supervisor::cgroup::snapshot()));
+    s
 }
 
 #[cfg(feature = "metrics")]
@@ -133,6 +135,26 @@ mod imp {
         let _ = writeln!(s, "{name} {value}");
     }
 
+    /// One gauge family (point-in-time value) in Prometheus text format.
+    fn gauge(s: &mut String, name: &str, help: &str, value: u64) {
+        let _ = writeln!(s, "# HELP {name} {help}");
+        let _ = writeln!(s, "# TYPE {name} gauge");
+        let _ = writeln!(s, "{name} {value}");
+    }
+
+    /// Live cgroup v2 memory gauges, emitted only for fields the kernel exposes
+    /// (kept out of `Registry::render` so the counter set stays deterministic).
+    pub(super) fn memory_gauges(mem: crate::supervisor::cgroup::MemorySnapshot) -> String {
+        let mut s = String::new();
+        if let Some(v) = mem.max {
+            gauge(&mut s, "agentd_memory_max_bytes", "cgroup v2 memory.max hard limit (bytes)", v);
+        }
+        if let Some(v) = mem.current {
+            gauge(&mut s, "agentd_memory_current_bytes", "cgroup v2 memory.current usage (bytes)", v);
+        }
+        s
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -154,6 +176,19 @@ mod imp {
             // Every metric carries a HELP + TYPE header (8 counter families).
             assert_eq!(out.matches("# TYPE ").count(), 8);
             assert_eq!(out.matches(" counter\n").count(), 8);
+        }
+
+        #[test]
+        fn memory_gauges_emit_only_present_fields() {
+            use crate::supervisor::cgroup::MemorySnapshot;
+            // a limited cgroup → two gauge families
+            let g = memory_gauges(MemorySnapshot { max: Some(1024), current: Some(512), high: None });
+            assert!(g.contains("# TYPE agentd_memory_max_bytes gauge"));
+            assert!(g.contains("agentd_memory_max_bytes 1024"));
+            assert!(g.contains("agentd_memory_current_bytes 512"));
+            assert_eq!(g.matches(" gauge\n").count(), 2);
+            // no cgroup → no gauge lines (keeps /metrics clean off-cgroup)
+            assert!(memory_gauges(MemorySnapshot::default()).is_empty());
         }
     }
 }

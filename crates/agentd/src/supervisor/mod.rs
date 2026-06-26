@@ -6,3 +6,4 @@ pub mod liveness;
 pub mod kill;
 pub mod restart;
 pub mod budget;
+pub mod cgroup;

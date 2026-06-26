@@ -10,13 +10,11 @@ stop*. This is deliberate (RFC 0008 §2): anything else reproduces the
 This page covers the four modes, then deep-dives the signature mode —
 **reactive** — and time scheduling.
 
-> **Build status.** The config layer (mode parsing, validation, the flag/env
-> surface below) is implemented and the binary validates it at startup. The
-> drivers, router, and MCP client land across M1–M3. Today the binary validates
-> config, logs, and exits with a scaffold notice for run modes. The examples
-> below describe the **intended v1 behavior**; track progress in
-> [`docs/design/PLAN.md`](design/PLAN.md). Where an item is deferred past v1 it
-> is marked **(roadmap)**.
+> **Build status.** The runtime is implemented: config validation, the agentic
+> loop, the supervisor + subagent process tree, the MCP client, all four run
+> modes, the reactive router, and the self-tools / served self-MCP all ship and
+> are covered by tests. The examples below describe live behavior. Where an item
+> is deferred past v1 it is marked **(roadmap)**.
 
 ---
 

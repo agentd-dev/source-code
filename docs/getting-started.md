@@ -14,14 +14,10 @@ instruction in `loop` and `reactive` modes. For the full knob list see
 see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 [RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md).
 
-> **Build status.** agentd is mid-build. The foundation — config parsing +
-> validation, exit codes, JSON-lines logging, signal handling — is live today.
-> The supervisor reactor, MCP client, intelligence client, and the agentic loop
-> land across milestones **M1–M3** in
-> [docs/design/PLAN.md](design/PLAN.md). A validated run currently logs and
-> exits with a "scaffold only" notice (see [Status](#status-what-runs-today)
-> below). The example runs on this page describe the **intended v1 behavior**;
-> where that differs from what runs today it is called out.
+> **Build status.** The agentd runtime is fully implemented — config
+> validation, the agentic loop, the supervisor + subagent process tree, the
+> MCP client, the intelligence client, and all four run modes. The examples on
+> this page run as written.
 
 ---
 
@@ -150,7 +146,7 @@ Three things are wired here:
 
 ### Read the telemetry (stderr) and the result (stdout)
 
-On stderr you get one JSON object per line. The intended v1 run threads a
+On stderr you get one JSON object per line. The run threads a
 `proc.start`, the loop's tool calls, and a terminal `proc.exit` — all stamped
 with the same `run_id`, `agent_id`, `agent_path`, and `comp` correlation tuple:
 
@@ -195,24 +191,11 @@ or runaway loop can never burn unbounded cost. See
 
 ### Status: what runs today
 
-The foundation is live; the loop is not yet. Running the command above **today**
-validates config, logs, and exits with a scaffold notice:
-
-```console
-$ agentd --instruction "summarize /data/report.md" \
-    --intelligence unix:/run/intel.sock \
-    --mcp "fs=mcp-server-fs --root /data"
-{"ts":"2026-06-25T11:18:02.796Z","level":"info","event":"proc.start","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1741188,"version":"0.1.0","mode":"once","mcp_servers":1,"subscribe":0}
-{"ts":"2026-06-25T11:18:02.796Z","level":"warn","event":"proc.exit","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","reason":"not_implemented","detail":"supervisor + agentic loop land in M1-M3"}
-agentd 0.1.0: scaffold only — 'once' mode runs once M1-M3 land (docs/design/PLAN.md)
-$ echo $?
-1
-```
-
-What already behaves per the contract: `--help` and `--version` exit 0; invalid
-config exits **2** in milliseconds with an `agentd: …` message on stderr; valid
-config parses, logs `proc.start`, and exits 1 with the scaffold notice. Track the
-loop landing in [docs/design/PLAN.md](design/PLAN.md).
+The runtime is fully implemented and runs the command above end to end:
+`--help` and `--version` exit 0; invalid config exits **2** in milliseconds with
+an `agentd: …` message on stderr; valid config parses, logs `proc.start`, runs
+the agentic loop, and exits on the agent's terminal status (see the exit-code
+table above).
 
 ---
 
@@ -300,5 +283,5 @@ runtime is built around.
   debounce/coalesce), self-subscribe, and internal `schedule`/cron.
 - **[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md)** — the architecture
   front door; sub-RFCs 0002–0013 cover each mechanism in depth.
-- **[docs/design/PLAN.md](design/PLAN.md)** — current build status and the
-  M1–M3 roadmap for the loop, MCP client, and intelligence client.
+- **[docs/design/PLAN.md](design/PLAN.md)** — the design plan and milestone
+  history for the loop, MCP client, and intelligence client.

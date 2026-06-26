@@ -11,11 +11,10 @@ This is the **intelligence wire** — the model-facing channel. It is
 **categorically not MCP.** Tools come from MCP servers (RFC 0004); this channel
 only carries the LLM request/response. Do not conflate the two.
 
-> **Status (mid-build).** The config layer that parses and validates these
-> flags is implemented and tested; a valid run today logs `proc.start` and exits
-> with a `scaffold only` notice. The transport/adapter/loop machinery lands
-> across M1–M3 — see [`design/PLAN.md`](design/PLAN.md). The examples below
-> describe the **intended v1 behavior** per [RFC 0006](../rfcs/0006-intelligence-transport-and-wire.md).
+> **Status.** The runtime is implemented: config validation, the agentic ReAct
+> loop, the transport/adapter machinery, and the supervisor + subagent process
+> tree all ship and are tested. The examples below describe live behavior per
+> [RFC 0006](../rfcs/0006-intelligence-transport-and-wire.md).
 
 ---
 

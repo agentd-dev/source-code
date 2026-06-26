@@ -511,6 +511,7 @@ fn help_text() -> String {
          \x20 --drain-timeout <dur>       graceful drain budget (default 25s; < pod grace)\n\
          \x20 --health-file <PATH>        liveness heartbeat file\n\
          \x20 --metrics-addr <ADDR>       serve /metrics+/healthz+/readyz (needs --features metrics)\n\
+         \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
     )

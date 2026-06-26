@@ -13,11 +13,8 @@ That symmetry is the whole composition story: an agentd is just an MCP server
 that happens to also be an MCP client, so agentds nest and drive each other with
 no special-case protocol.
 
-> **Build status.** The binary today validates config, logs structured JSON,
-> and exits with a scaffold notice for the run modes; the MCP client lands in
-> M2 and the self-MCP server / subagent tools in M3. See
-> [`docs/design/PLAN.md`](design/PLAN.md) for milestone state. This page
-> documents the **intended v1 behavior** per RFCs
+> **Status.** The MCP client and the self-MCP server / subagent tools are
+> implemented and tested. This page documents shipped behavior per RFCs
 > [0004](../rfcs/0004-mcp-client-subset-and-codec.md) and
 > [0005](../rfcs/0005-self-mcp-server-and-control-protocol.md). Items marked
 > **(roadmap)** are explicitly deferred past v1.

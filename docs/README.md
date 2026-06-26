@@ -16,11 +16,10 @@ in [`design/`](design/) — [`00-architecture-assessment.md`](design/00-architec
 is the binding decision record and [`PLAN.md`](design/PLAN.md) tracks build
 status and the M1–M3 milestones.
 
-> **Status.** agentd is under active rewrite. The foundation (config parse +
-> validate, exit codes, JSON-lines logging, signals) is live; the supervisor
-> reactor, MCP client, intelligence client, and agentic loop land across
-> milestones — see [`design/PLAN.md`](design/PLAN.md). Pages describe the
-> intended v1 behavior and call out what runs today.
+> **Status.** The agentd runtime is implemented: config validation, the agentic
+> loop, the supervisor + subagent process tree, the MCP client, all four run
+> modes, the reactive router, the self-tools, and the served self-MCP all run
+> today — see [`design/PLAN.md`](design/PLAN.md).
 
 ## Pages
 

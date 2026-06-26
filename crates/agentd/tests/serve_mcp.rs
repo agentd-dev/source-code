@@ -237,6 +237,78 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let _ = child.wait();
 }
 
+/// Read lines until a `notifications/resources/updated` for `uri` arrives (or the
+/// deadline). Skips replies/other notifications interleaved on the stream.
+fn read_until_resource_updated(reader: &mut BufReader<UnixStream>, uri: &str, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false, // peer closed
+            Ok(_) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                    && v["method"] == "notifications/resources/updated"
+                    && v["params"]["uri"] == uri
+                {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+#[test]
+fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
+    // The reactive loop closed: a peer subscribes to agentd://subagent/<handle>
+    // and is PUSHED notifications/resources/updated when that run terminates —
+    // no polling. (We cancel a hanging run to make it terminate on cue.)
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let llm_sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(exe, &llm_sock, "hang");
+    let sock = dir.path().join("agentd.sock");
+    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+
+    let stream = connect(&sock);
+    let mut write = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    let init = rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    assert_eq!(init["result"]["capabilities"]["resources"]["subscribe"], true, "subscribe advertised: {init}");
+
+    let spawn = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"slow","async":true}}}"#,
+    );
+    let handle = spawn["result"]["structuredContent"]["handle"].as_str().expect("handle").to_string();
+    let uri = format!("agentd://subagent/{handle}");
+
+    // subscribe to the run's resource, then cancel it so it terminates.
+    let sub = rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":3,"method":"resources/subscribe","params":{{"uri":"{uri}"}}}}"#),
+    );
+    assert!(sub["error"].is_null(), "subscribe ok: {sub}");
+    rpc(
+        &mut reader,
+        &mut write,
+        &format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#),
+    );
+
+    // The run drains (~5-7s) → its resource changed → we are pushed an update.
+    assert!(
+        read_until_resource_updated(&mut reader, &uri, Instant::now() + Duration::from_secs(20)),
+        "expected a pushed notifications/resources/updated for {uri}"
+    );
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+    sigterm(child.id());
+    let _ = child.wait();
+}
+
 #[test]
 fn concurrent_async_runs_do_not_serialize() {
     // Two async runs in flight at once. The second is cancelled and must drain

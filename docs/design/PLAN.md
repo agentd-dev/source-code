@@ -134,12 +134,22 @@ cargo clippy -p agentd -- -D warnings # keep clean
   never spin on a missing reap), corrected coexistence docs, `exec` final-wait
   made ECHILD-tolerant, `reap_pending` visibility restricted. **Proven** by a new
   `concurrent_async_runs_do_not_serialize` test (cancelling one live run drains it
-  while another is still supervising — impossible under the old lock). **Still
-  deferred:** served `subagent.send` (needs served **warm** sessions) +
-  `resources/subscribe` (push) + a coordinated served-session drain on shutdown
-  (PDEATHSIG prevents leaks today); self-subscribe → auto `continue(this_session)`
-  route; cgroup `cgroup.kill`/`memory.high` (cgroup-v2 host); a standalone
-  `agentd-conformance` crate.
+  while another is still supervising — impossible under the old lock). (10)
+  **wired self-subscribe → a warm continue route** (the signature capability — a
+  self-subscribing agent re-enters one live session per event, not a fresh spawn;
+  `tests/observe_e2e.rs`). (11) **shipped `resources/subscribe` push** (closes the
+  reactive loop; 2-lens adversarial review): the served MCP server gained
+  per-connection shared writers + a subscription registry; a peer subscribes to a
+  **running** `agentd://subagent/<handle>` and is pushed `notifications/resources/
+  updated` when the run terminates (the bg run thread pushes). Review fixes folded
+  in: a socket **write timeout** (a stalled peer can't pin a run thread under the
+  writer lock), subscribe **validates a running handle** (reject unknown/terminal/
+  status → no leak, no late-subscribe gap), and notify **consumes** the
+  subscription on its one event. `tests/serve_mcp.rs` proves a real subscribe →
+  cancel → pushed notification. **Still deferred:** served `subagent.send` (needs
+  served **warm** sessions) + a coordinated served-session drain on shutdown
+  (PDEATHSIG prevents leaks today); cgroup `cgroup.kill`/`memory.high` (cgroup-v2
+  host); a standalone `agentd-conformance` crate.
 - **Active milestone:** M7 (complete). M1–M6 all complete with acceptance holding.
 - **Blockers:** none. **Build complete** — the hourly cron (`6885e804`) is
   disabled per the completion protocol. Infra-gated checks (real MCP reference
@@ -195,7 +205,7 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 - [x] `signals.rs` SIGCHLD handler (SA_NOCLDSTOP) + self-pipe wakeup (`wakeup_fd`/`drain_wakeup`/`take_child_exit`) for the reactor
 - [x] `supervisor/restart.rs` **restart governor** — pure backoff + capped jitter + circuit breaker + crash-on-spawn detection (hand-rolled jitter, no `rand`); `RestartGovernor::on_outcome → Backoff(d) | Tripped`. Wired into `run_scheduled`: failed fires back off via the governor, a crash-loop trips the breaker → `proc.exit{reason:"restart_breaker"}` + exit 1 (no hot-spin). 8 unit tests. _(Reactor-side per-child wiring for warm sessions: later, with M3 sessions.)_
 - [x] **`subagent.spawn` self-tool — the model self-orchestrates** (`agentloop/action.rs` `SelfHandler` + `subagent/orchestrator.rs`): builds a child payload (depth+1, narrowed MCP scope, inherited intel), enforces depth/breadth caps **refused as tool results**, and supervises the child synchronously via `supervise_once` (nested real processes). e2e test spawns a real child (`tests/orchestrator_spawn.rs`). `reactor::reap` made flag-independent (nested supervise works).
-- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + `subagent.spawn` (sync **and async**) + `subagent.status`/`subagent.cancel` + the `agentd://` resource surface landed** (`agentd://status` + per-run `agentd://subagent/<handle>`; see M4/M5). _(Concurrency: the single-reaper refactor landed — served runs are truly concurrent with the daemon.) Remaining: `subagent.send` (needs served **warm** sessions) + `resources/subscribe` (push notifications — the reply-only transport can't push yet)._
+- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + `subagent.spawn` (sync **and async**) + `subagent.status`/`subagent.cancel` + the `agentd://` resource surface landed** (`agentd://status` + per-run `agentd://subagent/<handle>`) **+ `resources/subscribe` push** (a peer subscribes to a run's resource and is pushed `notifications/resources/updated` on completion — the reactive loop closed); see M4/M5. _(Concurrency: the single-reaper refactor landed — served runs are truly concurrent with the daemon.) Remaining: `subagent.send` (needs served **warm** sessions) + a coordinated served-session drain on daemon shutdown (PDEATHSIG prevents leaks today)._
 - [x] `sec/scope.rs` tool-scope grant logic (granted-MCP-subset, monotonic narrow, Rule-of-Two) — wiring into the chokepoint pending `spawn.rs`. (depth/breadth/rate caps already in `tree.rs`)
 - **Acceptance:** parent spawns scoped child → child loop → distilled result up the channel; `kill -STOP` child → no-progress+missing-pongs → stuck → ladder to SIGKILL within budget; exited child reaped (no zombie); orphan grandchild reparents+reaped; killing supervisor collapses tree via PDEATHSIG; spawn past caps refused as tool result; crash-loop trips breaker.
 

@@ -137,6 +137,7 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                 Disposition::Spawn | Disposition::Continue(_) => {
                     let payload = reactive_payload(&base, &delivery.uri, &content);
                     log.info("trigger.fired", json!({"uri": delivery.uri, "bytes": content.len()}));
+                    crate::obs::metrics::record_reaction();
                     react(&exe, &payload, cfg.drain_timeout, log);
                 }
             }
@@ -221,6 +222,7 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
             _ if ok => sleep_interruptible(interval),
             RestartAction::Backoff(d) => sleep_interruptible(d.max(interval)),
             RestartAction::Tripped => {
+                crate::obs::metrics::record_restart_tripped();
                 log.warn("proc.exit", json!({"reason": "restart_breaker", "iteration": iteration}));
                 return exit::GENERIC;
             }

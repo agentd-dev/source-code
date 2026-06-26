@@ -178,6 +178,7 @@ impl Supervisor {
             AgentMsg::Event { .. } => self.on_event(node, now),
             AgentMsg::Usage(u) => {
                 self.on_event(node, now);
+                crate::obs::metrics::record_tokens(u.input_tokens, u.output_tokens);
                 if self.tree.charge_tokens(node, u.total()) && self.drain.is_none() {
                     self.log.warn("limit.exceeded", json!({"limit": "tree_tokens"}));
                     self.begin_drain(KillReason::TreeBudget);
@@ -321,7 +322,14 @@ pub fn supervise_once(
     drain_timeout: Duration,
     log: Logger,
 ) -> std::io::Result<SuperviseResult> {
+    crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.spawn_root(payload)?;
-    Ok(sup.run())
+    let result = sup.run();
+    crate::obs::metrics::record_run(match &result {
+        SuperviseResult::Completed(_) => crate::obs::metrics::RunOutcome::Completed,
+        SuperviseResult::Failed(_) => crate::obs::metrics::RunOutcome::Failed,
+        SuperviseResult::Killed(_) => crate::obs::metrics::RunOutcome::Killed,
+    });
+    Ok(result)
 }

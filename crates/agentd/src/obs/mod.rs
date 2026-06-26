@@ -11,5 +11,13 @@ pub mod health;
 // inside `trace.rs`). RFC 0010 §context-propagation.
 pub mod trace;
 
-#[cfg(feature = "metrics")]
+// The metrics *module* is always compiled, but its `record_*` fns are no-ops
+// unless built `--features metrics` (the atomic registry + Prometheus render +
+// `/metrics` surface are gated). This keeps call sites clean and the default
+// build cost-free. RFC 0010 §metrics.
 pub mod metrics;
+
+// The opt-in HTTP probe/scrape surface (/metrics + /healthz + /readyz) is the
+// one piece that needs a listener thread, so it is gated with the registry.
+#[cfg(feature = "metrics")]
+pub mod serve;

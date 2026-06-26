@@ -123,12 +123,31 @@ fn run() -> i32 {
                 );
                 log.info("health.armed", json!({"file": path}));
             }
+            // Opt-in HTTP scrape/probe surface (RFC 0010). Built only with
+            // `--features metrics`; without it, `--metrics-addr` warns and is inert.
+            if let Some(addr) = &cfg.metrics_addr {
+                serve_metrics(addr, &log);
+            }
             match cfg.mode {
                 Mode::Reactive => run_reactive(exe, root_payload(&cfg), &cfg, &log),
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
             }
         }
     }
+}
+
+/// Start the opt-in HTTP probe/scrape surface, or warn that this build can't.
+/// Gated so the default build links no listener. RFC 0010.
+#[cfg(feature = "metrics")]
+fn serve_metrics(addr: &str, log: &Logger) {
+    if let Err(e) = agentd::obs::serve::spawn(addr, log.clone()) {
+        log.error("metrics.bind_fail", json!({"addr": addr, "err": e.to_string()}));
+    }
+}
+
+#[cfg(not(feature = "metrics"))]
+fn serve_metrics(addr: &str, log: &Logger) {
+    log.warn("metrics.unavailable", json!({"addr": addr, "reason": "built without --features metrics"}));
 }
 
 /// One-shot mode: spawn + supervise a root subagent that runs the agentic

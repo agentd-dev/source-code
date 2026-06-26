@@ -19,6 +19,7 @@ use crate::obs::log::Logger;
 use crate::signals;
 use crate::subagent::protocol::{SeedMessage, SpawnPayload};
 use crate::supervisor::reactor::{supervise_once, SuperviseResult};
+use crate::supervisor::restart::{RestartAction, RestartConfig, RestartGovernor};
 use crate::triggers::router::{Disposition, Route, Router};
 use crate::wire::mcp::method;
 use serde_json::{json, Value};
@@ -152,12 +153,25 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
 /// 5-field-cron source is the `cron` feature (later); v1 is interval-based.
 ///
 /// Daemon exit predicate = signal only; a per-fire run carries its own
-/// deadline, and the orchestrator bounds the daemon (Job deadline). A
-/// fast-failing run backs off (capped) so it can't hot-spin — a lightweight
-/// stand-in for the restart governor (RFC 0003).
+/// deadline, and the orchestrator bounds the daemon (Job deadline). Failed
+/// fires are governed by the [`RestartGovernor`] (RFC 0003 §3.7): exponential
+/// backoff + capped jitter keeps it from hot-spinning, and a crash-loop trips
+/// the circuit breaker (assessment §4 M2) — at which point the daemon exits
+/// rather than respawn into a known-bad loop.
 pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger) -> i32 {
     let interval = cfg.interval.unwrap_or(Duration::ZERO);
-    let mut backoff = Duration::from_millis(500);
+    // This driver supervises whole re-runs, not the session-backing children the
+    // §3.7 default profile is tuned for: each fire spawns, reaches `ready`, runs
+    // its loop, and exits. So a transient-dependency failure (e.g. intelligence
+    // momentarily unreachable) reaches the model call before failing and must be
+    // an *ordinary* governed failure, not the fork-bomb fast-fail. We keep the
+    // §3.7 backoff/breaker but set `spawn_ready` to a sliver, so only a run that
+    // dies near-instantly (couldn't do any work — the genuine crash-on-spawn,
+    // §3.6) is weighted heavier here. RFC 0003 §3.7.
+    let mut governor = RestartGovernor::new(RestartConfig {
+        spawn_ready: Duration::from_millis(50),
+        ..RestartConfig::default()
+    });
     let mut iteration: u64 = 0;
     log.info(
         "trigger.armed",
@@ -174,6 +188,9 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         iteration += 1;
         log.info("schedule.fired", json!({"iteration": iteration}));
 
+        // Time the run so the governor can spot a crash-on-spawn (RFC 0003 §3.7
+        // — a run that dies faster than the ready threshold counts heavier).
+        let started = Instant::now();
         let ok = match supervise_once(exe.clone(), &base, cfg.drain_timeout, log.clone()) {
             Ok(SuperviseResult::Completed(o)) => {
                 log.info("run.completed", json!({"status": o.status.as_str()}));
@@ -193,15 +210,21 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
             }
         };
 
-        let wait = if ok {
-            backoff = Duration::from_millis(500);
-            interval
-        } else {
-            let w = backoff.max(interval);
-            backoff = (backoff * 2).min(Duration::from_secs(30));
-            w
-        };
-        sleep_interruptible(wait);
+        // Consult the restart governor. A successful run resets it and waits
+        // the configured interval — 0 for `loop`, the `--interval` for
+        // `schedule` (interval semantics preserved). A failed/killed run either
+        // backs off (capped + jittered, never below the interval) or, on a
+        // tripped breaker, ends the daemon rather than respawn into a known-bad
+        // loop. RFC 0003 §3.7 / assessment §4 M2 "crash-loop trips breaker".
+        let now = Instant::now();
+        match governor.on_outcome(ok, now.duration_since(started), now) {
+            _ if ok => sleep_interruptible(interval),
+            RestartAction::Backoff(d) => sleep_interruptible(d.max(interval)),
+            RestartAction::Tripped => {
+                log.warn("proc.exit", json!({"reason": "restart_breaker", "iteration": iteration}));
+                return exit::GENERIC;
+            }
+        }
     }
 }
 

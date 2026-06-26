@@ -175,8 +175,9 @@ pub fn rfc3339_millis(t: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
 }
 
-/// Days since 1970-01-01 → (year, month, day). Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+/// Days since 1970-01-01 → (year, month, day). Hinnant's algorithm. Shared with
+/// the cron `timer` (UTC field decomposition).
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]

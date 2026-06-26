@@ -100,6 +100,10 @@ pub struct Config {
     /// instead of refusing at startup (RFC 0012 §3.2). Process-global operator
     /// override — deliberately NOT carried in the spawn payload.
     pub allow_trifecta: bool,
+    /// Optional 5-field UTC cron schedule for `--mode schedule` (RFC 0008).
+    /// Only honoured in `--features cron` builds; the production path is an
+    /// external CronJob → `--mode once`.
+    pub cron: Option<String>,
 }
 
 impl Default for Config {
@@ -127,6 +131,7 @@ impl Default for Config {
             log_content: false,
             metrics_addr: None,
             allow_trifecta: false,
+            cron: None,
         }
     }
 }
@@ -157,6 +162,7 @@ impl fmt::Debug for Config {
             .field("log_content", &self.log_content)
             .field("metrics_addr", &self.metrics_addr)
             .field("allow_trifecta", &self.allow_trifecta)
+            .field("cron", &self.cron)
             .finish()
     }
 }
@@ -234,6 +240,9 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_ALLOW_TRIFECTA") {
             c.allow_trifecta = truthy(v);
         }
+        if let Some(v) = envmap.get("AGENTD_CRON") {
+            c.cron = Some((*v).to_string());
+        }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
@@ -273,6 +282,7 @@ impl Config {
                 }
                 "--subscribe" => c.subscribe.push(take("--subscribe")?),
                 "--interval" => c.interval = Some(parse_duration(&take("--interval")?).map_err(usage)?),
+                "--cron" => c.cron = Some(take("--cron")?),
                 "--max-steps" => {
                     let v = take("--max-steps")?;
                     c.max_steps = v.parse().map_err(|_| usage(format!("invalid --max-steps: {v}")))?;
@@ -360,8 +370,11 @@ impl Config {
         if self.mode == Mode::Reactive && self.subscribe.is_empty() {
             return Err(usage("--mode reactive requires at least one --subscribe <uri>".into()));
         }
-        if self.mode == Mode::Schedule && self.interval.is_none() {
-            return Err(usage("--mode schedule requires --interval <dur>".into()));
+        if self.mode == Mode::Schedule && self.interval.is_none() && self.cron.is_none() {
+            return Err(usage("--mode schedule requires --interval <dur> or --cron <expr>".into()));
+        }
+        if self.cron.is_some() && self.mode != Mode::Schedule {
+            return Err(usage("--cron is only valid with --mode schedule".into()));
         }
         Ok(())
     }
@@ -483,6 +496,7 @@ fn help_text() -> String {
          \x20 --mode once|loop|reactive|schedule   (default once)\n\
          \x20 --subscribe <uri>           subscribe to an MCP resource (repeatable)\n\
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
+         \x20 --cron <5-field>           schedule on a UTC cron expr (needs --features cron)\n\
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
@@ -544,6 +558,23 @@ mod tests {
         let bad_tag =
             Config::load(&args(&["--mcp", "fs=cmd", "--mcp-tags", "fs=bogus"]), &base_env()).unwrap_err();
         assert!(matches!(bad_tag, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn cron_requires_schedule_mode() {
+        // --cron with the wrong mode → usage error
+        let e = Config::load(
+            &args(&["--mode", "reactive", "--subscribe", "x://y", "--cron", "* * * * *"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+        // --mode schedule --cron validates (the expr itself is parsed by the cron feature)
+        let c = Config::load(&args(&["--mode", "schedule", "--cron", "0 9 * * 1-5"]), &base_env()).unwrap();
+        assert_eq!(c.cron.as_deref(), Some("0 9 * * 1-5"));
+        // schedule mode with neither interval nor cron → usage error
+        let e2 = Config::load(&args(&["--mode", "schedule"]), &base_env()).unwrap_err();
+        assert!(matches!(e2, ConfigError::Usage(_)));
     }
 
     #[test]

@@ -1,8 +1,7 @@
 #!/bin/sh
 # cargo-deb `maintainer-scripts` — runs on install / upgrade.
-# Creates /etc/agentd/ (empty) so the systemd unit's
-# `--config /etc/agentd/workflow.toml` resolves cleanly once the
-# operator drops a file in place.
+# Creates /etc/agentd/ (empty) for any operator config (e.g. an instruction
+# file referenced via --instruction-file in /etc/default/agentd).
 
 set -e
 

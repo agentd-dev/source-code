@@ -7,16 +7,12 @@
 # A rolled pod should look like a clean 0, not a 143 failure (rfcs/0011 §5) —
 # which is why the drain budget must fit inside the pod grace.
 #
-# v1 SCOPE: reactivity is stdio-only (no reactive-over-HTTP) — subscriptions
-# ride stdio MCP servers spawned by agentd. (roadmap: reactive over HTTP.)
+# SCOPE: reactivity is stdio-only — subscriptions ride stdio MCP servers spawned
+# by agentd. (Reactive-over-HTTP is a deferred v2 surface, RFC 0013.)
 #
 # NOTE: the operator that schedules/replicates/rolls this Deployment is
 # EXTERNAL and not part of agentd (rfcs/0011 §1). agentd only honors the
 # signal/drain/exit contract below.
-#
-# Status: see docs/design/PLAN.md — reactive routing + the supervisor land
-# across M1–M3. Today the container validates config and prints a scaffold
-# notice for reactive mode.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,7 +46,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agentd
-          image: agentd:latest
+          # Multi-arch, cosign-signed, static-on-scratch; ships the dep-free
+          # cloud-native features (the /healthz+/readyz surface the probes use).
+          # Pin a version tag (or a digest) in production rather than :latest.
+          image: ghcr.io/agentd-dev/agentd:latest
           args:
             - --mode
             - reactive
@@ -58,11 +57,12 @@ spec:
             # URIs served by the stdio MCP servers declared below.
             - --subscribe
             - file:///data/inbox
-            # The supervisor writes this file every heartbeat (atomic rename):
-            #   {"status":"ready"|"draining","ts":"<RFC3339>","hb":N,...}
-            # (rfcs/0010 §3.7). The liveness/readiness probes read it.
-            - --health-file
-            - /run/agentd/health.json
+            # Serve /healthz + /readyz (+ /metrics) for the k8s probes below.
+            # The scratch image has no shell, so HTTP probes — not exec — are
+            # the way to health-check it (rfcs/0010 §3.7). Bind 0.0.0.0 (not
+            # localhost) so the kubelet can reach it at the pod IP.
+            - --metrics-addr
+            - 0.0.0.0:9090
             # Keep the drain budget < terminationGracePeriodSeconds above.
             - --drain-timeout
             - 25s
@@ -83,43 +83,33 @@ spec:
                   name: agentd-intelligence
                   key: token
             - name: AGENTD_MODEL
-              value: claude-sonnet-4-5
+              value: claude-sonnet-4-6
             - name: AGENTD_LOG_LEVEL
               value: info
-          # Liveness = the supervisor heartbeat is fresh. An EXEC probe reads
-          # the health file with a tiny shell expression — NOTE this needs a
-          # shell in the image, which the distroless runtime does NOT have. To
-          # use an exec probe, build a downstream image that adds a shell (or a
-          # small static health-check helper) and reference it here. For the
-          # default distroless image, prefer readiness via the same mechanism
-          # in a sidecar, or add the `serve-mcp`/HTTP health surface (roadmap)
-          # once available. The probe below documents the intended check.
-          #
-          # An idle reactive agent is HEALTHY (rfcs/0010 §3.7): liveness checks
-          # the supervisor's freshness, not whether work is flowing. A stuck
-          # subagent must NOT fail pod liveness — the supervisor kills it.
+          ports:
+            - name: probes
+              containerPort: 9090
+          # Liveness = the supervisor heartbeat is fresh. The scratch image has no
+          # shell, so probes are HTTP against the --metrics-addr surface above —
+          # /healthz returns 200 while the supervisor tick is fresh, 503 once it
+          # goes stale (rfcs/0010 §3.7). An idle reactive agent is HEALTHY:
+          # liveness checks the supervisor's freshness, not whether work is
+          # flowing. A stuck subagent must NOT fail pod liveness — the supervisor
+          # kills it.
           livenessProbe:
-            exec:
-              command:
-                - /busybox/sh
-                - -c
-                - >-
-                  test "$(grep -o '"status":"[a-z]*"' /run/agentd/health.json)" != "" &&
-                  test -f /run/agentd/health.json
+            httpGet:
+              path: /healthz
+              port: probes
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
-          # Readiness = MCP connected AND every declared subscription
-          # reconciled (subscribed + read-after-subscribe) → health file
-          # status:"ready" (rfcs/0010 §3.7). On drain the supervisor flips the
-          # file to status:"draining" → not-ready → no new traffic routed.
+          # Readiness = the daemon is up and serving. /readyz returns 200 while
+          # running; on drain agentd stops serving and the pod leaves rotation.
           readinessProbe:
-            exec:
-              command:
-                - /busybox/sh
-                - -c
-                - 'grep -q ''"status":"ready"'' /run/agentd/health.json'
+            httpGet:
+              path: /readyz
+              port: probes
             initialDelaySeconds: 3
             periodSeconds: 5
             timeoutSeconds: 3
@@ -137,17 +127,12 @@ spec:
               # OOM => 137 => raise this (rfcs/0011 §5).
               memory: 512Mi
           volumeMounts:
-            - name: health
-              mountPath: /run/agentd
             - name: intel
               mountPath: /run/intel
             - name: data
               mountPath: /data
       volumes:
-        # Writable tmpfs for the health file (rootfs is read-only).
-        - name: health
-          emptyDir:
-            medium: Memory
+        # The TLS-terminating intelligence sidecar's unix socket, shared in.
         - name: intel
           emptyDir: {}
         - name: data

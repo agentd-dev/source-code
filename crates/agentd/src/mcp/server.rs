@@ -11,6 +11,7 @@
 use crate::json::{self, frame, Id, Incoming, Notification, Request, Response};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
+use crate::supervisor::cgroup;
 use crate::supervisor::reactor::{supervise_cancellable, supervise_once, SuperviseResult};
 use crate::supervisor::spawn::{spawn, Subagent};
 use crate::supervisor::tree::NodeId;
@@ -531,6 +532,14 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     if instruction.is_empty() {
         // Malformed call (missing required param) → JSON-RPC error (RFC §3.2).
         return Response::err(id, json::INVALID_PARAMS, "subagent.spawn requires a non-empty 'instruction'");
+    }
+    // Memory backpressure: when the unit sits at its `memory.high` soft limit,
+    // refuse new subagents (warm/async/sync alike) rather than push the cgroup
+    // into reclaim/OOM — the peer retries once pressure clears. Best-effort:
+    // never fires off-cgroup or when `memory.high` is unset.
+    if cgroup::under_memory_pressure() {
+        log.warn("cgroup.backpressure", json!({"reason": "memory.high", "tool": "subagent.spawn"}));
+        return tool_error(id, "spawn refused: memory pressure (cgroup at memory.high); retry shortly".to_string());
     }
     let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
     let handle = format!("served.{n}");

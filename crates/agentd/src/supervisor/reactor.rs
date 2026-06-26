@@ -21,6 +21,7 @@ use crate::agentloop::stop::Outcome;
 use crate::obs::log::Logger;
 use crate::signals;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
+use crate::supervisor::cgroup::CgroupGuard;
 use crate::supervisor::kill::{kill_group, term_group, Ladder, LadderAction};
 use crate::supervisor::liveness::{Health, Liveness, LivenessConfig};
 use crate::supervisor::reap::Reaped;
@@ -110,6 +111,11 @@ pub struct Supervisor {
     /// handle). Set → the run drains gracefully, like a SIGTERM but scoped to
     /// this one supervisor. `None` for runs that only honour process SIGTERM.
     cancel: Option<Arc<AtomicBool>>,
+    /// The per-run child cgroup (opt-in via `--cgroup`; `None` when off / not
+    /// writable). The root subagent is placed here so its whole subtree can be
+    /// torn down atomically with `cgroup.kill` — the backstop beyond killpg +
+    /// PDEATHSIG. RAII: dropping the supervisor kills + removes the cgroup.
+    cgroup: Option<CgroupGuard>,
     log: Logger,
 }
 
@@ -139,6 +145,7 @@ impl Supervisor {
             last_ping: Instant::now(),
             ping_seq: 0,
             cancel: None,
+            cgroup: None,
             log,
         }
     }
@@ -156,6 +163,19 @@ impl Supervisor {
         // fork (under the global reaper lock), so the reaper can't waitpid the
         // child before it is tracked.
         let sub = reaper::spawn_tracked(&self.reap_tx, || spawn(&self.exe, payload, node, self.events_tx.clone()))?;
+        // Place the root in the per-run cgroup; descendants it forks AFTER this
+        // inherit membership, so the subtree becomes `cgroup.kill`-able at once.
+        // (A grandchild forked in the sub-ms window before this write inherits the
+        // parent cgroup and falls back to killpg + PDEATHSIG — i.e. the pre-cgroup
+        // baseline, never worse. In practice the root reads its payload + makes an
+        // LLM round-trip long before it could nest, so the window is empty.)
+        if let Some(cg) = &self.cgroup {
+            let placed = cg.place(sub.pid());
+            self.log.info(
+                "cgroup.placed",
+                json!({"node": node.0, "pid": sub.pid(), "cgroup": cg.path().display().to_string(), "ok": placed}),
+            );
+        }
         self.pid_to_node.insert(sub.pid(), node);
         self.live.insert(node, sub);
         self.log.info("subagent.spawn", json!({"node": node.0, "depth": payload.depth}));
@@ -417,6 +437,12 @@ impl Supervisor {
         // guarantees `drive_drain` always terminates.
         if !all_reaped && self.drain.as_ref().is_some_and(|d| now >= d.deadline + ABANDON_GRACE) {
             let reason = self.drain.as_ref().map(|d| d.reason).unwrap_or(KillReason::Drain);
+            // Last word before abandoning: `cgroup.kill` SIGKILLs the entire
+            // subtree atomically — including any process that escaped the group
+            // and would survive the killpg above (the whole point of the cgroup).
+            if let Some(cg) = &self.cgroup {
+                cg.kill_all();
+            }
             self.log.warn("drain.abandon", json!({"live": self.live.len(), "reason": format!("{reason:?}")}));
             for h in self.live.values_mut() {
                 h.mark_reaped(); // already SIGKILL'd; don't let Drop block waiting on it
@@ -439,6 +465,12 @@ impl Supervisor {
             LadderAction::Kill => {
                 for h in self.live.values() {
                     kill_group(h.pgid());
+                }
+                // Atomic subtree backstop: catches any process that left its
+                // group (setsid) and so slipped past killpg. No-op when the
+                // cgroup feature is off.
+                if let Some(cg) = &self.cgroup {
+                    cg.kill_all();
                 }
                 self.log.warn("subagent.sigkill", json!({"live": self.live.len()}));
                 None
@@ -483,6 +515,11 @@ pub fn supervise_cancellable(
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.cancel = cancel;
+    // Per-run child cgroup (opt-in, best-effort): the root + its whole subtree
+    // land here so teardown can `cgroup.kill` them atomically. `None` when the
+    // feature is off or the tree isn't writable — the run then relies on
+    // PDEATHSIG + the kill ladder exactly as before.
+    sup.cgroup = CgroupGuard::for_run();
     sup.spawn_root(payload)?;
     let result = sup.run();
     crate::obs::metrics::record_run(match &result {

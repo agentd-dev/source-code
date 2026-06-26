@@ -331,6 +331,17 @@ impl Supervisor {
     }
 }
 
+/// Serializes `supervise_once` *within a process*. A process may run several
+/// supervisors over its lifetime — the daemon's mode loop AND served-MCP
+/// `subagent.spawn` calls (RFC 0005) — but they must not run **concurrently**:
+/// each reactor reaps via `waitpid(-1)` (which also collects `PR_SET_CHILD_
+/// SUBREAPER` orphans, RFC 0003), so two concurrent reactors would steal each
+/// other's children and hang the robbed one. Serializing keeps orphan reaping
+/// intact without a process-wide reaper. The lock is per-process, so nested
+/// supervise in a *separate* subagent process never contends. (A single-reaper
+/// refactor that allows true concurrency is a throughput follow-up.)
+static SUPERVISE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Supervise one root subagent to completion (once-mode entry). The handle
 /// map's `Drop` backstops any leak on early return.
 pub fn supervise_once(
@@ -339,6 +350,7 @@ pub fn supervise_once(
     drain_timeout: Duration,
     log: Logger,
 ) -> std::io::Result<SuperviseResult> {
+    let _serialize = SUPERVISE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.spawn_root(payload)?;

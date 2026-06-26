@@ -91,6 +91,28 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
     assert!(bad["error"].is_object(), "bad tool should error: {bad}");
 
+    // subagent.spawn delegates a real run. The spawned agent fails on the
+    // unreachable intel → a tool-domain error (isError:true), not a JSON-RPC
+    // error — proving delegation reaches supervise_once + the result mapping.
+    let spawn = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing"}}}"#,
+    );
+    assert_eq!(spawn["result"]["isError"], true, "spawn (unreachable intel) is a tool error: {spawn}");
+    assert!(
+        spawn["result"]["content"][0]["text"].as_str().unwrap_or("").contains("intel"),
+        "spawn error should mention intel: {spawn}"
+    );
+
+    // a malformed subagent.spawn (no instruction) is a JSON-RPC error
+    let bad_spawn = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{}}}"#,
+    );
+    assert!(bad_spawn["error"].is_object(), "missing instruction → JSON-RPC error: {bad_spawn}");
+
     sigterm(child.id());
     let _ = child.wait();
 }

@@ -83,16 +83,18 @@ cargo clippy -p agentd -- -D warnings # keep clean
   reason, so a stuck-kill now correctly exits 124, not 1; (4) **shipped the `otel`
   feature** (OTLP/HTTP span export, GenAI semconv) — hand-rolled OTLP-over-JSON
   reusing the existing trace ids + HTTP client + serde_json, so `--features otel`
-  stays **dependency-free (still 3 deps)**. A finished run exports an
-  `invoke_agent` span (`gen_ai.operation.name`/`request.model`/`usage.*_tokens`)
-  to `OTEL_EXPORTER_OTLP_ENDPOINT`, best-effort. Built as the no-op-shim pattern
-  (no-op without the feature → clean loop call sites, zero default cost); proven
-  end-to-end by `tests/otel_e2e.rs` (a real run POSTs the span to an in-test
-  collector). **Still deferred:** M3 warm `Continue` sessions + async
-  `subagent.spawn{async,detach}`; served `subagent.send`/`cancel`/`status` +
-  `agentd://` resources; `chat`/`execute_tool` otel *child* spans (the run span
-  ships); cgroup `cgroup.kill`/`memory.high` (cgroup-v2 host); a standalone
-  `agentd-conformance` crate; a single-reaper refactor to retire `SUPERVISE_LOCK`.
+  stays **dependency-free (still 3 deps)**. A finished run exports its whole
+  trace as one OTLP batch: the `invoke_agent` run span **plus a `chat` child per
+  model call and an `execute_tool` child per tool call** (`gen_ai.*` attrs,
+  children parented to the run span), to `OTEL_EXPORTER_OTLP_ENDPOINT`,
+  best-effort. Built as a no-op `RunSpan` handle (no-op without the feature →
+  clean loop call sites, zero default cost); proven end-to-end by
+  `tests/otel_e2e.rs` (a real ReAct run POSTs invoke_agent + chat + execute_tool
+  to an in-test collector). **This closes the M6 otel acceptance.** **Still
+  deferred:** M3 warm `Continue` sessions + async `subagent.spawn{async,detach}`;
+  served `subagent.send`/`cancel`/`status` + `agentd://` resources; cgroup
+  `cgroup.kill`/`memory.high` (cgroup-v2 host); a standalone `agentd-conformance`
+  crate; a single-reaper refactor to retire `SUPERVISE_LOCK`.
 - **Active milestone:** M7 (complete). M1–M6 all complete with acceptance holding.
 - **Blockers:** none. **Build complete** — the hourly cron (`6885e804`) is
   disabled per the completion protocol. Infra-gated checks (real MCP reference
@@ -193,7 +195,7 @@ Modules: `obs/{trace,metrics,otel}.rs`; extends `obs/log.rs sec/scope.rs net/htt
 - [x] `sec/scope.rs` Rule-of-Two tag check — **wired and enforcing**. `TrifectaTag` (untrusted-input / sensitive-data / egress) + `check_trifecta`. Tag source: `--mcp-tags name=tag,tag` attaches operator tags to a server (carried in the spawn payload); untagged → `untrusted_input` (conservative default); `--enable-exec` → `egress`. Enforced **once at root startup** (`main.rs`): `Config::trifecta_grant_tags()` → refuse with exit 2 + `scope.trifecta_refused` unless `--allow-trifecta` (then proceed + `scope.trifecta_grant` warn). **Design note / deviation from RFC's per-spawn chokepoint:** because scope narrows monotonically (RFC 0009) a child's tags ⊆ the root's, so the single root check bounds the whole tree — no in-subagent orchestrator check, hence no process-global-flag-propagation problem. `--allow-trifecta` stays out of the payload. Observe-proven (refuse→exit 2, allow→warn+proceed, two-legs→silent).
 - [~] SSRF guard — **pure classifier landed** in `net/ssrf.rs`: `is_global(IpAddr)` + `guard_host(host, allow_private)` reject loopback / RFC-1918 / link-local / ULA / unspecified / multicast / IPv4-mapped equivalents, 18 unit tests. _Not wired to a default-on call site: agentd's only HTTP client path is the operator-configured (trusted) intelligence endpoint, frequently localhost — blocking it would be wrong. The guard is ready for any future model/agent-supplied-URL fetcher, which MUST route through `guard_host` (acceptance "refuses RFC-1918 by default" applies there)._
 - [x] `metrics` feature (Prometheus text) — **dependency-free**: `obs/metrics.rs` is always compiled but its `record_*` fns are no-ops unless `--features metrics` (the atomic registry + `render_prometheus` are gated), so default call sites stay clean and cost nothing. Counters (runs started/completed/failed/killed, reactions, in/out tokens, restart-breaker trips) increment at the supervisor chokepoints (`supervise_once`, the `Usage` handler, `trigger.fired`, breaker trip). `obs/serve.rs` (gated) serves `/metrics` + `/healthz` + `/readyz` on a single blocking-accept thread bound by `--metrics-addr` (opt-in). Live-proven via curl (valid Prometheus, 200/503/404 routing). Per-process scope documented (same boundary as the tree token ceiling).
-- [x] `otel` feature (OTLP + GenAI semconv, HTTP exporter) — **dependency-free**: `obs/otel.rs` is always compiled but `export_run_span` is a no-op unless `--features otel` (the OTLP/JSON encoder + HTTP export are gated), so default loop call sites stay clean and cost nothing. Hand-rolled OTLP-over-**HTTP/JSON** reuses the run's W3C trace/span ids (`obs/trace.rs`), `serde_json`, and the existing HTTP client (`net/http.rs`) → `--features otel` stays **3 deps**. A finished run exports an `invoke_agent` span (`gen_ai.operation.name`/`gen_ai.request.model`/`gen_ai.usage.{input,output}_tokens`, status OK/ERROR) to `OTEL_EXPORTER_OTLP_ENDPOINT` at `/v1/traces`, best-effort (an export failure is logged-and-dropped; telemetry never fails a run). `https://` collectors need `--features tls`. e2e-proven (`tests/otel_e2e.rs`: a *real* run POSTs the span to an in-test OTLP collector — asserts `/v1/traces`, `resourceSpans`, `invoke_agent`, the GenAI attrs, the model). _(`chat`/`execute_tool` child spans build on this — deferred; the run span ships.)_
+- [x] `otel` feature (OTLP + GenAI semconv, HTTP exporter) — **dependency-free**: `obs/otel.rs` is always compiled but `export_run_span` is a no-op unless `--features otel` (the OTLP/JSON encoder + HTTP export are gated), so default loop call sites stay clean and cost nothing. Hand-rolled OTLP-over-**HTTP/JSON** reuses the run's W3C trace/span ids (`obs/trace.rs`), `serde_json`, and the existing HTTP client (`net/http.rs`) → `--features otel` stays **3 deps**. A finished run exports its whole trace as one OTLP batch — the `invoke_agent` run span **plus a `chat` child per model call and an `execute_tool` child per tool call** (`gen_ai.operation.name`/`gen_ai.request.model`/`gen_ai.usage.{input,output}_tokens`/`gen_ai.tool.name`, status OK/ERROR, children parented to the run span) — to `OTEL_EXPORTER_OTLP_ENDPOINT` at `/v1/traces`, best-effort (an export failure is logged-and-dropped; telemetry never fails a run). `https://` collectors need `--features tls`. Wired via a no-op `RunSpan` handle (`runner.rs` records a child as each chat/tool completes, flushes at the terminal). e2e-proven (`tests/otel_e2e.rs`: a *real* ReAct run POSTs `invoke_agent` + `chat` + `execute_tool` to an in-test OTLP collector — asserts `/v1/traces`, `resourceSpans`, all three span kinds, the GenAI attrs incl. `gen_ai.tool.name`, the model). **Closes the M6 otel acceptance.**
 - **Acceptance:** upstream trace flows through agentd → MCP `_meta` + LLM header + child processes, reassembles by `run_id`+`agent_path`; trifecta grant refused without `--allow-trifecta`; HTTP client refuses RFC-1918/link-local by default; `--features metrics` serves valid Prometheus; `--features otel` exports `invoke_agent`/`chat`/`execute_tool` with `gen_ai.*`.
 
 ### M7 — Minimalism audit + conformance + release

@@ -29,7 +29,9 @@ use crate::supervisor::tree::{Caps, NodeId, NodeStatus, Tree};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Reactor tick. Bounds signal/deadline detection latency without a poll loop.
@@ -82,6 +84,10 @@ pub struct Supervisor {
     liveness_cfg: LivenessConfig,
     last_ping: Instant,
     ping_seq: u64,
+    /// Optional per-run cancel flag (a served async run can be cancelled by
+    /// handle). Set → the run drains gracefully, like a SIGTERM but scoped to
+    /// this one supervisor. `None` for runs that only honour process SIGTERM.
+    cancel: Option<Arc<AtomicBool>>,
     log: Logger,
 }
 
@@ -106,6 +112,7 @@ impl Supervisor {
             liveness_cfg: LivenessConfig::from_env(),
             last_ping: Instant::now(),
             ping_seq: 0,
+            cancel: None,
             log,
         }
     }
@@ -150,7 +157,10 @@ impl Supervisor {
                 }
             }
 
-            if signals::draining() && self.drain.is_none() {
+            // Tear down on a process SIGTERM *or* this run's own cancel flag (a
+            // served async run cancelled by handle). Both drain gracefully.
+            let cancelled = self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            if (signals::draining() || cancelled) && self.drain.is_none() {
                 self.begin_drain(KillReason::Drain);
             }
 
@@ -389,9 +399,23 @@ pub fn supervise_once(
     drain_timeout: Duration,
     log: Logger,
 ) -> std::io::Result<SuperviseResult> {
+    supervise_cancellable(exe, payload, drain_timeout, log, None)
+}
+
+/// Like [`supervise_once`] but with an optional per-run `cancel` flag: setting it
+/// drains this run's subtree gracefully (a served async run cancelled by handle),
+/// independent of process SIGTERM. RFC 0005 §3.2.
+pub fn supervise_cancellable(
+    exe: PathBuf,
+    payload: &SpawnPayload,
+    drain_timeout: Duration,
+    log: Logger,
+    cancel: Option<Arc<AtomicBool>>,
+) -> std::io::Result<SuperviseResult> {
     let _serialize = SUPERVISE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
+    sup.cancel = cancel;
     sup.spawn_root(payload)?;
     let result = sup.run();
     crate::obs::metrics::record_run(match &result {

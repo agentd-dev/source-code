@@ -34,6 +34,14 @@ fn run() -> i32 {
         return agentd::mcp::mock::run(uri, emit);
     }
 
+    // Hidden built-in mock LLM (M7 observe-suite):
+    // `--internal-mock-llm <socket> [final|read|schedule]`.
+    if argv.get(1).map(String::as_str) == Some("--internal-mock-llm") {
+        let socket = argv.get(2).map(String::as_str).unwrap_or("/tmp/agentd-mock-llm.sock");
+        let script = argv.get(3).map(String::as_str).unwrap_or("final");
+        return agentd::intel::mock::run(socket, script);
+    }
+
     // Subagent re-exec dispatch (M2). The supervisor sets this in the child's
     // environment; the child reads its spawn payload over the control channel
     // (stdin) rather than from CLI/env config.

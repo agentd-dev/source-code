@@ -243,8 +243,8 @@ mod tests {
             context_seed: Vec::new(),
             intelligence: IntelConfig { uri: "unix:/x".into(), token: None, model: None },
             mcp_servers: vec![
-                McpServerSpec { name: "fs".into(), command: vec!["a".into()] },
-                McpServerSpec { name: "db".into(), command: vec!["b".into()] },
+                McpServerSpec { name: "fs".into(), command: vec!["a".into()], tags: Vec::new() },
+                McpServerSpec { name: "db".into(), command: vec!["b".into()], tags: Vec::new() },
             ],
             limits: Limits { max_steps: 10, max_tokens: 1000, deadline_ms: 1000, max_depth },
             telemetry: Telemetry {

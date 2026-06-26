@@ -156,7 +156,7 @@ mod tests {
                 token: Some("secret".into()),
                 model: Some("m".into()),
             },
-            mcp_servers: vec![McpServerSpec { name: "fs".into(), command: vec!["mcp-fs".into()] }],
+            mcp_servers: vec![McpServerSpec { name: "fs".into(), command: vec!["mcp-fs".into()], tags: Vec::new() }],
             limits: Limits { max_steps: 20, max_tokens: 100_000, deadline_ms: 600_000, max_depth: 4 },
             telemetry: Telemetry {
                 run_id: "r1".into(),

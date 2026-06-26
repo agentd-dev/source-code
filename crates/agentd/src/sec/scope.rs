@@ -170,6 +170,17 @@ pub enum TrifectaTag {
 }
 
 impl TrifectaTag {
+    /// Parse an operator-declared tag string (`--mcp-tags name=…`). Snake-case,
+    /// matching the serde wire form; unknown tags return `None`.
+    pub fn parse(s: &str) -> Option<TrifectaTag> {
+        match s {
+            "untrusted_input" => Some(TrifectaTag::UntrustedInput),
+            "sensitive" => Some(TrifectaTag::Sensitive),
+            "egress" => Some(TrifectaTag::Egress),
+            _ => None,
+        }
+    }
+
     /// This tag as a single-leg [`Trifecta`], so the accumulation logic lives
     /// in exactly one place (`Trifecta::merge`).
     pub fn as_trifecta(self) -> Trifecta {

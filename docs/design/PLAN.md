@@ -59,29 +59,33 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M4/M2 — **`--serve-mcp`** (agentd serving its own MCP over a unix
-  socket — the composability feature) landed this wake: transport + protocol +
-  a `status` tool, dep-free, proven E2E by a peer. On top of the `cron` feature,
-  M3 self-*, M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
-- **Last completed (this wake):** **`--serve-mcp`** — agentd serving its own MCP
-  over a unix socket (composability, RFC 0005). `mcp/server.rs` (feature
-  `serve-mcp`, **made dep-free** — dropped the scaffold's `mio` per RFC §3.6's
-  blocking `UnixListener`): a thread-per-connection NDJSON JSON-RPC server
-  reusing the `json/` codec, answering `initialize`/`ping`/`tools/list`/
-  `tools/call`; v1 exposes a read-only `status` tool. Wired in `main.rs` for
-  daemon modes (`serve_self_mcp`, stale-socket cleanup; `--serve-mcp` warns
-  without the feature). **Composability proven E2E** (`tests/serve_mcp.rs`: a
-  peer connects → initialize/list/status/error). (Prior wakes: cron;
-  self-subscribe; self-scheduling; drain; cgroup; trifecta; metrics.) **No new
-  deps — default build 3, and `--features serve-mcp` is also exactly 3.**
-  **183 default / 188 serve-mcp tests** green, clippy clean (default + all-feats).
-- **Next action:** the served-MCP **`subagent.spawn` action tool** (the powerful
-  composability — a peer delegates work to agentd: build a spawn-payload from the
-  daemon's config + the request, `supervise_once`, return the outcome; with caps).
-  Other open items: M3 warm `Continue` sessions + async `subagent.spawn`; the
-  `otel` feature (the one allowed heavier deps); M7 (conformance + observe-suite
-  + container + docs — the mock-LLM fixture there unlocks live self-* firing
-  tests); M5 cgroup `cgroup.kill`/backpressure (needs a cgroup-v2 host).
+- **Phase:** M4/M2 — the served-MCP **`subagent.spawn` action tool** (a peer
+  delegates work to agentd) landed this wake, plus a real **concurrency-bug fix**
+  (`SUPERVISE_LOCK`). On top of the `--serve-mcp` transport, `cron`, M3 self-*,
+  M5 drain + cgroup, M6 trifecta/metrics/`--log-content`.
+- **Last completed (this wake):** the served-MCP **`subagent.spawn` tool** (RFC
+  0005 §3.2, sync) — a peer delegates work: agentd builds a fresh root run from
+  the daemon's payload template + request (instruction / `output_contract` /
+  `tool_scope` subset; depth minted, not requested), supervises it, returns
+  `{handle,status,result}`. Concurrency-capped (≤4, RAII); bad params → JSON-RPC
+  error, refusal/failure → `isError:true` result. **Found + fixed a real
+  concurrency bug:** a served spawn's `supervise_once` ran concurrently with the
+  daemon's mode-loop `supervise_once`; both reap `waitpid(-1)` → child-stealing
+  → hang. Fixed with a per-process `SUPERVISE_LOCK` serializing supervisors
+  (subreaper-orphan reaping intact; a single-reaper refactor for true
+  concurrency is the follow-up). Proven E2E (`tests/serve_mcp.rs` drives
+  `subagent.spawn` over the socket). (Prior wakes: serve-mcp transport; cron;
+  self-*; drain; cgroup; trifecta; metrics.) **No new deps — default + serve-mcp
+  both 3.** **183 default / 190 serve-mcp tests** green, clippy clean (default +
+  all-features).
+- **Next action:** open items — M3 warm `Continue` sessions + async
+  `subagent.spawn` (which would also let served spawns run truly concurrently via
+  the daemon's single reactor, retiring the `SUPERVISE_LOCK` serialization); the
+  `otel` feature (the one allowed heavier deps); **M7** (conformance + the
+  observe-suite + minimal container image + docs — the mock-LLM fixture there
+  unlocks live self-* firing tests); the served `subagent.send`/`cancel`/`status`
+  tools; M5 cgroup `cgroup.kill`/backpressure (needs a cgroup-v2 host). Most M1–M6
+  acceptance now holds — M7 (audit/conformance/container/docs) is the main gap.
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -137,7 +141,7 @@ Modules: `supervisor/{reactor,tree,spawn,reap,liveness,kill,restart}.rs subagent
 - [x] `signals.rs` SIGCHLD handler (SA_NOCLDSTOP) + self-pipe wakeup (`wakeup_fd`/`drain_wakeup`/`take_child_exit`) for the reactor
 - [x] `supervisor/restart.rs` **restart governor** — pure backoff + capped jitter + circuit breaker + crash-on-spawn detection (hand-rolled jitter, no `rand`); `RestartGovernor::on_outcome → Backoff(d) | Tripped`. Wired into `run_scheduled`: failed fires back off via the governor, a crash-loop trips the breaker → `proc.exit{reason:"restart_breaker"}` + exit 1 (no hot-spin). 8 unit tests. _(Reactor-side per-child wiring for warm sessions: later, with M3 sessions.)_
 - [x] **`subagent.spawn` self-tool — the model self-orchestrates** (`agentloop/action.rs` `SelfHandler` + `subagent/orchestrator.rs`): builds a child payload (depth+1, narrowed MCP scope, inherited intel), enforces depth/breadth caps **refused as tool results**, and supervises the child synchronously via `supervise_once` (nested real processes). e2e test spawns a real child (`tests/orchestrator_spawn.rs`). `reactor::reap` made flag-independent (nested supervise works).
-- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + protocol landed** (see M4). _Remaining: the action tools `subagent.spawn`/`send`/`cancel`/`status` + the `agentd://` state resources (need warm sessions / async spawn first)._
+- [~] self-MCP **server** listener (`mcp/server.rs`, `--serve-mcp unix:`) — **transport + the `subagent.spawn` action tool landed** (see M4). _Remaining: `subagent.send`/`cancel`/`status` + the `agentd://` state resources (need warm sessions / async spawn first)._
 - [x] `sec/scope.rs` tool-scope grant logic (granted-MCP-subset, monotonic narrow, Rule-of-Two) — wiring into the chokepoint pending `spawn.rs`. (depth/breadth/rate caps already in `tree.rs`)
 - **Acceptance:** parent spawns scoped child → child loop → distilled result up the channel; `kill -STOP` child → no-progress+missing-pongs → stuck → ladder to SIGKILL within budget; exited child reaped (no zombie); orphan grandchild reparents+reaped; killing supervisor collapses tree via PDEATHSIG; spawn past caps refused as tool result; crash-loop trips breaker.
 
@@ -156,7 +160,7 @@ Modules: `triggers/{router,mode,timer}.rs`; extends `mcp/{client,server}.rs`, `s
 
 ### M4 — Composition, transports, exec, schedule
 Modules: `net/vsock.rs sec/exec.rs`; extends `mcp/server.rs`, `triggers/{mode,timer}.rs`
-- [~] serve self-MCP over `unix:` (`--serve-mcp unix:…`) — **transport + protocol landed**, dep-free. `mcp/server.rs` (feature `serve-mcp`, made dep-free — dropped the scaffold's mio per RFC 0005 §3.6's blocking `UnixListener`): a thread-per-connection NDJSON JSON-RPC server reusing the `json/` codec, answering `initialize` (declares `tools`), `ping`, `tools/list`, `tools/call`. v1 exposes a read-only `status` tool (run_id/mode/version/pid/uptime). Wired in `main.rs` for daemon modes (`serve_self_mcp`, stale-socket cleanup); without the feature `--serve-mcp` warns `mcp.serve_unavailable`. **Composability proven E2E** (`tests/serve_mcp.rs`, gated: a peer connects to the socket → initialize/list/status/error). _Remaining: the `subagent.*` action tools (the powerful composability — delegate work to agentd; needs a spawn-payload template + caps + warm sessions/async)._
+- [~] serve self-MCP over `unix:` (`--serve-mcp unix:…`) — **transport + protocol landed**, dep-free. `mcp/server.rs` (feature `serve-mcp`, made dep-free — dropped the scaffold's mio per RFC 0005 §3.6's blocking `UnixListener`): a thread-per-connection NDJSON JSON-RPC server reusing the `json/` codec, answering `initialize` (declares `tools`), `ping`, `tools/list`, `tools/call`. v1 exposes a read-only `status` tool **and `subagent.spawn`** (sync): a peer delegates work — agentd builds a fresh root run from the daemon's payload template + the request (instruction, `output_contract`, `tool_scope` subset; depth minted here, not read from the request), supervises it, and returns the distilled `{handle,status,result}`. Concurrency-capped (≤4 in-flight, RAII guard); malformed params → JSON-RPC error, a cap/scope refusal or run failure → `isError:true` result (RFC §3.2). Trust boundary documented (socket perms gate who can delegate). **Concurrency bug found + fixed:** a served spawn runs `supervise_once` *concurrently* with the daemon's own mode-loop `supervise_once` in one process, and both reap via `waitpid(-1)` → child-stealing → hang; fixed with a per-process `SUPERVISE_LOCK` serializing supervisors (keeps subreaper-orphan reaping intact; a single-reaper refactor for true concurrency is a follow-up). Wired in `main.rs`; `--serve-mcp` warns `mcp.serve_unavailable` without the feature. **Proven E2E** (`tests/serve_mcp.rs`: a peer drives initialize/list/status + `subagent.spawn` → isError on unreachable intel + JSON-RPC error on bad params). _Remaining: `subagent.send`/`cancel`/`status` + `agentd://` resources (async/warm sessions)._
 - [x] `net/vsock.rs` + vsock intelligence transport [vsock] — `VsockStream::connect_with_cid_port` + timeouts, drops into the HTTP client like the other transports. Compiles under `--features vsock`; live verification needs a microVM peer (deferred).
 - [x] `sec/exec.rs` gated `exec` self-tool — off by default, advertised only with `--enable-exec` (propagated via the spawn payload, inherited by children). argv-style (no shell/PATH/interpolation), argv[0] = absolute path to an existing executable, scrubbed env, output capped (64 KiB), own process group `killpg`'d on a mandatory per-call timeout. Salvaged from the retired `shell.rs`. Validation/spawn failures are recoverable observations. (Budget/Rule-of-Two folding = later refinement.)
 - [x] `--mode loop`/`schedule` drivers (`triggers/mode.rs::run_scheduled`): interval-based re-run of the standing instruction (each fire = an independent supervised `once` run); `loop` re-enters back-to-back (interval default 0), `schedule` fires on `--interval`; SIGTERM → graceful drain → exit 0; fast-failing runs back off (capped) so they can't hot-spin. e2e-proven (`tests/daemon_modes.rs`). _Remaining: optional 5-field `cron` feature (croner)._

@@ -8,23 +8,73 @@
 //! (`subagent.spawn` sync/async, `subagent.send/cancel/status`, RFC §3.2) build
 //! on this transport next.
 
-use crate::json::{self, frame, Incoming, Request, Response};
+use crate::json::{self, frame, Id, Incoming, Request, Response};
 use crate::obs::log::Logger;
+use crate::subagent::protocol::SpawnPayload;
+use crate::supervisor::reactor::{supervise_once, SuperviseResult};
 use crate::wire::mcp::PROTOCOL_VERSION;
 use serde_json::{json, Value};
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Read-only context the served tools report. Shared (read-only) across
-/// connections; richer action context (a spawn-payload template) lands with the
-/// `subagent.*` tools.
+/// Cap on concurrent peer-driven `subagent.spawn` runs in flight (bounds a peer
+/// spamming the socket; each run is also bounded by the base payload's limits).
+const MAX_INFLIGHT_SPAWNS: usize = 4;
+/// Cap on the result text returned to the peer (~chars).
+const RESULT_CAP: usize = 4096;
+
+/// Context for the served tools. `run_id`/`mode`/`started` back `status`; the
+/// rest back `subagent.spawn` (a peer delegating work). Shared across
+/// connections; the atomics enforce the concurrency cap + mint handles.
 pub struct ServeCtx {
-    pub run_id: String,
-    pub mode: String,
-    pub started: Instant,
+    run_id: String,
+    mode: String,
+    started: Instant,
+    exe: PathBuf,
+    base: SpawnPayload,
+    drain_timeout: Duration,
+    inflight: Arc<AtomicUsize>,
+    counter: Arc<AtomicU64>,
+}
+
+impl ServeCtx {
+    pub fn new(run_id: String, mode: String, exe: PathBuf, base: SpawnPayload, drain_timeout: Duration) -> ServeCtx {
+        ServeCtx {
+            run_id,
+            mode,
+            started: Instant::now(),
+            exe,
+            base,
+            drain_timeout,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// RAII concurrency permit for a served spawn; releases the slot on drop.
+struct SpawnGuard(Arc<AtomicUsize>);
+
+impl SpawnGuard {
+    fn acquire(slots: &Arc<AtomicUsize>, max: usize) -> Option<SpawnGuard> {
+        if slots.fetch_add(1, Ordering::Relaxed) >= max {
+            slots.fetch_sub(1, Ordering::Relaxed);
+            None
+        } else {
+            Some(SpawnGuard(Arc::clone(slots)))
+        }
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Bind `path` and serve the self-MCP on a background accept thread (one thread
@@ -33,7 +83,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<()> {
     // A stale socket from a crashed prior run would block the bind; clear it.
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    log.info("mcp.serving", json!({"path": path, "tools": ["status"]}));
+    log.info("mcp.serving", json!({"path": path, "tools": ["status", "subagent.spawn"]}));
     let ctx = Arc::new(ctx);
     thread::Builder::new()
         .name("serve-mcp".into())
@@ -61,7 +111,7 @@ fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {
     while let Ok(Some(bytes)) = frame::read_line(&mut reader) {
         // Requests get a reply; notifications (initialized, …) do not.
         if let Ok(Incoming::Request(req)) = serde_json::from_slice::<Incoming>(&bytes) {
-            let resp = dispatch(req, ctx);
+            let resp = dispatch(req, ctx, log);
             if frame::write_line(&mut write, &resp).is_err() {
                 break; // peer hung up mid-reply
             }
@@ -70,8 +120,8 @@ fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {
     log.debug("mcp.disconnect", json!({"peer": "unix"}));
 }
 
-/// Route one JSON-RPC request to a response. Pure given `ctx`.
-fn dispatch(req: Request, ctx: &ServeCtx) -> Response {
+/// Route one JSON-RPC request to a response.
+fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     match req.method.as_str() {
         "initialize" => Response::ok(
             req.id,
@@ -82,13 +132,15 @@ fn dispatch(req: Request, ctx: &ServeCtx) -> Response {
             }),
         ),
         "ping" => Response::ok(req.id, json!({})),
-        "tools/list" => Response::ok(req.id, json!({"tools": [status_tool_def()]})),
-        "tools/call" => tools_call(req, ctx),
+        "tools/list" => {
+            Response::ok(req.id, json!({"tools": [status_tool_def(), spawn_tool_def()]}))
+        }
+        "tools/call" => tools_call(req, ctx, log),
         other => Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported method: {other}")),
     }
 }
 
-fn tools_call(req: Request, ctx: &ServeCtx) -> Response {
+fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let name = req.params.as_ref().and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
     match name {
         "status" => {
@@ -109,7 +161,93 @@ fn tools_call(req: Request, ctx: &ServeCtx) -> Response {
                 }),
             )
         }
+        "subagent.spawn" => handle_spawn(req, ctx, log),
         other => Response::err(req.id, json::INVALID_PARAMS, format!("unknown tool: {other}")),
+    }
+}
+
+/// A peer delegates a task to agentd (RFC 0005 §3.2, sync). Build a fresh root
+/// run from the daemon's payload template + the request, supervise it, and
+/// return the distilled outcome. Bad params → a JSON-RPC error; a cap/scope
+/// refusal or a run failure → `isError:true` inside a successful result (so the
+/// caller's model adapts), never a crash.
+///
+/// **Trust boundary:** anyone able to connect to the `--serve-mcp` socket can
+/// run instructions with this agentd's intelligence + tool scope. The operator
+/// gates access via the socket's filesystem permissions; `async`/`detach` and
+/// the spawn-payload's `limits`/`context_seed` overrides land with M3.
+fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
+    let id = req.id.clone();
+    let args = req.params.as_ref().and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+    let instruction = args.get("instruction").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if instruction.is_empty() {
+        // Malformed call (missing required param) → JSON-RPC error (RFC §3.2).
+        return Response::err(id, json::INVALID_PARAMS, "subagent.spawn requires a non-empty 'instruction'");
+    }
+    // Concurrency cap → refused as a tool result, never a crash.
+    let _permit = match SpawnGuard::acquire(&ctx.inflight, MAX_INFLIGHT_SPAWNS) {
+        Some(g) => g,
+        None => {
+            return tool_error(id, format!("spawn refused: {MAX_INFLIGHT_SPAWNS} concurrent served spawns in flight"));
+        }
+    };
+    let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
+    let handle = format!("served.{n}");
+    let payload = build_served_payload(&ctx.base, &args, &handle);
+    log.info("mcp.spawn", json!({"handle": handle, "servers": payload.mcp_servers.len()}));
+    match supervise_once(ctx.exe.clone(), &payload, ctx.drain_timeout, log.clone()) {
+        Ok(SuperviseResult::Completed(o)) => Response::ok(
+            id,
+            json!({
+                "content": [{"type": "text", "text": distill(&o.result)}],
+                "structuredContent": {
+                    "handle": handle, "status": o.status.as_str(), "partial": o.partial, "result": o.result
+                },
+                "isError": false
+            }),
+        ),
+        Ok(SuperviseResult::Failed(e)) => tool_error(id, format!("subagent failed: {e}")),
+        Ok(SuperviseResult::Killed(r)) => tool_error(id, format!("subagent terminated: {r:?}")),
+        Err(e) => tool_error(id, format!("subagent could not start: {e}")),
+    }
+}
+
+/// Build a served run's payload from the daemon's template + the request. The
+/// child's depth is minted here (a fresh root, not read from the request); the
+/// `tool_scope` only ever narrows the daemon's server set (RFC 0005 §3.2). Pure.
+fn build_served_payload(base: &SpawnPayload, args: &Value, handle: &str) -> SpawnPayload {
+    let mut p = base.clone();
+    p.instruction = args.get("instruction").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    p.output_contract = args.get("output_contract").map(|v| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    if let Some(names) = args.get("tool_scope").and_then(Value::as_array) {
+        let wanted: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+        p.mcp_servers.retain(|s| wanted.contains(&s.name.as_str()));
+    }
+    p.telemetry.agent_id = handle.to_string();
+    p.telemetry.agent_path = handle.to_string();
+    p.depth = 0; // a fresh root run triggered by the peer
+    p
+}
+
+/// A tool-domain failure: `isError:true` inside a *successful* JSON-RPC result.
+fn tool_error(id: Id, msg: String) -> Response {
+    Response::ok(id, json!({"content": [{"type": "text", "text": msg}], "isError": true}))
+}
+
+/// Cap a result value to text for the `content` block (the full value is also in
+/// `structuredContent`).
+fn distill(v: &Value) -> String {
+    let s = match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if s.chars().count() <= RESULT_CAP {
+        s
+    } else {
+        s.chars().take(RESULT_CAP).collect::<String>() + "…[truncated]"
     }
 }
 
@@ -121,13 +259,72 @@ fn status_tool_def() -> Value {
     })
 }
 
+fn spawn_tool_def() -> Value {
+    json!({
+        "name": "subagent.spawn",
+        "description": "Delegate a task to this agentd: it runs a fresh agent (its own intelligence \
+            + tool scope) and returns the distilled result. Give an 'instruction' and optionally an \
+            'output_contract' and a 'tool_scope' (a subset of this agentd's MCP server names). Sync: \
+            the call blocks until the run finishes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "instruction": {"type": "string", "description": "the task for the spawned agent"},
+                "output_contract": {"type": "string", "description": "exactly what the agent should return"},
+                "tool_scope": {"type": "array", "items": {"type": "string"}, "description": "subset of MCP server names to grant"}
+            },
+            "required": ["instruction"]
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json::Id;
+    use crate::config::McpServerSpec;
+    use crate::obs::log::{Comp, Level, LogCtx};
+    use crate::subagent::protocol::{IntelConfig, Limits, Telemetry};
+
+    fn base() -> SpawnPayload {
+        SpawnPayload {
+            instruction: "standing".into(),
+            output_contract: None,
+            context_seed: Vec::new(),
+            intelligence: IntelConfig { uri: "unix:/x".into(), token: None, model: None },
+            mcp_servers: vec![
+                McpServerSpec { name: "fs".into(), command: vec!["a".into()], tags: Vec::new() },
+                McpServerSpec { name: "db".into(), command: vec!["b".into()], tags: Vec::new() },
+            ],
+            limits: Limits { max_steps: 10, max_tokens: 1000, deadline_ms: 1000, max_depth: 4 },
+            telemetry: Telemetry {
+                run_id: "r1".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                trace_id: None,
+                log_level: "error".into(),
+                log_content: false,
+            },
+            depth: 0,
+            enable_exec: false,
+        }
+    }
 
     fn ctx() -> ServeCtx {
-        ServeCtx { run_id: "r1".into(), mode: "reactive".into(), started: Instant::now() }
+        ServeCtx::new("r1".into(), "reactive".into(), "agentd".into(), base(), Duration::from_secs(5))
+    }
+
+    fn log() -> Logger {
+        Logger::new(
+            LogCtx {
+                run_id: "r1".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: 0,
+                trace_id: None,
+            },
+            Level::Error,
+        )
     }
 
     fn req(method: &str, params: Option<Value>) -> Request {
@@ -136,7 +333,7 @@ mod tests {
 
     #[test]
     fn initialize_declares_tools_capability() {
-        let r = dispatch(req("initialize", None), &ctx());
+        let r = dispatch(req("initialize", None), &ctx(), &log());
         let v = r.result.expect("ok");
         assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
         assert!(v["capabilities"]["tools"].is_object());
@@ -144,15 +341,17 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_advertises_status() {
-        let r = dispatch(req("tools/list", None), &ctx());
+    fn tools_list_advertises_status_and_spawn() {
+        let r = dispatch(req("tools/list", None), &ctx(), &log());
         let tools = r.result.expect("ok")["tools"].clone();
-        assert_eq!(tools[0]["name"], "status");
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"subagent.spawn"));
     }
 
     #[test]
     fn status_call_returns_structured_state() {
-        let r = dispatch(req("tools/call", Some(json!({"name": "status"}))), &ctx());
+        let r = dispatch(req("tools/call", Some(json!({"name": "status"}))), &ctx(), &log());
         let v = r.result.expect("ok");
         assert_eq!(v["isError"], false);
         assert_eq!(v["structuredContent"]["run_id"], "r1");
@@ -161,9 +360,30 @@ mod tests {
 
     #[test]
     fn unknown_tool_and_method_are_errors() {
-        let bad_tool = dispatch(req("tools/call", Some(json!({"name": "ghost"}))), &ctx());
+        let bad_tool = dispatch(req("tools/call", Some(json!({"name": "ghost"}))), &ctx(), &log());
         assert!(bad_tool.error.is_some());
-        let bad_method = dispatch(req("frobnicate", None), &ctx());
+        let bad_method = dispatch(req("frobnicate", None), &ctx(), &log());
         assert!(bad_method.error.is_some());
+    }
+
+    #[test]
+    fn build_served_payload_sets_instruction_and_narrows_scope() {
+        let p = build_served_payload(&base(), &json!({"instruction": "do x", "tool_scope": ["fs"]}), "served.0");
+        assert_eq!(p.instruction, "do x");
+        assert_eq!(p.mcp_servers.len(), 1); // narrowed to the requested subset
+        assert_eq!(p.mcp_servers[0].name, "fs");
+        assert_eq!(p.telemetry.agent_path, "served.0"); // handle minted here
+        assert_eq!(p.depth, 0);
+    }
+
+    #[test]
+    fn spawn_missing_instruction_is_a_jsonrpc_error() {
+        // Malformed params → JSON-RPC error (not an isError result); never reaches a real spawn.
+        let r = dispatch(
+            req("tools/call", Some(json!({"name": "subagent.spawn", "arguments": {}}))),
+            &ctx(),
+            &log(),
+        );
+        assert!(r.error.is_some(), "missing instruction → JSON-RPC error");
     }
 }

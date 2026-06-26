@@ -21,6 +21,7 @@ pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup
 pub mod exit; // the public exit-code table + terminal-status -> code map
 pub mod json; // shared JSON-RPC 2.0 codec + framing (NDJSON + length-prefix)
 pub mod wire; // MCP + intelligence wire types
+pub mod agentd_uri; // the agentd:// resource scheme (self-state + async completion)
 pub mod net; // hand-rolled HTTP/1.1(+SSE), unix-socket, (tls/vsock gated)
 pub mod intel; // intelligence client + provider adapters
 pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config

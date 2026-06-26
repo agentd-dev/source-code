@@ -22,6 +22,21 @@ pub trait SelfHandler {
     /// one of this handler's self-tools; `None` to fall through to MCP.
     fn handle(&mut self, name: &str, args: &Value) -> Option<(String, bool)>;
 
+    /// Read an `agentd://` self-resource (e.g. `agentd://subagent/<handle>` — an
+    /// async child's completion). A `resource.read` for an `agentd://` URI routes
+    /// here instead of to MCP. `Some((content, is_error))` if this handler serves
+    /// the URI; `None` (the default) means it does not. RFC 0009 §async.
+    fn read_resource(&mut self, _uri: &str) -> Option<(String, bool)> {
+        None
+    }
+
+    /// Whether this handler exposes any `agentd://` self-resources — so the loop
+    /// offers the `resource.read` tool even when no MCP resources exist. Default
+    /// `false`.
+    fn serves_self_resources(&self) -> bool {
+        false
+    }
+
     /// Drain any future wake-ups the agent scheduled for itself this run
     /// (RFC 0008 §self-scheduling). Default: none. The loop attaches these to
     /// the run's [`Outcome`](crate::agentloop::stop::Outcome) so a daemon

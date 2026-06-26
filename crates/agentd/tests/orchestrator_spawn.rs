@@ -100,9 +100,82 @@ fn async_spawn_returns_a_handle_then_await_collects_the_result() {
     assert!(!is_error, "the child should complete, got error: {result}");
     assert!(result.contains("mock-llm done"), "expected the distilled child result, got: {result}");
 
-    // The handle is consumed once collected.
+    // Collection is idempotent: a status/read after await still returns the result
+    // (the handle is a peek, reaped at Drop — consistent across status/await/read).
     let (again, is_error) = orch.handle("subagent.status", &json!({"handle": "0.0"})).expect("status is a self-tool");
-    assert!(is_error && again.contains("no async subagent"), "the handle should be consumed: {again}");
+    assert!(!is_error && again.contains("mock-llm done"), "status should still return the result (idempotent): {again}");
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+}
+
+#[test]
+fn a_detached_child_is_not_collectable() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(&sock);
+
+    let mut payload = parent_payload();
+    payload.intelligence.uri = format!("unix:{}", sock.display());
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
+
+    // detach=true: fire-and-forget. The ack must NOT promise a collectable result.
+    let (ack, err) = orch.handle("subagent.spawn", &json!({"instruction": "x", "detach": true})).expect("spawn");
+    assert!(!err, "detached spawn should succeed: {ack}");
+    assert!(ack.contains("fire-and-forget") && !ack.contains("agentd://"), "detach ack omits the resource uri: {ack}");
+
+    // Every collection path reports the detached child as not collectable.
+    for tool in ["subagent.status", "subagent.await"] {
+        let (msg, _) = orch.handle(tool, &json!({"handle": "0.0"})).expect("self-tool");
+        assert!(msg.contains("detached"), "{tool} should report detached, got: {msg}");
+    }
+    let (msg, _) = orch.read_resource("agentd://subagent/0.0").expect("agentd:// served");
+    assert!(msg.contains("detached"), "resource.read should report detached, got: {msg}");
+
+    let _ = llm.kill();
+    let _ = llm.wait();
+}
+
+#[test]
+fn async_completion_is_readable_as_an_agentd_resource() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("llm.sock");
+    let mut llm = start_mock_llm(&sock);
+
+    let mut payload = parent_payload();
+    payload.intelligence.uri = format!("unix:{}", sock.display());
+
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
+
+    // The handler serves agentd:// resources (so the loop offers resource.read).
+    assert!(orch.serves_self_resources(), "an orchestrator that can nest serves agentd:// resources");
+
+    // Spawn async and confirm the ack points at the readable resource URI.
+    let (ack, err) = orch.handle("subagent.spawn", &json!({"instruction": "x", "async": true})).expect("spawn");
+    assert!(!err, "async spawn should succeed: {ack}");
+    assert!(ack.contains("agentd://subagent/0.0"), "ack should mention the resource uri: {ack}");
+
+    // resource.read is an idempotent peek: poll until the child completes.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut done = None;
+    while Instant::now() < deadline {
+        let (content, is_err) = orch.read_resource("agentd://subagent/0.0").expect("agentd:// is self-served");
+        if content.contains("mock-llm done") {
+            done = Some((content, is_err));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (content, is_err) = done.expect("the completion should become readable as a resource");
+    assert!(!is_err && content.contains("mock-llm done"), "got: {content}");
+
+    // Idempotent: a second read still returns the completion (handle NOT consumed,
+    // unlike subagent.status / await).
+    let (again, _) = orch.read_resource("agentd://subagent/0.0").expect("still served");
+    assert!(again.contains("mock-llm done"), "resource.read should be an idempotent peek: {again}");
 
     let _ = llm.kill();
     let _ = llm.wait();

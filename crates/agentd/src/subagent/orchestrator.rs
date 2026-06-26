@@ -245,7 +245,8 @@ impl Orchestrator {
                 if detach {
                     (format!("spawned detached subagent (handle={handle}); fire-and-forget — it runs independently and is reaped on completion"), false)
                 } else {
-                    (format!("spawned async subagent (handle={handle}); keep working, then collect its result with subagent.await or subagent.status using this handle"), false)
+                    let uri = crate::agentd_uri::subagent_uri(&handle);
+                    (format!("spawned async subagent (handle={handle}); keep working, then get its result with subagent.await (waits for it) — or peek anytime with subagent.status / resource.read {uri} (all idempotent)"), false)
                 }
             }
             Err(e) => {
@@ -281,35 +282,52 @@ impl Orchestrator {
         }
     }
 
-    /// `subagent.status` — non-blocking peek. Reports "still running", or hands
-    /// back (and reaps) the distilled result once the child has finished.
+    /// Idempotent peek at an async child: drain its channel and report the
+    /// current state — "still running", the distilled result, or (for a detached
+    /// child) a not-collectable notice. `None` if no such handle. Does **not**
+    /// consume the handle, so status / await / `agentd://` reads of one child are
+    /// all consistent and repeatable; the child is reaped at [`Drop`] (or via the
+    /// breadth cap). Shared by `status`, `await_child`, and `read_resource`.
+    fn peek_child(&mut self, handle: &str) -> Option<(String, bool)> {
+        let child = self.async_children.get_mut(handle)?;
+        if child.detached {
+            return Some((
+                format!("subagent {handle} was spawned detached (fire-and-forget); its result is not collectable"),
+                false,
+            ));
+        }
+        Self::drain_child(child);
+        Some(match &child.outcome {
+            None => (format!("subagent {handle} is still running"), false),
+            Some((result, is_err)) => (result.clone(), *is_err),
+        })
+    }
+
+    /// `subagent.status` — non-blocking, idempotent peek (see [`Self::peek_child`]).
     fn status(&mut self, args: &Value) -> (String, bool) {
         let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let Some(child) = self.async_children.get_mut(&handle) else {
-            return (format!("error: no async subagent with handle '{handle}'"), true);
-        };
-        Self::drain_child(child);
-        if child.outcome.is_none() {
-            return (format!("subagent {handle} is still running"), false);
-        }
-        // Terminal: hand back the result and reap the handle.
-        self.async_children.remove(&handle).unwrap().outcome.unwrap()
+        self.peek_child(&handle).unwrap_or_else(|| (format!("error: no async subagent with handle '{handle}'"), true))
     }
 
     /// `subagent.await` — block (bounded by [`AWAIT_MAX`]) until the child
-    /// finishes, then hand back (and reap) its distilled result. On timeout
-    /// returns "still running" so the loop regains control (await again).
+    /// finishes, then hand back its distilled result (idempotent — the handle is
+    /// not consumed). On timeout returns "still running" so the loop regains
+    /// control (await again).
     fn await_child(&mut self, args: &Value) -> (String, bool) {
         let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        if !self.async_children.contains_key(&handle) {
-            return (format!("error: no async subagent with handle '{handle}'"), true);
+        match self.async_children.get(&handle) {
+            None => return (format!("error: no async subagent with handle '{handle}'"), true),
+            // A detached child is not awaitable (fire-and-forget).
+            Some(c) if c.detached => return self.peek_child(&handle).unwrap(),
+            Some(_) => {}
         }
+        // (the immutable borrow above ends here; the loop below re-borrows mutably)
         let deadline = Instant::now() + AWAIT_MAX;
         loop {
             if let Some(child) = self.async_children.get_mut(&handle) {
                 Self::drain_child(child);
-                if child.outcome.is_some() {
-                    return self.async_children.remove(&handle).unwrap().outcome.unwrap();
+                if let Some((result, is_err)) = &child.outcome {
+                    return (result.clone(), *is_err);
                 }
             }
             if Instant::now() >= deadline {
@@ -376,6 +394,25 @@ impl SelfHandler for Orchestrator {
             }
             _ => None,
         }
+    }
+
+    fn read_resource(&mut self, uri: &str) -> Option<(String, bool)> {
+        // `agentd://subagent/<handle>` reads an async child's completion as a
+        // resource (completion-as-self-resource, RFC 0009) — the same idempotent
+        // peek as subagent.status (a detached child is not collectable).
+        match crate::agentd_uri::AgentdResource::parse(uri) {
+            Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
+                Some(self.peek_child(&handle).unwrap_or_else(|| (format!("no async subagent with handle '{handle}'"), true)))
+            }
+            // agentd://status is a served-only resource; not served from a subagent.
+            _ => None,
+        }
+    }
+
+    fn serves_self_resources(&self) -> bool {
+        // Async children (and thus agentd://subagent/<handle> resources) are
+        // possible exactly when delegation is.
+        self.can_nest()
     }
 
     fn take_scheduled(&mut self) -> Vec<ScheduleRequest> {

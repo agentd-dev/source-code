@@ -55,6 +55,20 @@ impl ServeCtx {
             counter: Arc::new(AtomicU64::new(0)),
         }
     }
+
+    /// This agentd's own run/health state — the single source of truth for both
+    /// the `status` tool and the `agentd://status` resource.
+    fn status_body(&self) -> Value {
+        json!({
+            "run_id": self.run_id,
+            "mode": self.mode,
+            "version": crate::VERSION,
+            "pid": std::process::id(),
+            "uptime_ms": self.started.elapsed().as_millis() as u64,
+            "inflight_spawns": self.inflight.load(Ordering::Relaxed),
+            "total_spawns": self.counter.load(Ordering::Relaxed),
+        })
+    }
 }
 
 /// RAII concurrency permit for a served spawn; releases the slot on drop.
@@ -83,7 +97,10 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<()> {
     // A stale socket from a crashed prior run would block the bind; clear it.
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    log.info("mcp.serving", json!({"path": path, "tools": ["status", "subagent.spawn"]}));
+    log.info(
+        "mcp.serving",
+        json!({"path": path, "tools": ["status", "subagent.spawn"], "resources": ["agentd://status"]}),
+    );
     let ctx = Arc::new(ctx);
     thread::Builder::new()
         .name("serve-mcp".into())
@@ -127,7 +144,9 @@ fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             req.id,
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
+                // `resources: {}` (no subscribe yet) advertises the agentd://
+                // read-only resource surface; presence is what a client gates on.
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": "agentd", "version": crate::VERSION}
             }),
         ),
@@ -136,7 +155,38 @@ fn dispatch(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             Response::ok(req.id, json!({"tools": [status_tool_def(), spawn_tool_def()]}))
         }
         "tools/call" => tools_call(req, ctx, log),
+        "resources/list" => Response::ok(req.id, json!({"resources": resource_list()})),
+        "resources/read" => resources_read(req, ctx),
         other => Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported method: {other}")),
+    }
+}
+
+/// The agentd:// resources this server exposes. v1: `agentd://status` (agentd's
+/// own state). Per-served-subagent resources need a tracked async-spawn registry
+/// (served spawns are sync today) — a follow-on.
+fn resource_list() -> Value {
+    json!([{
+        "uri": "agentd://status",
+        "name": "status",
+        "description": "This agentd's run id, mode, version, pid, uptime, and spawn counts.",
+        "mimeType": "application/json"
+    }])
+}
+
+/// `resources/read` over the agentd:// scheme. A known URI returns a `contents`
+/// body; an unknown/missing URI is a JSON-RPC INVALID_PARAMS error.
+fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
+    let uri = req.params.as_ref().and_then(|p| p.get("uri")).and_then(Value::as_str).unwrap_or("");
+    match crate::agentd_uri::AgentdResource::parse(uri) {
+        Some(crate::agentd_uri::AgentdResource::Status) => Response::ok(
+            req.id,
+            json!({
+                "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.status_body().to_string()}]
+            }),
+        ),
+        // agentd://subagent/<handle> needs a tracked async-spawn registry (served
+        // spawns are sync) — not available yet.
+        _ => Response::err(req.id, json::INVALID_PARAMS, format!("unknown resource: {uri}")),
     }
 }
 
@@ -144,13 +194,7 @@ fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let name = req.params.as_ref().and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
     match name {
         "status" => {
-            let body = json!({
-                "run_id": ctx.run_id,
-                "mode": ctx.mode,
-                "version": crate::VERSION,
-                "pid": std::process::id(),
-                "uptime_ms": ctx.started.elapsed().as_millis() as u64,
-            });
+            let body = ctx.status_body();
             // CallToolResult: human text + a structured payload (MCP 2025-11-25).
             Response::ok(
                 req.id,
@@ -357,6 +401,42 @@ mod tests {
         assert_eq!(v["isError"], false);
         assert_eq!(v["structuredContent"]["run_id"], "r1");
         assert_eq!(v["structuredContent"]["mode"], "reactive");
+    }
+
+    #[test]
+    fn initialize_declares_resources_capability() {
+        let r = dispatch(req("initialize", None), &ctx(), &log());
+        let v = r.result.expect("ok");
+        assert!(v["capabilities"]["resources"].is_object(), "resources capability advertised");
+    }
+
+    #[test]
+    fn resources_list_advertises_agentd_status() {
+        let r = dispatch(req("resources/list", None), &ctx(), &log());
+        let resources = r.result.expect("ok")["resources"].clone();
+        let uris: Vec<&str> = resources.as_array().unwrap().iter().filter_map(|x| x["uri"].as_str()).collect();
+        assert!(uris.contains(&"agentd://status"), "agentd://status listed: {uris:?}");
+    }
+
+    #[test]
+    fn resources_read_status_returns_a_contents_body() {
+        let r = dispatch(req("resources/read", Some(json!({"uri": "agentd://status"}))), &ctx(), &log());
+        let v = r.result.expect("ok");
+        let entry = &v["contents"][0];
+        assert_eq!(entry["uri"], "agentd://status");
+        assert_eq!(entry["mimeType"], "application/json");
+        // the text is the JSON status body
+        let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["run_id"], "r1");
+        assert_eq!(body["mode"], "reactive");
+    }
+
+    #[test]
+    fn resources_read_unknown_uri_is_an_error() {
+        let r = dispatch(req("resources/read", Some(json!({"uri": "agentd://ghost"}))), &ctx(), &log());
+        assert!(r.error.is_some(), "unknown agentd:// uri → JSON-RPC error");
+        let bad = dispatch(req("resources/read", Some(json!({"uri": "file:///x"}))), &ctx(), &log());
+        assert!(bad.error.is_some(), "non-agentd uri → JSON-RPC error");
     }
 
     #[test]

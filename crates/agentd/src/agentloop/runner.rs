@@ -132,7 +132,9 @@ impl<'a> Session<'a> {
         let (mut tools, tool_to_server) = build_catalogue(servers)?;
         tools.extend(self_handler.tools());
         let resources = collect_resources(servers);
-        if !resources.owner.is_empty() {
+        // Offer `resource.read` when there are MCP resources OR the handler
+        // serves agentd:// self-resources (e.g. async-child completions).
+        if !resources.owner.is_empty() || self_handler.serves_self_resources() {
             tools.push(resource_read_tool_def());
         }
         let mut messages = vec![Message::system(system_prompt(input.output_contract.as_deref()))];
@@ -250,7 +252,17 @@ impl<'a> Session<'a> {
                     log.info("tool.call", call);
                     let tool_start = crate::obs::otel::now_unix_nanos();
                     let (content, is_error) = if tc.name == "resource.read" {
-                        read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
+                        // An `agentd://` URI reads agentd's own state (e.g. an
+                        // async child's completion) via the self-handler; any
+                        // other URI is an MCP-server resource.
+                        let uri = tc.arguments.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+                        if crate::agentd_uri::is_agentd(uri) {
+                            self_handler
+                                .read_resource(uri)
+                                .unwrap_or_else(|| (format!("unknown agentd resource: {uri}"), true))
+                        } else {
+                            read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
+                        }
                     } else {
                         match self_handler.handle(&tc.name, &tc.arguments) {
                             Some(r) => r, // a self-tool (e.g. subagent.spawn)

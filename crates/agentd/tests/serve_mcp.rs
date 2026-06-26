@@ -68,6 +68,7 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
     assert_eq!(init["result"]["serverInfo"]["name"], "agentd", "init: {init}");
     assert!(init["result"]["capabilities"]["tools"].is_object());
+    assert!(init["result"]["capabilities"]["resources"].is_object(), "resources capability: {init}");
 
     // tools/list advertises `status`
     let list = rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
@@ -112,6 +113,30 @@ fn a_peer_initializes_lists_and_calls_status() {
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{}}}"#,
     );
     assert!(bad_spawn["error"].is_object(), "missing instruction → JSON-RPC error: {bad_spawn}");
+
+    // resources/list advertises the agentd:// surface
+    let res_list = rpc(&mut reader, &mut write, r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#);
+    assert_eq!(res_list["result"]["resources"][0]["uri"], "agentd://status", "resources/list: {res_list}");
+
+    // resources/read agentd://status returns a contents body with the live state
+    let res_read = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"agentd://status"}}"#,
+    );
+    let entry = &res_read["result"]["contents"][0];
+    assert_eq!(entry["uri"], "agentd://status", "resources/read: {res_read}");
+    assert_eq!(entry["mimeType"], "application/json");
+    let body: serde_json::Value = serde_json::from_str(entry["text"].as_str().expect("text")).expect("json body");
+    assert_eq!(body["mode"], "loop", "served status body reflects the daemon mode: {body}");
+
+    // an unknown agentd:// uri is a JSON-RPC error
+    let bad_read = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"agentd://ghost"}}"#,
+    );
+    assert!(bad_read["error"].is_object(), "unknown resource → JSON-RPC error: {bad_read}");
 
     sigterm(child.id());
     let _ = child.wait();

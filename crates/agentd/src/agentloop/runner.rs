@@ -91,10 +91,6 @@ impl LoopInput {
             cancel: None,
         }
     }
-
-    fn cancelled(&self) -> bool {
-        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
-    }
 }
 
 /// Run the agent loop to a terminal status (in-process, once-mode entry).
@@ -107,9 +103,194 @@ pub fn run_root(
     run_loop(intel, servers, &LoopInput::from_config(cfg), &mut NoopSelfHandler, log)
 }
 
-/// The agentic loop over explicit inputs. Used by once-mode (`run_root`) and by
-/// a subagent process (`subagent::control`). `self_handler` supplies agentd's
-/// in-process self-tools (e.g. `subagent.spawn`); the loop tries it before MCP.
+/// The durable state of an agent session: the scoped tool catalogue, the
+/// resource-awareness map, and the **conversation transcript** — everything that
+/// persists *across turns*. A once-mode / per-event run is a session of exactly
+/// one turn ([`run_loop`]); a **warm** continue-session runs many turns over the
+/// same transcript (RFC 0008 §spawn-vs-continue), each new event appended via
+/// [`Session::deliver`] before another [`Session::run_turn`].
+pub struct Session<'a> {
+    servers: &'a [McpClient],
+    tools: Vec<ToolDef>,
+    tool_to_server: HashMap<String, usize>,
+    resources: ResourceCatalogue,
+    model: String,
+    messages: Vec<Message>,
+}
+
+impl<'a> Session<'a> {
+    /// Assemble a session: the tool catalogue (MCP tools + self-tools +
+    /// `resource.read` when resources exist; resources: list = awareness,
+    /// read = on-demand attention, RFC 0007 §resources), the resource awareness
+    /// note, and the opening transcript (system prompt + seed + the instruction
+    /// as the first user turn).
+    pub fn prepare(
+        servers: &'a [McpClient],
+        input: &LoopInput,
+        self_handler: &mut dyn SelfHandler,
+    ) -> Result<Session<'a>, LoopAbort> {
+        let (mut tools, tool_to_server) = build_catalogue(servers)?;
+        tools.extend(self_handler.tools());
+        let resources = collect_resources(servers);
+        if !resources.owner.is_empty() {
+            tools.push(resource_read_tool_def());
+        }
+        let mut messages = vec![Message::system(system_prompt(input.output_contract.as_deref()))];
+        if let Some(note) = resources.catalogue_note() {
+            messages.push(Message::system(note));
+        }
+        for (role, content) in &input.seed {
+            messages.push(seed_message(role, content));
+        }
+        messages.push(Message::user(&input.instruction));
+        Ok(Session { servers, tools, tool_to_server, resources, model: input.model.clone(), messages })
+    }
+
+    /// Append the next event as a new user turn — the delivery point for a warm
+    /// continue-session (RFC 0008). The transcript (the model's memory of the
+    /// session) carries forward, so the next turn continues the conversation.
+    pub fn deliver(&mut self, content: &str) {
+        self.messages.push(Message::user(content));
+    }
+
+    /// Run one turn: the ReAct loop over the persistent transcript until a
+    /// terminal status, bounded by `budget`. `cancel` is polled at each turn
+    /// boundary. Every assistant/tool message (including the final answer) is
+    /// appended to the transcript, so a subsequent turn continues the same
+    /// conversation.
+    pub fn run_turn(
+        &mut self,
+        intel: &IntelClient,
+        self_handler: &mut dyn SelfHandler,
+        log: &Logger,
+        budget: &mut Budget,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<Outcome, LoopAbort> {
+        let mut last_text: Option<String> = None;
+        // otel run trace: the `invoke_agent` span plus a `chat` child per model
+        // call and an `execute_tool` child per tool call. No-op without
+        // `--features otel`, so the wiring carries no `cfg`. One trace per turn.
+        let run_start = crate::obs::otel::now_unix_nanos();
+        let mut run_span = crate::obs::otel::run_begin(log.ctx().trace_id.as_deref(), run_start);
+        let (mut tok_in, mut tok_out) = (0u64, 0u64);
+
+        log.info(
+            "loop.start",
+            json!({"tools": self.tools.len(), "servers": self.servers.len(), "resources": self.resources.owner.len(), "max_steps": budget.max_steps()}),
+        );
+
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                log.warn("loop.final", json!({"status": "cancelled", "steps": budget.steps()}));
+                run_span.finish(&self.model, tok_in, tok_out, false);
+                return Ok(Outcome {
+                    status: TerminalStatus::Cancelled,
+                    partial: last_text.is_some(),
+                    result: json!(last_text.unwrap_or_default()),
+                    scheduled: self_handler.take_scheduled(),
+                    subscriptions: self_handler.take_subscriptions(),
+                });
+            }
+            if let Some(status) = budget.exceeded() {
+                log.warn("loop.final", json!({"status": status.as_str(), "steps": budget.steps(), "tokens": budget.tokens()}));
+                run_span.finish(&self.model, tok_in, tok_out, false);
+                return Ok(Outcome {
+                    status,
+                    partial: last_text.is_some(),
+                    result: json!(last_text.unwrap_or_default()),
+                    scheduled: self_handler.take_scheduled(),
+                    subscriptions: self_handler.take_subscriptions(),
+                });
+            }
+
+            // Per-turn audit anchor (RFC 0010 §2.9 `loop.step`): the running
+            // budget snapshot at the head of each ReAct turn, distinct from the
+            // LLM-call event below.
+            log.debug(
+                "loop.step",
+                json!({"step": budget.steps(), "tokens": budget.tokens(), "messages": self.messages.len()}),
+            );
+
+            let req = Request {
+                model: self.model.clone(),
+                messages: self.messages.clone(),
+                tools: self.tools.clone(),
+                max_tokens: PER_CALL_MAX_TOKENS,
+                temperature: Some(0.0),
+            };
+
+            log.debug("intel.call", json!({"step": budget.steps(), "messages": self.messages.len()}));
+            let chat_start = crate::obs::otel::now_unix_nanos();
+            let resp = intel.complete(&req).map_err(|e| LoopAbort::Intel(e.to_string()))?;
+            budget.record_usage(resp.usage);
+            budget.record_step();
+            tok_in += resp.usage.input_tokens;
+            tok_out += resp.usage.output_tokens;
+            run_span.record_chat(&self.model, resp.usage.input_tokens, resp.usage.output_tokens, true, chat_start);
+            log.debug(
+                "intel.result",
+                json!({"tool_calls": resp.tool_calls.len(), "tokens_in": resp.usage.input_tokens, "tokens_out": resp.usage.output_tokens}),
+            );
+
+            if resp.wants_tools() {
+                if let Some(t) = resp.text.as_deref().filter(|t| !t.is_empty()) {
+                    last_text = Some(t.to_string());
+                }
+                let tool_calls = resp.tool_calls.clone();
+                self.messages.push(Message::Assistant { text: resp.text, tool_calls: tool_calls.clone() });
+
+                for tc in &tool_calls {
+                    let mut call = json!({"tool": tc.name, "id": tc.id});
+                    // Content capture is opt-in (RFC 0010 §2.9): default logs only
+                    // the tool name + length; `--log-content` adds the (truncated)
+                    // arguments/result body for debugging.
+                    if log.content_capture() {
+                        call["args"] = json!(truncate_for_log(&tc.arguments.to_string()));
+                    }
+                    log.info("tool.call", call);
+                    let tool_start = crate::obs::otel::now_unix_nanos();
+                    let (content, is_error) = if tc.name == "resource.read" {
+                        read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
+                    } else {
+                        match self_handler.handle(&tc.name, &tc.arguments) {
+                            Some(r) => r, // a self-tool (e.g. subagent.spawn)
+                            None => dispatch_tool(self.servers, &self.tool_to_server, &tc.name, &tc.arguments),
+                        }
+                    };
+                    run_span.record_tool(&tc.name, !is_error, tool_start);
+                    let mut result = json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()});
+                    if log.content_capture() {
+                        result["content"] = json!(truncate_for_log(&content));
+                    }
+                    log.info("tool.result", result);
+                    self.messages.push(Message::tool_result(&tc.id, content, is_error));
+                }
+                continue;
+            }
+
+            // No tool calls → the model's text is the final answer for this turn.
+            // Record it in the transcript so a warm session's next turn sees its
+            // own prior reply (invisible to once-mode, which discards the session).
+            let text = resp.text.clone().or(last_text).unwrap_or_default();
+            self.messages.push(Message::Assistant { text: Some(text.clone()), tool_calls: Vec::new() });
+            log.info("loop.final", json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}));
+            run_span.finish(&self.model, tok_in, tok_out, true);
+            return Ok(Outcome {
+                status: TerminalStatus::Completed,
+                partial: false,
+                result: json!(text),
+                scheduled: self_handler.take_scheduled(),
+                subscriptions: self_handler.take_subscriptions(),
+            });
+        }
+    }
+}
+
+/// The agentic loop over explicit inputs — one session, one turn. Used by
+/// once-mode (`run_root`) and a per-event subagent run (`subagent::control`).
+/// `self_handler` supplies agentd's in-process self-tools (e.g. `subagent.spawn`);
+/// the loop tries it before MCP. A warm continue-session instead drives
+/// [`Session`] directly across many turns.
 pub fn run_loop(
     intel: &IntelClient,
     servers: &[McpClient],
@@ -117,143 +298,9 @@ pub fn run_loop(
     self_handler: &mut dyn SelfHandler,
     log: &Logger,
 ) -> Result<Outcome, LoopAbort> {
-    let (mut tools, tool_to_server) = build_catalogue(servers)?;
-    tools.extend(self_handler.tools());
-
-    // Resources: list = awareness (a compact catalogue injected as context),
-    // read = attention (the model pulls a body on demand via resource.read).
-    // RFC 0007 §resources.
-    let resources = collect_resources(servers);
-    if !resources.owner.is_empty() {
-        tools.push(resource_read_tool_def());
-    }
-
+    let mut session = Session::prepare(servers, input, self_handler)?;
     let mut budget = Budget::new(input.max_steps, input.max_tokens, input.deadline);
-
-    let mut messages = vec![Message::system(system_prompt(input.output_contract.as_deref()))];
-    if let Some(note) = resources.catalogue_note() {
-        messages.push(Message::system(note));
-    }
-    for (role, content) in &input.seed {
-        messages.push(seed_message(role, content));
-    }
-    messages.push(Message::user(&input.instruction));
-    let mut last_text: Option<String> = None;
-    let model = input.model.clone();
-    // otel run trace: the `invoke_agent` span plus a `chat` child per model call
-    // and an `execute_tool` child per tool call. The handle is a no-op without
-    // `--features otel`, so the wiring below carries no `cfg`. `tok_*` are the
-    // run-span token totals.
-    let run_start = crate::obs::otel::now_unix_nanos();
-    let mut run_span = crate::obs::otel::run_begin(log.ctx().trace_id.as_deref(), run_start);
-    let (mut tok_in, mut tok_out) = (0u64, 0u64);
-
-    log.info(
-        "loop.start",
-        json!({"tools": tools.len(), "servers": servers.len(), "resources": resources.owner.len(), "max_steps": input.max_steps}),
-    );
-
-    loop {
-        if input.cancelled() {
-            log.warn("loop.final", json!({"status": "cancelled", "steps": budget.steps()}));
-            run_span.finish(&model, tok_in, tok_out, false);
-            return Ok(Outcome {
-                status: TerminalStatus::Cancelled,
-                partial: last_text.is_some(),
-                result: json!(last_text.unwrap_or_default()),
-                scheduled: self_handler.take_scheduled(),
-                subscriptions: self_handler.take_subscriptions(),
-            });
-        }
-        if let Some(status) = budget.exceeded() {
-            log.warn("loop.final", json!({"status": status.as_str(), "steps": budget.steps(), "tokens": budget.tokens()}));
-            run_span.finish(&model, tok_in, tok_out, false);
-            return Ok(Outcome {
-                status,
-                partial: last_text.is_some(),
-                result: json!(last_text.unwrap_or_default()),
-                scheduled: self_handler.take_scheduled(),
-                subscriptions: self_handler.take_subscriptions(),
-            });
-        }
-
-        // Per-turn audit anchor (RFC 0010 §2.9 `loop.step`): the running budget
-        // snapshot at the head of each ReAct turn, distinct from the LLM-call
-        // event below.
-        log.debug(
-            "loop.step",
-            json!({"step": budget.steps(), "tokens": budget.tokens(), "messages": messages.len()}),
-        );
-
-        let req = Request {
-            model: model.clone(),
-            messages: messages.clone(),
-            tools: tools.clone(),
-            max_tokens: PER_CALL_MAX_TOKENS,
-            temperature: Some(0.0),
-        };
-
-        log.debug("intel.call", json!({"step": budget.steps(), "messages": messages.len()}));
-        let chat_start = crate::obs::otel::now_unix_nanos();
-        let resp = intel.complete(&req).map_err(|e| LoopAbort::Intel(e.to_string()))?;
-        budget.record_usage(resp.usage);
-        budget.record_step();
-        tok_in += resp.usage.input_tokens;
-        tok_out += resp.usage.output_tokens;
-        run_span.record_chat(&model, resp.usage.input_tokens, resp.usage.output_tokens, true, chat_start);
-        log.debug(
-            "intel.result",
-            json!({"tool_calls": resp.tool_calls.len(), "tokens_in": resp.usage.input_tokens, "tokens_out": resp.usage.output_tokens}),
-        );
-
-        if resp.wants_tools() {
-            if let Some(t) = resp.text.as_deref().filter(|t| !t.is_empty()) {
-                last_text = Some(t.to_string());
-            }
-            let tool_calls = resp.tool_calls.clone();
-            messages.push(Message::Assistant { text: resp.text, tool_calls: tool_calls.clone() });
-
-            for tc in &tool_calls {
-                let mut call = json!({"tool": tc.name, "id": tc.id});
-                // Content capture is opt-in (RFC 0010 §2.9): default logs only
-                // the tool name + length; `--log-content` adds the (truncated)
-                // arguments/result body for debugging.
-                if log.content_capture() {
-                    call["args"] = json!(truncate_for_log(&tc.arguments.to_string()));
-                }
-                log.info("tool.call", call);
-                let tool_start = crate::obs::otel::now_unix_nanos();
-                let (content, is_error) = if tc.name == "resource.read" {
-                    read_resource_tool(servers, &resources.owner, &tc.arguments)
-                } else {
-                    match self_handler.handle(&tc.name, &tc.arguments) {
-                        Some(r) => r, // a self-tool (e.g. subagent.spawn)
-                        None => dispatch_tool(servers, &tool_to_server, &tc.name, &tc.arguments),
-                    }
-                };
-                run_span.record_tool(&tc.name, !is_error, tool_start);
-                let mut result = json!({"tool": tc.name, "is_error": is_error, "bytes": content.len()});
-                if log.content_capture() {
-                    result["content"] = json!(truncate_for_log(&content));
-                }
-                log.info("tool.result", result);
-                messages.push(Message::tool_result(&tc.id, content, is_error));
-            }
-            continue;
-        }
-
-        // No tool calls → the model's text is the final answer.
-        let text = resp.text.clone().or(last_text).unwrap_or_default();
-        log.info("loop.final", json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}));
-        run_span.finish(&model, tok_in, tok_out, true);
-        return Ok(Outcome {
-            status: TerminalStatus::Completed,
-            partial: false,
-            result: json!(text),
-            scheduled: self_handler.take_scheduled(),
-            subscriptions: self_handler.take_subscriptions(),
-        });
-    }
+    session.run_turn(intel, self_handler, log, &mut budget, input.cancel.as_ref())
 }
 
 /// Max characters of tool content recorded under `--log-content`. Bounds a log

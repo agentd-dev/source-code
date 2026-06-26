@@ -29,6 +29,12 @@ pub trait SelfHandler {
     fn take_scheduled(&mut self) -> Vec<crate::agentloop::stop::ScheduleRequest> {
         Vec::new()
     }
+
+    /// Drain any resource (un)subscriptions the agent requested for itself this
+    /// run (RFC 0008). Default: none. Attached to the run's `Outcome`.
+    fn take_subscriptions(&mut self) -> Vec<crate::agentloop::stop::SubscriptionRequest> {
+        Vec::new()
+    }
 }
 
 /// The default: no self-tools (used by the in-process once-mode loop, which

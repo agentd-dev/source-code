@@ -154,6 +154,7 @@ pub fn run_loop(
                 partial: last_text.is_some(),
                 result: json!(last_text.unwrap_or_default()),
                 scheduled: self_handler.take_scheduled(),
+                subscriptions: self_handler.take_subscriptions(),
             });
         }
         if let Some(status) = budget.exceeded() {
@@ -163,6 +164,7 @@ pub fn run_loop(
                 partial: last_text.is_some(),
                 result: json!(last_text.unwrap_or_default()),
                 scheduled: self_handler.take_scheduled(),
+                subscriptions: self_handler.take_subscriptions(),
             });
         }
 
@@ -233,6 +235,7 @@ pub fn run_loop(
             partial: false,
             result: json!(text),
             scheduled: self_handler.take_scheduled(),
+            subscriptions: self_handler.take_subscriptions(),
         });
     }
 }

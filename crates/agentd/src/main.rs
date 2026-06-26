@@ -122,6 +122,16 @@ fn run() -> i32 {
         }
     }
 
+    // cgroup v2 memory awareness (best-effort): report the scheduler-imposed
+    // budget so OOM risk is observable. Quiet when there is no cgroup. RFC 0010.
+    let mem = agentd::supervisor::cgroup::snapshot();
+    if mem.detected() {
+        log.info(
+            "cgroup.detected",
+            json!({"memory_max": mem.max, "memory_current": mem.current, "memory_high": mem.high}),
+        );
+    }
+
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
         // The long-lived modes all re-exec a root subagent, so they need our

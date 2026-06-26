@@ -59,28 +59,27 @@ cargo clippy -p agentd -- -D warnings # keep clean
 
 ## Current status
 
-- **Phase:** M6 observability + security tags — the **lethal-trifecta check is
-  now wired and enforcing** (`--mcp-tags` + `--allow-trifecta`, refused at root
-  startup); `--aggregate-logs` resolved as satisfied-by-design (stderr
-  inheritance). On top of metrics, `--log-content`, and the prior hardening pass.
-- **Last completed (this wake):** **trifecta enforcement wired** + the
-  `--aggregate-logs` deviation. Tag source `--mcp-tags name=tag,tag` (carried in
-  the spawn payload); untagged → `untrusted_input`, `--enable-exec` → `egress`.
-  `Config::trifecta_grant_tags()` feeds `check_trifecta` **once at root startup**
-  (`main.rs`): refuse → exit 2 + `scope.trifecta_refused`; `--allow-trifecta` →
-  proceed + `scope.trifecta_grant` warn. Root enforcement bounds the tree
-  (monotonic narrowing, RFC 0009) — no per-spawn check, no flag-in-payload.
-  `--aggregate-logs` resolved as satisfied-by-design (child stderr is
-  `Stdio::inherit()` → already single-stream). Observe-proven via CLI (exit
-  2 / warn+proceed / silent). (Prior wakes: metrics feature; `--log-content`;
-  restart governor; SSRF classifier; exit-code table.) No new deps, default
-  build still 3 deps. **172 tests** green, clippy clean (default + all-features).
-- **Next action:** M6's only remaining code item is the **`otel` feature** (OTLP
-  + GenAI semconv — the one feature allowed heavier deps; a bigger lift, defer
-  unless prioritized). Otherwise advance to: the **`--serve-mcp` peer listener**
-  (M2/M4 composability), the `cron` feature (M4), M3 reactive depth (warm
-  sessions / async-spawn / self-subscribe — the signature capability), M5 drain
-  choreography + cgroup-v2, M7 (conformance + observe-suite + container + docs).
+- **Phase:** M6 done bar `otel`; now picking up M5 — **cgroup-v2 memory
+  awareness (read-side)** landed this wake (startup `cgroup.detected` + `/metrics`
+  memory gauges). On top of trifecta enforcement, metrics, `--log-content`.
+- **Last completed (this wake):** **cgroup-v2 memory awareness (read-side)**.
+  New `supervisor/cgroup.rs` (no deps): best-effort `memory.max`/`current`/`high`
+  reads under `/sys/fs/cgroup`, degrading to `None` off-cgroup. Logged once at
+  startup as `cgroup.detected` (quiet when absent) and exposed as live
+  `agentd_memory_max_bytes` / `agentd_memory_current_bytes` gauges appended to
+  the `/metrics` render (kept out of the counter registry so the counter render
+  stays deterministic). Parse/read fixture-tested; graceful no-cgroup
+  degradation verified on this (cgroup-v1) host. (Prior wakes: trifecta
+  enforcement; metrics feature; `--log-content`; restart governor; SSRF; exit
+  table.) No new deps, default build still 3 deps. **175 default / 179 metrics
+  tests** green, clippy clean (default + metrics + all-features).
+- **Next action:** M5 **drain choreography** (`AGENTD_DRAIN_TIMEOUT`; SIGTERM →
+  drain within budget → exit 0, second SIGTERM forces) — mostly verify + tighten
+  existing reactor drain + a test. Then bigger features: **`--serve-mcp` peer
+  listener** (M2/M4 composability), M3 reactive depth (warm sessions /
+  async-spawn / **self-subscribe** — the signature capability), the `cron` and
+  `otel` features, M7 (conformance + observe-suite + container + docs). The
+  cgroup `cgroup.kill`/backpressure follow-ups remain on the M5 line.
 - **Active milestone:** M6 (observability depth); M2 restart done, M5 exit-table
   done. M4 still owes `--serve-mcp`/`cron`.
 - **Blockers:** none — disk healthy. **Workflow caveat learned:** parallel
@@ -168,7 +167,7 @@ Modules: `obs/health.rs`; extends `signals.rs supervisor/{kill,reap}.rs config.r
 - [x] `obs/health.rs` **supervisor-heartbeat liveness** + `--health-file`: a process-global `tick()` is bumped by every supervisor hot loop (reactor, daemon driver, interval sleep) so liveness reflects the *supervisor* making progress — idle is healthy, a busy/stuck *subagent* doesn't flip it. A 1s writer thread renders `{alive, supervisor_tick_age_ms, mode, draining, ts}` atomically (temp+rename); a K8s exec probe checks `alive`/tick-age freshness. e2e-proven (`tests/daemon_modes.rs`: loop mode writes a live health file). The opt-in `/healthz`+`/readyz` HTTP surface now ships with the `metrics` feature (`obs/serve.rs`, bound by `--metrics-addr`); `/healthz` reuses this same supervisor-heartbeat liveness (200 when fresh + not draining, else 503).
 - [x] complete exit-code table in `exit.rs` — the full RFC 0011 §5 table (0 success, 1 generic, 2 usage, 3 partial, 4 intelligence, 5 semantic/refused, 6 MCP, 7 budget, 124 deadline; 137/143 documented as OS-set), `once_exit` total over every `TerminalStatus`, and tests asserting the mapping, pairwise-distinctness, documented bands, and "non-completed never looks like success". (The supervisor hard-deadline path maps `KillReason::Deadline → 124` in `main.rs`, distinct from the loop's soft budget `7`.)
 - [x] RUN_ID propagation into MCP `_meta` — `McpClient::set_tool_meta` stamps `{"agentd/run_id": …}` onto every `tools/call` `params._meta` (set after initialize in the subagent) so backing services dedupe retries of a run (RFC 0011 §idempotency). Pure builder unit-tested.
-- [ ] cgroup-v2 awareness (read `memory.max`, optional child-cgroup + `cgroup.kill`, `memory.high` backpressure, never required)
+- [~] cgroup-v2 awareness — **read-side landed** (`supervisor/cgroup.rs`, no deps): best-effort reads of `memory.max`/`current`/`high` under `/sys/fs/cgroup` (correct under a container cgroup namespace; degrades to `None` off-cgroup / cgroup-v1). Logged once at startup as `cgroup.detected` (quiet when absent) and exposed as live `agentd_memory_max_bytes`/`agentd_memory_current_bytes` gauges on the `/metrics` surface. Parse + read fixture-tested; graceful no-cgroup degradation verified on this host. _Remaining (the "optional" active-enforcement pieces): a child cgroup + `cgroup.kill` for atomic subtree teardown, and `memory.high` backpressure on spawn._
 - **Acceptance:** SIGTERM drains within budget → exit **0** (not 143); second SIGTERM forces kill; health file goes stale only when the *supervisor* wedges; each exit code matches the table; stable RUN_ID retried run detects "already done" via backing MCP → exit 0 cheaply; cgroup-writable host → tree reaped by `cgroup.kill`.
 
 ### M6 — Observability depth + security tags

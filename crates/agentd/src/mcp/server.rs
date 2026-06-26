@@ -163,9 +163,35 @@ impl Drop for SpawnGuard {
     }
 }
 
+/// A shutdown handle for the served self-MCP: lets the daemon drain in-flight
+/// served runs before it exits (their reactors also self-drain on the process
+/// SIGTERM; this makes the daemon *wait* for them rather than guillotine their
+/// subtrees at `process::exit`).
+pub struct ServeHandle {
+    sessions: Registry,
+    inflight: Arc<AtomicUsize>,
+}
+
+impl ServeHandle {
+    /// Ask every in-flight served run to cancel, then wait (bounded by `timeout`)
+    /// for them to finish so their subtrees drain gracefully.
+    pub fn drain(&self, timeout: Duration) {
+        if let Ok(reg) = self.sessions.lock() {
+            for s in reg.values() {
+                s.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        while self.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 /// Bind `path` and serve the self-MCP on a background accept thread (one thread
-/// per connection). Returns the bind error so the caller decides if it's fatal.
-pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<()> {
+/// per connection). Returns a [`ServeHandle`] (for shutdown drain), or the bind
+/// error so the caller decides if it's fatal.
+pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHandle> {
     // A stale socket from a crashed prior run would block the bind; clear it.
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -173,6 +199,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<()> {
         "mcp.serving",
         json!({"path": path, "tools": ["status", "subagent.spawn"], "resources": ["agentd://status"]}),
     );
+    let handle = ServeHandle { sessions: Arc::clone(&ctx.sessions), inflight: Arc::clone(&ctx.inflight) };
     let ctx = Arc::new(ctx);
     thread::Builder::new()
         .name("serve-mcp".into())
@@ -187,7 +214,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<()> {
                     .ok();
             }
         })?;
-    Ok(())
+    Ok(handle)
 }
 
 fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {

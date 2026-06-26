@@ -34,6 +34,15 @@ fn handle(mut stream: UnixStream, script: &str) {
     // A `role:tool` message means the model already called a tool, so the next
     // turn is a final answer.
     let saw_tool_result = body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\"");
+    // `slow`: hold the response so the calling subagent stays alive in the
+    // model call — used by the chaos suite to catch a live subagent before
+    // collapsing the tree.
+    let script = if script == "slow" {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        "final"
+    } else {
+        script
+    };
     let payload = response_json(script, saw_tool_result);
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

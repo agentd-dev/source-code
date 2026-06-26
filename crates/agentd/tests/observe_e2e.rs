@@ -54,16 +54,33 @@ fn once_mode_runs_the_real_loop_to_a_completed_answer() {
     let mut llm = start_mock_llm(&sock, "final");
 
     let intel = format!("unix:{}", sock.display());
-    let (code, stdout, stderr) =
-        run_once(&["--mode", "once", "--instruction", "do the thing", "--intelligence", &intel, "--log-level", "info"]);
+    let (code, stdout, stderr) = run_once(&[
+        "--mode",
+        "once",
+        "--instruction",
+        "do the thing",
+        "--intelligence",
+        &intel,
+        "--log-level",
+        "info",
+    ]);
 
     sigterm(llm.id());
     let _ = llm.wait();
 
     assert_eq!(code, 0, "expected exit 0; stderr:\n{stderr}");
-    assert!(stdout.contains("mock-llm done"), "model answer not on stdout: {stdout:?}");
-    assert!(stderr.contains(r#""event":"loop.final""#), "no loop.final:\n{stderr}");
-    assert!(stderr.contains(r#""status":"completed""#), "loop did not complete:\n{stderr}");
+    assert!(
+        stdout.contains("mock-llm done"),
+        "model answer not on stdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains(r#""event":"loop.final""#),
+        "no loop.final:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(r#""status":"completed""#),
+        "loop did not complete:\n{stderr}"
+    );
 }
 
 #[test]
@@ -73,24 +90,44 @@ fn once_mode_runs_a_tool_call_react_cycle() {
     let mut llm = start_mock_llm(&sock, "read");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!("mock={} --internal-mock-mcp file:///in.json --no-emit", exe());
+    let mcp = format!(
+        "mock={} --internal-mock-mcp file:///in.json --no-emit",
+        exe()
+    );
     let (code, stdout, stderr) = run_once(&[
-        "--mode", "once", "--instruction", "read the resource", "--intelligence", &intel, "--mcp", &mcp,
-        "--log-level", "info",
+        "--mode",
+        "once",
+        "--instruction",
+        "read the resource",
+        "--intelligence",
+        &intel,
+        "--mcp",
+        &mcp,
+        "--log-level",
+        "info",
     ]);
 
     sigterm(llm.id());
     let _ = llm.wait();
 
     assert_eq!(code, 0, "expected exit 0; stderr:\n{stderr}");
-    assert!(stdout.contains("read complete"), "final answer not on stdout: {stdout:?}");
+    assert!(
+        stdout.contains("read complete"),
+        "final answer not on stdout: {stdout:?}"
+    );
     // The model called the resource.read tool, and the loop ran it then finished.
     assert!(
         stderr.contains(r#""event":"tool.call""#) && stderr.contains("resource.read"),
         "no resource.read tool.call:\n{stderr}"
     );
-    assert!(stderr.contains(r#""event":"tool.result""#), "no tool.result:\n{stderr}");
-    assert!(stderr.contains(r#""status":"completed""#), "loop did not complete:\n{stderr}");
+    assert!(
+        stderr.contains(r#""event":"tool.result""#),
+        "no tool.result:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(r#""status":"completed""#),
+        "loop did not complete:\n{stderr}"
+    );
 }
 
 #[test]
@@ -102,11 +139,24 @@ fn reactive_self_scheduling_fires_a_wake() {
     let mut llm = start_mock_llm(&sock, "schedule");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!("mock={} --internal-mock-mcp file:///in.json --no-emit", exe());
+    let mcp = format!(
+        "mock={} --internal-mock-mcp file:///in.json --no-emit",
+        exe()
+    );
     let mut child = Command::new(exe())
         .args([
-            "--mode", "reactive", "--instruction", "react", "--intelligence", &intel, "--subscribe",
-            "file:///in.json", "--mcp", &mcp, "--log-level", "info",
+            "--mode",
+            "reactive",
+            "--instruction",
+            "react",
+            "--intelligence",
+            &intel,
+            "--subscribe",
+            "file:///in.json",
+            "--mcp",
+            &mcp,
+            "--log-level",
+            "info",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -128,12 +178,18 @@ fn reactive_self_scheduling_fires_a_wake() {
     let _ = llm.wait();
     let out = reader.join().unwrap_or_default();
 
-    assert!(out.contains(r#""event":"self.schedule""#), "model never called schedule:\n{out}");
+    assert!(
+        out.contains(r#""event":"self.schedule""#),
+        "model never called schedule:\n{out}"
+    );
     assert!(
         out.contains(r#""kind":"self_schedule""#),
         "no self-scheduled wake armed/fired:\n{out}"
     );
-    assert!(out.contains(r#""event":"trigger.fired""#), "no trigger fired:\n{out}");
+    assert!(
+        out.contains(r#""event":"trigger.fired""#),
+        "no trigger fired:\n{out}"
+    );
 }
 
 #[test]
@@ -146,11 +202,24 @@ fn reactive_self_subscribe_arms_a_warm_continue_route() {
     let mut llm = start_mock_llm(&sock, "subscribe");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!("mock={} --internal-mock-mcp file:///in.json --no-emit", exe());
+    let mcp = format!(
+        "mock={} --internal-mock-mcp file:///in.json --no-emit",
+        exe()
+    );
     let mut child = Command::new(exe())
         .args([
-            "--mode", "reactive", "--instruction", "react", "--intelligence", &intel, "--subscribe",
-            "file:///in.json", "--mcp", &mcp, "--log-level", "info",
+            "--mode",
+            "reactive",
+            "--instruction",
+            "react",
+            "--intelligence",
+            &intel,
+            "--subscribe",
+            "file:///in.json",
+            "--mcp",
+            &mcp,
+            "--log-level",
+            "info",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -172,8 +241,14 @@ fn reactive_self_subscribe_arms_a_warm_continue_route() {
     let _ = llm.wait();
     let out = reader.join().unwrap_or_default();
 
-    assert!(out.contains(r#""event":"self.subscribe""#), "model never called subscribe:\n{out}");
-    assert!(out.contains(r#""kind":"self_subscribe""#), "no self-subscription armed:\n{out}");
+    assert!(
+        out.contains(r#""event":"self.subscribe""#),
+        "model never called subscribe:\n{out}"
+    );
+    assert!(
+        out.contains(r#""kind":"self_subscribe""#),
+        "no self-subscription armed:\n{out}"
+    );
     // The new route is a WARM continue, not a Spawn (the signature capability).
     assert!(
         out.contains(r#""disposition":"continue""#),

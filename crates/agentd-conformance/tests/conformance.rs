@@ -2,7 +2,7 @@
 //! checks against a freshly-built agentd and asserting every check passes. The
 //! same checks back the `agentd-conformance` runner binary.
 
-use agentd_conformance::{checks, run_check, Check, Harness};
+use agentd_conformance::{Check, Harness, checks, run_check};
 
 fn run_family(name: &str, family: Vec<Check>) {
     let h = Harness::new();

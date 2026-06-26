@@ -118,26 +118,44 @@ impl<'de> Deserialize<'de> for Version {
 
 impl Request {
     pub fn new(id: impl Into<Id>, method: impl Into<String>, params: Option<Value>) -> Self {
-        Request { jsonrpc: Version, id: id.into(), method: method.into(), params }
+        Request {
+            jsonrpc: Version,
+            id: id.into(),
+            method: method.into(),
+            params,
+        }
     }
 }
 
 impl Notification {
     pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {
-        Notification { jsonrpc: Version, method: method.into(), params }
+        Notification {
+            jsonrpc: Version,
+            method: method.into(),
+            params,
+        }
     }
 }
 
 impl Response {
     pub fn ok(id: Id, result: Value) -> Self {
-        Response { jsonrpc: Version, id, result: Some(result), error: None }
+        Response {
+            jsonrpc: Version,
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     pub fn err(id: Id, code: i64, message: impl Into<String>) -> Self {
         Response {
             jsonrpc: Version,
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into(), data: None }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
         }
     }
 }

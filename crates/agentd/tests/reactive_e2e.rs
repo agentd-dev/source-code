@@ -56,11 +56,23 @@ fn reactive_observably_reacts_to_a_resource_update() {
     // Mock emits a resources/updated ~200ms after subscribe.
     let out = run_reactive_capture("", 1800);
 
-    assert!(out.contains(r#""event":"subscribe""#), "no subscribe event:\n{out}");
-    assert!(out.contains(r#""event":"resource.updated""#), "no resource.updated event:\n{out}");
-    assert!(out.contains(r#""event":"trigger.fired""#), "no trigger.fired event:\n{out}");
+    assert!(
+        out.contains(r#""event":"subscribe""#),
+        "no subscribe event:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"resource.updated""#),
+        "no resource.updated event:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"trigger.fired""#),
+        "no trigger.fired event:\n{out}"
+    );
     // The reaction ran a real subagent (its own agent_path under the run).
-    assert!(out.contains(r#""event":"subagent.spawn""#), "no reaction subagent.spawn:\n{out}");
+    assert!(
+        out.contains(r#""event":"subagent.spawn""#),
+        "no reaction subagent.spawn:\n{out}"
+    );
 }
 
 #[test]
@@ -75,9 +87,20 @@ fn trace_context_propagates_across_the_agent_tree() {
 
     let mut child = Command::new(exe)
         .args([
-            "--mode", "reactive", "--instruction", "react", "--intelligence",
-            "unix:/nonexistent.sock", "--subscribe", "file:///in.json", "--mcp", &mcp,
-            "--traceparent", &traceparent, "--log-level", "info",
+            "--mode",
+            "reactive",
+            "--instruction",
+            "react",
+            "--intelligence",
+            "unix:/nonexistent.sock",
+            "--subscribe",
+            "file:///in.json",
+            "--mcp",
+            &mcp,
+            "--traceparent",
+            &traceparent,
+            "--log-level",
+            "info",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -97,12 +120,21 @@ fn trace_context_propagates_across_the_agent_tree() {
 
     let tid_field = format!(r#""trace_id":"{trace_id}""#);
     // present on supervisor-emitted lines
-    let on_supervisor =
-        out.lines().any(|l| l.contains(r#""comp":"supervisor""#) && l.contains(&tid_field));
+    let on_supervisor = out
+        .lines()
+        .any(|l| l.contains(r#""comp":"supervisor""#) && l.contains(&tid_field));
     // present on subagent-emitted lines
-    let on_agent = out.lines().any(|l| l.contains(r#""comp":"agent""#) && l.contains(&tid_field));
-    assert!(on_supervisor, "upstream trace id not on supervisor lines:\n{out}");
-    assert!(on_agent, "upstream trace id not propagated to subagent lines:\n{out}");
+    let on_agent = out
+        .lines()
+        .any(|l| l.contains(r#""comp":"agent""#) && l.contains(&tid_field));
+    assert!(
+        on_supervisor,
+        "upstream trace id not on supervisor lines:\n{out}"
+    );
+    assert!(
+        on_agent,
+        "upstream trace id not propagated to subagent lines:\n{out}"
+    );
 }
 
 #[test]
@@ -111,9 +143,21 @@ fn read_after_subscribe_reacts_without_an_emitted_update() {
     // resource's current state on startup (read-after-subscribe, §2.8).
     let out = run_reactive_capture(" --no-emit", 1500);
 
-    assert!(out.contains(r#""event":"subscribe""#), "no subscribe event:\n{out}");
-    assert!(out.contains(r#""event":"reactive.initial_read""#), "no read-after-subscribe:\n{out}");
-    assert!(out.contains(r#""event":"trigger.fired""#), "no trigger.fired event:\n{out}");
+    assert!(
+        out.contains(r#""event":"subscribe""#),
+        "no subscribe event:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"reactive.initial_read""#),
+        "no read-after-subscribe:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"trigger.fired""#),
+        "no trigger.fired event:\n{out}"
+    );
     // No real notification arrived, so there must be no resource.updated event.
-    assert!(!out.contains(r#""event":"resource.updated""#), "unexpected resource.updated:\n{out}");
+    assert!(
+        !out.contains(r#""event":"resource.updated""#),
+        "unexpected resource.updated:\n{out}"
+    );
 }

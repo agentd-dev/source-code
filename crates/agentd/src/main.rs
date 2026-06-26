@@ -11,10 +11,10 @@
 use agentd::config::{Config, ConfigError, Mode};
 use agentd::obs::log::{Comp, LogCtx, Logger};
 use agentd::subagent::protocol::{IntelConfig, Limits, SpawnPayload, Telemetry};
-use agentd::supervisor::reactor::{supervise_once, KillReason, SuperviseResult};
+use agentd::supervisor::reactor::{KillReason, SuperviseResult, supervise_once};
 use agentd::triggers::mode::{run_reactive, run_scheduled};
 use agentd::{exit, signals};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn main() {
     std::process::exit(run());
@@ -34,7 +34,10 @@ fn run() -> i32 {
     // Hidden built-in mock LLM (tests / observe-suite):
     // `--internal-mock-llm <socket> [final|read|schedule]`.
     if argv.get(1).map(String::as_str) == Some("--internal-mock-llm") {
-        let socket = argv.get(2).map(String::as_str).unwrap_or("/tmp/agentd-mock-llm.sock");
+        let socket = argv
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("/tmp/agentd-mock-llm.sock");
         let script = argv.get(3).map(String::as_str).unwrap_or("final");
         return agentd::intel::mock::run(socket, script);
     }
@@ -110,14 +113,20 @@ fn run() -> i32 {
     // lethal capability legs (untrusted input + sensitive data + egress) in one
     // agent, unless --allow-trifecta. Scope narrows monotonically (RFC 0009), so
     // enforcing on the root grant bounds the entire subagent tree.
-    use agentd::sec::scope::{check_trifecta, TrifectaVerdict};
+    use agentd::sec::scope::{TrifectaVerdict, check_trifecta};
     match check_trifecta(cfg.trifecta_grant_tags(), cfg.allow_trifecta) {
         TrifectaVerdict::Ok => {}
         TrifectaVerdict::AllowedWithWarning => {
-            log.warn("scope.trifecta_grant", json!({"allowed": true, "legs": ["untrusted_input", "sensitive", "egress"]}));
+            log.warn(
+                "scope.trifecta_grant",
+                json!({"allowed": true, "legs": ["untrusted_input", "sensitive", "egress"]}),
+            );
         }
         TrifectaVerdict::RefusedTrifecta => {
-            log.error("scope.trifecta_refused", json!({"legs": ["untrusted_input", "sensitive", "egress"]}));
+            log.error(
+                "scope.trifecta_refused",
+                json!({"legs": ["untrusted_input", "sensitive", "egress"]}),
+            );
             eprintln!(
                 "agentd: refused — this grant gives one agent all three lethal-trifecta legs \
                  (untrusted input + sensitive data + egress). Split the capabilities across \
@@ -155,7 +164,10 @@ fn run() -> i32 {
                     // Limits were requested but the controllers couldn't be
                     // delegated (e.g. `auto` under a busy unit cgroup) — teardown
                     // still works, but the limits won't be enforced.
-                    log.warn("cgroup.limits_unavailable", json!({"parent": c.parent.display().to_string()}));
+                    log.warn(
+                        "cgroup.limits_unavailable",
+                        json!({"parent": c.parent.display().to_string()}),
+                    );
                 }
             }
             None => log.warn("cgroup.unavailable", json!({"spec": spec})),
@@ -191,7 +203,10 @@ fn run() -> i32 {
             }
             // Opt-in served self-MCP for composability (RFC 0005). Built only
             // with `--features serve-mcp`; otherwise `--serve-mcp` warns + is inert.
-            let serve_handle = cfg.serve_mcp.as_ref().and_then(|spec| serve_self_mcp(spec, &exe, root_payload(&cfg), &cfg, &log));
+            let serve_handle = cfg
+                .serve_mcp
+                .as_ref()
+                .and_then(|spec| serve_self_mcp(spec, &exe, root_payload(&cfg), &cfg, &log));
             let code = match cfg.mode {
                 Mode::Reactive => run_reactive(exe, root_payload(&cfg), &cfg, &log),
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
@@ -215,13 +230,19 @@ fn run() -> i32 {
 #[cfg(feature = "metrics")]
 fn serve_metrics(addr: &str, log: &Logger) {
     if let Err(e) = agentd::obs::serve::spawn(addr, log.clone()) {
-        log.error("metrics.bind_fail", json!({"addr": addr, "err": e.to_string()}));
+        log.error(
+            "metrics.bind_fail",
+            json!({"addr": addr, "err": e.to_string()}),
+        );
     }
 }
 
 #[cfg(not(feature = "metrics"))]
 fn serve_metrics(addr: &str, log: &Logger) {
-    log.warn("metrics.unavailable", json!({"addr": addr, "reason": "built without --features metrics"}));
+    log.warn(
+        "metrics.unavailable",
+        json!({"addr": addr, "reason": "built without --features metrics"}),
+    );
 }
 
 /// Start the served self-MCP (composability, RFC 0005), or warn this build can't.
@@ -246,15 +267,27 @@ fn serve_self_mcp(
     match agentd::mcp::server::serve(path, ctx, log.clone()) {
         Ok(handle) => Some(handle),
         Err(e) => {
-            log.error("mcp.serve_fail", json!({"path": path, "err": e.to_string()}));
+            log.error(
+                "mcp.serve_fail",
+                json!({"path": path, "err": e.to_string()}),
+            );
             None
         }
     }
 }
 
 #[cfg(not(feature = "serve-mcp"))]
-fn serve_self_mcp(spec: &str, _exe: &std::path::Path, _base: SpawnPayload, _cfg: &Config, log: &Logger) -> Option<()> {
-    log.warn("mcp.serve_unavailable", json!({"spec": spec, "reason": "built without --features serve-mcp"}));
+fn serve_self_mcp(
+    spec: &str,
+    _exe: &std::path::Path,
+    _base: SpawnPayload,
+    _cfg: &Config,
+    log: &Logger,
+) -> Option<()> {
+    log.warn(
+        "mcp.serve_unavailable",
+        json!({"spec": spec, "reason": "built without --features serve-mcp"}),
+    );
     None
 }
 
@@ -276,7 +309,10 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
     match supervise_once(exe, &payload, cfg.drain_timeout, log.clone()) {
         Ok(SuperviseResult::Completed(outcome)) => {
             print_result(&outcome.result);
-            log.info("proc.exit", json!({"status": outcome.status.as_str(), "partial": outcome.partial}));
+            log.info(
+                "proc.exit",
+                json!({"status": outcome.status.as_str(), "partial": outcome.partial}),
+            );
             exit::once_exit(outcome.status, outcome.partial)
         }
         Ok(SuperviseResult::Failed(err)) => {
@@ -310,7 +346,10 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
 /// full configured MCP set (scope narrows only for *child* subagents).
 fn root_payload(cfg: &Config) -> SpawnPayload {
     // ~10 years if no deadline, so the child's `Instant + ms` never overflows.
-    let deadline_ms = cfg.deadline.map(|d| d.as_millis() as u64).unwrap_or(315_360_000_000);
+    let deadline_ms = cfg
+        .deadline
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(315_360_000_000);
     SpawnPayload {
         instruction: cfg.instruction.clone().unwrap_or_default(),
         output_contract: None,
@@ -333,7 +372,9 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             agent_path: "0".into(),
             // Same trace id as the supervisor's logs → the whole tree correlates
             // (resolve is deterministic for a given run id; RFC 0010).
-            trace_id: Some(agentd::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id),
+            trace_id: Some(
+                agentd::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id,
+            ),
             log_level: cfg.log_level.as_str().into(),
             log_content: cfg.log_content,
         },
@@ -360,6 +401,9 @@ fn failed_exit(err: &str) -> i32 {
 fn print_result(v: &Value) {
     match v {
         Value::String(s) => println!("{s}"),
-        other => println!("{}", serde_json::to_string_pretty(other).unwrap_or_default()),
+        other => println!(
+            "{}",
+            serde_json::to_string_pretty(other).unwrap_or_default()
+        ),
     }
 }

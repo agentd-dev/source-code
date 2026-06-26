@@ -5,8 +5,8 @@
 //!
 //! Invariant: **stdout is the agent's result; stderr is all telemetry.**
 
-pub mod log;
 pub mod health;
+pub mod log;
 // W3C trace-context *propagation* is default-on and dependency-free (a few
 // formatted fields). Only span *export* (OTLP) is gated behind `otel` (added
 // inside `trace.rs`). RFC 0010 §context-propagation.

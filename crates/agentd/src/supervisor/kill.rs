@@ -56,7 +56,12 @@ impl Ladder {
     /// Begin a teardown at `now`. The caller should immediately send a
     /// graceful `Cancel` to every target (the ladder assumes that happened).
     pub fn new(now: Instant, grace: Duration, kill_grace: Duration) -> Ladder {
-        Ladder { started: now, grace, kill_grace, phase: Phase::Cancel }
+        Ladder {
+            started: now,
+            grace,
+            kill_grace,
+            phase: Phase::Cancel,
+        }
     }
 
     pub fn with_defaults(now: Instant) -> Ladder {
@@ -133,25 +138,40 @@ mod tests {
     fn waits_during_grace() {
         let t0 = Instant::now();
         let mut l = ladder(t0);
-        assert_eq!(l.poll(t0 + Duration::from_secs(1), false, false), LadderAction::Wait);
+        assert_eq!(
+            l.poll(t0 + Duration::from_secs(1), false, false),
+            LadderAction::Wait
+        );
     }
 
     #[test]
     fn escalates_term_then_kill() {
         let t0 = Instant::now();
         let mut l = ladder(t0);
-        assert_eq!(l.poll(t0 + Duration::from_secs(5), false, false), LadderAction::Term);
+        assert_eq!(
+            l.poll(t0 + Duration::from_secs(5), false, false),
+            LadderAction::Term
+        );
         // still waiting between term and kill
-        assert_eq!(l.poll(t0 + Duration::from_secs(6), false, false), LadderAction::Wait);
+        assert_eq!(
+            l.poll(t0 + Duration::from_secs(6), false, false),
+            LadderAction::Wait
+        );
         // after grace + kill_grace = 7s
-        assert_eq!(l.poll(t0 + Duration::from_secs(7), false, false), LadderAction::Kill);
+        assert_eq!(
+            l.poll(t0 + Duration::from_secs(7), false, false),
+            LadderAction::Kill
+        );
     }
 
     #[test]
     fn all_exited_is_done() {
         let t0 = Instant::now();
         let mut l = ladder(t0);
-        assert_eq!(l.poll(t0 + Duration::from_secs(1), true, false), LadderAction::Done);
+        assert_eq!(
+            l.poll(t0 + Duration::from_secs(1), true, false),
+            LadderAction::Done
+        );
     }
 
     #[test]
@@ -161,7 +181,10 @@ mod tests {
         // even at t0, force jumps straight to SIGKILL
         assert_eq!(l.poll(t0, false, true), LadderAction::Kill);
         // and won't re-issue Kill on the next poll (waits to reap)
-        assert_eq!(l.poll(t0 + Duration::from_millis(1), false, true), LadderAction::Wait);
+        assert_eq!(
+            l.poll(t0 + Duration::from_millis(1), false, true),
+            LadderAction::Wait
+        );
     }
 
     #[test]
@@ -169,6 +192,9 @@ mod tests {
         let t0 = Instant::now();
         let mut l = ladder(t0);
         l.poll(t0, false, true); // Kill
-        assert_eq!(l.poll(t0 + Duration::from_secs(1), true, false), LadderAction::Done);
+        assert_eq!(
+            l.poll(t0 + Duration::from_secs(1), true, false),
+            LadderAction::Done
+        );
     }
 }

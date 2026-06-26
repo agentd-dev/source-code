@@ -25,12 +25,14 @@ use crate::agentloop::action::SelfHandler;
 use crate::agentloop::stop::{ScheduleRequest, SubscriptionAction, SubscriptionRequest};
 use crate::config::McpServerSpec;
 use crate::obs::log::Logger;
-use crate::subagent::protocol::{AgentMsg, IntelConfig, Limits, SeedMessage, SpawnPayload, Telemetry};
-use crate::supervisor::reactor::{supervise_once, SuperviseResult};
-use crate::supervisor::spawn::{spawn, Subagent};
+use crate::subagent::protocol::{
+    AgentMsg, IntelConfig, Limits, SeedMessage, SpawnPayload, Telemetry,
+};
+use crate::supervisor::reactor::{SuperviseResult, supervise_once};
+use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
 use crate::wire::intel::ToolDef;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -100,7 +102,12 @@ pub struct Orchestrator {
 impl Orchestrator {
     /// Build from the running subagent's own payload. Children inherit its
     /// intelligence + (narrowable) MCP scope and carry depth + 1.
-    pub fn from_payload(exe: PathBuf, payload: &SpawnPayload, drain_timeout: Duration, log: Logger) -> Orchestrator {
+    pub fn from_payload(
+        exe: PathBuf,
+        payload: &SpawnPayload,
+        drain_timeout: Duration,
+        log: Logger,
+    ) -> Orchestrator {
         Orchestrator {
             exe,
             parent_depth: payload.depth,
@@ -133,15 +140,25 @@ impl Orchestrator {
         }
         let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
         if uri.is_empty() {
-            return ("error: subscribe/unsubscribe requires a non-empty 'uri'".into(), true);
+            return (
+                "error: subscribe/unsubscribe requires a non-empty 'uri'".into(),
+                true,
+            );
         }
         let verb = match action {
             SubscriptionAction::Subscribe => "subscribe",
             SubscriptionAction::Unsubscribe => "unsubscribe",
         };
-        self.subscriptions.push(SubscriptionRequest { uri: uri.to_string(), action });
-        self.log.info("self.subscribe", json!({"action": verb, "uri": uri}));
-        (format!("requested: the daemon will {verb} {uri} after this run"), false)
+        self.subscriptions.push(SubscriptionRequest {
+            uri: uri.to_string(),
+            action,
+        });
+        self.log
+            .info("self.subscribe", json!({"action": verb, "uri": uri}));
+        (
+            format!("requested: the daemon will {verb} {uri} after this run"),
+            false,
+        )
     }
 
     /// Queue a future self-wake-up (RFC 0008 §self-scheduling). Bounded; refused
@@ -155,19 +172,36 @@ impl Orchestrator {
             Some(s) if (MIN_SCHEDULE_SECS..=MAX_SCHEDULE_SECS).contains(&s) => s,
             _ => {
                 return (
-                    format!("error: schedule needs 'after_seconds' in {MIN_SCHEDULE_SECS}..={MAX_SCHEDULE_SECS}"),
+                    format!(
+                        "error: schedule needs 'after_seconds' in {MIN_SCHEDULE_SECS}..={MAX_SCHEDULE_SECS}"
+                    ),
                     true,
                 );
             }
         };
-        let instruction = args.get("instruction").and_then(Value::as_str).unwrap_or("").trim();
+        let instruction = args
+            .get("instruction")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if instruction.is_empty() {
-            return ("error: schedule requires a non-empty 'instruction'".into(), true);
+            return (
+                "error: schedule requires a non-empty 'instruction'".into(),
+                true,
+            );
         }
-        self.scheduled
-            .push(ScheduleRequest { after_ms: after.saturating_mul(1000), instruction: instruction.to_string() });
-        self.log.info("self.schedule", json!({"after_s": after, "queued": self.scheduled.len()}));
-        (format!("scheduled: a wake-up in {after}s will run the given instruction"), false)
+        self.scheduled.push(ScheduleRequest {
+            after_ms: after.saturating_mul(1000),
+            instruction: instruction.to_string(),
+        });
+        self.log.info(
+            "self.schedule",
+            json!({"after_s": after, "queued": self.scheduled.len()}),
+        );
+        (
+            format!("scheduled: a wake-up in {after}s will run the given instruction"),
+            false,
+        )
     }
 
     fn can_nest(&self) -> bool {
@@ -186,16 +220,30 @@ impl Orchestrator {
         // Memory backpressure: refuse nesting when the unit is at its memory.high
         // soft limit (best-effort; never fires off-cgroup). The model adapts.
         if crate::supervisor::cgroup::under_memory_pressure() {
-            return refused("memory pressure (cgroup at memory.high); do this step yourself or retry");
+            return refused(
+                "memory pressure (cgroup at memory.high); do this step yourself or retry",
+            );
         }
-        let instruction = args.get("instruction").and_then(Value::as_str).unwrap_or("").trim();
+        let instruction = args
+            .get("instruction")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if instruction.is_empty() {
-            return ("error: subagent.spawn requires a non-empty 'instruction'".into(), true);
+            return (
+                "error: subagent.spawn requires a non-empty 'instruction'".into(),
+                true,
+            );
         }
 
         let output_contract = str_arg(args, "output_contract");
         let context_seed = str_arg(args, "context")
-            .map(|c| vec![SeedMessage { role: "user".into(), content: c }])
+            .map(|c| {
+                vec![SeedMessage {
+                    role: "user".into(),
+                    content: c,
+                }]
+            })
             .unwrap_or_default();
         let mcp_servers = self.narrow_servers(args);
 
@@ -235,7 +283,12 @@ impl Orchestrator {
             return self.spawn_async(payload, child_path, detach);
         }
 
-        match supervise_once(self.exe.clone(), &payload, self.drain_timeout, self.log.clone()) {
+        match supervise_once(
+            self.exe.clone(),
+            &payload,
+            self.drain_timeout,
+            self.log.clone(),
+        ) {
             Ok(SuperviseResult::Completed(outcome)) => (distill(&outcome.result), false),
             Ok(SuperviseResult::Failed(e)) => (format!("subagent failed: {e}"), true),
             Ok(SuperviseResult::Killed(r)) => (format!("subagent terminated ({r:?})"), true),
@@ -247,18 +300,44 @@ impl Orchestrator {
     /// keeps working while it runs. The result is collected later via
     /// `subagent.await` / `subagent.status`; if never collected it is reaped when
     /// the orchestrator drops (no async child outlives the parent's tree).
-    fn spawn_async(&mut self, payload: SpawnPayload, handle: String, detach: bool) -> (String, bool) {
+    fn spawn_async(
+        &mut self,
+        payload: SpawnPayload,
+        handle: String,
+        detach: bool,
+    ) -> (String, bool) {
         let (tx, rx) = mpsc::channel();
         let node = NodeId(u64::from(self.child_count));
         match spawn(&self.exe, &payload, node, tx) {
             Ok(sub) => {
-                self.async_children.insert(handle.clone(), AsyncChild { sub, rx, outcome: None, detached: detach });
-                self.log.info("subagent.spawn_async", json!({"handle": handle, "detach": detach}));
+                self.async_children.insert(
+                    handle.clone(),
+                    AsyncChild {
+                        sub,
+                        rx,
+                        outcome: None,
+                        detached: detach,
+                    },
+                );
+                self.log.info(
+                    "subagent.spawn_async",
+                    json!({"handle": handle, "detach": detach}),
+                );
                 if detach {
-                    (format!("spawned detached subagent (handle={handle}); fire-and-forget — it runs independently and is reaped on completion"), false)
+                    (
+                        format!(
+                            "spawned detached subagent (handle={handle}); fire-and-forget — it runs independently and is reaped on completion"
+                        ),
+                        false,
+                    )
                 } else {
                     let uri = crate::agentd_uri::subagent_uri(&handle);
-                    (format!("spawned async subagent (handle={handle}); keep working, then get its result with subagent.await (waits for it) — or peek anytime with subagent.status / resource.read {uri} (all idempotent)"), false)
+                    (
+                        format!(
+                            "spawned async subagent (handle={handle}); keep working, then get its result with subagent.await (waits for it) — or peek anytime with subagent.status / resource.read {uri} (all idempotent)"
+                        ),
+                        false,
+                    )
                 }
             }
             Err(e) => {
@@ -304,7 +383,9 @@ impl Orchestrator {
         let child = self.async_children.get_mut(handle)?;
         if child.detached {
             return Some((
-                format!("subagent {handle} was spawned detached (fire-and-forget); its result is not collectable"),
+                format!(
+                    "subagent {handle} was spawned detached (fire-and-forget); its result is not collectable"
+                ),
                 false,
             ));
         }
@@ -317,8 +398,18 @@ impl Orchestrator {
 
     /// `subagent.status` — non-blocking, idempotent peek (see [`Self::peek_child`]).
     fn status(&mut self, args: &Value) -> (String, bool) {
-        let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        self.peek_child(&handle).unwrap_or_else(|| (format!("error: no async subagent with handle '{handle}'"), true))
+        let handle = args
+            .get("handle")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        self.peek_child(&handle).unwrap_or_else(|| {
+            (
+                format!("error: no async subagent with handle '{handle}'"),
+                true,
+            )
+        })
     }
 
     /// `subagent.await` — block (bounded by [`AWAIT_MAX`]) until the child
@@ -326,9 +417,19 @@ impl Orchestrator {
     /// not consumed). On timeout returns "still running" so the loop regains
     /// control (await again).
     fn await_child(&mut self, args: &Value) -> (String, bool) {
-        let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let handle = args
+            .get("handle")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         match self.async_children.get(&handle) {
-            None => return (format!("error: no async subagent with handle '{handle}'"), true),
+            None => {
+                return (
+                    format!("error: no async subagent with handle '{handle}'"),
+                    true,
+                );
+            }
             // A detached child is not awaitable (fire-and-forget).
             Some(c) if c.detached => return self.peek_child(&handle).unwrap(),
             Some(_) => {}
@@ -343,7 +444,13 @@ impl Orchestrator {
                 }
             }
             if Instant::now() >= deadline {
-                return (format!("subagent {handle} is still running (awaited {}s); await again or check status", AWAIT_MAX.as_secs()), false);
+                return (
+                    format!(
+                        "subagent {handle} is still running (awaited {}s); await again or check status",
+                        AWAIT_MAX.as_secs()
+                    ),
+                    false,
+                );
             }
             std::thread::sleep(AWAIT_POLL);
         }
@@ -355,7 +462,11 @@ impl Orchestrator {
         match args.get("servers").and_then(Value::as_array) {
             Some(names) => {
                 let wanted: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
-                self.mcp_servers.iter().filter(|s| wanted.contains(&s.name.as_str())).cloned().collect()
+                self.mcp_servers
+                    .iter()
+                    .filter(|s| wanted.contains(&s.name.as_str()))
+                    .cloned()
+                    .collect()
             }
             None => self.mcp_servers.clone(),
         }
@@ -401,9 +512,10 @@ impl SelfHandler for Orchestrator {
             "unsubscribe" if self.parent_depth == 0 => {
                 Some(self.subscription(SubscriptionAction::Unsubscribe, args))
             }
-            "exec" if self.enable_exec => {
-                Some(crate::sec::exec::handle_call(args, crate::sec::exec::DEFAULT_TIMEOUT))
-            }
+            "exec" if self.enable_exec => Some(crate::sec::exec::handle_call(
+                args,
+                crate::sec::exec::DEFAULT_TIMEOUT,
+            )),
             _ => None,
         }
     }
@@ -413,9 +525,10 @@ impl SelfHandler for Orchestrator {
         // resource (completion-as-self-resource, RFC 0009) — the same idempotent
         // peek as subagent.status (a detached child is not collectable).
         match crate::agentd_uri::AgentdResource::parse(uri) {
-            Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
-                Some(self.peek_child(&handle).unwrap_or_else(|| (format!("no async subagent with handle '{handle}'"), true)))
-            }
+            Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => Some(
+                self.peek_child(&handle)
+                    .unwrap_or_else(|| (format!("no async subagent with handle '{handle}'"), true)),
+            ),
             // agentd://status is a served-only resource; not served from a subagent.
             _ => None,
         }
@@ -456,7 +569,10 @@ fn refused(why: &str) -> (String, bool) {
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn distill(result: &Value) -> String {
@@ -566,9 +682,10 @@ fn subscribe_tool_def() -> ToolDef {
 fn unsubscribe_tool_def() -> ToolDef {
     ToolDef {
         name: "unsubscribe".into(),
-        description: "Stop watching an MCP resource you previously subscribed to (by uri). Use this \
+        description:
+            "Stop watching an MCP resource you previously subscribed to (by uri). Use this \
             when you no longer need to react to its changes."
-            .into(),
+                .into(),
         input_schema: json!({
             "type": "object",
             "properties": {"uri": {"type": "string", "description": "the resource uri to stop watching"}},
@@ -601,12 +718,29 @@ mod tests {
             instruction: "parent".into(),
             output_contract: None,
             context_seed: Vec::new(),
-            intelligence: IntelConfig { uri: "unix:/x".into(), token: None, model: None },
+            intelligence: IntelConfig {
+                uri: "unix:/x".into(),
+                token: None,
+                model: None,
+            },
             mcp_servers: vec![
-                McpServerSpec { name: "fs".into(), command: vec!["a".into()], tags: Vec::new() },
-                McpServerSpec { name: "db".into(), command: vec!["b".into()], tags: Vec::new() },
+                McpServerSpec {
+                    name: "fs".into(),
+                    command: vec!["a".into()],
+                    tags: Vec::new(),
+                },
+                McpServerSpec {
+                    name: "db".into(),
+                    command: vec!["b".into()],
+                    tags: Vec::new(),
+                },
             ],
-            limits: Limits { max_steps: 10, max_tokens: 1000, deadline_ms: 1000, max_depth },
+            limits: Limits {
+                max_steps: 10,
+                max_tokens: 1000,
+                deadline_ms: 1000,
+                max_depth,
+            },
             telemetry: Telemetry {
                 run_id: "t".into(),
                 agent_id: "0".into(),
@@ -625,19 +759,34 @@ mod tests {
     fn exec_tool_is_gated_by_enable_exec() {
         let mut p = payload(0, 4);
         p.enable_exec = false;
-        let mut o = Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
-        assert!(!o.tools().iter().any(|t| t.name == "exec"), "exec must be off by default");
-        assert!(o.handle("exec", &json!({"argv": ["/bin/true"]})).is_none(), "exec must not run when disabled");
+        let mut o =
+            Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
+        assert!(
+            !o.tools().iter().any(|t| t.name == "exec"),
+            "exec must be off by default"
+        );
+        assert!(
+            o.handle("exec", &json!({"argv": ["/bin/true"]})).is_none(),
+            "exec must not run when disabled"
+        );
 
         p.enable_exec = true;
         let o = Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
-        assert!(o.tools().iter().any(|t| t.name == "exec"), "exec advertised when enabled");
+        assert!(
+            o.tools().iter().any(|t| t.name == "exec"),
+            "exec advertised when enabled"
+        );
     }
 
     #[test]
     fn refuses_when_at_max_depth() {
         // depth 4, max_depth 4 → can't nest (child would be depth 5).
-        let mut o = Orchestrator::from_payload("agentd".into(), &payload(4, 4), Duration::from_secs(5), logger());
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(4, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         assert!(o.tools().is_empty());
         let (msg, is_err) = o.spawn(&json!({"instruction": "x"}));
         assert!(is_err);
@@ -647,7 +796,12 @@ mod tests {
     #[test]
     fn advertises_tool_with_depth_budget() {
         // The root (depth 0) advertises delegation + self-scheduling + self-subscribe.
-        let o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         let tools = o.tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"subagent.spawn"));
@@ -659,15 +813,42 @@ mod tests {
     #[test]
     fn subscribe_is_root_only_and_accumulates() {
         // A nested child does not get the self-subscription tools.
-        let mut child = Orchestrator::from_payload("agentd".into(), &payload(1, 4), Duration::from_secs(5), logger());
+        let mut child = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(1, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         assert!(!child.tools().iter().any(|t| t.name == "subscribe"));
-        assert!(child.handle("subscribe", &json!({"uri": "file:///x"})).is_none());
+        assert!(
+            child
+                .handle("subscribe", &json!({"uri": "file:///x"}))
+                .is_none()
+        );
 
         // The root accumulates subscribe/unsubscribe requests, drained by take.
-        let mut root = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
-        assert!(!root.handle("subscribe", &json!({"uri": "file:///watch"})).unwrap().1);
-        assert!(!root.handle("unsubscribe", &json!({"uri": "file:///old"})).unwrap().1);
-        assert!(root.handle("subscribe", &json!({"uri": "  "})).unwrap().1, "empty uri → error");
+        let mut root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(
+            !root
+                .handle("subscribe", &json!({"uri": "file:///watch"}))
+                .unwrap()
+                .1
+        );
+        assert!(
+            !root
+                .handle("unsubscribe", &json!({"uri": "file:///old"}))
+                .unwrap()
+                .1
+        );
+        assert!(
+            root.handle("subscribe", &json!({"uri": "  "})).unwrap().1,
+            "empty uri → error"
+        );
         let drained = root.take_subscriptions();
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].uri, "file:///watch");
@@ -680,13 +861,32 @@ mod tests {
     fn schedule_is_root_only_and_accumulates() {
         // A nested child (depth 1) does NOT get `schedule` (its request would be
         // lost to the parent), and handle() declines it.
-        let mut child = Orchestrator::from_payload("agentd".into(), &payload(1, 4), Duration::from_secs(5), logger());
+        let mut child = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(1, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         assert!(!child.tools().iter().any(|t| t.name == "schedule"));
-        assert!(child.handle("schedule", &json!({"after_seconds": 5, "instruction": "x"})).is_none());
+        assert!(
+            child
+                .handle("schedule", &json!({"after_seconds": 5, "instruction": "x"}))
+                .is_none()
+        );
 
         // The root accumulates valid requests, drained by take_scheduled.
-        let mut root = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
-        let (_m, err) = root.handle("schedule", &json!({"after_seconds": 30, "instruction": "poll again"})).unwrap();
+        let mut root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        let (_m, err) = root
+            .handle(
+                "schedule",
+                &json!({"after_seconds": 30, "instruction": "poll again"}),
+            )
+            .unwrap();
         assert!(!err);
         let drained = root.take_scheduled();
         assert_eq!(drained.len(), 1);
@@ -697,48 +897,93 @@ mod tests {
 
     #[test]
     fn schedule_validates_delay_and_instruction() {
-        let mut o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         // out-of-range / missing delay → error observation, nothing queued
-        assert!(o.schedule(&json!({"after_seconds": 0, "instruction": "x"})).1);
+        assert!(
+            o.schedule(&json!({"after_seconds": 0, "instruction": "x"}))
+                .1
+        );
         assert!(o.schedule(&json!({"instruction": "x"})).1);
         // empty instruction → error
-        assert!(o.schedule(&json!({"after_seconds": 5, "instruction": "  "})).1);
+        assert!(
+            o.schedule(&json!({"after_seconds": 5, "instruction": "  "}))
+                .1
+        );
         assert!(o.take_scheduled().is_empty());
         // cap is enforced
         for _ in 0..MAX_SCHEDULED {
-            assert!(!o.schedule(&json!({"after_seconds": 5, "instruction": "x"})).1);
+            assert!(
+                !o.schedule(&json!({"after_seconds": 5, "instruction": "x"}))
+                    .1
+            );
         }
-        assert!(o.schedule(&json!({"after_seconds": 5, "instruction": "x"})).1, "over cap → refused");
+        assert!(
+            o.schedule(&json!({"after_seconds": 5, "instruction": "x"}))
+                .1,
+            "over cap → refused"
+        );
         assert_eq!(o.take_scheduled().len(), MAX_SCHEDULED);
     }
 
     #[test]
     fn status_and_await_reject_unknown_handles() {
-        let mut o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         let (msg, err) = o.status(&json!({"handle": "0.7"}));
-        assert!(err && msg.contains("no async subagent"), "status on an unknown handle errors: {msg}");
+        assert!(
+            err && msg.contains("no async subagent"),
+            "status on an unknown handle errors: {msg}"
+        );
         let (msg, err) = o.await_child(&json!({"handle": "0.7"}));
-        assert!(err && msg.contains("no async subagent"), "await on an unknown handle errors: {msg}");
+        assert!(
+            err && msg.contains("no async subagent"),
+            "await on an unknown handle errors: {msg}"
+        );
     }
 
     #[test]
     fn spawn_schema_advertises_async_and_detach() {
         let def = spawn_tool_def();
         let props = &def.input_schema["properties"];
-        assert!(props.get("async").is_some(), "spawn schema must offer async");
-        assert!(props.get("detach").is_some(), "spawn schema must offer detach");
+        assert!(
+            props.get("async").is_some(),
+            "spawn schema must offer async"
+        );
+        assert!(
+            props.get("detach").is_some(),
+            "spawn schema must offer detach"
+        );
     }
 
     #[test]
     fn empty_instruction_is_rejected() {
-        let mut o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         let (_msg, is_err) = o.spawn(&json!({"instruction": "   "}));
         assert!(is_err);
     }
 
     #[test]
     fn narrow_servers_filters_to_subset() {
-        let o = Orchestrator::from_payload("agentd".into(), &payload(0, 4), Duration::from_secs(5), logger());
+        let o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
         let narrowed = o.narrow_servers(&json!({"servers": ["fs", "ghost"]}));
         assert_eq!(narrowed.len(), 1);
         assert_eq!(narrowed[0].name, "fs");

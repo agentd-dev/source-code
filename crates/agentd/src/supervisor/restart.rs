@@ -109,7 +109,12 @@ impl Default for RestartGovernor {
 
 impl RestartGovernor {
     pub fn new(cfg: RestartConfig) -> RestartGovernor {
-        RestartGovernor { cfg, consecutive: 0, failures: VecDeque::new(), open: false }
+        RestartGovernor {
+            cfg,
+            consecutive: 0,
+            failures: VecDeque::new(),
+            open: false,
+        }
     }
 
     /// Whether the breaker is currently open (session is failed). Lets the
@@ -138,7 +143,11 @@ impl RestartGovernor {
         // A spawn that died before it could signal readiness is the fork-bomb
         // early warning (§3.7): charge it `spawn_fail_weight` failures.
         let crash_on_spawn = ran_for < self.cfg.spawn_ready;
-        let weight = if crash_on_spawn { self.cfg.spawn_fail_weight } else { 1 };
+        let weight = if crash_on_spawn {
+            self.cfg.spawn_fail_weight
+        } else {
+            1
+        };
 
         self.consecutive = self.consecutive.saturating_add(1);
         self.prune(now);
@@ -206,7 +215,10 @@ fn jitter_up_to(max: Duration, _now: Instant) -> Duration {
     if max.is_zero() {
         return Duration::ZERO;
     }
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     // FNV-1a-style mix (house style, obs/trace) so successive same-nanosecond
     // calls still spread; the process id breaks cross-process correlation.
     let seed = 0xcbf2_9ce4_8422_2325u64 ^ (std::process::id() as u64);
@@ -262,16 +274,28 @@ mod tests {
         let t = Instant::now();
         // base 500ms, jitter <= delay/4. First failure → ~500ms.
         let d1 = backoff_of(g.on_outcome(false, healthy(), t));
-        assert!(d1 >= Duration::from_millis(500) && d1 <= Duration::from_millis(625), "d1={d1:?}");
+        assert!(
+            d1 >= Duration::from_millis(500) && d1 <= Duration::from_millis(625),
+            "d1={d1:?}"
+        );
         // Second → ~1s.
         let d2 = backoff_of(g.on_outcome(false, healthy(), t));
-        assert!(d2 >= Duration::from_secs(1) && d2 <= Duration::from_millis(1250), "d2={d2:?}");
+        assert!(
+            d2 >= Duration::from_secs(1) && d2 <= Duration::from_millis(1250),
+            "d2={d2:?}"
+        );
         // Third → ~2s.
         let d3 = backoff_of(g.on_outcome(false, healthy(), t));
-        assert!(d3 >= Duration::from_secs(2) && d3 <= Duration::from_millis(2500), "d3={d3:?}");
+        assert!(
+            d3 >= Duration::from_secs(2) && d3 <= Duration::from_millis(2500),
+            "d3={d3:?}"
+        );
         // Fourth → ~4s (still below the 5-failure breaker threshold).
         let d4 = backoff_of(g.on_outcome(false, healthy(), t));
-        assert!(d4 >= Duration::from_secs(4) && d4 <= Duration::from_secs(5), "d4={d4:?}");
+        assert!(
+            d4 >= Duration::from_secs(4) && d4 <= Duration::from_secs(5),
+            "d4={d4:?}"
+        );
     }
 
     #[test]
@@ -287,8 +311,14 @@ mod tests {
             last = backoff_of(g.on_outcome(false, healthy(), t));
         }
         // After many doublings the delay is pinned to cap (+ up to cap/4 jitter).
-        assert!(last >= Duration::from_secs(30), "should reach cap: {last:?}");
-        assert!(last <= Duration::from_secs(30) + Duration::from_secs(30) / 4, "over cap+jitter: {last:?}");
+        assert!(
+            last >= Duration::from_secs(30),
+            "should reach cap: {last:?}"
+        );
+        assert!(
+            last <= Duration::from_secs(30) + Duration::from_secs(30) / 4,
+            "over cap+jitter: {last:?}"
+        );
     }
 
     #[test]
@@ -297,7 +327,10 @@ mod tests {
         let t = Instant::now();
         // 4 healthy-length failures stay Backoff; the 5th trips (consecutive==5).
         for i in 0..4 {
-            assert!(matches!(g.on_outcome(false, healthy(), t), RestartAction::Backoff(_)), "i={i}");
+            assert!(
+                matches!(g.on_outcome(false, healthy(), t), RestartAction::Backoff(_)),
+                "i={i}"
+            );
         }
         assert_eq!(g.on_outcome(false, healthy(), t), RestartAction::Tripped);
         assert!(g.is_tripped());
@@ -311,11 +344,17 @@ mod tests {
             g.on_outcome(false, healthy(), t);
         }
         // A clean run wipes the slate before the breaker would have tripped.
-        assert!(matches!(g.on_outcome(true, healthy(), t), RestartAction::Backoff(_)));
+        assert!(matches!(
+            g.on_outcome(true, healthy(), t),
+            RestartAction::Backoff(_)
+        ));
         assert!(!g.is_tripped());
         // And the next failure starts from base again (consecutive reset).
         let d = backoff_of(g.on_outcome(false, healthy(), t));
-        assert!(d <= Duration::from_millis(625), "should restart from base: {d:?}");
+        assert!(
+            d <= Duration::from_millis(625),
+            "should restart from base: {d:?}"
+        );
     }
 
     #[test]
@@ -326,7 +365,10 @@ mod tests {
         // charges 3 more → windowed weight 6 >= 5, so the breaker trips on the
         // SECOND crash-on-spawn — far faster than 5 healthy-length failures.
         let fast = Duration::from_millis(50); // < spawn_ready (2s)
-        assert!(matches!(g.on_outcome(false, fast, t), RestartAction::Backoff(_)));
+        assert!(matches!(
+            g.on_outcome(false, fast, t),
+            RestartAction::Backoff(_)
+        ));
         assert_eq!(g.on_outcome(false, fast, t), RestartAction::Tripped);
     }
 

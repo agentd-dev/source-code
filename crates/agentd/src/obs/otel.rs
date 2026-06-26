@@ -17,7 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current time as unix nanoseconds — a span start/end stamp.
 pub fn now_unix_nanos() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// A run's span recorder. Begin it once (mints the `invoke_agent` span id under
@@ -35,7 +38,9 @@ pub struct RunSpan {
 pub fn run_begin(trace_id: Option<&str>, start_unix_nanos: u128) -> RunSpan {
     #[cfg(feature = "otel")]
     {
-        RunSpan { inner: imp::RunSpan::begin(trace_id, start_unix_nanos) }
+        RunSpan {
+            inner: imp::RunSpan::begin(trace_id, start_unix_nanos),
+        }
     }
     #[cfg(not(feature = "otel"))]
     {
@@ -46,7 +51,14 @@ pub fn run_begin(trace_id: Option<&str>, start_unix_nanos: u128) -> RunSpan {
 
 impl RunSpan {
     /// Record a `chat` child span for one model call (parent = the run span).
-    pub fn record_chat(&mut self, model: &str, input_tokens: u64, output_tokens: u64, ok: bool, start_unix_nanos: u128) {
+    pub fn record_chat(
+        &mut self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        ok: bool,
+        start_unix_nanos: u128,
+    ) {
         #[cfg(feature = "otel")]
         if let Some(i) = self.inner.as_mut() {
             i.record_chat(model, input_tokens, output_tokens, ok, start_unix_nanos);
@@ -80,7 +92,7 @@ impl RunSpan {
 #[cfg(feature = "otel")]
 mod imp {
     use crate::net::http::{self, Url};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::time::Duration;
 
     /// A finished span, ready to encode as OTLP. Times are unix nanoseconds.
@@ -118,7 +130,9 @@ mod imp {
     impl RunSpan {
         /// Begin a run span, or `None` if there's no endpoint / trace to anchor it.
         pub(super) fn begin(trace_id: Option<&str>, start_unix_nanos: u128) -> Option<RunSpan> {
-            let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().filter(|s| !s.is_empty())?;
+            let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|s| !s.is_empty())?;
             let trace_id = trace_id?.to_string();
             Some(RunSpan {
                 span_id: crate::obs::trace::new_span_id(),
@@ -129,7 +143,14 @@ mod imp {
             })
         }
 
-        pub(super) fn record_chat(&mut self, model: &str, input_tokens: u64, output_tokens: u64, ok: bool, start_unix_nanos: u128) {
+        pub(super) fn record_chat(
+            &mut self,
+            model: &str,
+            input_tokens: u64,
+            output_tokens: u64,
+            ok: bool,
+            start_unix_nanos: u128,
+        ) {
             self.children.push(Span {
                 trace_id: self.trace_id.clone(),
                 span_id: crate::obs::trace::new_span_id(),
@@ -164,7 +185,13 @@ mod imp {
         }
 
         /// Close the run span and export the whole trace as one OTLP batch.
-        pub(super) fn finish(mut self, model: &str, input_tokens: u64, output_tokens: u64, ok: bool) {
+        pub(super) fn finish(
+            mut self,
+            model: &str,
+            input_tokens: u64,
+            output_tokens: u64,
+            ok: bool,
+        ) {
             let run = Span {
                 trace_id: self.trace_id.clone(),
                 span_id: self.span_id.clone(),
@@ -182,7 +209,10 @@ mod imp {
             };
             self.children.push(run);
             // Best-effort: telemetry export must never fail the run.
-            let _ = export(&self.endpoint, &to_otlp_json(&self.children, "agentd", crate::VERSION));
+            let _ = export(
+                &self.endpoint,
+                &to_otlp_json(&self.children, "agentd", crate::VERSION),
+            );
         }
     }
 
@@ -201,7 +231,11 @@ mod imp {
     }
 
     fn encode_span(s: &Span) -> Value {
-        let attrs: Vec<Value> = s.attrs.iter().map(|(k, v)| json!({ "key": k, "value": v })).collect();
+        let attrs: Vec<Value> = s
+            .attrs
+            .iter()
+            .map(|(k, v)| json!({ "key": k, "value": v }))
+            .collect();
         let mut span = json!({
             "traceId": s.trace_id,
             "spanId": s.span_id,
@@ -222,17 +256,28 @@ mod imp {
     /// only in the default build; an `https://` collector needs `--features tls`.
     fn export(endpoint: &str, body: &Value) -> Result<(), String> {
         let base = endpoint.trim_end_matches('/');
-        let target = if base.ends_with("/v1/traces") { base.to_string() } else { format!("{base}/v1/traces") };
+        let target = if base.ends_with("/v1/traces") {
+            base.to_string()
+        } else {
+            format!("{base}/v1/traces")
+        };
         let url = Url::parse(&target).map_err(|e| format!("otel: bad endpoint '{target}': {e}"))?;
         if url.is_tls() {
             return Err("otel: https OTLP endpoints need --features tls".into());
         }
         let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-        let mut stream =
-            http::connect_tcp(&url.host, url.port, Duration::from_secs(5)).map_err(|e| e.to_string())?;
-        let headers = [("content-type", "application/json")];
-        let resp = http::send(&mut stream, &url.host_header(), "POST", &url.path, &headers, &bytes)
+        let mut stream = http::connect_tcp(&url.host, url.port, Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
+        let headers = [("content-type", "application/json")];
+        let resp = http::send(
+            &mut stream,
+            &url.host_header(),
+            "POST",
+            &url.path,
+            &headers,
+            &bytes,
+        )
+        .map_err(|e| e.to_string())?;
         if resp.is_success() {
             Ok(())
         } else {
@@ -264,7 +309,10 @@ mod imp {
         fn otlp_json_has_the_expected_shape() {
             let v = to_otlp_json(&[span()], "agentd", "0.1.0");
             let rs = &v["resourceSpans"][0];
-            assert_eq!(rs["resource"]["attributes"][0]["value"]["stringValue"], "agentd");
+            assert_eq!(
+                rs["resource"]["attributes"][0]["value"]["stringValue"],
+                "agentd"
+            );
             let sp = &rs["scopeSpans"][0]["spans"][0];
             assert_eq!(sp["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
             assert_eq!(sp["name"], "invoke_agent");
@@ -317,7 +365,10 @@ mod imp {
             assert_eq!(spans[0]["parentSpanId"], "00f067aa0ba902b7");
             assert_eq!(spans[0]["attributes"][1]["value"]["stringValue"], "m");
             assert_eq!(spans[1]["name"], "execute_tool");
-            assert_eq!(spans[1]["attributes"][1]["value"]["stringValue"], "resource.read");
+            assert_eq!(
+                spans[1]["attributes"][1]["value"]["stringValue"],
+                "resource.read"
+            );
             assert_eq!(spans[1]["parentSpanId"], "00f067aa0ba902b7");
             assert_eq!(spans[2]["name"], "invoke_agent");
             assert!(spans[2].get("parentSpanId").is_none()); // root

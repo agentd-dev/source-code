@@ -74,7 +74,11 @@ pub struct Route {
 
 impl Route {
     pub fn new(pattern: &str, disposition: Disposition, debounce: Duration) -> Route {
-        Route { matcher: Match::parse(pattern), disposition, debounce }
+        Route {
+            matcher: Match::parse(pattern),
+            disposition,
+            debounce,
+        }
     }
 
     /// Whether this route is an exact match for `uri` — used for dynamic
@@ -102,7 +106,11 @@ pub struct Router {
 
 impl Router {
     pub fn new(routes: Vec<Route>) -> Router {
-        Router { routes, pending: HashMap::new(), dropped: 0 }
+        Router {
+            routes,
+            pending: HashMap::new(),
+            dropped: 0,
+        }
     }
 
     /// Number of unmatched updates dropped (a no-route counter; `on_updated`
@@ -137,7 +145,9 @@ impl Router {
     pub fn on_updated(&mut self, uri: &str, now: Instant) -> bool {
         // Resolve the owner into owned values first, so the immutable borrow of
         // the route table is released before we mutate `pending`.
-        let armed = self.best_match(uri).map(|r| (now + r.debounce, r.disposition.clone()));
+        let armed = self
+            .best_match(uri)
+            .map(|r| (now + r.debounce, r.disposition.clone()));
         match armed {
             Some(entry) => {
                 // Coalesce: arm only on the first event of a burst; later events
@@ -161,8 +171,12 @@ impl Router {
 
     /// Drain every delivery whose debounce has elapsed by `now`.
     pub fn due(&mut self, now: Instant) -> Vec<Delivery> {
-        let ready: Vec<String> =
-            self.pending.iter().filter(|(_, (at, _))| *at <= now).map(|(uri, _)| uri.clone()).collect();
+        let ready: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(uri, _)| uri.clone())
+            .collect();
         ready
             .into_iter()
             .map(|uri| {
@@ -193,7 +207,11 @@ mod tests {
     fn exact_beats_glob() {
         let routes = vec![
             Route::new("file:///*", Disposition::Spawn, ms(0)),
-            Route::new("file:///inbox.json", Disposition::Continue("s1".into()), ms(0)),
+            Route::new(
+                "file:///inbox.json",
+                Disposition::Continue("s1".into()),
+                ms(0),
+            ),
         ];
         let r = Router::new(routes);
         // exact owner
@@ -202,21 +220,31 @@ mod tests {
             Disposition::Continue("s1".into())
         );
         // glob owner for anything else
-        assert_eq!(r.best_match("file:///other.json").unwrap().disposition, Disposition::Spawn);
+        assert_eq!(
+            r.best_match("file:///other.json").unwrap().disposition,
+            Disposition::Spawn
+        );
     }
 
     #[test]
     fn longest_prefix_glob_wins() {
         let routes = vec![
             Route::new("db://*", Disposition::Spawn, ms(0)),
-            Route::new("db://orders/*", Disposition::Continue("orders".into()), ms(0)),
+            Route::new(
+                "db://orders/*",
+                Disposition::Continue("orders".into()),
+                ms(0),
+            ),
         ];
         let r = Router::new(routes);
         assert_eq!(
             r.best_match("db://orders/42").unwrap().disposition,
             Disposition::Continue("orders".into())
         );
-        assert_eq!(r.best_match("db://users/7").unwrap().disposition, Disposition::Spawn);
+        assert_eq!(
+            r.best_match("db://users/7").unwrap().disposition,
+            Disposition::Spawn
+        );
     }
 
     #[test]
@@ -230,7 +258,11 @@ mod tests {
 
     #[test]
     fn debounce_coalesces_a_burst_to_one_delivery() {
-        let mut r = Router::new(vec![Route::new("file:///in.json", Disposition::Spawn, ms(100))]);
+        let mut r = Router::new(vec![Route::new(
+            "file:///in.json",
+            Disposition::Spawn,
+            ms(100),
+        )]);
         let t0 = Instant::now();
         assert!(r.on_updated("file:///in.json", t0));
         assert!(r.on_updated("file:///in.json", t0 + ms(10))); // within window → coalesced

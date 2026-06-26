@@ -42,7 +42,9 @@ fn a_run_exports_invoke_agent_chat_and_execute_tool_spans() {
                     s.set_read_timeout(Some(Duration::from_secs(2))).ok();
                     let mut buf = vec![0u8; 65536];
                     let n = s.read(&mut buf).unwrap_or(0);
-                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = s.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                     break String::from_utf8_lossy(&buf[..n]).into_owned();
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -63,11 +65,24 @@ fn a_run_exports_invoke_agent_chat_and_execute_tool_spans() {
     let mut llm = start_mock_llm(&sock, "read");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!("mock={} --internal-mock-mcp file:///in.json --no-emit", exe());
+    let mcp = format!(
+        "mock={} --internal-mock-mcp file:///in.json --no-emit",
+        exe()
+    );
     let status = Command::new(exe())
         .args([
-            "--mode", "once", "--instruction", "read it", "--intelligence", &intel, "--mcp", &mcp,
-            "--model", "my-model", "--log-level", "error",
+            "--mode",
+            "once",
+            "--instruction",
+            "read it",
+            "--intelligence",
+            &intel,
+            "--mcp",
+            &mcp,
+            "--model",
+            "my-model",
+            "--log-level",
+            "error",
         ])
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", format!("http://{addr}"))
         .stdout(Stdio::null())
@@ -80,14 +95,41 @@ fn a_run_exports_invoke_agent_chat_and_execute_tool_spans() {
     let _ = llm.wait();
 
     assert!(status.success(), "run should complete (exit 0)");
-    assert!(captured.contains("POST /v1/traces"), "no OTLP POST to /v1/traces:\n{captured}");
-    assert!(captured.contains("resourceSpans"), "not an OTLP body:\n{captured}");
-    assert!(captured.contains("my-model"), "model not recorded on the span:\n{captured}");
+    assert!(
+        captured.contains("POST /v1/traces"),
+        "no OTLP POST to /v1/traces:\n{captured}"
+    );
+    assert!(
+        captured.contains("resourceSpans"),
+        "not an OTLP body:\n{captured}"
+    );
+    assert!(
+        captured.contains("my-model"),
+        "model not recorded on the span:\n{captured}"
+    );
     // the run span + both child span kinds (GenAI semconv) ship in one batch
-    assert!(captured.contains("invoke_agent"), "no invoke_agent run span:\n{captured}");
-    assert!(captured.contains("\"chat\""), "no chat child span:\n{captured}");
-    assert!(captured.contains("execute_tool"), "no execute_tool child span:\n{captured}");
-    assert!(captured.contains("gen_ai.operation.name"), "no GenAI operation attr:\n{captured}");
-    assert!(captured.contains("gen_ai.tool.name"), "no tool-name attr on execute_tool:\n{captured}");
-    assert!(captured.contains("resource.read"), "execute_tool span missing the tool name:\n{captured}");
+    assert!(
+        captured.contains("invoke_agent"),
+        "no invoke_agent run span:\n{captured}"
+    );
+    assert!(
+        captured.contains("\"chat\""),
+        "no chat child span:\n{captured}"
+    );
+    assert!(
+        captured.contains("execute_tool"),
+        "no execute_tool child span:\n{captured}"
+    );
+    assert!(
+        captured.contains("gen_ai.operation.name"),
+        "no GenAI operation attr:\n{captured}"
+    );
+    assert!(
+        captured.contains("gen_ai.tool.name"),
+        "no tool-name attr on execute_tool:\n{captured}"
+    );
+    assert!(
+        captured.contains("resource.read"),
+        "execute_tool span missing the tool name:\n{captured}"
+    );
 }

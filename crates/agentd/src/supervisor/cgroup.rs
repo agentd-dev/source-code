@@ -131,7 +131,11 @@ impl MemorySnapshot {
 
 /// Read the current cgroup v2 memory snapshot (best-effort; never fails).
 pub fn snapshot() -> MemorySnapshot {
-    MemorySnapshot { max: memory_max(), current: memory_current(), high: memory_high() }
+    MemorySnapshot {
+        max: memory_max(),
+        current: memory_current(),
+        high: memory_high(),
+    }
 }
 
 /// `memory.max` — the hard limit; `None` when unlimited (`"max"`) or unreadable.
@@ -151,7 +155,9 @@ pub fn memory_high() -> Option<u64> {
 
 /// Read + parse one cgroup memory file. `None` on any I/O error or `"max"`.
 fn read_mem(path: &Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok().and_then(|s| parse_mem(&s))
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| parse_mem(&s))
 }
 
 /// Parse a cgroup v2 memory value: a byte count, or `"max"` (unlimited → `None`).
@@ -186,7 +192,11 @@ pub struct Configured {
 /// best-effort delegates the controllers to the parent so the limits can take
 /// effect. Returns `None` when off / not writable (the feature stays dormant).
 /// Idempotent — the first call wins.
-pub fn configure(spec: Option<&str>, memory_max: Option<&str>, pids_max: Option<&str>) -> Option<Configured> {
+pub fn configure(
+    spec: Option<&str>,
+    memory_max: Option<&str>,
+    pids_max: Option<&str>,
+) -> Option<Configured> {
     let resolved = spec.and_then(resolve_parent).filter(|p| ensure_writable(p));
     let limits = Limits::from_specs(memory_max, pids_max);
     let mut limits_unavailable = false;
@@ -208,7 +218,11 @@ pub fn configure(spec: Option<&str>, memory_max: Option<&str>, pids_max: Option<
     let _ = PARENT.set(resolved);
     let _ = LIMITS.set(limits);
     let parent = PARENT.get().cloned().flatten()?;
-    Some(Configured { parent, limits: LIMITS.get().cloned().unwrap_or_default(), limits_unavailable })
+    Some(Configured {
+        parent,
+        limits: LIMITS.get().cloned().unwrap_or_default(),
+        limits_unavailable,
+    })
 }
 
 /// Delegate the `memory`/`pids` controllers (only those the requested limits
@@ -283,7 +297,10 @@ fn resolve_parent(spec: &str) -> Option<PathBuf> {
         // `..`. A guard-rail, not a security boundary — `--cgroup` is operator-
         // supplied and the operator already controls the process; a symlink
         // component could still redirect, which the trust model accepts.
-        p if Path::new(p).is_absolute() && Path::new(p).starts_with(CGROUP_ROOT) && !p.contains("..") => {
+        p if Path::new(p).is_absolute()
+            && Path::new(p).starts_with(CGROUP_ROOT)
+            && !p.contains("..") =>
+        {
             Some(PathBuf::from(p))
         }
         _ => None,
@@ -348,7 +365,11 @@ impl CgroupGuard {
     /// (best-effort, never an error).
     pub fn for_run() -> Option<CgroupGuard> {
         let parent = PARENT.get().and_then(|o| o.clone())?;
-        let name = format!("run-{}-{}", std::process::id(), RUN_SEQ.fetch_add(1, Ordering::Relaxed));
+        let name = format!(
+            "run-{}-{}",
+            std::process::id(),
+            RUN_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let guard = Self::create(&parent, &name)?;
         if let Some(limits) = LIMITS.get() {
             guard.apply_limits(limits);
@@ -436,7 +457,12 @@ fn write_cgroup(path: &Path, value: &str) -> bool {
 /// Parse the `oom_kill` counter from a `memory.events` body (one `key value`
 /// pair per line). `None` when the key is absent.
 fn parse_oom_kills(events: &str) -> Option<u64> {
-    events.lines().find_map(|l| l.strip_prefix("oom_kill "))?.trim().parse().ok()
+    events
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -471,7 +497,13 @@ mod tests {
     #[test]
     fn snapshot_detected_reflects_any_readable_field() {
         assert!(!MemorySnapshot::default().detected());
-        assert!(MemorySnapshot { max: Some(1), ..Default::default() }.detected());
+        assert!(
+            MemorySnapshot {
+                max: Some(1),
+                ..Default::default()
+            }
+            .detected()
+        );
     }
 
     #[test]
@@ -493,9 +525,18 @@ mod tests {
         assert_eq!(normalize_bytes("max").as_deref(), Some("max"));
         assert_eq!(normalize_bytes("MAX").as_deref(), Some("max"));
         assert_eq!(normalize_bytes("1048576").as_deref(), Some("1048576"));
-        assert_eq!(normalize_bytes("512M").as_deref(), Some((512 * 1024 * 1024).to_string().as_str()));
-        assert_eq!(normalize_bytes("2G").as_deref(), Some((2u64 * 1024 * 1024 * 1024).to_string().as_str()));
-        assert_eq!(normalize_bytes("64k").as_deref(), Some((64 * 1024).to_string().as_str()));
+        assert_eq!(
+            normalize_bytes("512M").as_deref(),
+            Some((512 * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(
+            normalize_bytes("2G").as_deref(),
+            Some((2u64 * 1024 * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(
+            normalize_bytes("64k").as_deref(),
+            Some((64 * 1024).to_string().as_str())
+        );
         assert_eq!(normalize_bytes(""), None);
         assert_eq!(normalize_bytes("M"), None); // no digits
         assert_eq!(normalize_bytes("12T"), None); // unsupported suffix
@@ -524,7 +565,10 @@ mod tests {
     #[test]
     fn limits_from_specs_drops_unparseable() {
         let l = Limits::from_specs(Some("256M"), Some("32"));
-        assert_eq!(l.memory_max.as_deref(), Some((256 * 1024 * 1024).to_string().as_str()));
+        assert_eq!(
+            l.memory_max.as_deref(),
+            Some((256 * 1024 * 1024).to_string().as_str())
+        );
         assert_eq!(l.pids_max.as_deref(), Some("32"));
         assert!(!l.is_empty());
         assert!(Limits::from_specs(None, None).is_empty());
@@ -560,10 +604,17 @@ mod tests {
         let guard = CgroupGuard::create(&mgr, "leaf").expect("create leaf cgroup");
         let (mem_ok, pids_ok) = guard.apply_limits(&limits);
         assert!(pids_ok, "pids.max applied");
-        assert_eq!(std::fs::read_to_string(guard.dir.join("pids.max")).unwrap().trim(), "1");
+        assert_eq!(
+            std::fs::read_to_string(guard.dir.join("pids.max"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
         if mem_ok {
             assert_eq!(
-                std::fs::read_to_string(guard.dir.join("memory.max")).unwrap().trim(),
+                std::fs::read_to_string(guard.dir.join("memory.max"))
+                    .unwrap()
+                    .trim(),
                 (32 * 1024 * 1024).to_string()
             );
         }
@@ -617,7 +668,11 @@ mod tests {
             libc::close(wfd);
         }
         let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "reap probe");
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, 0) },
+            pid,
+            "reap probe"
+        );
         probe.0 = None; // reaped — disarm the guard (avoid waitpid on a reused pid)
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
@@ -649,8 +704,14 @@ mod tests {
         let me = std::process::id();
         // A pid above any possible pid_max → never assigned → always dead (ESRCH).
         let dead = i32::MAX as u32;
-        assert!(stale_run(&format!("run-{dead}-0"), me), "dead pid → reclaim");
-        assert!(stale_run(&format!("run-{me}-7"), me), "our reused pid → reclaim");
+        assert!(
+            stale_run(&format!("run-{dead}-0"), me),
+            "dead pid → reclaim"
+        );
+        assert!(
+            stale_run(&format!("run-{me}-7"), me),
+            "our reused pid → reclaim"
+        );
         assert!(stale_run(".probe-123", me), "probe leftover → reclaim");
         assert!(!stale_run("run-1-0", me), "live sibling (pid 1) → spare");
         assert!(!stale_run("unrelated", me), "non-run dir → spare");

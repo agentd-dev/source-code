@@ -5,14 +5,16 @@
 //! one per line) to `<record-file>` so the suite can assert exactly what agentd's
 //! client sent. Independent of the agentd library on purpose.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let record_path = args.next().expect("usage: confmcp <record-file> [uri]");
-    let uri = args.next().unwrap_or_else(|| "file:///conf-watch.json".to_string());
+    let uri = args
+        .next()
+        .unwrap_or_else(|| "file:///conf-watch.json".to_string());
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -21,7 +23,9 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         record(&record_path, &line);
 
         let method = req["method"].as_str().unwrap_or("");
@@ -40,14 +44,22 @@ fn main() {
                 {"name": "echo", "description": "echo the input", "inputSchema": {"type": "object"}}
             ]}),
             "resources/list" => json!({"resources": [{"uri": uri, "name": "watched"}]}),
-            "resources/read" => json!({"contents": [{"uri": uri, "mimeType": "text/plain", "text": "conf content"}]}),
+            "resources/read" => {
+                json!({"contents": [{"uri": uri, "mimeType": "text/plain", "text": "conf content"}]})
+            }
             "resources/subscribe" | "resources/unsubscribe" => json!({}),
             _ => {
-                reply(&stdout, json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}}));
+                reply(
+                    &stdout,
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}}),
+                );
                 continue;
             }
         };
-        reply(&stdout, json!({"jsonrpc": "2.0", "id": id, "result": result}));
+        reply(
+            &stdout,
+            json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        );
 
         // After a subscribe, push one resources/updated so a reactive agent fires
         // a reaction — that reaction's subagent is what performs tools/list, so

@@ -14,7 +14,7 @@
 //! child's JSON telemetry (inherited to the parent). stdin carries
 //! [`ControlMsg`] down.
 
-use crate::agentloop::runner::{run_loop, LoopAbort, LoopInput, Session};
+use crate::agentloop::runner::{LoopAbort, LoopInput, Session, run_loop};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::intel::client::IntelClient;
 use crate::json::frame;
@@ -61,18 +61,37 @@ pub fn run() -> i32 {
 
     // The control reader runs on its own thread and owns stdin from here on,
     // so Ping/Pong keeps flowing while the loop is busy.
-    spawn_control_thread(stdin, Arc::clone(&up), Arc::clone(&cancel), inject_tx, log.ctx().clone());
+    spawn_control_thread(
+        stdin,
+        Arc::clone(&up),
+        Arc::clone(&cancel),
+        inject_tx,
+        log.ctx().clone(),
+    );
 
     send_up(&up, &AgentMsg::Ready);
-    log.info("loop.start", serde_json::json!({"depth": payload.depth, "warm": payload.warm}));
+    log.info(
+        "loop.start",
+        serde_json::json!({"depth": payload.depth, "warm": payload.warm}),
+    );
 
-    let intel = match IntelClient::from_parts(&payload.intelligence.uri, payload.intelligence.token.clone()) {
+    let intel = match IntelClient::from_parts(
+        &payload.intelligence.uri,
+        payload.intelligence.token.clone(),
+    ) {
         Ok(mut c) => {
             // Outbound LLM calls join the run's distributed trace (RFC 0010).
             c.set_trace_id(payload.telemetry.trace_id.clone());
             c
         }
-        Err(e) => return fail(&up, &log, format!("intel: {e}"), crate::exit::INTEL_UNAVAILABLE),
+        Err(e) => {
+            return fail(
+                &up,
+                &log,
+                format!("intel: {e}"),
+                crate::exit::INTEL_UNAVAILABLE,
+            );
+        }
     };
 
     let mut servers = Vec::new();
@@ -92,7 +111,12 @@ pub fn run() -> i32 {
                 servers.push(c);
             }
             Err(e) => {
-                return fail(&up, &log, format!("mcp '{}': {e}", spec.name), crate::exit::MCP_REQUIRED_DOWN)
+                return fail(
+                    &up,
+                    &log,
+                    format!("mcp '{}': {e}", spec.name),
+                    crate::exit::MCP_REQUIRED_DOWN,
+                );
             }
         }
     }
@@ -100,7 +124,11 @@ pub fn run() -> i32 {
     let input = LoopInput {
         instruction: payload.instruction.clone(),
         output_contract: payload.output_contract.clone(),
-        seed: payload.context_seed.iter().map(|m| (m.role.clone(), m.content.clone())).collect(),
+        seed: payload
+            .context_seed
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect(),
         model: payload.intelligence.model.clone().unwrap_or_default(),
         max_steps: payload.limits.max_steps,
         max_tokens: payload.limits.max_tokens,
@@ -115,7 +143,9 @@ pub fn run() -> i32 {
 
     // A warm continue-session lives across many events; a one-shot runs once.
     if payload.warm {
-        return run_warm(&intel, &servers, &input, &payload, &mut orch, &cancel, &inject_rx, &up, &log);
+        return run_warm(
+            &intel, &servers, &input, &payload, &mut orch, &cancel, &inject_rx, &up, &log,
+        );
     }
 
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
@@ -124,8 +154,18 @@ pub fn run() -> i32 {
             send_up(&up, &AgentMsg::Result { outcome });
             code
         }
-        Err(LoopAbort::Intel(m)) => fail(&up, &log, format!("intel: {m}"), crate::exit::INTEL_UNAVAILABLE),
-        Err(LoopAbort::Mcp(m)) => fail(&up, &log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN),
+        Err(LoopAbort::Intel(m)) => fail(
+            &up,
+            &log,
+            format!("intel: {m}"),
+            crate::exit::INTEL_UNAVAILABLE,
+        ),
+        Err(LoopAbort::Mcp(m)) => fail(
+            &up,
+            &log,
+            format!("mcp: {m}"),
+            crate::exit::MCP_REQUIRED_DOWN,
+        ),
     }
 }
 
@@ -150,8 +190,17 @@ fn run_warm(
 ) -> i32 {
     let mut session = match Session::prepare(servers, input, orch) {
         Ok(s) => s,
-        Err(LoopAbort::Intel(m)) => return fail(up, log, format!("intel: {m}"), crate::exit::INTEL_UNAVAILABLE),
-        Err(LoopAbort::Mcp(m)) => return fail(up, log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN),
+        Err(LoopAbort::Intel(m)) => {
+            return fail(
+                up,
+                log,
+                format!("intel: {m}"),
+                crate::exit::INTEL_UNAVAILABLE,
+            );
+        }
+        Err(LoopAbort::Mcp(m)) => {
+            return fail(up, log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN);
+        }
     };
     let limits = &payload.limits;
     loop {
@@ -161,8 +210,17 @@ fn run_warm(
         let mut budget = Budget::new(limits.max_steps, limits.max_tokens, deadline);
         let outcome = match session.run_turn(intel, orch, log, &mut budget, Some(cancel)) {
             Ok(o) => o,
-            Err(LoopAbort::Intel(m)) => return fail(up, log, format!("intel: {m}"), crate::exit::INTEL_UNAVAILABLE),
-            Err(LoopAbort::Mcp(m)) => return fail(up, log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN),
+            Err(LoopAbort::Intel(m)) => {
+                return fail(
+                    up,
+                    log,
+                    format!("intel: {m}"),
+                    crate::exit::INTEL_UNAVAILABLE,
+                );
+            }
+            Err(LoopAbort::Mcp(m)) => {
+                return fail(up, log, format!("mcp: {m}"), crate::exit::MCP_REQUIRED_DOWN);
+            }
         };
         // Cancellation during a turn ends the session (terminal Result below);
         // any other terminal is just this reaction's turn — the session lives on.
@@ -176,14 +234,21 @@ fn run_warm(
         // Block for the next event (single-consumer, in-order FIFO).
         match wait_for_inject(inject_rx, cancel) {
             Some(message) => {
-                log.info("subagent.inject", serde_json::json!({"bytes": message.len()}));
+                log.info(
+                    "subagent.inject",
+                    serde_json::json!({"bytes": message.len()}),
+                );
                 session.deliver(&message);
             }
             None => break, // cancelled, or the supervisor closed the control channel
         }
     }
     // Session closed: a single terminal Result so the supervisor sees closure.
-    let status = if cancel.load(Ordering::Relaxed) { TerminalStatus::Cancelled } else { TerminalStatus::Completed };
+    let status = if cancel.load(Ordering::Relaxed) {
+        TerminalStatus::Cancelled
+    } else {
+        TerminalStatus::Completed
+    };
     let code = crate::exit::once_exit(status, false);
     send_up(
         up,
@@ -297,7 +362,13 @@ fn spawn_control_thread(
 #[cfg(target_os = "linux")]
 fn install_pdeathsig() {
     unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
     }
 }
 

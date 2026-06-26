@@ -1,7 +1,7 @@
 //! Aggregate result of a conformance run, with text + JSON renderings.
 
 use crate::{Category, Outcome};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// One check's record in the report.
 pub struct Record {

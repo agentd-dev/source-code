@@ -12,14 +12,14 @@
 //! subscribe/unsubscribe, ping. We declare **no** client capabilities and
 //! answer server→client `ping`/`roots/list` minimally, rejecting `sampling`.
 
-use crate::json::{self, frame, Id, Incoming, RpcError};
+use crate::json::{self, Id, Incoming, RpcError, frame};
 use crate::wire::mcp::{
-    method, CallToolResult, ClientCapabilities, Implementation, InitializeParams,
-    InitializeResult, ListResourcesResult, ListToolsResult, ReadResourceParams, ReadResourceResult,
-    Resource, ServerCapabilities, SubscribeParams, Tool, PROTOCOL_VERSION,
+    CallToolResult, ClientCapabilities, Implementation, InitializeParams, InitializeResult,
+    ListResourcesResult, ListToolsResult, PROTOCOL_VERSION, ReadResourceParams, ReadResourceResult,
+    Resource, ServerCapabilities, SubscribeParams, Tool, method,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::BufReader;
@@ -91,8 +91,14 @@ impl McpClient {
             .spawn()
             .map_err(McpError::Spawn)?;
 
-        let stdin = child.stdin.take().ok_or_else(|| McpError::Transport("no child stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| McpError::Transport("no child stdout".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::Transport("no child stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::Transport("no child stdout".into()))?;
 
         let writer: SharedWriter = Arc::new(Mutex::new(stdin));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -178,9 +184,16 @@ impl McpClient {
     /// `tools/call`. The returned [`CallToolResult`] carries `isError` (a
     /// tool-domain failure observation) — distinct from an `Err` here, which
     /// is a transport/protocol failure (RFC 0004 §isError).
-    pub fn call_tool(&self, name: &str, arguments: Option<Value>) -> Result<CallToolResult, McpError> {
+    pub fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<CallToolResult, McpError> {
         if !self.caps.supports_tools() {
-            return Err(McpError::Capability(format!("server '{}' has no tools", self.name)));
+            return Err(McpError::Capability(format!(
+                "server '{}' has no tools",
+                self.name
+            )));
         }
         let params = build_call_params(name, arguments, self.tool_meta.as_ref());
         self.request_as(method::TOOLS_CALL, Some(params))
@@ -205,7 +218,9 @@ impl McpClient {
     }
 
     pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
-        let params = ReadResourceParams { uri: uri.to_string() };
+        let params = ReadResourceParams {
+            uri: uri.to_string(),
+        };
         self.request_as(method::RESOURCES_READ, Some(to_value(&params)))
     }
 
@@ -217,12 +232,18 @@ impl McpClient {
                 self.name
             )));
         }
-        self.request(method::RESOURCES_SUBSCRIBE, Some(to_value(&SubscribeParams { uri: uri.into() })))?;
+        self.request(
+            method::RESOURCES_SUBSCRIBE,
+            Some(to_value(&SubscribeParams { uri: uri.into() })),
+        )?;
         Ok(())
     }
 
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
-        self.request(method::RESOURCES_UNSUBSCRIBE, Some(to_value(&SubscribeParams { uri: uri.into() })))?;
+        self.request(
+            method::RESOURCES_UNSUBSCRIBE,
+            Some(to_value(&SubscribeParams { uri: uri.into() })),
+        )?;
         Ok(())
     }
 
@@ -242,7 +263,8 @@ impl McpClient {
         params: Option<Value>,
     ) -> Result<T, McpError> {
         let v = self.request(method, params)?;
-        serde_json::from_value(v).map_err(|e| McpError::Transport(format!("bad {method} result: {e}")))
+        serde_json::from_value(v)
+            .map_err(|e| McpError::Transport(format!("bad {method} result: {e}")))
     }
 
     fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
@@ -270,9 +292,10 @@ impl McpClient {
                 );
                 Err(McpError::Timeout(format!("{method} on '{}'", self.name)))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(McpError::Transport(format!("server '{}' closed the connection", self.name)))
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(McpError::Transport(format!(
+                "server '{}' closed the connection",
+                self.name
+            ))),
         }
     }
 
@@ -367,7 +390,11 @@ fn answer_server_request(writer: &SharedWriter, req: json::Request) {
     let resp = match req.method.as_str() {
         "ping" => json::Response::ok(req.id, json!({})),
         "roots/list" => json::Response::ok(req.id, json!({ "roots": [] })),
-        other => json::Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported: {other}")),
+        other => json::Response::err(
+            req.id,
+            json::METHOD_NOT_FOUND,
+            format!("unsupported: {other}"),
+        ),
     };
     let _ = write_msg(writer, &resp);
 }

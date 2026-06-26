@@ -39,7 +39,10 @@ pub enum Health {
 impl Health {
     /// Does this verdict require the kill ladder to run?
     pub fn needs_teardown(self) -> bool {
-        matches!(self, Health::Stuck | Health::Dead | Health::DeadlineExceeded)
+        matches!(
+            self,
+            Health::Stuck | Health::Dead | Health::DeadlineExceeded
+        )
     }
 }
 
@@ -68,8 +71,13 @@ impl LivenessConfig {
     /// Build from the two timeouts, deriving a ping cadence (≈ a third of the
     /// pong window, clamped to a sane band).
     pub fn new(progress_timeout: Duration, pong_timeout: Duration) -> LivenessConfig {
-        let ping_interval = (pong_timeout / 3).clamp(Duration::from_millis(50), Duration::from_secs(5));
-        LivenessConfig { progress_timeout, pong_timeout, ping_interval }
+        let ping_interval =
+            (pong_timeout / 3).clamp(Duration::from_millis(50), Duration::from_secs(5));
+        LivenessConfig {
+            progress_timeout,
+            pong_timeout,
+            ping_interval,
+        }
     }
 
     /// Optional operator/test tuning via `AGENTD_PROGRESS_TIMEOUT_MS` /
@@ -78,7 +86,11 @@ impl LivenessConfig {
     pub fn from_env() -> LivenessConfig {
         let d = LivenessConfig::default();
         let ms = |k: &str, fallback: Duration| {
-            std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis).unwrap_or(fallback)
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(fallback)
         };
         LivenessConfig::new(
             ms("AGENTD_PROGRESS_TIMEOUT_MS", d.progress_timeout),
@@ -100,7 +112,13 @@ pub struct Liveness {
 
 impl Liveness {
     pub fn new(now: Instant, deadline: Instant, cfg: LivenessConfig) -> Liveness {
-        Liveness { deadline, cfg, last_event_at: now, last_pong_at: now, eof: false }
+        Liveness {
+            deadline,
+            cfg,
+            last_event_at: now,
+            last_pong_at: now,
+            eof: false,
+        }
     }
 
     /// A substantive progress frame arrived (Event/Usage/Result). Also counts
@@ -155,11 +173,20 @@ mod tests {
     #[test]
     fn ping_interval_is_derived_below_the_pong_window_and_clamped() {
         // ~ a third of the pong window, so a responsive child answers in time.
-        assert_eq!(LivenessConfig::new(Duration::from_secs(100), Duration::from_secs(9)).ping_interval, Duration::from_secs(3));
+        assert_eq!(
+            LivenessConfig::new(Duration::from_secs(100), Duration::from_secs(9)).ping_interval,
+            Duration::from_secs(3)
+        );
         // clamped low: a tiny pong window still pings no faster than 50ms.
-        assert_eq!(LivenessConfig::new(Duration::from_secs(1), Duration::from_millis(30)).ping_interval, Duration::from_millis(50));
+        assert_eq!(
+            LivenessConfig::new(Duration::from_secs(1), Duration::from_millis(30)).ping_interval,
+            Duration::from_millis(50)
+        );
         // clamped high: a huge pong window still pings at least every 5s.
-        assert_eq!(LivenessConfig::new(Duration::from_secs(600), Duration::from_secs(60)).ping_interval, Duration::from_secs(5));
+        assert_eq!(
+            LivenessConfig::new(Duration::from_secs(600), Duration::from_secs(60)).ping_interval,
+            Duration::from_secs(5)
+        );
         // the production default keeps the ping interval under the pong window.
         let d = LivenessConfig::default();
         assert!(d.ping_interval < d.pong_timeout);
@@ -204,7 +231,10 @@ mod tests {
         let t0 = Instant::now();
         let mut l = Liveness::new(t0, t0 + Duration::from_secs(60), cfg());
         l.on_event(t0 + Duration::from_secs(59)); // busy right up to the wire
-        assert_eq!(l.classify(t0 + Duration::from_secs(61)), Health::DeadlineExceeded);
+        assert_eq!(
+            l.classify(t0 + Duration::from_secs(61)),
+            Health::DeadlineExceeded
+        );
     }
 
     #[test]

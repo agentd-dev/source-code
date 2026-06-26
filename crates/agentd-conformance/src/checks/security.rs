@@ -5,12 +5,24 @@ use crate::{Category, Check, Harness, Outcome};
 
 pub fn checks() -> Vec<Check> {
     vec![
-        Check { id: "security/trifecta-refused", category: Category::Security,
-            desc: "granting one agent all three lethal-trifecta legs is refused at startup → exit 2", run: trifecta_refused },
-        Check { id: "security/trifecta-allow-override", category: Category::Security,
-            desc: "--allow-trifecta downgrades the refusal to a logged grant", run: trifecta_allow_override },
-        Check { id: "security/secret-not-in-telemetry", category: Category::Security,
-            desc: "the intelligence token never appears in the JSON-lines telemetry", run: secret_not_in_telemetry },
+        Check {
+            id: "security/trifecta-refused",
+            category: Category::Security,
+            desc: "granting one agent all three lethal-trifecta legs is refused at startup → exit 2",
+            run: trifecta_refused,
+        },
+        Check {
+            id: "security/trifecta-allow-override",
+            category: Category::Security,
+            desc: "--allow-trifecta downgrades the refusal to a logged grant",
+            run: trifecta_allow_override,
+        },
+        Check {
+            id: "security/secret-not-in-telemetry",
+            category: Category::Security,
+            desc: "the intelligence token never appears in the JSON-lines telemetry",
+            run: secret_not_in_telemetry,
+        },
     ]
 }
 
@@ -34,8 +46,19 @@ fn trifecta_refused(h: &Harness) -> Outcome {
     // The refusal is a startup config-validation rejection (the agent never runs)
     // → exit 2 (config/usage). Exit 5 is reserved for a *runtime* refusal after
     // the agent ran. The scope.trifecta_refused event names the policy cause.
-    Outcome::require(r.code == Some(2), format!("want exit 2 (config refusal), got {:?}; stderr:\n{}", r.code, r.stderr))
-        .and(|| Outcome::require(r.saw_event("scope.trifecta_refused"), "no scope.trifecta_refused event".to_string()))
+    Outcome::require(
+        r.code == Some(2),
+        format!(
+            "want exit 2 (config refusal), got {:?}; stderr:\n{}",
+            r.code, r.stderr
+        ),
+    )
+    .and(|| {
+        Outcome::require(
+            r.saw_event("scope.trifecta_refused"),
+            "no scope.trifecta_refused event".to_string(),
+        )
+    })
 }
 
 fn trifecta_allow_override(h: &Harness) -> Outcome {
@@ -44,8 +67,16 @@ fn trifecta_allow_override(h: &Harness) -> Outcome {
     let r = h.run(&args);
     // The override must NOT refuse (exit 5); it proceeds (then fails for another
     // reason, e.g. intel down → 4). The grant is logged as allowed.
-    Outcome::require(r.code != Some(5), format!("override still refused (exit 5); stderr:\n{}", r.stderr))
-        .and(|| Outcome::require(r.saw_event("scope.trifecta_grant"), "no scope.trifecta_grant event".to_string()))
+    Outcome::require(
+        r.code != Some(5),
+        format!("override still refused (exit 5); stderr:\n{}", r.stderr),
+    )
+    .and(|| {
+        Outcome::require(
+            r.saw_event("scope.trifecta_grant"),
+            "no scope.trifecta_grant event".to_string(),
+        )
+    })
 }
 
 fn secret_not_in_telemetry(h: &Harness) -> Outcome {

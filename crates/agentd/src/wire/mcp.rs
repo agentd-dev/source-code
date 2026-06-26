@@ -114,7 +114,10 @@ impl ServerCapabilities {
         self.resources.is_some()
     }
     pub fn supports_subscribe(&self) -> bool {
-        self.resources.as_ref().and_then(|r| r.subscribe).unwrap_or(false)
+        self.resources
+            .as_ref()
+            .and_then(|r| r.subscribe)
+            .unwrap_or(false)
     }
 }
 

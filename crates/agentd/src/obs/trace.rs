@@ -40,8 +40,16 @@ pub fn outbound_traceparent(trace_id: &str) -> String {
 /// deterministically from the run id (so retries of a run share a trace id).
 pub fn resolve(run_id: &str, incoming: Option<&str>) -> TraceContext {
     match incoming.and_then(parse) {
-        Some(up) => TraceContext { trace_id: up.trace_id, span_id: new_span_id(), flags: up.flags },
-        None => TraceContext { trace_id: trace_id_from(run_id), span_id: new_span_id(), flags: "01".into() },
+        Some(up) => TraceContext {
+            trace_id: up.trace_id,
+            span_id: new_span_id(),
+            flags: up.flags,
+        },
+        None => TraceContext {
+            trace_id: trace_id_from(run_id),
+            span_id: new_span_id(),
+            flags: "01".into(),
+        },
     }
 }
 
@@ -62,7 +70,11 @@ pub fn parse(s: &str) -> Option<TraceContext> {
     if tid.bytes().all(|b| b == b'0') || sid.bytes().all(|b| b == b'0') {
         return None; // all-zero ids are invalid
     }
-    Some(TraceContext { trace_id: tid.to_string(), span_id: sid.to_string(), flags: flags.to_string() })
+    Some(TraceContext {
+        trace_id: tid.to_string(),
+        span_id: sid.to_string(),
+        flags: flags.to_string(),
+    })
 }
 
 fn is_hex(s: &str) -> bool {
@@ -93,7 +105,10 @@ fn trace_id_from(run_id: &str) -> String {
 pub fn new_span_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let seed = 0xcbf2_9ce4_8422_2325 ^ (std::process::id() as u64) ^ n;
     let mixed = fnv1a(&nanos.to_le_bytes(), seed) | 1; // avoid all-zero
     format!("{mixed:016x}")
@@ -109,7 +124,10 @@ mod tests {
         assert_eq!(tc.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(tc.span_id, "00f067aa0ba902b7");
         assert_eq!(tc.flags, "01");
-        assert_eq!(tc.traceparent(), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+        assert_eq!(
+            tc.traceparent(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
     }
 
     #[test]

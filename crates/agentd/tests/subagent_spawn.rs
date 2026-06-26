@@ -6,7 +6,9 @@
 //! endpoint is unreachable — a terminal `Failed`. Exercises re-exec + payload
 //! delivery + `main` dispatch + `subagent::control` without a live LLM.
 
-use agentd::subagent::protocol::{AgentMsg, ControlMsg, IntelConfig, Limits, SpawnPayload, Telemetry};
+use agentd::subagent::protocol::{
+    AgentMsg, ControlMsg, IntelConfig, Limits, SpawnPayload, Telemetry,
+};
 use agentd::supervisor::spawn::spawn;
 use agentd::supervisor::tree::{Caps, NodeId, Tree};
 use std::path::Path;
@@ -25,7 +27,12 @@ fn bogus_payload() -> SpawnPayload {
             model: Some("test-model".into()),
         },
         mcp_servers: Vec::new(),
-        limits: Limits { max_steps: 3, max_tokens: 10_000, deadline_ms: 10_000, max_depth: 4 },
+        limits: Limits {
+            max_steps: 3,
+            max_tokens: 10_000,
+            deadline_ms: 10_000,
+            max_depth: 4,
+        },
         telemetry: Telemetry {
             run_id: "itest".into(),
             agent_id: "0".into(),
@@ -129,14 +136,20 @@ fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
     );
 
     // Deliver a second event → a second turn over the SAME live session.
-    sub.send(&ControlMsg::Inject { message: "now the second thing".into() }).expect("inject");
+    sub.send(&ControlMsg::Inject {
+        message: "now the second thing".into(),
+    })
+    .expect("inject");
     assert!(
         recv_kind(&rx, "turn", Instant::now() + Duration::from_secs(20)),
         "expected a second Turn after Inject (warm re-entry)"
     );
 
     // Cancel → the warm session winds down with a terminal Result.
-    sub.send(&ControlMsg::Cancel { reason: "test done".into() }).expect("cancel");
+    sub.send(&ControlMsg::Cancel {
+        reason: "test done".into(),
+    })
+    .expect("cancel");
     assert!(
         recv_kind(&rx, "result", Instant::now() + Duration::from_secs(20)),
         "expected a terminal Result after Cancel"
@@ -158,10 +171,16 @@ fn subagent_round_trips_ready_then_failed() {
 
     let msgs = drain_to_terminal(&rx, Instant::now() + Duration::from_secs(20));
 
-    assert!(matches!(msgs.first(), Some(AgentMsg::Ready)), "expected Ready first, got {msgs:?}");
+    assert!(
+        matches!(msgs.first(), Some(AgentMsg::Ready)),
+        "expected Ready first, got {msgs:?}"
+    );
     match msgs.last() {
         Some(AgentMsg::Failed { error }) => {
-            assert!(error.contains("intel"), "expected an intel failure, got: {error}")
+            assert!(
+                error.contains("intel"),
+                "expected an intel failure, got: {error}"
+            )
         }
         other => panic!("expected terminal Failed, got {other:?}"),
     }

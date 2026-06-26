@@ -56,7 +56,12 @@ fn payload(sock: &Path) -> SpawnPayload {
             model: Some("m".into()),
         },
         mcp_servers: Vec::new(),
-        limits: Limits { max_steps: 4, max_tokens: 10_000, deadline_ms: 10_000, max_depth: 4 },
+        limits: Limits {
+            max_steps: 4,
+            max_tokens: 10_000,
+            deadline_ms: 10_000,
+            max_depth: 4,
+        },
         telemetry: Telemetry {
             run_id: "warm".into(),
             agent_id: "0".into(),
@@ -72,7 +77,13 @@ fn payload(sock: &Path) -> SpawnPayload {
 }
 
 /// Drain turns until `target` total have been seen, or the deadline.
-fn drain_until(reg: &mut WarmRegistry, log: &Logger, have: usize, target: usize, deadline: Instant) -> usize {
+fn drain_until(
+    reg: &mut WarmRegistry,
+    log: &Logger,
+    have: usize,
+    target: usize,
+    deadline: Instant,
+) -> usize {
     let mut turns = have;
     while turns < target && Instant::now() < deadline {
         turns += reg.drain(log).len();
@@ -91,7 +102,9 @@ fn continue_route_spawns_once_then_injects_into_the_same_session() {
     let deadline = Instant::now() + Duration::from_secs(20);
 
     // First event → spawns the warm session.
-    let spawned = reg.deliver(Path::new(exe()), "s1", payload(&sock), "first event", &log).expect("deliver 1");
+    let spawned = reg
+        .deliver(Path::new(exe()), "s1", payload(&sock), "first event", &log)
+        .expect("deliver 1");
     assert!(spawned, "the first delivery should spawn a warm session");
     assert_eq!(reg.len(), 1);
 
@@ -99,12 +112,20 @@ fn continue_route_spawns_once_then_injects_into_the_same_session() {
     assert!(turns >= 1, "the warm session should complete turn 1");
 
     // Second event on the same route → injected into the SAME live session.
-    let spawned2 = reg.deliver(Path::new(exe()), "s1", payload(&sock), "second event", &log).expect("deliver 2");
-    assert!(!spawned2, "the second delivery should inject, not spawn a new process");
+    let spawned2 = reg
+        .deliver(Path::new(exe()), "s1", payload(&sock), "second event", &log)
+        .expect("deliver 2");
+    assert!(
+        !spawned2,
+        "the second delivery should inject, not spawn a new process"
+    );
     assert_eq!(reg.len(), 1, "still exactly one warm session");
 
     let turns = drain_until(&mut reg, &log, turns, 2, deadline);
-    assert!(turns >= 2, "the SAME warm session should run a second turn from the injected event");
+    assert!(
+        turns >= 2,
+        "the SAME warm session should run a second turn from the injected event"
+    );
 
     // Graceful teardown: cancel → let it emit a terminal Result + exit.
     reg.cancel_all(&log);
@@ -113,7 +134,10 @@ fn continue_route_spawns_once_then_injects_into_the_same_session() {
         let _ = reg.drain(&log);
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(reg.is_empty(), "the warm session should wind down on cancel");
+    assert!(
+        reg.is_empty(),
+        "the warm session should wind down on cancel"
+    );
 
     reg.clear();
     let _ = llm.kill();

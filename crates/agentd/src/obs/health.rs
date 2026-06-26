@@ -27,7 +27,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Record supervisor progress. Call from each supervisor hot loop.
@@ -43,7 +46,12 @@ pub fn tick_age_ms() -> u64 {
 /// Spawn the health-file writer thread for a daemon. It writes once a second
 /// until the process exits or a drain is requested (after which it writes a
 /// final `draining` record and stops). `stale_after` is the liveness window.
-pub fn spawn_writer(path: PathBuf, run_id: String, mode: String, stale_after: Duration) -> JoinHandle<()> {
+pub fn spawn_writer(
+    path: PathBuf,
+    run_id: String,
+    mode: String,
+    stale_after: Duration,
+) -> JoinHandle<()> {
     tick(); // seed so the first write looks alive
     std::thread::Builder::new()
         .name("health-writer".into())

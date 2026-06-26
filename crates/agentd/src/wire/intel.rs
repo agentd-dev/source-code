@@ -17,11 +17,18 @@ use serde_json::Value;
 pub enum Message {
     System(String),
     User(String),
-    Assistant { text: Option<String>, tool_calls: Vec<ToolCall> },
+    Assistant {
+        text: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
     /// A tool/exec result fed back into the loop. `is_error` carries the MCP
     /// `isError: true` signal (a tool-domain failure observation, distinct
     /// from a transport error — RFC 0004 §isError).
-    ToolResult { id: String, content: String, is_error: bool },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 impl Message {
@@ -31,8 +38,16 @@ impl Message {
     pub fn user(s: impl Into<String>) -> Message {
         Message::User(s.into())
     }
-    pub fn tool_result(id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Message {
-        Message::ToolResult { id: id.into(), content: content.into(), is_error }
+    pub fn tool_result(
+        id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Message {
+        Message::ToolResult {
+            id: id.into(),
+            content: content.into(),
+            is_error,
+        }
     }
 }
 
@@ -119,7 +134,10 @@ mod tests {
 
     #[test]
     fn usage_totals() {
-        let u = Usage { input_tokens: 100, output_tokens: 25 };
+        let u = Usage {
+            input_tokens: 100,
+            output_tokens: 25,
+        };
         assert_eq!(u.total(), 125);
     }
 
@@ -152,7 +170,13 @@ mod tests {
 
     #[test]
     fn stop_reason_snake_case() {
-        assert_eq!(serde_json::to_string(&StopReason::ToolUse).unwrap(), "\"tool_use\"");
-        assert_eq!(serde_json::to_string(&StopReason::EndTurn).unwrap(), "\"end_turn\"");
+        assert_eq!(
+            serde_json::to_string(&StopReason::ToolUse).unwrap(),
+            "\"tool_use\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::EndTurn).unwrap(),
+            "\"end_turn\""
+        );
     }
 }

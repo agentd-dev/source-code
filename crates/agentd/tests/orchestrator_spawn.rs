@@ -41,7 +41,12 @@ fn parent_payload() -> SpawnPayload {
             model: Some("m".into()),
         },
         mcp_servers: Vec::new(),
-        limits: Limits { max_steps: 3, max_tokens: 10_000, deadline_ms: 10_000, max_depth: 4 },
+        limits: Limits {
+            max_steps: 3,
+            max_tokens: 10_000,
+            deadline_ms: 10_000,
+            max_depth: 4,
+        },
         telemetry: Telemetry {
             run_id: "itest".into(),
             agent_id: "0".into(),
@@ -85,25 +90,47 @@ fn async_spawn_returns_a_handle_then_await_collects_the_result() {
 
     // The collection tools ride alongside spawn at a depth-budgeted node.
     let names: Vec<String> = orch.tools().iter().map(|t| t.name.clone()).collect();
-    assert!(names.iter().any(|n| n == "subagent.await"), "subagent.await should be advertised");
-    assert!(names.iter().any(|n| n == "subagent.status"), "subagent.status should be advertised");
+    assert!(
+        names.iter().any(|n| n == "subagent.await"),
+        "subagent.await should be advertised"
+    );
+    assert!(
+        names.iter().any(|n| n == "subagent.status"),
+        "subagent.status should be advertised"
+    );
 
     // async=true returns a handle immediately (non-blocking), NOT the result.
     let (ack, is_error) = orch
-        .handle("subagent.spawn", &json!({"instruction": "do a focused subtask", "async": true}))
+        .handle(
+            "subagent.spawn",
+            &json!({"instruction": "do a focused subtask", "async": true}),
+        )
         .expect("subagent.spawn is a self-tool");
     assert!(!is_error, "async spawn should succeed: {ack}");
-    assert!(ack.contains("handle=0.0"), "expected the child handle in the ack, got: {ack}");
+    assert!(
+        ack.contains("handle=0.0"),
+        "expected the child handle in the ack, got: {ack}"
+    );
 
     // await collects the real child's distilled result (mock LLM → "mock-llm done").
-    let (result, is_error) = orch.handle("subagent.await", &json!({"handle": "0.0"})).expect("await is a self-tool");
+    let (result, is_error) = orch
+        .handle("subagent.await", &json!({"handle": "0.0"}))
+        .expect("await is a self-tool");
     assert!(!is_error, "the child should complete, got error: {result}");
-    assert!(result.contains("mock-llm done"), "expected the distilled child result, got: {result}");
+    assert!(
+        result.contains("mock-llm done"),
+        "expected the distilled child result, got: {result}"
+    );
 
     // Collection is idempotent: a status/read after await still returns the result
     // (the handle is a peek, reaped at Drop — consistent across status/await/read).
-    let (again, is_error) = orch.handle("subagent.status", &json!({"handle": "0.0"})).expect("status is a self-tool");
-    assert!(!is_error && again.contains("mock-llm done"), "status should still return the result (idempotent): {again}");
+    let (again, is_error) = orch
+        .handle("subagent.status", &json!({"handle": "0.0"}))
+        .expect("status is a self-tool");
+    assert!(
+        !is_error && again.contains("mock-llm done"),
+        "status should still return the result (idempotent): {again}"
+    );
 
     let _ = llm.kill();
     let _ = llm.wait();
@@ -122,17 +149,35 @@ fn a_detached_child_is_not_collectable() {
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
 
     // detach=true: fire-and-forget. The ack must NOT promise a collectable result.
-    let (ack, err) = orch.handle("subagent.spawn", &json!({"instruction": "x", "detach": true})).expect("spawn");
+    let (ack, err) = orch
+        .handle(
+            "subagent.spawn",
+            &json!({"instruction": "x", "detach": true}),
+        )
+        .expect("spawn");
     assert!(!err, "detached spawn should succeed: {ack}");
-    assert!(ack.contains("fire-and-forget") && !ack.contains("agentd://"), "detach ack omits the resource uri: {ack}");
+    assert!(
+        ack.contains("fire-and-forget") && !ack.contains("agentd://"),
+        "detach ack omits the resource uri: {ack}"
+    );
 
     // Every collection path reports the detached child as not collectable.
     for tool in ["subagent.status", "subagent.await"] {
-        let (msg, _) = orch.handle(tool, &json!({"handle": "0.0"})).expect("self-tool");
-        assert!(msg.contains("detached"), "{tool} should report detached, got: {msg}");
+        let (msg, _) = orch
+            .handle(tool, &json!({"handle": "0.0"}))
+            .expect("self-tool");
+        assert!(
+            msg.contains("detached"),
+            "{tool} should report detached, got: {msg}"
+        );
     }
-    let (msg, _) = orch.read_resource("agentd://subagent/0.0").expect("agentd:// served");
-    assert!(msg.contains("detached"), "resource.read should report detached, got: {msg}");
+    let (msg, _) = orch
+        .read_resource("agentd://subagent/0.0")
+        .expect("agentd:// served");
+    assert!(
+        msg.contains("detached"),
+        "resource.read should report detached, got: {msg}"
+    );
 
     let _ = llm.kill();
     let _ = llm.wait();
@@ -151,18 +196,31 @@ fn async_completion_is_readable_as_an_agentd_resource() {
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
 
     // The handler serves agentd:// resources (so the loop offers resource.read).
-    assert!(orch.serves_self_resources(), "an orchestrator that can nest serves agentd:// resources");
+    assert!(
+        orch.serves_self_resources(),
+        "an orchestrator that can nest serves agentd:// resources"
+    );
 
     // Spawn async and confirm the ack points at the readable resource URI.
-    let (ack, err) = orch.handle("subagent.spawn", &json!({"instruction": "x", "async": true})).expect("spawn");
+    let (ack, err) = orch
+        .handle(
+            "subagent.spawn",
+            &json!({"instruction": "x", "async": true}),
+        )
+        .expect("spawn");
     assert!(!err, "async spawn should succeed: {ack}");
-    assert!(ack.contains("agentd://subagent/0.0"), "ack should mention the resource uri: {ack}");
+    assert!(
+        ack.contains("agentd://subagent/0.0"),
+        "ack should mention the resource uri: {ack}"
+    );
 
     // resource.read is an idempotent peek: poll until the child completes.
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut done = None;
     while Instant::now() < deadline {
-        let (content, is_err) = orch.read_resource("agentd://subagent/0.0").expect("agentd:// is self-served");
+        let (content, is_err) = orch
+            .read_resource("agentd://subagent/0.0")
+            .expect("agentd:// is self-served");
         if content.contains("mock-llm done") {
             done = Some((content, is_err));
             break;
@@ -170,12 +228,20 @@ fn async_completion_is_readable_as_an_agentd_resource() {
         std::thread::sleep(Duration::from_millis(30));
     }
     let (content, is_err) = done.expect("the completion should become readable as a resource");
-    assert!(!is_err && content.contains("mock-llm done"), "got: {content}");
+    assert!(
+        !is_err && content.contains("mock-llm done"),
+        "got: {content}"
+    );
 
     // Idempotent: a second read still returns the completion (handle NOT consumed,
     // unlike subagent.status / await).
-    let (again, _) = orch.read_resource("agentd://subagent/0.0").expect("still served");
-    assert!(again.contains("mock-llm done"), "resource.read should be an idempotent peek: {again}");
+    let (again, _) = orch
+        .read_resource("agentd://subagent/0.0")
+        .expect("still served");
+    assert!(
+        again.contains("mock-llm done"),
+        "resource.read should be an idempotent peek: {again}"
+    );
 
     let _ = llm.kill();
     let _ = llm.wait();
@@ -184,15 +250,25 @@ fn async_completion_is_readable_as_an_agentd_resource() {
 #[test]
 fn subagent_spawn_runs_a_real_child() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
-    let mut orch = Orchestrator::from_payload(exe, &parent_payload(), Duration::from_secs(15), logger());
+    let mut orch =
+        Orchestrator::from_payload(exe, &parent_payload(), Duration::from_secs(15), logger());
 
     // The root (depth 0, max_depth 4) can delegate and self-schedule.
     let tool_names: Vec<String> = orch.tools().iter().map(|t| t.name.clone()).collect();
-    assert!(tool_names.iter().any(|n| n == "subagent.spawn"), "subagent.spawn should be advertised");
-    assert!(tool_names.iter().any(|n| n == "schedule"), "schedule should be advertised at the root");
+    assert!(
+        tool_names.iter().any(|n| n == "subagent.spawn"),
+        "subagent.spawn should be advertised"
+    );
+    assert!(
+        tool_names.iter().any(|n| n == "schedule"),
+        "schedule should be advertised at the root"
+    );
 
     let (content, is_error) = orch
-        .handle("subagent.spawn", &json!({"instruction": "do a focused subtask"}))
+        .handle(
+            "subagent.spawn",
+            &json!({"instruction": "do a focused subtask"}),
+        )
         .expect("subagent.spawn is a self-tool");
 
     assert!(is_error, "child should report failure (unreachable intel)");

@@ -67,11 +67,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Assert the default build has exactly 3 direct deps
         run: |
-          deps=$(cargo tree -p agentd --depth 1 --edges normal | grep -cE '^[├└]')
+          # `--prefix none` lists one package per line with no tree glyphs, so the
+          # count is charset-independent (cargo tree emits ASCII art off a TTY, so
+          # a `├`/`└` grep counts 0 in CI). First line is the agentd root; drop it.
+          deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -c .)
           echo "direct deps: $deps"
           if [ "$deps" -ne 3 ]; then
             echo "::error::default build must have exactly 3 direct deps (serde, serde_json, libc); found $deps"
-            cargo tree -p agentd --depth 1 --edges normal
+            cargo tree -p agentd --depth 1 --edges normal --prefix none
             exit 1
           fi
 

@@ -163,14 +163,26 @@ mod tests {
         SpawnPayload {
             instruction: "summarize the file".into(),
             output_contract: Some("Return a 3-bullet summary.".into()),
-            context_seed: vec![SeedMessage { role: "user".into(), content: "prior note".into() }],
+            context_seed: vec![SeedMessage {
+                role: "user".into(),
+                content: "prior note".into(),
+            }],
             intelligence: IntelConfig {
                 uri: "unix:/run/intel.sock".into(),
                 token: Some("secret".into()),
                 model: Some("m".into()),
             },
-            mcp_servers: vec![McpServerSpec { name: "fs".into(), command: vec!["mcp-fs".into()], tags: Vec::new() }],
-            limits: Limits { max_steps: 20, max_tokens: 100_000, deadline_ms: 600_000, max_depth: 4 },
+            mcp_servers: vec![McpServerSpec {
+                name: "fs".into(),
+                command: vec!["mcp-fs".into()],
+                tags: Vec::new(),
+            }],
+            limits: Limits {
+                max_steps: 20,
+                max_tokens: 100_000,
+                deadline_ms: 600_000,
+                max_depth: 4,
+            },
             telemetry: Telemetry {
                 run_id: "r1".into(),
                 agent_id: "0.1".into(),
@@ -224,9 +236,17 @@ mod tests {
 
     #[test]
     fn control_ping_cancel_tags() {
-        assert!(serde_json::to_string(&ControlMsg::Ping { seq: 1 }).unwrap().contains("\"type\":\"ping\""));
-        assert!(serde_json::to_string(&ControlMsg::Cancel { reason: "drain".into() })
+        assert!(
+            serde_json::to_string(&ControlMsg::Ping { seq: 1 })
+                .unwrap()
+                .contains("\"type\":\"ping\"")
+        );
+        assert!(
+            serde_json::to_string(&ControlMsg::Cancel {
+                reason: "drain".into()
+            })
             .unwrap()
-            .contains("\"type\":\"cancel\""));
+            .contains("\"type\":\"cancel\"")
+        );
     }
 }

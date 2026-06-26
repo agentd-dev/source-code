@@ -20,12 +20,12 @@ use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
 use crate::signals;
 use crate::subagent::protocol::{SeedMessage, SpawnPayload};
-use crate::supervisor::reactor::{supervise_once, SuperviseResult};
+use crate::supervisor::reactor::{SuperviseResult, supervise_once};
 use crate::supervisor::restart::{RestartAction, RestartConfig, RestartGovernor};
 use crate::triggers::router::{Disposition, Route, Router};
 use crate::triggers::warm::WarmRegistry;
 use crate::wire::mcp::method;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -54,7 +54,10 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                 servers.push(c);
             }
             Err(e) => {
-                log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
+                log.error(
+                    "mcp.connect.fail",
+                    json!({"server": spec.name, "err": e.to_string()}),
+                );
                 eprintln!("agentd: MCP server '{}' failed: {e}", spec.name);
                 return exit::MCP_REQUIRED_DOWN;
             }
@@ -64,10 +67,15 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     // `--subscribe` URIs route to a fresh Spawn per event; `--continue` URIs
     // route to one warm session (Disposition::Continue, session_id = the URI),
     // RFC 0008 §spawn-vs-continue.
-    let mut routes: Vec<Route> =
-        cfg.subscribe.iter().map(|u| Route::new(u, Disposition::Spawn, DEBOUNCE)).collect();
+    let mut routes: Vec<Route> = cfg
+        .subscribe
+        .iter()
+        .map(|u| Route::new(u, Disposition::Spawn, DEBOUNCE))
+        .collect();
     routes.extend(
-        cfg.continue_subscribe.iter().map(|u| Route::new(u, Disposition::Continue(u.clone()), DEBOUNCE)),
+        cfg.continue_subscribe
+            .iter()
+            .map(|u| Route::new(u, Disposition::Continue(u.clone()), DEBOUNCE)),
     );
     let mut router = Router::new(routes);
     let mut warm = WarmRegistry::default();
@@ -163,7 +171,10 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                 Disposition::Spawn => {
                     // A fresh, independent reaction per event (synchronous v1).
                     let payload = reactive_payload(&base, &delivery.uri, &content);
-                    log.info("trigger.fired", json!({"uri": delivery.uri, "bytes": content.len()}));
+                    log.info(
+                        "trigger.fired",
+                        json!({"uri": delivery.uri, "bytes": content.len()}),
+                    );
                     if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
                         apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
                     }
@@ -179,7 +190,10 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                         json!({"uri": delivery.uri, "bytes": content.len(), "session": session_id}),
                     );
                     if let Err(e) = warm.deliver(&exe, &session_id, payload, &event, log) {
-                        log.error("warm.spawn_fail", json!({"session": session_id, "err": e.to_string()}));
+                        log.error(
+                            "warm.spawn_fail",
+                            json!({"session": session_id, "err": e.to_string()}),
+                        );
                     }
                 }
             }
@@ -196,7 +210,10 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
         // agent, bounded by the daemon lifetime + per-run budgets).
         for instruction in drain_due_wakes(&mut wakes, now) {
             let payload = scheduled_payload(&base, &instruction);
-            log.info("trigger.fired", json!({"kind": "self_schedule", "instruction_len": instruction.len()}));
+            log.info(
+                "trigger.fired",
+                json!({"kind": "self_schedule", "instruction_len": instruction.len()}),
+            );
             crate::obs::metrics::record_reaction();
             if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
                 apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
@@ -248,7 +265,10 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
     };
     #[cfg(not(feature = "cron"))]
     if cfg.cron.is_some() {
-        log.warn("cron.unavailable", json!({"reason": "built without --features cron"}));
+        log.warn(
+            "cron.unavailable",
+            json!({"reason": "built without --features cron"}),
+        );
     }
 
     let mut iteration: u64 = 0;
@@ -261,7 +281,10 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
     loop {
         crate::obs::health::tick();
         if signals::draining() {
-            log.info("proc.exit", json!({"reason": "drain", "mode": cfg.mode.as_str()}));
+            log.info(
+                "proc.exit",
+                json!({"reason": "drain", "mode": cfg.mode.as_str()}),
+            );
             return exit::SUCCESS;
         }
 
@@ -280,7 +303,10 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
                 .unwrap_or(Duration::from_secs(60));
             sleep_interruptible(wait);
             if signals::draining() {
-                log.info("proc.exit", json!({"reason": "drain", "mode": cfg.mode.as_str()}));
+                log.info(
+                    "proc.exit",
+                    json!({"reason": "drain", "mode": cfg.mode.as_str()}),
+                );
                 return exit::SUCCESS;
             }
         }
@@ -319,14 +345,21 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         // cron's spacing is the pre-run wait above, so a successful cron fire has
         // no post-wait; interval mode waits its interval here. A failed run still
         // backs off (capped + jittered) regardless of the schedule source.
-        let post_wait = if cron_active { Duration::ZERO } else { interval };
+        let post_wait = if cron_active {
+            Duration::ZERO
+        } else {
+            interval
+        };
         let now = Instant::now();
         match governor.on_outcome(ok, now.duration_since(started), now) {
             _ if ok => sleep_interruptible(post_wait),
             RestartAction::Backoff(d) => sleep_interruptible(d.max(post_wait)),
             RestartAction::Tripped => {
                 crate::obs::metrics::record_restart_tripped();
-                log.warn("proc.exit", json!({"reason": "restart_breaker", "iteration": iteration}));
+                log.warn(
+                    "proc.exit",
+                    json!({"reason": "restart_breaker", "iteration": iteration}),
+                );
                 return exit::GENERIC;
             }
         }
@@ -415,7 +448,10 @@ fn apply_effects(
                     }
                 });
                 if !armed {
-                    log.warn("subscribe.unsupported", json!({"uri": req.uri, "kind": "self_subscribe"}));
+                    log.warn(
+                        "subscribe.unsupported",
+                        json!({"uri": req.uri, "kind": "self_subscribe"}),
+                    );
                 }
             }
             SubscriptionAction::Unsubscribe => {
@@ -423,7 +459,10 @@ fn apply_effects(
                     let _ = servers[i].unsubscribe(&req.uri);
                 }
                 if router.remove_exact(&req.uri) > 0 {
-                    log.info("unsubscribe", json!({"uri": req.uri, "kind": "self_subscribe"}));
+                    log.info(
+                        "unsubscribe",
+                        json!({"uri": req.uri, "kind": "self_subscribe"}),
+                    );
                 }
             }
         }
@@ -431,10 +470,18 @@ fn apply_effects(
 }
 
 /// Arm self-scheduled wake-ups relative to `base_time`, logging each (RFC 0008).
-fn arm_wakes(wakes: &mut Vec<(Instant, String)>, reqs: Vec<ScheduleRequest>, base_time: Instant, log: &Logger) {
+fn arm_wakes(
+    wakes: &mut Vec<(Instant, String)>,
+    reqs: Vec<ScheduleRequest>,
+    base_time: Instant,
+    log: &Logger,
+) {
     for r in reqs {
         let at = base_time + Duration::from_millis(r.after_ms);
-        log.info("trigger.armed", json!({"kind": "self_schedule", "after_ms": r.after_ms}));
+        log.info(
+            "trigger.armed",
+            json!({"kind": "self_schedule", "after_ms": r.after_ms}),
+        );
         wakes.push((at, r.instruction));
     }
 }
@@ -465,7 +512,10 @@ pub fn changed_message(uri: &str, content: &str) -> String {
 /// changed resource's current state as context. Pure.
 pub fn reactive_payload(base: &SpawnPayload, uri: &str, content: &str) -> SpawnPayload {
     let mut p = base.clone();
-    p.context_seed = vec![SeedMessage { role: "user".into(), content: changed_message(uri, content) }];
+    p.context_seed = vec![SeedMessage {
+        role: "user".into(),
+        content: changed_message(uri, content),
+    }];
     p
 }
 
@@ -482,7 +532,11 @@ fn updated_uri(params: &Option<Value>) -> Option<String> {
     params.as_ref()?.get("uri")?.as_str().map(str::to_string)
 }
 
-fn read_current(servers: &[McpClient], owner: &HashMap<String, usize>, uri: &str) -> Option<String> {
+fn read_current(
+    servers: &[McpClient],
+    owner: &HashMap<String, usize>,
+    uri: &str,
+) -> Option<String> {
     let idx = *owner.get(uri)?;
     servers.get(idx)?.read_resource(uri).ok().map(|r| r.text())
 }
@@ -497,9 +551,18 @@ mod tests {
             instruction: "triage the change".into(),
             output_contract: None,
             context_seed: Vec::new(),
-            intelligence: IntelConfig { uri: "unix:/x".into(), token: None, model: None },
+            intelligence: IntelConfig {
+                uri: "unix:/x".into(),
+                token: None,
+                model: None,
+            },
             mcp_servers: Vec::new(),
-            limits: Limits { max_steps: 10, max_tokens: 1000, deadline_ms: 1000, max_depth: 4 },
+            limits: Limits {
+                max_steps: 10,
+                max_tokens: 1000,
+                deadline_ms: 1000,
+                max_depth: 4,
+            },
             telemetry: Telemetry {
                 run_id: "t".into(),
                 agent_id: "0".into(),
@@ -525,7 +588,10 @@ mod tests {
 
     #[test]
     fn updated_uri_parses() {
-        assert_eq!(updated_uri(&Some(json!({"uri": "file://a"}))), Some("file://a".into()));
+        assert_eq!(
+            updated_uri(&Some(json!({"uri": "file://a"}))),
+            Some("file://a".into())
+        );
         assert_eq!(updated_uri(&Some(json!({"title": "x"}))), None);
         assert_eq!(updated_uri(&None), None);
     }
@@ -548,7 +614,10 @@ mod tests {
     #[test]
     fn scheduled_payload_replaces_instruction_and_clears_seed() {
         let mut b = base();
-        b.context_seed = vec![SeedMessage { role: "user".into(), content: "stale".into() }];
+        b.context_seed = vec![SeedMessage {
+            role: "user".into(),
+            content: "stale".into(),
+        }];
         let p = scheduled_payload(&b, "do the deferred thing");
         assert_eq!(p.instruction, "do the deferred thing"); // the agent's own follow-up
         assert!(p.context_seed.is_empty()); // no resource context on a time wake
@@ -561,8 +630,14 @@ mod tests {
         arm_wakes(
             &mut wakes,
             vec![
-                ScheduleRequest { after_ms: 0, instruction: "now".into() },
-                ScheduleRequest { after_ms: 60_000, instruction: "later".into() },
+                ScheduleRequest {
+                    after_ms: 0,
+                    instruction: "now".into(),
+                },
+                ScheduleRequest {
+                    after_ms: 60_000,
+                    instruction: "later".into(),
+                },
             ],
             now,
             &test_logger(),

@@ -75,7 +75,17 @@ mod tests {
 
     #[test]
     fn codes_are_distinct_and_in_documented_bands() {
-        let table = [SUCCESS, GENERIC, USAGE, PARTIAL, INTEL_UNAVAILABLE, REFUSED, MCP_REQUIRED_DOWN, BUDGET, DEADLINE];
+        let table = [
+            SUCCESS,
+            GENERIC,
+            USAGE,
+            PARTIAL,
+            INTEL_UNAVAILABLE,
+            REFUSED,
+            MCP_REQUIRED_DOWN,
+            BUDGET,
+            DEADLINE,
+        ];
         // pairwise distinct — a collision would make a podFailurePolicy ambiguous
         for (i, a) in table.iter().enumerate() {
             for b in &table[i + 1..] {
@@ -88,8 +98,21 @@ mod tests {
 
     #[test]
     fn once_exit_never_returns_success_for_a_non_completed_status() {
-        for s in [Refused, ExhaustedSteps, ExhaustedTokens, Deadline, Stalled, LoopDetected, Cancelled, Crashed] {
-            assert_ne!(once_exit(s, false), SUCCESS, "{s:?} must not look like success");
+        for s in [
+            Refused,
+            ExhaustedSteps,
+            ExhaustedTokens,
+            Deadline,
+            Stalled,
+            LoopDetected,
+            Cancelled,
+            Crashed,
+        ] {
+            assert_ne!(
+                once_exit(s, false),
+                SUCCESS,
+                "{s:?} must not look like success"
+            );
         }
     }
 }

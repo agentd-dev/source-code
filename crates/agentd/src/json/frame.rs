@@ -25,7 +25,10 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// assert the invariant the transport relies on).
 pub fn write_line<W: Write, T: serde::Serialize>(w: &mut W, value: &T) -> io::Result<()> {
     let buf = serde_json::to_vec(value).map_err(io::Error::other)?;
-    debug_assert!(!buf.contains(&b'\n'), "compact JSON must not contain newlines");
+    debug_assert!(
+        !buf.contains(&b'\n'),
+        "compact JSON must not contain newlines"
+    );
     w.write_all(&buf)?;
     w.write_all(b"\n")?;
     w.flush()
@@ -52,7 +55,10 @@ pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
                     return Ok(Some(buf));
                 }
                 if buf.len() >= MAX_FRAME {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "line exceeds MAX_FRAME"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "line exceeds MAX_FRAME",
+                    ));
                 }
                 buf.push(byte[0]);
             }
@@ -66,7 +72,10 @@ pub fn read_line<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 pub fn write_frame<W: Write, T: serde::Serialize>(w: &mut W, value: &T) -> io::Result<()> {
     let buf = serde_json::to_vec(value).map_err(io::Error::other)?;
     if buf.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds MAX_FRAME"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds MAX_FRAME",
+        ));
     }
     w.write_all(&(buf.len() as u32).to_be_bytes())?;
     w.write_all(&buf)?;
@@ -83,7 +92,10 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds MAX_FRAME"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length exceeds MAX_FRAME",
+        ));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
@@ -100,7 +112,10 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
                 return if filled == 0 {
                     Ok(false)
                 } else {
-                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF mid-frame"))
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF mid-frame",
+                    ))
                 };
             }
             n => filled += n,

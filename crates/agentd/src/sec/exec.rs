@@ -18,7 +18,7 @@
 
 use crate::supervisor::kill::kill_group;
 use crate::wire::intel::ToolDef;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -71,7 +71,9 @@ pub fn run(argv: &[String], timeout: Duration) -> Result<ExecResult, String> {
     }
 
     let started = Instant::now();
-    let mut child = cmd.spawn().map_err(|e| format!("exec: spawn {prog}: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("exec: spawn {prog}: {e}"))?;
     let pgid = child.id() as i32;
 
     // Drain stdout/stderr on threads so a chatty child can't deadlock the wait.
@@ -214,8 +216,16 @@ pub fn tool_def() -> ToolDef {
 /// ran (any exit code) is a normal observation.
 pub fn handle_call(args: &Value, timeout: Duration) -> (String, bool) {
     let argv: Vec<String> = match args.get("argv").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        None => return ("error: exec requires 'argv' (an array of strings)".into(), true),
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => {
+            return (
+                "error: exec requires 'argv' (an array of strings)".into(),
+                true,
+            );
+        }
     };
     if argv.is_empty() {
         return ("error: exec 'argv' must not be empty".into(), true);
@@ -253,7 +263,11 @@ mod tests {
     #[test]
     fn timeout_kills_and_flags() {
         // /bin/sleep 5 with a 200ms bound → killed, timed_out true.
-        let sleep = if Path::new("/bin/sleep").exists() { "/bin/sleep" } else { "/usr/bin/sleep" };
+        let sleep = if Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
         let r = run(&[sleep.into(), "5".into()], Duration::from_millis(200)).unwrap();
         assert!(r.timed_out, "expected timeout");
     }

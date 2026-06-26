@@ -33,7 +33,10 @@ fn supervised_once_exits_4_on_unreachable_intel() {
 #[test]
 fn bad_flag_exits_2() {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let out = Command::new(exe).arg("--no-such-flag").output().expect("run agentd");
+    let out = Command::new(exe)
+        .arg("--no-such-flag")
+        .output()
+        .expect("run agentd");
     assert_eq!(out.status.code(), Some(2));
 }
 
@@ -41,7 +44,14 @@ fn bad_flag_exits_2() {
 fn reactive_requires_a_subscription() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
-        .args(["--mode", "reactive", "--instruction", "hi", "--intelligence", "unix:/x"])
+        .args([
+            "--mode",
+            "reactive",
+            "--instruction",
+            "hi",
+            "--intelligence",
+            "unix:/x",
+        ])
         .output()
         .expect("run agentd");
     assert_eq!(out.status.code(), Some(2)); // validation: needs --subscribe
@@ -67,5 +77,10 @@ fn reactive_exits_6_when_required_mcp_server_is_down() {
         ])
         .output()
         .expect("run agentd");
-    assert_eq!(out.status.code(), Some(6), "stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

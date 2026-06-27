@@ -30,11 +30,9 @@ const CONTRACT_VERSION: &str = "1.0";
 /// (RFC 0015 §4) — the authoritative `surfaces.operator_tools` list, which
 /// MIRRORS what `tools/list` returns to a `Management` peer (the served gate
 /// reads this same const, so the manifest and the live surface cannot drift,
-/// RFC 0015 §5.2). `pause`/`resume` are DEFERRED (they need a new `ctrl/pause`
-/// control message + loop turn-boundary suspension that does not yet exist), so
-/// they are intentionally absent until built — capability-absence-not-error
-/// (RFC 0015 §2.5 / §5.5).
-pub const OPERATOR_TOOLS: &[&str] = &["drain", "lame-duck", "cancel"];
+/// RFC 0015 §5.2). `pause`/`resume` fan `ctrl/pause`/`ctrl/resume` to suspend the
+/// agentic tree at turn boundaries (RFC 0015 §4.3).
+pub const OPERATOR_TOOLS: &[&str] = &["drain", "lame-duck", "pause", "resume", "cancel"];
 
 /// Build the capabilities manifest from resolved config + identity.
 ///
@@ -237,8 +235,7 @@ fn surfaces(cfg: &Config) -> Value {
         // Operator tools listed to a `Management` peer (RFC 0015 §4). They exist
         // only on the management transport, so they're advertised only when this
         // build can serve it (`serve-mcp`); otherwise the surface is empty —
-        // capability-absence-not-error (RFC 0015 §2.5). `pause`/`resume` are
-        // deferred (see OPERATOR_TOOLS).
+        // capability-absence-not-error (RFC 0015 §2.5).
         "operator_tools": operator_tools(),
         // The A2A external-agent surface (RFC 0020). When this build serves A2A
         // (the `a2a` feature, which rides the management transport), advertise the
@@ -443,10 +440,13 @@ mod tests {
         assert_eq!(s["management"], json!(false));
         assert_eq!(s["metrics"], json!(false));
         // operator_tools mirrors the built management surface (RFC 0015 §5.2):
-        // the drain/lame-duck/cancel set with `serve-mcp`, empty without it.
-        // pause/resume are deferred and never appear in either build.
+        // the full drain/lame-duck/pause/resume/cancel set with `serve-mcp`,
+        // empty without it. pause/resume are PRESENT (RFC 0015 §4.3 — shipped).
         if cfg!(feature = "serve-mcp") {
-            assert_eq!(s["operator_tools"], json!(["drain", "lame-duck", "cancel"]));
+            assert_eq!(
+                s["operator_tools"],
+                json!(["drain", "lame-duck", "pause", "resume", "cancel"])
+            );
         } else {
             assert_eq!(s["operator_tools"], json!([]));
         }

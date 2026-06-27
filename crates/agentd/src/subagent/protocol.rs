@@ -31,6 +31,14 @@ pub enum ControlMsg {
     Spawn(Box<SpawnPayload>),
     /// Liveness probe; the child's control thread answers [`AgentMsg::Pong`].
     Ping { seq: u64 },
+    /// Suspend the agentic loop at its next turn boundary (RFC 0005 §4.3,
+    /// RFC 0015 §4.3). The child's control thread sets a `paused` flag; the loop
+    /// waits between turns until [`ControlMsg::Resume`] clears it. The control
+    /// thread keeps running while the loop is suspended, so `Resume`/`Ping`/
+    /// `Cancel` still arrive — `Cancel` always wins over a pause.
+    Pause,
+    /// Clear a prior [`ControlMsg::Pause`]: the loop resumes at the next turn.
+    Resume,
     /// Ask the child to wind down at the next turn boundary (graceful).
     Cancel { reason: String },
     /// Inject a message into the child's running warm session (parent `send` /
@@ -255,5 +263,22 @@ mod tests {
             .unwrap()
             .contains("\"type\":\"cancel\"")
         );
+    }
+
+    #[test]
+    fn control_pause_resume_roundtrip() {
+        // No-param, serde-tagged like Ready/Pong (RFC 0005 §4.3 / RFC 0015 §4.3).
+        let pause = serde_json::to_string(&ControlMsg::Pause).unwrap();
+        assert_eq!(pause, "{\"type\":\"pause\"}");
+        let resume = serde_json::to_string(&ControlMsg::Resume).unwrap();
+        assert_eq!(resume, "{\"type\":\"resume\"}");
+        assert!(matches!(
+            serde_json::from_str::<ControlMsg>(&pause).unwrap(),
+            ControlMsg::Pause
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ControlMsg>(&resume).unwrap(),
+            ControlMsg::Resume
+        ));
     }
 }

@@ -114,6 +114,16 @@ pub struct Supervisor {
     /// handle). Set → the run drains gracefully, like a SIGTERM but scoped to
     /// this one supervisor. `None` for runs that only honour process SIGTERM.
     cancel: Option<Arc<AtomicBool>>,
+    /// Optional per-run pause flag (a served async run can be paused by the
+    /// instance-wide `pause` operator tool, RFC 0015 §4.3). Set → the reactor
+    /// forwards `ctrl/pause` to every live child so each suspends at its next
+    /// turn boundary; cleared → it forwards `ctrl/resume`. `None` for runs with
+    /// no pause channel. This is the async-session parallel of `cancel`: a shared
+    /// atomic the reactor reads and translates to a `ControlMsg`, exactly as
+    /// `cancel` becomes `ControlMsg::Cancel`. `paused_sent` debounces the
+    /// forward so an edge fans exactly once, not every tick.
+    paused: Option<Arc<AtomicBool>>,
+    paused_sent: bool,
     /// The per-run child cgroup (opt-in via `--cgroup`; `None` when off / not
     /// writable). The root subagent is placed here so its whole subtree can be
     /// torn down atomically with `cgroup.kill` — the backstop beyond killpg +
@@ -148,6 +158,8 @@ impl Supervisor {
             last_ping: Instant::now(),
             ping_seq: 0,
             cancel: None,
+            paused: None,
+            paused_sent: false,
             cgroup: None,
             log,
         }
@@ -230,6 +242,11 @@ impl Supervisor {
             if (signals::draining() || cancelled) && self.drain.is_none() {
                 self.begin_drain(KillReason::Drain);
             }
+
+            // Forward an instance-wide pause/resume edge to every live child
+            // (RFC 0015 §4.3). Skipped during a drain — the kill ladder owns the
+            // children then, and a paused tree must still drain.
+            self.forward_pause();
 
             self.maybe_send_pings(Instant::now());
             self.tick_liveness();
@@ -330,6 +347,39 @@ impl Supervisor {
         for h in self.live.values_mut() {
             let _ = h.send(&ControlMsg::Ping { seq });
         }
+    }
+
+    /// Translate the per-run `paused` atomic into `ctrl/pause`/`ctrl/resume`
+    /// frames to every live child on each edge (RFC 0015 §4.3) — the async-run
+    /// parallel of how `cancel` becomes `ctrl/cancel` in `begin_drain`. Debounced
+    /// via `paused_sent` so an edge fans exactly once. Suspended during a drain:
+    /// the kill ladder owns the children then, and a paused tree must still drain.
+    /// The supervisor loop (and its `health::tick` liveness heartbeat) keeps
+    /// running — only the children's agentic loops suspend (RFC 0015 §4.3).
+    fn forward_pause(&mut self) {
+        if self.drain.is_some() {
+            return;
+        }
+        let want = self
+            .paused
+            .as_ref()
+            .is_some_and(|p| p.load(Ordering::Relaxed));
+        if want == self.paused_sent {
+            return; // no edge
+        }
+        let msg = if want {
+            ControlMsg::Pause
+        } else {
+            ControlMsg::Resume
+        };
+        for h in self.live.values_mut() {
+            let _ = h.send(&msg);
+        }
+        self.log.info(
+            "subagent.pause",
+            json!({"paused": want, "live": self.live.len()}),
+        );
+        self.paused_sent = want;
     }
 
     fn reap(&mut self) {
@@ -606,9 +656,27 @@ pub fn supervise_cancellable(
     log: Logger,
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<SuperviseResult> {
+    supervise_pausable(exe, payload, drain_timeout, log, cancel, None)
+}
+
+/// Like [`supervise_cancellable`] but also with an optional per-run `paused` flag
+/// (RFC 0015 §4.3): setting it forwards `ctrl/pause` to every live child so each
+/// suspends at its next turn boundary; clearing it forwards `ctrl/resume`. The
+/// async-session pause channel, the parallel of `cancel`. The supervisor loop
+/// (and its liveness heartbeat) is never gated by `paused` — only the children's
+/// agentic loops suspend.
+pub fn supervise_pausable(
+    exe: PathBuf,
+    payload: &SpawnPayload,
+    drain_timeout: Duration,
+    log: Logger,
+    cancel: Option<Arc<AtomicBool>>,
+    paused: Option<Arc<AtomicBool>>,
+) -> std::io::Result<SuperviseResult> {
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.cancel = cancel;
+    sup.paused = paused;
     // Per-run child cgroup (opt-in, best-effort): the root + its whole subtree
     // land here so teardown can `cgroup.kill` them atomically. `None` when the
     // feature is off or the tree isn't writable — the run then relies on

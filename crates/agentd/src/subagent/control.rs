@@ -54,17 +54,23 @@ pub fn run() -> i32 {
     let up: Up = Arc::new(Mutex::new(io::stdout()));
     let log = build_logger(&payload);
     let cancel = Arc::new(AtomicBool::new(false));
+    // Tree-wide turn-boundary suspension (RFC 0005 §4.3 / RFC 0015 §4.3): the
+    // control thread sets this on `Pause`, clears it on `Resume`; the loop waits
+    // between turns while it is set. `cancel` always wins (see `pause_wait`).
+    let paused = Arc::new(AtomicBool::new(false));
 
     // For a warm continue-session, the control thread forwards each `Inject`
     // event to the loop over this channel; a one-shot run never reads it.
     let (inject_tx, inject_rx) = std::sync::mpsc::channel::<String>();
 
     // The control reader runs on its own thread and owns stdin from here on,
-    // so Ping/Pong keeps flowing while the loop is busy.
+    // so Ping/Pong keeps flowing while the loop is busy — and so Resume/Cancel
+    // still arrive while the loop is suspended at a turn boundary.
     spawn_control_thread(
         stdin,
         Arc::clone(&up),
         Arc::clone(&cancel),
+        Arc::clone(&paused),
         inject_tx,
         log.ctx().clone(),
     );
@@ -148,10 +154,13 @@ pub fn run() -> i32 {
     if payload.warm {
         intel.enable_alldown_backoff(crate::intel::client::AllDownPolicy::default());
         return run_warm(
-            &intel, &servers, &input, &payload, &mut orch, &cancel, &inject_rx, &up, &log,
+            &intel, &servers, &input, &payload, &mut orch, &cancel, &paused, &inject_rx, &up, &log,
         );
     }
 
+    // One-shot: a single turn. Suspend at the turn boundary (before the turn
+    // starts) if paused; a turn already in progress is never interrupted.
+    pause_wait(&paused, &cancel, &log);
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
         Ok(outcome) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
@@ -188,6 +197,7 @@ fn run_warm(
     payload: &SpawnPayload,
     orch: &mut Orchestrator,
     cancel: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
     inject_rx: &Receiver<String>,
     up: &Up,
     log: &Logger,
@@ -208,6 +218,13 @@ fn run_warm(
     };
     let limits = &payload.limits;
     loop {
+        // Turn boundary: if paused (RFC 0005 §4.3 / RFC 0015 §4.3), suspend HERE,
+        // before starting the next turn — never mid-turn. A `Cancel` during pause
+        // wins and proceeds to wind-down (the loop falls through to the cancel
+        // check below). The control thread keeps running, so Resume/Cancel arrive
+        // while we wait. The supervisor reactor and its liveness heartbeat are not
+        // affected — only this child loop suspends.
+        pause_wait(paused, cancel, log);
         // One turn over the persistent transcript, bounded by a fresh per-event
         // budget (a new deadline each turn, so the session isn't globally capped).
         let deadline = Instant::now() + Duration::from_millis(limits.deadline_ms.max(1));
@@ -285,6 +302,24 @@ fn wait_for_inject(rx: &Receiver<String>, cancel: &AtomicBool) -> Option<String>
     }
 }
 
+/// Suspend the loop at a turn boundary while `paused` is set (RFC 0005 §4.3 /
+/// RFC 0015 §4.3). Polls at the same cadence as `wait_for_inject` so a `Resume`
+/// (or `Cancel`) lands promptly. `cancel` always wins: a cancel during a pause
+/// returns immediately so the loop proceeds to wind-down. Logs once on enter and
+/// once on leave (debounced — never per poll). The supervisor reactor is NOT
+/// gated by this; only the child's agentic loop suspends, so the liveness
+/// heartbeat keeps ticking (RFC 0015 §4.3).
+fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
+    if !paused.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+        return; // fast path: not paused (or cancel wins) → no log, no wait
+    }
+    log.info("loop.paused", serde_json::json!({}));
+    while paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    log.info("loop.resumed", serde_json::json!({}));
+}
+
 fn fail(up: &Up, log: &Logger, error: String, code: i32) -> i32 {
     log.error("loop.error", serde_json::json!({"err": error}));
     send_up(up, &AgentMsg::Failed { error });
@@ -326,13 +361,17 @@ fn send_up(up: &Up, msg: &AgentMsg) {
 }
 
 /// The control reader thread. Owns stdin, answers `Ping` with `Pong`, flips the
-/// cancel flag on `Cancel`, and forwards each `Inject` event to a warm session's
-/// loop over `inject_tx`. Exits on EOF (the supervisor closed the channel) or a
-/// read error — which drops `inject_tx`, unblocking a warm session's wait.
+/// cancel flag on `Cancel`, toggles the `paused` flag on `Pause`/`Resume`, and
+/// forwards each `Inject` event to a warm session's loop over `inject_tx`. It
+/// keeps running while the loop is suspended (so `Resume`/`Cancel`/`Ping` still
+/// arrive — the whole point of a separate thread). Exits on EOF (the supervisor
+/// closed the channel) or a read error — which drops `inject_tx`, unblocking a
+/// warm session's wait.
 fn spawn_control_thread(
     mut stdin: BufReader<Stdin>,
     up: Up,
     cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     inject_tx: Sender<String>,
     ctx: LogCtx,
 ) {
@@ -348,6 +387,11 @@ fn spawn_control_thread(
                         log.info("subagent.cancel", serde_json::json!({"reason": reason}));
                         cancel.store(true, Ordering::Relaxed);
                     }
+                    // Turn-boundary suspension (RFC 0005 §4.3 / RFC 0015 §4.3): set
+                    // the flag here; the loop suspends at its next boundary. The
+                    // loop's `pause_wait` does the enter/leave logging (debounced).
+                    Ok(ControlMsg::Pause) => paused.store(true, Ordering::Relaxed),
+                    Ok(ControlMsg::Resume) => paused.store(false, Ordering::Relaxed),
                     // Deliver into the warm session; a one-shot run never reads
                     // the receiver, so the send is simply dropped there.
                     Ok(ControlMsg::Inject { message }) => {
@@ -382,5 +426,82 @@ fn install_pdeathsig() {
     // the fallback. (agentd targets Linux for production.)
 }
 
-// (No unit tests here — the control path is exercised end to end by the
-// `subagent_spawn` integration test, which launches a real subagent process.)
+// The full control path is exercised end to end by the `subagent_spawn`
+// integration test (a real subagent process). The flag-driven turn-boundary
+// suspend logic is unit-tested here directly.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::obs::log::{Comp, Level, LogCtx, Logger};
+
+    fn test_log() -> Logger {
+        Logger::new(
+            LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Agent,
+                pid: 0,
+                trace_id: None,
+            },
+            Level::Info,
+        )
+    }
+
+    #[test]
+    fn pause_wait_returns_immediately_when_not_paused() {
+        let paused = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        let t = Instant::now();
+        pause_wait(&paused, &cancel, &test_log());
+        // No sleep on the fast path.
+        assert!(t.elapsed() < Duration::from_millis(40));
+    }
+
+    #[test]
+    fn pause_wait_cancel_wins_over_pause() {
+        // Paused AND cancelled → cancel wins: return at once (the loop then winds
+        // down at its cancel check). Never blocks.
+        let paused = AtomicBool::new(true);
+        let cancel = AtomicBool::new(true);
+        let t = Instant::now();
+        pause_wait(&paused, &cancel, &test_log());
+        assert!(t.elapsed() < Duration::from_millis(40));
+    }
+
+    #[test]
+    fn pause_wait_suspends_until_resume() {
+        // Paused → block; another thread clears `paused` (a Resume), and the wait
+        // returns. The flag is the whole mechanism — this proves the seam.
+        let paused = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let p2 = Arc::clone(&paused);
+        let unblock = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            p2.store(false, Ordering::Relaxed); // Resume
+        });
+        let t = Instant::now();
+        pause_wait(&paused, &cancel, &test_log());
+        // It actually waited for the resume (≥ ~one poll interval), then returned.
+        assert!(t.elapsed() >= Duration::from_millis(80));
+        assert!(!paused.load(Ordering::Relaxed));
+        unblock.join().unwrap();
+    }
+
+    #[test]
+    fn pause_wait_breaks_out_on_cancel_during_pause() {
+        // A cancel that lands WHILE suspended unblocks the wait (cancel always
+        // wins), so a drain during a pause proceeds (RFC 0015 §4.3).
+        let paused = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            c2.store(true, Ordering::Relaxed); // Cancel during pause
+        });
+        pause_wait(&paused, &cancel, &test_log());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(paused.load(Ordering::Relaxed)); // still paused, but cancel broke us out
+        canceller.join().unwrap();
+    }
+}

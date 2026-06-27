@@ -24,6 +24,14 @@ mod imp {
     // served operator tool (mcp::server, `serve-mcp`), with neither feature
     // depending on the other. Distinct from `DRAINING`: lame-duck never exits.
     static LAME_DUCK: AtomicBool = AtomicBool::new(false);
+    // Tree-wide pause state (RFC 0015 §4.3): set by the `pause` operator tool,
+    // cleared by `resume`. Like `LAME_DUCK`, it rides here (not a feature-gated
+    // module) so it is one process-global truth read by BOTH the served operator
+    // surface (`agentd://inventory`, `serve-mcp`) and the `agentd_paused` gauge
+    // (`metrics`), with neither feature depending on the other. Distinct from
+    // DRAINING/LAME_DUCK: pause freezes the agentic loops only — never exits, never
+    // touches readiness (the supervisor reactor and liveness heartbeat run on).
+    static PAUSED: AtomicBool = AtomicBool::new(false);
     // Self-pipe fds (-1 until install()). The write end is touched from signal
     // handlers; the read end is what the reactor waits on.
     static WAKE_R: AtomicI32 = AtomicI32::new(-1);
@@ -125,6 +133,18 @@ mod imp {
         LAME_DUCK.store(on, Ordering::SeqCst);
     }
 
+    pub fn paused() -> bool {
+        PAUSED.load(Ordering::SeqCst)
+    }
+
+    /// Set/clear the instance-wide pause state (the `pause`/`resume` operator
+    /// tools, RFC 0015 §4.3). Reporting-only: the per-session pause channels do
+    /// the actual loop suspension; this flag is the single truth `agentd://inventory`
+    /// and `agentd_paused` read. Reversible; never exits, never touches readiness.
+    pub fn set_paused(on: bool) {
+        PAUSED.store(on, Ordering::SeqCst);
+    }
+
     /// Take and clear the SIGCHLD flag — the reactor then runs the waitpid loop.
     pub fn take_child_exit() -> bool {
         CHILD_EXIT.swap(false, Ordering::SeqCst)
@@ -164,6 +184,10 @@ mod imp {
         false
     }
     pub fn set_lame_duck(_on: bool) {}
+    pub fn paused() -> bool {
+        false
+    }
+    pub fn set_paused(_on: bool) {}
     pub fn take_child_exit() -> bool {
         false
     }
@@ -206,6 +230,20 @@ pub fn lame_duck() -> bool {
 /// RFC 0015 §4.2). `true` overrides readiness toward NotReady; `false` clears it.
 pub fn set_lame_duck(on: bool) {
     imp::set_lame_duck(on)
+}
+
+/// Is the instance-wide pause active (RFC 0015 §4.3)? When true, the agentic
+/// loops are suspended at their turn boundaries; the supervisor and readiness
+/// are unaffected.
+pub fn paused() -> bool {
+    imp::paused()
+}
+
+/// Set or clear the instance-wide pause state (the `pause`/`resume` operator
+/// tools, RFC 0015 §4.3). Reporting truth for `agentd://inventory` + the
+/// `agentd_paused` gauge; the per-session pause channels do the suspension.
+pub fn set_paused(on: bool) {
+    imp::set_paused(on)
 }
 
 /// Take-and-clear the SIGCHLD flag — true if a child exited since last checked.

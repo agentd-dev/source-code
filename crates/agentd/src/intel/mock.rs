@@ -7,9 +7,11 @@
 //! to a final answer once a tool result appears in the transcript (so the ReAct
 //! cycle closes). Scripts: `final` (answer at once), `read` (call `resource.read`
 //! then answer), `schedule` (call the `schedule` self-tool then answer),
-//! `subscribe` (call the `subscribe` self-tool then answer); `slow`/`hang` hold
-//! the response to exercise the stuck/deadline detectors. Small enough to ship;
-//! it makes the loop + self-* tools observable end to end.
+//! `subscribe` (call the `subscribe` self-tool then answer), `spawn-churn`
+//! (call `subagent.spawn` on *every* turn — never converging — so a run issues
+//! a rapid burst of spawns that trips the spawn-rate limiter, RFC 0009 §3.6);
+//! `slow`/`hang` hold the response to exercise the stuck/deadline detectors.
+//! Small enough to ship; it makes the loop + self-* tools observable end to end.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -104,6 +106,15 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         ("schedule", true) => final_answer("scheduled a follow-up"),
         ("subscribe", false) => tool_call("subscribe", r#"{"uri":"file:///watch.json"}"#),
         ("subscribe", true) => final_answer("now watching the resource"),
+        // Unlike read/schedule (which answer once a tool result is seen),
+        // spawn-churn ignores `saw_tool_result` and keeps emitting a
+        // `subagent.spawn` call every turn — so an in-loop run fires many rapid,
+        // detached spawns and exercises the spawn-rate limiter end to end. detach
+        // keeps each accepted spawn fire-and-forget so the burst stays rapid.
+        ("spawn-churn", _) => tool_call(
+            "subagent.spawn",
+            r#"{"instruction":"do a trivial subtask","detach":true}"#,
+        ),
         _ => final_answer("mock-llm done"),
     }
 }
@@ -161,6 +172,23 @@ mod tests {
         let turn1 = openai::parse_response(response_json("schedule", false).as_bytes()).unwrap();
         assert_eq!(turn1.tool_calls[0].name, "schedule");
         assert_eq!(turn1.tool_calls[0].arguments["after_seconds"], 1);
+    }
+
+    #[test]
+    fn spawn_churn_never_converges() {
+        // Every turn — whether or not a tool result was seen — is another
+        // subagent.spawn with a valid (non-empty) instruction, so the run keeps
+        // hammering the chokepoint instead of answering.
+        for saw_tool in [false, true] {
+            let turn =
+                openai::parse_response(response_json("spawn-churn", saw_tool).as_bytes()).unwrap();
+            assert!(turn.wants_tools(), "spawn-churn must keep calling tools");
+            assert_eq!(turn.tool_calls[0].name, "subagent.spawn");
+            assert_eq!(
+                turn.tool_calls[0].arguments["instruction"],
+                "do a trivial subtask"
+            );
+        }
     }
 
     #[test]

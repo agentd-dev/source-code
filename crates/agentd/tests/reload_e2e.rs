@@ -113,6 +113,95 @@ fn sighup_applies_a_reloadable_change_then_drains_to_exit_0() {
     assert_eq!(code, Some(0), "expected graceful exit 0; stderr:\n{out}");
 }
 
+/// Like [`run_reload`] but the intelligence endpoint list is set in the FILE
+/// (not a flag), so a reload can repoint it — the RFC 0018 §5 hot-swap path. No
+/// `--intelligence` flag is passed (a flag would override the file + pin it).
+fn run_reload_intel_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("agentd.json");
+    std::fs::write(&cfg_path, initial_file).expect("write initial config");
+
+    let mut child = Command::new(exe)
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--mode",
+            "reactive",
+            "--instruction",
+            "react",
+            "--subscribe",
+            "file:///in.json",
+            "--mcp",
+            &mcp,
+            "--log-level",
+            "info",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd reactive");
+
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        stderr.read_to_string(&mut s).ok();
+        s
+    });
+
+    std::thread::sleep(Duration::from_millis(700));
+    {
+        let mut f = std::fs::File::create(&cfg_path).expect("rewrite config");
+        f.write_all(new_file.as_bytes()).expect("write new config");
+        f.flush().ok();
+    }
+    sighup(child.id());
+    std::thread::sleep(Duration::from_millis(800));
+    sigterm(child.id());
+    let status = child.wait().expect("wait for agentd");
+    let out = reader.join().unwrap_or_default();
+    (status.code(), out)
+}
+
+#[test]
+fn sighup_applies_an_intelligence_repoint_as_a_hot_swap() {
+    // RFC 0018 §5.1: changing the intelligence endpoint LIST in the file is now a
+    // RELOADABLE hot-swap — applied (config.reloaded + intel.swap), NOT rejected.
+    // The endpoints are unreachable (no live LLM), but the reload BEHAVIOUR — the
+    // swap is accepted, the daemon stays up, drains to 0 — is fully observable.
+    let initial =
+        r#"{ "intelligence": "unix:/nonexistent-a.sock", "model": "m", "log_level": "info" }"#;
+    let changed = r#"{ "intelligence": "unix:/nonexistent-b.sock,unix:/nonexistent-c.sock", "model": "m", "model_swap": "restart-turn", "log_level": "info" }"#;
+    let (code, out) = run_reload_intel_in_file(initial, changed);
+
+    assert!(
+        out.contains(r#""event":"proc.ready""#),
+        "reactive never became ready:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"config.reloaded""#),
+        "an intelligence repoint must be APPLIED, not rejected:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"intel.swap""#),
+        "the swap event was not emitted:\n{out}"
+    );
+    assert!(
+        out.contains("restart-turn"),
+        "the new swap policy should surface in the swap event:\n{out}"
+    );
+    // RFC 0012 §3.7: the endpoint URL must NEVER appear in the swap event/logs —
+    // only transport+index. The full `unix:/...` socket path must not leak.
+    // (The mock URI in `--subscribe` is file:///in.json, distinct from the intel
+    // sockets, so finding the intel path would be a real leak.)
+    assert!(
+        !out.contains("nonexistent-b.sock"),
+        "the endpoint URL leaked into the telemetry:\n{out}"
+    );
+    assert_eq!(code, Some(0), "expected graceful exit 0; stderr:\n{out}");
+}
+
 #[test]
 fn sighup_rejects_a_restart_only_change_as_a_no_op() {
     // Changing a RESTART-ONLY field (mcp_servers — scoped restart-only in this

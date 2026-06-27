@@ -40,6 +40,17 @@ pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 pub struct ConfigFile {
     /// Optional; pins the file to a schema major agentctl validated against.
     pub config_version: Option<String>,
+    /// `--intelligence` / `AGENTD_INTELLIGENCE` — the ordered intelligence
+    /// endpoint *list* URI (RFC 0018 §3.1). File-settable + **reloadable** so a
+    /// ConfigMap update can repoint the endpoint list as a hot-swap (RFC 0018 §5):
+    /// the reload fans `ctrl/swap_intel` to in-flight work and re-points new
+    /// spawns. The transport SCHEME is data, not a secret; the per-endpoint
+    /// credential is NEVER inline here (env/`_FILE` only, RFC 0012 §3.7).
+    pub intelligence: Option<String>,
+    /// `--model-swap` / `AGENTD_MODEL_SWAP` (RFC 0018 §5.3): the model hot-swap
+    /// policy (`finish-on-old` | `restart-turn`). Reloadable. Validated against
+    /// [`crate::config::SwapPolicy`].
+    pub model_swap: Option<String>,
     /// `--model` / `AGENTD_MODEL` (reloadable param, never the transport).
     pub model: Option<String>,
     /// `--max-tokens` / `AGENTD_MAX_TOKENS`.
@@ -109,6 +120,8 @@ pub struct A2aPeerFile {
 /// `properties` can never silently diverge from the struct (§4.2).
 pub const CONFIG_FILE_FIELDS: &[&str] = &[
     "config_version",
+    "intelligence",
+    "model_swap",
     "model",
     "max_tokens",
     "limits",
@@ -230,6 +243,8 @@ pub fn config_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "config_version": { "type": "string" },
+            "intelligence": { "type": "string" },
+            "model_swap": { "enum": ["finish-on-old", "restart-turn"] },
             "model": { "type": "string" },
             "max_tokens": { "type": "integer", "minimum": 1 },
             "limits": { "$ref": "#/$defs/Limits" },
@@ -406,7 +421,8 @@ mod tests {
         let mut obj = serde_json::Map::new();
         for k in CONFIG_FILE_FIELDS {
             let v = match *k {
-                "config_version" | "model" | "log_level" => json!("x"),
+                "config_version" | "model" | "log_level" | "intelligence" => json!("x"),
+                "model_swap" => json!("finish-on-old"),
                 "max_tokens" => json!(1),
                 "limits" => json!({}),
                 "mcp_servers" => json!([{ "name": "a", "command": "c" }]),

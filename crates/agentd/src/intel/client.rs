@@ -163,6 +163,19 @@ impl IntelClient {
         self.list.borrow().len()
     }
 
+    /// The run's trace id, if stamped (RFC 0010). Read on a hot-swap (RFC 0018
+    /// §5.2) to re-stamp the rebuilt client so it keeps joining the run's trace.
+    pub fn trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
+
+    /// Whether the all-endpoints-down backoff is enabled (a long-lived
+    /// loop/reactive daemon). Read on a hot-swap (RFC 0018 §5.2) so the rebuilt
+    /// client preserves the daemon's resilience posture across a repoint.
+    pub fn alldown_enabled(&self) -> bool {
+        self.alldown.is_some()
+    }
+
     /// One completion round-trip, driven through the failover policy (RFC 0018
     /// §3.3). The call-site signature is unchanged from RFC 0006, so the whole
     /// exit-code path (`IntelError` → `LoopAbort::Intel` → exit 4) is intact.

@@ -484,6 +484,35 @@ policy, cost/latency triggers, rolling a fleet's model) is policy — agentctl w
 the new ConfigMap and signals the reload (RFC 0017). agentd only executes the
 quiesce-switch-resume primitive.
 
+> **Resolved / implemented (§5.1–§5.3).** Shipped. RFC 0017 §5.1 now lists
+> `intelligence`/`model`/`model_swap` as **reloadable via this RFC's swap
+> primitive** (no longer restart-only). **Process-boundary adaptation:** the §5.2
+> sketch models `LIVE` as a single supervisor-held `RwLock<Arc<IntelConfig>>` that
+> "subagents read per turn" — but agentd re-execs each subagent as its own
+> **process**, so a supervisor-side `RwLock` cannot reach a child's loop. The
+> faithful implementation makes `LIVE` **child-local**: a new
+> `ControlMsg::SwapIntel` (the same fan-out shape as `pause`/`resume`, with a
+> payload) crosses the process boundary; the child's control-reader thread parks
+> it, and the loop drains it **once per turn at the turn boundary** (exactly where
+> `pause_wait` sits) — that IS the §5.2 "read LIVE once per turn", just
+> process-local. The supervisor fans the swap to in-flight children on an
+> `intelligence`/`model`-touching reload by **reusing the pause fan-out
+> infrastructure** (`forward_pause` → a parallel `forward_swap`; warm `--continue`
+> sessions via `w.sub.send`; served async runs via a per-run swap channel the
+> run's reactor reads). A repointed endpoint is rebuilt with **fresh** health
+> (`IntelClient::from_parts` → a new `HealthRecord` per endpoint — no stale breaker
+> carries to a new CID, §5.2 step 2). **`finish-on-old` is implemented fully**
+> (the natural turn-boundary behaviour). **`restart-turn` is implemented** for warm
+> sessions (snapshot the pre-turn transcript, let the in-flight turn finish, then
+> discard its appended messages and re-run on the new model from the pre-turn
+> state — bounded by the step budget; a one-shot has a single turn so the policy is
+> moot for it). The `intel.swap` event (§8) and the `agentd://intelligence` notify
+> (§4.4) fire on a swap; **no secret/URL** appears in either (transport+index +
+> non-secret model names + policy only — RFC 0012 §3.7). Zero new dependencies
+> (std `Arc`/`Mutex`; no `arc_swap`). The endpoint **list** is now file-settable in
+> the config schema so a ConfigMap repoint can act; the per-endpoint **credential**
+> stays env/`_FILE`-only.
+
 ### 5.4 Optional model discovery (capability-negotiated)
 
 agentd may learn what an endpoint serves via a tiny handshake — **off unless an

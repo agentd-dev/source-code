@@ -135,6 +135,39 @@ impl<'a> Session<'a> {
         self.messages.push(Message::user(content));
     }
 
+    /// Adopt a new model for subsequent turns (RFC 0018 §5.3 model hot-swap). The
+    /// transcript is UNTOUCHED — only the model dialed for the NEXT turn changes;
+    /// a turn already in flight completes on the old model (finish-on-old). The
+    /// `model` is what each request's `model` field carries.
+    pub fn set_model(&mut self, model: &str) {
+        self.model = model.to_string();
+    }
+
+    /// The current model dialed for the next turn (RFC 0018 §5.3) — used to detect
+    /// whether a swap actually changed the model (a repoint with no model change is
+    /// always finish-on-old / invisible, §5.1).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The number of transcript messages so far — a cheap pre-turn marker for the
+    /// `restart-turn` policy (RFC 0018 §5.3): snapshot this before a turn, then
+    /// [`truncate_transcript`](Session::truncate_transcript) back to it to discard
+    /// the swapped-turn's appended messages and re-run from the same pre-turn state.
+    pub fn transcript_len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Truncate the transcript back to `len` (RFC 0018 §5.3 `restart-turn`): drop
+    /// every message a discarded turn appended, restoring the exact pre-turn
+    /// transcript so the turn can be re-run on the new model. A no-op if `len`
+    /// already ≥ the current length (never grows the transcript).
+    pub fn truncate_transcript(&mut self, len: usize) {
+        if len < self.messages.len() {
+            self.messages.truncate(len);
+        }
+    }
+
     /// Run one turn: the ReAct loop over the persistent transcript until a
     /// terminal status, bounded by `budget`. `cancel` is polled at each turn
     /// boundary. Every assistant/tool message (including the final answer) is

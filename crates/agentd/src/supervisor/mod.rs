@@ -7,4 +7,5 @@ pub mod reap;
 pub mod reaper;
 pub mod restart;
 pub mod spawn;
+pub mod swap;
 pub mod tree;

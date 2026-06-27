@@ -417,10 +417,10 @@ transport, or the exit-predicate **restart-only**. The partition is binding:
 | `mcp_servers[]` (add/remove/edit a server) | **reloadable** | re-handshake at a quiesce boundary; RFC 0003 §3.11 rebuild machinery already does this on restart |
 | `subscribe[]` (add/remove a subscription) | **reloadable** | re-subscribe + **read-after-subscribe** (RFC 0003 §3.11) on add; unsubscribe on remove |
 | `model`, `max_tokens`, `intelligence_headers` | **reloadable** | next intel call uses the new value; no in-flight corruption |
+| **`intelligence` (endpoint list) + `model_swap` policy** | **reloadable** | **resolved/implemented via RFC 0018 §5** (the runtime hot-swap primitive): a reload that repoints the endpoint list / changes the swap policy is **applied** at a turn boundary — the supervisor fans `ctrl/swap_intel` to in-flight children (warm `--continue` sessions + served runs), re-points new spawns, and notifies `agentd://intelligence`. A repointed endpoint starts with **fresh** health/breaker (no stale state carries to a new CID). The per-endpoint **credential** stays env/`_FILE`-only (never inline in the file, RFC 0012 §3.7). |
 | `limits.*` | **reloadable** | applied to **new** spawns/turns; in-flight children keep their minted budgets (§5.5) |
 | `log_level` | **reloadable (live)** | applied immediately, no quiesce needed — it gates emission only |
 | **`mode`** (once/loop/reactive/schedule) | **restart-only** | changes the **exit predicate** (RFC 0008 / RFC 0011 §7) — the whole shape of the process |
-| **intelligence transport / endpoint identity** (`--intelligence` scheme+target) | **restart-only here** | endpoint *resilience* (failover, hot-swap) is **RFC 0018**, not this RFC; a transport change is a restart |
 | **instance identity** (`--run-id`, downward-API identity) | **restart-only** | the idempotency key (RFC 0011 §6) and log-correlation root must be stable for a process's life |
 | **`--serve-mcp` transport** (stdio/unix/vsock + path/port) | **restart-only** | rebinding a live control socket mid-flight breaks agentctl's connection (RFC 0014/0015) |
 | **`--enable-exec`** (and its allowlist) | **restart-only** | a security-capability toggle; never widen the trifecta surface live (RFC 0012 §3.6) |

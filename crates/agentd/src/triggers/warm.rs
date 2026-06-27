@@ -20,7 +20,7 @@
 
 use crate::agentloop::stop::Outcome;
 use crate::obs::log::Logger;
-use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
+use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
 use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
 use serde_json::json;
@@ -123,6 +123,25 @@ impl WarmRegistry {
             self.sessions.remove(id); // Subagent::Drop kills + reaps (ECHILD-tolerant)
         }
         turns
+    }
+
+    /// Fan an intelligence hot-swap (RFC 0018 §5.2) to every live warm session —
+    /// the reactive-daemon reach of a reload that repoints the endpoint list /
+    /// changes the model. Each session's control thread parks it; the session's
+    /// loop applies it at its next turn boundary (rebuild client + adopt model;
+    /// transcript untouched, §5.3). The parallel of `cancel_all`'s fan, with a
+    /// payload — `w.sub.send(ControlMsg::SwapIntel)`. Returns the count reached.
+    /// The `token` rides the frame (like the spawn payload) but is NEVER logged.
+    pub fn fan_swap_intel(&mut self, swap: &SwapIntel, log: &Logger) -> u64 {
+        let mut reached = 0u64;
+        let msg = ControlMsg::SwapIntel(Box::new(swap.clone()));
+        for (id, w) in self.sessions.iter_mut() {
+            if w.sub.send(&msg).is_ok() {
+                reached += 1;
+                log.info("warm.swap_intel", json!({"session": id}));
+            }
+        }
+        reached
     }
 
     /// Begin graceful teardown: ask every session to wind down. The warm loop

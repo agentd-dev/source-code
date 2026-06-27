@@ -20,6 +20,8 @@ pub mod capabilities; // the capabilities manifest — the agentctl control-plan
 pub mod cluster; // horizontal scaling: sharding + autoscaling signals + capacity (RFC 0019)
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup
 pub mod config_file; // the declarative config FILE (JSON) + JSON Schema export (RFC 0017 §3/§4)
+#[cfg(all(unix, feature = "config-watch"))]
+pub mod config_watch; // inotify file-watch reload trigger (RFC 0017 §5.2)
 pub mod exit; // the public exit-code table + terminal-status -> code map
 pub mod identity; // instance identity from the k8s downward API (env-only, RFC 0015 §6)
 pub mod intel; // intelligence client + provider adapters

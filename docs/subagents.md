@@ -234,13 +234,14 @@ a permanent non-goal.
 
 Because `subagent.spawn` is served by the supervisor (it owns the process
 table), the supervisor sees every request, mints the trusted fields, narrows the
-scope by intersection, clamps the limits, evaluates the Rule-of-Two trust budget
-(RFC 0012; refused or warned if one child would hold all three of
-`untrusted_input` + `sensitive` + `egress` without `--allow-trifecta`), and only
-then re-execs.
+scope by intersection, clamps the limits, and only then re-execs. The Rule-of-Two
+trifecta is **not** re-evaluated here: it is enforced once, at startup, over the
+root grant (RFC 0012; `--allow-trifecta` to override). Because scope only narrows
+as you descend, a child's tag union can never exceed the root's, so that single
+root check already bounds the whole tree.
 
 `exec` (the gated shell tool, off by default) is folded into the **same
-accounting path** — it counts against the same breadth/rate/budget caps — even
+accounting path** — it counts against the same breadth/budget caps — even
 though it has no control channel. It is not a fork-bomb bypass around the
 chokepoint (§7).
 
@@ -248,7 +249,7 @@ chokepoint (§7).
 
 ## 6. Caps — refused as tool results, never crashes
 
-The chokepoint enforces five caps. A violation comes back to the parent's model
+The chokepoint enforces four caps. A violation comes back to the parent's model
 as a normal MCP tool result with `isError: true` — an **observation it can
 adapt to**, never a JSON-RPC protocol error and never a crash:
 
@@ -257,7 +258,6 @@ adapt to**, never a JSON-RPC protocol error and never a crash:
 | `max_depth` | **4** (range 3–5) | tree | `spawn denied: max_depth N reached` |
 | `max_children` | 8 | per node | `spawn denied: node child cap reached` |
 | `max_total_subagents` | 64 | tree-wide | `spawn denied: tree subagent cap reached` |
-| spawn-rate | token bucket, 8 burst / 2 per s | tree-wide | `spawn denied: spawn rate exceeded` |
 | tree-token ceiling | from budget | tree-wide | refuse new spawns + new model calls; drain |
 
 `max_depth` is the one you set directly on the CLI — `--max-depth N`
@@ -276,7 +276,6 @@ fn handle_spawn(caller: Handle, req: SpawnRequest) -> ToolResult {
     if self.tree.total >= self.caps.max_total_subagents {
         return tool_err("spawn denied: tree subagent cap");
     }
-    if !self.spawn_bucket.try_take()      { return tool_err("spawn denied: spawn rate exceeded"); }
     if self.tree.root_tokens >= self.caps.tree_token_ceiling {
         return tool_err("spawn denied: tree token ceiling");
     }
@@ -286,9 +285,9 @@ fn handle_spawn(caller: Handle, req: SpawnRequest) -> ToolResult {
 
 A wedged or runaway child that keeps hammering `subagent.spawn` therefore just
 keeps getting refusals — it **cannot** fork-bomb, because the only spawn path is
-this one chokepoint. The token bucket catches a fast churn loop that stays under
-the absolute count; the **tree-draining flag** makes `subagent.spawn` error
-during teardown, so a parent cannot spawn replacements mid-kill-ladder.
+this one chokepoint and the absolute depth/breadth/total/token caps bound it. The
+**tree-draining flag** makes `subagent.spawn` error during teardown, so a parent
+cannot spawn replacements mid-kill-ladder.
 
 ---
 
@@ -347,15 +346,16 @@ enum Disposition { Sync, Async, Detach } // default = Sync
   returns whatever terminal status the kill produced (`deadline`, `cancelled`,
   `crashed`).
 
-- **`Async`.** Returns a handle immediately
-  (`{ handle, resource_uri }`); the parent keeps reasoning and later calls
-  `subagent.status` / `subagent.await`, or subscribes to `resource_uri` — the
-  child's completion *is* an `agentd://` resource update. Bounded by
-  `max_inflight` (default 4).
+- **`Async`.** Returns the `handle` immediately; the parent keeps reasoning and
+  later calls `subagent.await` (waits for it) or peeks with `subagent.status` /
+  `resource.read agentd://subagent/{handle}` — the child's completion *is* an
+  update on that `agentd://subagent/{handle}` resource (the URI is derived from
+  the handle; there is no separate result resource). Bounded by `max_inflight`
+  (default 4).
 
 - **`Detach`.** Fire-and-forget. The child **still** counts
-  against the tree budget, depth cap, and breadth/rate caps, and is **still
-  reaped**. Use sparingly.
+  against the tree budget, depth cap, and breadth cap, and is **still reaped**.
+  Use sparingly.
 
 Async and detach reuse the subscribe/notify machinery they share with
 reactivity — the same machinery is built and live. Streaming a child's partial output into
@@ -489,10 +489,10 @@ the spawn chokepoint (§6). They are complementary.
 - **Exponential backoff + jitter, capped** — base 500ms, cap 30s. A
   session-backing child is not respawned before its backoff expires.
 - **Circuit breaker** — more than 5 failures inside a 60s window opens the
-  breaker for that handle: stop respawning, mark the session **failed**, surface
-  it as `agentd://session/<id>` state=failed so a watcher/operator sees it, and
-  **drop routed reactive events** that would target the broken session. Don't
-  spawn into a known-bad loop.
+  breaker for that handle: stop respawning, mark the session **failed** (a
+  watcher/operator sees it via `subagent.status` on the handle), and **drop
+  routed reactive events** that would target the broken session. Don't spawn into
+  a known-bad loop.
 - **Crash-on-spawn fast-fail** — a child that exits before its `ctrl/ready`
   frame within 2s is weighted 3× heavier toward the breaker (the fork-bomb early
   warning).
@@ -563,7 +563,7 @@ Knobs that exist on the CLI/env surface today (`config.rs`):
 | `--run-id <id>` | `AGENTD_RUN_ID` | generated | idempotency key for re-trigger |
 
 RFC-level chokepoint and detector defaults (not CLI flags in v1):
-`max_children` 8, `max_total_subagents` 64, spawn bucket 8 burst / 2 per s,
+`max_children` 8, `max_total_subagents` 64, `tree_token_ceiling` 2,000,000,
 `AGENTD_CHILD_DEADLINE` 600s, `AGENTD_EXEC_DEADLINE` 120s,
 `AGENTD_PROGRESS_TIMEOUT` 120s, `AGENTD_PING_INTERVAL` 5s, `AGENTD_PING_MISS` 3,
 `AGENTD_SPAWN_READY` 2s, `DRAIN_GRACE` 5s, `KILL_GRACE` 2s.

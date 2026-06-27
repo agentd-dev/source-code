@@ -180,8 +180,8 @@ an external scheduler can branch on it:
 | intelligence unreachable / auth failed | 4 |
 | `refused` | 5 |
 | a required MCP server is down | 6 |
-| budget hit (`exhausted_steps`/`exhausted_tokens`) | 7 |
-| `deadline` | 124 |
+| budget hit (`exhausted_steps`/`exhausted_tokens`/`deadline`) | 7 |
+| supervisor hard-kill backstop (a child that won't self-terminate) | 124 |
 | bad config (validation) | 2 |
 
 Every run is bounded by limits you can tune — `--max-steps` (default 50),

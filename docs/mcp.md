@@ -89,7 +89,7 @@ On connect, before anything else, agentd runs the MCP lifecycle. It pins
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agentd","title":"agentd","version":"2.0.0"}
+    "clientInfo":{"name":"agentd","version":"2.0.1"}              // title omitted
 }}
 // server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
@@ -265,9 +265,10 @@ whole drain counts inside `--drain-timeout` (default `25s`).
 ## 2. agentd as MCP server (self-MCP)
 
 agentd is *also* an MCP server. A parent agentd, a peer, or any MCP-aware harness
-can `initialize` against it and get a real, capability-negotiated catalogue:
-tools to spawn and steer subagents, tools to read and subscribe to state, an
-optional gated `exec`, and a tree of subscribable `agentd://` state resources.
+can `initialize` against it and get a real, capability-negotiated catalogue: five
+tools to spawn and steer subagents (`subagent.spawn` / `.send` / `.status` /
+`.cancel`) plus a `status` tool, and the subscribable `agentd://` state resources
+(this agentd's `status`, and a per-run `agentd://subagent/<handle>`).
 
 It serves this over **stdio always**, and over a **unix socket** when you pass
 `--serve-mcp unix:PATH`:
@@ -294,71 +295,73 @@ agentd \
 ### 2.1 Declared capabilities
 
 The self-MCP answers `initialize` and declares exactly two capabilities — and
-nothing else:
+nothing else. Note `tools` is an **empty object** (no `listChanged`) and
+`resources` advertises **only** `subscribe` (no `listChanged`):
 
 ```jsonc
 { "jsonrpc":"2.0","id":1,"result":{
     "protocolVersion":"2025-11-25",
     "capabilities":{
-      "tools":     { "listChanged": true },
-      "resources": { "subscribe": true, "listChanged": true }
+      "tools":     { },
+      "resources": { "subscribe": true }
     },
-    "serverInfo":{ "name":"agentd","title":"agentd","version":"2.0.0" },
-    "instructions":"agentd self-MCP: spawn/steer subagents, read+subscribe agentd:// state."
+    "serverInfo":{ "name":"agentd","version":"2.0.1" }   // version = the binary's CARGO_PKG_VERSION
 }}
 ```
 
-No `prompts`, `logging`, `completions`, or `tasks`. It answers `ping`, accepts
-`notifications/cancelled` for an in-flight served request, and does **not** emit
-`notifications/message` or `notifications/progress` in v1.
+No `prompts`, `logging`, `completions`, or `tasks`, and no `listChanged` on either
+capability (the listed resource set is the single, stable `agentd://status`). It
+answers `ping`, and does **not** emit `notifications/message` or
+`notifications/progress` in v1.
 
 ### 2.2 The `agentd://` tools
 
-`tools/list` returns the catalogue below. Each `inputSchema` is JSON Schema
-2020-12. The *available* set is gated per caller — when a caller's scope narrows
-(e.g. a child whose grant excludes `exec`), the server emits
-`notifications/tools/list_changed` and the caller re-lists.
+`tools/list` returns exactly these five tools — the **same fixed set for every
+peer** on the socket. The self-MCP advertises no `tools.listChanged` and never
+re-lists. Each `inputSchema` is JSON Schema 2020-12.
 
 | Tool | Purpose | Mode |
 |---|---|---|
-| `subagent.spawn` | create a child subagent from a rich spawn payload | sync \| async \| detach |
-| `subagent.send` | inject an instruction/event into a warm subagent session | sync ack |
-| `subagent.cancel` | request graceful cancel of a subtree (→ kill ladder) | sync ack |
-| `subagent.status` | read a handle's status + usage snapshot | sync |
-| `subscribe` | subscribe the **caller agent itself** to an external MCP resource `(server, uri)` | sync ack |
-| `unsubscribe` | drop such a subscription | sync ack |
-| `resource.read` | read an MCP resource body the caller is aware of | sync |
-| `exec` | gated shell exec under the subtree kill ladder + caps | sync; off by default |
+| `status` | read this agentd's run id, mode, version, pid, uptime | sync |
+| `subagent.spawn` | delegate a task to a fresh agent; return its distilled result | sync \| async \| warm |
+| `subagent.send` | send another message into a **warm** session (multi-turn) | sync ack |
+| `subagent.status` | read a handle's status (and result once terminal) | sync |
+| `subagent.cancel` | request graceful cancel of a run/subtree (→ kill ladder) | sync ack |
 
-`subagent.spawn` (abridged schema — full payload semantics in
-[RFC 0009](../rfcs/0009-subagent-process-model.md)):
+The in-agent `subscribe`/`unsubscribe` self-tools and the gated `exec` tool are
+**not** part of this served list — they belong to a running agent's *own* loop,
+not to peers on the socket (the `subscribe` self-tool is covered in §2.4). To read
+an `agentd://` resource a peer uses the JSON-RPC `resources/read` / `resources/subscribe`
+methods (§2.3), which are likewise not `tools/call` entries.
+
+`subagent.spawn` — the served `inputSchema` (the supervisor expands this compact
+surface into the rich internal spawn payload, [RFC 0009](../rfcs/0009-subagent-process-model.md)):
 
 ```jsonc
-{ "name":"subagent.spawn","title":"Spawn subagent",
+{ "name":"subagent.spawn",
   "inputSchema":{ "type":"object",
     "properties":{
-      "instruction":    {"type":"string"},
-      "output_contract":{"type":"object"},
-      "context_seed":   {"type":"array","items":{"type":"object"}},
-      "tool_scope":     {"type":"array","items":{"type":"string"}},
-      "limits":         {"type":"object"},
-      "async":          {"type":"boolean","default":false},   // return a handle immediately
-      "detach":         {"type":"boolean","default":false}    // outlive the parent's turn
+      "instruction":    {"type":"string"},                          // the task (required)
+      "output_contract":{"type":"string"},                          // exactly what to return
+      "tool_scope":     {"type":"array","items":{"type":"string"}},  // subset of this agentd's MCP server names
+      "async":          {"type":"boolean","default":false},         // return a handle immediately
+      "warm":           {"type":"boolean","default":false}          // keep alive as a session driven by subagent.send
     },
-    "required":["instruction"],
-    "additionalProperties":false }}
+    "required":["instruction"] }}
 ```
 
-A **sync** spawn blocks and returns the distilled result, terminal status,
-and usage:
+A **sync** spawn blocks and returns the distilled result and terminal status. The
+`structuredContent` shape is unified with the async ack (`{handle,status,done,…}`)
+so a peer parses one schema; there is no `usage` field:
 
 ```jsonc
 { "jsonrpc":"2.0","id":7,"result":{
     "content":[{"type":"text","text":"{…distillate…}"}],
     "structuredContent":{
-      "handle":"0.2",
+      "handle":"served.2",
       "status":"completed",
-      "usage":{"tokens_in":1234,"tokens_out":456,"steps":9},
+      "done":true,
+      "partial":false,
       "result":{ /* distilled structured value, ~1–2k tokens */ }
 }}}
 ```
@@ -366,8 +369,8 @@ and usage:
 **Critical invariants enforced at the spawn chokepoint:** the child's depth is
 *minted by the supervisor* from the caller's handle (never read from the
 request); `tool_scope` must be a **subset** of the caller's scope (monotonic
-narrowing); and a spawn that would breach `--max-depth`, a child/total cap, the
-spawn-rate bucket, or the tree token ceiling is **refused as a tool result**, not
+narrowing); and a spawn that would breach `--max-depth`, a per-node child cap, the
+total-subagent cap, or the tree token ceiling is **refused as a tool result**, not
 a crash:
 
 ```jsonc
@@ -380,83 +383,84 @@ model adapts), while a malformed `tools/call` (unknown tool, bad params) is a
 JSON-RPC `error` (`-32601`/`-32602`) — the same distinction agentd honors as a
 client (§1.4).
 
-> **Async / detached spawn ships.** `subagent.spawn` defaults to sync; an
-> `{async}` spawn returns immediately with a handle plus a `result_resource` URI
-> the caller subscribes to, and `{detach}` lets the child outlive the parent's
-> turn. The resource/notify machinery below carries the result.
+> **Async & warm spawn ship.** `subagent.spawn` defaults to sync. An `{async}`
+> spawn returns immediately with a `handle` (the ack carries `{handle,status:"running",done:false}`,
+> no separate `result_resource`); the caller then polls `subagent.status` or
+> `resources/read`/subscribes `agentd://subagent/<handle>` — that handle's own
+> resource **is** the completion resource. A `{warm}` spawn keeps the agent alive
+> as a session you drive with `subagent.send`. (`detach` is an *in-loop*
+> orchestrator disposition, not offered on the served socket.)
 
-The `exec` tool appears in `tools/list` **only when** `--enable-exec` is set (and
-the target binary exists). Absent that flag it is simply not listed — capability
-absence, not a runtime error.
+The gated `exec` tool is an in-agent self-tool (enabled by `--enable-exec` for the
+agent's *own* loop); it never appears in the served peer-facing `tools/list`.
 
 ### 2.3 Subscribable `agentd://` state resources
 
-The self-MCP exposes session/run/subagent state as readable **and subscribable**
-resources under the custom `agentd://` scheme. This is the substrate for
-agent-to-agent reactivity and for async-subagent completion.
+The self-MCP exposes its own run state and each served async run as resources
+under the custom `agentd://` scheme. The scheme has exactly **two** forms — there
+is no `agentd://run/{id}`, `agentd://session/{id}`, or `.../result` sub-resource:
 
-| URI | Body on `resources/read` |
-|---|---|
-| `agentd://run/{run_id}` | run-level status, mode, root handle, aggregate usage, exit disposition |
-| `agentd://session/{session_id}` | warm-session status, current turn, last activity |
-| `agentd://subagent/{handle}` | per-node status, depth, scope summary, usage, last terminal status |
-| `agentd://subagent/{handle}/result` | distilled result once the node is terminal (the async-completion handle) |
+| URI | Listed? | Body on `resources/read` |
+|---|---|---|
+| `agentd://status` | yes | this agentd's run id, mode, version, pid, uptime, and spawn counts |
+| `agentd://subagent/{handle}` | no | a served async run's state — `{handle,status,done,age_ms}` while running, `{handle,status,done,partial,result}` once terminal |
+
+`agentd://subagent/{handle}` is **read**able and (while still running)
+**subscribable** — the peer learns the `handle` from its `subagent.spawn async`
+reply. It is deliberately **not listed**: a run's resource appears then vanishes
+(eviction), and this reply-only transport has no `resources/list_changed` to
+announce that, so listing only the stable `agentd://status` avoids advertising a
+URI that could 404 on read. A served async handle is `served.{n}`.
 
 `resources/read` returns the standard `contents[]` array with one JSON text item:
 
 ```jsonc
 { "result":{ "contents":[
-    {"uri":"agentd://subagent/0.2","mimeType":"application/json",
-     "text":"{\"handle\":\"0.2\",\"status\":\"working\",\"depth\":1,\"usage\":{…}}"}
+    {"uri":"agentd://subagent/served.2","mimeType":"application/json",
+     "text":"{\"handle\":\"served.2\",\"status\":\"running\",\"done\":false,\"age_ms\":812}"}
 ]}}
 ```
 
-**The emission rule — the reactive substrate.** On every state transition of a
-resource, agentd emits `notifications/resources/updated{uri}` to every peer
-subscribed to that URI — **URI only, no payload, no diff**, exactly like the
-client side (§1.6). The peer then `resources/read`s to learn the new state.
-Same notify-then-read, same at-least-once + re-read-current-state convergence.
+**The emission rule — the reactive substrate.** When a served async run reaches a
+terminal status, agentd emits `notifications/resources/updated{uri}` for its
+`agentd://subagent/{handle}` to every peer subscribed to that URI — **URI only, no
+payload, no diff**, exactly like the client side (§1.6) — then consumes the
+subscription. The peer `resources/read`s to learn the result. Same notify-then-read,
+same re-read-current-state convergence.
 
-The closed set of transitions that emit:
-
-| Transition | URI emitted |
-|---|---|
-| node status change (working → stalled → … → terminal) | `agentd://subagent/{handle}` |
-| node reaches a **terminal** status | `agentd://subagent/{handle}` **and** `.../result` |
-| warm-session turn boundary / new activity | `agentd://session/{session_id}` |
-| run aggregate usage / disposition change | `agentd://run/{run_id}` |
-
-`notifications/resources/list_changed` (no params) fires when the *set* of listed
-resources changes — a node spawns or is reaped — gated on the peer negotiating
-`resources.listChanged`. As on the client side, this is distinct from per-URI
-subscribe. agentd never emits to a peer that didn't negotiate the capability, and
-never emits `updated` for a URI a peer didn't subscribe to.
+That terminal transition is the **only** `updated` emission: there is no
+per-intermediate-status push, no `session`/`run` resource, and no `.../result`
+URI. The self-MCP advertises no `resources.listChanged` and never emits
+`notifications/resources/list_changed` (the single listed resource,
+`agentd://status`, is stable). agentd never emits `updated` for a URI a peer
+didn't subscribe to.
 
 ### 2.4 Two `subscribe` surfaces — don't confuse them
 
 The word "subscribe" appears in two different roles here:
 
 - **MCP `resources/subscribe`** — a *method a peer calls on agentd's server* to
-  get `updated` notifications for one of agentd's own `agentd://` URIs (§2.3).
-- **The `subscribe` *tool*** — a *running subagent calls this* (via `tools/call`)
-  to subscribe **itself** to an *external* MCP resource reachable through
-  agentd's client side. When a running agent self-subscribes, the supervisor
-  auto-creates a `continue(this_session)` route — **self-subscribe =
-  self-scheduling**, the signature reactive capability.
+  get an `updated` notification for one of agentd's own `agentd://subagent/<handle>`
+  URIs (§2.3).
+- **The `subscribe` *self-tool*** — a *running agent calls this on its own loop*
+  (via `tools/call`) to subscribe **itself** to an *external* MCP resource
+  reachable through agentd's client side. Self-subscribe = **self-scheduling**,
+  the signature reactive capability. (It is a self-tool of the agent's loop, not
+  part of the served peer-facing `tools/list`.)
 
 ```jsonc
-{ "name":"subscribe","title":"Subscribe to a resource",
+{ "name":"subscribe",
   "inputSchema":{ "type":"object",
     "properties":{
-      "server":{"type":"string"},   // MCP server name from agentd's client registry
-      "uri":{"type":"string"}        // concrete URI (not a template)
+      "uri":{"type":"string"}   // the external MCP resource URI to subscribe this agent to
     },
-    "required":["server","uri"],
-    "additionalProperties":false }}
+    "required":["uri"] }}
 ```
 
-Returns `{}` on success, or `isError:true` if the named server didn't advertise
-`resources.subscribe` (graceful degrade) or the URI is a template.
+The request is **queued** (bounded per run) and applied by the daemon after the
+run finishes; it returns `isError:true` only on an empty `uri` or when the per-run
+subscription cap is exceeded — it does not validate the target server's
+capabilities or template-ness at call time.
 
 ### 2.5 The private control protocol is *not* exposed
 
@@ -484,31 +488,31 @@ agentd \
 ```
 
 From the parent's point of view the child is a normal MCP server: it
-`initialize`s, lists the `subagent.*` / `subscribe` / `resource.read` tools,
-calls them, lists `agentd://` resources, and subscribes to them. Two patterns
-fall out:
+`initialize`s, lists the `subagent.*` and `status` tools, calls them, and reads /
+subscribes the child's `agentd://` resources via the `resources/read` /
+`resources/subscribe` methods. Two patterns fall out:
 
 **Drive** — the parent calls `subagent.spawn` (or `subagent.send` to a warm
 session) on the child and gets back a distilled result. The parent never reasons
 about the child's internal steps; it gets a clean, bounded answer.
 
-**Subscribe** — the parent subscribes to `agentd://subagent/{handle}/result` on
-the child. When the child reaches a terminal status, the child emits
-`notifications/resources/updated` on that URI; the parent (woken by its reactive
-router) `resources/read`s it to collect the distillate. This is exactly how an
-**async** subagent closes the loop — the same notify-then-read machinery, just
-across a process boundary.
+**Subscribe** — the parent spawns `{async}` and subscribes to
+`agentd://subagent/{handle}` on the child. When the child reaches a terminal
+status, the child emits `notifications/resources/updated` on that URI; the parent
+(woken by its reactive router) `resources/read`s it to collect the distillate.
+This is exactly how an **async** subagent closes the loop — the same
+notify-then-read machinery, just across a process boundary.
 
 A worked picture of the reactive close-the-loop:
 
 ```
 parent agentd                              child agentd (self-MCP, unix:/run/rev.sock)
   │  tools/call subagent.spawn{async}  ──▶
-  │  ◀── result_resource: agentd://subagent/0.2/result
-  │  resources/subscribe{uri:.../0.2/result}  ──▶
+  │  ◀── ack: handle=served.2  (read agentd://subagent/served.2)
+  │  resources/subscribe{uri:agentd://subagent/served.2}  ──▶
   │                                            … child works …
-  │  ◀── notifications/resources/updated{uri:.../0.2/result}
-  │  resources/read{uri:.../0.2/result}  ──▶
+  │  ◀── notifications/resources/updated{uri:agentd://subagent/served.2}
+  │  resources/read{uri:agentd://subagent/served.2}  ──▶
   │  ◀── contents[]: { distilled result }
 ```
 

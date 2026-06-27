@@ -106,42 +106,43 @@ split into e.g. a `read_*` subset that is `sensitive` but not `egress`):
 }
 ```
 
-### The Rule-of-Two check at the spawn chokepoint
+### The Rule-of-Two check at startup
 
-All scope grants flow through the supervisor-owned `subagent.spawn` — the single unforgeable
-chokepoint (the supervisor mints depth; the child re-execs agentd's own `argv[0]`, never a
-model-supplied path). Before re-exec, the supervisor ORs the tags across the granted tool set
-and evaluates the budget:
+The trifecta check runs **once, at startup**, over the **root grant** — the OR of the capability
+tags across every granted MCP server (an untagged server counts conservatively as
+`untrusted_input`; `--enable-exec` counts as `egress`). Because scope narrows **monotonically**
+down the tree (a child's grant is always a subset of its parent's, RFC 0009), bounding the root
+bounds every descendant — so the single root check suffices and the per-spawn path never has to
+re-evaluate it.
 
-- **Refuse** (default): a grant that hands one subagent all three trifecta legs is refused.
-  Crucially this is **not a crash and not a JSON-RPC error** — `subagent.spawn` returns an MCP
-  tool result with `isError: true`, which the parent's model sees as an *observation* and adapts
-  to (RFC 0007):
+- **Refuse** (default): a root grant that co-locates all three trifecta legs makes agentd
+  **refuse to start** — it logs `scope.trifecta_refused`, prints the reason, and exits `2` (a
+  config-usage refusal; the daemon never comes up):
 
-  ```json
-  {"isError": true,
-   "content": [{"type": "text",
-     "text": "refused: this grant gives one subagent all three lethal-trifecta legs
-              (untrusted_input + sensitive + egress). Split into reader/actor subagents,
-              or relaunch agentd with --allow-trifecta to override."}]}
+  ```text
+  agentd: refused — this grant gives one agent all three lethal-trifecta legs
+  (untrusted input + sensitive data + egress). Split the capabilities across
+  subagents, or relaunch with --allow-trifecta.
   ```
 
-- **Warn** (with `--allow-trifecta`): the spawn proceeds and the supervisor emits an auditable
+- **Warn** (with `--allow-trifecta`): startup proceeds and the supervisor emits an auditable
   log event so the override is never silent:
 
   ```json
-  {"level":"warn","event":"scope.trifecta_grant","agent_path":"root/reader",
-   "agent_id":"a1b2","legs":3,"tools":["mcp-fetch.get","mcp-vault.read","mcp-smtp.send"]}
+  {"level":"warn","event":"scope.trifecta_grant","allowed":true,
+   "legs":["untrusted_input","sensitive","egress"]}
   ```
 
   `--allow-trifecta` is **process-global** and does **not** propagate into spawn payloads — a
-  child cannot re-grant itself the override; it stays the supervisor's per-spawn decision.
+  child cannot re-grant itself the override.
 
 - **Ok**: silent.
 
 The check is **purely structural**. It never inspects content and never asks the model to judge
-safety. Because scope narrows monotonically, a child can never widen its tag union beyond its
-parent's, so the budget is enforced identically at every level of the tree.
+safety. The per-spawn `subagent.spawn` chokepoint does **not** re-run it: it only **narrows**
+scope by intersection (a child requesting a tool its parent doesn't hold is refused as an
+`isError` tool result) and clamps limits. Because a child's tag union can never exceed its
+parent's, the one root-startup check bounds the whole tree.
 
 The recommended pattern (encoded in the `subagent.spawn` tool description) is to split a
 trifecta task into a **reader** (no sensitive, no egress) that returns a distilled summary, and
@@ -264,7 +265,7 @@ no-ICU dependency stance.
   `/bin/sh -c`), so the model cannot inject shell metacharacters. A shell opt-in for the cases
   that genuinely need it is loudly documented as widening the surface.
 - **Same OS regime.** Each `exec` child is its own process group (`setpgid`), carries a
-  mandatory finite deadline, counts against the subtree token/breadth/rate budgets, and is torn
+  mandatory finite deadline, counts against the subtree token/depth/breadth caps, and is torn
   down by the same bounded SIGTERM→SIGKILL kill ladder as any child (RFC 0003).
 - **Tagged `egress` (+`sensitive` when un-jailed),** so the Rule-of-Two budget naturally refuses
   co-locating `exec` with an untrusted-input reader. Guidance: an `exec`-scoped subagent should

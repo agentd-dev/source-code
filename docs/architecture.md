@@ -498,8 +498,9 @@ than persisting live state. The mechanisms an operator should know about
   every child so a supervisor crash collapses the tree.
 - **Nesting goes through one chokepoint.** A child creates children **only** by
   calling back into the supervisor-owned `subagent.spawn` self-tool. That is the
-  single unforgeable place where finite caps (`max_depth`, breadth, spawn-rate,
-  tree-wide token ceiling) are enforced; **depth is minted by the supervisor**,
+  single unforgeable place where finite caps (`max_depth`, breadth — per-node
+  `max_children` and tree-wide `max_total` — and the tree-wide token ceiling) are
+  enforced; **depth is minted by the supervisor**,
   never trusted from the child. A spawn past any cap is **refused as a tool
   result**, never a crash.
 

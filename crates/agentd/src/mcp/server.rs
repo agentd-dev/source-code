@@ -478,8 +478,8 @@ impl ServeCtx {
     /// saturation numerator the supervisor can see); `free_slots` = `max_total -
     /// active`; `saturation` = `active / max_total` (the tree cap, RFC 0009 — the
     /// per-route product is not reachable from the served ctx, so the cap alone is
-    /// used per RFC 0019 §5.1's `min(…, max_total_subagents)`). `standby: false`
-    /// (standby is DEFERRED, RFC 0019 §7/§12). Intelligence `warm`/`healthy` derive
+    /// used per RFC 0019 §5.1's `min(…, max_total_subagents)`). `standby` reflects
+    /// `--standby` (RFC 0019 §7). Intelligence `warm`/`healthy` derive
     /// from the configured endpoint list's all-down flag (the supervisor-side view
     /// is fresh per RFC 0018 §4.4 — the model loop runs in a child process).
     #[cfg(feature = "cluster")]
@@ -508,8 +508,9 @@ impl ServeCtx {
             "instance": identity.instance,
             // The shard identity string "K/N", or null when unsharded (N==1).
             "shard": self.config.shard.label(),
-            // Standby is deferred (RFC 0019 §7/§12) — always false in this build.
-            "standby": false,
+            // Standby (RFC 0019 §7) reflects `--standby`: agentctl reads this to
+            // place a directed assignment only on warm standby members.
+            "standby": self.config.standby,
             "free_slots": free,
             "active_subagents": active,
             "intelligence": { "warm": warm, "healthy": healthy },

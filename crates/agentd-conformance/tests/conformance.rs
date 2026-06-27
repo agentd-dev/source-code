@@ -47,3 +47,8 @@ fn agent_loop_conformance() {
 fn security_conformance() {
     run_family("security", checks::security::checks());
 }
+
+#[test]
+fn work_claim_conformance() {
+    run_family("work-claim", checks::work_claim::checks());
+}

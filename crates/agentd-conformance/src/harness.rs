@@ -40,16 +40,31 @@ impl Drop for TempDir {
     }
 }
 
+/// The resolved binary paths the suite drives.
+struct Bins {
+    /// The default agentd (serve-mcp + internal-mocks) most checks run.
+    agentd: PathBuf,
+    /// A `cluster`-featured agentd (adds sharding + the `--claim`/`--standby`
+    /// path), built into a SEPARATE target dir so it never clobbers `agentd`.
+    /// Used by the work-claim family, whose `--claim` route exits 2 on a
+    /// non-cluster build (RFC 0019 §3.6 / RFC 0015 §5.6).
+    agentd_cluster: PathBuf,
+    /// The recording reference MCP server (MCP-client conformance).
+    confmcp: PathBuf,
+    /// The mock work-claim coordination server (work-claim conformance).
+    workmcp: PathBuf,
+}
+
 /// Build the binaries the suite needs once, then resolve their paths.
-fn binaries() -> &'static (PathBuf, PathBuf) {
-    static BINS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+fn binaries() -> &'static Bins {
+    static BINS: OnceLock<Bins> = OnceLock::new();
     BINS.get_or_init(|| {
         // Ensure the agentd binary (with serve-mcp + the mock LLM / mock MCP the
-        // suite drives) and our recording reference MCP server both exist,
-        // regardless of whether we were invoked via `cargo test` (which builds
-        // them) or `cargo run` (which may not). `internal-mocks` is implicit in a
-        // debug build but we ask for it explicitly so a `--release` conformance
-        // run still ships the mock re-exec modes.
+        // suite drives) and our reference MCP servers all exist, regardless of
+        // whether we were invoked via `cargo test` (which builds them) or `cargo
+        // run` (which may not). `internal-mocks` is implicit in a debug build but
+        // we ask for it explicitly so a `--release` conformance run still ships
+        // the mock re-exec modes.
         build(&[
             "build",
             "-p",
@@ -58,21 +73,51 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
             "serve-mcp,internal-mocks",
         ]);
         build(&["build", "-p", "agentd-conformance", "--bin", "confmcp"]);
+        build(&["build", "-p", "agentd-conformance", "--bin", "workmcp"]);
         let dir = target_dir();
         let agentd = dir.join("agentd");
         let confmcp = dir.join("confmcp");
-        assert!(
-            agentd.exists(),
-            "agentd binary not found at {}",
-            agentd.display()
+        let workmcp = dir.join("workmcp");
+        // The `cluster`-featured agentd. The `--claim` path (RFC 0019 §3) is
+        // `cluster`-gated, so the work-claim e2e check NEEDS a cluster build — a
+        // default build exits 2 on `--claim`. We build it with the SAME feature
+        // set as the default (serve-mcp + internal-mocks) PLUS `cluster`, into a
+        // dedicated `--target-dir` so the resulting `agentd` does not overwrite
+        // the default one (both are named `agentd`). The dir is a sibling of the
+        // shared target so it inherits the same toolchain/deps cache.
+        let cluster_target = cluster_target_dir(&dir);
+        build_with_target_dir(
+            &[
+                "build",
+                "-p",
+                "agentd",
+                "--features",
+                "serve-mcp,internal-mocks,cluster",
+            ],
+            &cluster_target,
         );
-        assert!(
-            confmcp.exists(),
-            "confmcp binary not found at {}",
-            confmcp.display()
-        );
-        (agentd, confmcp)
+        let agentd_cluster = cluster_target.join("debug").join("agentd");
+        for (p, what) in [
+            (&agentd, "agentd"),
+            (&agentd_cluster, "agentd (cluster)"),
+            (&confmcp, "confmcp"),
+            (&workmcp, "workmcp"),
+        ] {
+            assert!(p.exists(), "{what} binary not found at {}", p.display());
+        }
+        Bins {
+            agentd,
+            agentd_cluster,
+            confmcp,
+            workmcp,
+        }
     })
+}
+
+/// Where the `cluster`-featured agentd is built: `<target>/conf-cluster/` (its
+/// own `--target-dir`, so the cluster `agentd` never clobbers the default one).
+fn cluster_target_dir(shared_target: &Path) -> PathBuf {
+    shared_target.join("conf-cluster")
 }
 
 fn build(args: &[&str]) {
@@ -81,6 +126,18 @@ fn build(args: &[&str]) {
         .status()
         .unwrap_or_else(|e| panic!("failed to run cargo {args:?}: {e}"));
     assert!(status.success(), "cargo {args:?} failed");
+}
+
+/// Build into a dedicated `--target-dir` (so a differently-featured variant of a
+/// same-named binary doesn't overwrite the shared one).
+fn build_with_target_dir(args: &[&str], target_dir: &Path) {
+    let status = Command::new(env!("CARGO"))
+        .args(args)
+        .arg("--target-dir")
+        .arg(target_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run cargo {args:?}: {e}"));
+    assert!(status.success(), "cargo {args:?} (cluster) failed");
 }
 
 /// The `target/<profile>/` dir, derived from our own executable's location
@@ -98,7 +155,9 @@ fn target_dir() -> PathBuf {
 /// every spawn gets its own temp dir + sockets so checks never collide.
 pub struct Harness {
     agentd: PathBuf,
+    agentd_cluster: PathBuf,
     confmcp: PathBuf,
+    workmcp: PathBuf,
 }
 
 impl Default for Harness {
@@ -109,10 +168,12 @@ impl Default for Harness {
 
 impl Harness {
     pub fn new() -> Harness {
-        let (agentd, confmcp) = binaries();
+        let b = binaries();
         Harness {
-            agentd: agentd.clone(),
-            confmcp: confmcp.clone(),
+            agentd: b.agentd.clone(),
+            agentd_cluster: b.agentd_cluster.clone(),
+            confmcp: b.confmcp.clone(),
+            workmcp: b.workmcp.clone(),
         }
     }
 
@@ -120,9 +181,22 @@ impl Harness {
         &self.agentd
     }
 
+    /// Path to a `cluster`-featured agentd (sharding + the `--claim`/`--standby`
+    /// path). The default `agentd()` exits 2 on `--claim`; the work-claim e2e
+    /// check spawns THIS one instead.
+    pub fn agentd_cluster(&self) -> &Path {
+        &self.agentd_cluster
+    }
+
     /// Path to the recording reference MCP server (for client conformance).
     pub fn confmcp(&self) -> &Path {
         &self.confmcp
+    }
+
+    /// Path to the mock work-claim coordination server (for work-claim
+    /// conformance — the frozen `work.*` contract with atomic single-grant).
+    pub fn workmcp(&self) -> &Path {
+        &self.workmcp
     }
 
     pub fn tempdir(&self) -> TempDir {
@@ -168,7 +242,18 @@ impl Harness {
     /// Spawn agentd as a long-lived daemon with `args`; returns a guard that
     /// SIGTERMs it on drop (or via [`Daemon::sigterm`] / [`Daemon::wait`]).
     pub fn spawn(&self, args: &[&str]) -> Daemon {
-        let child = Command::new(&self.agentd)
+        self.spawn_exe(&self.agentd, args)
+    }
+
+    /// Spawn the `cluster`-featured agentd as a daemon (for the `--claim` /
+    /// `--standby` paths the default build rejects with exit 2).
+    pub fn spawn_cluster(&self, args: &[&str]) -> Daemon {
+        self.spawn_exe(&self.agentd_cluster, args)
+    }
+
+    /// Spawn an arbitrary agentd binary as a daemon, capturing nothing.
+    fn spawn_exe(&self, exe: &Path, args: &[&str]) -> Daemon {
+        let child = Command::new(exe)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

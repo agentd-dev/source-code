@@ -631,6 +631,82 @@ are ratified by RFC 0016 (the freeze authority); listed here so the operator too
 state is observable. agentctl reads them via the `/metrics` surface declared in
 `surfaces.metrics`.
 
+### 5.6 The work-claim coordination contract (`work.*`) — frozen
+
+> Resolves RFC 0019 §12 ("`work.*` tool names are a frozen contract — confirm
+> ownership") and the matching item in §10 below. RFC 0019 §3 defines the *claim
+> lifecycle* agentd honours; this subsection is the **single frozen authority** for
+> the tool **names**, **argument shapes**, and the **`_meta` convention** so a
+> fleet and its coordination server agree. The umbrella (RFC 0014 §3.4) ratifies it
+> here, in RFC 0015, because it is a control-plane contract agentctl negotiates on —
+> even though agentd *calls* these tools (it does not serve them; cf. §4, which is
+> tools agentd serves). agentctl, or the source MCP server, **provides** `work.*`;
+> agentd is a participant, exactly as RFC 0011 §6 makes it a participant in the
+> idempotency contract.
+
+**Direction & discovery.** Unlike the operator tools (§4, served *by* agentd on the
+management transport), `work.*` are tools agentd *calls* on a coordination MCP
+server (the source server, or a thin claim/lease server the operator runs) over the
+ordinary MCP client codec (RFC 0004). Their JSON-Schemas are the server's, found via
+`tools/list`. The **names and `_meta` keys** below are frozen; the server owns the
+result schema.
+
+**The four tools.**
+
+```jsonc
+// work.claim — atomically lease one item. Atomicity is the SERVER's contract;
+// it is the single serializing point that makes RFC 0008 exactly-one-owner hold
+// across replicas (RFC 0019 §3.1).
+{ "name":"work.claim",  "arguments":{ "item": "<uri|id>", "ttl_ms": 30000 } }
+//   → { "granted": true,  "lease_id": "<opaque>", "expires_in_ms": 30000 }
+//   | { "granted": false, "held_by": "<opaque>" }     // another replica owns it
+{ "name":"work.renew",  "arguments":{ "lease_id": "<opaque>", "ttl_ms": 30000 } }
+{ "name":"work.ack",    "arguments":{ "lease_id": "<opaque>" } }   // work done; side effect committed
+{ "name":"work.release","arguments":{ "lease_id": "<opaque>", "reason": "<string>" } }  // relinquish; re-claimable now
+```
+
+**The `_meta` convention (frozen).** agentd stamps these onto the `work.*`
+`tools/call` (the `agentd/*` namespace is reserved for this contract):
+
+| `_meta` key | Value | Purpose |
+|---|---|---|
+| `agentd/claim_key` | the item-derived RUN_ID (below) | the dedupe key the server keys the side effect + ack on |
+| `agentd/instance` | `identity.instance` (RFC 0015 §6) | observability / `held_by` attribution |
+| `agentd/shard` | `"K/N"` or absent (RFC 0019 §4) | server-side observability only |
+| `traceparent` | W3C trace-context (RFC 0010) | span propagation |
+
+**Two styles (frozen, per-route `claim.style`).** `tool` (default): the server
+advertises the four `work.*` tools above. `resource`: the server models items as
+resources carrying a `lease` field; `work.claim` degenerates to a conditional
+(compare-and-set) `tools/call` the server exposes, observed after a
+`resources/read`. The lifecycle (CLAIMED → ack/release/expire) is identical; only
+the wire shape differs.
+
+**The claim key narrows RUN_ID for `claim` routes (extension to RFC 0011 §6).**
+RFC 0011 §6.1 mints RUN_ID as a per-process value. For a `claim` route this would
+break redelivery dedup (two claimers of the same redelivered item would mint two
+keys). So **for `claim` routes only**, `agentd/claim_key == RUN_ID == derive(item)`
+— a *stable, item-derived* key (default: a deterministic hex digest of the FNV-1a
+of `item_uri + route_id`, reusing the RFC 0019 §4.1 hash; overridable to the item's
+own id via `claim.key`). This is an **additive, route-scoped** narrowing of
+RFC 0011 §6.1, not a conflict: non-claim routes keep per-process RUN_ID unchanged.
+The same key rides every downstream side-effect `tools/call` (RFC 0011 §6.2), so the
+durable effect dedupes identically whether the first claimer or a post-expiry second
+claimer does the work.
+
+**Validation & exit codes (frozen, per RFC 0011 §5 / RFC 0019 §3.6).** A `claim`
+route whose coordination server is not a declared `--mcp` server fails at startup,
+**exit 2 (EXIT_USAGE)**. A declared server that is *down* at the `tools/list`
+handshake is **exit 6 (EXIT_MCP)** (retriable — a sidecar may be racing up); a server
+that is *up but lacks* `work.claim`/`work.ack` is **exit 2** (an operator wired a
+non-claim server). These are post-handshake checks run before the first reactive
+wake.
+
+**Capabilities advertisement.** A `cluster` build that has wired the claim path
+advertises `surfaces.claim: { "styles": ["tool","resource"] }` in the manifest
+(§5.2); a build without it omits the key (capability-absence-not-error, §2.5).
+agentctl places a `claim` route only on instances advertising `claim`.
+
 ---
 
 ## 6. Mechanism — instance identity from the downward API (env-only)

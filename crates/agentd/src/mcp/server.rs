@@ -445,6 +445,29 @@ impl ServeCtx {
         })
     }
 
+    /// The `agentd://intelligence` body (RFC 0018 §4.4): the endpoint list
+    /// (transport + index, NEVER the URL/creds), which is active, and each one's
+    /// health (state/latency/error-rate). Built from the daemon config's endpoint
+    /// list — a pure structural+health read, no secret, no URL (RFC 0012 §3.7).
+    ///
+    /// Note: in served mode the model loop runs in a child subagent process, so
+    /// the live breaker counters are per-run; this supervisor-side view reflects
+    /// the configured endpoint topology with the supervisor's own (fresh) health
+    /// records. The per-endpoint creds resolve from env at build time and are
+    /// never surfaced (the parse drops them into the dialer only).
+    fn intelligence_body(&self) -> Value {
+        let uri = self.config.intelligence.as_deref().unwrap_or_default();
+        match crate::intel::endpoints::EndpointList::parse(
+            uri,
+            self.config.intelligence_token.clone(),
+        ) {
+            Ok(list) => list.body(self.config.model.as_deref()),
+            // A misconfigured list (should not reach a running daemon — startup
+            // validated it) degrades to an empty, honest body rather than erroring.
+            Err(_) => json!({ "active": 0, "all_down": true, "endpoints": [] }),
+        }
+    }
+
     /// The aggregate state of this served run — what `agentd://run/<run_id>`
     /// reads + pushes on each change. The `root` handle convention names the run's
     /// own node (depth 0); `status` is "running" for the daemon's life. Spawn
@@ -1100,6 +1123,18 @@ fn subscribe_resource(
                 );
             }
         }
+        // agentd://intelligence fires on breaker / active / all-down transitions
+        // (RFC 0018 §4.4) and is Management-only — reject a non-Management
+        // subscribe as not-found, matching the read gate.
+        Some(crate::agentd_uri::AgentdResource::Intelligence) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("not a subscribable resource: {uri}"),
+                );
+            }
+        }
         Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
             let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
             match reg.get(&handle) {
@@ -1319,6 +1354,15 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
             "description": "The live subagent-tree projection: lifecycle flags (draining/paused/ready), totals, and per-node status/usage. Subscribable — pushed on each spawn / exit / status change.",
             "mimeType": "application/json"
         }));
+        // agentd://intelligence — operator-facing intelligence-endpoint health
+        // (RFC 0018 §4.4), Management-only. The endpoint list (transport + index),
+        // which is active, and per-endpoint breaker/latency — never the URL/creds.
+        list.push(json!({
+            "uri": crate::agentd_uri::INTELLIGENCE_URI,
+            "name": "intelligence",
+            "description": "The intelligence-endpoint health view: the ordered endpoint list (transport + index, never the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, and the all-down flag. Subscribable — pushed on breaker / active / all-down transitions.",
+            "mimeType": "application/json"
+        }));
         // agentd://events — the bounded live-event ring (RFC 0016 §7), operator-
         // facing and only when this build serves it (`events` feature). Its URI is
         // daemon-stable (the bare base), so it's safe to list; the cursor/filters
@@ -1365,6 +1409,26 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
                 req.id,
                 json!({
                     "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.inventory_body().to_string()}]
+                }),
+            )
+        }
+        // agentd://intelligence — operator-facing intelligence-endpoint health
+        // (RFC 0018 §4.4). Management-only (the same gate as inventory): a
+        // non-Management origin is refused as resource-not-found so a stdio peer
+        // can't even confirm it exists. The body is transport+index+health only —
+        // never the URL or any credential (RFC 0012 §3.7).
+        Some(crate::agentd_uri::AgentdResource::Intelligence) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("resource not found: {uri}"),
+                );
+            }
+            Response::ok(
+                req.id,
+                json!({
+                    "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.intelligence_body().to_string()}]
                 }),
             )
         }
@@ -3605,6 +3669,136 @@ mod tests {
         assert!(
             subscribe_resource(
                 req("sub", Some(json!({"uri": "agentd://inventory"}))),
+                &ctx,
+                PeerOrigin::Stdio,
+                &writer(),
+                1,
+            )
+            .error
+            .is_some()
+        );
+    }
+
+    /// A ServeCtx whose config carries a multi-endpoint intelligence list, so
+    /// the `agentd://intelligence` body has >1 endpoint to project.
+    fn ctx_multi_endpoint() -> ServeCtx {
+        let cfg = crate::config::Config {
+            run_id: "r1".into(),
+            mode: crate::config::Mode::Reactive,
+            intelligence: Some("vsock:3:8080,unix:/run/intel.sock".into()),
+            intelligence_token: Some("super-secret-tok".into()),
+            model: Some("claude-opus-4".into()),
+            ..crate::config::Config::default()
+        };
+        ServeCtx::new(
+            "r1".into(),
+            "reactive".into(),
+            "agentd".into(),
+            base(),
+            Duration::from_secs(5),
+            Arc::new(cfg),
+        )
+    }
+
+    #[test]
+    fn intelligence_read_is_management_gated_and_carries_no_url_or_token() {
+        let ctx = ctx_multi_endpoint();
+        // Management read → endpoints + health, schema per RFC 0018 §4.4.
+        let r = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://intelligence"})),
+            ),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("intelligence readable for management");
+        let text = v["contents"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["active"], 0);
+        assert_eq!(body["all_down"], false);
+        assert_eq!(body["model"], "claude-opus-4");
+        let eps = body["endpoints"].as_array().unwrap();
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[0]["index"], 0);
+        assert_eq!(eps[0]["transport"], "vsock");
+        assert_eq!(eps[0]["addr"], "3:8080");
+        assert_eq!(eps[0]["state"], "closed");
+        assert_eq!(eps[1]["transport"], "unix");
+        // RFC 0012 §3.7: NEVER the token, NEVER a full URL with its scheme.
+        assert!(!text.contains("super-secret-tok"), "token leaked: {text}");
+        assert!(!text.contains("vsock:3:8080"), "full URI leaked: {text}");
+        assert!(!text.contains("unix:/run"), "full URI leaked: {text}");
+
+        // A stdio peer must NOT read it — 404, as if it didn't exist.
+        let denied = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://intelligence"})),
+            ),
+            &ctx,
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert!(denied.error.is_some(), "stdio intelligence read is refused");
+    }
+
+    #[test]
+    fn intelligence_is_listed_and_subscribable_for_management_only() {
+        let ctx = ctx_multi_endpoint();
+        // listed to management, not to stdio
+        let mgmt = dispatch(
+            req("resources/list", None),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let uris: Vec<String> = mgmt.result.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["uri"].as_str().map(str::to_string))
+            .collect();
+        assert!(uris.contains(&"agentd://intelligence".to_string()));
+
+        let stdio = dispatch(
+            req("resources/list", None),
+            &ctx,
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        let stdio_uris: Vec<String> = stdio.result.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["uri"].as_str().map(str::to_string))
+            .collect();
+        assert!(!stdio_uris.contains(&"agentd://intelligence".to_string()));
+
+        // subscribable for management, refused for stdio
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://intelligence"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+            )
+            .error
+            .is_none()
+        );
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://intelligence"}))),
                 &ctx,
                 PeerOrigin::Stdio,
                 &writer(),

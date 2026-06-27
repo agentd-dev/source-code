@@ -75,7 +75,7 @@ pub fn run() -> i32 {
         serde_json::json!({"depth": payload.depth, "warm": payload.warm}),
     );
 
-    let intel = match IntelClient::from_parts(
+    let mut intel = match IntelClient::from_parts(
         &payload.intelligence.uri,
         payload.intelligence.token.clone(),
     ) {
@@ -142,7 +142,11 @@ pub fn run() -> i32 {
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(25), log.clone());
 
     // A warm continue-session lives across many events; a one-shot runs once.
+    // A warm session is the long-lived loop/reactive shape (RFC 0008), so it gets
+    // the all-down backoff (RFC 0018 §6): a transient host-model roll recovers
+    // without crashing the daemon, rather than exiting 4 like a `once` job.
     if payload.warm {
+        intel.enable_alldown_backoff(crate::intel::client::AllDownPolicy::default());
         return run_warm(
             &intel, &servers, &input, &payload, &mut orch, &cancel, &inject_rx, &up, &log,
         );

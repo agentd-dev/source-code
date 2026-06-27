@@ -265,6 +265,35 @@ pub fn set_reactive_backlog(pending: u64, inflight: u64, subscriptions: u64, lag
     let _ = (pending, inflight, subscriptions, lag_ms);
 }
 
+/// An item was dropped as out-of-shard (RFC 0019 §4.1 / §5.1
+/// `agentd_shard_skipped_total`). The shard gate is the cheap pre-filter applied
+/// at routing intake before any spawn; this counts the items this replica rejects.
+pub fn record_shard_skipped() {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.shard_skipped.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A claim was lost to another replica (RFC 0019 §5.1 `agentd_claims_lost_total`).
+/// **Frozen-but-unfed**: claim/lease (RFC 0019 §3) is DEFERRED (§12), so nothing
+/// increments this yet — the name is reserved now so the schema is stable when the
+/// claim mechanism lands (exactly like the other pre-frozen RFC 0016 series).
+pub fn record_claim_lost() {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.claims_lost.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set the saturation gauge — `in_flight / capacity` in `[0.0, 1.0]` (RFC 0019
+/// §5.1), the HPA "utilization" target. Stored as basis points (0..=10000) in a
+/// u64 atomic and rendered as `value/10000.0`, so the gauge stays a plain atomic
+/// (telemetry never allocates / never fails). `numerator`/`denominator` are the
+/// live in-flight count and the capacity cap; a zero denominator reads 0.0.
+pub fn set_saturation(numerator: u64, denominator: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.set_saturation(numerator, denominator);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (numerator, denominator);
+}
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -408,6 +437,14 @@ mod imp {
         inflight_reactions: AtomicU64,
         subscriptions_active: AtomicU64,
         reaction_lag_ms: AtomicU64,
+
+        // --- RFC 0019 §5.1: horizontal-scaling signals ----------------------
+        // `agentd_saturation` is stored as basis points (0..=10000) and rendered
+        // as a float in [0,1]. `agentd_shard_skipped_total` counts out-of-shard
+        // drops; `agentd_claims_lost_total` is frozen-but-unfed (claim is deferred).
+        saturation_bp: AtomicU64,
+        pub(super) shard_skipped: AtomicU64,
+        pub(super) claims_lost: AtomicU64,
     }
 
     impl Registry {
@@ -444,6 +481,9 @@ mod imp {
                 inflight_reactions: AtomicU64::new(0),
                 subscriptions_active: AtomicU64::new(0),
                 reaction_lag_ms: AtomicU64::new(0),
+                saturation_bp: AtomicU64::new(0),
+                shard_skipped: AtomicU64::new(0),
+                claims_lost: AtomicU64::new(0),
             }
         }
 
@@ -529,6 +569,19 @@ mod imp {
             self.subscriptions_active
                 .store(subscriptions, Ordering::Relaxed);
             self.reaction_lag_ms.store(lag_ms, Ordering::Relaxed);
+        }
+
+        pub(super) fn set_saturation(&self, numerator: u64, denominator: u64) {
+            // Store as basis points (0..=10000) so the gauge stays a plain atomic;
+            // `render` divides by 10000.0 to emit the [0,1] float. Clamp to the cap
+            // so a transient over-cap in-flight never reports > 1.0. A zero capacity
+            // is reported as 0 (no work possible ⇒ no saturation), never a div-by-0.
+            let bp = numerator
+                .saturating_mul(10_000)
+                .checked_div(denominator)
+                .unwrap_or(0)
+                .min(10_000);
+            self.saturation_bp.store(bp, Ordering::Relaxed);
         }
 
         pub(super) fn render(&self) -> String {
@@ -719,6 +772,31 @@ mod imp {
                 g(&self.reaction_lag_ms),
             );
 
+            // --- horizontal-scaling signals (RFC 0019 §5.1) ------------------
+            // `agentd_saturation` is in_flight/capacity in [0,1] — the HPA target.
+            // Stored as basis points; rendered as the float.
+            let sat = g(&self.saturation_bp) as f64 / 10_000.0;
+            gauge_f64(
+                &mut s,
+                "agentd_saturation",
+                "In-flight / capacity utilization in [0,1] (RFC 0019 §5.1).",
+                sat,
+            );
+            counter(
+                &mut s,
+                "agentd_shard_skipped_total",
+                "Items dropped as out-of-shard (RFC 0019 §4.1).",
+                g(&self.shard_skipped),
+            );
+            // Frozen-but-unfed: claim/lease is deferred (RFC 0019 §3/§12), so this
+            // reads 0; the name is reserved now so the schema is stable on landing.
+            counter(
+                &mut s,
+                "agentd_claims_lost_total",
+                "Work claims lost to another replica (RFC 0019 §5.1; claim deferred).",
+                g(&self.claims_lost),
+            );
+
             // --- legacy bare series (RFC 0010 §3.8; retained, additive) ------
             counter(
                 &mut s,
@@ -858,6 +936,13 @@ mod imp {
         let _ = writeln!(s, "{name} {value}");
     }
 
+    /// One float-valued gauge family (e.g. a [0,1] ratio) in Prometheus text.
+    fn gauge_f64(s: &mut String, name: &str, help: &str, value: f64) {
+        let _ = writeln!(s, "# HELP {name} {help}");
+        let _ = writeln!(s, "# TYPE {name} gauge");
+        let _ = writeln!(s, "{name} {value}");
+    }
+
     /// One labelled counter family: a single HELP/TYPE header, then one series
     /// line per closed-domain label value (RFC 0016 §4.2 — the domain is the
     /// bound). `domain` and the `LabelCounter` slots are the same length.
@@ -992,6 +1077,35 @@ mod imp {
             assert!(out.contains("agentd_inflight_reactions 1"));
             assert!(out.contains("agentd_subscriptions_active 9"));
             assert!(out.contains("agentd_reaction_lag_ms 250"));
+        }
+
+        #[test]
+        fn horizontal_scaling_signals_render() {
+            // RFC 0019 §5.1: saturation (float [0,1]), shard-skip counter, and the
+            // frozen-but-unfed claims-lost counter.
+            let r = Registry::new();
+            // 35/64 in-flight → 5468 bp → 0.5468 (basis-point granularity).
+            r.set_saturation(35, 64);
+            r.shard_skipped.fetch_add(3, Ordering::Relaxed);
+            let out = r.render();
+            assert!(out.contains("# TYPE agentd_saturation gauge"));
+            assert!(out.contains("agentd_saturation 0.5468"));
+            assert!(out.contains("# TYPE agentd_shard_skipped_total counter"));
+            assert!(out.contains("agentd_shard_skipped_total 3"));
+            // claims-lost is frozen-but-unfed: present, reads 0.
+            assert!(out.contains("# TYPE agentd_claims_lost_total counter"));
+            assert!(out.contains("agentd_claims_lost_total 0"));
+        }
+
+        #[test]
+        fn saturation_clamps_and_guards_zero_capacity() {
+            let r = Registry::new();
+            // over-cap in-flight clamps to 1.0
+            r.set_saturation(100, 64);
+            assert!(r.render().contains("agentd_saturation 1"));
+            // zero capacity → 0.0 (never a div-by-zero)
+            r.set_saturation(5, 0);
+            assert!(r.render().contains("agentd_saturation 0"));
         }
 
         #[test]

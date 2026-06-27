@@ -49,6 +49,11 @@ pub enum AgentdResource {
     /// which is active, and each one's health (up/broken/last-latency).
     /// Management-only, subscribable; fires on breaker/active/all-down transitions.
     Intelligence,
+    /// `agentd://capacity` — the live capacity/placement view (RFC 0019 §7.2/§9):
+    /// instance identity, shard `K/N`, free slots, active subagents, intelligence
+    /// warmth/health, and saturation. Management-only. The read surface agentctl
+    /// uses to place work. Present only in `cluster` builds.
+    Capacity,
 }
 
 /// The parsed query of an `agentd://events?…` read (RFC 0016 §7.2/§7.3). All
@@ -129,6 +134,9 @@ impl AgentdResource {
         if rest == "intelligence" {
             return Some(AgentdResource::Intelligence);
         }
+        if rest == "capacity" {
+            return Some(AgentdResource::Capacity);
+        }
         if let Some(handle) = rest.strip_prefix("subagent/") {
             let handle = handle.trim();
             if handle.is_empty() {
@@ -175,6 +183,10 @@ pub const INVENTORY_URI: &str = "agentd://inventory";
 /// The `agentd://intelligence` URI — the live intelligence-endpoint health view
 /// (RFC 0018 §4.4). Management-only; subscribable.
 pub const INTELLIGENCE_URI: &str = "agentd://intelligence";
+
+/// The `agentd://capacity` URI — the live capacity/placement view (RFC 0019
+/// §7.2/§9). Management-only; present only in `cluster` builds.
+pub const CAPACITY_URI: &str = "agentd://capacity";
 
 /// The `agentd://events` URI — the bounded live-event ring (RFC 0016 §7). The
 /// bare base URI (subscribe/list/notify use it); a read appends `?after=<seq>`
@@ -271,6 +283,18 @@ mod tests {
         assert_eq!(
             AgentdResource::parse("agentd://intelligence/"),
             Some(AgentdResource::Intelligence)
+        );
+    }
+
+    #[test]
+    fn parses_capacity() {
+        assert_eq!(
+            AgentdResource::parse(CAPACITY_URI),
+            Some(AgentdResource::Capacity)
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://capacity/"),
+            Some(AgentdResource::Capacity)
         );
     }
 

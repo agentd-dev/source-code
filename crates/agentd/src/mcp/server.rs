@@ -468,6 +468,56 @@ impl ServeCtx {
         }
     }
 
+    /// The `agentd://capacity` body (RFC 0019 §7.2/§9): this instance's placement
+    /// view — identity, shard `K/N`, free slots, active subagents, intelligence
+    /// warmth/health, and saturation — read by agentctl to place work. Built from
+    /// the supervisor-reachable state (config + the served-run atomics + the
+    /// configured intelligence topology); no secret, no URL (RFC 0012 §3.7).
+    ///
+    /// `active_subagents` is the served-run in-flight spawn count (the load-bearing
+    /// saturation numerator the supervisor can see); `free_slots` = `max_total -
+    /// active`; `saturation` = `active / max_total` (the tree cap, RFC 0009 — the
+    /// per-route product is not reachable from the served ctx, so the cap alone is
+    /// used per RFC 0019 §5.1's `min(…, max_total_subagents)`). `standby: false`
+    /// (standby is DEFERRED, RFC 0019 §7/§12). Intelligence `warm`/`healthy` derive
+    /// from the configured endpoint list's all-down flag (the supervisor-side view
+    /// is fresh per RFC 0018 §4.4 — the model loop runs in a child process).
+    #[cfg(feature = "cluster")]
+    fn capacity_body(&self) -> Value {
+        let identity = crate::identity::Identity::from_env(&self.run_id);
+        let max_total = u64::from(crate::supervisor::tree::Caps::default().max_total);
+        let active = self.inflight.load(Ordering::Relaxed) as u64;
+        let free = max_total.saturating_sub(active);
+        let saturation = if max_total == 0 {
+            0.0
+        } else {
+            (active as f64 / max_total as f64).min(1.0)
+        };
+        // Intelligence warmth/health from the configured endpoint topology: at
+        // least one endpoint not all-down ⇒ warm + healthy. A misconfigured list
+        // (should not reach a running daemon — startup validated it) reads not-warm.
+        let uri = self.config.intelligence.as_deref().unwrap_or_default();
+        let (warm, healthy) = match crate::intel::endpoints::EndpointList::parse(
+            uri,
+            self.config.intelligence_token.clone(),
+        ) {
+            Ok(list) => (!list.all_down(), !list.all_down()),
+            Err(_) => (false, false),
+        };
+        json!({
+            "instance": identity.instance,
+            // The shard identity string "K/N", or null when unsharded (N==1).
+            "shard": self.config.shard.label(),
+            // Standby is deferred (RFC 0019 §7/§12) — always false in this build.
+            "standby": false,
+            "free_slots": free,
+            "active_subagents": active,
+            "intelligence": { "warm": warm, "healthy": healthy },
+            "max_total_subagents": max_total,
+            "saturation": saturation,
+        })
+    }
+
     /// The aggregate state of this served run — what `agentd://run/<run_id>`
     /// reads + pushes on each change. The `root` handle convention names the run's
     /// own node (depth 0); `status` is "running" for the daemon's life. Spawn
@@ -1363,6 +1413,17 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
             "description": "The intelligence-endpoint health view: the ordered endpoint list (transport + index, never the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, and the all-down flag. Subscribable — pushed on breaker / active / all-down transitions.",
             "mimeType": "application/json"
         }));
+        // agentd://capacity — the placement view (RFC 0019 §7.2/§9), Management-only
+        // and present only in `cluster` builds. Identity, shard K/N, free slots,
+        // active subagents, intelligence warmth, and saturation — what agentctl
+        // reads to place work. Not subscribable in this chunk (a static-ish read).
+        #[cfg(feature = "cluster")]
+        list.push(json!({
+            "uri": crate::agentd_uri::CAPACITY_URI,
+            "name": "capacity",
+            "description": "The placement/capacity view: instance identity, shard K/N (null if unsharded), standby flag, free slots, active subagents, intelligence warmth/health, max_total_subagents, and saturation [0,1]. Read by agentctl to place work (RFC 0019).",
+            "mimeType": "application/json"
+        }));
         // agentd://events — the bounded live-event ring (RFC 0016 §7), operator-
         // facing and only when this build serves it (`events` feature). Its URI is
         // daemon-stable (the bare base), so it's safe to list; the cursor/filters
@@ -1432,6 +1493,27 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
                 }),
             )
         }
+        // agentd://capacity — the placement view (RFC 0019 §7.2/§9). Management-only
+        // (the same gate as inventory/intelligence): a non-Management origin is
+        // refused as resource-not-found. Present only in `cluster` builds; without
+        // the feature it 404s like any unknown uri (capability-absence-not-error,
+        // RFC 0015 §2.5). No secret, no URL.
+        #[cfg(feature = "cluster")]
+        Some(crate::agentd_uri::AgentdResource::Capacity) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("resource not found: {uri}"),
+                );
+            }
+            Response::ok(
+                req.id,
+                json!({
+                    "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.capacity_body().to_string()}]
+                }),
+            )
+        }
         // agentd://capabilities — the live self-description manifest (RFC 0015
         // §3.4). Readable on every origin (it discloses no secret, confers no
         // authority).
@@ -1497,6 +1579,15 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
                 ),
             }
         }
+        // Without the `cluster` feature the capacity resource is absent: parse may
+        // still yield it (the enum variant is unconditional), so 404 it like any
+        // unknown uri — capability-absence-not-error (RFC 0015 §2.5).
+        #[cfg(not(feature = "cluster"))]
+        Some(crate::agentd_uri::AgentdResource::Capacity) => Response::err(
+            req.id,
+            json::RESOURCE_NOT_FOUND,
+            format!("resource not found: {uri}"),
+        ),
         None => Response::err(
             req.id,
             json::RESOURCE_NOT_FOUND,

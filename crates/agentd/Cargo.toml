@@ -42,6 +42,12 @@ cron = []
 # 0005 notify-then-read cursor. Rides serve-mcp (it's a served resource); no dep
 # — reuses the existing serde_json serializer + the served listener.
 events = ["serve-mcp"]
+# Horizontal scaling (RFC 0019): `--shard K/N` partitioning + the autoscaling
+# signal set + the agentd://capacity read surface. Dependency-free — the shard
+# predicate is a hand-rolled FNV-1a (no hashbrown/siphash/sha2), pure CPU; the
+# capacity resource rides serve-mcp (gated like events/intelligence). Claim/lease
+# + standby are DEFERRED (RFC 0019 §12), so neither is built here.
+cluster = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
 # OTLP span export + GenAI semconv. Hand-rolled OTLP-over-HTTP/JSON over the

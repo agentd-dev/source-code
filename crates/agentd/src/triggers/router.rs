@@ -169,6 +169,21 @@ impl Router {
         self.pending.values().map(|(at, _)| *at).min()
     }
 
+    /// Number of distinct URIs currently armed/coalesced and not yet fired — the
+    /// reactive backlog this replica sees (RFC 0019 §5.1, the `agentd_pending_events`
+    /// scaling signal). Cheap (a `HashMap::len`); read each reactive tick.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The fire-at `Instant` of the oldest (earliest-armed) pending delivery, for
+    /// the reaction-lag signal (RFC 0019 §5.1). Each entry's stored instant is
+    /// `armed_at + debounce`, so the minimum is the oldest pending item's deadline;
+    /// the caller derives a `lag_ms` from it. `None` when nothing is pending.
+    pub fn oldest_pending(&self) -> Option<Instant> {
+        self.pending.values().map(|(at, _)| *at).min()
+    }
+
     /// Drain every delivery whose debounce has elapsed by `now`.
     pub fn due(&mut self, now: Instant) -> Vec<Delivery> {
         let ready: Vec<String> = self

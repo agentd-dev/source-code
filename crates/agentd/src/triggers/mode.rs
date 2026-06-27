@@ -81,6 +81,41 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     let mut router = Router::new(routes);
     let mut warm = WarmRegistry::default();
 
+    // Shard gate (RFC 0019 §4.1): an instance with shard K/N considers only the
+    // URIs it owns; out-of-shard URIs are dropped at routing intake (before the
+    // debounce queue + before spawn) at near-zero cost. `shard_key` defaults to
+    // the resource URI. Only active under the `cluster` feature with N>1 — a
+    // default build (or N==1) owns everything, exactly as RFC 0008.
+    #[cfg(feature = "cluster")]
+    let shard = crate::cluster::Shard {
+        k: cfg.shard.k,
+        n: cfg.shard.n,
+    };
+    if cfg.shard.n > 1 {
+        log.info(
+            "shard.armed",
+            json!({"k": cfg.shard.k, "n": cfg.shard.n, "shard": cfg.shard.label()}),
+        );
+    }
+    // `in_shard(uri)`: true when this replica owns the URI (always true without
+    // the feature / when unsharded). Drops increment `agentd_shard_skipped_total`.
+    let in_shard = |uri: &str| -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            if shard.owns(uri) {
+                true
+            } else {
+                crate::obs::metrics::record_shard_skipped();
+                false
+            }
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            let _ = uri;
+            true
+        }
+    };
+
     // Subscribe each URI (spawn + continue alike) on the first connected server
     // that supports it; track which server owns each URI so we read it back from
     // the same place.
@@ -117,7 +152,9 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     // the resource *is* now, so this is safe and idempotent.
     let t0 = Instant::now();
     for uri in owner.keys() {
-        if router.on_updated(uri, t0) {
+        // Shard gate precedes routing: an out-of-shard URI never enters `pending`,
+        // even on the startup read-after-subscribe sweep (RFC 0019 §4.1).
+        if in_shard(uri) && router.on_updated(uri, t0) {
             log.info("reactive.initial_read", json!({"uri": uri}));
         }
     }
@@ -157,6 +194,7 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
             for n in s.drain_notifications() {
                 if n.method == method::NOTIFY_RESOURCES_UPDATED
                     && let Some(uri) = updated_uri(&n.params)
+                    && in_shard(&uri)
                     && router.on_updated(&uri, now)
                 {
                     log.info("resource.updated", json!({"uri": uri}));
@@ -220,6 +258,23 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
                 apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
             }
         }
+
+        // Publish the reactive-backlog scaling signals (RFC 0019 §5.1) each tick:
+        // `pending` distinct queued URIs, `inflight` warm active sessions,
+        // `subscriptions` reconciled live, and the lag of the oldest pending item
+        // (how overdue it is past its debounce). No-op without the `metrics`
+        // feature — call it unconditionally.
+        let now = Instant::now();
+        let lag_ms = router
+            .oldest_pending()
+            .map(|at| now.saturating_duration_since(at).as_millis() as u64)
+            .unwrap_or(0);
+        crate::obs::metrics::set_reactive_backlog(
+            router.pending_count() as u64,
+            warm.len() as u64,
+            owner.len() as u64,
+            lag_ms,
+        );
 
         std::thread::sleep(TICK);
     }
@@ -285,6 +340,28 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         json!({"kind": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64, "cron": cfg.cron}),
     );
     log.info("proc.ready", json!({"mode": cfg.mode.as_str()}));
+
+    // Timer-shard gate (RFC 0019 §4.1): a sharded `schedule`/`loop` fleet must not
+    // have every replica fire the same tick. In `shard0` mode (the default) only
+    // shard 0 fires; the others have no work — so this instance idles until SIGTERM
+    // and exits 0 cleanly rather than running the ticker. (`keyed` mode fires on
+    // every replica; the per-tick key gate is applied elsewhere / deferred.)
+    if !fires_timers(cfg) {
+        log.info(
+            "shard.idle",
+            json!({"k": cfg.shard.k, "n": cfg.shard.n, "timer": cfg.shard.timer.as_str(), "reason": "non-firing timer shard"}),
+        );
+        while !signals::draining() {
+            crate::obs::health::tick();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        log.info(
+            "proc.exit",
+            json!({"reason": "drain", "mode": cfg.mode.as_str()}),
+        );
+        write_daemon_report(cfg, last_status, exit::SUCCESS, daemon_started, log);
+        return exit::SUCCESS;
+    }
 
     loop {
         crate::obs::health::tick();
@@ -424,6 +501,21 @@ fn write_daemon_report(
         SystemTime::now(),
     );
     report.write_to_file(path, log);
+}
+
+/// Whether this instance fires timer events for its shard identity (RFC 0019
+/// §4.1). An unsharded instance (`n == 1`, the default / non-cluster build) always
+/// fires. In `shard0` mode only shard 0 fires (one fleet-wide ticker); in `keyed`
+/// mode every replica fires. Pure (reads `cfg.shard`).
+fn fires_timers(cfg: &Config) -> bool {
+    use crate::config::TimerShardMode;
+    if cfg.shard.n == 1 {
+        return true;
+    }
+    match cfg.shard.timer {
+        TimerShardMode::Shard0 => cfg.shard.k == 0,
+        TimerShardMode::Keyed => true,
+    }
 }
 
 /// Current UTC unix seconds — the clock the cron source matches against.
@@ -645,6 +737,29 @@ mod tests {
         assert_eq!(p.context_seed.len(), 1);
         assert!(p.context_seed[0].content.contains("file:///in.json"));
         assert!(p.context_seed[0].content.contains("{\"n\":1}"));
+    }
+
+    #[test]
+    fn fires_timers_gates_non_firing_shards() {
+        use crate::config::{Mode, ShardCfg, TimerShardMode};
+        let mut cfg = Config {
+            mode: Mode::Schedule,
+            ..Config::default()
+        };
+        // Unsharded (default): always fires.
+        assert!(fires_timers(&cfg));
+        // shard0 mode: only shard 0 of a real fleet fires; others idle.
+        cfg.shard = ShardCfg {
+            k: 0,
+            n: 4,
+            timer: TimerShardMode::Shard0,
+        };
+        assert!(fires_timers(&cfg));
+        cfg.shard.k = 2;
+        assert!(!fires_timers(&cfg));
+        // keyed mode: every replica fires (the per-key gate is elsewhere).
+        cfg.shard.timer = TimerShardMode::Keyed;
+        assert!(fires_timers(&cfg));
     }
 
     #[test]

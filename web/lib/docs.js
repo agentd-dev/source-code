@@ -23,11 +23,20 @@ export const DOCS = [
   { slug: "rfc-0003", file: "rfcs/0003-process-supervision-and-recovery.md", title: "rfc 0003 · supervision & recovery" },
   { slug: "rfc-0004", file: "rfcs/0004-mcp-client-subset-and-codec.md", title: "rfc 0004 · mcp client & codec" },
   { slug: "rfc-0005", file: "rfcs/0005-self-mcp-server-and-control-protocol.md", title: "rfc 0005 · self-mcp server" },
+  { slug: "rfc-0006", file: "rfcs/0006-intelligence-transport-and-wire.md", title: "rfc 0006 · intelligence transport" },
   { slug: "rfc-0007", file: "rfcs/0007-agentic-loop-and-terminal-status.md", title: "rfc 0007 · agentic loop" },
   { slug: "rfc-0008", file: "rfcs/0008-execution-modes-and-reactive-routing.md", title: "rfc 0008 · modes & reactivity" },
   { slug: "rfc-0009", file: "rfcs/0009-subagent-process-model.md", title: "rfc 0009 · subagent model" },
+  { slug: "rfc-0010", file: "rfcs/0010-observability-health-telemetry.md", title: "rfc 0010 · observability" },
   { slug: "rfc-0011", file: "rfcs/0011-cloud-native-contract.md", title: "rfc 0011 · cloud-native contract" },
   { slug: "rfc-0012", file: "rfcs/0012-security-posture.md", title: "rfc 0012 · security posture" },
+  { slug: "rfc-0013", file: "rfcs/0013-deferred-v2-surface.md", title: "rfc 0013 · deferred v2" },
+  { slug: "rfc-0014", file: "rfcs/0014-control-plane-contract.md", title: "rfc 0014 · control-plane contract" },
+  { slug: "rfc-0015", file: "rfcs/0015-management-and-control-surface.md", title: "rfc 0015 · management surface" },
+  { slug: "rfc-0016", file: "rfcs/0016-telemetry-and-lifecycle-contract.md", title: "rfc 0016 · telemetry contract" },
+  { slug: "rfc-0017", file: "rfcs/0017-declarative-config-and-hot-reload.md", title: "rfc 0017 · config & hot reload" },
+  { slug: "rfc-0018", file: "rfcs/0018-intelligence-transport-resilience.md", title: "rfc 0018 · intelligence resilience" },
+  { slug: "rfc-0019", file: "rfcs/0019-horizontal-scaling.md", title: "rfc 0019 · horizontal scaling" },
 ];
 
 // docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so

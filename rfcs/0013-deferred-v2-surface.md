@@ -5,6 +5,13 @@
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
+> **Forward note (control-plane track).** Two items here are dependencies of the
+> agentctl control-plane track (RFC 0014): **Streamable HTTP serving** is the
+> cluster-network alternative to the vsock management transport (RFC 0015 §3),
+> and **MCP-backed session checkpointing** is the durability primitive a stateful
+> fleet agent would use to resume across a pod reschedule (RFC 0014 §4). The track
+> does **not** pull either forward; it references them as the named v2 path.
+
 ---
 
 ## 1. Problem / Context

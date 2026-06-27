@@ -87,7 +87,7 @@ fn drain_until(
 ) -> usize {
     let mut turns = have;
     while turns < target && Instant::now() < deadline {
-        turns += reg.drain(log).len();
+        turns += reg.drain(log).turns.len();
         std::thread::sleep(Duration::from_millis(20));
     }
     turns

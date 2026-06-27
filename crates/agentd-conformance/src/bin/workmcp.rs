@@ -28,8 +28,9 @@
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Write};
+use std::os::fd::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One work item's lease state. `None` lease ⇒ the item is free (claimable).
@@ -64,14 +65,21 @@ fn main() {
     let state_path = args.next().expect("usage: workmcp <state-file> [item-uri]");
     let item_uri = args.next().unwrap_or_else(|| "work:///item/1".to_string());
 
-    let mut state = State::default();
-    // NB: we do NOT seed-write the state file at startup. A reactive agentd
-    // passes its `--mcp work=…` server to the spawned reaction too, so a SECOND
-    // workmcp process exists (the child's) pointed at the SAME state file — but
-    // the child never issues a `work.*` `tools/call`, so it must never write.
-    // Writing only after a tools/call (below) keeps the file owned by whichever
-    // process actually claims/acks (the supervisor's). The check treats a missing
-    // file as "no calls yet" (zeros).
+    // The lease state is the SHARED FILE, not in-process memory. Each `work.*`
+    // call flocks the state file, reloads the current state from disk, applies its
+    // decision, and writes it back under the lock (load-modify-store). This makes
+    // the FILE the single serializing point ACROSS PROCESSES — so two reactive
+    // agentd daemons, each with their OWN workmcp child pointed at the SAME state
+    // file, still grant a contended item exactly once (RFC 0019 §3.1 / §8 row 1).
+    // (A single-process driver — the protocol-level checks — works identically: it
+    // locks, reads back its own last write, applies, writes.)
+    //
+    // NB: we do NOT seed-write the state file at startup. A reactive agentd passes
+    // its `--mcp work=…` server to the spawned reaction too, so a SECOND workmcp
+    // process exists (the child's) pointed at the SAME state file — but the child
+    // never issues a `work.*` `tools/call`, so it must never write. Writing only
+    // under a tools/call (below) keeps the file owned by whichever process
+    // actually claims/acks. The check treats a missing file as "no calls yet".
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -105,11 +113,11 @@ fn main() {
             }
             "resources/subscribe" | "resources/unsubscribe" => json!({}),
             "tools/call" => {
-                let res = handle_tool_call(&req["params"], &mut state);
-                // Persist the snapshot after every state-mutating call so the
-                // check can assert grant-once / ack-once from the file.
-                write_state(&state_path, &state);
-                res
+                // Flock-serialized load-modify-store: lock the state file, reload
+                // the shared state, apply, persist, unlock. This is the
+                // cross-process single serializing point (two daemons' workmcp
+                // children racing one item still grant once).
+                with_locked_state(&state_path, |state| handle_tool_call(&req["params"], state))
             }
             _ => {
                 reply(
@@ -223,9 +231,10 @@ fn handle_tool_call(params: &Value, state: &mut State) -> Value {
     }
 }
 
-/// Atomic claim (RFC 0019 §3.2). Grants iff the item has no LIVE lease (free, or
-/// its lease expired / was released). A still-held item is refused — the single
-/// serializing point that makes exactly-one-owner hold across replicas.
+/// Atomic claim (RFC 0019 §3.2). Grants iff the item has no LIVE lease AND is not
+/// already done (acked). A still-held item OR an already-acked item is refused —
+/// the single serializing point that makes exactly-one-owner hold across
+/// replicas, plus the §3.5 "already-done" collapse a redelivery hits.
 fn claim(state: &mut State, item: &str, ttl_ms: u64) -> Value {
     let now = now_ms();
     let entry = state.items.entry(item.to_string()).or_insert(Item {
@@ -239,8 +248,19 @@ fn claim(state: &mut State, item: &str, ttl_ms: u64) -> Value {
         state.claims_refused += 1;
         return json!({"granted": false, "held_by": held_lease});
     }
-    // Free (or expired/released): grant a fresh lease. Granting after an ack is a
-    // fresh attempt; the ack COUNT is what the check asserts, never re-incremented.
+    // Already DONE (acked, no live lease): the work is complete → refuse (the
+    // §3.5 redelivered-but-already-acked collapse). This makes the two-instance
+    // race deterministic REGARDLESS of timing: the loser's claim is refused
+    // whether it races while the winner still HOLDS the lease (refused-as-held
+    // above) or AFTER the winner has acked (refused-as-done here). A `release`
+    // (non-terminal wind-down) clears the lease WITHOUT setting `acked`, so a
+    // released item stays freely re-claimable — only a completed (acked) item is
+    // done. `held_by:"done"` distinguishes this refusal for observability.
+    if entry.acked {
+        state.claims_refused += 1;
+        return json!({"granted": false, "held_by": "done"});
+    }
+    // Free (or expired/released, and not done): grant a fresh lease.
     state.next_lease += 1;
     let lease_id = format!("L-{}", state.next_lease);
     let expires_at = now + ttl_ms as u128;
@@ -301,7 +321,11 @@ fn dump(state: &State) -> Value {
     snapshot(state)
 }
 
-/// The persisted / introspectable state snapshot.
+/// The persisted / introspectable state snapshot. It is BOTH the public view the
+/// conformance check reads (the top-level counters + per-item `leased`/`acked`)
+/// AND the round-trippable persisted form `load_state` reconstructs `State` from
+/// (the per-item `lease_id`/`expires_at` + the global `next_lease`), so the
+/// shared file is a faithful save/restore across processes.
 fn snapshot(state: &State) -> Value {
     let now = now_ms();
     let items: Value = state
@@ -314,6 +338,9 @@ fn snapshot(state: &State) -> Value {
                 json!({
                     "leased": leased,
                     "lease_id": it.lease.as_ref().map(|(l, _)| l.clone()),
+                    // expires_at is load-bearing for restore (refusal compares it
+                    // against `now`); the public `leased` bool is derived from it.
+                    "expires_at": it.lease.as_ref().map(|(_, e)| *e as u64),
                     "acked": it.acked,
                 }),
             )
@@ -325,8 +352,121 @@ fn snapshot(state: &State) -> Value {
         "acks": state.acks,
         "releases": state.releases,
         "claims_refused": state.claims_refused,
+        "next_lease": state.next_lease,
         "items": items,
     })
+}
+
+/// Reconstruct a [`State`] from a persisted snapshot (the inverse of
+/// [`snapshot`]). A missing/unparseable file ⇒ a fresh default state ("no calls
+/// yet"). This is how each `work.*` call reloads the SHARED state before applying
+/// its decision, so two processes serialize through the file.
+fn load_state(text: &str) -> State {
+    let Ok(v) = serde_json::from_str::<Value>(text.trim()) else {
+        return State::default();
+    };
+    let mut state = State {
+        claims_granted: v["claims_granted"].as_u64().unwrap_or(0),
+        acks: v["acks"].as_u64().unwrap_or(0),
+        releases: v["releases"].as_u64().unwrap_or(0),
+        claims_refused: v["claims_refused"].as_u64().unwrap_or(0),
+        next_lease: v["next_lease"].as_u64().unwrap_or(0),
+        items: HashMap::new(),
+    };
+    if let Some(items) = v["items"].as_object() {
+        for (uri, it) in items {
+            let lease = match (it["lease_id"].as_str(), it["expires_at"].as_u64()) {
+                (Some(lid), Some(exp)) => Some((lid.to_string(), exp as u128)),
+                _ => None,
+            };
+            state.items.insert(
+                uri.clone(),
+                Item {
+                    lease,
+                    acked: it["acked"].as_bool().unwrap_or(false),
+                },
+            );
+        }
+    }
+    state
+}
+
+/// Flock-serialized load-modify-store of the shared state file (RFC 0019 §3.1 —
+/// the single serializing point, here realized ACROSS PROCESSES by a file lock).
+/// The lock is taken on a SIBLING `<path>.lock` file (so the state file itself is
+/// always replaced atomically via temp+rename — a polling reader never sees a
+/// torn write); under the lock we reload `<path>`, run `f` (the tool's mutation,
+/// returning the JSON-RPC result), then atomically persist. Two workmcp processes
+/// contending for one item are serialized by the `LOCK_EX`, so the item is
+/// granted exactly once. Best-effort on any IO error: applies against a throwaway
+/// state so the call still returns (the check then observes the missing
+/// persistence and fails loudly, which is correct), never panicking the server.
+fn with_locked_state<F: FnOnce(&mut State) -> Value>(path: &str, f: F) -> Value {
+    let lock_path = format!("{path}.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path);
+    let Ok(lock_file) = lock_file else {
+        let mut state = State::default();
+        return f(&mut state);
+    };
+    let _guard = FlockGuard::acquire(&lock_file);
+    // Reload the current shared state from disk (the OTHER process may have
+    // written since our last call — the lock makes that read-then-write atomic).
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut state = load_state(&text);
+    // Apply the mutation, capturing the JSON-RPC result.
+    let result = f(&mut state);
+    // Persist atomically: temp sibling + rename, so a concurrent (unlocked)
+    // reader polling the file always sees a complete snapshot.
+    let snap = snapshot(&state).to_string();
+    let tmp = format!("{path}.tmp.{}", std::process::id());
+    if let Ok(mut tf) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)
+        && writeln!(tf, "{snap}").is_ok()
+    {
+        let _ = tf.flush();
+        let _ = std::fs::rename(&tmp, path);
+    }
+    result
+    // `_guard` drops here → flock(LOCK_UN).
+}
+
+/// An RAII exclusive `flock` on a file (released on drop). Held only for the
+/// brief load-modify-store window, so two workmcp processes serialize per call.
+struct FlockGuard {
+    fd: i32,
+}
+
+impl FlockGuard {
+    fn acquire(file: &File) -> FlockGuard {
+        let fd = file.as_raw_fd();
+        // Blocking exclusive lock; EINTR-retry. This is the cross-process gate.
+        loop {
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break; // give up locking but proceed (best-effort)
+            }
+        }
+        FlockGuard { fd }
+    }
+}
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
 }
 
 /// Wrap a body as a `CallToolResult` carrying it BOTH as `structuredContent` and
@@ -337,25 +477,6 @@ fn tool_result(body: Value) -> Value {
         "content": [{"type": "text", "text": body.to_string()}],
         "structuredContent": body,
     })
-}
-
-/// Atomically rewrite the state file with the current snapshot. Best-effort: a
-/// failed write never breaks the server (the check would observe stale state and
-/// fail loudly, which is correct).
-fn write_state(path: &str, state: &State) {
-    let snap = snapshot(state).to_string();
-    // Write to a temp sibling + rename so a concurrent reader never sees a torn
-    // file (the conformance check polls this while the daemon runs).
-    let tmp = format!("{path}.tmp");
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp)
-        && writeln!(f, "{snap}").is_ok()
-    {
-        let _ = std::fs::rename(&tmp, path);
-    }
 }
 
 fn now_ms() -> u128 {

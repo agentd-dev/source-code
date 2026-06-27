@@ -165,6 +165,13 @@ pub struct ClaimRoute {
     pub server: String,
     /// The wire style (`tool` default | `resource` CAS stub).
     pub style: ClaimStyle,
+    /// Whether this claim route delivers into a warm `--continue` session
+    /// (`Disposition::Continue`) rather than a fresh `Spawn` per event (RFC 0019
+    /// §3.4). Set at load when the route's `uri` is ALSO a `--continue` URI: the
+    /// claim is held for the session's life (claimed on the session's first
+    /// delivery, renewed by the heartbeat while live, acked/released when the
+    /// session ends/drains) instead of claimed→settled within one delivery.
+    pub continue_session: bool,
 }
 
 /// A standby worker's assignment channel (`--assign-from <server>:<uri>`, RFC
@@ -1095,16 +1102,34 @@ impl Config {
                 uri: a.uri.clone(),
                 server: a.server.clone(),
                 style: ClaimStyle::Tool,
+                continue_session: false,
             });
         }
 
+        // continue-claim (RFC 0019 §3.4): a claim route whose URI is ALSO a
+        // `--continue` URI delivers into the warm session (Disposition::Continue),
+        // holding the lease for the session's life, rather than claiming→settling
+        // a fresh Spawn per event. We mark it here (after both `--claim` and
+        // `--continue` are parsed) so the subscribe-fold below routes it to the
+        // CONTINUE set, not the spawn set, and `run_reactive` keys its held claim
+        // by session id. Picking the idiom "honor a claim on an existing
+        // `--continue` URI" keeps the surface minimal — no new flag.
+        for r in &mut c.claim_routes {
+            if c.continue_subscribe.contains(&r.uri) {
+                r.continue_session = true;
+            }
+        }
+
         // A claim route's URI is subscribed + routed as a Spawn (RFC 0019 §3.4):
-        // fold each route's URI into the subscribe set so it is subscribed and
-        // the router delivers it; the claim gate runs before the spawn acts
-        // (wired in `run_reactive`). Dedup against an explicit `--subscribe` of
-        // the same URI so it is not subscribed twice.
+        // fold each spawn-style route's URI into the subscribe set so it is
+        // subscribed and the router delivers it; the claim gate runs before the
+        // spawn acts (wired in `run_reactive`). Dedup against an explicit
+        // `--subscribe` of the same URI so it is not subscribed twice. A
+        // continue-claim route is SKIPPED here — its URI is already in
+        // `continue_subscribe` (routed as Disposition::Continue), so folding it
+        // into `subscribe` would double-route it as a Spawn.
         for r in &c.claim_routes {
-            if !c.subscribe.contains(&r.uri) {
+            if !r.continue_session && !c.subscribe.contains(&r.uri) {
                 c.subscribe.push(r.uri.clone());
             }
         }
@@ -1927,6 +1952,9 @@ fn parse_claim_route(spec: &str) -> Result<ClaimRoute, ConfigError> {
         uri: uri.to_string(),
         server: server.to_string(),
         style,
+        // Defaults to spawn-claim; `load` flips this on when the URI is also a
+        // `--continue` URI (continue-claim, RFC 0019 §3.4).
+        continue_session: false,
     })
 }
 
@@ -2453,6 +2481,7 @@ mod tests {
                 uri: "file:///inbox/42.json".into(),
                 server: "coord".into(),
                 style: ClaimStyle::Tool,
+                continue_session: false,
             }
         );
         assert_eq!(
@@ -2544,6 +2573,63 @@ mod tests {
             }
             other => panic!("expected Usage, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn claim_route_on_a_continue_uri_is_a_continue_claim_not_a_spawn() {
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        // A `--claim` URI that is ALSO a `--continue` URI is a continue-claim:
+        // marked `continue_session`, kept in `continue_subscribe` (routed as
+        // Disposition::Continue), and NOT double-folded into `subscribe`.
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--mcp",
+                "coord=mcp-coord",
+                "--continue",
+                "file:///inbox/42.json",
+                "--claim",
+                "file:///inbox/42.json=coord",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(c.claim_routes.len(), 1);
+        assert!(
+            c.claim_routes[0].continue_session,
+            "a claim on a --continue URI must be a continue-claim"
+        );
+        assert!(
+            c.continue_subscribe
+                .contains(&"file:///inbox/42.json".to_string()),
+            "the URI stays a continue route"
+        );
+        assert!(
+            !c.subscribe.contains(&"file:///inbox/42.json".to_string()),
+            "a continue-claim URI must NOT be double-routed as a Spawn"
+        );
+
+        // A `--claim` URI with no matching `--continue` is a spawn-claim (the
+        // existing behaviour): folded into subscribe, not marked continue.
+        let c2 = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--mcp",
+                "coord=mcp-coord",
+                "--claim",
+                "file:///inbox/42.json=coord",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert!(!c2.claim_routes[0].continue_session);
+        assert!(c2.subscribe.contains(&"file:///inbox/42.json".to_string()));
     }
 
     #[cfg(not(feature = "cluster"))]
@@ -3643,6 +3729,7 @@ mod tests {
             uri: "file:///in.json".into(),
             server: "ghost".into(),
             style: ClaimStyle::Tool,
+            continue_session: false,
         }];
         let diags = Config::reload_coherence_check(&cfg, None, false)
             .expect_err("an undeclared coordination server must be an error");
@@ -3706,6 +3793,7 @@ mod tests {
                         uri: "u".into(),
                         server: "s".into(),
                         style: ClaimStyle::Tool,
+                        continue_session: false,
                     }]
                 }
                 "standby" => a.standby = true,
@@ -3775,6 +3863,7 @@ mod tests {
             uri: "file:///in.json".into(),
             server: "ghost".into(),
             style: ClaimStyle::Tool,
+            continue_session: false,
         }];
         let verdict = cfg.validate_collect_all(true);
         assert!(

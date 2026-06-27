@@ -16,5 +16,7 @@
 pub mod claim;
 pub mod shard;
 
-pub use claim::{ClaimOutcome, ClaimSpec, advertises_work_tools, claim, derive_claim_key};
+pub use claim::{
+    ClaimOutcome, ClaimSpec, advertises_work_tools, claim, claim_styled, derive_claim_key,
+};
 pub use shard::{Shard, TimerShard};

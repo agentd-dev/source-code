@@ -57,7 +57,13 @@ fn run() -> i32 {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let cfg = match Config::load(&argv[1..], &env) {
         Ok(c) => c,
-        Err(ConfigError::Help(s)) | Err(ConfigError::Version(s)) => {
+        // `--capabilities` (RFC 0015 §5.2) joins `--help`/`--version` as a
+        // side-effect-free early exit: the manifest JSON goes to stdout, exit 0.
+        // It is resolved during config parse, before any MCP connect / LLM call /
+        // socket bind below.
+        Err(ConfigError::Help(s))
+        | Err(ConfigError::Version(s))
+        | Err(ConfigError::Capabilities(s)) => {
             print!("{s}");
             return exit::SUCCESS;
         }

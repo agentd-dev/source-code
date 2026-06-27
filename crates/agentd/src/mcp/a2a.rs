@@ -83,6 +83,112 @@ impl TaskState {
             TaskState::Unspecified => "TASK_STATE_UNSPECIFIED",
         }
     }
+
+    /// Parse a wire `TASK_STATE_*` string back into a [`TaskState`] — the inverse
+    /// of [`as_str`](Self::as_str), used by the A2A **client** (RFC 0020 §3) to
+    /// read a Task's status off a remote peer. An unrecognized string is
+    /// `Unspecified` (a peer speaking a newer enum is treated as not-yet-terminal,
+    /// so the client keeps polling rather than mistaking it for a terminal state).
+    pub fn from_wire(s: &str) -> TaskState {
+        match s {
+            "TASK_STATE_SUBMITTED" => TaskState::Submitted,
+            "TASK_STATE_WORKING" => TaskState::Working,
+            "TASK_STATE_COMPLETED" => TaskState::Completed,
+            "TASK_STATE_FAILED" => TaskState::Failed,
+            "TASK_STATE_CANCELED" => TaskState::Canceled,
+            "TASK_STATE_REJECTED" => TaskState::Rejected,
+            "TASK_STATE_INPUT_REQUIRED" => TaskState::InputRequired,
+            "TASK_STATE_AUTH_REQUIRED" => TaskState::AuthRequired,
+            _ => TaskState::Unspecified,
+        }
+    }
+
+    /// Whether this state is **terminal** — the A2A client stops polling once a
+    /// Task reaches one (RFC 0020 §3). `Submitted`/`Working` are in-flight;
+    /// `Unspecified` and the input/auth-required interaction states are treated
+    /// as non-terminal (agentd never produces them, but a richer gateway peer
+    /// might, and the client should keep waiting on the deadline, not give up).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected
+        )
+    }
+}
+
+// ── A2A client-side wire helpers (RFC 0020 §3) ───────────────────────────────
+//
+// The inverse of the server builders above: agentd-as-A2A-client mints a
+// `SendMessage` request and reads `Task` objects back off a remote peer. These
+// live here (not in the client module) so client and server share ONE A2A wire
+// vocabulary — no duplicated (de)serialization.
+
+/// Build the `params` for an `a2a.SendMessage` request carrying `objective` as a
+/// single text `Part` of one `ROLE_USER` message (`message_id` minted by the
+/// caller). The optional `output_contract` rides as a second text part so the
+/// remote agent gets the same delegation contract a local subagent would
+/// (RFC 0009 §spawn-payload). `returnImmediately:true` (the default) → an async
+/// Task the client then polls via `a2a.GetTask`.
+pub fn send_message_params(
+    objective: &str,
+    output_contract: Option<&str>,
+    message_id: &str,
+) -> Value {
+    let mut parts = vec![json!({ "text": objective })];
+    if let Some(contract) = output_contract.filter(|c| !c.is_empty()) {
+        parts.push(json!({ "text": format!("Required output: {contract}") }));
+    }
+    json!({
+        "message": {
+            "messageId": message_id,
+            "role": "ROLE_USER",
+            "parts": parts,
+        }
+    })
+}
+
+/// The `id` (task handle) of a `Task` value returned by `a2a.SendMessage` /
+/// `a2a.GetTask`. Empty if absent (a malformed reply the client surfaces as an
+/// error).
+pub fn task_id_of(task: &Value) -> String {
+    task.get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The [`TaskState`] of a `Task` value (`status.state`). A missing/garbled
+/// status reads as `Unspecified` (non-terminal — the client keeps polling).
+pub fn task_state_of(task: &Value) -> TaskState {
+    task.get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(Value::as_str)
+        .map(TaskState::from_wire)
+        .unwrap_or(TaskState::Unspecified)
+}
+
+/// Concatenate the text `Part`s of a completed `Task`'s terminal artifact(s) —
+/// the **distillate** the client returns to the delegating model (RFC 0020 §5:
+/// `Artifact` (final) = the distillate). Parts are joined with newlines, across
+/// every artifact, in order. Empty if the task carries no artifact text.
+pub fn artifact_text_of(task: &Value) -> String {
+    let mut out = String::new();
+    let Some(artifacts) = task.get("artifacts").and_then(Value::as_array) else {
+        return out;
+    };
+    for artifact in artifacts {
+        if let Some(parts) = artifact.get("parts").and_then(Value::as_array) {
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Map an agentd `TerminalStatus` string (RFC 0007 §3.4, the `as_str` vocabulary)
@@ -575,6 +681,85 @@ mod tests {
     }
 
     #[test]
+    fn task_state_from_wire_roundtrips_and_terminal_classifies() {
+        // from_wire ∘ as_str is identity for every named variant.
+        for st in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::Rejected,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+            TaskState::Unspecified,
+        ] {
+            assert_eq!(TaskState::from_wire(st.as_str()), st, "{}", st.as_str());
+        }
+        // An unknown wire string is Unspecified (non-terminal — keep polling).
+        assert_eq!(
+            TaskState::from_wire("TASK_STATE_FUTURE"),
+            TaskState::Unspecified
+        );
+        // Terminal classification: the four end states are terminal, the rest not.
+        for st in [
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::Rejected,
+        ] {
+            assert!(st.is_terminal(), "{} is terminal", st.as_str());
+        }
+        for st in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+            TaskState::Unspecified,
+        ] {
+            assert!(!st.is_terminal(), "{} is not terminal", st.as_str());
+        }
+    }
+
+    #[test]
+    fn send_message_params_carry_objective_and_contract_as_text_parts() {
+        let p = send_message_params("do the thing", Some("a 1-line summary"), "m-1");
+        assert_eq!(p["message"]["messageId"], "m-1");
+        assert_eq!(p["message"]["role"], "ROLE_USER");
+        assert_eq!(p["message"]["parts"][0]["text"], "do the thing");
+        assert_eq!(
+            p["message"]["parts"][1]["text"], "Required output: a 1-line summary",
+            "the output contract rides as a second text part"
+        );
+        // No contract → a single part.
+        let p2 = send_message_params("solo", None, "m-2");
+        assert_eq!(p2["message"]["parts"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_parses_task_id_state_and_distillate() {
+        // A completed Task as the server builds it (snapshot_to_task) round-trips
+        // through the client readers back to the distillate.
+        let task = snapshot_to_task("served.7", TaskState::Completed, Some(&json!("the answer")));
+        assert_eq!(task_id_of(&task), "served.7");
+        assert_eq!(task_state_of(&task), TaskState::Completed);
+        assert!(task_state_of(&task).is_terminal());
+        assert_eq!(artifact_text_of(&task), "the answer");
+
+        // A working task: terminal=false, no artifact text.
+        let working = snapshot_to_task("served.8", TaskState::Working, None);
+        assert_eq!(task_state_of(&working), TaskState::Working);
+        assert!(!task_state_of(&working).is_terminal());
+        assert_eq!(artifact_text_of(&working), "");
+
+        // A garbled reply degrades gracefully (empty id, Unspecified, no text).
+        let junk = json!({ "not": "a task" });
+        assert_eq!(task_id_of(&junk), "");
+        assert_eq!(task_state_of(&junk), TaskState::Unspecified);
+        assert_eq!(artifact_text_of(&junk), "");
+    }
+
+    #[test]
     fn task_object_carries_distillate_only_when_completed() {
         let done = snapshot_to_task("served.0", TaskState::Completed, Some(&json!("the answer")));
         assert_eq!(done["id"], "served.0");
@@ -621,6 +806,7 @@ mod tests {
                 command: vec!["a".into()],
                 tags: Vec::new(),
             }],
+            a2a_peers: Vec::new(),
             limits: Limits {
                 max_steps: 2,
                 max_tokens: 1000,

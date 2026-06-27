@@ -18,3 +18,10 @@ pub mod server;
 // JSON-RPC codec + the vsock/unix management transport).
 #[cfg(feature = "a2a")]
 pub mod a2a;
+
+// agentd-as-A2A-client: the remote-A2A-agent delegation backend (RFC 0020 §3).
+// Connects to a declared peer over the unix/vsock transport + the RFC 0004
+// JSON-RPC codec, runs `a2a.SendMessage` then polls `a2a.GetTask` to a terminal
+// state, and returns the distillate. Reuses the wire types from `a2a`; no deps.
+#[cfg(feature = "a2a")]
+pub mod a2a_client;

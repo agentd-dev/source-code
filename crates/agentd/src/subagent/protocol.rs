@@ -13,7 +13,7 @@
 //! mechanics are `supervisor/spawn.rs`, the child side `subagent/control.rs`.
 
 use crate::agentloop::stop::Outcome;
-use crate::config::McpServerSpec;
+use crate::config::{A2aPeerSpec, McpServerSpec};
 use crate::wire::intel::Usage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,6 +89,12 @@ pub struct SpawnPayload {
     /// The child's **scoped** MCP server subset (⊆ parent's; RFC 0009).
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Declared remote-A2A delegation peers (RFC 0020 §3). Inherited by children
+    /// like `mcp_servers` so a subagent can also delegate over A2A; the
+    /// `a2a.delegate` self-tool dials these. `#[serde(default)]` keeps older
+    /// frames (and non-`a2a` peers, which simply send an empty vec) parseable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub a2a_peers: Vec<A2aPeerSpec>,
     pub limits: Limits,
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
@@ -177,6 +183,7 @@ mod tests {
                 command: vec!["mcp-fs".into()],
                 tags: Vec::new(),
             }],
+            a2a_peers: Vec::new(),
             limits: Limits {
                 max_steps: 20,
                 max_tokens: 100_000,

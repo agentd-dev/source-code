@@ -436,6 +436,7 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             model: cfg.model.clone(),
         },
         mcp_servers: cfg.mcp_servers.clone(),
+        a2a_peers: cfg.a2a_peers.clone(),
         limits: Limits {
             max_steps: cfg.max_steps,
             max_tokens: cfg.max_tokens,

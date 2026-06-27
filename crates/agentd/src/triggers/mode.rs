@@ -557,6 +557,7 @@ mod tests {
                 model: None,
             },
             mcp_servers: Vec::new(),
+            a2a_peers: Vec::new(),
             limits: Limits {
                 max_steps: 10,
                 max_tokens: 1000,

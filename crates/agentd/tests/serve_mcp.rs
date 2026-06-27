@@ -799,6 +799,119 @@ fn management_peer_drives_the_operator_surface() {
 // drive it end-to-end (the served transports are unix/vsock only), so it isn't
 // re-tested here.
 
+/// RFC 0020 §3 loopback: ONE agentd delegating to ANOTHER over A2A. A "server"
+/// agentd serves its A2A surface over a unix socket (with the mock LLM as its
+/// intelligence, so a served Task COMPLETES → a distillate). A "client" agentd
+/// runs a one-shot whose mock LLM calls the `a2a.delegate` self-tool against a
+/// declared peer pointing at the server. This exercises the whole A2A client path
+/// end to end — connect → SendMessage → poll GetTask → distillate — and proves
+/// the "agentd-as-A2A-client ↔ agentd-as-A2A-server" composition. Then we read
+/// the SERVER's task registry to confirm a COMPLETED task actually landed there.
+#[cfg(feature = "a2a")]
+#[test]
+fn one_agentd_delegates_to_another_over_a2a() {
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // The server agentd: a mock LLM it can reach, and its A2A surface served on a
+    // unix socket. A loop-mode daemon stays up and keeps serving while idle.
+    let srv_llm = dir.path().join("srv-llm.sock");
+    let mut srv_llm_proc = start_mock_llm(exe, &srv_llm, "final");
+    let srv_sock = dir.path().join("server-a2a.sock");
+    let mut server = Command::new(exe)
+        .args([
+            "--mode",
+            "loop",
+            "--interval",
+            "60s",
+            "--instruction",
+            "serve a2a",
+            "--intelligence",
+        ])
+        .arg(format!("unix:{}", srv_llm.display()))
+        .arg("--serve-mcp")
+        .arg(format!("unix:{}", srv_sock.display()))
+        .args(["--log-level", "warn"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server agentd");
+    // Wait until the server has bound its A2A socket.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !srv_sock.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "server never bound its a2a socket"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = connect(&srv_sock); // ensure it's connectable before the client dials
+
+    // The client agentd: a one-shot run whose mock LLM script calls a2a.delegate
+    // against a peer that points at the server's A2A socket. Its own intelligence
+    // is the `a2a-delegate` mock; the peer is the server.
+    let cli_llm = dir.path().join("cli-llm.sock");
+    let mut cli_llm_proc = start_mock_llm(exe, &cli_llm, "a2a-delegate");
+    let client = Command::new(exe)
+        .args(["--mode", "once", "--instruction", "delegate the work"])
+        .arg("--intelligence")
+        .arg(format!("unix:{}", cli_llm.display()))
+        .arg("--a2a-peer")
+        .arg(format!("peer=unix:{}", srv_sock.display()))
+        .args(["--log-level", "warn"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("run client agentd");
+
+    assert!(
+        client.status.success(),
+        "client run exited non-zero: {:?}",
+        client.status.code()
+    );
+    let out = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        out.contains("delegated over a2a"),
+        "client should answer after a successful delegation; stdout: {out}"
+    );
+
+    // Confirm the delegation actually reached the SERVER: its A2A task registry
+    // now holds a COMPLETED task (the served run the client's SendMessage started).
+    let stream = connect(&srv_sock);
+    let mut write = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    let list = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"a2a.ListTasks"}"#,
+    );
+    let tasks = list["result"]["tasks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !tasks.is_empty(),
+        "the server should have a task from the delegation: {list}"
+    );
+    let completed = tasks.iter().any(|t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+            && t["artifacts"][0]["parts"][0]["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("mock-llm done"))
+    });
+    assert!(
+        completed,
+        "the server's delegated task completed with the distillate: {tasks:?}"
+    );
+
+    sigterm(server.id());
+    let _ = server.wait();
+    let _ = srv_llm_proc.kill();
+    let _ = srv_llm_proc.wait();
+    let _ = cli_llm_proc.kill();
+    let _ = cli_llm_proc.wait();
+}
+
 /// Wait up to `timeout` for `child` to exit; return its code (None on timeout).
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
     let deadline = Instant::now() + timeout;

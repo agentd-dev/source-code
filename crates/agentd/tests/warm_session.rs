@@ -56,6 +56,7 @@ fn payload(sock: &Path) -> SpawnPayload {
             model: Some("m".into()),
         },
         mcp_servers: Vec::new(),
+        a2a_peers: Vec::new(),
         limits: Limits {
             max_steps: 4,
             max_tokens: 10_000,

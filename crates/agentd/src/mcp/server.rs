@@ -65,11 +65,15 @@ struct WarmServed {
 /// Handle → live warm session.
 type WarmRegistry = Arc<Mutex<HashMap<String, WarmServed>>>;
 
-/// Drain a warm session's channel: record completed turns + detect end. Idempotent.
-fn drain_warm(w: &mut WarmServed) {
+/// Drain a warm session's channel: record completed turns + detect end. Returns
+/// `true` if the session's observable state advanced (a turn completed or it
+/// ended) — the caller pushes a `agentd://session/<handle>` update on `true`.
+/// Idempotent: a no-op drain on an already-`done` session returns `false`.
+fn drain_warm(w: &mut WarmServed) -> bool {
     if w.done {
-        return;
+        return false;
     }
+    let mut changed = false;
     loop {
         match w.rx.try_recv() {
             Ok((_, AgentMsg::Turn { outcome })) => {
@@ -82,18 +86,30 @@ fn drain_warm(w: &mut WarmServed) {
                         crate::agentloop::stop::TerminalStatus::Completed
                     ),
                 ));
+                changed = true; // a turn boundary — the session resource changed
             }
             Ok((_, AgentMsg::Result { .. })) | Ok((_, AgentMsg::Failed { .. })) => {
                 w.done = true;
-                return;
+                return true;
             }
             Ok(_) => {} // Ready / Pong / Event / Usage
-            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Empty) => return changed,
             Err(TryRecvError::Disconnected) => {
                 w.done = true;
-                return;
+                return true;
             }
         }
+    }
+}
+
+/// Drain a warm session and, if its state advanced, push a
+/// `notifications/resources/updated` for `agentd://session/<handle>` to its
+/// subscribers (the keep-variant — a warm session fires on *every* turn boundary,
+/// so the subscription must survive each emission). Used on every path that drains
+/// a still-tracked session by handle.
+fn drain_warm_notify(handle: &str, w: &mut WarmServed, subs: &SubRegistry) {
+    if drain_warm(w) {
+        notify_resource_updated_keep(subs, &crate::agentd_uri::session_uri(handle));
     }
 }
 
@@ -240,6 +256,23 @@ impl ServeCtx {
             "total_spawns": self.counter.load(Ordering::Relaxed),
         })
     }
+
+    /// The aggregate state of this served run — what `agentd://run/<run_id>`
+    /// reads + pushes on each change. The `root` handle convention names the run's
+    /// own node (depth 0); `status` is "running" for the daemon's life. Spawn
+    /// counts come straight from the same atomics `status_body` reads (no token
+    /// aggregation exists yet — RFC 0005 §3.3 reports counts, not totals).
+    fn run_body(&self) -> Value {
+        json!({
+            "run_id": self.run_id,
+            "mode": self.mode,
+            "root": "0", // the run's own node id (depth-0 root) by convention
+            "status": "running",
+            "inflight_spawns": self.inflight.load(Ordering::Relaxed),
+            "total_spawns": self.counter.load(Ordering::Relaxed),
+            "uptime_ms": self.started.elapsed().as_millis() as u64,
+        })
+    }
 }
 
 /// RAII concurrency permit for a served spawn; releases the slot on drop.
@@ -310,7 +343,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
     let listener = UnixListener::bind(path)?;
     log.info(
         "mcp.serving",
-        json!({"path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status"]}),
+        json!({"path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status", crate::agentd_uri::run_uri(&ctx.run_id)]}),
     );
     let handle = ServeHandle {
         sessions: Arc::clone(&ctx.sessions),
@@ -392,7 +425,7 @@ fn dispatch(
             json!({"tools": [status_tool_def(), spawn_tool_def(), send_tool_def(), session_status_tool_def(), session_cancel_tool_def()]}),
         ),
         "tools/call" => tools_call(req, ctx, log),
-        "resources/list" => Response::ok(req.id, json!({"resources": resource_list()})),
+        "resources/list" => Response::ok(req.id, json!({"resources": resource_list(ctx)})),
         "resources/read" => resources_read(req, ctx),
         "resources/subscribe" => subscribe_resource(req, ctx, writer, conn),
         "resources/unsubscribe" => unsubscribe_resource(req, ctx, conn),
@@ -405,11 +438,18 @@ fn dispatch(
 }
 
 /// `resources/subscribe`: register this connection to be pushed a
-/// `notifications/resources/updated` when `uri`'s state changes. Only a
-/// **running** `agentd://subagent/<handle>` is subscribable — its resource
-/// changes exactly once (on completion). An unknown / already-finished handle (or
-/// the read-only `agentd://status`) is rejected so the peer `resources/read`s it
-/// instead; this also avoids storing a subscription that would never fire.
+/// `notifications/resources/updated` when `uri`'s state changes. Three resources
+/// are subscribable:
+///   * `agentd://subagent/<handle>` — a **running** async run; fires exactly once
+///     (on completion), so its subscription is *consumed* when it fires.
+///   * `agentd://run/<run_id>` (this run) — fires REPEATEDLY (each spawn / each
+///     terminal-run change); the subscription is *kept*.
+///   * `agentd://session/<handle>` — a **live** (non-done) warm session; fires
+///     REPEATEDLY (each warm-turn boundary); the subscription is *kept*.
+///
+/// An unknown / already-finished handle (or the read-only `agentd://status`) is
+/// rejected so the peer `resources/read`s it instead; this also avoids storing a
+/// subscription that would never fire.
 fn subscribe_resource(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn: u64) -> Response {
     let uri = req
         .params
@@ -417,8 +457,54 @@ fn subscribe_resource(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn:
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let handle = match crate::agentd_uri::AgentdResource::parse(uri) {
-        Some(crate::agentd_uri::AgentdResource::Subagent(h)) => h,
+    match crate::agentd_uri::AgentdResource::parse(uri) {
+        Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
+            let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match reg.get(&handle) {
+                None => {
+                    return Response::err(
+                        req.id,
+                        json::RESOURCE_NOT_FOUND,
+                        format!("no such run: {uri}"),
+                    );
+                }
+                Some(s) if s.status.is_terminal() => {
+                    return Response::err(
+                        req.id,
+                        json::RESOURCE_NOT_FOUND,
+                        format!("run already finished; resources/read {uri}"),
+                    );
+                }
+                Some(_) => {} // running → subscribable
+            }
+        }
+        // The run aggregate is subscribable only for *this* daemon's run id — a
+        // peer asking for some other run's URI is rejected (it never fires here).
+        Some(crate::agentd_uri::AgentdResource::Run(id)) if id == ctx.run_id => {}
+        // A warm session is subscribable while it's LIVE (not yet done); an unknown
+        // or finished handle is rejected so the peer reads it instead.
+        Some(crate::agentd_uri::AgentdResource::Session(handle)) => {
+            let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+            match warm.get_mut(&handle) {
+                Some(w) => {
+                    drain_warm(w); // refresh `done` before deciding subscribability
+                    if w.done {
+                        return Response::err(
+                            req.id,
+                            json::RESOURCE_NOT_FOUND,
+                            format!("warm session already ended; resources/read {uri}"),
+                        );
+                    }
+                }
+                None => {
+                    return Response::err(
+                        req.id,
+                        json::RESOURCE_NOT_FOUND,
+                        format!("no such warm session: {uri}"),
+                    );
+                }
+            }
+        }
         _ => {
             return Response::err(
                 req.id,
@@ -426,27 +512,7 @@ fn subscribe_resource(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn:
                 format!("not a subscribable resource: {uri}"),
             );
         }
-    };
-    {
-        let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        match reg.get(&handle) {
-            None => {
-                return Response::err(
-                    req.id,
-                    json::RESOURCE_NOT_FOUND,
-                    format!("no such run: {uri}"),
-                );
-            }
-            Some(s) if s.status.is_terminal() => {
-                return Response::err(
-                    req.id,
-                    json::RESOURCE_NOT_FOUND,
-                    format!("run already finished; resources/read {uri}"),
-                );
-            }
-            Some(_) => {} // running → subscribable
-        }
-    } // release the sessions lock before taking the subscriptions lock
+    } // release the sessions / warm lock before taking the subscriptions lock
     let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
     let list = subs.entry(uri.to_string()).or_default();
     if !list.iter().any(|s| s.conn == conn) {
@@ -507,20 +573,53 @@ fn notify_resource_updated(subs: &SubRegistry, uri: &str) {
     }
 }
 
-/// The agentd:// resources this server *lists*: just `agentd://status`. The
-/// per-run `agentd://subagent/<handle>` resources are **read**able (the peer
-/// learns a handle from its `subagent.spawn async` reply) but deliberately NOT
-/// listed — they appear and vanish (eviction) and this reply-only transport has
-/// no `resources/list_changed` to announce that, so a listed handle could 404 on
-/// read. Listing only the stable `agentd://status` avoids advertising vanishing
-/// resources.
-fn resource_list() -> Value {
-    json!([{
-        "uri": "agentd://status",
-        "name": "status",
-        "description": "This agentd's run id, mode, version, pid, uptime, and spawn counts.",
-        "mimeType": "application/json"
-    }])
+/// Like [`notify_resource_updated`] but **keeps** the subscriber list — the
+/// `agentd://run/<run_id>` and `agentd://session/<handle>` resources change
+/// REPEATEDLY (each spawn / each warm-turn boundary), so a single subscribe must
+/// keep receiving updates rather than fire once and be consumed. Cloning the
+/// writers under the lock (then releasing it before writing) keeps the entry
+/// intact for the next emission. Dead peers are pruned when their reader loop ends
+/// (`remove_conn_subscriptions`).
+fn notify_resource_updated_keep(subs: &SubRegistry, uri: &str) {
+    let writers: Vec<SharedWriter> = {
+        let g = subs.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(uri) {
+            Some(list) => list.iter().map(|s| Arc::clone(&s.writer)).collect(),
+            None => return,
+        }
+    };
+    let note = Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({"uri": uri})));
+    for w in writers {
+        if let Ok(mut wl) = w.lock() {
+            let _ = frame::write_line(&mut *wl, &note);
+        }
+    }
+}
+
+/// The agentd:// resources this server *lists*: the stable `agentd://status` and
+/// `agentd://run/<run_id>` resources. The run resource has a daemon-lifetime URI
+/// (the run id is fixed at startup), so it's safe to list — unlike the per-handle
+/// `agentd://subagent/<handle>` and `agentd://session/<handle>` resources, which
+/// are **read**able / **subscribe**able (the peer learns a handle from its
+/// `subagent.spawn` reply) but deliberately NOT listed: they appear and vanish
+/// (eviction / session end) and this reply-only transport has no
+/// `resources/list_changed` to announce that, so a listed handle could 404 on
+/// read. Listing only the stable resources avoids advertising vanishing ones.
+fn resource_list(ctx: &ServeCtx) -> Value {
+    json!([
+        {
+            "uri": "agentd://status",
+            "name": "status",
+            "description": "This agentd's run id, mode, version, pid, uptime, and spawn counts.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": crate::agentd_uri::run_uri(&ctx.run_id),
+            "name": "run",
+            "description": "This served run's aggregate: mode, root handle, status, spawn counts, and uptime. Subscribable — pushed on each spawn / terminal-run change.",
+            "mimeType": "application/json"
+        }
+    ])
 }
 
 /// `resources/read` over the agentd:// scheme. A known URI returns a `contents`
@@ -549,6 +648,35 @@ fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
                         "contents": [{"uri": uri, "mimeType": "application/json", "text": session_body(&handle, s).to_string()}]
                     }),
                 ),
+                None => Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("resource not found: {uri}"),
+                ),
+            }
+        }
+        // agentd://run/<run_id> — the served run aggregate (RFC 0005 §3.3).
+        Some(crate::agentd_uri::AgentdResource::Run(_)) => Response::ok(
+            req.id,
+            json!({
+                "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.run_body().to_string()}]
+            }),
+        ),
+        // agentd://session/<handle> — a served warm session's turn state. Drain
+        // first so the body reflects any turns that completed since the last poll;
+        // an unknown handle is RESOURCE_NOT_FOUND (mirrors the subagent arm).
+        Some(crate::agentd_uri::AgentdResource::Session(handle)) => {
+            let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+            match warm.get_mut(&handle) {
+                Some(w) => {
+                    drain_warm_notify(&handle, w, &ctx.subscriptions);
+                    Response::ok(
+                        req.id,
+                        json!({
+                            "contents": [{"uri": uri, "mimeType": "application/json", "text": warm_body(&handle, w).to_string()}]
+                        }),
+                    )
+                }
                 None => Response::err(
                     req.id,
                     json::RESOURCE_NOT_FOUND,
@@ -659,6 +787,10 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         );
     }
     let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
+    // A new spawn changed the run aggregate (total_spawns / inflight) → push to any
+    // `agentd://run/<run_id>` subscribers (the keep-variant: the run resource fires
+    // repeatedly over the daemon's life).
+    notify_resource_updated_keep(&ctx.subscriptions, &crate::agentd_uri::run_uri(&ctx.run_id));
     let handle = format!("served.{n}");
     let payload = build_served_payload(&ctx.base, &args, &handle);
     let is_warm = args.get("warm").and_then(Value::as_bool).unwrap_or(false);
@@ -780,7 +912,7 @@ fn handle_send(id: Id, ctx: &ServeCtx, args: &Value) -> Response {
     let Some(w) = warm.get_mut(&handle) else {
         return tool_error(id, format!("no such warm session '{handle}'"));
     };
-    drain_warm(w);
+    drain_warm_notify(&handle, w, &ctx.subscriptions);
     if w.done {
         warm.remove(&handle); // ended — reap it
         return tool_error(id, format!("warm session '{handle}' has ended"));
@@ -868,13 +1000,14 @@ fn spawn_async(
             },
         );
     }
-    let (exe, drain, sessions, subs, log2, h) = (
+    let (exe, drain, sessions, subs, log2, h, run_uri) = (
         ctx.exe.clone(),
         ctx.drain_timeout,
         Arc::clone(&ctx.sessions),
         Arc::clone(&ctx.subscriptions),
         log.clone(),
         handle.clone(),
+        crate::agentd_uri::run_uri(&ctx.run_id),
     );
     let spawned = thread::Builder::new()
         .name(format!("served-run:{handle}"))
@@ -892,9 +1025,11 @@ fn spawn_async(
                     s.status = run_to_status(result, cancel.load(Ordering::Relaxed));
                 }
             }
-            // The run finished → its `agentd://subagent/<handle>` resource changed;
-            // push to any subscribers (outside the sessions lock).
+            // The run finished → its `agentd://subagent/<handle>` resource changed
+            // (consume — it fires exactly once), and the run aggregate's inflight
+            // count dropped → push the run resource too (keep — it fires repeatedly).
             notify_resource_updated(&subs, &crate::agentd_uri::subagent_uri(&h));
+            notify_resource_updated_keep(&subs, &run_uri);
         });
     if spawned.is_err() {
         ctx.sessions
@@ -964,7 +1099,7 @@ fn handle_session_tool(id: Id, ctx: &ServeCtx, name: &str, args: &Value) -> Resp
     {
         let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = warm.get_mut(&handle) {
-            drain_warm(w);
+            drain_warm_notify(&handle, w, &ctx.subscriptions);
             return match name {
                 "subagent.cancel" => {
                     let _ = w.sub.send(&ControlMsg::Cancel {
@@ -1305,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn resources_list_advertises_agentd_status() {
+    fn resources_list_advertises_status_and_run() {
         let r = dispatch(req("resources/list", None), &ctx(), &writer(), 0, &log());
         let resources = r.result.expect("ok")["resources"].clone();
         let uris: Vec<&str> = resources
@@ -1317,6 +1452,11 @@ mod tests {
         assert!(
             uris.contains(&"agentd://status"),
             "agentd://status listed: {uris:?}"
+        );
+        // the run aggregate is stable (daemon-lifetime uri) → safe to list.
+        assert!(
+            uris.contains(&"agentd://run/r1"),
+            "agentd://run/r1 listed: {uris:?}"
         );
     }
 
@@ -1465,6 +1605,110 @@ mod tests {
             &log(),
         );
         assert!(r.error.is_some(), "unknown session uri → JSON-RPC error");
+    }
+
+    #[test]
+    fn run_body_reports_run_id_mode_and_counts() {
+        let ctx = ctx();
+        let b = ctx.run_body();
+        assert_eq!(b["run_id"], "r1");
+        assert_eq!(b["mode"], "reactive");
+        assert_eq!(b["root"], "0");
+        assert_eq!(b["status"], "running");
+        // counts come straight from the atomics; fresh ctx → zero.
+        assert_eq!(b["inflight_spawns"], 0);
+        assert_eq!(b["total_spawns"], 0);
+        assert!(b["uptime_ms"].is_u64());
+    }
+
+    #[test]
+    fn resources_read_run_returns_a_contents_body() {
+        let r = dispatch(
+            req("resources/read", Some(json!({"uri": "agentd://run/r1"}))),
+            &ctx(),
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("ok");
+        let entry = &v["contents"][0];
+        assert_eq!(entry["uri"], "agentd://run/r1");
+        assert_eq!(entry["mimeType"], "application/json");
+        let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["run_id"], "r1");
+        assert_eq!(body["mode"], "reactive");
+    }
+
+    #[test]
+    fn run_resource_is_subscribable_only_for_this_run_id() {
+        let ctx = ctx();
+        // the daemon's own run id is subscribable…
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://run/r1"}))),
+                &ctx,
+                &writer(),
+                0,
+            )
+            .error
+            .is_none()
+        );
+        // …but some other run's uri is rejected (it would never fire here).
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://run/other"}))),
+                &ctx,
+                &writer(),
+                0,
+            )
+            .error
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn subscribe_rejects_unknown_session() {
+        let ctx = ctx();
+        let r = subscribe_resource(
+            req("sub", Some(json!({"uri": "agentd://session/served.404"}))),
+            &ctx,
+            &writer(),
+            0,
+        );
+        assert!(
+            r.error.is_some(),
+            "unknown warm session is not subscribable"
+        );
+    }
+
+    #[test]
+    fn keep_notify_fires_repeatedly_without_consuming() {
+        use std::io::{BufRead, BufReader};
+        let ctx = ctx();
+        let uri = "agentd://run/r1";
+        let (a, b) = UnixStream::pair().unwrap();
+        let w: SharedWriter = Arc::new(Mutex::new(a));
+        assert!(
+            subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7)
+                .error
+                .is_none()
+        );
+        // The keep-variant must NOT consume the subscription: it fires every time.
+        notify_resource_updated_keep(&ctx.subscriptions, uri);
+        notify_resource_updated_keep(&ctx.subscriptions, uri);
+        assert_eq!(
+            ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(),
+            1,
+            "keep-variant leaves the subscriber registered"
+        );
+        let mut reader = BufReader::new(b);
+        for _ in 0..2 {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["method"], "notifications/resources/updated");
+            assert_eq!(v["params"]["uri"], uri);
+        }
     }
 
     #[test]

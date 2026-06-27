@@ -2020,6 +2020,19 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             "spawn refused: memory pressure (cgroup at memory.high); retry shortly".to_string(),
         );
     }
+    // Hot-reload quiesce guard (RFC 0017 §5.3 step 3): while a validated reload is
+    // mid-apply, transiently refuse NEW spawns so they pick up the new config —
+    // mirrors the `draining` guard, but the flag is cleared the instant the apply
+    // finishes (step 6), so the peer's retry succeeds within milliseconds. Gated
+    // on `hot-reload` (the flag is only ever set by that build's reactive loop).
+    #[cfg(feature = "hot-reload")]
+    if crate::signals::reloading() {
+        log.warn("mcp.spawn_refused", json!({"reason": "reload_in_progress"}));
+        return tool_error(
+            id,
+            "spawn refused: a config reload is in progress; retry shortly".to_string(),
+        );
+    }
     let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
     // A new spawn changed the run aggregate (total_spawns / inflight) → push to any
     // `agentd://run/<run_id>` subscribers (the keep-variant: the run resource fires

@@ -76,7 +76,20 @@ fn claim_meta(cfg: &Config, claim_key: &str) -> Value {
 /// Reactive mode: subscribe to the configured resources and act on updates
 /// until SIGTERM. `base` is the root payload whose `instruction` is the
 /// standing task; each reaction adds the changed resource as context.
-pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger) -> i32 {
+///
+/// `args`/`env` are the process's original argv (sans program name) + env — the
+/// FIXED env/flag layers a hot reload (RFC 0017 §5) re-merges the new FILE over.
+/// They are only ever consulted under the `hot-reload` feature; without it the
+/// reload latch is never set and this loop is byte-for-byte the pre-reload path.
+#[cfg_attr(not(feature = "hot-reload"), allow(unused_variables))]
+pub fn run_reactive(
+    exe: PathBuf,
+    base: SpawnPayload,
+    cfg: &Config,
+    args: &[String],
+    env: &[(String, String)],
+    log: &Logger,
+) -> i32 {
     // The supervisor owns the MCP connections used for subscriptions + reads.
     // (Each spawned reaction connects its own MCP for tool use, via the payload.)
     let mut servers = Vec::new();
@@ -286,8 +299,54 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     // them — a reaction can set its own next tick.
     let mut wakes: Vec<(Instant, String)> = Vec::new();
 
+    // Hot-reload working state (RFC 0017 §5). `base` carries the live reloadable
+    // values stamped into each reaction's payload (model/limits/log_level); a
+    // reload swaps them so the NEXT `reactive_payload` uses them. `running` is the
+    // diff baseline (the config currently in effect). Both are `mut` only under
+    // the `hot-reload` feature — without it the loop never touches them, so the
+    // no-reload path is unchanged. `generation` counts applied reloads (the
+    // `agentd_config_generation` gauge, RFC 0017 §5.6).
+    #[cfg(feature = "hot-reload")]
+    let mut base = base;
+    #[cfg(feature = "hot-reload")]
+    let mut running: Config = cfg.clone();
+    #[cfg(feature = "hot-reload")]
+    let mut generation: u64 = 0;
+
     loop {
         crate::obs::health::tick();
+
+        // Hot-reload routine (RFC 0017 §5.3): on a tick where a SIGHUP-set RELOAD
+        // is pending AND we are not draining (drain wins, §5.2), run the bounded
+        // validate-first/quiesce/apply choreography, then clear the latch. A
+        // rejected reload is a clean no-op (the running config is byte-for-byte
+        // unchanged). Gated on `hot-reload`; off-feature `reload_requested()` is a
+        // const `false`, so this whole block is dead-code-eliminated and the
+        // no-reload path is identical to before.
+        #[cfg(feature = "hot-reload")]
+        if signals::reload_requested() && !signals::draining() {
+            if let Some(new_cfg) = apply_reload(
+                args,
+                env,
+                &running,
+                &mut base,
+                &mut router,
+                &mut owner,
+                &servers,
+                &mut generation,
+                log,
+            ) {
+                running = new_cfg;
+            }
+            signals::clear_reload();
+        }
+        // A SIGHUP that arrived while draining is consumed without acting (drain
+        // supersedes it — the process is exiting). Clearing keeps the latch tidy.
+        #[cfg(feature = "hot-reload")]
+        if signals::reload_requested() && signals::draining() {
+            signals::clear_reload();
+        }
+
         if signals::draining() {
             // Drain step 1.5 (RFC 0019 §6): release every held claim BEFORE
             // winding down, so a surviving replica re-claims immediately rather
@@ -502,6 +561,281 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
 
         std::thread::sleep(TICK);
     }
+}
+
+/// The hot-reload choreography (RFC 0017 §5.3), run on the reactor thread when a
+/// SIGHUP-set RELOAD is pending (and not draining). Validate-first, quiesce,
+/// all-or-nothing. Returns `Some(new_running)` when the reloadable diff was
+/// applied (the caller adopts it as the new baseline), or `None` when the reload
+/// was rejected — a clean, byte-for-byte no-op (RFC 0017 §7): the running config,
+/// `base`, `router`, `owner`, and `servers` are all left exactly as they were.
+///
+/// `mcp_servers` is treated as **restart-only** in this build (it is in
+/// [`RESTART_ONLY_FIELDS`]): the positional `owner`/claim index map makes a fully
+/// correct live re-handshake + remap too invasive to do safely in this chunk
+/// (RFC 0017 §5.3 "scope it out cleanly"). An `mcp_servers` change is therefore
+/// rejected in step 2 with `reason="restart_required"` — a conservative reject is
+/// correct; a half-correct live swap is not. A live re-handshake is the follow-up.
+#[cfg(feature = "hot-reload")]
+#[allow(clippy::too_many_arguments)]
+fn apply_reload(
+    args: &[String],
+    env: &[(String, String)],
+    running: &Config,
+    base: &mut SpawnPayload,
+    router: &mut Router,
+    owner: &mut HashMap<String, usize>,
+    servers: &[McpClient],
+    generation: &mut u64,
+    log: &Logger,
+) -> Option<Config> {
+    let started = Instant::now();
+    log.info("config.reload_requested", json!({"trigger": "sighup"}));
+
+    // STEP 1 — re-load + re-validate (pure-CPU, no side effect). Re-read ONLY the
+    // FILE, re-merge built-in<file<env<flag. `Config::reload` runs the FULL
+    // `validate()` pipeline, so a now-invalid file is a `Usage` error here.
+    let mut new_cfg = match Config::reload(args, env) {
+        Ok(c) => c,
+        Err(e) => {
+            reject(log, generation, "invalid", None, &e.to_string());
+            return None; // no-op — running config kept verbatim
+        }
+    };
+    // Process identity is restart-only and MUST be stable for the process's life
+    // (RFC 0017 §5.1 / RFC 0011 §6). When no explicit `--run-id`/`AGENTD_RUN_ID`
+    // is set, `load` MINTS a fresh run id each call (time+pid) — that is not a
+    // config change, it is the same auto-identity re-rolled. Pin the candidate's
+    // run id to the running one when there is no explicit source, so a reload
+    // never spuriously trips the restart-only `run_id` diff. An EXPLICIT run id
+    // that genuinely changed is still (correctly) a restart-only reject.
+    if !run_id_explicit(args, env) {
+        new_cfg.run_id = running.run_id.clone();
+    }
+    // The reload-coherence check (RFC 0017 §5.4): internal consistency of the
+    // reloadable subset. `file_present` is implied (a reload only matters with a
+    // file), but pass it honestly so the restart-only-in-file warnings surface.
+    let file_present = config_file_present(args, env);
+    if let Err(diags) = Config::reload_coherence_check(&new_cfg, Some(running), file_present) {
+        // STEP 2's restart-only diff and the §5.4 consistency errors both land
+        // here. Name the first error's field + reason so agentctl can route it
+        // (a restart-only diff → roll a restart; an inconsistency → fix the file).
+        let first = diags.iter().find(|d| d.is_error());
+        let (reason, field, msg) = match first {
+            Some(d) if d.msg.contains("restart-only") => {
+                ("restart_required", Some(d.field.clone()), d.msg.clone())
+            }
+            Some(d) => ("invalid", Some(d.field.clone()), d.msg.clone()),
+            None => ("invalid", None, "reload rejected".to_string()),
+        };
+        reject(log, generation, reason, field, &msg);
+        return None; // no-op
+    }
+
+    // Both pure-CPU gates passed. Compute the reloadable diff (what changed) for
+    // the success event's `changed` list. Restart-only fields cannot differ here
+    // (the coherence check would have rejected), so only reloadable fields remain.
+    let changed = reloadable_changes(running, &new_cfg);
+    if changed.is_empty() {
+        // A reload with no reloadable change is still a successful no-op apply
+        // (the file may have been touched without a material change). Report it as
+        // applied so the generation advances and agentctl sees the push landed.
+        log.info(
+            "config.reloaded",
+            json!({"changed": [], "applied_ms": started.elapsed().as_millis() as u64}),
+        );
+        *generation += 1;
+        crate::obs::metrics::record_config_reload("applied");
+        crate::obs::metrics::set_config_generation(*generation);
+        return Some(new_cfg);
+    }
+
+    // STEP 3 — QUIESCE. In reactive mode the quiesce point IS this idle moment
+    // between routed deliveries (we run at the top of the tick, before any
+    // delivery is dispatched). Set the tree-wide `reloading` guard so the served
+    // `subagent.spawn` chokepoint transiently refuses NEW spawns (cleared in step
+    // 6). We do NOT cancel in-flight work — a synchronous reaction, if one were
+    // mid-flight, would already have returned before this tick boundary.
+    signals::set_reloading(true);
+
+    // STEP 4 — APPLY the reloadable diff (idempotent, ordered, all-or-nothing on
+    // what validated). value-swaps first (lowest risk), then the subscription
+    // reconcile (read-after-subscribe on adds, RFC 0017 §5.3).
+    apply_value_swaps(base, &new_cfg, log);
+    apply_subscription_diff(running, &new_cfg, router, owner, servers, log);
+
+    // STEP 5 — self-MCP surface refresh. The tool set is `mcp_servers`-derived
+    // and `mcp_servers` is restart-only here, so it never changes on a reload —
+    // no `tools/list_changed` is warranted. `agentd://config/effective` is a
+    // documented follow-up as a SUBSCRIBABLE served resource (the effective view
+    // is already exposed via `Config::effective_view` for a one-shot read); we do
+    // not fire `resources/updated` for a resource the served surface does not yet
+    // subscribe, to avoid advertising a push that has no subscriber. (Noted in the
+    // report as the follow-up.)
+
+    // STEP 6 — clear the guard, emit success, bump the generation + metric.
+    signals::set_reloading(false);
+    *generation += 1;
+    log.info(
+        "config.reloaded",
+        json!({"changed": changed, "applied_ms": started.elapsed().as_millis() as u64}),
+    );
+    crate::obs::metrics::record_config_reload("applied");
+    crate::obs::metrics::set_config_generation(*generation);
+    Some(new_cfg)
+}
+
+/// Emit the `config.reload_rejected` event + the `rejected` metric (RFC 0017
+/// §5.6 / §7). A rejected reload is a clean no-op; the generation does NOT
+/// advance. `field` names the offending field when known.
+#[cfg(feature = "hot-reload")]
+fn reject(log: &Logger, _generation: &mut u64, reason: &str, field: Option<String>, msg: &str) {
+    log.warn(
+        "config.reload_rejected",
+        json!({"reason": reason, "field": field, "diagnostics": [msg]}),
+    );
+    crate::obs::metrics::record_config_reload("rejected");
+}
+
+/// The reloadable field groups (RFC 0017 §5.1) that differ between `running` and
+/// `new` — the success event's `changed` list. Restart-only fields are excluded
+/// (the coherence check already proved they are unchanged). Pure.
+#[cfg(feature = "hot-reload")]
+fn reloadable_changes(running: &Config, new: &Config) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if running.model != new.model
+        || running.max_tokens != new.max_tokens
+        || running.intelligence_headers != new.intelligence_headers
+    {
+        changed.push("model");
+    }
+    if running.max_steps != new.max_steps
+        || running.max_depth != new.max_depth
+        || running.deadline != new.deadline
+    {
+        changed.push("limits");
+    }
+    if running.log_level != new.log_level {
+        changed.push("log_level");
+    }
+    if running.subscribe != new.subscribe {
+        changed.push("subscribe");
+    }
+    changed
+}
+
+/// Apply the low-risk value-swaps (RFC 0017 §5.3 step 4) into the working spawn
+/// template `base`, so the NEXT reaction's payload uses them. model/max_tokens →
+/// the intel + limits blocks; limits.* → the new spawn template; log_level → the
+/// child telemetry level (and logged immediately). In-flight children keep their
+/// already-minted budgets (§5.5) — only NEW spawns see the new template.
+#[cfg(feature = "hot-reload")]
+fn apply_value_swaps(base: &mut SpawnPayload, new: &Config, log: &Logger) {
+    base.intelligence.model = new.model.clone();
+    base.limits.max_tokens = new.max_tokens;
+    base.limits.max_steps = new.max_steps;
+    base.limits.max_depth = new.max_depth;
+    base.limits.deadline_ms = new
+        .deadline
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(315_360_000_000);
+    base.telemetry.log_level = new.log_level.as_str().to_string();
+    log.info(
+        "config.reload.values",
+        json!({
+            "model": new.model,
+            "max_tokens": new.max_tokens,
+            "max_steps": new.max_steps,
+            "max_depth": new.max_depth,
+            "log_level": new.log_level.as_str(),
+        }),
+    );
+}
+
+/// Reconcile the declared `subscribe` set across the reload boundary (RFC 0017
+/// §5.3 step 4 / §5.5): unsubscribe REMOVED URIs (drop their route + owner);
+/// for ADDED URIs subscribe on a supporting server AND read-after-subscribe
+/// (MANDATORY — synthesize the initial read so edge→level holds across the
+/// reload), adding their route. Unchanged URIs are left untouched. This reuses
+/// the already-proven restart reconcile machinery, run at a reload boundary.
+#[cfg(feature = "hot-reload")]
+fn apply_subscription_diff(
+    running: &Config,
+    new: &Config,
+    router: &mut Router,
+    owner: &mut HashMap<String, usize>,
+    servers: &[McpClient],
+    log: &Logger,
+) {
+    use std::collections::HashSet;
+    let old_set: HashSet<&str> = running.subscribe.iter().map(String::as_str).collect();
+    let new_set: HashSet<&str> = new.subscribe.iter().map(String::as_str).collect();
+
+    // REMOVED: unsubscribe + drop the route + owner (and any pending delivery).
+    for uri in running.subscribe.iter() {
+        if !new_set.contains(uri.as_str()) {
+            if let Some(i) = owner.remove(uri) {
+                let _ = servers[i].unsubscribe(uri); // best-effort
+            }
+            router.remove_exact(uri);
+            log.info("unsubscribe", json!({"uri": uri, "kind": "reload"}));
+        }
+    }
+
+    // ADDED: subscribe on the first supporting server, add the route, then
+    // read-after-subscribe so a change that predates the subscribe isn't missed.
+    let now = Instant::now();
+    for uri in new.subscribe.iter() {
+        if old_set.contains(uri.as_str()) || router.has_exact(uri) {
+            continue; // unchanged (or already routed) — leave it
+        }
+        let mut armed = false;
+        for (i, s) in servers.iter().enumerate() {
+            if s.capabilities().supports_subscribe() && s.subscribe(uri).is_ok() {
+                owner.insert(uri.clone(), i);
+                router.add_route(Route::new(uri, Disposition::Spawn, DEBOUNCE));
+                log.info(
+                    "subscribe",
+                    json!({"uri": uri, "server": s.name(), "kind": "reload"}),
+                );
+                // MANDATORY read-after-subscribe (RFC 0017 §5.3): convert the
+                // edge-triggered `updated` into level-triggered "act on current
+                // state" across the reload boundary, exactly like startup.
+                if router.on_updated(uri, now) {
+                    log.info(
+                        "reactive.initial_read",
+                        json!({"uri": uri, "kind": "reload"}),
+                    );
+                }
+                armed = true;
+                break;
+            }
+        }
+        if !armed {
+            log.warn(
+                "subscribe.unsupported",
+                json!({"uri": uri, "kind": "reload"}),
+            );
+        }
+    }
+}
+
+/// Whether a config FILE is in play (`--config` / `AGENTD_CONFIG`) — a reload
+/// only matters when the FILE (the one mutable layer) can change. Used to scope
+/// the restart-only-in-file advisory warnings (RFC 0017 §5.4 check 1). Pure.
+#[cfg(feature = "hot-reload")]
+fn config_file_present(args: &[String], env: &[(String, String)]) -> bool {
+    args.iter().any(|a| a == "--config") || env.iter().any(|(k, _)| k == "AGENTD_CONFIG")
+}
+
+/// Whether the run id was EXPLICITLY set (`--run-id` / `AGENTD_RUN_ID`) rather
+/// than auto-minted by `load` (RFC 0011 §6 / RFC 0017 §5). A reload re-runs
+/// `load`, which re-mints an auto run id each call; an auto id is therefore not a
+/// real config change and is pinned to the running one (see `apply_reload`). An
+/// explicit id that genuinely changed remains a (correct) restart-only reject.
+#[cfg(feature = "hot-reload")]
+fn run_id_explicit(args: &[String], env: &[(String, String)]) -> bool {
+    args.iter().any(|a| a == "--run-id") || env.iter().any(|(k, _)| k == "AGENTD_RUN_ID")
 }
 
 /// `loop`/`schedule` driver — re-run the standing instruction on a timer until

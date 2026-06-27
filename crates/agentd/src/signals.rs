@@ -17,6 +17,23 @@ mod imp {
     static DRAINING: AtomicBool = AtomicBool::new(false);
     static FORCE: AtomicBool = AtomicBool::new(false);
     static CHILD_EXIT: AtomicBool = AtomicBool::new(false);
+    // Hot-reload request latch (RFC 0017 §5.2). The SIGHUP handler sets it +
+    // wakes the reactor; the reactive supervisor consults `reload_requested()`
+    // on its next tick (after `health::tick()`, like `draining()`) and runs the
+    // validate-first/quiesce/apply choreography, then `clear_reload()`s it. A
+    // SIGHUP while DRAINING is ignored (drain wins — checked at the consult site),
+    // so this latch can be set-but-never-honoured during a drain, which is fine:
+    // the process is exiting. The handler is registered ONLY under the
+    // `hot-reload` feature; without it SIGHUP keeps its default disposition.
+    static RELOAD: AtomicBool = AtomicBool::new(false);
+    // Reload-in-progress guard (RFC 0017 §5.3 step 3). Set while the reactive
+    // supervisor is APPLYING a validated reload; the served `subagent.spawn`
+    // chokepoint consults it and returns a transient "reload in progress" error to
+    // NEW spawns (mirrors the `draining` guard, but transient — cleared in step 6).
+    // Like PAUSED/LAME_DUCK it rides here (not a feature-gated module) so it is one
+    // process-global truth the served surface reads without a feature dependency;
+    // it is only ever SET by the `hot-reload` reactive apply step.
+    static RELOADING: AtomicBool = AtomicBool::new(false);
     // Lame-duck override (RFC 0015 §4.2): a one-way-per-call readiness override
     // toward NotReady, flipped by the `lame-duck` operator tool — NOT a signal.
     // It rides here (not in a feature-gated module) so it is one process-global
@@ -61,6 +78,16 @@ mod imp {
         wake();
     }
 
+    /// Async-signal-safe SIGHUP handler (RFC 0017 §5.2): set the RELOAD latch +
+    /// wake the reactor. Exactly the SIGTERM pattern (one atomic store + one
+    /// self-pipe byte); the heavy lifting (re-load, validate, apply) runs on the
+    /// reactor thread, never here. Registered only under the `hot-reload` feature.
+    #[cfg(feature = "hot-reload")]
+    extern "C" fn on_hup(_sig: libc::c_int) {
+        RELOAD.store(true, Ordering::SeqCst);
+        wake();
+    }
+
     fn set_handler(sig: libc::c_int, handler: libc::sighandler_t, flags: libc::c_int) {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
@@ -100,6 +127,14 @@ mod imp {
         // SA_NOCLDSTOP: only fire on child *termination*, not stop/continue.
         set_handler(libc::SIGCHLD, chld, libc::SA_NOCLDSTOP);
         set_handler(libc::SIGPIPE, libc::SIG_IGN, 0);
+        // SIGHUP → hot reload (RFC 0017 §5.2), only when the feature is built.
+        // Without it SIGHUP keeps its default disposition (terminate) — exactly
+        // the RFC 0011 §4.1 signal table (this is the *one* amendment, gated).
+        #[cfg(feature = "hot-reload")]
+        {
+            let hup = on_hup as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            set_handler(libc::SIGHUP, hup, 0);
+        }
     }
 
     pub fn draining() -> bool {
@@ -150,6 +185,42 @@ mod imp {
         CHILD_EXIT.swap(false, Ordering::SeqCst)
     }
 
+    /// Has a hot reload been requested (SIGHUP, RFC 0017 §5.2)? Read by the
+    /// reactive supervisor's tick; cleared with `clear_reload()` once the reload
+    /// routine has run (whether it applied or was rejected — both consume the
+    /// request). Always readable, but only ever SET under the `hot-reload`
+    /// feature (the handler is the only setter besides `request_reload`).
+    pub fn reload_requested() -> bool {
+        RELOAD.load(Ordering::SeqCst)
+    }
+
+    /// Clear the hot-reload latch (after the reload routine has run, or when a
+    /// drain supersedes it). Idempotent.
+    pub fn clear_reload() {
+        RELOAD.store(false, Ordering::SeqCst);
+    }
+
+    /// Programmatically request a hot reload (parity with `request_drain` — for
+    /// a future `reload` operator tool / tests), plus a reactor wakeup. Honoured
+    /// only by a `hot-reload` build's reactive loop; a no-feature build never
+    /// consults the latch, so this is inert there.
+    pub fn request_reload() {
+        RELOAD.store(true, Ordering::SeqCst);
+        wake();
+    }
+
+    /// Is a validated reload mid-apply (RFC 0017 §5.3 step 3)? The served
+    /// `subagent.spawn` chokepoint reads this and transiently refuses NEW spawns.
+    pub fn reloading() -> bool {
+        RELOADING.load(Ordering::SeqCst)
+    }
+
+    /// Set/clear the reload-in-progress guard (the reactive apply step brackets
+    /// its reloadable-diff application with `set_reloading(true)`/`(false)`).
+    pub fn set_reloading(on: bool) {
+        RELOADING.store(on, Ordering::SeqCst);
+    }
+
     pub fn wakeup_fd() -> i32 {
         WAKE_R.load(Ordering::SeqCst)
     }
@@ -191,6 +262,15 @@ mod imp {
     pub fn take_child_exit() -> bool {
         false
     }
+    pub fn reload_requested() -> bool {
+        false
+    }
+    pub fn clear_reload() {}
+    pub fn request_reload() {}
+    pub fn reloading() -> bool {
+        false
+    }
+    pub fn set_reloading(_on: bool) {}
     pub fn wakeup_fd() -> i32 {
         -1
     }
@@ -249,6 +329,41 @@ pub fn set_paused(on: bool) {
 /// Take-and-clear the SIGCHLD flag — true if a child exited since last checked.
 pub fn take_child_exit() -> bool {
     imp::take_child_exit()
+}
+
+/// Has a hot reload been requested (SIGHUP, RFC 0017 §5.2)? The reactive
+/// supervisor consults this each tick; a drain supersedes it (the caller checks
+/// `draining()` first). Always `false` on a build without the `hot-reload`
+/// feature (the handler that sets it is feature-gated).
+pub fn reload_requested() -> bool {
+    imp::reload_requested()
+}
+
+/// Clear the hot-reload latch once the reload routine has run (applied or
+/// rejected), or when a drain supersedes the request. Idempotent.
+pub fn clear_reload() {
+    imp::clear_reload()
+}
+
+/// Programmatically request a hot reload (the same RELOAD latch SIGHUP sets) +
+/// a reactor wakeup. Parity with `request_drain`; honoured only by a
+/// `hot-reload` build's reactive loop.
+pub fn request_reload() {
+    imp::request_reload()
+}
+
+/// Is a validated reload mid-apply (RFC 0017 §5.3 step 3)? The served
+/// `subagent.spawn` chokepoint reads this to transiently refuse NEW spawns while
+/// the reloadable diff is being applied. Always `false` off the `hot-reload` path
+/// (only the reactive apply step ever sets it).
+pub fn reloading() -> bool {
+    imp::reloading()
+}
+
+/// Set or clear the reload-in-progress guard. The reactive apply step brackets
+/// its reloadable-diff application with `set_reloading(true)` then `(false)`.
+pub fn set_reloading(on: bool) {
+    imp::set_reloading(on)
 }
 
 /// The read end of the self-pipe — the reactor waits on it for prompt wakeups.

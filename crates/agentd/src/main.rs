@@ -263,7 +263,14 @@ fn run() -> i32 {
                 .as_ref()
                 .and_then(|spec| serve_self_mcp(spec, &exe, root_payload(&cfg), &cfg, &log));
             let code = match cfg.mode {
-                Mode::Reactive => run_reactive(exe, root_payload(&cfg), &cfg, &log),
+                // The reactive driver re-reads the config FILE on SIGHUP (RFC 0017
+                // §5), so it needs the process's original argv + env (the fixed
+                // env/flag layers; only the FILE can change between loads). These
+                // are inert without the `hot-reload` feature (the loop never
+                // consults the reload latch), so the no-reload path is unchanged.
+                Mode::Reactive => {
+                    run_reactive(exe, root_payload(&cfg), &cfg, &argv[1..], &env, &log)
+                }
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
             };
             // On shutdown, let in-flight served runs drain before we exit (their

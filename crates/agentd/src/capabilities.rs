@@ -262,8 +262,11 @@ fn surfaces(cfg: &Config) -> Value {
         // RFC 0017 control-plane surfaces. `config_validate` (--validate-config,
         // §4.1) and `config_schema` (--config-schema, §4.2) are dependency-free
         // default-build flags — always available, so always advertised true.
-        // `hot_reload` (§5) is chunk B (still deferred).
-        "hot_reload": false,
+        // `hot_reload` (§5) is the SIGHUP-triggered reload of the reloadable
+        // subset — served only in a `hot-reload` build (the SIGHUP handler is
+        // feature-gated; without it SIGHUP keeps its default disposition). The
+        // inotify file-watch trigger is a documented follow-up.
+        "hot_reload": cfg!(feature = "hot-reload"),
         "config_validate": true,
         "config_schema": true,
         // RFC 0019 horizontal-scaling surface. `cluster` is true in a `cluster`
@@ -453,8 +456,8 @@ mod tests {
         // events needs `events` + a management transport (neither configured here).
         assert_eq!(s["events"], json!(false));
         // RFC 0017: config_validate/config_schema are always-available default-build
-        // flags (true); hot_reload is chunk B (still deferred).
-        assert_eq!(s["hot_reload"], json!(false));
+        // flags (true); hot_reload reflects the `hot-reload` build feature (§5).
+        assert_eq!(s["hot_reload"], json!(cfg!(feature = "hot-reload")));
         assert_eq!(s["config_validate"], json!(true));
         assert_eq!(s["config_schema"], json!(true));
         // Frozen contract versions, read from their owning modules (RFC 0016).

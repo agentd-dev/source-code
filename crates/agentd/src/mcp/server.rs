@@ -359,6 +359,83 @@ impl ServeCtx {
         })
     }
 
+    /// The `agentd://inventory` projection (RFC 0015 §5.3) — the instance-local
+    /// view of the served subagent tree: the lifecycle flags, totals, and a
+    /// `nodes[]` array projected from the served-run registries (warm sessions +
+    /// async runs). It is a pure read of supervisor-held state, so it costs only
+    /// serialization. `draining` reads the global drain latch (the same one the
+    /// `drain` tool/SIGTERM set); `ready` reflects the lame-duck override; `paused`
+    /// is constant `false` — pause/resume are DEFERRED (no `ctrl/pause` machinery
+    /// yet). `status` reuses the terminal-status vocabulary (RFC 0007 §3.4) plus
+    /// `running` for a live node — this surface introduces no new status.
+    fn inventory_body(&self) -> Value {
+        let mut nodes: Vec<Value> = Vec::new();
+        let mut active = 0u64;
+        // Warm sessions: live (driven by subagent.send) until done. Drain is not
+        // done here (a &self read must not mutate the channel); `status` reflects
+        // the last observed turn state.
+        if let Ok(warm) = self.warm.lock() {
+            for (handle, w) in warm.iter() {
+                let status = if w.done {
+                    "completed"
+                } else if w.pending > 0 {
+                    "working"
+                } else {
+                    "idle"
+                };
+                if !w.done {
+                    active += 1;
+                }
+                nodes.push(json!({
+                    "handle": handle,
+                    "depth": 0,                 // served runs are fresh roots (RFC 0005 §3.2)
+                    "kind": "warm",
+                    "status": status,
+                    "paused": false,
+                    "usage": { "turns": w.turns },
+                    "last_event_ms": w.started.elapsed().as_millis() as u64,
+                }));
+            }
+        }
+        // Async runs, by handle.
+        if let Ok(reg) = self.sessions.lock() {
+            for (handle, s) in reg.iter() {
+                let status = match &s.status {
+                    ServedStatus::Running => "running",
+                    ServedStatus::Done { status, .. } => status.as_str(),
+                    ServedStatus::Failed(_) => "failed",
+                    ServedStatus::Cancelled => "cancelled",
+                };
+                if !s.status.is_terminal() {
+                    active += 1;
+                }
+                nodes.push(json!({
+                    "handle": handle,
+                    "depth": 0,
+                    "kind": "async",
+                    "status": status,
+                    "paused": false,
+                    "usage": {},
+                    "last_event_ms": s.started.elapsed().as_millis() as u64,
+                }));
+            }
+        }
+        json!({
+            "run_id": self.run_id,
+            "mode": self.mode,
+            // Instance-level lifecycle flags (RFC 0015 §4 / §5.3).
+            "draining": crate::signals::draining(),
+            "paused": false, // pause/resume deferred (no ctrl/pause machinery)
+            "ready": !crate::signals::lame_duck() && !crate::signals::draining(),
+            "totals": {
+                "active": active,
+                "total_spawned": self.counter.load(Ordering::Relaxed),
+                "depth": 0,
+            },
+            "nodes": nodes,
+        })
+    }
+
     /// The aggregate state of this served run — what `agentd://run/<run_id>`
     /// reads + pushes on each change. The `root` handle convention names the run's
     /// own node (depth 0); `status` is "running" for the daemon's life. Spawn
@@ -574,7 +651,6 @@ fn dispatch(
     conn: u64,
     log: &Logger,
 ) -> Response {
-    let _ = origin; // chunk 3 (RFC 0015 §3.4) reads this to gate operator tools.
     match req.method.as_str() {
         "initialize" => Response::ok(
             req.id,
@@ -587,14 +663,26 @@ fn dispatch(
             }),
         ),
         "ping" => Response::ok(req.id, json!({})),
-        "tools/list" => Response::ok(
-            req.id,
-            json!({"tools": [status_tool_def(), spawn_tool_def(), send_tool_def(), session_status_tool_def(), session_cancel_tool_def()]}),
-        ),
-        "tools/call" => tools_call(req, ctx, log),
-        "resources/list" => Response::ok(req.id, json!({"resources": resource_list(ctx)})),
-        "resources/read" => resources_read(req, ctx),
-        "resources/subscribe" => subscribe_resource(req, ctx, writer, conn),
+        // The work tools are listed to every peer; the operator tools
+        // (drain/lame-duck/cancel) only to a `Management` peer (RFC 0015 §3.4) —
+        // a stdio-spawned subagent must never see, much less call, them.
+        "tools/list" => {
+            let mut tools = vec![
+                status_tool_def(),
+                spawn_tool_def(),
+                send_tool_def(),
+                session_status_tool_def(),
+                session_cancel_tool_def(),
+            ];
+            if origin == PeerOrigin::Management {
+                tools.extend(operator_tool_defs());
+            }
+            Response::ok(req.id, json!({ "tools": tools }))
+        }
+        "tools/call" => tools_call(req, ctx, origin, log),
+        "resources/list" => Response::ok(req.id, json!({"resources": resource_list(ctx, origin)})),
+        "resources/read" => resources_read(req, ctx, origin),
+        "resources/subscribe" => subscribe_resource(req, ctx, origin, writer, conn),
         "resources/unsubscribe" => unsubscribe_resource(req, ctx, conn),
         other => Response::err(
             req.id,
@@ -617,7 +705,13 @@ fn dispatch(
 /// An unknown / already-finished handle (or the read-only `agentd://status`) is
 /// rejected so the peer `resources/read`s it instead; this also avoids storing a
 /// subscription that would never fire.
-fn subscribe_resource(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn: u64) -> Response {
+fn subscribe_resource(
+    req: Request,
+    ctx: &ServeCtx,
+    origin: PeerOrigin,
+    writer: &SharedWriter,
+    conn: u64,
+) -> Response {
     let uri = req
         .params
         .as_ref()
@@ -625,6 +719,18 @@ fn subscribe_resource(req: Request, ctx: &ServeCtx, writer: &SharedWriter, conn:
         .and_then(Value::as_str)
         .unwrap_or("");
     match crate::agentd_uri::AgentdResource::parse(uri) {
+        // agentd://inventory fires REPEATEDLY (each spawn/exit/status change) and
+        // is Management-only (RFC 0015 §5.3) — reject a non-Management subscribe
+        // as not-found, matching the read gate.
+        Some(crate::agentd_uri::AgentdResource::Inventory) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("not a subscribable resource: {uri}"),
+                );
+            }
+        }
         Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
             let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
             match reg.get(&handle) {
@@ -772,34 +878,46 @@ fn notify_resource_updated_keep(subs: &SubRegistry, uri: &str) {
 /// (eviction / session end) and this reply-only transport has no
 /// `resources/list_changed` to announce that, so a listed handle could 404 on
 /// read. Listing only the stable resources avoids advertising vanishing ones.
-fn resource_list(ctx: &ServeCtx) -> Value {
-    json!([
-        {
+fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
+    let mut list = vec![
+        json!({
             "uri": "agentd://status",
             "name": "status",
             "description": "This agentd's run id, mode, version, pid, uptime, and spawn counts.",
             "mimeType": "application/json"
-        },
-        {
+        }),
+        json!({
             // Stable + listable (RFC 0015 §3.4): a self-description manifest, readable
             // on every origin. The run id is fixed at startup, so the uri never 404s.
             "uri": "agentd://capabilities",
             "name": "capabilities",
             "description": "This agentd's self-description: identity, the declared capability surface (intelligence transport, MCP servers, exec, limits, isolation), and live daemon counters.",
             "mimeType": "application/json"
-        },
-        {
+        }),
+        json!({
             "uri": crate::agentd_uri::run_uri(&ctx.run_id),
             "name": "run",
             "description": "This served run's aggregate: mode, root handle, status, spawn counts, and uptime. Subscribable — pushed on each spawn / terminal-run change.",
             "mimeType": "application/json"
-        }
-    ])
+        }),
+    ];
+    // agentd://inventory is operator-facing — listed (and readable) only to a
+    // `Management` peer (RFC 0015 §3.4 / §5.3). A stdio-spawned subagent never
+    // sees it; a stdio read of it 404s like any unknown uri (resources_read).
+    if origin == PeerOrigin::Management {
+        list.push(json!({
+            "uri": crate::agentd_uri::INVENTORY_URI,
+            "name": "inventory",
+            "description": "The live subagent-tree projection: lifecycle flags (draining/paused/ready), totals, and per-node status/usage. Subscribable — pushed on each spawn / exit / status change.",
+            "mimeType": "application/json"
+        }));
+    }
+    Value::Array(list)
 }
 
 /// `resources/read` over the agentd:// scheme. A known URI returns a `contents`
 /// body; an unknown/missing URI is a JSON-RPC INVALID_PARAMS error.
-fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
+fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response {
     let uri = req
         .params
         .as_ref()
@@ -813,6 +931,24 @@ fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
                 "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.status_body().to_string()}]
             }),
         ),
+        // agentd://inventory — operator-facing, Management-only (RFC 0015 §5.3).
+        // A non-Management origin is refused as resource-not-found (the same shape
+        // as an unknown uri) so a stdio peer can't even confirm it exists.
+        Some(crate::agentd_uri::AgentdResource::Inventory) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("resource not found: {uri}"),
+                );
+            }
+            Response::ok(
+                req.id,
+                json!({
+                    "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.inventory_body().to_string()}]
+                }),
+            )
+        }
         // agentd://capabilities — the live self-description manifest (RFC 0015
         // §3.4). Readable on every origin (it discloses no secret, confers no
         // authority).
@@ -876,13 +1012,33 @@ fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
     }
 }
 
-fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
+fn tools_call(req: Request, ctx: &ServeCtx, origin: PeerOrigin, log: &Logger) -> Response {
     let name = req
         .params
         .as_ref()
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    // The operator tools are gated by transport origin, not an in-band flag
+    // (RFC 0015 §3.4). A `Stdio` peer never reaches the operator arms — they
+    // fall through to the `-32601`-style unknown-tool error below, so a spawned
+    // subagent can neither see (tools/list) nor invoke (tools/call) them. Bare
+    // `match` arms with a `Management` guard keep the gate structural.
+    if origin == PeerOrigin::Management {
+        let args = || {
+            req.params
+                .as_ref()
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or(json!({}))
+        };
+        match name {
+            "drain" => return handle_drain(req.id, ctx, &args(), log),
+            "lame-duck" => return handle_lame_duck(req.id, ctx, &args(), log),
+            "cancel" => return handle_cancel(req.id, ctx, &args(), log),
+            _ => {}
+        }
+    }
     match name {
         "status" => {
             let body = ctx.status_body();
@@ -921,6 +1077,156 @@ fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             format!("unknown tool: {other}"),
         ),
     }
+}
+
+/// The operator tool defs listed to a `Management` peer (RFC 0015 §4). The names
+/// MIRROR `capabilities::OPERATOR_TOOLS` — the manifest's `surfaces.operator_tools`
+/// and this `tools/list` set are the same const, so they cannot drift (§5.2).
+/// `pause`/`resume` are deferred (no `ctrl/pause` machinery yet), so they're
+/// absent here and in the manifest.
+fn operator_tool_defs() -> Vec<Value> {
+    vec![drain_tool_def(), lame_duck_tool_def(), cancel_tool_def()]
+}
+
+/// `drain` (RFC 0015 §4.1) — trigger the SAME graceful-drain choreography
+/// SIGTERM does, via the one-way `DRAINING` latch (`signals::request_drain`), and
+/// return immediately with a snapshot. Idempotent/monotonic: a second `drain`
+/// (or a SIGTERM after this) re-reports; it never escalates to the second-signal
+/// FORCE path. `deadline_ms` is accepted and clamped to the configured drain
+/// timeout (never above it, so a tool call can't push drain past the pod grace,
+/// RFC 0015 §8) — the latch itself carries no deadline, so the clamp only shapes
+/// the reported `eta_ms`.
+fn handle_drain(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
+    crate::signals::request_drain();
+    let drain_timeout_ms = ctx.drain_timeout.as_millis() as u64;
+    // An optional deadline override is clamped to the configured bound.
+    let eta_ms = args
+        .get("deadline_ms")
+        .and_then(Value::as_u64)
+        .map_or(drain_timeout_ms, |d| d.min(drain_timeout_ms));
+    let in_flight = ctx.inflight.load(Ordering::Relaxed);
+    let started_at = crate::obs::log::rfc3339_millis(std::time::SystemTime::now());
+    log.info(
+        "mcp.drain",
+        json!({"in_flight": in_flight, "eta_ms": eta_ms}),
+    );
+    let body = json!({
+        "draining": true,
+        "in_flight": in_flight,
+        "eta_ms": eta_ms,
+        "drain_timeout_ms": drain_timeout_ms,
+        "started_at": started_at,
+    });
+    Response::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": format!("draining: {in_flight} in flight, eta {eta_ms}ms")}],
+            "structuredContent": body,
+            "isError": false
+        }),
+    )
+}
+
+/// `lame-duck` (RFC 0015 §4.2) — flip the readiness override toward NotReady
+/// (`ready:false`, the default) or clear it (`ready:true`), WITHOUT draining or
+/// exiting. The override only ever pushes *toward* NotReady: clearing it restores
+/// the genuine computed readiness (it can't assert Ready over a not-ready
+/// supervisor — here, a drain in progress still holds `/readyz` down). Reversible.
+fn handle_lame_duck(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
+    // Default false: the unqualified call lame-ducks the instance (§4.2).
+    let want_ready = args.get("ready").and_then(Value::as_bool).unwrap_or(false);
+    // A drain already holds readiness down and cannot be undone (one-way latch) —
+    // `ready:true` then can't assert Ready, so report it honestly as a refusal
+    // rather than silently flip a flag with no effect.
+    if want_ready && crate::signals::draining() {
+        return tool_error(
+            id,
+            "cannot clear lame-duck: a drain is in progress (readiness stays NotReady)".to_string(),
+        );
+    }
+    crate::signals::set_lame_duck(!want_ready);
+    let in_flight = ctx.inflight.load(Ordering::Relaxed);
+    let since = crate::obs::log::rfc3339_millis(std::time::SystemTime::now());
+    log.info("mcp.lame_duck", json!({"ready": want_ready}));
+    let body = json!({ "ready": want_ready, "since": since, "in_flight": in_flight });
+    Response::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": if want_ready { "readiness override cleared" } else { "lame-duck: advertising NotReady" }}],
+            "structuredContent": body,
+            "isError": false
+        }),
+    )
+}
+
+/// `cancel` (RFC 0015 §4.4) — the instance-scoped wrapper over the served
+/// cancellation by handle (the `subagent.cancel` path). Cancels a tracked warm
+/// session or async run by handle; an unknown handle is `isError:true` inside a
+/// successful result (a racing reap may have already removed it — RFC 0015 §8),
+/// not a protocol error. `cancel{handle:"0"}`/`"served.0"` targets the run, never
+/// the supervisor — distinct from `drain`, which also exits.
+fn handle_cancel(id: Id, ctx: &ServeCtx, args: &Value, _log: &Logger) -> Response {
+    let handle = args
+        .get("handle")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if handle.is_empty() {
+        return Response::err(id, json::INVALID_PARAMS, "cancel requires a 'handle'");
+    }
+    // Warm session?
+    {
+        let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = warm.get_mut(&handle) {
+            let _ = w.sub.send(&ControlMsg::Cancel {
+                reason: cancel_reason(args),
+            });
+            // Drop the Subagent outside the lock (its Drop SIGKILL+reaps).
+            let removed = warm.remove(&handle);
+            drop(warm);
+            drop(removed);
+            notify_resource_updated_keep(&ctx.subscriptions, crate::agentd_uri::INVENTORY_URI);
+            let body = json!({ "handle": handle, "cancelled": true });
+            return Response::ok(
+                id,
+                json!({"content": [{"type": "text", "text": format!("cancelled {handle}")}], "structuredContent": body, "isError": false}),
+            );
+        }
+    }
+    // Async run?
+    let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    match reg.get_mut(&handle) {
+        Some(s) if !s.status.is_terminal() => {
+            s.cancel.store(true, Ordering::Relaxed);
+            drop(reg);
+            notify_resource_updated_keep(&ctx.subscriptions, crate::agentd_uri::INVENTORY_URI);
+            let body = json!({ "handle": handle, "cancelled": true });
+            Response::ok(
+                id,
+                json!({"content": [{"type": "text", "text": format!("cancel requested for {handle}; it is draining")}], "structuredContent": body, "isError": false}),
+            )
+        }
+        Some(_) => {
+            // Already finished — nothing to cancel, but not an error condition.
+            let body =
+                json!({ "handle": handle, "cancelled": false, "reason": "already finished" });
+            Response::ok(
+                id,
+                json!({"content": [{"type": "text", "text": format!("{handle} already finished; nothing to cancel")}], "structuredContent": body, "isError": false}),
+            )
+        }
+        // Unknown handle → isError result (a racing reap, §8), not a protocol error.
+        None => tool_error(id, format!("no such handle: {handle}")),
+    }
+}
+
+/// The cancel reason surfaced into `ctrl/cancel` + logs (RFC 0015 §4.4).
+fn cancel_reason(args: &Value) -> String {
+    args.get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "operator cancel".to_string())
 }
 
 /// A peer delegates a task to agentd (RFC 0005 §3.2). Build a fresh root run from
@@ -973,8 +1279,10 @@ fn handle_spawn(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let n = ctx.counter.fetch_add(1, Ordering::Relaxed);
     // A new spawn changed the run aggregate (total_spawns / inflight) → push to any
     // `agentd://run/<run_id>` subscribers (the keep-variant: the run resource fires
-    // repeatedly over the daemon's life).
+    // repeatedly over the daemon's life). The tree gained a node, so the
+    // `agentd://inventory` projection changed too (RFC 0015 §5.3 — emit on spawn).
     notify_resource_updated_keep(&ctx.subscriptions, &crate::agentd_uri::run_uri(&ctx.run_id));
+    notify_resource_updated_keep(&ctx.subscriptions, crate::agentd_uri::INVENTORY_URI);
     let handle = format!("served.{n}");
     let payload = build_served_payload(&ctx.base, &args, &handle);
     let is_warm = args.get("warm").and_then(Value::as_bool).unwrap_or(false);
@@ -1212,8 +1520,11 @@ fn spawn_async(
             // The run finished → its `agentd://subagent/<handle>` resource changed
             // (consume — it fires exactly once), and the run aggregate's inflight
             // count dropped → push the run resource too (keep — it fires repeatedly).
+            // The node reached a terminal status → the inventory projection changed
+            // (RFC 0015 §5.3 — emit on exit/status-change; keep — fires repeatedly).
             notify_resource_updated(&subs, &crate::agentd_uri::subagent_uri(&h));
             notify_resource_updated_keep(&subs, &run_uri);
+            notify_resource_updated_keep(&subs, crate::agentd_uri::INVENTORY_URI);
         });
     if spawned.is_err() {
         ctx.sessions
@@ -1475,6 +1786,59 @@ fn session_cancel_tool_def() -> Value {
             "type": "object",
             "properties": {"handle": {"type": "string", "description": "the handle from subagent.spawn async=true"}},
             "required": ["handle"]
+        }
+    })
+}
+
+fn drain_tool_def() -> Value {
+    json!({
+        "name": "drain",
+        "description": "Begin a graceful drain of this instance — identical to a SIGTERM: flip \
+            readiness to NotReady, stop accepting new work, wind down in-flight subagents at turn \
+            boundaries, then exit 0. Returns IMMEDIATELY with a snapshot (it does not block until \
+            exit). Idempotent: a second call re-reports. Management transport only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deadline_ms": {"type": "integer", "description": "optional drain budget; clamped to the configured drain timeout"}
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn lame_duck_tool_def() -> Value {
+    json!({
+        "name": "lame-duck",
+        "description": "Flip /readyz to NotReady WITHOUT draining or exiting (the rolling-update \
+            primitive): the instance keeps running and serving in-flight work but advertises \
+            'don't send me new work'. Reversible: ready=true clears the override (readiness then \
+            reflects the genuine computed state). Management transport only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ready": {"type": "boolean", "default": false, "description": "false ⇒ NotReady (default); true ⇒ clear the override"}
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+fn cancel_tool_def() -> Value {
+    json!({
+        "name": "cancel",
+        "description": "Cancel a run or subtree in THIS instance by handle (the management-transport, \
+            instance-scoped wrapper over subagent.cancel) — kills the work, keeps the pod (unlike \
+            drain, which also exits). An unknown handle is reported as an error result, not a \
+            failure. Management transport only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "the run/subtree handle to cancel"},
+                "reason": {"type": "string", "description": "surfaced in logs + ctrl/cancel"}
+            },
+            "required": ["handle"],
+            "additionalProperties": false
         }
     })
 }
@@ -1935,6 +2299,7 @@ mod tests {
             subscribe_resource(
                 req("sub", Some(json!({"uri": "agentd://run/r1"}))),
                 &ctx,
+                PeerOrigin::Management,
                 &writer(),
                 0,
             )
@@ -1946,6 +2311,7 @@ mod tests {
             subscribe_resource(
                 req("sub", Some(json!({"uri": "agentd://run/other"}))),
                 &ctx,
+                PeerOrigin::Management,
                 &writer(),
                 0,
             )
@@ -1960,6 +2326,7 @@ mod tests {
         let r = subscribe_resource(
             req("sub", Some(json!({"uri": "agentd://session/served.404"}))),
             &ctx,
+            PeerOrigin::Management,
             &writer(),
             0,
         );
@@ -1977,9 +2344,15 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         let w: SharedWriter = Arc::new(Mutex::new(ServeStream::Unix(a)));
         assert!(
-            subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7)
-                .error
-                .is_none()
+            subscribe_resource(
+                req("sub", Some(json!({"uri": uri}))),
+                &ctx,
+                PeerOrigin::Management,
+                &w,
+                7
+            )
+            .error
+            .is_none()
         );
         // The keep-variant must NOT consume the subscription: it fires every time.
         notify_resource_updated_keep(&ctx.subscriptions, uri);
@@ -2142,12 +2515,24 @@ mod tests {
         let w: SharedWriter = Arc::new(Mutex::new(ServeStream::Unix(a)));
         let uri = "agentd://subagent/served.0";
         assert!(
-            subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7)
-                .error
-                .is_none()
+            subscribe_resource(
+                req("sub", Some(json!({"uri": uri}))),
+                &ctx,
+                PeerOrigin::Management,
+                &w,
+                7
+            )
+            .error
+            .is_none()
         );
         // dedup: a second subscribe from the same conn doesn't double-register.
-        subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7);
+        subscribe_resource(
+            req("sub", Some(json!({"uri": uri}))),
+            &ctx,
+            PeerOrigin::Management,
+            &w,
+            7,
+        );
         assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 1);
 
         notify_resource_updated(&ctx.subscriptions, uri);
@@ -2164,8 +2549,20 @@ mod tests {
         let ctx = ctx();
         let uri = "agentd://subagent/served.1";
         insert_running(&ctx, "served.1");
-        subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &writer(), 3);
-        subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &writer(), 4);
+        subscribe_resource(
+            req("sub", Some(json!({"uri": uri}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            3,
+        );
+        subscribe_resource(
+            req("sub", Some(json!({"uri": uri}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            4,
+        );
         assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 2);
         unsubscribe_resource(req("unsub", Some(json!({"uri": uri}))), &ctx, 3);
         assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 1);
@@ -2185,7 +2582,13 @@ mod tests {
             "agentd://status",
             "agentd://subagent/served.999",
         ] {
-            let r = subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &writer(), 0);
+            let r = subscribe_resource(
+                req("sub", Some(json!({"uri": uri}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+            );
             assert!(r.error.is_some(), "{uri} must not be subscribable");
         }
         // an already-finished run is not subscribable either (read it instead).
@@ -2204,6 +2607,7 @@ mod tests {
         let r = subscribe_resource(
             req("sub", Some(json!({"uri": "agentd://subagent/served.5"}))),
             &ctx,
+            PeerOrigin::Management,
             &writer(),
             0,
         );
@@ -2261,5 +2665,364 @@ mod tests {
             &log(),
         );
         assert!(r.error.is_some(), "missing instruction → JSON-RPC error");
+    }
+
+    // ── RFC 0015 chunk 3: the operator surface (drain / lame-duck / cancel,
+    //    agentd://inventory, and the PeerOrigin gate). ──────────────────────────
+
+    fn tool_names(r: &Response) -> Vec<String> {
+        r.result
+            .as_ref()
+            .and_then(|v| v["tools"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn management_peer_sees_operator_tools_stdio_does_not() {
+        let mgmt = dispatch(
+            req("tools/list", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let names = tool_names(&mgmt);
+        for t in ["drain", "lame-duck", "cancel"] {
+            assert!(
+                names.contains(&t.to_string()),
+                "management sees {t}: {names:?}"
+            );
+        }
+        // The operator-tool set matches the manifest's authoritative list (§5.2).
+        for t in crate::capabilities::OPERATOR_TOOLS {
+            assert!(names.contains(&t.to_string()), "manifest tool {t} listed");
+        }
+        // pause/resume are deferred → never listed.
+        assert!(!names.contains(&"pause".to_string()), "pause is deferred");
+        assert!(!names.contains(&"resume".to_string()), "resume is deferred");
+
+        let stdio = dispatch(
+            req("tools/list", None),
+            &ctx(),
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        let names = tool_names(&stdio);
+        for t in ["drain", "lame-duck", "cancel"] {
+            assert!(
+                !names.contains(&t.to_string()),
+                "stdio must NOT see {t}: {names:?}"
+            );
+        }
+        // …but the work tools are still there for a stdio peer.
+        assert!(names.contains(&"status".to_string()));
+        assert!(names.contains(&"subagent.spawn".to_string()));
+    }
+
+    #[test]
+    fn stdio_call_of_an_operator_tool_is_refused() {
+        // A stdio peer can't even call drain — it falls through to unknown-tool
+        // (JSON-RPC error), so it can neither see nor invoke the operator surface.
+        // (DRAINING is a one-way process-global latch another test may have set;
+        // assert the refused call doesn't CHANGE it rather than asserting absolute.)
+        let before = crate::signals::draining();
+        let r = dispatch(
+            req("tools/call", Some(json!({"name": "drain"}))),
+            &ctx(),
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert!(
+            r.error.is_some(),
+            "stdio drain → JSON-RPC unknown-tool error"
+        );
+        assert_eq!(
+            crate::signals::draining(),
+            before,
+            "a refused stdio drain must not change the latch"
+        );
+        // lame-duck and cancel are equally invisible to stdio.
+        for tool in ["lame-duck", "cancel"] {
+            let r = dispatch(
+                req(
+                    "tools/call",
+                    Some(json!({"name": tool, "arguments": {"handle": "0"}})),
+                ),
+                &ctx(),
+                PeerOrigin::Stdio,
+                &writer(),
+                0,
+                &log(),
+            );
+            assert!(r.error.is_some(), "stdio {tool} → unknown-tool error");
+        }
+    }
+
+    #[test]
+    fn drain_latches_draining_and_returns_a_snapshot_idempotently() {
+        let ctx = ctx();
+        let call = || {
+            dispatch(
+                req("tools/call", Some(json!({"name": "drain"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            )
+        };
+        let v = call().result.expect("drain ok");
+        assert_eq!(v["isError"], false);
+        let body = &v["structuredContent"];
+        assert_eq!(body["draining"], true);
+        assert!(body["in_flight"].is_u64());
+        assert!(body["eta_ms"].is_u64());
+        assert!(body["drain_timeout_ms"].is_u64());
+        assert!(body["started_at"].is_string());
+        // The SAME one-way latch SIGTERM sets is now on.
+        assert!(
+            crate::signals::draining(),
+            "drain set the global DRAINING latch"
+        );
+        // Idempotent/monotonic: a second drain re-reports, never escalates to FORCE.
+        let v2 = call().result.expect("second drain ok");
+        assert_eq!(v2["structuredContent"]["draining"], true);
+        assert!(
+            !crate::signals::force(),
+            "drain never maps to the FORCE path"
+        );
+
+        // deadline_ms is clamped to the configured drain timeout (5s here).
+        let clamped = dispatch(
+            req(
+                "tools/call",
+                Some(json!({"name": "drain", "arguments": {"deadline_ms": 999_999}})),
+            ),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        )
+        .result
+        .expect("ok");
+        assert_eq!(clamped["structuredContent"]["eta_ms"], json!(5000));
+    }
+
+    #[test]
+    fn lame_duck_flips_the_readiness_override_and_clears() {
+        let ctx = ctx();
+        crate::signals::set_lame_duck(false); // clean baseline (process-global)
+        let on = dispatch(
+            req("tools/call", Some(json!({"name": "lame-duck"}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        )
+        .result
+        .expect("ok");
+        assert_eq!(on["isError"], false);
+        assert_eq!(on["structuredContent"]["ready"], false);
+        assert!(crate::signals::lame_duck(), "lame-duck override set");
+        // ready:true clears the override — but only when no drain holds readiness
+        // down. (DRAINING is a one-way process-global latch another test may have
+        // set; guard so this stays order-independent.)
+        let off = dispatch(
+            req(
+                "tools/call",
+                Some(json!({"name": "lame-duck", "arguments": {"ready": true}})),
+            ),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        )
+        .result
+        .expect("ok");
+        if crate::signals::draining() {
+            // §4.2: can't assert Ready over a draining supervisor → isError refusal.
+            assert_eq!(off["isError"], true);
+        } else {
+            assert_eq!(off["structuredContent"]["ready"], true);
+            assert!(!crate::signals::lame_duck(), "override cleared");
+        }
+    }
+
+    #[test]
+    fn cancel_unknown_handle_is_an_iserror_result_not_a_protocol_error() {
+        let r = dispatch(
+            req(
+                "tools/call",
+                Some(json!({"name": "cancel", "arguments": {"handle": "0.2.9"}})),
+            ),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("cancel returns a result, not an error");
+        assert_eq!(v["isError"], true);
+        assert!(
+            v["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no such handle"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn cancel_of_a_running_async_run_requests_cancel() {
+        let ctx = ctx();
+        insert_running(&ctx, "served.7");
+        let r = dispatch(
+            req(
+                "tools/call",
+                Some(json!({"name": "cancel", "arguments": {"handle": "served.7"}})),
+            ),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("ok");
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["cancelled"], true);
+        // The run's cancel flag is now set.
+        assert!(
+            ctx.sessions.lock().unwrap()["served.7"]
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn inventory_read_is_management_gated_and_projects_the_lifecycle_flags() {
+        let ctx = ctx();
+        crate::signals::set_lame_duck(false);
+        insert_running(&ctx, "served.0");
+        // Management read → the projection with lifecycle flags + the node.
+        let r = dispatch(
+            req("resources/read", Some(json!({"uri": "agentd://inventory"}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("inventory readable for management");
+        let body: Value = serde_json::from_str(v["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["run_id"], "r1");
+        assert_eq!(body["mode"], "reactive");
+        // The instance-level lifecycle flags (§5.3). paused is constant false
+        // (pause deferred); ready reflects the lame-duck override (clear here,
+        // and not draining unless an earlier test latched it).
+        assert_eq!(body["paused"], false);
+        assert!(body["draining"].is_boolean());
+        assert!(body["ready"].is_boolean());
+        assert!(body["totals"]["total_spawned"].is_u64());
+        // The running async node is projected with a non-new status.
+        let nodes = body["nodes"].as_array().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n["handle"] == "served.0" && n["status"] == "running"),
+            "running node projected: {nodes:?}"
+        );
+
+        // A stdio peer must NOT be able to read it — 404, as if it didn't exist.
+        let denied = dispatch(
+            req("resources/read", Some(json!({"uri": "agentd://inventory"}))),
+            &ctx,
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert!(denied.error.is_some(), "stdio inventory read is refused");
+    }
+
+    #[test]
+    fn inventory_is_listed_only_for_management() {
+        let mgmt = dispatch(
+            req("resources/list", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let mgmt_uris: Vec<String> = mgmt.result.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["uri"].as_str().map(str::to_string))
+            .collect();
+        assert!(mgmt_uris.contains(&"agentd://inventory".to_string()));
+
+        let stdio = dispatch(
+            req("resources/list", None),
+            &ctx(),
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        let stdio_uris: Vec<String> = stdio.result.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["uri"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !stdio_uris.contains(&"agentd://inventory".to_string()),
+            "inventory not listed to stdio: {stdio_uris:?}"
+        );
+        // capabilities stays visible on stdio (it's harmless self-description).
+        assert!(stdio_uris.contains(&"agentd://capabilities".to_string()));
+    }
+
+    #[test]
+    fn inventory_is_subscribable_for_management_only() {
+        let ctx = ctx();
+        // Management can subscribe (it fires repeatedly — keep-variant).
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://inventory"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+            )
+            .error
+            .is_none()
+        );
+        // A stdio peer is refused.
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://inventory"}))),
+                &ctx,
+                PeerOrigin::Stdio,
+                &writer(),
+                1,
+            )
+            .error
+            .is_some()
+        );
     }
 }

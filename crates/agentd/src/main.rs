@@ -212,8 +212,15 @@ fn run() -> i32 {
             if let Some(addr) = &cfg.metrics_addr {
                 serve_metrics(addr, &log);
             }
-            // Opt-in served self-MCP for composability (RFC 0005). Built only
-            // with `--features serve-mcp`; otherwise `--serve-mcp` warns + is inert.
+            // Opt-in served self-MCP for composability (RFC 0005) + the operator
+            // profile (RFC 0015 §4). Built only with `--features serve-mcp`;
+            // otherwise `--serve-mcp` warns + is inert. The operator tools share
+            // the daemon's lifecycle state through process-global latches in
+            // `signals` (no flag threading): `drain` flips the SAME one-way
+            // DRAINING latch SIGTERM sets — so the metrics `/readyz` probe above,
+            // the reactor's drain choreography, and the served inventory all read
+            // one truth — and `lame-duck` flips the readiness override that both
+            // `/readyz` and `agentd://inventory.ready` consult.
             let serve_handle = cfg
                 .serve_mcp
                 .as_ref()

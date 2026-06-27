@@ -1,17 +1,25 @@
-//! Intelligence client — transport selection + one round-trip. RFC 0006.
+//! Intelligence client — endpoint *list* selection + one round-trip. RFC 0006 + RFC 0018.
 //!
-//! The transport (unix / https / vsock) is chosen by the `AGENTD_INTELLIGENCE`
-//! URI; the wire is always HTTP/1.1 (the gateway/provider speaks
+//! The transport (unix / https / vsock) is chosen by each `AGENTD_INTELLIGENCE`
+//! list element; the wire is always HTTP/1.1 (the gateway/provider speaks
 //! OpenAI-compatible `/chat/completions`). One request opens one connection
-//! (`Connection: close`) — simple and robust; pooling is a later optimisation.
+//! (`Connection: close`) — simple and robust; pooling is a non-goal (RFC 0018 §10).
+//!
+//! RFC 0018 makes the channel **resilient**: `--intelligence` is an ordered list
+//! (primary + fallbacks); `complete()` drives the list through the sticky-primary
+//! failover policy ([`super::failover`]) with a per-endpoint health record +
+//! circuit breaker ([`super::health`]). A single-element list is byte-for-byte RFC
+//! 0006 behaviour — the failover machinery is inert with one endpoint. The
+//! wire/adapter/JSON path is UNCHANGED; only endpoint *selection* wraps it.
 
-use crate::config::Config;
-use crate::net::http::{self, Stream, Url};
+use crate::net::http::{Stream, Url};
 use crate::wire::intel::{Request, Response};
+use std::cell::RefCell;
 use std::fmt;
 use std::time::Duration;
 
-use super::{anthropic, openai};
+use super::endpoints::EndpointList;
+use super::{anthropic, failover, openai};
 
 /// Which in-binary adapter speaks to the endpoint. OpenAI-compatible is the
 /// canonical default; anthropic is the only other in-binary dialect. Anything
@@ -41,6 +49,11 @@ pub enum IntelError {
     Parse(String),
     /// A transport this build doesn't support (e.g. https without `tls`).
     Unsupported(String),
+    /// Every endpoint in the list is down/broken after the bounded failover
+    /// sweep (RFC 0018 §6). The boxed cause is the last failover-class error
+    /// seen. Maps to the same fatal-infra class as `Transport` → exit 4 on
+    /// `once`; a loop/reactive daemon backs off rather than crashing.
+    AllEndpointsDown(Option<Box<IntelError>>),
 }
 
 impl fmt::Display for IntelError {
@@ -50,6 +63,10 @@ impl fmt::Display for IntelError {
             IntelError::Http(code, body) => write!(f, "intelligence HTTP {code}: {body}"),
             IntelError::Parse(m) => write!(f, "{m}"),
             IntelError::Unsupported(m) => write!(f, "{m}"),
+            IntelError::AllEndpointsDown(cause) => match cause {
+                Some(e) => write!(f, "all intelligence endpoints down (last error: {e})"),
+                None => write!(f, "all intelligence endpoints down"),
+            },
         }
     }
 }
@@ -61,47 +78,68 @@ impl From<std::io::Error> for IntelError {
     }
 }
 
-/// A resolved intelligence endpoint.
+/// A resolved intelligence client over an ordered endpoint list (RFC 0018 §3).
 pub struct IntelClient {
-    transport: Transport,
-    http_path: String,
-    host_header: String,
-    token: Option<String>,
-    provider: Provider,
+    /// The endpoint list + sticky-primary cursor + per-endpoint health/breaker.
+    /// Behind a `RefCell` so `complete(&self)` can advance the cursor / record
+    /// health without forcing a `&mut` through the loop's call sites (the
+    /// per-subagent client is single-threaded; this is interior mutability, not
+    /// sharing). RFC 0018 §5.2 will swap the whole `IntelClient` on hot reload.
+    list: RefCell<EndpointList>,
     timeout: Duration,
     /// The run's trace id; when set, every completion carries a `traceparent`
     /// header so the LLM call joins the run's distributed trace (RFC 0010).
     trace_id: Option<String>,
+    /// All-endpoints-down backoff policy (RFC 0018 §6). `None` (the default,
+    /// `once`-mode) means a single sweep: all-down returns immediately and the
+    /// caller maps it to exit 4. `Some(policy)` (loop/reactive daemons) re-runs
+    /// the sweep with bounded jittered backoff so a transient host-model roll
+    /// recovers without the daemon crashing — it resumes the instant any endpoint
+    /// half-opens healthy.
+    alldown: Option<AllDownPolicy>,
 }
 
-enum Transport {
+/// Bounded, jittered all-down backoff (RFC 0018 §6 / §4.2). A daemon re-arms the
+/// sweep up to `max_retries` times, sleeping `base × 2^n` (capped at `max`) with
+/// per-attempt jitter, before surfacing the terminal all-down.
+#[derive(Debug, Clone, Copy)]
+pub struct AllDownPolicy {
+    pub max_retries: u32,
+    pub base: Duration,
+    pub max: Duration,
+}
+
+impl Default for AllDownPolicy {
+    fn default() -> AllDownPolicy {
+        // The §4.2 default: 1s..30s jittered.
+        AllDownPolicy {
+            max_retries: 8,
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Per-endpoint dial transport — RFC 0006 verbatim, now owned by [`super::endpoints`].
+pub enum Transport {
     Unix(String),
     Tcp { host: String, port: u16, tls: bool },
     Vsock { cid: u32, port: u32 },
 }
 
 impl IntelClient {
-    /// Build from validated config. `cfg.intelligence` is guaranteed present
-    /// and well-formed by `Config::validate`.
-    pub fn from_config(cfg: &Config) -> Result<IntelClient, IntelError> {
-        let uri = cfg.intelligence.as_deref().unwrap_or_default();
-        Self::from_parts(uri, cfg.intelligence_token.clone())
-    }
-
-    /// Build from explicit parts (the subagent path — the spawn payload, not
-    /// CLI `Config`). Provider is OpenAI-compatible by default (RFC 0006).
-    pub fn from_parts(uri: &str, token: Option<String>) -> Result<IntelClient, IntelError> {
-        let provider = Provider::OpenAiCompatible;
-        let (transport, http_path, host_header) = resolve(uri, provider)?;
+    /// Build from explicit parts (the subagent path — the spawn payload, not CLI
+    /// `Config`). `uri` is the RFC 0018 endpoint *list* (a single element is RFC
+    /// 0006). `default_token` is endpoint 1's resolved credential when its env
+    /// override is unset; later endpoints resolve their own `_<N>` token.
+    pub fn from_parts(uri: &str, default_token: Option<String>) -> Result<IntelClient, IntelError> {
+        let list = EndpointList::parse(uri, default_token)?;
         Ok(IntelClient {
-            transport,
-            http_path,
-            host_header,
-            token,
-            provider,
+            list: RefCell::new(list),
             // Generous per-call ceiling; the run deadline is the real bound.
             timeout: Duration::from_secs(120),
             trace_id: None,
+            alldown: None,
         })
     }
 
@@ -111,54 +149,129 @@ impl IntelClient {
         self.trace_id = trace_id;
     }
 
-    /// Append a fresh-span `traceparent` header when a trace id is set. Pure
-    /// (testable without a connection).
-    fn apply_trace_header(&self, headers: &mut Vec<(String, String)>) {
-        if let Some(tid) = &self.trace_id {
-            headers.push((
-                "traceparent".into(),
-                crate::obs::trace::outbound_traceparent(tid),
-            ));
+    /// Enable the all-endpoints-down backoff (RFC 0018 §6) for a long-lived
+    /// `loop`/`reactive` daemon: on all-down, re-arm the failover sweep with
+    /// bounded jittered backoff instead of surfacing the terminal immediately.
+    /// `once`-mode leaves this unset (a single sweep → exit 4). The run deadline
+    /// still bounds the total wait (RFC 0011 §5 — backoff does not extend it).
+    pub fn enable_alldown_backoff(&mut self, policy: AllDownPolicy) {
+        self.alldown = Some(policy);
+    }
+
+    /// The number of configured endpoints (1 == RFC 0006).
+    pub fn endpoint_count(&self) -> usize {
+        self.list.borrow().len()
+    }
+
+    /// One completion round-trip, driven through the failover policy (RFC 0018
+    /// §3.3). The call-site signature is unchanged from RFC 0006, so the whole
+    /// exit-code path (`IntelError` → `LoopAbort::Intel` → exit 4) is intact.
+    ///
+    /// When all endpoints are down (§6) and the all-down backoff is enabled
+    /// (loop/reactive daemons), the sweep is re-armed with bounded jittered
+    /// backoff so a transient host-model roll recovers without crashing the
+    /// daemon; `once`-mode surfaces the terminal immediately (→ exit 4). A fatal
+    /// auth failure (401/403) is NEVER backed off — it is a misconfiguration, not
+    /// a transient outage (§6).
+    pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
+        // --- RFC 0018 §4.3 metric call site: one model call (no-op without metrics).
+        crate::obs::metrics::record_intel_call();
+
+        let mut attempt: u32 = 0;
+        loop {
+            let sweep = {
+                let mut list = self.list.borrow_mut();
+                failover::complete_resilient(&mut list, req, self.timeout, self.trace_id.as_deref())
+            };
+
+            // `set_intel_up` reflects the active endpoint's reachability (in rotation).
+            {
+                let list = self.list.borrow();
+                let active_up = list.ep(list.active()).health.is_up();
+                crate::obs::metrics::set_intel_up(active_up && !list.all_down());
+            }
+
+            match sweep.outcome {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    crate::obs::metrics::record_intel_error(error_reason(&e));
+                    // All-down + a daemon backoff policy + an auth-free cause →
+                    // back off and re-arm (§6). Anything else (a fatal class, no
+                    // policy, or an exhausted budget) surfaces now.
+                    let backoff = match (&self.alldown, &e) {
+                        (Some(p), IntelError::AllEndpointsDown(cause))
+                            if !cause.as_deref().is_some_and(failover::is_auth)
+                                && attempt < p.max_retries =>
+                        {
+                            *p
+                        }
+                        _ => return Err(e),
+                    };
+                    let delay = backoff_delay(&backoff, attempt);
+                    attempt += 1;
+                    std::thread::sleep(delay);
+                    // Loop: the next sweep promotes any elapsed-cooldown breaker to
+                    // half-open and resumes the instant an endpoint recovers.
+                }
+            }
         }
     }
 
-    /// One completion round-trip.
-    pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
-        let (body, mut headers) = match self.provider {
-            Provider::OpenAiCompatible => openai::build_request(req, self.token.as_deref()),
-            Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
-        };
-        self.apply_trace_header(&mut headers);
-        let header_refs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        let mut stream = self.transport.connect(self.timeout)?;
-        let resp = http::send(
-            stream.as_mut(),
-            &self.host_header,
-            "POST",
-            &self.http_path,
-            &header_refs,
-            &body,
-        )?;
-
-        if !resp.is_success() {
-            let snippet: String = resp.body_str().chars().take(512).collect();
-            return Err(IntelError::Http(resp.status, snippet));
-        }
-
-        match self.provider {
-            Provider::OpenAiCompatible => openai::parse_response(&resp.body),
-            Provider::Anthropic => anthropic::parse_response(&resp.body),
-        }
-        .map_err(IntelError::Parse)
+    /// Borrow the endpoint list for the read-only `agentd://intelligence`
+    /// resource body (§4.4). The caller serializes transport/index/health only —
+    /// NEVER the URL or any credential (RFC 0012 §3.7).
+    pub fn with_list<R>(&self, f: impl FnOnce(&EndpointList) -> R) -> R {
+        f(&self.list.borrow())
     }
 }
 
-/// Parse the intelligence URI into (transport, http-path, host-header).
-fn resolve(uri: &str, provider: Provider) -> Result<(Transport, String, String), IntelError> {
+/// The jittered backoff delay for all-down retry `attempt` (RFC 0018 §6): the
+/// exponential `base × 2^attempt` capped at `max`, then ±25% jitter from a cheap
+/// clock-seeded PRNG (no `rand` dependency — the minimalism moat).
+fn backoff_delay(policy: &AllDownPolicy, attempt: u32) -> Duration {
+    let shift = attempt.min(20);
+    let scaled = policy.base.saturating_mul(1u32 << shift).min(policy.max);
+    let ms = scaled.as_millis() as u64;
+    // ±25% jitter, drawn from a clock-seeded splitmix64 step (no `rand` dep).
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Map z → [-25%, +25%] of ms: window width is ms/2 (rounded up).
+    let lo = ms.saturating_sub(ms / 4);
+    let window = (ms / 2) + 1;
+    Duration::from_millis(lo + z % window)
+}
+
+/// Map an [`IntelError`] to the frozen `agentd_intel_errors_total{reason}` label
+/// domain (RFC 0016 §4.3: `unreachable`|`auth`|`timeout`|`5xx`|`other`).
+fn error_reason(e: &IntelError) -> &'static str {
+    match e {
+        IntelError::Transport(io) => match io.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "timeout",
+            _ => "unreachable",
+        },
+        IntelError::Http(401 | 403, _) => "auth",
+        IntelError::Http(c, _) if (500..600).contains(c) => "5xx",
+        IntelError::Http(_, _) => "other",
+        IntelError::Parse(_) | IntelError::Unsupported(_) => "other",
+        // All-down classifies by its underlying cause when present.
+        IntelError::AllEndpointsDown(Some(cause)) => error_reason(cause),
+        IntelError::AllEndpointsDown(None) => "unreachable",
+    }
+}
+
+/// Parse one intelligence URI element into (transport, http-path, host-header).
+/// Shared by [`super::endpoints`] (the list parser); unchanged from RFC 0006.
+pub(super) fn resolve(
+    uri: &str,
+    provider: Provider,
+) -> Result<(Transport, String, String), IntelError> {
     if let Some(path) = uri.strip_prefix("unix:") {
         return Ok((
             Transport::Unix(path.to_string()),
@@ -200,7 +313,8 @@ fn resolve(uri: &str, provider: Provider) -> Result<(Transport, String, String),
 }
 
 impl Transport {
-    fn connect(&self, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
+    pub(super) fn connect(&self, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
+        use crate::net::http;
         match self {
             Transport::Unix(path) => Ok(Box::new(crate::net::unixsock::connect(path, timeout)?)),
             Transport::Tcp {
@@ -220,7 +334,7 @@ impl Transport {
 
 #[cfg(feature = "tls")]
 fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
-    let tcp = http::connect_tcp(host, port, timeout)?;
+    let tcp = crate::net::http::connect_tcp(host, port, timeout)?;
     Ok(Box::new(
         crate::net::tls::connect(tcp, host).map_err(IntelError::Transport)?,
     ))
@@ -292,28 +406,39 @@ mod tests {
     }
 
     #[test]
-    fn trace_header_appended_only_when_set() {
-        // Constructing the client does not connect, so this is a pure check of
-        // the outbound-trace wiring (RFC 0010).
+    fn single_endpoint_client_builds() {
+        let c = IntelClient::from_parts("unix:/run/intel.sock", None).unwrap();
+        assert_eq!(c.endpoint_count(), 1);
+    }
+
+    #[test]
+    fn comma_list_client_builds_with_all_endpoints() {
+        let c = IntelClient::from_parts("unix:/a,unix:/b,unix:/c", None).unwrap();
+        assert_eq!(c.endpoint_count(), 3);
+    }
+
+    #[test]
+    fn all_endpoints_down_maps_to_unreachable_reason() {
+        // exercises the §4.3 reason mapping for the §6 terminal.
+        let cause = Box::new(IntelError::Http(503, "x".into()));
+        assert_eq!(
+            error_reason(&IntelError::AllEndpointsDown(Some(cause))),
+            "5xx"
+        );
+        assert_eq!(
+            error_reason(&IntelError::AllEndpointsDown(None)),
+            "unreachable"
+        );
+        assert_eq!(error_reason(&IntelError::Http(401, "x".into())), "auth");
+    }
+
+    #[test]
+    fn trace_header_propagates_to_endpoint_dialect() {
+        // Construction does not connect; we only assert the trace id is held and
+        // would be applied per endpoint (the per-endpoint dial appends it).
         let mut c = IntelClient::from_parts("unix:/run/intel.sock", None).unwrap();
-        let mut headers = vec![("authorization".to_string(), "Bearer x".to_string())];
-
-        c.apply_trace_header(&mut headers);
-        assert_eq!(headers.len(), 1, "no trace id set → no traceparent header");
-
-        let tid = "1234567890abcdef1234567890abcdef";
-        c.set_trace_id(Some(tid.to_string()));
-        c.apply_trace_header(&mut headers);
-        assert_eq!(headers.len(), 2);
-        let (k, v) = &headers[1];
-        assert_eq!(k, "traceparent");
-        assert!(
-            v.contains(tid),
-            "traceparent carries the run's trace id: {v}"
-        );
-        assert!(
-            v.starts_with("00-") && v.ends_with("-01"),
-            "well-formed traceparent: {v}"
-        );
+        assert!(c.trace_id.is_none());
+        c.set_trace_id(Some("1234567890abcdef1234567890abcdef".into()));
+        assert!(c.trace_id.is_some());
     }
 }

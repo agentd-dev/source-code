@@ -831,6 +831,10 @@ impl Config {
             ));
         }
         validate_intelligence_uri(self.intelligence.as_deref().unwrap())?;
+        // Per-endpoint credential probe (RFC 0018 §3.1/§3.2): a named-but-unset
+        // per-endpoint token *file* on any listed endpoint is exit 2 — we fail
+        // fast at startup rather than discover an unreadable secret on failover.
+        validate_endpoint_token_files(self.intelligence.as_deref().unwrap())?;
         for s in &self.mcp_servers {
             if s.name.is_empty() || s.command.is_empty() {
                 return Err(usage(format!(
@@ -960,7 +964,36 @@ fn config_invalid_line(msg: &str) -> String {
     serde_json::json!({"event": "config.invalid", "msg": msg}).to_string()
 }
 
+/// Validate the `--intelligence` value as an ORDERED, comma-separated endpoint
+/// list (RFC 0018 §3.1). At least one non-empty element is required; every
+/// element's scheme is validated (exit 2 with the bad element), and a transport
+/// this build can't dial (`https:` without `tls`, `vsock:` without `vsock`)
+/// fails fast per element rather than being discovered on failover. A
+/// single-element list is exactly the RFC 0006 check.
 fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
+    let elements: Vec<&str> = uri
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if elements.is_empty() {
+        return Err(usage(
+            "missing intelligence endpoint (AGENTD_INTELLIGENCE or --intelligence)".into(),
+        ));
+    }
+    for el in elements {
+        validate_one_intelligence_uri(el)?;
+    }
+    Ok(())
+}
+
+/// Validate one endpoint URI's scheme (RFC 0018 §3.1). The *scheme shape* is the
+/// startup gate (a bad scheme on any element is exit 2); a transport this build
+/// can't dial (`https:` without `tls`, `vsock:` without `vsock`) is surfaced by
+/// the client as `Unsupported` at dial time — matching the established
+/// single-endpoint contract (so a manifest/validate-config probe of an
+/// https endpoint on a no-tls build still passes, as before this RFC).
+fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     let ok = uri.starts_with("https://")
         || uri.starts_with("unix:")
         || uri.starts_with("vsock:")
@@ -972,6 +1005,43 @@ fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
             "intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: {uri})"
         )))
     }
+}
+
+/// Probe each listed endpoint's per-endpoint token *file* env var (RFC 0018
+/// §3.2): a `AGENTD_INTELLIGENCE_TOKEN[_N]_FILE` that is set but unreadable is
+/// exit 2 before any side effect — we fail fast rather than discover a missing
+/// secret on failover. Endpoint 1 (index 0) uses the bare name; later endpoints
+/// are 1-indexed (`_2`, `_3`, …). The inline env wins over the file (so a set
+/// inline var means the file is not consulted), matching the resolver. The
+/// resolved bytes are dropped immediately — never logged (RFC 0012 §3.7).
+fn validate_endpoint_token_files(uri: &str) -> Result<(), ConfigError> {
+    let count = uri
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .count();
+    for idx in 0..count {
+        let (inline_var, file_var) = if idx == 0 {
+            (
+                "AGENTD_INTELLIGENCE_TOKEN".to_string(),
+                "AGENTD_INTELLIGENCE_TOKEN_FILE".to_string(),
+            )
+        } else {
+            let n = idx + 1;
+            (
+                format!("AGENTD_INTELLIGENCE_TOKEN_{n}"),
+                format!("AGENTD_INTELLIGENCE_TOKEN_{n}_FILE"),
+            )
+        };
+        // An inline override means the file is never consulted — skip the probe.
+        if std::env::var(&inline_var).is_ok() {
+            continue;
+        }
+        if let Ok(path) = std::env::var(&file_var) {
+            crate::sec::secret::read_token_file(&path).map_err(usage)?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse `--mcp name=cmd arg arg`. The command is whitespace-split into argv;
@@ -1505,6 +1575,36 @@ mod tests {
     fn invalid_intelligence_uri_rejected() {
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(&args(&["--intelligence", "ftp://x"]), &env).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn multi_endpoint_list_accepts_ordered_comma_list() {
+        // RFC 0018 §3.1: --intelligence is an ORDERED comma-list (unix needs no
+        // build feature, so this validates on the default test build).
+        let env = vec![("INSTRUCTION".into(), "x".into())];
+        let c = Config::load(&args(&["--intelligence", "unix:/a,unix:/b,unix:/c"]), &env).unwrap();
+        // the raw scalar is preserved; the client parses it into N endpoints.
+        assert_eq!(c.intelligence.as_deref(), Some("unix:/a,unix:/b,unix:/c"));
+    }
+
+    #[test]
+    fn multi_endpoint_bad_element_scheme_is_exit_2() {
+        // A bad scheme on ANY element rejects the whole list (RFC 0018 §3.1).
+        let env = vec![("INSTRUCTION".into(), "x".into())];
+        let e = Config::load(
+            &args(&["--intelligence", "unix:/a,ftp://nope,unix:/c"]),
+            &env,
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn empty_endpoint_list_is_exit_2() {
+        // An all-empty/whitespace list is "missing endpoint" (RFC 0018 §3.1).
+        let env = vec![("INSTRUCTION".into(), "x".into())];
+        let e = Config::load(&args(&["--intelligence", " , , "]), &env).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
     }
 

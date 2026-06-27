@@ -44,6 +44,11 @@ pub enum AgentdResource {
     /// bounded live-event ring (RFC 0016 §7). Subscribable; fires on each new
     /// event (notify-then-read). The cursor + filters ride the query string.
     Events(EventsQuery),
+    /// `agentd://intelligence` — the live intelligence-endpoint health view (RFC
+    /// 0018 §4.4): the endpoint list (transport + index, NEVER the URL/creds),
+    /// which is active, and each one's health (up/broken/last-latency).
+    /// Management-only, subscribable; fires on breaker/active/all-down transitions.
+    Intelligence,
 }
 
 /// The parsed query of an `agentd://events?…` read (RFC 0016 §7.2/§7.3). All
@@ -121,6 +126,9 @@ impl AgentdResource {
         if rest == "inventory" {
             return Some(AgentdResource::Inventory);
         }
+        if rest == "intelligence" {
+            return Some(AgentdResource::Intelligence);
+        }
         if let Some(handle) = rest.strip_prefix("subagent/") {
             let handle = handle.trim();
             if handle.is_empty() {
@@ -163,6 +171,10 @@ pub fn session_uri(handle: &str) -> String {
 
 /// The `agentd://inventory` URI — the live subagent-tree projection (RFC 0015 §5.3).
 pub const INVENTORY_URI: &str = "agentd://inventory";
+
+/// The `agentd://intelligence` URI — the live intelligence-endpoint health view
+/// (RFC 0018 §4.4). Management-only; subscribable.
+pub const INTELLIGENCE_URI: &str = "agentd://intelligence";
 
 /// The `agentd://events` URI — the bounded live-event ring (RFC 0016 §7). The
 /// bare base URI (subscribe/list/notify use it); a read appends `?after=<seq>`
@@ -247,6 +259,18 @@ mod tests {
         assert_eq!(
             AgentdResource::parse("agentd://inventory/"),
             Some(AgentdResource::Inventory)
+        );
+    }
+
+    #[test]
+    fn parses_intelligence() {
+        assert_eq!(
+            AgentdResource::parse(INTELLIGENCE_URI),
+            Some(AgentdResource::Intelligence)
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://intelligence/"),
+            Some(AgentdResource::Intelligence)
         );
     }
 

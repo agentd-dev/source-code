@@ -115,10 +115,33 @@ fn intelligence(cfg: &Config, live: bool) -> Value {
     // transport/count are static config and always real.
     let _ = live;
     json!({
-        "transport": transport_scheme(cfg.intelligence.as_deref()),
-        // v1 configures a single endpoint; multi-endpoint is RFC 0018.
-        "endpoints": cfg.intelligence.as_ref().map_or(0, |_| 1),
+        // The PRIMARY endpoint's transport scheme (the list may mix transports,
+        // RFC 0018 §3.1; the primary is `eps[0]`). Never the URL/creds.
+        "transport": transport_scheme(primary_endpoint(cfg.intelligence.as_deref())),
+        // The configured endpoint-list length (RFC 0018 §3.1 / §5.4): a
+        // comma-separated `--intelligence` list parses to N endpoints; a single
+        // element is exactly RFC 0006 (count 1). The full per-endpoint health
+        // view lives at `agentd://intelligence` (§4.4) — the manifest carries
+        // only the bounded count.
+        "endpoints": endpoint_count(cfg.intelligence.as_deref()),
         "healthy": "unknown",
+    })
+}
+
+/// The first (primary) element of the comma-list `--intelligence` value, for the
+/// manifest's `transport` scheme. `None` ⇒ no endpoint configured.
+fn primary_endpoint(uri: Option<&str>) -> Option<&str> {
+    uri.and_then(|u| u.split(',').map(str::trim).find(|s| !s.is_empty()))
+}
+
+/// The number of non-empty endpoints in the comma-list `--intelligence` value
+/// (RFC 0018 §3.1). `0` when unset; a single element is `1` (RFC 0006).
+fn endpoint_count(uri: Option<&str>) -> usize {
+    uri.map_or(0, |u| {
+        u.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .count()
     })
 }
 
@@ -233,6 +256,10 @@ fn surfaces(cfg: &Config) -> Value {
         "report_schema": crate::report::REPORT_SCHEMA,
         // The frozen exit-code contract version (RFC 0016 §5, around RFC 0011 §5).
         "exit_codes": crate::exit::EXIT_CODES,
+        // The agentd://intelligence endpoint-health resource (RFC 0018 §4.4). The
+        // failover/health core is always on, but the observable resource rides the
+        // management transport, so it's advertised only with `serve-mcp`.
+        "intelligence": cfg!(feature = "serve-mcp"),
         // RFC 0017 control-plane surfaces. `config_validate` (--validate-config,
         // §4.1) and `config_schema` (--config-schema, §4.2) are dependency-free
         // default-build flags — always available, so always advertised true.
@@ -364,6 +391,26 @@ mod tests {
         assert_eq!(m["intelligence"]["healthy"], json!("unknown"));
         assert_eq!(m["intelligence"]["transport"], json!("https"));
         assert_eq!(m["intelligence"]["endpoints"], json!(1));
+    }
+
+    #[test]
+    fn multi_endpoint_list_reports_count_and_primary_transport() {
+        // RFC 0018 §3.1: a comma-list parses to N endpoints; the manifest
+        // `endpoints` is the count, `transport` is the PRIMARY's scheme.
+        let cfg = cfg_with(
+            &[
+                ("INSTRUCTION", "x"),
+                (
+                    "AGENTD_INTELLIGENCE",
+                    "vsock:3:8080,vsock:3:8081,unix:/run/i.sock",
+                ),
+            ],
+            &[],
+        );
+        let id = Identity::from_env(&cfg.run_id);
+        let m = manifest(&cfg, &id, false);
+        assert_eq!(m["intelligence"]["endpoints"], json!(3));
+        assert_eq!(m["intelligence"]["transport"], json!("vsock"));
     }
 
     #[test]

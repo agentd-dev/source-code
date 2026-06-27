@@ -49,6 +49,73 @@ impl Mode {
     }
 }
 
+/// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
+/// implicit default (no `--serve-mcp`); the explicit targets are a unix socket or
+/// — `--features vsock` — an AF_VSOCK port. The string forms are
+/// `unix:PATH` | `vsock:PORT` | `vsock:CID:PORT`; `vsock:PORT` binds the wildcard
+/// context id `VMADDR_CID_ANY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeTarget {
+    /// Bind a unix-domain socket at this path.
+    Unix(std::path::PathBuf),
+    /// Bind AF_VSOCK `(cid, port)`. `cid` is the wildcard `VMADDR_CID_ANY` for
+    /// the bare `vsock:PORT` form.
+    Vsock { cid: u32, port: u32 },
+}
+
+/// The wildcard listen context id (`VMADDR_CID_ANY`) for the bare `vsock:PORT`
+/// form. Hard-coded (libc's value) so config parsing carries no `vsock`-feature
+/// dependency — the binding itself is feature-gated in `mcp::server`.
+pub const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
+
+impl ServeTarget {
+    /// Parse a `--serve-mcp` value. Validates the scheme/port and, for `vsock:`,
+    /// that this build has the `vsock` feature (mirroring the intelligence
+    /// `https`-needs-`tls` scheme check). Returns a [`ConfigError::Usage`] (exit 2,
+    /// before any side effect) on any problem.
+    pub fn parse(spec: &str) -> Result<ServeTarget, ConfigError> {
+        if let Some(path) = spec.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err(usage("--serve-mcp: unix path is empty".into()));
+            }
+            return Ok(ServeTarget::Unix(path.into()));
+        }
+        if let Some(rest) = spec.strip_prefix("vsock:") {
+            // The scheme is gated on the build, like https→tls — reject early so the
+            // operator gets a crisp exit 2, not a silent inert listener.
+            if !cfg!(feature = "vsock") {
+                return Err(usage(
+                    "--serve-mcp: scheme unsupported: vsock requires the 'vsock' build feature"
+                        .into(),
+                ));
+            }
+            let (cid, port_str) = match rest.split_once(':') {
+                Some((c, p)) => {
+                    let cid = c.parse::<u32>().map_err(|_| {
+                        usage(format!(
+                            "--serve-mcp: invalid vsock cid '{c}' (want a number)"
+                        ))
+                    })?;
+                    (cid, p)
+                }
+                None => (VMADDR_CID_ANY, rest),
+            };
+            let port = port_str.parse::<u32>().map_err(|_| {
+                usage(format!(
+                    "--serve-mcp: invalid vsock port '{port_str}' (want a number)"
+                ))
+            })?;
+            if port == 0 {
+                return Err(usage("--serve-mcp: vsock port must be > 0".into()));
+            }
+            return Ok(ServeTarget::Vsock { cid, port });
+        }
+        Err(usage(format!(
+            "--serve-mcp: scheme unsupported (want unix:PATH | vsock:PORT | vsock:CID:PORT): {spec}"
+        )))
+    }
+}
+
 /// A declared MCP server: a name and the argv to spawn it (stdio transport).
 /// Serializable because it travels in the subagent spawn payload as the
 /// child's scoped server subset (RFC 0005, RFC 0009).
@@ -517,6 +584,12 @@ impl Config {
         if self.cgroup_memory_max.as_deref().map(str::trim) == Some("0") {
             return Err(usage("--cgroup-memory-max must be > 0 or 'max'".into()));
         }
+        // Validate the served-MCP target up front (RFC 0015 §3.1): a bad scheme,
+        // a vsock target on a non-vsock build, or a zero/non-numeric port exits 2
+        // before any listener is bound — mirroring the intelligence-URI check.
+        if let Some(spec) = &self.serve_mcp {
+            ServeTarget::parse(spec)?;
+        }
         Ok(())
     }
 }
@@ -640,7 +713,7 @@ fn help_text() -> String {
          \n\
          TOOLS / MCP:\n\
          \x20 --mcp name=command          declare an MCP server (repeatable; stdio)\n\
-         \x20 --serve-mcp <unix:/path>    serve agentd's own MCP\n\
+         \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
          \x20 --enable-exec               expose the gated exec tool\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
          \x20 --allow-trifecta            permit all three capability legs in one agent\n\
@@ -901,6 +974,72 @@ mod tests {
     fn invalid_intelligence_uri_rejected() {
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(&args(&["--intelligence", "ftp://x"]), &env).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn serve_target_unix_parses() {
+        assert_eq!(
+            ServeTarget::parse("unix:/run/agentd.sock").unwrap(),
+            ServeTarget::Unix("/run/agentd.sock".into())
+        );
+        // empty path → usage error
+        assert!(matches!(
+            ServeTarget::parse("unix:"),
+            Err(ConfigError::Usage(_))
+        ));
+        // a bare/foreign scheme → usage error
+        assert!(matches!(
+            ServeTarget::parse("tcp:1234"),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[cfg(feature = "vsock")]
+    #[test]
+    fn serve_target_vsock_parses_on_vsock_build() {
+        // vsock:PORT → wildcard cid (VMADDR_CID_ANY)
+        assert_eq!(
+            ServeTarget::parse("vsock:5005").unwrap(),
+            ServeTarget::Vsock {
+                cid: VMADDR_CID_ANY,
+                port: 5005
+            }
+        );
+        // vsock:CID:PORT → that cid
+        assert_eq!(
+            ServeTarget::parse("vsock:2:5005").unwrap(),
+            ServeTarget::Vsock { cid: 2, port: 5005 }
+        );
+        // port 0 / non-numeric port / non-numeric cid → usage error
+        for bad in ["vsock:0", "vsock:2:0", "vsock:abc", "vsock:x:5005"] {
+            assert!(
+                matches!(ServeTarget::parse(bad), Err(ConfigError::Usage(_))),
+                "{bad} must be a usage error"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "vsock"))]
+    #[test]
+    fn serve_target_vsock_rejected_without_feature() {
+        let e = ServeTarget::parse("vsock:5005").unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("vsock requires the 'vsock' build feature"),
+                "got: {msg}"
+            ),
+            _ => panic!("expected a Usage error"),
+        }
+    }
+
+    #[test]
+    fn serve_mcp_validation_runs_at_load() {
+        // unix: still parses through full load() exactly as before.
+        let c = Config::load(&args(&["--serve-mcp", "unix:/tmp/a.sock"]), &base_env()).unwrap();
+        assert_eq!(c.serve_mcp.as_deref(), Some("unix:/tmp/a.sock"));
+        // a foreign scheme is rejected at load (exit 2) before any side effect.
+        let e = Config::load(&args(&["--serve-mcp", "tcp:9000"]), &base_env()).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
     }
 

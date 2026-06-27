@@ -26,6 +26,9 @@ pub fn is_agentd(uri: &str) -> bool {
 pub enum AgentdResource {
     /// `agentd://status` — this agentd's own run/health state.
     Status,
+    /// `agentd://capabilities` — this agentd's self-description manifest
+    /// (identity, declared capability surface, live counters). RFC 0015 §3.4.
+    Capabilities,
     /// `agentd://subagent/<handle>` — an async child's status / distilled result.
     Subagent(String),
     /// `agentd://run/<run_id>` — the served run's aggregate (mode, spawn counts,
@@ -43,6 +46,9 @@ impl AgentdResource {
         let rest = uri.trim().strip_prefix(SCHEME)?.trim_end_matches('/');
         if rest == "status" {
             return Some(AgentdResource::Status);
+        }
+        if rest == "capabilities" {
+            return Some(AgentdResource::Capabilities);
         }
         if let Some(handle) = rest.strip_prefix("subagent/") {
             let handle = handle.trim();
@@ -138,6 +144,18 @@ mod tests {
         assert_eq!(
             AgentdResource::parse(&session_uri("served.3")),
             Some(AgentdResource::Session("served.3".into()))
+        );
+    }
+
+    #[test]
+    fn parses_capabilities() {
+        assert_eq!(
+            AgentdResource::parse("agentd://capabilities"),
+            Some(AgentdResource::Capabilities)
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://capabilities/"),
+            Some(AgentdResource::Capabilities)
         );
     }
 

@@ -9,6 +9,7 @@
 //! and `subagent.cancel` (RFC §3.2), plus the agentd:// resource scheme with
 //! resources/subscribe push.
 
+use crate::config::Config;
 use crate::json::{self, Id, Incoming, Notification, Request, Response, frame};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
@@ -19,7 +20,7 @@ use crate::supervisor::tree::NodeId;
 use crate::wire::mcp::{PROTOCOL_VERSION, method};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{self, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -27,6 +28,90 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Which transport a connection arrived on, and therefore its trust domain
+/// (RFC 0015 §3.3-§3.4). `Stdio` is the agent's own driving harness (the
+/// process's stdio); `Management` is a peer that connected to a `--serve-mcp`
+/// listener (unix socket / vsock). This chunk only *plumbs* it — it is logged on
+/// connect and carried in the per-connection context; the operator-tool gate that
+/// reads it lands in the next chunk (RFC 0015 §3.4). Stored so it isn't dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerOrigin {
+    /// The process's own stdio (the driving harness).
+    Stdio,
+    /// A peer on a `--serve-mcp` listener (unix / vsock) — the management domain.
+    Management,
+}
+
+impl PeerOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            PeerOrigin::Stdio => "stdio",
+            PeerOrigin::Management => "management",
+        }
+    }
+}
+
+/// The served-MCP transport, type-erased to one concrete enum so the connection
+/// registry (`SharedWriter`, `Subscriber`) stays monomorphic across transports
+/// while the *same* [`handle_conn`] code serves each. Both variants are
+/// `Read + Write` with a `try_clone` (the connection's write half is shared with
+/// the run threads that push notifications), so the NDJSON framing, threading,
+/// and dispatch are entirely transport-agnostic (RFC 0015 §3.2 — "the unix server
+/// with the socket type swapped").
+pub enum ServeStream {
+    Unix(UnixStream),
+    #[cfg(feature = "vsock")]
+    Vsock(vsock::VsockStream),
+}
+
+impl ServeStream {
+    /// Clone the handle (a second fd onto the same connection) for the shared
+    /// write half. Mirrors `UnixStream::try_clone`.
+    fn try_clone(&self) -> io::Result<ServeStream> {
+        match self {
+            ServeStream::Unix(s) => s.try_clone().map(ServeStream::Unix),
+            #[cfg(feature = "vsock")]
+            ServeStream::Vsock(s) => s.try_clone().map(ServeStream::Vsock),
+        }
+    }
+
+    /// Bound a stalled-but-alive peer so it can't pin the writer Mutex forever.
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self {
+            ServeStream::Unix(s) => s.set_write_timeout(dur),
+            #[cfg(feature = "vsock")]
+            ServeStream::Vsock(s) => s.set_write_timeout(dur),
+        }
+    }
+}
+
+impl Read for ServeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ServeStream::Unix(s) => s.read(buf),
+            #[cfg(feature = "vsock")]
+            ServeStream::Vsock(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ServeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ServeStream::Unix(s) => s.write(buf),
+            #[cfg(feature = "vsock")]
+            ServeStream::Vsock(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ServeStream::Unix(s) => s.flush(),
+            #[cfg(feature = "vsock")]
+            ServeStream::Vsock(s) => s.flush(),
+        }
+    }
+}
 
 /// Cap on concurrent peer-driven `subagent.spawn` runs in flight (bounds a peer
 /// spamming the socket; each run is also bounded by the base payload's limits).
@@ -162,8 +247,8 @@ type Registry = Arc<Mutex<HashMap<String, ServedSession>>>;
 
 /// A connection's shared write half — both replies and pushed notifications go
 /// through it, serialized by the Mutex (a reply and a notification can't interleave
-/// bytes).
-type SharedWriter = Arc<Mutex<UnixStream>>;
+/// bytes). The [`ServeStream`] enum keeps this one type across unix + vsock peers.
+type SharedWriter = Arc<Mutex<ServeStream>>;
 
 /// A peer subscribed to an `agentd://` resource: which connection, and the writer
 /// to push a `notifications/resources/updated` to.
@@ -217,6 +302,10 @@ pub struct ServeCtx {
     subscriptions: SubRegistry,
     /// Monotonic per-connection id (to scope + clean up subscriptions).
     conn_counter: Arc<AtomicU64>,
+    /// The resolved daemon config — the source for the `agentd://capabilities`
+    /// self-description manifest (RFC 0015 §3.4). Arc-shared so the per-read
+    /// build borrows it without cloning the struct.
+    config: Arc<Config>,
 }
 
 impl ServeCtx {
@@ -226,6 +315,7 @@ impl ServeCtx {
         exe: PathBuf,
         base: SpawnPayload,
         drain_timeout: Duration,
+        config: Arc<Config>,
     ) -> ServeCtx {
         ServeCtx {
             run_id,
@@ -240,7 +330,19 @@ impl ServeCtx {
             warm: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             conn_counter: Arc::new(AtomicU64::new(0)),
+            config,
         }
+    }
+
+    /// The live `agentd://capabilities` manifest — this daemon's self-description
+    /// plus cheap liveness counters lifted off the same atomics the `status`
+    /// surface reads (RFC 0015 §3.4). Built `live=true` from the running daemon.
+    fn capabilities_body(&self) -> Value {
+        // ONE builder for the one-shot `agentd --capabilities` and this live
+        // resource, so they never drift (RFC 0015 §5.2). Identity is env-only and
+        // cheap, so build it per read rather than threading it through ServeCtx.
+        let identity = crate::identity::Identity::from_env(&self.run_id);
+        crate::capabilities::manifest(&self.config, &identity, true)
     }
 
     /// This agentd's own run/health state — the single source of truth for both
@@ -343,7 +445,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
     let listener = UnixListener::bind(path)?;
     log.info(
         "mcp.serving",
-        json!({"path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status", crate::agentd_uri::run_uri(&ctx.run_id)]}),
+        json!({"transport": "unix", "path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status", "agentd://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
     );
     let handle = ServeHandle {
         sessions: Arc::clone(&ctx.sessions),
@@ -357,17 +459,71 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
             for stream in listener.incoming().flatten() {
                 let ctx = Arc::clone(&ctx);
                 let log = log.clone();
-                // One blocking thread per peer connection (RFC §3.6).
+                // One blocking thread per peer connection (RFC §3.6). A unix
+                // `--serve-mcp` peer is in the management trust domain (§3.3).
                 thread::Builder::new()
                     .name("serve-mcp-conn".into())
-                    .spawn(move || handle_conn(stream, &ctx, &log))
+                    .spawn(move || {
+                        handle_conn(
+                            ServeStream::Unix(stream),
+                            PeerOrigin::Management,
+                            &ctx,
+                            &log,
+                        )
+                    })
                     .ok();
             }
         })?;
     Ok(handle)
 }
 
-fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {
+/// Bind a vsock `(cid, port)` and serve the self-MCP — the **management
+/// transport** (RFC 0015 §3.2). Byte-for-byte the unix server with the socket
+/// type swapped: a blocking `VsockListener`, thread-per-connection, the same
+/// generic [`handle_conn`]; no async, no new framing. Peers arrive in
+/// [`PeerOrigin::Management`]. Returns a [`ServeHandle`] for shutdown drain (the
+/// session/warm/inflight registries are shared with `ctx`), or the bind error.
+#[cfg(feature = "vsock")]
+pub fn serve_vsock(
+    cid: u32,
+    port: u32,
+    ctx: ServeCtx,
+    log: Logger,
+) -> std::io::Result<ServeHandle> {
+    let listener = vsock::VsockListener::bind_with_cid_port(cid, port)?;
+    log.info(
+        "mcp.serving",
+        json!({"transport": "vsock", "cid": cid, "port": port, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status", "agentd://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
+    );
+    let handle = ServeHandle {
+        sessions: Arc::clone(&ctx.sessions),
+        warm: Arc::clone(&ctx.warm),
+        inflight: Arc::clone(&ctx.inflight),
+    };
+    let ctx = Arc::new(ctx);
+    thread::Builder::new()
+        .name("serve-mcp-vsock".into())
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let ctx = Arc::clone(&ctx);
+                let log = log.clone();
+                thread::Builder::new()
+                    .name("serve-mcp-conn".into())
+                    .spawn(move || {
+                        handle_conn(
+                            ServeStream::Vsock(stream),
+                            PeerOrigin::Management,
+                            &ctx,
+                            &log,
+                        )
+                    })
+                    .ok();
+            }
+        })?;
+    Ok(handle)
+}
+
+fn handle_conn(stream: ServeStream, origin: PeerOrigin, ctx: &ServeCtx, log: &Logger) {
     // The write half is shared (Arc<Mutex>) so a run thread can push a
     // notification on it concurrently with this thread writing a reply. A write
     // timeout bounds a stalled-but-alive peer so it can't pin the writer Mutex
@@ -381,12 +537,15 @@ fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {
         Err(_) => return,
     };
     let conn = ctx.conn_counter.fetch_add(1, Ordering::Relaxed);
-    log.info("mcp.connect", json!({"peer": "unix", "conn": conn}));
+    log.info(
+        "mcp.connect",
+        json!({"origin": origin.as_str(), "conn": conn}),
+    );
     let mut reader = BufReader::new(stream);
     while let Ok(Some(bytes)) = frame::read_line(&mut reader) {
         // Requests get a reply; notifications (initialized, …) do not.
         if let Ok(Incoming::Request(req)) = serde_json::from_slice::<Incoming>(&bytes) {
-            let resp = dispatch(req, ctx, &writer, conn, log);
+            let resp = dispatch(req, ctx, origin, &writer, conn, log);
             let wrote = writer
                 .lock()
                 .is_ok_and(|mut w| frame::write_line(&mut *w, &resp).is_ok());
@@ -396,18 +555,26 @@ fn handle_conn(stream: UnixStream, ctx: &ServeCtx, log: &Logger) {
         }
     }
     remove_conn_subscriptions(ctx, conn); // don't push to a dead socket
-    log.debug("mcp.disconnect", json!({"peer": "unix", "conn": conn}));
+    log.debug(
+        "mcp.disconnect",
+        json!({"origin": origin.as_str(), "conn": conn}),
+    );
 }
 
 /// Route one JSON-RPC request to a response. `writer`/`conn` identify the calling
-/// connection so `resources/subscribe` can register a push target.
+/// connection so `resources/subscribe` can register a push target. `origin` is the
+/// caller's trust domain (RFC 0015 §3.4) — carried through so the next chunk's
+/// operator-tool gate can refuse `Stdio`-origin management calls; this chunk's
+/// surface (incl. `agentd://capabilities`) is readable on every origin.
 fn dispatch(
     req: Request,
     ctx: &ServeCtx,
+    origin: PeerOrigin,
     writer: &SharedWriter,
     conn: u64,
     log: &Logger,
 ) -> Response {
+    let _ = origin; // chunk 3 (RFC 0015 §3.4) reads this to gate operator tools.
     match req.method.as_str() {
         "initialize" => Response::ok(
             req.id,
@@ -614,6 +781,14 @@ fn resource_list(ctx: &ServeCtx) -> Value {
             "mimeType": "application/json"
         },
         {
+            // Stable + listable (RFC 0015 §3.4): a self-description manifest, readable
+            // on every origin. The run id is fixed at startup, so the uri never 404s.
+            "uri": "agentd://capabilities",
+            "name": "capabilities",
+            "description": "This agentd's self-description: identity, the declared capability surface (intelligence transport, MCP servers, exec, limits, isolation), and live daemon counters.",
+            "mimeType": "application/json"
+        },
+        {
             "uri": crate::agentd_uri::run_uri(&ctx.run_id),
             "name": "run",
             "description": "This served run's aggregate: mode, root handle, status, spawn counts, and uptime. Subscribable — pushed on each spawn / terminal-run change.",
@@ -636,6 +811,15 @@ fn resources_read(req: Request, ctx: &ServeCtx) -> Response {
             req.id,
             json!({
                 "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.status_body().to_string()}]
+            }),
+        ),
+        // agentd://capabilities — the live self-description manifest (RFC 0015
+        // §3.4). Readable on every origin (it discloses no secret, confers no
+        // authority).
+        Some(crate::agentd_uri::AgentdResource::Capabilities) => Response::ok(
+            req.id,
+            json!({
+                "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.capabilities_body().to_string()}]
             }),
         ),
         // agentd://subagent/<handle> — a served async run's status / result.
@@ -1345,12 +1529,19 @@ mod tests {
     }
 
     fn ctx() -> ServeCtx {
+        let cfg = crate::config::Config {
+            run_id: "r1".into(),
+            mode: crate::config::Mode::Reactive,
+            intelligence: Some("unix:/x".into()),
+            ..crate::config::Config::default()
+        };
         ServeCtx::new(
             "r1".into(),
             "reactive".into(),
             "agentd".into(),
             base(),
             Duration::from_secs(5),
+            Arc::new(cfg),
         )
     }
 
@@ -1376,7 +1567,7 @@ mod tests {
     /// dropped; the unit tests never push to it, so no write occurs).
     fn writer() -> SharedWriter {
         let (a, _b) = UnixStream::pair().expect("socketpair");
-        Arc::new(Mutex::new(a))
+        Arc::new(Mutex::new(ServeStream::Unix(a)))
     }
 
     /// Insert a Running session so `subscribe_resource` accepts its handle.
@@ -1393,7 +1584,14 @@ mod tests {
 
     #[test]
     fn initialize_declares_tools_capability() {
-        let r = dispatch(req("initialize", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("initialize", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         let v = r.result.expect("ok");
         assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
         assert!(v["capabilities"]["tools"].is_object());
@@ -1402,7 +1600,14 @@ mod tests {
 
     #[test]
     fn tools_list_advertises_status_and_spawn() {
-        let r = dispatch(req("tools/list", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("tools/list", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         let tools = r.result.expect("ok")["tools"].clone();
         let names: Vec<&str> = tools
             .as_array()
@@ -1419,6 +1624,7 @@ mod tests {
         let r = dispatch(
             req("tools/call", Some(json!({"name": "status"}))),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
@@ -1431,7 +1637,14 @@ mod tests {
 
     #[test]
     fn initialize_declares_resources_capability() {
-        let r = dispatch(req("initialize", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("initialize", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         let v = r.result.expect("ok");
         assert!(
             v["capabilities"]["resources"].is_object(),
@@ -1441,7 +1654,14 @@ mod tests {
 
     #[test]
     fn resources_list_advertises_status_and_run() {
-        let r = dispatch(req("resources/list", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("resources/list", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         let resources = r.result.expect("ok")["resources"].clone();
         let uris: Vec<&str> = resources
             .as_array()
@@ -1458,6 +1678,54 @@ mod tests {
             uris.contains(&"agentd://run/r1"),
             "agentd://run/r1 listed: {uris:?}"
         );
+        // capabilities is a stable, listable self-description (RFC 0015 §3.4).
+        assert!(
+            uris.contains(&"agentd://capabilities"),
+            "agentd://capabilities listed: {uris:?}"
+        );
+    }
+
+    #[test]
+    fn resources_read_capabilities_returns_the_manifest() {
+        let r = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://capabilities"})),
+            ),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("ok");
+        let entry = &v["contents"][0];
+        assert_eq!(entry["uri"], "agentd://capabilities");
+        assert_eq!(entry["mimeType"], "application/json");
+        let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
+        // The served manifest is the canonical RFC 0015 §5.2 schema (the same
+        // builder as the `--capabilities` one-shot): contract_version + top-level
+        // mode + identity.run_id from the downward-API/run id.
+        assert_eq!(body["contract_version"], "1.0");
+        assert_eq!(body["identity"]["run_id"], "r1");
+        assert_eq!(body["mode"], "reactive");
+    }
+
+    #[test]
+    fn capabilities_is_readable_on_stdio_origin_too() {
+        // §3.4: the manifest is harmless self-description — readable on every origin.
+        let r = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://capabilities"})),
+            ),
+            &ctx(),
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert!(r.result.is_some(), "capabilities readable on stdio origin");
     }
 
     #[test]
@@ -1465,6 +1733,7 @@ mod tests {
         let r = dispatch(
             req("resources/read", Some(json!({"uri": "agentd://status"}))),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
@@ -1484,6 +1753,7 @@ mod tests {
         let r = dispatch(
             req("resources/read", Some(json!({"uri": "agentd://ghost"}))),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
@@ -1492,6 +1762,7 @@ mod tests {
         let bad = dispatch(
             req("resources/read", Some(json!({"uri": "file:///x"}))),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
@@ -1501,7 +1772,14 @@ mod tests {
 
     #[test]
     fn tools_list_advertises_send_and_spawn_schema_has_warm() {
-        let r = dispatch(req("tools/list", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("tools/list", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         let tools = r.result.expect("ok")["tools"].clone();
         let names: Vec<&str> = tools
             .as_array()
@@ -1547,7 +1825,14 @@ mod tests {
 
     #[test]
     fn tools_list_advertises_async_session_tools() {
-        let r = dispatch(req("tools/list", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("tools/list", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         let tools = r.result.expect("ok")["tools"].clone();
         let names: Vec<&str> = tools
             .as_array()
@@ -1577,6 +1862,7 @@ mod tests {
                     Some(json!({"name": tool, "arguments": {"handle": "served.9"}})),
                 ),
                 &ctx(),
+                PeerOrigin::Management,
                 &writer(),
                 0,
                 &log(),
@@ -1600,6 +1886,7 @@ mod tests {
                 Some(json!({"uri": "agentd://subagent/served.404"})),
             ),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
@@ -1626,6 +1913,7 @@ mod tests {
         let r = dispatch(
             req("resources/read", Some(json!({"uri": "agentd://run/r1"}))),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
@@ -1687,7 +1975,7 @@ mod tests {
         let ctx = ctx();
         let uri = "agentd://run/r1";
         let (a, b) = UnixStream::pair().unwrap();
-        let w: SharedWriter = Arc::new(Mutex::new(a));
+        let w: SharedWriter = Arc::new(Mutex::new(ServeStream::Unix(a)));
         assert!(
             subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7)
                 .error
@@ -1829,7 +2117,14 @@ mod tests {
 
     #[test]
     fn initialize_declares_subscribe_capability() {
-        let r = dispatch(req("initialize", None), &ctx(), &writer(), 0, &log());
+        let r = dispatch(
+            req("initialize", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         assert_eq!(
             r.result.unwrap()["capabilities"]["resources"]["subscribe"],
             true
@@ -1844,7 +2139,7 @@ mod tests {
         // A connected pair: `a` is the peer's write target (what subscribe stores);
         // `b` is the peer's read end, where the pushed notification lands.
         let (a, b) = UnixStream::pair().unwrap();
-        let w: SharedWriter = Arc::new(Mutex::new(a));
+        let w: SharedWriter = Arc::new(Mutex::new(ServeStream::Unix(a)));
         let uri = "agentd://subagent/served.0";
         assert!(
             subscribe_resource(req("sub", Some(json!({"uri": uri}))), &ctx, &w, 7)
@@ -1920,12 +2215,20 @@ mod tests {
         let bad_tool = dispatch(
             req("tools/call", Some(json!({"name": "ghost"}))),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),
         );
         assert!(bad_tool.error.is_some());
-        let bad_method = dispatch(req("frobnicate", None), &ctx(), &writer(), 0, &log());
+        let bad_method = dispatch(
+            req("frobnicate", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
         assert!(bad_method.error.is_some());
     }
 
@@ -1952,6 +2255,7 @@ mod tests {
                 Some(json!({"name": "subagent.spawn", "arguments": {}})),
             ),
             &ctx(),
+            PeerOrigin::Management,
             &writer(),
             0,
             &log(),

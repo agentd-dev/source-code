@@ -6,7 +6,8 @@ pub mod client;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock;
 
-// agentd serving its own MCP over a unix socket (composability, RFC 0005).
-// Feature-gated, no deps (blocking UnixListener).
+// agentd serving its own MCP over a unix socket (composability, RFC 0005) and
+// over vsock (the agentctl management transport, RFC 0015 §3). Feature-gated,
+// no deps (blocking listener, thread-per-connection).
 #[cfg(feature = "serve-mcp")]
 pub mod server;

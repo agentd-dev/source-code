@@ -14,11 +14,12 @@ permissions:
   contents: read
 
 # All release artifacts ship the dependency-free cloud-native feature set: the
-# /healthz+/readyz+/metrics probe surface, served MCP, UTC-cron, and OTLP — still
-# a fully static, 3-dependency binary. (Need tls/vsock? build from source; the
-# default reaches intelligence over unix: to a TLS-terminating sidecar.)
+# /healthz+/readyz+/metrics probe surface, served MCP, UTC-cron, OTLP, horizontal
+# scaling (cluster: sharding + work-claim + autoscaling signals), and SIGHUP
+# config hot-reload — still a fully static, 3-dependency binary. (Need tls/vsock?
+# build from source; the default reaches intelligence over unix: to a sidecar.)
 env:
-  FEATURES: "metrics,serve-mcp,cron,otel"
+  FEATURES: "metrics,serve-mcp,cron,otel,cluster,hot-reload"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

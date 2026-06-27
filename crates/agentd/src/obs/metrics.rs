@@ -246,6 +246,16 @@ pub fn set_intel_up(up: bool) {
     let _ = up;
 }
 
+/// Point-in-time set of the tree-pause gauge (`agentd_paused`, RFC 0015 §5.5 /
+/// RFC 0016 §4.3) — 1 while the `pause` operator tool has frozen the agentic
+/// loops, 0 after `resume`. No-op-safe / metrics-gated, mirroring `set_intel_up`.
+pub fn set_paused(on: bool) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.paused.store(u64::from(on), Ordering::Relaxed);
+    #[cfg(not(feature = "metrics"))]
+    let _ = on;
+}
+
 /// Point-in-time set of the subagent-tree shape gauges (RFC 0016 §4.3:
 /// `agentd_active_subagents` / `agentd_tree_depth` / `agentd_tree_breadth`).
 pub fn set_tree_shape(active: u64, depth: u64, breadth: u64) {
@@ -439,6 +449,10 @@ mod imp {
         pub(super) intel_up: AtomicU64,
         intel_errors: LabelCounter<{ INTEL_ERROR_REASONS.len() }>,
 
+        // --- RFC 0015 §5.5: tree-pause gauge (0/1) ---------------------------
+        // Set by the `pause`/`resume` operator tools; 1 while the tree is paused.
+        pub(super) paused: AtomicU64,
+
         // --- frozen §4.3: MCP server health ----------------------------------
         mcp_connect_failures: LabelCounter<{ MCP_SERVER_SLOTS }>,
 
@@ -492,6 +506,7 @@ mod imp {
                 intel_calls: AtomicU64::new(0),
                 intel_up: AtomicU64::new(0),
                 intel_errors: LabelCounter::new(),
+                paused: AtomicU64::new(0),
                 mcp_connect_failures: LabelCounter::new(),
                 drains: LabelCounter::new(),
                 supervisor_restarts: AtomicU64::new(0),
@@ -621,6 +636,15 @@ mod imp {
                 "agentd_ready",
                 "1 when ready to accept work (not draining / lame-ducked)",
                 ready,
+            );
+            // `agentd_paused` (RFC 0015 §5.5): 1 while the tree is paused at turn
+            // boundaries. Pause is NOT readiness — a paused instance can still be
+            // ready (the `ready` gauge above ignores pause, only drain/lame-duck).
+            gauge(
+                &mut s,
+                "agentd_paused",
+                "1 while the agentic tree is paused at turn boundaries (RFC 0015 §4.3)",
+                g(&self.paused),
             );
 
             // --- run lifecycle & terminal-status (RFC 0016 §4.3) -------------
@@ -1050,6 +1074,18 @@ mod imp {
             assert!(out.contains("# TYPE agentd_ready gauge"));
             // ready is 0/1; in a bare test process (no drain) it is 1.
             assert!(out.contains("agentd_ready "));
+        }
+
+        #[test]
+        fn paused_gauge_renders_zero_then_one() {
+            // RFC 0015 §5.5: `agentd_paused` is a 0/1 gauge, default 0.
+            let r = Registry::new();
+            let out = r.render();
+            assert!(out.contains("# TYPE agentd_paused gauge"));
+            assert!(out.contains("agentd_paused 0"));
+            // Set via the same atomic `set_paused` writes; renders 1.
+            r.paused.store(1, Ordering::Relaxed);
+            assert!(r.render().contains("agentd_paused 1"));
         }
 
         #[test]

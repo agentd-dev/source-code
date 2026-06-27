@@ -725,12 +725,9 @@ fn management_peer_drives_the_operator_surface() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    for t in ["drain", "lame-duck", "cancel"] {
+    for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
         assert!(names.contains(&t), "management sees {t}: {names:?}");
     }
-    // pause/resume are deferred → never advertised.
-    assert!(!names.contains(&"pause"), "pause is deferred: {names:?}");
-    assert!(!names.contains(&"resume"), "resume is deferred: {names:?}");
 
     // agentd://inventory is readable + carries the lifecycle flags.
     let inv = rpc(
@@ -740,10 +737,56 @@ fn management_peer_drives_the_operator_surface() {
     );
     let body: serde_json::Value =
         serde_json::from_str(inv["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(body["paused"], false, "pause deferred → false: {body}");
+    assert_eq!(body["paused"], false, "not paused at startup: {body}");
     assert_eq!(body["draining"], false);
     assert_eq!(body["ready"], true);
     assert!(body["totals"]["total_spawned"].is_number());
+
+    // pause flips the instance-wide pause flag in the projection (no in-flight
+    // subagents on this idle daemon → affected:0) and is reversible. NOT a drain
+    // and NOT a lame-duck: readiness is unchanged by pause (RFC 0015 §4.3).
+    let pause = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"pause"}}"#,
+    );
+    assert_eq!(pause["result"]["isError"], false, "pause: {pause}");
+    assert_eq!(pause["result"]["structuredContent"]["paused"], true);
+    assert_eq!(pause["result"]["structuredContent"]["affected"], 0);
+    let inv_p: serde_json::Value = serde_json::from_str(
+        rpc(
+            &mut reader,
+            &mut write,
+            r#"{"jsonrpc":"2.0","id":32,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+        )["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        inv_p["paused"], true,
+        "pause reflected in inventory: {inv_p}"
+    );
+    assert_eq!(inv_p["ready"], true, "pause is not lame-duck → still ready");
+    assert_eq!(inv_p["draining"], false, "pause is not drain");
+    // resume clears it.
+    let resume = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"resume"}}"#,
+    );
+    assert_eq!(resume["result"]["structuredContent"]["paused"], false);
+    let inv_r: serde_json::Value = serde_json::from_str(
+        rpc(
+            &mut reader,
+            &mut write,
+            r#"{"jsonrpc":"2.0","id":34,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+        )["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inv_r["paused"], false, "resume cleared the flag: {inv_r}");
 
     // lame-duck flips readiness in the projection (no exit, no drain).
     let ld = rpc(

@@ -14,7 +14,7 @@ use crate::json::{self, Id, Incoming, Notification, Request, Response, frame};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::cgroup;
-use crate::supervisor::reactor::{SuperviseResult, supervise_cancellable, supervise_once};
+use crate::supervisor::reactor::{SuperviseResult, supervise_once, supervise_pausable};
 use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
 use crate::wire::mcp::{PROTOCOL_VERSION, method};
@@ -233,11 +233,16 @@ impl ServedStatus {
     }
 }
 
-/// One tracked served async run: its state, its per-run cancel flag, and when it
-/// started (for age reporting + oldest-first eviction).
+/// One tracked served async run: its state, its per-run cancel flag, its per-run
+/// pause flag, and when it started (for age reporting + oldest-first eviction).
 struct ServedSession {
     status: ServedStatus,
     cancel: Arc<AtomicBool>,
+    /// Per-run pause flag (RFC 0015 §4.3): the instance-wide `pause`/`resume`
+    /// tools toggle it; the run's supervisor reactor forwards `ctrl/pause`/
+    /// `ctrl/resume` to its live children on each edge. The async parallel of
+    /// `cancel` — a shared atomic the reactor reads, never the child directly.
+    paused: Arc<AtomicBool>,
     started: Instant,
 }
 
@@ -374,12 +379,17 @@ impl ServeCtx {
     /// async runs). It is a pure read of supervisor-held state, so it costs only
     /// serialization. `draining` reads the global drain latch (the same one the
     /// `drain` tool/SIGTERM set); `ready` reflects the lame-duck override; `paused`
-    /// is constant `false` — pause/resume are DEFERRED (no `ctrl/pause` machinery
-    /// yet). `status` reuses the terminal-status vocabulary (RFC 0007 §3.4) plus
-    /// `running` for a live node — this surface introduces no new status.
+    /// reflects the instance-wide pause flag (the `pause`/`resume` operator tools,
+    /// RFC 0015 §4.3). Pause is tree-wide, so the instance flag is the source of
+    /// truth and every live node mirrors it (per-node pause is not tracked
+    /// separately — pause suspends the whole tree). `status` reuses the
+    /// terminal-status vocabulary (RFC 0007 §3.4) plus `running` for a live node —
+    /// this surface introduces no new status.
     fn inventory_body(&self) -> Value {
         let mut nodes: Vec<Value> = Vec::new();
         let mut active = 0u64;
+        // Pause is instance-wide (RFC 0015 §4.3); a live node mirrors it.
+        let paused = crate::signals::paused();
         // Warm sessions: live (driven by subagent.send) until done. Drain is not
         // done here (a &self read must not mutate the channel); `status` reflects
         // the last observed turn state.
@@ -400,7 +410,7 @@ impl ServeCtx {
                     "depth": 0,                 // served runs are fresh roots (RFC 0005 §3.2)
                     "kind": "warm",
                     "status": status,
-                    "paused": false,
+                    "paused": paused && !w.done, // a live node mirrors the tree pause
                     "usage": { "turns": w.turns },
                     "last_event_ms": w.started.elapsed().as_millis() as u64,
                 }));
@@ -423,7 +433,7 @@ impl ServeCtx {
                     "depth": 0,
                     "kind": "async",
                     "status": status,
-                    "paused": false,
+                    "paused": paused && !s.status.is_terminal(), // live nodes mirror the tree pause
                     "usage": {},
                     "last_event_ms": s.started.elapsed().as_millis() as u64,
                 }));
@@ -434,7 +444,7 @@ impl ServeCtx {
             "mode": self.mode,
             // Instance-level lifecycle flags (RFC 0015 §4 / §5.3).
             "draining": crate::signals::draining(),
-            "paused": false, // pause/resume deferred (no ctrl/pause machinery)
+            "paused": paused, // instance-wide pause (RFC 0015 §4.3); NOT readiness
             "ready": !crate::signals::lame_duck() && !crate::signals::draining(),
             "totals": {
                 "active": active,
@@ -718,6 +728,7 @@ impl ServeCtx {
             ServedSession {
                 status,
                 cancel: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(false)),
                 started: Instant::now(),
             },
         );
@@ -1669,6 +1680,8 @@ fn tools_call(req: Request, ctx: &ServeCtx, origin: PeerOrigin, log: &Logger) ->
         match name {
             "drain" => return handle_drain(req.id, ctx, &args(), log),
             "lame-duck" => return handle_lame_duck(req.id, ctx, &args(), log),
+            "pause" => return handle_pause(req.id, ctx, log),
+            "resume" => return handle_resume(req.id, ctx, log),
             "cancel" => return handle_cancel(req.id, ctx, &args(), log),
             _ => {}
         }
@@ -1716,10 +1729,14 @@ fn tools_call(req: Request, ctx: &ServeCtx, origin: PeerOrigin, log: &Logger) ->
 /// The operator tool defs listed to a `Management` peer (RFC 0015 §4). The names
 /// MIRROR `capabilities::OPERATOR_TOOLS` — the manifest's `surfaces.operator_tools`
 /// and this `tools/list` set are the same const, so they cannot drift (§5.2).
-/// `pause`/`resume` are deferred (no `ctrl/pause` machinery yet), so they're
-/// absent here and in the manifest.
 fn operator_tool_defs() -> Vec<Value> {
-    vec![drain_tool_def(), lame_duck_tool_def(), cancel_tool_def()]
+    vec![
+        drain_tool_def(),
+        lame_duck_tool_def(),
+        pause_tool_def(),
+        resume_tool_def(),
+        cancel_tool_def(),
+    ]
 }
 
 /// `drain` (RFC 0015 §4.1) — trigger the SAME graceful-drain choreography
@@ -1791,6 +1808,99 @@ fn handle_lame_duck(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Respo
             "isError": false
         }),
     )
+}
+
+/// `pause` (RFC 0015 §4.3) — tree-wide turn-boundary suspension. Fans
+/// `ctrl/pause` to every in-flight ROOT subagent (warm sessions directly; async
+/// runs via their per-run pause channel, which the reactor forwards as
+/// `ctrl/pause`), so each loop suspends at its next turn boundary. NOT a drain
+/// and NOT a lame-duck: the tree freezes but stays intact, readiness is unchanged
+/// (the supervisor reactor + liveness heartbeat keep running). Sets the
+/// instance-wide pause flag (so `agentd://inventory.paused` + the `agentd_paused`
+/// gauge reflect it, and runs launched while paused start paused). Returns
+/// `{paused:true, affected:N}` — N = the count of subtrees that took the message.
+fn handle_pause(id: Id, ctx: &ServeCtx, log: &Logger) -> Response {
+    crate::signals::set_paused(true);
+    crate::obs::metrics::set_paused(true);
+    let affected = fan_pause(ctx, true);
+    log.info("mcp.pause", json!({"affected": affected}));
+    // State changed → the inventory projection's instance-level `paused` flag
+    // flipped (RFC 0015 §5.3): notify a subscribed agentctl to re-read.
+    notify_resource_updated_keep(&ctx.subscriptions, crate::agentd_uri::INVENTORY_URI);
+    let body = json!({ "paused": true, "affected": affected });
+    Response::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": format!("paused: {affected} subtree(s) suspending at their next turn boundary")}],
+            "structuredContent": body,
+            "isError": false
+        }),
+    )
+}
+
+/// `resume` (RFC 0015 §4.3) — clear a prior `pause`: fan `ctrl/resume` to every
+/// in-flight root subagent so each loop continues at its next turn. Clears the
+/// instance-wide pause flag. Returns `{paused:false, affected:N}`.
+fn handle_resume(id: Id, ctx: &ServeCtx, log: &Logger) -> Response {
+    crate::signals::set_paused(false);
+    crate::obs::metrics::set_paused(false);
+    let affected = fan_pause(ctx, false);
+    log.info("mcp.resume", json!({"affected": affected}));
+    notify_resource_updated_keep(&ctx.subscriptions, crate::agentd_uri::INVENTORY_URI);
+    let body = json!({ "paused": false, "affected": affected });
+    Response::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": format!("resumed: {affected} subtree(s) continuing")}],
+            "structuredContent": body,
+            "isError": false
+        }),
+    )
+}
+
+/// Fan a pause (`want=true`) or resume (`want=false`) to every in-flight root
+/// subagent, mirroring `handle_cancel`'s dual fan-out (RFC 0015 §4.3), and return
+/// the count of subtrees that took the message:
+/// - warm sessions (`ctx.warm`): the server holds the `Subagent`, so send
+///   `ctrl/pause`/`ctrl/resume` straight down its control channel (the parallel
+///   of `w.sub.send(ControlMsg::Cancel)`).
+/// - async runs (`ctx.sessions`): the server holds only a shared atomic the run's
+///   supervisor reactor reads, so flip `s.paused` — the reactor translates the
+///   edge into `ctrl/pause`/`ctrl/resume` to its live children (the parallel of
+///   how `s.cancel` becomes a `ctrl/cancel`). Match the existing mechanism
+///   EXACTLY: no second control path is invented.
+///
+/// Only live (non-terminal) subtrees are counted — a finished run can neither
+/// pause nor resume, so it does not contribute to `affected`.
+fn fan_pause(ctx: &ServeCtx, want: bool) -> u64 {
+    let mut affected = 0u64;
+    let msg = if want {
+        ControlMsg::Pause
+    } else {
+        ControlMsg::Resume
+    };
+    {
+        let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+        for w in warm.values_mut() {
+            if w.done {
+                continue;
+            }
+            if w.sub.send(&msg).is_ok() {
+                affected += 1;
+            }
+        }
+    }
+    {
+        let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for s in reg.values() {
+            if s.status.is_terminal() {
+                continue;
+            }
+            s.paused.store(want, Ordering::Relaxed);
+            affected += 1;
+        }
+    }
+    affected
 }
 
 /// `cancel` (RFC 0015 §4.4) — the instance-scoped wrapper over the served
@@ -2144,6 +2254,10 @@ fn launch_async_run(
     permit: SpawnGuard,
 ) -> Result<(), ()> {
     let cancel = Arc::new(AtomicBool::new(false));
+    // Seed the per-run pause flag from the instance-wide pause state (RFC 0015
+    // §4.3): a run launched while the instance is paused starts paused, so the
+    // reactor forwards `ctrl/pause` to its root as soon as it is live.
+    let paused = Arc::new(AtomicBool::new(crate::signals::paused()));
     {
         let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
         evict_if_full(&mut reg);
@@ -2152,6 +2266,7 @@ fn launch_async_run(
             ServedSession {
                 status: ServedStatus::Running,
                 cancel: Arc::clone(&cancel),
+                paused: Arc::clone(&paused),
                 started: Instant::now(),
             },
         );
@@ -2169,8 +2284,14 @@ fn launch_async_run(
         .name(format!("served-run:{handle}"))
         .spawn(move || {
             let _permit = permit; // held for the run's lifetime → bounds live runs
-            let result =
-                supervise_cancellable(exe, &payload, drain, log2, Some(Arc::clone(&cancel)));
+            let result = supervise_pausable(
+                exe,
+                &payload,
+                drain,
+                log2,
+                Some(Arc::clone(&cancel)),
+                Some(Arc::clone(&paused)),
+            );
             // Write the terminal status and re-read the cancel flag UNDER the same
             // lock the cancel tool uses, so a cancel that lands while we finish is
             // never lost: either its store happens-before this load (→ a killed run
@@ -2477,6 +2598,34 @@ fn lame_duck_tool_def() -> Value {
     })
 }
 
+fn pause_tool_def() -> Value {
+    json!({
+        "name": "pause",
+        "description": "Suspend the whole agentic tree at turn boundaries (RFC 0015 §4.3): every \
+            in-flight root subagent finishes its current turn, then waits. NOT a drain and NOT a \
+            lame-duck — the tree freezes but stays intact, readiness is unchanged, the instance \
+            keeps answering ping / serving management / bumping liveness. Reversible with resume. \
+            Useful for live debugging or holding a tree while the model service is swapped. \
+            Management transport only.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false
+        }
+    })
+}
+
+fn resume_tool_def() -> Value {
+    json!({
+        "name": "resume",
+        "description": "Clear a prior pause (RFC 0015 §4.3): every paused root subagent continues \
+            at its next turn. Management transport only.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false
+        }
+    })
+}
+
 fn cancel_tool_def() -> Value {
     json!({
         "name": "cancel",
@@ -2595,6 +2744,7 @@ mod tests {
             ServedSession {
                 status: ServedStatus::Running,
                 cancel: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(false)),
                 started: Instant::now(),
             },
         );
@@ -3159,6 +3309,7 @@ mod tests {
         let s = ServedSession {
             status: ServedStatus::Running,
             cancel: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
         };
         let b = session_body("served.0", &s);
@@ -3172,6 +3323,7 @@ mod tests {
                 result: json!("done"),
             },
             cancel: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
         };
         let b = session_body("served.0", &s);
@@ -3198,6 +3350,7 @@ mod tests {
                 ServedSession {
                     status,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    paused: Arc::new(AtomicBool::new(false)),
                     started: Instant::now(),
                 },
             );
@@ -3221,6 +3374,7 @@ mod tests {
                 ServedSession {
                     status: ServedStatus::Running,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    paused: Arc::new(AtomicBool::new(false)),
                     started: Instant::now(),
                 },
             );
@@ -3346,6 +3500,7 @@ mod tests {
                     result: json!("ok"),
                 },
                 cancel: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(false)),
                 started: Instant::now(),
             },
         );
@@ -3438,7 +3593,7 @@ mod tests {
             &log(),
         );
         let names = tool_names(&mgmt);
-        for t in ["drain", "lame-duck", "cancel"] {
+        for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
             assert!(
                 names.contains(&t.to_string()),
                 "management sees {t}: {names:?}"
@@ -3448,9 +3603,9 @@ mod tests {
         for t in crate::capabilities::OPERATOR_TOOLS {
             assert!(names.contains(&t.to_string()), "manifest tool {t} listed");
         }
-        // pause/resume are deferred → never listed.
-        assert!(!names.contains(&"pause".to_string()), "pause is deferred");
-        assert!(!names.contains(&"resume".to_string()), "resume is deferred");
+        // pause/resume are PRESENT now (RFC 0015 §4.3 — shipped).
+        assert!(names.contains(&"pause".to_string()), "pause is listed");
+        assert!(names.contains(&"resume".to_string()), "resume is listed");
 
         let stdio = dispatch(
             req("tools/list", None),
@@ -3461,7 +3616,9 @@ mod tests {
             &log(),
         );
         let names = tool_names(&stdio);
-        for t in ["drain", "lame-duck", "cancel"] {
+        // No operator tool — INCLUDING pause/resume — is visible to a stdio peer
+        // (a spawned subagent must not pause/drain its supervisor, RFC 0015 §3.4).
+        for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
             assert!(
                 !names.contains(&t.to_string()),
                 "stdio must NOT see {t}: {names:?}"
@@ -3607,6 +3764,99 @@ mod tests {
     }
 
     #[test]
+    fn pause_resume_fans_to_async_sessions_and_sets_the_flag() {
+        let ctx = ctx();
+        crate::signals::set_paused(false); // clean baseline (process-global)
+        insert_running(&ctx, "served.0");
+        insert_running(&ctx, "served.1");
+        // Grab one session's pause Arc to prove the fan-out actually flips it.
+        let one = Arc::clone(&ctx.sessions.lock().unwrap().get("served.0").unwrap().paused);
+
+        let on = dispatch(
+            req("tools/call", Some(json!({"name": "pause"}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        )
+        .result
+        .expect("ok");
+        assert_eq!(on["isError"], false);
+        assert_eq!(on["structuredContent"]["paused"], true);
+        // Two live async subtrees took the message.
+        assert_eq!(on["structuredContent"]["affected"], 2);
+        assert!(crate::signals::paused(), "instance-wide pause flag set");
+        assert!(one.load(Ordering::Relaxed), "session pause channel flipped");
+
+        // Inventory now reflects the pause (instance flag + per live node).
+        let inv = ctx.inventory_body();
+        assert_eq!(inv["paused"], true);
+        assert!(
+            inv["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|n| n["paused"] == true),
+            "every live node mirrors the tree pause: {inv}"
+        );
+
+        let off = dispatch(
+            req("tools/call", Some(json!({"name": "resume"}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        )
+        .result
+        .expect("ok");
+        assert_eq!(off["structuredContent"]["paused"], false);
+        assert_eq!(off["structuredContent"]["affected"], 2);
+        assert!(!crate::signals::paused(), "instance-wide pause cleared");
+        assert!(
+            !one.load(Ordering::Relaxed),
+            "session pause channel cleared"
+        );
+    }
+
+    #[test]
+    fn pause_is_not_drain_or_lame_duck_readiness_unchanged() {
+        // §4.3: a paused instance is NOT lame-duck/draining — readiness reflects
+        // only those, never pause.
+        let ctx = ctx();
+        crate::signals::set_paused(false);
+        crate::signals::set_lame_duck(false);
+        let was_draining = crate::signals::draining();
+        let before = ctx.inventory_body();
+        let ready_before = before["ready"].as_bool().unwrap();
+        dispatch(
+            req("tools/call", Some(json!({"name": "pause"}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        )
+        .result
+        .expect("ok");
+        let after = ctx.inventory_body();
+        assert_eq!(after["paused"], true);
+        // ready is computed from lame_duck/draining ONLY — pause must not move it.
+        assert_eq!(
+            after["ready"].as_bool().unwrap(),
+            ready_before,
+            "pause must not change readiness"
+        );
+        // And readiness still equals the genuine drain/lame-duck computation.
+        assert_eq!(
+            after["ready"].as_bool().unwrap(),
+            !crate::signals::lame_duck() && !was_draining && !crate::signals::draining()
+        );
+        crate::signals::set_paused(false); // restore
+    }
+
+    #[test]
     fn cancel_unknown_handle_is_an_iserror_result_not_a_protocol_error() {
         let r = dispatch(
             req(
@@ -3674,10 +3924,11 @@ mod tests {
         let body: Value = serde_json::from_str(v["contents"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["run_id"], "r1");
         assert_eq!(body["mode"], "reactive");
-        // The instance-level lifecycle flags (§5.3). paused is constant false
-        // (pause deferred); ready reflects the lame-duck override (clear here,
-        // and not draining unless an earlier test latched it).
-        assert_eq!(body["paused"], false);
+        // The instance-level lifecycle flags (§5.3). `paused` reflects the
+        // instance-wide pause flag (RFC 0015 §4.3) — a process-global another test
+        // may have toggled, so assert the shape, not an absolute (like
+        // draining/ready). `ready` reflects the lame-duck override.
+        assert!(body["paused"].is_boolean());
         assert!(body["draining"].is_boolean());
         assert!(body["ready"].is_boolean());
         assert!(body["totals"]["total_spawned"].is_u64());
@@ -3921,6 +4172,7 @@ mod tests {
                         result,
                     },
                     cancel: Arc::new(AtomicBool::new(false)),
+                    paused: Arc::new(AtomicBool::new(false)),
                     started: Instant::now(),
                 },
             );

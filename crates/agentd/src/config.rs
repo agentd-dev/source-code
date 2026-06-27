@@ -49,6 +49,101 @@ impl Mode {
     }
 }
 
+/// Timer-route shard behaviour (RFC 0019 §4.1, `AGENTD_SHARD_TIMER`). Stored on
+/// [`Config`] in ALL feature combos (so `Config` stays uniform), but only
+/// consulted by the `cluster`-feature timer driver. `shard0` ⇒ one fleet-wide
+/// ticker (only shard 0 fires); `keyed` ⇒ every replica fires (the per-tick key
+/// gate is applied elsewhere / deferred).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimerShardMode {
+    #[default]
+    Shard0,
+    Keyed,
+}
+
+impl TimerShardMode {
+    fn parse(s: &str) -> Option<TimerShardMode> {
+        match s {
+            "shard0" => Some(TimerShardMode::Shard0),
+            "keyed" => Some(TimerShardMode::Keyed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimerShardMode::Shard0 => "shard0",
+            TimerShardMode::Keyed => "keyed",
+        }
+    }
+}
+
+/// Shard identity (`--shard K/N`, RFC 0019 §4). Held on [`Config`] in ALL feature
+/// combos as primitive fields (no dependency on the feature-gated `cluster`
+/// module's types), so `Config::load` compiles uniformly. The default `0/1` is a
+/// single logical shard that owns everything — byte-for-byte RFC 0008 behaviour.
+/// Without the `cluster` feature a requested `N > 1` is rejected at validation
+/// (exit 2): a silently-ignored shard directive would cause duplicate processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardCfg {
+    /// Shard ordinal `K` (`0 <= k < n`).
+    pub k: u32,
+    /// Shard count `N` (`>= 1`). `1` is unsharded (the default).
+    pub n: u32,
+    /// Timer-route behaviour for a sharded `schedule`/`loop` fleet.
+    pub timer: TimerShardMode,
+}
+
+impl Default for ShardCfg {
+    fn default() -> Self {
+        ShardCfg {
+            k: 0,
+            n: 1,
+            timer: TimerShardMode::Shard0,
+        }
+    }
+}
+
+impl ShardCfg {
+    /// Parse the `K/N` value of `--shard` / `AGENTD_SHARD` into `(k, n)`, leaving
+    /// `timer` at its current value. Rejects `N == 0`, `K >= N`, and any
+    /// non-numeric / malformed form with a [`ConfigError::Usage`] (exit 2, before
+    /// any side effect). Mirrors the hand-rolled-FNV shard contract (RFC 0019 §4.1)
+    /// without pulling in the gated `cluster` module.
+    fn parse_into(&mut self, spec: &str) -> Result<(), ConfigError> {
+        let (k_str, n_str) = spec
+            .split_once('/')
+            .ok_or_else(|| usage(format!("--shard must be K/N (got: {spec})")))?;
+        let k: u32 = k_str
+            .trim()
+            .parse()
+            .map_err(|_| usage(format!("--shard: invalid K '{k_str}' (want a number)")))?;
+        let n: u32 = n_str
+            .trim()
+            .parse()
+            .map_err(|_| usage(format!("--shard: invalid N '{n_str}' (want a number)")))?;
+        if n == 0 {
+            return Err(usage("--shard: N must be > 0".into()));
+        }
+        if k >= n {
+            return Err(usage(format!("--shard: K must be < N (got {k}/{n})")));
+        }
+        self.k = k;
+        self.n = n;
+        Ok(())
+    }
+
+    /// The `"K/N"` identity for the capabilities manifest / capacity resource
+    /// (RFC 0019 §9). `None` for the unsharded `N == 1` case (reported as null).
+    pub fn label(&self) -> Option<String> {
+        if self.n == 1 {
+            None
+        } else {
+            Some(format!("{}/{}", self.k, self.n))
+        }
+    }
+}
+
 /// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
 /// implicit default (no `--serve-mcp`); the explicit targets are a unix socket or
 /// — `--features vsock` — an AF_VSOCK port. The string forms are
@@ -299,6 +394,11 @@ pub struct Config {
     /// stored here or logged. An inline secret-shaped value is rejected at
     /// validation (§3.1). A `BTreeMap` so the order is deterministic.
     pub intelligence_headers: std::collections::BTreeMap<String, String>,
+    /// Shard identity (`--shard K/N` / `AGENTD_SHARD`, RFC 0019 §4) +
+    /// timer-shard behaviour (`AGENTD_SHARD_TIMER`). Always present (default
+    /// `0/1`, unsharded) so `Config` is uniform across feature combos; a
+    /// requested `N > 1` needs the `cluster` build feature (validated, exit 2).
+    pub shard: ShardCfg,
 }
 
 impl Default for Config {
@@ -336,6 +436,7 @@ impl Default for Config {
             report_file: None,
             events_ring: crate::obs::log::EVENTS_RING_DEFAULT,
             intelligence_headers: std::collections::BTreeMap::new(),
+            shard: ShardCfg::default(),
         }
     }
 }
@@ -384,6 +485,7 @@ impl fmt::Debug for Config {
                 "intelligence_headers",
                 &self.intelligence_headers.keys().collect::<Vec<_>>(),
             )
+            .field("shard", &self.shard)
             .finish()
     }
 }
@@ -537,6 +639,16 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
+        // Shard identity (RFC 0019 §4.2): agentctl injects `AGENTD_SHARD=K/N`
+        // from the StatefulSet ordinal; a `--shard` flag below overrides it.
+        if let Some(v) = envmap.get("AGENTD_SHARD") {
+            c.shard.parse_into(v)?;
+        }
+        // Timer-route shard behaviour (RFC 0019 §4.1): `shard0` (default) | `keyed`.
+        if let Some(v) = envmap.get("AGENTD_SHARD_TIMER") {
+            c.shard.timer = TimerShardMode::parse(v)
+                .ok_or_else(|| usage(format!("invalid AGENTD_SHARD_TIMER: {v}")))?;
+        }
         // A single `AGENTD_A2A_PEER` env declares one peer (the env channel is
         // one value; declare more with repeated `--a2a-peer` flags). RFC 0020 §3.
         if let Some(v) = envmap.get("AGENTD_A2A_PEER") {
@@ -648,6 +760,11 @@ impl Config {
                 "--cgroup-memory-max" => c.cgroup_memory_max = Some(take("--cgroup-memory-max")?),
                 "--cgroup-pids-max" => c.cgroup_pids_max = Some(take("--cgroup-pids-max")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
+                // Shard identity (RFC 0019 §4): `--shard K/N` overrides AGENTD_SHARD.
+                "--shard" => {
+                    let v = take("--shard")?;
+                    c.shard.parse_into(&v)?;
+                }
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 "--report-file" => c.report_file = Some(take("--report-file")?),
@@ -900,6 +1017,14 @@ impl Config {
         // before any listener is bound — mirroring the intelligence-URI check.
         if let Some(spec) = &self.serve_mcp {
             ServeTarget::parse(spec)?;
+        }
+        // Sharding (`--shard K/N`, RFC 0019 §4) needs the `cluster` build feature.
+        // A requested `N > 1` without it is rejected at startup (exit 2) — NOT
+        // silently ignored: a dropped scaling directive would make this replica
+        // own every item, duplicating the work the operator meant to partition.
+        // `N == 1` (the unsharded default / absent flag) is always fine.
+        if self.shard.n > 1 && !cfg!(feature = "cluster") {
+            return Err(usage("--shard requires the 'cluster' build feature".into()));
         }
         // Declared A2A delegation peers (RFC 0020 §3) need the `a2a` build
         // feature, and each endpoint scheme is validated up front (exit 2 before
@@ -1285,6 +1410,7 @@ fn help_text() -> String {
          \x20 --continue <uri>            subscribe, routed to one warm session (repeatable)\n\
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
          \x20 --cron <5-field>           schedule on a UTC cron expr (needs --features cron)\n\
+         \x20 --shard K/N                 partition the URI/key space across a fleet (needs --features cluster; or AGENTD_SHARD)\n\
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
@@ -1468,6 +1594,81 @@ mod tests {
         // schedule mode with neither interval nor cron → usage error
         let e2 = Config::load(&args(&["--mode", "schedule"]), &base_env()).unwrap_err();
         assert!(matches!(e2, ConfigError::Usage(_)));
+    }
+
+    // ───────────────────────── RFC 0019 — sharding (§4) ───────────────────────
+
+    #[test]
+    fn shard_defaults_to_unsharded() {
+        // Absent --shard ⇒ 0/1 (single shard, owns everything), no feature needed.
+        let c = Config::load(&args(&[]), &base_env()).unwrap();
+        assert_eq!(c.shard, ShardCfg::default());
+        assert_eq!(c.shard.n, 1);
+        assert_eq!(c.shard.label(), None);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn shard_parses_from_flag_and_env_with_precedence() {
+        // Env sets a shard; a flag overrides it (precedence: flag > env).
+        let mut env = base_env();
+        env.push(("AGENTD_SHARD".into(), "1/4".into()));
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!((c.shard.k, c.shard.n), (1, 4));
+        assert_eq!(c.shard.label(), Some("1/4".into()));
+
+        let c = Config::load(&args(&["--shard", "3/8"]), &env).unwrap();
+        assert_eq!((c.shard.k, c.shard.n), (3, 8));
+        assert_eq!(c.shard.label(), Some("3/8".into()));
+
+        // AGENTD_SHARD_TIMER parses; default is shard0.
+        assert_eq!(c.shard.timer, TimerShardMode::Shard0);
+        let mut env2 = base_env();
+        env2.push(("AGENTD_SHARD".into(), "0/2".into()));
+        env2.push(("AGENTD_SHARD_TIMER".into(), "keyed".into()));
+        let c = Config::load(&args(&[]), &env2).unwrap();
+        assert_eq!(c.shard.timer, TimerShardMode::Keyed);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn shard_malformed_or_out_of_range_is_usage_error() {
+        for bad in ["8/3", "0/0", "x/8", "3/y", "3", "", "5/5"] {
+            assert!(
+                matches!(
+                    Config::load(&args(&["--shard", bad]), &base_env()),
+                    Err(ConfigError::Usage(_))
+                ),
+                "--shard {bad} must be a usage error"
+            );
+        }
+        // A bad AGENTD_SHARD_TIMER is exit 2 too.
+        let mut env = base_env();
+        env.push(("AGENTD_SHARD".into(), "0/2".into()));
+        env.push(("AGENTD_SHARD_TIMER".into(), "nonsense".into()));
+        assert!(matches!(
+            Config::load(&args(&[]), &env),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[test]
+    fn shard_n_gt_1_requires_cluster_feature() {
+        // A scaling directive must NOT be silently ignored: N>1 without the
+        // feature is exit 2. N==1 (the default / explicit 0/1) is always fine.
+        let e = Config::load(&args(&["--shard", "3/8"]), &base_env()).unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--shard requires the 'cluster' build feature"),
+                "got: {msg}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+        // The parse itself still works (so the message is the feature one, not a
+        // parse error), and 0/1 validates with no feature.
+        let c = Config::load(&args(&["--shard", "0/1"]), &base_env()).unwrap();
+        assert_eq!(c.shard.n, 1);
     }
 
     #[test]

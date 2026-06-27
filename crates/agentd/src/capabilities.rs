@@ -267,6 +267,15 @@ fn surfaces(cfg: &Config) -> Value {
         "hot_reload": false,
         "config_validate": true,
         "config_schema": true,
+        // RFC 0019 horizontal-scaling surface. `cluster` is true in a `cluster`
+        // build (sharding + the capacity resource are present). `shard` is this
+        // instance's "K/N" identity, or null when unsharded (N==1) / no cluster.
+        // `standby` is always false — standby (RFC 0019 §7) is DEFERRED (§12). No
+        // `claim` key: the work-claim convention (§3) is not implemented, and
+        // capability-absence-not-error (RFC 0015 §2.5) means we don't advertise it.
+        "cluster": cfg!(feature = "cluster"),
+        "shard": cfg.shard.label().map_or(Value::Null, Value::String),
+        "standby": false,
     })
 }
 
@@ -469,6 +478,39 @@ mod tests {
         } else {
             // Capability-absence-not-error: no a2a build ⇒ the surface is `false`.
             assert_eq!(a2a, &json!(false));
+        }
+    }
+
+    #[test]
+    fn surfaces_advertise_cluster_and_shard_per_build(/* RFC 0019 §9 */) {
+        // Unsharded base: `standby` is always false; `cluster` mirrors the build;
+        // `shard` is null when N==1; there is NO `claim` key (claim is deferred).
+        let cfg = base();
+        let s = &manifest(&cfg, &Identity::from_env(&cfg.run_id), false)["surfaces"];
+        assert_eq!(s["standby"], json!(false));
+        assert_eq!(s["cluster"], json!(cfg!(feature = "cluster")));
+        assert_eq!(s["shard"], Value::Null); // unsharded ⇒ null
+        assert!(
+            s.get("claim").is_none(),
+            "claim must not be advertised (deferred)"
+        );
+
+        // With a real shard (cluster build only — N>1 needs the feature), `shard`
+        // is the "K/N" string. Gated like surfaces_advertise_a2a_per_build.
+        #[cfg(feature = "cluster")]
+        {
+            let cfg = cfg_with(
+                &[
+                    ("INSTRUCTION", "x"),
+                    ("AGENTD_INTELLIGENCE", "https://api.example/v1"),
+                    ("AGENTD_SHARD", "3/8"),
+                ],
+                &[],
+            );
+            let s = &manifest(&cfg, &Identity::from_env(&cfg.run_id), false)["surfaces"];
+            assert_eq!(s["cluster"], json!(true));
+            assert_eq!(s["shard"], json!("3/8"));
+            assert_eq!(s["standby"], json!(false));
         }
     }
 

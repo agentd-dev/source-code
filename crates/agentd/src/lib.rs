@@ -16,6 +16,8 @@
 pub mod agentd_uri; // the agentd:// resource scheme (self-state + async completion)
 pub mod agentloop; // the ReAct loop + terminal-status state machine
 pub mod capabilities; // the capabilities manifest — the agentctl control-plane spine (RFC 0015)
+#[cfg(feature = "cluster")]
+pub mod cluster; // horizontal scaling: sharding + autoscaling signals + capacity (RFC 0019)
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup
 pub mod config_file; // the declarative config FILE (JSON) + JSON Schema export (RFC 0017 §3/§4)
 pub mod exit; // the public exit-code table + terminal-status -> code map

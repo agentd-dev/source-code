@@ -228,6 +228,35 @@ impl Orchestrator {
         self.parent_depth < self.max_depth
     }
 
+    /// Publish the subagent-tree shape + saturation gauges (RFC 0016 §4.3 /
+    /// RFC 0019 §5.1), called at each spawn and reap so `agentd_active_subagents`
+    /// reflects the live children — it is the load-bearing saturation numerator.
+    /// `active` = currently-held live children (backgrounded async/detached ones;
+    /// a synchronous spawn blocks inside `supervise_once`, so it is not "held");
+    /// `breadth` = the lifetime child-count cap counter; `depth` = this node's own
+    /// depth (best-effort). `agentd_saturation` = live / capacity where capacity is
+    /// the tree total cap (`max_total`, RFC 0009 — the per-route product is not
+    /// cheaply reachable from this local orchestrator, so the tree cap alone is
+    /// used, per RFC 0019 §5.1's `min(…, max_total_subagents)`). No-op without the
+    /// `metrics` feature.
+    fn publish_tree_shape(&self) {
+        // Live = held async/detached children that have not yet recorded a terminal
+        // outcome. A detached child has no observable outcome, so it counts live
+        // while held; a completed-but-uncollected child does not.
+        let active = self
+            .async_children
+            .values()
+            .filter(|c| c.detached || c.outcome.is_none())
+            .count() as u64;
+        crate::obs::metrics::set_tree_shape(
+            active,
+            u64::from(self.parent_depth),
+            u64::from(self.child_count),
+        );
+        let capacity = u64::from(crate::supervisor::tree::Caps::default().max_total);
+        crate::obs::metrics::set_saturation(active, capacity);
+    }
+
     fn spawn(&mut self, args: &Value) -> (String, bool) {
         // Caps — refused as a tool result so the model adapts (RFC 0009).
         if !self.can_nest() {
@@ -312,6 +341,10 @@ impl Orchestrator {
             return self.spawn_async(payload, child_path, detach);
         }
 
+        // A synchronous spawn is live for the duration of this blocking call; the
+        // breadth counter advanced above, so publish the shape now (it reflects the
+        // bumped `child_count`). The result returns once the child has completed.
+        self.publish_tree_shape();
         match supervise_once(
             self.exe.clone(),
             &payload,
@@ -433,6 +466,9 @@ impl Orchestrator {
                     "subagent.spawn_async",
                     json!({"handle": handle, "detach": detach}),
                 );
+                // A held live child just appeared — refresh the shape/saturation
+                // gauges (this one is "active" until reaped).
+                self.publish_tree_shape();
                 if detach {
                     (
                         format!(
@@ -500,10 +536,14 @@ impl Orchestrator {
             ));
         }
         Self::drain_child(child);
-        Some(match &child.outcome {
+        let result = match &child.outcome {
             None => (format!("subagent {handle} is still running"), false),
             Some((result, is_err)) => (result.clone(), *is_err),
-        })
+        };
+        // A child that just transitioned to terminal here is no longer live —
+        // refresh the active-subagents / saturation gauges to reflect the reap.
+        self.publish_tree_shape();
+        Some(result)
     }
 
     /// `subagent.status` — non-blocking, idempotent peek (see [`Self::peek_child`]).
@@ -550,7 +590,10 @@ impl Orchestrator {
             if let Some(child) = self.async_children.get_mut(&handle) {
                 Self::drain_child(child);
                 if let Some((result, is_err)) = &child.outcome {
-                    return (result.clone(), *is_err);
+                    let resolved = (result.clone(), *is_err);
+                    // Reaped: this child is now terminal — refresh the gauges.
+                    self.publish_tree_shape();
+                    return resolved;
                 }
             }
             if Instant::now() >= deadline {
@@ -686,6 +729,10 @@ impl Drop for Orchestrator {
                 json!({"uncollected": self.async_children.len(), "detached": detached}),
             );
         }
+        // The tree is collapsing — clear the live-children gauges so a daemon's
+        // next run doesn't inherit a stale active/saturation reading.
+        self.async_children.clear();
+        self.publish_tree_shape();
     }
 }
 

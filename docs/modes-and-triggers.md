@@ -57,7 +57,9 @@ Default mode is `once`. Select with `--mode` (or `AGENTD_MODE`):
 Run the instruction to a terminal status, then exit. No daemon, no socket, no
 warm session. Result on stdout, telemetry on stderr (RFC 0010). The exit code
 maps the root's terminal status (RFC 0011 §5.2): `completed`→0, `refused`→5,
-budget/exhausted→7, deadline→124, …
+budget/exhausted (steps / tokens / the run's own `deadline`)→7, … (exit code
+`124` is the *supervisor's* hard-kill backstop for a child that won't
+self-terminate, not a terminal-status mapping)
 
 ```
 agentd \
@@ -108,8 +110,10 @@ agentd \
 ```
 
 Exit predicate (RFC 0008 §3.1.2): a drain signal → `0` (clean) / `143`
-(ungraceful); tree token ceiling spent → `7`; wall-clock `--deadline` reached →
-`124`; restart breaker open → `1`.
+(ungraceful); tree token ceiling spent → `7`; the run's own wall-clock
+`--deadline` reached → `7` (a budget-class terminal status); restart breaker open
+→ `1`. (Exit `124` is reserved for the supervisor's hard-kill backstop, when a
+child won't self-terminate.)
 
 > **Fresh vs warm re-entry.** Whether each shift is a fresh subagent or a warm
 > continuation of the prior session is a planned `--session fresh|warm` knob

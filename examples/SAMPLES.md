@@ -4,14 +4,11 @@ Runnable samples for the three operational shapes of **agentd** — a one-shot
 run, an event-reactive daemon, and a polling/work-until-done loop — plus the
 instruction files and MCP server config they use.
 
-> **Status.** agentd is mid-build. The binary today validates its config,
-> initializes logging, and exits with a scaffold notice for the run modes
-> (foundation done). The agentic loop, supervisor, and MCP client land across
-> milestones **M1–M3** — see `docs/design/PLAN.md`. The commands below are
-> written against the **intended v1 behavior**; run them now and you get the
-> config-validated scaffold path, not a completed agent run yet. Every flag and
-> env var used here exists in `crates/agentd/src/config.rs` (the authoritative
-> surface).
+> **Status.** Implemented and released (v2.0.1). The agentic ReAct loop, the
+> supervisor + subagent process tree, the MCP client, served self-MCP, and all
+> four run modes ship; the commands below run real agent runs (given an
+> intelligence endpoint + MCP servers). Every flag and env var used here exists
+> in `crates/agentd/src/config.rs` (the authoritative surface).
 
 ---
 
@@ -138,8 +135,10 @@ agentd \
 ```
 
 The exit code maps the root subagent's terminal status: `completed`→`0`,
-`refused`→`5`, budget/exhausted→`7`, deadline→`124` (RFC 0007/0011). Setting an
-explicit `--run-id` makes retries idempotent.
+`refused`→`5`, budget/exhausted (steps / tokens / the run's own `deadline`)→`7`
+(RFC 0007/0011). Exit `124` is reserved for the supervisor's hard-kill backstop —
+a child that won't self-terminate — not the deadline terminal status itself.
+Setting an explicit `--run-id` makes retries idempotent.
 
 ---
 
@@ -216,8 +215,8 @@ kept-alive Deployment.
 > **Scheduling note.** For production cron, the **recommended** path is an
 > external scheduler (e.g. a k8s CronJob) invoking `agentd --mode once …` — robust
 > to clock skew and restart. agentd also has a `--mode schedule` (per-fire
-> identical to `once`, requires `--interval`) for non-orchestrated deployments
-> (RFC 0008).
+> identical to `once`, requires `--interval <dur>` or `--cron <expr>`) for
+> non-orchestrated deployments (RFC 0008).
 
 ---
 
@@ -275,7 +274,6 @@ Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 - **Reactivity is stdio-only.** Reactive-over-HTTP / SSE GET — **(roadmap)**, RFC 0013.
 - **Self-MCP serving is stdio/unix only** (`--serve-mcp unix:/path`). HTTP
   serving — **(roadmap)**.
-- **Async subagents** land in **M3**; v1 subagent spawn is synchronous.
 - **MCP `tasks` / `sampling` / `roots`** are not used as a client — **(roadmap)**, RFC 0013.
 - **Config file / `AGENTD_MCP_CONFIG`** layer and per-server allowlists —
   **(roadmap)**; v1 uses `--mcp` flags. See `docs/design/PLAN.md`.

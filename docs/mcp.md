@@ -312,7 +312,11 @@ nothing else. Note `tools` is an **empty object** (no `listChanged`) and
 No `prompts`, `logging`, `completions`, or `tasks`, and no `listChanged` on either
 capability (the listed resource set is the single, stable `agentd://status`). It
 answers `ping`, and does **not** emit `notifications/message` or
-`notifications/progress` in v1.
+`notifications/progress` in v1. It also does **not** accept an inbound
+`notifications/cancelled` — a peer cancels an in-flight or async run with the
+**`subagent.cancel`** tool (by handle), which walks the kill ladder over that
+run's subtree (§2.2). That tool, not a per-request cancel, is the served
+self-MCP's cancellation path.
 
 ### 2.2 The `agentd://` tools
 

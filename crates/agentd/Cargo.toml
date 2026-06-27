@@ -30,6 +30,10 @@ vsock = ["dep:vsock"]
 # Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
 # (RFC 0005 §3.6) — no dep. (mio/epoll is a future high-fan-in optimisation.)
 serve-mcp = []
+# A2A (Agent2Agent) v1.0 unary method surface over the served self-MCP listener
+# (RFC 0020). A thin binding — a Task IS a served run — over the existing RFC 0004
+# JSON-RPC codec + the vsock/unix management transport; no dep. Rides serve-mcp.
+a2a = ["serve-mcp"]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []

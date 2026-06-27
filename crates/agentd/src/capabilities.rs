@@ -76,6 +76,9 @@ fn build_features() -> Vec<&'static str> {
     if cfg!(feature = "serve-mcp") {
         f.push("serve-mcp");
     }
+    if cfg!(feature = "a2a") {
+        f.push("a2a");
+    }
     if cfg!(feature = "cron") {
         f.push("cron");
     }
@@ -189,6 +192,12 @@ fn surfaces(cfg: &Config) -> Value {
         // capability-absence-not-error (RFC 0015 §2.5). `pause`/`resume` are
         // deferred (see OPERATOR_TOOLS).
         "operator_tools": operator_tools(),
+        // The A2A external-agent surface (RFC 0020). When this build serves A2A
+        // (the `a2a` feature, which rides the management transport), advertise the
+        // served unary method set and `streaming:false` (A2A-2 adds streaming);
+        // else `false`. The Agent Card itself is the gateway's projection of this
+        // manifest (RFC 0020 §2.3) — agentd only advertises the capability here.
+        "a2a": a2a_surface(),
         // The /metrics addr if configured, else false. RFC 0010 / 0016.
         "metrics": cfg.metrics_addr.clone().map_or(Value::Bool(false), Value::String),
         "metrics_schema": "1.0",
@@ -209,6 +218,29 @@ fn operator_tools() -> Vec<&'static str> {
         OPERATOR_TOOLS.to_vec()
     } else {
         Vec::new()
+    }
+}
+
+/// The A2A surface advertisement (RFC 0020). The `a2a` build serves the four
+/// unary methods over the management transport with `streaming:false` (A2A-2 adds
+/// streaming); without the feature the surface is honestly `false`
+/// (capability-absence-not-error, RFC 0015 §2.5). The method names here MIRROR the
+/// `a2a.*` dispatch in [`crate::mcp::server`] / [`crate::mcp::a2a`] — the gateway
+/// reads this to build the Agent Card and to know which methods to bridge.
+fn a2a_surface() -> Value {
+    if cfg!(feature = "a2a") {
+        json!({
+            "version": "1.0",
+            "streaming": false,
+            "methods": [
+                "a2a.SendMessage",
+                "a2a.GetTask",
+                "a2a.CancelTask",
+                "a2a.ListTasks",
+            ],
+        })
+    } else {
+        Value::Bool(false)
     }
 }
 
@@ -273,6 +305,7 @@ mod tests {
                 "tls" => cfg!(feature = "tls"),
                 "vsock" => cfg!(feature = "vsock"),
                 "serve-mcp" => cfg!(feature = "serve-mcp"),
+                "a2a" => cfg!(feature = "a2a"),
                 "cron" => cfg!(feature = "cron"),
                 "metrics" => cfg!(feature = "metrics"),
                 "otel" => cfg!(feature = "otel"),
@@ -318,6 +351,30 @@ mod tests {
         // Frozen strings.
         assert_eq!(s["metrics_schema"], json!("1.0"));
         assert_eq!(s["exit_codes"], json!("RFC-0011-§5"));
+    }
+
+    #[test]
+    fn surfaces_advertise_a2a_per_build(/* RFC 0020 §integration */) {
+        let cfg = base();
+        let id = Identity::from_env(&cfg.run_id);
+        let a2a = &manifest(&cfg, &id, false)["surfaces"]["a2a"];
+        if cfg!(feature = "a2a") {
+            // The served unary method set + streaming honestly false (A2A-2 adds it).
+            assert_eq!(a2a["version"], json!("1.0"));
+            assert_eq!(a2a["streaming"], json!(false));
+            assert_eq!(
+                a2a["methods"],
+                json!([
+                    "a2a.SendMessage",
+                    "a2a.GetTask",
+                    "a2a.CancelTask",
+                    "a2a.ListTasks"
+                ])
+            );
+        } else {
+            // Capability-absence-not-error: no a2a build ⇒ the surface is `false`.
+            assert_eq!(a2a, &json!(false));
+        }
     }
 
     #[test]

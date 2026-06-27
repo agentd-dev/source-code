@@ -8,6 +8,7 @@
 //! the configured mode (once / loop / reactive / schedule), supervising a root
 //! subagent.
 
+use agentd::agentloop::stop::TerminalStatus;
 use agentd::config::{Config, ConfigError, Mode};
 use agentd::obs::log::{Comp, LogCtx, Logger};
 use agentd::subagent::protocol::{IntelConfig, Limits, SpawnPayload, Telemetry};
@@ -185,6 +186,23 @@ fn run() -> i32 {
         }
     }
 
+    // RFC 0016 §6.4: a reactive daemon has no single terminal outcome, so
+    // `--report-file` is inert — warn (not a hard error) so the operator learns
+    // the flag does nothing here. Its per-reaction outcomes live in metrics +
+    // the event stream.
+    if cfg.mode == Mode::Reactive && cfg.report_file.is_some() {
+        log.warn(
+            "config.inert",
+            json!({"flag": "--report-file", "reason": "reactive daemons emit no run report (RFC 0016 §6.4)"}),
+        );
+    }
+    // RFC 0016 §7.2 / §11: install the bounded `agentd://events` ring when the
+    // served self-MCP is configured (the events surface is implied by
+    // `--serve-mcp` + the `events` feature). A no-op without the feature; the ring
+    // capture path is a single relaxed atomic load otherwise, so the default build
+    // pays nothing. Telemetry never crashes the run (§8.4).
+    install_event_ring(&cfg, &log);
+
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
         // The long-lived modes all re-exec a root subagent, so they need our
@@ -240,6 +258,34 @@ fn run() -> i32 {
             let _ = serve_handle;
             code
         }
+    }
+}
+
+/// Install the bounded `agentd://events` ring when the served self-MCP is
+/// configured (RFC 0016 §7.2). The events surface is implied by `--serve-mcp` +
+/// the `events` feature; without either, no ring is installed and capture stays
+/// a no-op. `--events-ring N` sizes it (default 1024).
+#[cfg(feature = "events")]
+fn install_event_ring(cfg: &Config, log: &Logger) {
+    if cfg.serve_mcp.is_some() {
+        agentd::obs::log::install_event_ring(cfg.events_ring);
+        log.info(
+            "events.armed",
+            json!({"ring": cfg.events_ring, "uri": agentd::agentd_uri::EVENTS_URI}),
+        );
+    }
+}
+
+/// No-op without the `events` feature: this build serves no `agentd://events`
+/// resource, so no ring is installed (capability-absence-not-error). Warns when
+/// the surface was implied (`--serve-mcp` set) so the operator knows it is inert.
+#[cfg(not(feature = "events"))]
+fn install_event_ring(cfg: &Config, log: &Logger) {
+    if cfg.serve_mcp.is_some() {
+        log.warn(
+            "events.unavailable",
+            json!({"reason": "built without --features events"}),
+        );
     }
 }
 
@@ -382,40 +428,108 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
     };
     let payload = root_payload(cfg);
 
-    match supervise_once(exe, &payload, cfg.drain_timeout, log.clone()) {
+    // Bookend the run for the report's duration / timestamps (RFC 0016 §6.2).
+    let started = std::time::SystemTime::now();
+    let result = supervise_once(exe, &payload, cfg.drain_timeout, log.clone());
+    let ended = std::time::SystemTime::now();
+
+    // Derive (terminal-status, has_usable_partial, exit_code) ONCE, so the report
+    // and the process exit code agree (the exit code is the report's coarse
+    // projection, §6.2). `status`/`partial` come from the outcome where present;
+    // a fatal-infra Failed / a supervisor Kill have no TerminalStatus enum value
+    // (RFC 0007 §3.4 aborts), so they project to the nearest report status.
+    let (status, partial, code) = match &result {
+        Ok(SuperviseResult::Completed(o)) => {
+            (o.status, o.partial, exit::once_exit(o.status, o.partial))
+        }
+        Ok(SuperviseResult::Failed(err)) => (TerminalStatus::Crashed, false, failed_exit(err)),
+        Ok(SuperviseResult::Killed(reason)) => kill_report_status(*reason),
+        Err(_) => (TerminalStatus::Crashed, false, exit::GENERIC),
+    };
+
+    // Write the run-outcome report (RFC 0016 §6.3) BEFORE the proc.exit line and
+    // BEFORE returning the code. Best-effort-but-loud (§8.4): a failed write logs
+    // `report.write.fail` and the run still exits with `code` — the exit code is
+    // the floor contract, never gated on the report landing.
+    write_run_report(cfg, status, code, partial, started, ended, log);
+
+    match result {
         Ok(SuperviseResult::Completed(outcome)) => {
             print_result(&outcome.result);
             log.info(
                 "proc.exit",
                 json!({"status": outcome.status.as_str(), "partial": outcome.partial}),
             );
-            exit::once_exit(outcome.status, outcome.partial)
+            code
         }
         Ok(SuperviseResult::Failed(err)) => {
             log.error("proc.exit", json!({"err": err}));
             eprintln!("agentd: {err}");
-            failed_exit(&err)
+            code
         }
         Ok(SuperviseResult::Killed(reason)) => {
             log.warn("proc.exit", json!({"killed": format!("{reason:?}")}));
             eprintln!("agentd: run terminated ({reason:?})");
-            match reason {
-                KillReason::Deadline | KillReason::Stuck => exit::DEADLINE,
-                KillReason::TreeBudget => exit::BUDGET,
-                // A SIGTERM-initiated drain is a graceful shutdown → exit 0, never
-                // 143 (RFC 0011 §5.1: we self-exit 0; 143 is OS-set when the
-                // kernel kills us). A drain that overran its budget still exits 0
-                // but logged `drain.timeout` + the SIGKILL ladder, so the
-                // ungraceful teardown is auditable.
-                KillReason::Drain => exit::SUCCESS,
-            }
+            code
         }
         Err(e) => {
             log.error("proc.exit", json!({"err": format!("spawn: {e}")}));
             eprintln!("agentd: failed to spawn root subagent: {e}");
-            exit::GENERIC
+            code
         }
     }
+}
+
+/// Project a supervisor [`KillReason`] to a `(report status, has_usable_partial,
+/// exit code)` triple for the run report + exit (RFC 0016 §6.2 / RFC 0011 §5). A
+/// kill has no `TerminalStatus` enum value, so it maps to the nearest report
+/// status; the exit code matches `run_once`'s prior mapping exactly (a clean
+/// drain is `0`, never `143` — RFC 0011 §5.1).
+fn kill_report_status(reason: KillReason) -> (TerminalStatus, bool, i32) {
+    match reason {
+        KillReason::Deadline | KillReason::Stuck => {
+            (TerminalStatus::Deadline, false, exit::DEADLINE)
+        }
+        KillReason::TreeBudget => (TerminalStatus::ExhaustedTokens, false, exit::BUDGET),
+        KillReason::Drain => (TerminalStatus::Cancelled, false, exit::SUCCESS),
+    }
+}
+
+/// Build + write the run-outcome report (RFC 0016 §6) when `--report-file` is
+/// configured. Off for a bare CLI run (no file) and inert for reactive (§6.4 —
+/// reactive never calls this). Usage is best-effort: the supervisor does not
+/// aggregate per-run token/step totals into the `once` outcome path, so they are
+/// reported as `0` — honest absence, never an estimate (RFC 0010 §3.9 / §4.3).
+/// A control plane that needs exact usage reads the metrics / event stream.
+fn write_run_report(
+    cfg: &Config,
+    status: TerminalStatus,
+    exit_code: i32,
+    has_usable_partial: bool,
+    started: std::time::SystemTime,
+    ended: std::time::SystemTime,
+    log: &Logger,
+) {
+    let Some(path) = cfg.report_file.as_deref() else {
+        return; // off for a bare run
+    };
+    let identity = agentd::identity::Identity::from_env(&cfg.run_id);
+    let trace_id =
+        Some(agentd::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id);
+    let report = agentd::report::RunReport::new(
+        cfg.run_id.clone(),
+        identity.instance,
+        cfg.mode.as_str().to_string(),
+        status,
+        exit_code,
+        has_usable_partial,
+        agentd::report::Usage::default(),
+        agentd::report::Refusals::default(),
+        trace_id,
+        started,
+        ended,
+    );
+    report.write_to_file(path, log);
 }
 
 /// Build the root subagent's spawn payload from CLI config. The root gets the

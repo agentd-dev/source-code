@@ -9,8 +9,10 @@
 //! trace_id] [dur_ms] [err] <event-specific>`.
 
 use serde_json::{Map, Value};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -92,6 +94,192 @@ pub struct Logger {
 // One lock so concurrent threads in a process don't interleave partial lines.
 static STDERR_LOCK: Mutex<()> = Mutex::new(());
 
+// ---------------------------------------------------------------------------
+// The bounded in-memory event ring (RFC 0016 §7.2). A projection of the same
+// stderr stream — identical lines, identical closed vocabulary (RFC 0010
+// §3.2/§3.3) — captured into a fixed-size ring the `agentd://events` resource
+// drains with an `?after=<seq>` cursor (the self-MCP server reads it; this
+// module only owns the store). NOT a second telemetry path: stderr stays the
+// source of truth; the ring is the live-tail convenience.
+//
+// It is installed only when serving wants it (the supervisor calls
+// [`install_event_ring`] once at startup); without that, capture is a single
+// relaxed atomic load that short-circuits, so the default build pays nothing.
+// The ring is lossy and bounded by design (§8.4): an overrun drops the oldest
+// and bumps `dropped`, never blocking — a slow/dead subscriber can never
+// back-pressure the supervisor.
+
+/// Envelope version for the `agentd://events` read body (RFC 0016 §7.2/§8.1).
+/// Bumped only on a breaking change to the `{oldest_seq,newest_seq,dropped,
+/// events}` envelope — NOT the line schema (RFC 0010 owns + versions that).
+pub const EVENTS_SCHEMA: &str = "1.0";
+
+/// Default ring capacity (`AGENTD_EVENTS_RING`, RFC 0016 §7.2/§11): the last N
+/// emitted lines held in memory. Bounds memory on a slow subscriber.
+pub const EVENTS_RING_DEFAULT: usize = 1024;
+
+/// One captured line plus its monotonic ring `seq` (the only field added over
+/// the RFC 0010 §3.2 line — the cursor key the subscriber advances).
+struct RingEntry {
+    seq: u64,
+    /// The captured `level` (cheap prefix-filterable without re-parsing).
+    level: &'static str,
+    /// The captured `event` name (cheap prefix-filterable without re-parsing).
+    event: String,
+    /// The full RFC 0010 §3.2 line object (the `seq` is added on read).
+    line: Value,
+}
+
+/// A fixed-capacity ring of the last `cap` emitted lines. Lossy oldest-evicted;
+/// `dropped` counts lines evicted to date (a subscriber whose `after` predates
+/// `oldest_seq` learns it fell behind and re-baselines). RFC 0016 §7.2.
+struct EventRing {
+    buf: VecDeque<RingEntry>,
+    cap: usize,
+    /// Total lines evicted since start (monotonic; surfaced as `dropped`).
+    dropped: u64,
+}
+
+impl EventRing {
+    fn new(cap: usize) -> EventRing {
+        // A zero cap would make every push an immediate eviction; clamp to 1 so
+        // the ring always holds at least the newest line.
+        let cap = cap.max(1);
+        EventRing {
+            buf: VecDeque::with_capacity(cap),
+            cap,
+            dropped: 0,
+        }
+    }
+
+    /// Append a line, evicting the oldest (and bumping `dropped`) on overrun.
+    fn push(&mut self, entry: RingEntry) {
+        if self.buf.len() == self.cap {
+            self.buf.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.buf.push_back(entry);
+    }
+}
+
+/// The process-global ring. `None` until [`install_event_ring`] is called; a
+/// relaxed load gates the capture hot path so the default build is free.
+static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
+/// Cheap presence flag so the logging hot path avoids the mutex when no ring is
+/// installed (the overwhelmingly common case). Set once at install.
+static RING_INSTALLED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic ring sequence — the cursor key. Shared across all loggers in the
+/// process so every captured line gets a globally-ordered `seq`.
+static RING_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Set on every ring push; the served `agentd://events` resource coalesces this
+/// into one `notifications/resources/updated` per tick (RFC 0016 §7.2: "a small
+/// coalescing batch"). A flag, not a callback, keeps this `obs` layer free of any
+/// self-MCP server type — the server polls + clears it. Non-blocking (§8.4).
+static EVENTS_DIRTY: AtomicU64 = AtomicU64::new(0);
+
+/// Take-and-clear the "new events since last check" flag — the served
+/// `agentd://events` resource calls this on its coalescing tick to decide whether
+/// to fire a `notifications/resources/updated`. Returns `true` if any line was
+/// captured since the last call. RFC 0016 §7.2.
+pub fn take_events_dirty() -> bool {
+    EVENTS_DIRTY.swap(0, Ordering::Relaxed) != 0
+}
+
+/// Install the bounded event ring with capacity `cap` (RFC 0016 §7.2). Called
+/// once by the supervisor when the served `agentd://events` resource is wanted
+/// (gated by `--serve-mcp` + the `events` feature at the call site). Idempotent
+/// — a second call resizes/clears. Never fatal (telemetry never crashes the
+/// run, §8.4).
+pub fn install_event_ring(cap: usize) {
+    let mut g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(EventRing::new(cap));
+    RING_INSTALLED.store(1, Ordering::Relaxed);
+}
+
+/// A snapshot of the ring window an `agentd://events?after=<seq>` read returns:
+/// the entries with `seq > after` (after optional level/event-prefix filtering),
+/// plus the ring's current window bounds and cumulative `dropped`. RFC 0016 §7.2.
+pub struct EventWindow {
+    pub events: Vec<Value>,
+    pub oldest_seq: u64,
+    pub newest_seq: u64,
+    pub dropped: u64,
+}
+
+/// Drain the ring into an [`EventWindow`] for a cursor read. Returns the entries
+/// with `seq > after`, capped at `limit` (oldest-first), each with its `seq`
+/// folded into the RFC 0010 §3.2 line object. `level`/`event_prefixes` are the
+/// optional §7.3 server-side filters (a cheap prefix match over the held lines —
+/// no query engine). `None` when no ring is installed (the resource 404s at the
+/// server). RFC 0016 §7.2/§7.3.
+pub fn read_event_window(
+    after: u64,
+    limit: usize,
+    level: Option<&str>,
+    event_prefixes: &[&str],
+) -> Option<EventWindow> {
+    if RING_INSTALLED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
+    let ring = g.as_ref()?;
+    let oldest_seq = ring.buf.front().map(|e| e.seq).unwrap_or(0);
+    let newest_seq = ring.buf.back().map(|e| e.seq).unwrap_or(0);
+    let mut events = Vec::new();
+    for entry in ring.buf.iter() {
+        if entry.seq <= after {
+            continue;
+        }
+        if let Some(want) = level
+            && entry.level != want
+        {
+            continue;
+        }
+        if !event_prefixes.is_empty() && !event_prefixes.iter().any(|p| entry.event.starts_with(p))
+        {
+            continue;
+        }
+        // Fold the ring `seq` into the line object (the only added field).
+        let mut line = match &entry.line {
+            Value::Object(m) => m.clone(),
+            _ => Map::new(),
+        };
+        line.insert("seq".into(), Value::Number(entry.seq.into()));
+        events.push(Value::Object(line));
+        if events.len() >= limit {
+            break;
+        }
+    }
+    Some(EventWindow {
+        events,
+        oldest_seq,
+        newest_seq,
+        dropped: ring.dropped,
+    })
+}
+
+/// Capture one already-assembled line into the ring (a no-op when none is
+/// installed). Pulls `level`/`event` off the object for cheap filterable
+/// metadata, mints a `seq`, and pushes — lossy oldest-evicted, never blocking.
+/// Best-effort: a poisoned lock is recovered, never fatal (§8.4).
+fn capture_to_ring(level: &'static str, event: &str, line: &Value) {
+    if RING_INSTALLED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let seq = RING_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ring) = g.as_mut() {
+        ring.push(RingEntry {
+            seq,
+            level,
+            event: event.to_string(),
+            line: line.clone(),
+        });
+        // Mark the ring dirty so the served resource coalesces a notify (§7.2).
+        EVENTS_DIRTY.store(1, Ordering::Relaxed);
+    }
+}
+
 impl Logger {
     pub fn new(ctx: LogCtx, min: Level) -> Self {
         Logger {
@@ -147,8 +335,14 @@ impl Logger {
                 m.insert(k, v);
             }
         }
+        let value = Value::Object(m);
+        // Project the line into the bounded `agentd://events` ring (RFC 0016
+        // §7.2) — the same line, captured for the live-tail resource. A no-op
+        // (one relaxed atomic load) unless a ring is installed. Best-effort:
+        // capture never blocks and never fails the log write (§8.4).
+        capture_to_ring(level.as_str(), event, &value);
         // Build the whole line, then one locked write.
-        let mut line = serde_json::to_vec(&Value::Object(m)).unwrap_or_else(|_| b"{}".to_vec());
+        let mut line = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
         line.push(b'\n');
         let _guard = STDERR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = std::io::stderr().write_all(&line);
@@ -228,5 +422,88 @@ mod tests {
     fn level_ordering_filters() {
         assert!(Level::Debug < Level::Info);
         assert!(Level::Error > Level::Warn);
+    }
+
+    fn ring_entry(seq: u64, level: &'static str, event: &str) -> RingEntry {
+        RingEntry {
+            seq,
+            level,
+            event: event.to_string(),
+            line: serde_json::json!({"event": event, "level": level}),
+        }
+    }
+
+    #[test]
+    fn ring_evicts_oldest_and_counts_dropped() {
+        // A 2-slot ring: pushing 3 lines drops exactly the oldest and bumps
+        // `dropped` once (lossy-by-design, RFC 0016 §7.2/§8.4).
+        let mut r = EventRing::new(2);
+        r.push(ring_entry(1, "info", "loop.step"));
+        r.push(ring_entry(2, "info", "loop.step"));
+        assert_eq!(r.dropped, 0);
+        r.push(ring_entry(3, "warn", "limit.exceeded"));
+        assert_eq!(r.dropped, 1);
+        // Oldest (seq 1) is gone; 2 and 3 remain.
+        let seqs: Vec<u64> = r.buf.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+    }
+
+    #[test]
+    fn ring_zero_cap_clamps_to_one() {
+        // A 0 cap would make every push an immediate eviction; it clamps to 1 so
+        // the ring always holds the newest line.
+        let mut r = EventRing::new(0);
+        r.push(ring_entry(1, "info", "a"));
+        r.push(ring_entry(2, "info", "b"));
+        assert_eq!(r.buf.len(), 1);
+        assert_eq!(r.buf.back().unwrap().seq, 2);
+        assert_eq!(r.dropped, 1);
+    }
+
+    #[test]
+    fn install_then_read_window_with_cursor_and_filters() {
+        // The ring is process-global, so this test owns it for its duration. It
+        // installs a fresh ring, emits a few lines through a real Logger (the
+        // capture path), then drains the window with the `?after` cursor and the
+        // §7.3 level/event-prefix filters.
+        install_event_ring(64);
+        let base = RING_SEQ.load(Ordering::Relaxed); // cursor is global+monotonic
+        let log = Logger::new(
+            LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: 1,
+                trace_id: None,
+            },
+            Level::Trace,
+        );
+        log.info("loop.step", serde_json::json!({"step": 1}));
+        log.warn("limit.exceeded", serde_json::json!({"limit": "steps"}));
+        log.info("subagent.spawn", serde_json::json!({"node": 1}));
+
+        // No filter: everything after `base` is returned, each carrying a `seq`.
+        let w = read_event_window(base, 100, None, &[]).expect("ring installed");
+        assert!(w.events.len() >= 3);
+        assert!(w.events.iter().all(|e| e.get("seq").is_some()));
+        assert!(w.newest_seq >= w.oldest_seq);
+
+        // Level filter: only the warn line.
+        let w = read_event_window(base, 100, Some("warn"), &[]).expect("ring");
+        assert!(w.events.iter().all(|e| e["level"] == "warn"));
+        assert!(w.events.iter().any(|e| e["event"] == "limit.exceeded"));
+
+        // Event-prefix filter: only `subagent.*`.
+        let w = read_event_window(base, 100, None, &["subagent."]).expect("ring");
+        assert!(
+            w.events
+                .iter()
+                .all(|e| e["event"].as_str().unwrap().starts_with("subagent."))
+        );
+
+        // `limit` caps the slice oldest-first.
+        let w = read_event_window(base, 1, None, &[]).expect("ring");
+        assert_eq!(w.events.len(), 1);
     }
 }

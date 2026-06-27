@@ -308,6 +308,12 @@ pub struct ServeCtx {
     /// self-description manifest (RFC 0015 §3.4). Arc-shared so the per-read
     /// build borrows it without cloning the struct.
     config: Arc<Config>,
+    /// The terminal run-outcome report (RFC 0016 §6.2), once the run reaches a
+    /// terminal status — `None` while running. Folded into `agentd://run/<run_id>`
+    /// so a still-connected reader (vsock mgmt profile) learns the outcome without
+    /// the file (§6.3). The driver publishes it through [`ServeHandle::publish_report`]
+    /// at the terminal transition. Arc-shared so the read borrows it cheaply.
+    report: Arc<Mutex<Option<Value>>>,
 }
 
 impl ServeCtx {
@@ -333,6 +339,7 @@ impl ServeCtx {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             conn_counter: Arc::new(AtomicU64::new(0)),
             config,
+            report: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -443,16 +450,62 @@ impl ServeCtx {
     /// own node (depth 0); `status` is "running" for the daemon's life. Spawn
     /// counts come straight from the same atomics `status_body` reads (no token
     /// aggregation exists yet — RFC 0005 §3.3 reports counts, not totals).
+    ///
+    /// Once the run reaches a terminal status, the frozen run-outcome report
+    /// (RFC 0016 §6.2) is folded in under `"report"` and `status` flips to the
+    /// report's terminal-status string — so a still-connected reader learns the
+    /// outcome over the resource without the `--report-file` (§6.3.2). The driver
+    /// publishes the report via [`ServeHandle::publish_report`] at the transition.
     fn run_body(&self) -> Value {
-        json!({
+        let report = self
+            .report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // The terminal status string (if any) from the report — the run aggregate's
+        // `status` flips to it; otherwise the daemon is "running".
+        let status = report
+            .as_ref()
+            .and_then(|r| r.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("running")
+            .to_string();
+        let mut body = json!({
             "run_id": self.run_id,
             "mode": self.mode,
             "root": "0", // the run's own node id (depth-0 root) by convention
-            "status": "running",
+            "status": status,
             "inflight_spawns": self.inflight.load(Ordering::Relaxed),
             "total_spawns": self.counter.load(Ordering::Relaxed),
             "uptime_ms": self.started.elapsed().as_millis() as u64,
-        })
+        });
+        if let (Value::Object(m), Some(report)) = (&mut body, report) {
+            m.insert("report".into(), report);
+        }
+        body
+    }
+
+    /// The `agentd://events` read body (RFC 0016 §7.2): the §7.2 envelope
+    /// (`events_schema`/`oldest_seq`/`newest_seq`/`dropped`/`events`) drained from
+    /// the bounded in-memory ring with the `?after=<seq>` cursor + the optional
+    /// §7.3 level/event-prefix filters. `None` when no ring is installed (the
+    /// resource 404s — the build/serve did not arm it). Pure read of the ring; it
+    /// never blocks the supervisor (lossy-by-design, §8.4).
+    #[cfg(feature = "events")]
+    fn events_body(&self, q: &crate::agentd_uri::EventsQuery) -> Option<Value> {
+        // A bounded read window so one read can't return an unbounded ring; the
+        // subscriber advances `after` and reads again (the standard MCP cursor).
+        const READ_LIMIT: usize = 512;
+        let prefixes: Vec<&str> = q.event_prefixes.iter().map(String::as_str).collect();
+        let w =
+            crate::obs::log::read_event_window(q.after, READ_LIMIT, q.level.as_deref(), &prefixes)?;
+        Some(json!({
+            "events_schema": crate::obs::log::EVENTS_SCHEMA,
+            "oldest_seq": w.oldest_seq,
+            "newest_seq": w.newest_seq,
+            "dropped": w.dropped,
+            "events": w.events,
+        }))
     }
 }
 
@@ -734,9 +787,32 @@ pub struct ServeHandle {
     sessions: Registry,
     warm: WarmRegistry,
     inflight: Arc<AtomicUsize>,
+    /// The run aggregate's terminal-report slot + its subscribers + uri, so the
+    /// driver can publish the run-outcome report (RFC 0016 §6.3.2) through the
+    /// handle at the terminal transition (folded into `agentd://run/<run_id>`,
+    /// with a final `notifications/resources/updated`).
+    report: Arc<Mutex<Option<Value>>>,
+    subscriptions: SubRegistry,
+    run_uri: String,
 }
 
 impl ServeHandle {
+    /// Publish the frozen run-outcome report (RFC 0016 §6.2) onto the served
+    /// `agentd://run/<run_id>` resource and fire a final
+    /// `notifications/resources/updated` so a still-connected reader (vsock mgmt
+    /// profile) learns the outcome without the `--report-file` (§6.3.2). Telemetry
+    /// never crashes the run (§8.4): a poisoned lock is recovered, never fatal.
+    /// `report` is the §6.2 JSON object (built by [`crate::report::RunReport`]).
+    pub fn publish_report(&self, report: Value) {
+        {
+            let mut slot = self.report.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = Some(report);
+        }
+        // The run resource fires REPEATEDLY (each spawn / terminal change), so keep
+        // the subscriber list — this is its final, terminal emission.
+        notify_resource_updated_keep(&self.subscriptions, &self.run_uri);
+    }
+
     /// Ask every in-flight served run to cancel, then wait (bounded by `timeout`)
     /// for them to finish so their subtrees drain gracefully. Warm sessions are
     /// cancelled + dropped (their `Subagent` Drop kills + reaps the subtree).
@@ -780,7 +856,13 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
         sessions: Arc::clone(&ctx.sessions),
         warm: Arc::clone(&ctx.warm),
         inflight: Arc::clone(&ctx.inflight),
+        report: Arc::clone(&ctx.report),
+        subscriptions: Arc::clone(&ctx.subscriptions),
+        run_uri: crate::agentd_uri::run_uri(&ctx.run_id),
     };
+    // Coalesce ring-growth into `agentd://events` notifications (RFC 0016 §7.2).
+    #[cfg(feature = "events")]
+    spawn_events_notifier(Arc::clone(&ctx.subscriptions));
     let ctx = Arc::new(ctx);
     thread::Builder::new()
         .name("serve-mcp".into())
@@ -828,7 +910,13 @@ pub fn serve_vsock(
         sessions: Arc::clone(&ctx.sessions),
         warm: Arc::clone(&ctx.warm),
         inflight: Arc::clone(&ctx.inflight),
+        report: Arc::clone(&ctx.report),
+        subscriptions: Arc::clone(&ctx.subscriptions),
+        run_uri: crate::agentd_uri::run_uri(&ctx.run_id),
     };
+    // Coalesce ring-growth into `agentd://events` notifications (RFC 0016 §7.2).
+    #[cfg(feature = "events")]
+    spawn_events_notifier(Arc::clone(&ctx.subscriptions));
     let ctx = Arc::new(ctx);
     thread::Builder::new()
         .name("serve-mcp-vsock".into())
@@ -1032,6 +1120,20 @@ fn subscribe_resource(
                 Some(_) => {} // running → subscribable
             }
         }
+        // agentd://events fires REPEATEDLY (each new event — notify-then-read, RFC
+        // 0016 §7.2) and is Management-only (the operator live-tail) and only when
+        // this build serves it (`events` feature). A non-mgmt origin or an
+        // events-less build is rejected as not-found, matching the read gate. The
+        // subscription is *kept* (the keep-variant fires it on every new event).
+        Some(crate::agentd_uri::AgentdResource::Events(_)) => {
+            if origin != PeerOrigin::Management || !cfg!(feature = "events") {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("not a subscribable resource: {uri}"),
+                );
+            }
+        }
         // The run aggregate is subscribable only for *this* daemon's run id — a
         // peer asking for some other run's URI is rejected (it never fires here).
         Some(crate::agentd_uri::AgentdResource::Run(id)) if id == ctx.run_id => {}
@@ -1150,6 +1252,31 @@ fn notify_resource_updated_keep(subs: &SubRegistry, uri: &str) {
     }
 }
 
+/// Spawn the `agentd://events` coalescing notifier (RFC 0016 §7.2). The event
+/// ring is fed from the logging layer ([`crate::obs::log`]), which knows nothing
+/// of the self-MCP server; rather than wire a callback across that layer, this
+/// background thread polls the "ring dirty" flag on a short tick and, when new
+/// lines landed, fires ONE `notifications/resources/updated{uri:agentd://events}`
+/// to subscribers — the "small coalescing batch" the RFC allows. Non-blocking and
+/// best-effort: a slow/dead subscriber is pruned by its own reader loop; the ring
+/// stays lossy + bounded (§8.4). Idempotent per-subscriber notify-then-read — the
+/// peer drains with `?after=<seq>`.
+#[cfg(feature = "events")]
+fn spawn_events_notifier(subscriptions: SubRegistry) {
+    thread::Builder::new()
+        .name("serve-mcp-events".into())
+        .spawn(move || {
+            loop {
+                // ~100ms coalescing window: many lines collapse to one notify.
+                thread::sleep(Duration::from_millis(100));
+                if crate::obs::log::take_events_dirty() {
+                    notify_resource_updated_keep(&subscriptions, crate::agentd_uri::EVENTS_URI);
+                }
+            }
+        })
+        .ok();
+}
+
 /// The agentd:// resources this server *lists*: the stable `agentd://status` and
 /// `agentd://run/<run_id>` resources. The run resource has a daemon-lifetime URI
 /// (the run id is fixed at startup), so it's safe to list — unlike the per-handle
@@ -1190,6 +1317,17 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
             "uri": crate::agentd_uri::INVENTORY_URI,
             "name": "inventory",
             "description": "The live subagent-tree projection: lifecycle flags (draining/paused/ready), totals, and per-node status/usage. Subscribable — pushed on each spawn / exit / status change.",
+            "mimeType": "application/json"
+        }));
+        // agentd://events — the bounded live-event ring (RFC 0016 §7), operator-
+        // facing and only when this build serves it (`events` feature). Its URI is
+        // daemon-stable (the bare base), so it's safe to list; the cursor/filters
+        // ride the read query, not the listed uri.
+        #[cfg(feature = "events")]
+        list.push(json!({
+            "uri": crate::agentd_uri::EVENTS_URI,
+            "name": "events",
+            "description": "The live event stream: a bounded ring of the JSON log lines (RFC 0010 schema). Read agentd://events?after=<seq> to drain new lines (with the dropped count + window bounds); ?level=/?event=<prefixes> filter. Subscribable — pushed on each new event.",
             "mimeType": "application/json"
         }));
     }
@@ -1256,13 +1394,23 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
                 ),
             }
         }
-        // agentd://run/<run_id> — the served run aggregate (RFC 0005 §3.3).
+        // agentd://run/<run_id> — the served run aggregate (RFC 0005 §3.3), frozen
+        // to the RFC 0016 §6.2 schema once terminal (the report is folded into
+        // `run_body` under `report`).
         Some(crate::agentd_uri::AgentdResource::Run(_)) => Response::ok(
             req.id,
             json!({
                 "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.run_body().to_string()}]
             }),
         ),
+        // agentd://events[?after=…] — the bounded live-event ring (RFC 0016 §7).
+        // Management-only (the live-tail tool is an operator surface): a non-mgmt
+        // origin is refused as not-found, matching the inventory gate. The cursor +
+        // filters ride the query; the read returns the §7.2 envelope. Without the
+        // `events` feature the resource is absent — it 404s like any unknown uri.
+        Some(crate::agentd_uri::AgentdResource::Events(query)) => {
+            events_read(req, &query, origin, ctx)
+        }
         // agentd://session/<handle> — a served warm session's turn state. Drain
         // first so the body reflects any turns that completed since the last poll;
         // an unknown handle is RESOURCE_NOT_FOUND (mirrors the subagent arm).
@@ -1290,6 +1438,55 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
             json::RESOURCE_NOT_FOUND,
             format!("resource not found: {uri}"),
         ),
+    }
+}
+
+/// `resources/read` for `agentd://events` (RFC 0016 §7). Management-only (the
+/// live-tail is an operator surface): a non-mgmt origin gets RESOURCE_NOT_FOUND
+/// (the same shape as an unknown uri, so a stdio peer can't even confirm it
+/// exists — matching the inventory gate). With the `events` feature it serves the
+/// §7.2 envelope from the bounded ring; an installed-but-empty window is still a
+/// valid read. Without the ring (no `events` feature, or never installed) it
+/// 404s — capability-absence-not-error (RFC 0015 §2.5).
+fn events_read(
+    req: Request,
+    query: &crate::agentd_uri::EventsQuery,
+    origin: PeerOrigin,
+    ctx: &ServeCtx,
+) -> Response {
+    if origin != PeerOrigin::Management {
+        return Response::err(
+            req.id,
+            json::RESOURCE_NOT_FOUND,
+            "resource not found: agentd://events".to_string(),
+        );
+    }
+    #[cfg(feature = "events")]
+    {
+        match ctx.events_body(query) {
+            Some(body) => Response::ok(
+                req.id,
+                json!({
+                    "contents": [{"uri": crate::agentd_uri::EVENTS_URI, "mimeType": "application/json", "text": body.to_string()}]
+                }),
+            ),
+            // The feature is built but no ring is installed (the daemon did not arm
+            // it) — honest absence.
+            None => Response::err(
+                req.id,
+                json::RESOURCE_NOT_FOUND,
+                "agentd://events not served (no event ring installed)".to_string(),
+            ),
+        }
+    }
+    #[cfg(not(feature = "events"))]
+    {
+        let _ = (query, ctx);
+        Response::err(
+            req.id,
+            json::RESOURCE_NOT_FOUND,
+            "resource not found: agentd://events (built without --features events)".to_string(),
+        )
     }
 }
 
@@ -2590,6 +2787,97 @@ mod tests {
         let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["run_id"], "r1");
         assert_eq!(body["mode"], "reactive");
+    }
+
+    #[test]
+    fn run_body_folds_in_the_terminal_report_and_flips_status() {
+        // RFC 0016 §6.3.2: once a terminal report is published, the run aggregate
+        // carries it under `report` and `status` flips to the report's terminal
+        // status (vs the daemon's "running").
+        let ctx = ctx();
+        // Before terminal: running, no report.
+        let b = ctx.run_body();
+        assert_eq!(b["status"], "running");
+        assert!(b.get("report").is_none());
+        // Publish a frozen §6.2 report (the same shape RunReport produces).
+        *ctx.report.lock().unwrap() = Some(json!({
+            "report_schema": "1.0",
+            "status": "completed",
+            "exit_code": 0,
+        }));
+        let b = ctx.run_body();
+        assert_eq!(b["status"], "completed");
+        assert_eq!(b["report"]["report_schema"], "1.0");
+        assert_eq!(b["report"]["exit_code"], 0);
+    }
+
+    #[test]
+    fn events_resource_is_management_only() {
+        // A Stdio peer (a spawned subagent) must not even confirm the events
+        // resource exists — it 404s like any unknown uri (RFC 0016 §7; matches the
+        // inventory gate). This holds with or without the `events` feature.
+        let r = dispatch(
+            req("resources/read", Some(json!({"uri": "agentd://events"}))),
+            &ctx(),
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert_eq!(r.error.expect("err").code, json::RESOURCE_NOT_FOUND);
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn events_read_returns_the_envelope_after_ring_install() {
+        // With a ring installed, a Management read of agentd://events returns the
+        // §7.2 envelope (events_schema / oldest_seq / newest_seq / dropped /
+        // events). The ring is process-global, so this test owns it.
+        crate::obs::log::install_event_ring(64);
+        let l = log();
+        l.warn("limit.exceeded", json!({"limit": "steps"}));
+        let r = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://events?after=0"})),
+            ),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("ok");
+        let body: Value = serde_json::from_str(v["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["events_schema"], "1.0");
+        assert!(body["events"].is_array());
+        assert!(body["dropped"].is_u64());
+        assert!(body["newest_seq"].is_u64());
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn events_subscribe_is_management_only_and_kept() {
+        // Management may subscribe to the live events resource; a Stdio peer is
+        // rejected as not-subscribable (RFC 0016 §7.2).
+        let ctx = ctx();
+        crate::obs::log::install_event_ring(8);
+        let ok = subscribe_resource(
+            req("sub", Some(json!({"uri": "agentd://events"}))),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+        );
+        assert!(ok.error.is_none(), "management subscribe accepted");
+        let denied = subscribe_resource(
+            req("sub", Some(json!({"uri": "agentd://events"}))),
+            &ctx,
+            PeerOrigin::Stdio,
+            &writer(),
+            1,
+        );
+        assert_eq!(denied.error.expect("err").code, json::RESOURCE_NOT_FOUND);
     }
 
     #[test]

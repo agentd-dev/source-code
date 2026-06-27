@@ -275,6 +275,17 @@ pub struct Config {
     /// Only honoured in `--features cron` builds; the production path is an
     /// external CronJob → `--mode once`.
     pub cron: Option<String>,
+    /// Where to write the run-outcome report at the terminal transition
+    /// (`--report-file PATH` / `AGENTD_REPORT_FILE`, RFC 0016 §6.3). Atomic write
+    /// (temp + rename). Off for a bare CLI run; inert for `--mode reactive`
+    /// (warned at startup — a reactive daemon has no single terminal outcome,
+    /// §6.4).
+    pub report_file: Option<String>,
+    /// Capacity of the bounded `agentd://events` ring (`--events-ring N` /
+    /// `AGENTD_EVENTS_RING`, RFC 0016 §7.2/§11): the last N emitted lines held in
+    /// memory for the live-tail resource. Default 1024. Only consumed when the
+    /// `events` surface is served (`--serve-mcp` + the `events` feature).
+    pub events_ring: usize,
 }
 
 impl Default for Config {
@@ -308,6 +319,8 @@ impl Default for Config {
             cgroup_pids_max: None,
             allow_trifecta: false,
             cron: None,
+            report_file: None,
+            events_ring: crate::obs::log::EVENTS_RING_DEFAULT,
         }
     }
 }
@@ -347,6 +360,8 @@ impl fmt::Debug for Config {
             .field("cgroup_pids_max", &self.cgroup_pids_max)
             .field("allow_trifecta", &self.allow_trifecta)
             .field("cron", &self.cron)
+            .field("report_file", &self.report_file)
+            .field("events_ring", &self.events_ring)
             .finish()
     }
 }
@@ -446,6 +461,14 @@ impl Config {
         }
         if let Some(v) = envmap.get("AGENTD_CRON") {
             c.cron = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_REPORT_FILE") {
+            c.report_file = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_EVENTS_RING") {
+            c.events_ring = v
+                .parse()
+                .map_err(|_| usage(format!("invalid AGENTD_EVENTS_RING: {v}")))?;
         }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
@@ -551,6 +574,13 @@ impl Config {
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
+                "--report-file" => c.report_file = Some(take("--report-file")?),
+                "--events-ring" => {
+                    let v = take("--events-ring")?;
+                    c.events_ring = v
+                        .parse()
+                        .map_err(|_| usage(format!("invalid --events-ring: {v}")))?;
+                }
                 other => return Err(usage(format!("unknown argument: {other}"))),
             }
         }
@@ -637,6 +667,12 @@ impl Config {
         }
         if self.max_steps == 0 {
             return Err(usage("--max-steps must be > 0".into()));
+        }
+        // A zero events ring would hold nothing (every push instantly evicts) —
+        // reject it so an operator who wants the live-tail surface gets a usable
+        // window (RFC 0016 §7.2). Off-by-default; only consumed when serving.
+        if self.events_ring == 0 {
+            return Err(usage("--events-ring must be > 0".into()));
         }
         if self.mode == Mode::Reactive
             && self.subscribe.is_empty()
@@ -881,6 +917,8 @@ fn help_text() -> String {
          \x20 --cgroup-memory-max <SIZE>  per-run memory.max (max|512M|2G|bytes; needs --cgroup + delegation)\n\
          \x20 --cgroup-pids-max <N>       per-run pids.max (max|count of THREADS; needs --cgroup + delegation)\n\
          \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
+         \x20 --report-file <PATH>        write the run-outcome report at terminal (atomic; inert for reactive)\n\
+         \x20 --events-ring <N>           agentd://events ring size (default 1024; needs --serve-mcp + --features events)\n\
          \x20 --capabilities             print the capabilities manifest (JSON) and exit\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
@@ -911,6 +949,39 @@ mod tests {
             ("INSTRUCTION".into(), "x".into()),
             ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
         ]
+    }
+
+    #[test]
+    fn report_file_and_events_ring_parse_from_flag_and_env() {
+        // Default: off / the 1024 ring (RFC 0016 §11).
+        let c = Config::load(&args(&[]), &base_env()).unwrap();
+        assert_eq!(c.report_file, None);
+        assert_eq!(c.events_ring, crate::obs::log::EVENTS_RING_DEFAULT);
+
+        // Flags set both.
+        let c = Config::load(
+            &args(&["--report-file", "/out/report.json", "--events-ring", "256"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.report_file.as_deref(), Some("/out/report.json"));
+        assert_eq!(c.events_ring, 256);
+
+        // Env sets both; a flag overrides the ring (precedence: flag > env).
+        let mut env = base_env();
+        env.push(("AGENTD_REPORT_FILE".into(), "/env/report.json".into()));
+        env.push(("AGENTD_EVENTS_RING".into(), "64".into()));
+        let c = Config::load(&args(&["--events-ring", "512"]), &env).unwrap();
+        assert_eq!(c.report_file.as_deref(), Some("/env/report.json"));
+        assert_eq!(c.events_ring, 512);
+    }
+
+    #[test]
+    fn events_ring_zero_and_bad_value_are_usage_errors() {
+        let zero = Config::load(&args(&["--events-ring", "0"]), &base_env()).unwrap_err();
+        assert!(matches!(zero, ConfigError::Usage(_)));
+        let bad = Config::load(&args(&["--events-ring", "lots"]), &base_env()).unwrap_err();
+        assert!(matches!(bad, ConfigError::Usage(_)));
     }
 
     #[test]

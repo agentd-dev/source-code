@@ -24,6 +24,7 @@ pub mod json; // shared JSON-RPC 2.0 codec + framing (NDJSON + length-prefix)
 pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
 pub mod net; // hand-rolled HTTP/1.1 (non-streaming), unix-socket, (tls/vsock gated)
 pub mod obs; // logging, health, tracing, metrics
+pub mod report; // run-outcome reports — the kubectl-agents-results backend (RFC 0016 §6)
 pub mod sec; // secrets, tool-scope, gated exec
 pub mod signals;
 pub mod subagent; // supervisor<->subagent control protocol

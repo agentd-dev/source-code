@@ -13,11 +13,12 @@
 //! warm session (`warm.rs`). Events are processed serially on a single thread;
 //! warm sessions are supervised non-blocking.
 
-use crate::agentloop::stop::{Outcome, ScheduleRequest, SubscriptionAction};
+use crate::agentloop::stop::{Outcome, ScheduleRequest, SubscriptionAction, TerminalStatus};
 use crate::config::Config;
 use crate::exit;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
+use crate::report::{Refusals, RunReport, Usage};
 use crate::signals;
 use crate::subagent::protocol::{SeedMessage, SpawnPayload};
 use crate::supervisor::reactor::{SuperviseResult, supervise_once};
@@ -28,7 +29,7 @@ use crate::wire::mcp::method;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Poll cadence for draining MCP notifications + firing due deliveries.
 const TICK: Duration = Duration::from_millis(200);
@@ -272,6 +273,13 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
     }
 
     let mut iteration: u64 = 0;
+    // The bounded daemon's report bookends (RFC 0016 §6): a `loop`/`schedule`
+    // daemon reports its TERMINAL disposition (a clean drain → `cancelled`/exit 0;
+    // a tripped restart breaker → `crashed`/exit 1). `last_status` carries the most
+    // recent fire's terminal status into a drain report (the "schedule-tick"
+    // outcome, §6). Reactive emits nothing — it never reaches this driver (§6.4).
+    let daemon_started = SystemTime::now();
+    let mut last_status = TerminalStatus::Completed;
     log.info(
         "trigger.armed",
         json!({"kind": cfg.mode.as_str(), "interval_ms": interval.as_millis() as u64, "cron": cfg.cron}),
@@ -285,6 +293,7 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
                 "proc.exit",
                 json!({"reason": "drain", "mode": cfg.mode.as_str()}),
             );
+            write_daemon_report(cfg, last_status, exit::SUCCESS, daemon_started, log);
             return exit::SUCCESS;
         }
 
@@ -307,6 +316,7 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
                     "proc.exit",
                     json!({"reason": "drain", "mode": cfg.mode.as_str()}),
                 );
+                write_daemon_report(cfg, last_status, exit::SUCCESS, daemon_started, log);
                 return exit::SUCCESS;
             }
         }
@@ -320,18 +330,23 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         let ok = match supervise_once(exe.clone(), &base, cfg.drain_timeout, log.clone()) {
             Ok(SuperviseResult::Completed(o)) => {
                 log.info("run.completed", json!({"status": o.status.as_str()}));
+                // Carry the fire's terminal status into a later drain report (§6).
+                last_status = o.status;
                 true
             }
             Ok(SuperviseResult::Failed(e)) => {
                 log.warn("run.failed", json!({"err": e}));
+                last_status = TerminalStatus::Crashed;
                 false
             }
             Ok(SuperviseResult::Killed(r)) => {
                 log.warn("run.killed", json!({"reason": format!("{r:?}")}));
+                last_status = TerminalStatus::Crashed;
                 false
             }
             Err(e) => {
                 log.error("run.spawn_fail", json!({"err": e.to_string()}));
+                last_status = TerminalStatus::Crashed;
                 false
             }
         };
@@ -360,10 +375,55 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
                     "proc.exit",
                     json!({"reason": "restart_breaker", "iteration": iteration}),
                 );
+                // The daemon ends on a known-bad loop → a `crashed`/exit-1 report.
+                write_daemon_report(
+                    cfg,
+                    TerminalStatus::Crashed,
+                    exit::GENERIC,
+                    daemon_started,
+                    log,
+                );
                 return exit::GENERIC;
             }
         }
     }
+}
+
+/// Write the bounded `loop`/`schedule` daemon's run-outcome report at its
+/// terminal transition (RFC 0016 §6). Off for a bare run (no `--report-file`);
+/// reactive never calls this (§6.4). `status` is the daemon's terminal
+/// disposition (the last fire's status on a drain, `crashed` on a breaker trip);
+/// `exit_code` is its coarse projection. Usage is best-effort `0` (the daemon
+/// does not aggregate per-fire totals here) — honest absence, never an estimate
+/// (RFC 0010 §3.9). Best-effort-but-loud: a failed write logs `report.write.fail`
+/// and never gates the exit (§8.4).
+fn write_daemon_report(
+    cfg: &Config,
+    status: TerminalStatus,
+    exit_code: i32,
+    started: SystemTime,
+    log: &Logger,
+) {
+    let Some(path) = cfg.report_file.as_deref() else {
+        return;
+    };
+    let identity = crate::identity::Identity::from_env(&cfg.run_id);
+    let trace_id =
+        Some(crate::obs::trace::resolve(&cfg.run_id, cfg.traceparent.as_deref()).trace_id);
+    let report = RunReport::new(
+        cfg.run_id.clone(),
+        identity.instance,
+        cfg.mode.as_str().to_string(),
+        status,
+        exit_code,
+        false,
+        Usage::default(),
+        Refusals::default(),
+        trace_id,
+        started,
+        SystemTime::now(),
+    );
+    report.write_to_file(path, log);
 }
 
 /// Current UTC unix seconds — the clock the cron source matches against.

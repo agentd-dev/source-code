@@ -12,9 +12,9 @@
 use crate::config::Config;
 use crate::json::{self, Id, Incoming, Notification, Request, Response, frame};
 use crate::obs::log::Logger;
-use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
+use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
 use crate::supervisor::cgroup;
-use crate::supervisor::reactor::{SuperviseResult, supervise_once, supervise_pausable};
+use crate::supervisor::reactor::{SuperviseResult, supervise_once, supervise_swappable};
 use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
 use crate::wire::mcp::{PROTOCOL_VERSION, method};
@@ -243,6 +243,13 @@ struct ServedSession {
     /// `ctrl/resume` to its live children on each edge. The async parallel of
     /// `cancel` — a shared atomic the reactor reads, never the child directly.
     paused: Arc<AtomicBool>,
+    /// Per-run intelligence hot-swap channel (RFC 0018 §5.2): a hot reload that
+    /// touches `intelligence`/`model` publishes the new config here; the run's
+    /// supervisor reactor fans `ctrl/swap_intel` to its live children at the next
+    /// tick (each applies it at a turn boundary). The async parallel of `paused`:
+    /// the reload fan-out (via `LiveConfig::fan_swap_intel`) publishes; the reactor
+    /// reads + forwards. Cloned into the reactor at launch.
+    swap: crate::supervisor::swap::SwapChannel,
     started: Instant,
 }
 
@@ -279,15 +286,32 @@ type SubRegistry = Arc<Mutex<HashMap<String, Vec<Subscriber>>>>;
 pub struct LiveConfig {
     cfg: Mutex<Arc<Config>>,
     subs: SubRegistry,
+    /// The served async-run registry — the SAME one [`ServeCtx`] holds. A hot
+    /// reload that touches `intelligence`/`model` (RFC 0018 §5.2) publishes the
+    /// new config into each live run's [`SwapChannel`](crate::supervisor::swap::SwapChannel)
+    /// via [`fan_swap_intel`](LiveConfig::fan_swap_intel) — the supervisor reach
+    /// into served runs, mirroring how `fan_pause` flips each run's `paused`.
+    sessions: Registry,
+    /// The served warm-session registry — the SAME one [`ServeCtx`] holds. A hot
+    /// reload fans `ctrl/swap_intel` straight down each live warm session's control
+    /// channel (`w.sub.send`), the parallel of `fan_pause`'s warm branch.
+    warm: WarmRegistry,
 }
 
 impl LiveConfig {
     /// Build a live-config handle from the startup config snapshot and the served
-    /// subscription registry (the one [`ServeCtx`] also uses for push).
-    fn new(cfg: Arc<Config>, subs: SubRegistry) -> Arc<LiveConfig> {
+    /// registries (the same ones [`ServeCtx`] uses for push + run tracking).
+    fn new(
+        cfg: Arc<Config>,
+        subs: SubRegistry,
+        sessions: Registry,
+        warm: WarmRegistry,
+    ) -> Arc<LiveConfig> {
         Arc::new(LiveConfig {
             cfg: Mutex::new(cfg),
             subs,
+            sessions,
+            warm,
         })
     }
 
@@ -308,6 +332,57 @@ impl LiveConfig {
     /// 0017 §5.6). Subscriptions are KEPT (the resource fires on every reload).
     pub fn notify_config_effective_updated(&self) {
         notify_resource_updated_keep(&self.subs, crate::agentd_uri::CONFIG_EFFECTIVE_URI);
+    }
+
+    /// Fire `notifications/resources/updated{uri: agentd://intelligence}` to every
+    /// subscriber after a hot-swap is applied (RFC 0018 §4.4 / §5.3) — so a
+    /// subscribed agentctl re-reads the new endpoint topology / model / swap
+    /// policy. Notify-then-read: NO payload in the notification (the body is read
+    /// on demand, carrying transport+index only — never the URL/creds). KEPT
+    /// (fires on every swap), exactly like the config/effective notify.
+    pub fn notify_intelligence_updated(&self) {
+        notify_resource_updated_keep(&self.subs, crate::agentd_uri::INTELLIGENCE_URI);
+    }
+
+    /// Fan an intelligence hot-swap (RFC 0018 §5.2) into every live SERVED run —
+    /// the supervisor-side reach of a reload that repoints the endpoint list /
+    /// changes the model. Mirrors `fan_pause`'s dual fan-out EXACTLY:
+    /// - warm served sessions (`warm`): the server holds the `Subagent`, so send
+    ///   `ctrl/swap_intel` straight down its control channel (the parallel of
+    ///   `w.sub.send(ControlMsg::Pause)`).
+    /// - async runs (`sessions`): the server holds only a shared `SwapChannel` the
+    ///   run's reactor reads, so PUBLISH into it — the reactor fans the frame to
+    ///   its live children (the parallel of flipping `s.paused`). No second control
+    ///   path is invented.
+    ///
+    /// Returns the count of live subtrees the swap reached. Only live (non-terminal)
+    /// subtrees take it — a finished run can neither swap nor be reached. The
+    /// `token` rides the frame (like the spawn payload) and is NEVER logged.
+    pub fn fan_swap_intel(&self, swap: SwapIntel) -> u64 {
+        let mut reached = 0u64;
+        {
+            let msg = ControlMsg::SwapIntel(Box::new(swap.clone()));
+            let mut warm = self.warm.lock().unwrap_or_else(|e| e.into_inner());
+            for w in warm.values_mut() {
+                if w.done {
+                    continue;
+                }
+                if w.sub.send(&msg).is_ok() {
+                    reached += 1;
+                }
+            }
+        }
+        {
+            let reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            for s in reg.values() {
+                if s.status.is_terminal() {
+                    continue;
+                }
+                s.swap.publish(swap.clone());
+                reached += 1;
+            }
+        }
+        reached
     }
 }
 
@@ -386,9 +461,18 @@ impl ServeCtx {
         config: Arc<Config>,
     ) -> ServeCtx {
         // ONE subscription registry, shared by the served push helpers AND the
-        // live-config handle (the reload notify fires on the SAME registry).
+        // live-config handle (the reload notify fires on the SAME registry). The
+        // session + warm registries are likewise shared into `LiveConfig` so the
+        // reload-driven swap fan-out reaches the SAME live runs (RFC 0018 §5.2).
         let subscriptions: SubRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let live_config = LiveConfig::new(Arc::clone(&config), Arc::clone(&subscriptions));
+        let sessions: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let warm: WarmRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let live_config = LiveConfig::new(
+            Arc::clone(&config),
+            Arc::clone(&subscriptions),
+            Arc::clone(&sessions),
+            Arc::clone(&warm),
+        );
         ServeCtx {
             run_id,
             mode,
@@ -398,8 +482,8 @@ impl ServeCtx {
             drain_timeout,
             inflight: Arc::new(AtomicUsize::new(0)),
             counter: Arc::new(AtomicU64::new(0)),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            warm: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
+            warm,
             subscriptions,
             conn_counter: Arc::new(AtomicU64::new(0)),
             config,
@@ -543,12 +627,21 @@ impl ServeCtx {
     /// records. The per-endpoint creds resolve from env at build time and are
     /// never surfaced (the parse drops them into the dialer only).
     fn intelligence_body(&self) -> Value {
-        let uri = self.config.intelligence.as_deref().unwrap_or_default();
-        match crate::intel::endpoints::EndpointList::parse(
-            uri,
-            self.config.intelligence_token.clone(),
-        ) {
-            Ok(list) => list.body(self.config.model.as_deref()),
+        // Read the LIVE (post-reload) config: `intelligence`/`model` are reloadable
+        // via RFC 0018 §5, so a hot-swap must be reflected here. A swap fans
+        // `notifications/resources/updated{agentd://intelligence}` so a subscriber
+        // re-reads this and sees the new endpoint topology / model (§4.4).
+        let cfg = self.live_config.current();
+        let uri = cfg.intelligence.as_deref().unwrap_or_default();
+        match crate::intel::endpoints::EndpointList::parse(uri, cfg.intelligence_token.clone()) {
+            Ok(list) => {
+                let mut body = list.body(cfg.model.as_deref());
+                // The active swap policy (§4.4 / §5) — non-secret, read on demand.
+                if let Value::Object(m) = &mut body {
+                    m.insert("swap_policy".into(), json!(cfg.model_swap.as_str()));
+                }
+                body
+            }
             // A misconfigured list (should not reach a running daemon — startup
             // validated it) degrades to an empty, honest body rather than erroring.
             Err(_) => json!({ "active": 0, "all_down": true, "endpoints": [] }),
@@ -806,6 +899,8 @@ impl ServeCtx {
                 status,
                 cancel: Arc::new(AtomicBool::new(false)),
                 paused: Arc::new(AtomicBool::new(false)),
+                // A terminal session never runs again, so its swap channel is inert.
+                swap: crate::supervisor::swap::SwapChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -2391,6 +2486,9 @@ fn launch_async_run(
     // §4.3): a run launched while the instance is paused starts paused, so the
     // reactor forwards `ctrl/pause` to its root as soon as it is live.
     let paused = Arc::new(AtomicBool::new(crate::signals::paused()));
+    // The per-run intelligence hot-swap channel (RFC 0018 §5.2): the reload
+    // fan-out publishes into it; the run's reactor reads + fans to its children.
+    let swap = crate::supervisor::swap::SwapChannel::new();
     {
         let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
         evict_if_full(&mut reg);
@@ -2400,6 +2498,7 @@ fn launch_async_run(
                 status: ServedStatus::Running,
                 cancel: Arc::clone(&cancel),
                 paused: Arc::clone(&paused),
+                swap: swap.clone(),
                 started: Instant::now(),
             },
         );
@@ -2417,13 +2516,14 @@ fn launch_async_run(
         .name(format!("served-run:{handle}"))
         .spawn(move || {
             let _permit = permit; // held for the run's lifetime → bounds live runs
-            let result = supervise_pausable(
+            let result = supervise_swappable(
                 exe,
                 &payload,
                 drain,
                 log2,
                 Some(Arc::clone(&cancel)),
                 Some(Arc::clone(&paused)),
+                Some(swap),
             );
             // Write the terminal status and re-read the cancel flag UNDER the same
             // lock the cancel tool uses, so a cancel that lands while we finish is
@@ -2878,6 +2978,7 @@ mod tests {
                 status: ServedStatus::Running,
                 cancel: Arc::new(AtomicBool::new(false)),
                 paused: Arc::new(AtomicBool::new(false)),
+                swap: crate::supervisor::swap::SwapChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -3444,6 +3545,7 @@ mod tests {
             status: ServedStatus::Running,
             cancel: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            swap: crate::supervisor::swap::SwapChannel::new(),
             started: Instant::now(),
         };
         let b = session_body("served.0", &s);
@@ -3458,6 +3560,7 @@ mod tests {
             },
             cancel: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            swap: crate::supervisor::swap::SwapChannel::new(),
             started: Instant::now(),
         };
         let b = session_body("served.0", &s);
@@ -3485,6 +3588,7 @@ mod tests {
                     status,
                     cancel: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
+                    swap: crate::supervisor::swap::SwapChannel::new(),
                     started: Instant::now(),
                 },
             );
@@ -3509,6 +3613,7 @@ mod tests {
                     status: ServedStatus::Running,
                     cancel: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
+                    swap: crate::supervisor::swap::SwapChannel::new(),
                     started: Instant::now(),
                 },
             );
@@ -3635,6 +3740,7 @@ mod tests {
                 },
                 cancel: Arc::new(AtomicBool::new(false)),
                 paused: Arc::new(AtomicBool::new(false)),
+                swap: crate::supervisor::swap::SwapChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -3955,6 +4061,50 @@ mod tests {
             !one.load(Ordering::Relaxed),
             "session pause channel cleared"
         );
+    }
+
+    #[test]
+    fn fan_swap_intel_publishes_into_each_live_async_run() {
+        // RFC 0018 §5.2: the reload-driven swap fan-out reaches every LIVE served
+        // async run by PUBLISHING into its per-run `SwapChannel` (the parallel of
+        // flipping `paused`). The run's reactor reads + fans `ctrl/swap_intel` to
+        // its children. A terminal run is skipped (it can't swap).
+        let ctx = ctx();
+        insert_running(&ctx, "served.0");
+        insert_running(&ctx, "served.1");
+        // A terminal run that must NOT be reached.
+        ctx.sessions.lock().unwrap().insert(
+            "served.done".into(),
+            ServedSession {
+                status: ServedStatus::Cancelled,
+                cancel: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(false)),
+                swap: crate::supervisor::swap::SwapChannel::new(),
+                started: Instant::now(),
+            },
+        );
+        // Grab one live run's channel to prove the swap actually lands in it.
+        let ch = ctx
+            .sessions
+            .lock()
+            .unwrap()
+            .get("served.0")
+            .unwrap()
+            .swap
+            .clone();
+
+        let swap = SwapIntel {
+            uri: "vsock:7:9000".into(),
+            token: Some("rotated".into()),
+            model: Some("claude-haiku-4".into()),
+            policy: crate::config::SwapPolicy::FinishOnOld,
+        };
+        let reached = ctx.live_config().fan_swap_intel(swap);
+        // Two live async subtrees took it; the terminal one did not.
+        assert_eq!(reached, 2);
+        let (got, _gen) = ch.take_newer(0).expect("the swap landed in the live run");
+        assert_eq!(got.model.as_deref(), Some("claude-haiku-4"));
+        assert_eq!(got.uri, "vsock:7:9000");
     }
 
     #[test]
@@ -4467,6 +4617,7 @@ mod tests {
                     },
                     cancel: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
+                    swap: crate::supervisor::swap::SwapChannel::new(),
                     started: Instant::now(),
                 },
             );

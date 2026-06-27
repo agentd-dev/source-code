@@ -16,12 +16,13 @@
 
 use crate::agentloop::runner::{LoopAbort, LoopInput, Session, run_loop};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
+use crate::config::SwapPolicy;
 use crate::intel::client::IntelClient;
 use crate::json::frame;
 use crate::mcp::client::McpClient;
 use crate::obs::log::{Comp, Level, LogCtx, Logger};
 use crate::subagent::orchestrator::Orchestrator;
-use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
+use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
 use crate::supervisor::budget::Budget;
 use std::io::{self, BufReader, Stdin, Stdout};
 use std::path::PathBuf;
@@ -29,6 +30,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// The child-local LIVE intelligence handle (RFC 0018 §5.2, the process-boundary
+/// adaptation). A supervisor-side `RwLock<Arc<IntelConfig>>` cannot reach a child
+/// re-exec'd as its own PROCESS, so each child holds its own LIVE config: the
+/// control-reader thread parks a [`SwapIntel`] here on `ControlMsg::SwapIntel`,
+/// and the agentic loop drains it ONCE per turn at the turn boundary (the same
+/// boundary `pause_wait` sits at), rebuilds its [`IntelClient`] from the new
+/// endpoints (fresh health/breaker — §5.2 step 2), and adopts the new model. The
+/// `Mutex<Option<…>>` is the whole seam; the loop never holds it across a turn.
+type PendingSwap = Arc<Mutex<Option<SwapIntel>>>;
 
 type Up = Arc<Mutex<Stdout>>;
 
@@ -63,15 +74,22 @@ pub fn run() -> i32 {
     // event to the loop over this channel; a one-shot run never reads it.
     let (inject_tx, inject_rx) = std::sync::mpsc::channel::<String>();
 
+    // The child-local LIVE intel handle (RFC 0018 §5.2): the control thread parks
+    // a hot-swap here; the loop drains it at the turn boundary. `None` until the
+    // first swap arrives, so the no-swap path never touches the lock past one
+    // cheap empty check per turn.
+    let pending_swap: PendingSwap = Arc::new(Mutex::new(None));
+
     // The control reader runs on its own thread and owns stdin from here on,
-    // so Ping/Pong keeps flowing while the loop is busy — and so Resume/Cancel
-    // still arrive while the loop is suspended at a turn boundary.
+    // so Ping/Pong keeps flowing while the loop is busy — and so Resume/Cancel/
+    // SwapIntel still arrive while the loop is suspended at a turn boundary.
     spawn_control_thread(
         stdin,
         Arc::clone(&up),
         Arc::clone(&cancel),
         Arc::clone(&paused),
         inject_tx,
+        Arc::clone(&pending_swap),
         log.ctx().clone(),
     );
 
@@ -127,7 +145,7 @@ pub fn run() -> i32 {
         }
     }
 
-    let input = LoopInput {
+    let mut input = LoopInput {
         instruction: payload.instruction.clone(),
         output_contract: payload.output_contract.clone(),
         seed: payload
@@ -154,13 +172,28 @@ pub fn run() -> i32 {
     if payload.warm {
         intel.enable_alldown_backoff(crate::intel::client::AllDownPolicy::default());
         return run_warm(
-            &intel, &servers, &input, &payload, &mut orch, &cancel, &paused, &inject_rx, &up, &log,
+            intel,
+            &servers,
+            &input,
+            &payload,
+            &mut orch,
+            &cancel,
+            &paused,
+            &inject_rx,
+            &pending_swap,
+            &up,
+            &log,
         );
     }
 
     // One-shot: a single turn. Suspend at the turn boundary (before the turn
     // starts) if paused; a turn already in progress is never interrupted.
     pause_wait(&paused, &cancel, &log);
+    // RFC 0018 §5.2 turn-boundary read: a swap that landed before this single
+    // turn started is applied here (rebuild client + adopt model). A swap that
+    // lands DURING the turn is finish-on-old and invisible — a one-shot has no
+    // next turn, so `restart-turn` is moot for it (the run ends after this turn).
+    apply_pending_swap(&pending_swap, &mut intel, &mut input.model, &log);
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
         Ok(outcome) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
@@ -191,7 +224,7 @@ pub fn run() -> i32 {
 /// so one reaction can't starve the session.
 #[allow(clippy::too_many_arguments)]
 fn run_warm(
-    intel: &IntelClient,
+    mut intel: IntelClient,
     servers: &[McpClient],
     input: &LoopInput,
     payload: &SpawnPayload,
@@ -199,6 +232,7 @@ fn run_warm(
     cancel: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     inject_rx: &Receiver<String>,
+    pending_swap: &PendingSwap,
     up: &Up,
     log: &Logger,
 ) -> i32 {
@@ -225,11 +259,21 @@ fn run_warm(
         // while we wait. The supervisor reactor and its liveness heartbeat are not
         // affected — only this child loop suspends.
         pause_wait(paused, cancel, log);
+        // RFC 0018 §5.2 turn-boundary read: a hot-swap parked by the control thread
+        // is drained + applied HERE, before the turn — the loop rebuilds its client
+        // (fresh health/breaker) and adopts the new model. The transcript is
+        // UNTOUCHED (§5.3 — no context reset); a turn already running was never
+        // torn (finish-on-old by construction — the swap only lands at this seam).
+        apply_pending_swap_warm(pending_swap, &mut intel, &mut session, log);
+        // Snapshot the pre-turn transcript so `restart-turn` (RFC 0018 §5.3) can
+        // discard a turn that completed under a model swap and re-run it on the new
+        // model from this exact state. Cheap (a `usize`); unused under finish-on-old.
+        let pre_turn = session.transcript_len();
         // One turn over the persistent transcript, bounded by a fresh per-event
         // budget (a new deadline each turn, so the session isn't globally capped).
         let deadline = Instant::now() + Duration::from_millis(limits.deadline_ms.max(1));
         let mut budget = Budget::new(limits.max_steps, limits.max_tokens, deadline);
-        let outcome = match session.run_turn(intel, orch, log, &mut budget, Some(cancel)) {
+        let outcome = match session.run_turn(&intel, orch, log, &mut budget, Some(cancel)) {
             Ok(o) => o,
             Err(LoopAbort::Intel(m)) => {
                 return fail(
@@ -247,6 +291,22 @@ fn run_warm(
         // any other terminal is just this reaction's turn — the session lives on.
         if outcome.status == TerminalStatus::Cancelled {
             break;
+        }
+        // RFC 0018 §5.3 `restart-turn`: a model-changing swap that LANDED while this
+        // turn was in flight discards the turn's result and re-runs it on the new
+        // model from the pre-turn transcript. We never tore the `complete_once` —
+        // the turn finished; we drop its appended messages and loop WITHOUT
+        // consuming a new event. Bounded by the step budget like any turn. The swap
+        // is applied at the top of the loop (the turn-boundary seam), so we only
+        // decide here whether to re-run; an endpoint repoint (model unchanged) is
+        // never a restart (it is always invisible / finish-on-old, §5.1).
+        if restart_turn_pending(pending_swap, session.model()) {
+            session.truncate_transcript(pre_turn);
+            log.info(
+                "intel.swap.restart_turn",
+                serde_json::json!({"discarded_turn": true}),
+            );
+            continue;
         }
         send_up(up, &AgentMsg::Turn { outcome });
         if cancel.load(Ordering::Relaxed) {
@@ -320,6 +380,133 @@ fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
     log.info("loop.resumed", serde_json::json!({}));
 }
 
+/// Rebuild an [`IntelClient`] from a hot-swap's endpoint list (RFC 0018 §5.2
+/// step 2). A repointed endpoint starts CLOSED — a fresh [`crate::intel::endpoints::EndpointList`]
+/// gives every endpoint a brand-new `HealthRecord`, so NO stale breaker state
+/// carries to a new CID. The run's trace id is re-stamped onto the new client so
+/// outbound calls keep joining the run's distributed trace. Returns `None` (and
+/// logs) if the new list is unparseable, in which case the caller keeps the old
+/// client (a bad swap never tears a working run).
+fn rebuild_intel(swap: &SwapIntel, old: &IntelClient, log: &Logger) -> Option<IntelClient> {
+    match IntelClient::from_parts(&swap.uri, swap.token.clone()) {
+        Ok(mut c) => {
+            c.set_trace_id(old.trace_id().map(str::to_string));
+            // A warm/long-lived loop keeps its all-down backoff across a swap (the
+            // daemon must not start crashing on a transient roll just because it was
+            // repointed). The one-shot path never enabled it, so this is a no-op there.
+            if old.alldown_enabled() {
+                c.enable_alldown_backoff(crate::intel::client::AllDownPolicy::default());
+            }
+            Some(c)
+        }
+        Err(e) => {
+            log.warn(
+                "intel.swap.reject",
+                serde_json::json!({"err": e.to_string()}),
+            );
+            None
+        }
+    }
+}
+
+/// Emit the `intel.swap` event (RFC 0018 §8 / §5) for an applied swap. NO secret
+/// and NO URL ever appear — only the swap KIND (`endpoint`/`model`), the model
+/// names (which are non-secret identifiers), the policy, and whether the endpoint
+/// list changed. The endpoint identity stays transport+index-only, surfaced by
+/// the `agentd://intelligence` resource, never here (RFC 0012 §3.7).
+fn log_swap(
+    log: &Logger,
+    from_model: &str,
+    to_model: &str,
+    endpoint_change: bool,
+    policy: SwapPolicy,
+) {
+    let kind = if from_model != to_model {
+        "model"
+    } else {
+        "endpoint"
+    };
+    log.info(
+        "intel.swap",
+        serde_json::json!({
+            "kind": kind,
+            "model_from": from_model,
+            "model_to": to_model,
+            "endpoint_change": endpoint_change,
+            "policy": policy.as_str(),
+        }),
+    );
+}
+
+/// Apply a parked hot-swap at the ONE-SHOT turn boundary (RFC 0018 §5.2): drain
+/// the pending slot, rebuild the client (fresh health), and adopt the new model
+/// into `model`. A no-op (one cheap empty-lock check) when nothing is pending —
+/// the no-swap path is unchanged. `restart-turn` is moot for a one-shot (it has a
+/// single turn), so the policy only governs the event label here.
+fn apply_pending_swap(
+    pending: &PendingSwap,
+    intel: &mut IntelClient,
+    model: &mut String,
+    log: &Logger,
+) {
+    let Some(swap) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return; // fast path: no swap pending
+    };
+    let from_model = model.clone();
+    let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
+    let endpoint_change = match rebuild_intel(&swap, intel, log) {
+        Some(c) => {
+            *intel = c;
+            true
+        }
+        None => false,
+    };
+    *model = to_model.clone();
+    log_swap(log, &from_model, &to_model, endpoint_change, swap.policy);
+}
+
+/// Apply a parked hot-swap at a WARM-session turn boundary (RFC 0018 §5.2): drain
+/// the pending slot, rebuild the client (fresh health), and adopt the new model
+/// onto the live [`Session`] (the transcript is UNTOUCHED — §5.3). A no-op when
+/// nothing is pending.
+fn apply_pending_swap_warm(
+    pending: &PendingSwap,
+    intel: &mut IntelClient,
+    session: &mut Session<'_>,
+    log: &Logger,
+) {
+    let Some(swap) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return; // fast path: no swap pending
+    };
+    let from_model = session.model().to_string();
+    let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
+    let endpoint_change = match rebuild_intel(&swap, intel, log) {
+        Some(c) => {
+            *intel = c;
+            true
+        }
+        None => false,
+    };
+    session.set_model(&to_model);
+    log_swap(log, &from_model, &to_model, endpoint_change, swap.policy);
+}
+
+/// Peek (without draining) whether a `restart-turn` swap is parked that would
+/// CHANGE the model from the session's current one (RFC 0018 §5.3). Only a
+/// model-changing `restart-turn` swap that landed WHILE the turn was in flight
+/// warrants discarding + re-running the just-completed turn; an endpoint repoint
+/// (model unchanged) is always finish-on-old / invisible (§5.1), and a
+/// finish-on-old swap is applied at the next boundary without a re-run.
+fn restart_turn_pending(pending: &PendingSwap, current_model: &str) -> bool {
+    let guard = pending.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(swap) if swap.policy == SwapPolicy::RestartTurn => {
+            swap.model.as_deref().is_some_and(|m| m != current_model)
+        }
+        _ => false,
+    }
+}
+
 fn fail(up: &Up, log: &Logger, error: String, code: i32) -> i32 {
     log.error("loop.error", serde_json::json!({"err": error}));
     send_up(up, &AgentMsg::Failed { error });
@@ -367,12 +554,14 @@ fn send_up(up: &Up, msg: &AgentMsg) {
 /// arrive — the whole point of a separate thread). Exits on EOF (the supervisor
 /// closed the channel) or a read error — which drops `inject_tx`, unblocking a
 /// warm session's wait.
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_thread(
     mut stdin: BufReader<Stdin>,
     up: Up,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     inject_tx: Sender<String>,
+    pending_swap: PendingSwap,
     ctx: LogCtx,
 ) {
     let log = Logger::new(ctx, Level::Debug);
@@ -396,6 +585,20 @@ fn spawn_control_thread(
                     // the receiver, so the send is simply dropped there.
                     Ok(ControlMsg::Inject { message }) => {
                         let _ = inject_tx.send(message);
+                    }
+                    // Intelligence hot-swap (RFC 0018 §5.2): park the new config in
+                    // the child-local LIVE handle. The loop drains + applies it at
+                    // its next turn boundary (rebuild client + adopt model); we
+                    // never touch the loop's in-flight `complete_once`. A swap that
+                    // supersedes a still-unread one simply overwrites it — the loop
+                    // only ever cares about the LATEST config (last-write-wins). The
+                    // token rides this frame (like Spawn) but is NEVER logged.
+                    Ok(ControlMsg::SwapIntel(swap)) => {
+                        log.info(
+                            "subagent.swap_intel",
+                            serde_json::json!({"endpoint_change": true}),
+                        );
+                        *pending_swap.lock().unwrap_or_else(|e| e.into_inner()) = Some(*swap);
                     }
                     Ok(ControlMsg::Spawn(_)) | Err(_) => { /* unexpected/garbage — ignore */ }
                 }
@@ -503,5 +706,82 @@ mod tests {
         assert!(cancel.load(Ordering::Relaxed));
         assert!(paused.load(Ordering::Relaxed)); // still paused, but cancel broke us out
         canceller.join().unwrap();
+    }
+
+    fn swap_to(uri: &str, model: Option<&str>, policy: SwapPolicy) -> SwapIntel {
+        SwapIntel {
+            uri: uri.into(),
+            token: None,
+            model: model.map(str::to_string),
+            policy,
+        }
+    }
+
+    #[test]
+    fn apply_pending_swap_rebuilds_client_and_adopts_model() {
+        // RFC 0018 §5.2: a parked swap is drained + applied at the one-shot turn
+        // boundary — the client points at the new endpoint list and the model is
+        // adopted. The new endpoint list starts with FRESH health (every endpoint
+        // CLOSED — `from_parts` builds a new HealthRecord, no stale breaker).
+        let pending: PendingSwap = Arc::new(Mutex::new(None));
+        let mut intel = IntelClient::from_parts("unix:/old.sock", None).unwrap();
+        let mut model = "old-model".to_string();
+        *pending.lock().unwrap() = Some(swap_to(
+            "unix:/a.sock,unix:/b.sock",
+            Some("new-model"),
+            SwapPolicy::FinishOnOld,
+        ));
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        assert_eq!(model, "new-model");
+        assert_eq!(
+            intel.endpoint_count(),
+            2,
+            "client repointed to the new list"
+        );
+        // The slot is drained — a second apply is a no-op (no double-swap).
+        assert!(pending.lock().unwrap().is_none());
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        assert_eq!(model, "new-model");
+    }
+
+    #[test]
+    fn apply_pending_swap_is_a_noop_when_nothing_pending() {
+        // The no-swap path: the model + endpoint count are byte-for-byte unchanged.
+        let pending: PendingSwap = Arc::new(Mutex::new(None));
+        let mut intel = IntelClient::from_parts("unix:/only.sock", None).unwrap();
+        let mut model = "m".to_string();
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        assert_eq!(model, "m");
+        assert_eq!(intel.endpoint_count(), 1);
+    }
+
+    #[test]
+    fn restart_turn_pending_only_for_model_change_under_restart_policy() {
+        let pending: PendingSwap = Arc::new(Mutex::new(None));
+        // No swap pending → never a restart.
+        assert!(!restart_turn_pending(&pending, "m"));
+        // A finish-on-old swap (even a model change) → never a restart.
+        *pending.lock().unwrap() = Some(swap_to("unix:/a", Some("big"), SwapPolicy::FinishOnOld));
+        assert!(!restart_turn_pending(&pending, "small"));
+        // A restart-turn swap that does NOT change the model (endpoint repoint) →
+        // never a restart (a repoint is always finish-on-old / invisible, §5.1).
+        *pending.lock().unwrap() = Some(swap_to("unix:/a", Some("small"), SwapPolicy::RestartTurn));
+        assert!(!restart_turn_pending(&pending, "small"));
+        // A restart-turn swap that DOES change the model → a restart.
+        *pending.lock().unwrap() = Some(swap_to("unix:/a", Some("big"), SwapPolicy::RestartTurn));
+        assert!(restart_turn_pending(&pending, "small"));
+    }
+
+    #[test]
+    fn bad_swap_list_keeps_the_old_client() {
+        // RFC 0018 §5.2: an unparseable new list never tears a working run — the
+        // old client is kept; only the model (a plain string) is still adopted.
+        let pending: PendingSwap = Arc::new(Mutex::new(None));
+        let mut intel = IntelClient::from_parts("unix:/old.sock,unix:/old2.sock", None).unwrap();
+        let mut model = "old".to_string();
+        *pending.lock().unwrap() = Some(swap_to("", Some("new"), SwapPolicy::FinishOnOld));
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        assert_eq!(intel.endpoint_count(), 2, "kept the old 2-endpoint client");
+        assert_eq!(model, "new");
     }
 }

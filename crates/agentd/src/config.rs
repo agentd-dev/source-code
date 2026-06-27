@@ -49,6 +49,43 @@ impl Mode {
     }
 }
 
+/// Model hot-swap policy (RFC 0018 §5.3, `--model-swap` / `AGENTD_MODEL_SWAP`):
+/// what an in-flight run does when a reload changes the `model` under it. An
+/// endpoint repoint (model unchanged) is ALWAYS finish-on-old / invisible (§5.1),
+/// regardless of this policy. Default `FinishOnOld`. Serialized into the
+/// `ControlMsg::SwapIntel` frame so the child applies the same policy the
+/// supervisor was configured with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwapPolicy {
+    /// The turn in flight when the reload lands completes on the OLD model; the
+    /// NEXT turn uses the new model over the full existing transcript. The
+    /// natural turn-boundary behaviour — cheapest, no wasted work (§5.3).
+    #[default]
+    FinishOnOld,
+    /// The turn in flight finishes (we never tear a `complete_once`) but its
+    /// result is DISCARDED and the turn is RE-RUN on the new model from the same
+    /// pre-turn transcript state — costs one turn, bounded by the step budget
+    /// (§5.3). Opt-in.
+    RestartTurn,
+}
+
+impl SwapPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SwapPolicy::FinishOnOld => "finish-on-old",
+            SwapPolicy::RestartTurn => "restart-turn",
+        }
+    }
+    pub fn parse(s: &str) -> Option<SwapPolicy> {
+        match s {
+            "finish-on-old" => Some(SwapPolicy::FinishOnOld),
+            "restart-turn" => Some(SwapPolicy::RestartTurn),
+            _ => None,
+        }
+    }
+}
+
 /// Timer-route shard behaviour (RFC 0019 §4.1, `AGENTD_SHARD_TIMER`). Stored on
 /// [`Config`] in ALL feature combos (so `Config` stays uniform), but only
 /// consulted by the `cluster`-feature timer driver. `shard0` ⇒ one fleet-wide
@@ -415,6 +452,12 @@ pub struct Config {
     /// a log. The `--intelligence-token` flag/env stays as the inline source.
     pub intelligence_token_file: Option<String>,
     pub model: Option<String>,
+    /// Model hot-swap policy (RFC 0018 §5.3, `--model-swap` / `AGENTD_MODEL_SWAP`):
+    /// what an in-flight run does when a reload changes `model` under it.
+    /// `finish-on-old` (default) | `restart-turn`. An endpoint repoint (model
+    /// unchanged) is always finish-on-old regardless (§5.1). Reloadable: the
+    /// reload fans the new policy down with the swap.
+    pub model_swap: SwapPolicy,
     pub mcp_servers: Vec<McpServerSpec>,
     /// Declared remote-A2A delegation peers (`--a2a-peer name=endpoint`). The
     /// delegation-backend axis of RFC 0020 §3: `a2a.delegate` dials these. Only
@@ -558,6 +601,7 @@ impl Default for Config {
             intelligence_token: None,
             intelligence_token_file: None,
             model: None,
+            model_swap: SwapPolicy::FinishOnOld,
             mcp_servers: Vec::new(),
             a2a_peers: Vec::new(),
             mode: Mode::Once,
@@ -611,6 +655,7 @@ impl fmt::Debug for Config {
             )
             .field("intelligence_token_file", &self.intelligence_token_file)
             .field("model", &self.model)
+            .field("model_swap", &self.model_swap.as_str())
             .field("mcp_servers", &self.mcp_servers)
             .field("a2a_peers", &self.a2a_peers)
             .field("mode", &self.mode)
@@ -742,6 +787,13 @@ impl Config {
         }
         if let Some(v) = envmap.get("AGENTD_MODEL") {
             c.model = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_MODEL_SWAP") {
+            c.model_swap = SwapPolicy::parse(v).ok_or_else(|| {
+                usage(format!(
+                    "invalid AGENTD_MODEL_SWAP: {v} (want finish-on-old|restart-turn)"
+                ))
+            })?;
         }
         if let Some(v) = envmap.get("AGENTD_MODE") {
             c.mode = Mode::parse(v).ok_or_else(|| usage(format!("invalid AGENTD_MODE: {v}")))?;
@@ -898,6 +950,14 @@ impl Config {
                     c.intelligence_token = Some(take("--intelligence-token")?)
                 }
                 "--model" => c.model = Some(take("--model")?),
+                "--model-swap" => {
+                    let v = take("--model-swap")?;
+                    c.model_swap = SwapPolicy::parse(&v).ok_or_else(|| {
+                        usage(format!(
+                            "invalid --model-swap: {v} (want finish-on-old|restart-turn)"
+                        ))
+                    })?;
+                }
                 "--mcp" => {
                     let spec = take("--mcp")?;
                     c.mcp_servers.push(parse_mcp_spec(&spec)?);
@@ -1492,7 +1552,11 @@ impl Diag {
 /// safely — see the apply step in `triggers::mode`).
 pub const RESTART_ONLY_FIELDS: &[&str] = &[
     "mode",
-    "intelligence",       // transport/endpoint identity (RFC 0018 owns hot-swap)
+    // NB: `intelligence` (the endpoint list) and `model`/`model_swap` are
+    // RELOADABLE via RFC 0018 §5 — the runtime hot-swap primitive. A reload whose
+    // diff repoints the endpoint list or changes the model is APPLIED at a turn
+    // boundary (the supervisor fans `ctrl/swap_intel` to in-flight children), not
+    // rejected. They are deliberately absent from this list.
     "run_id",             // instance identity / idempotency key
     "serve_mcp",          // a live control socket must not rebind mid-flight
     "enable_exec",        // a security-capability toggle — never widen live
@@ -1612,7 +1676,6 @@ impl Config {
     fn restart_only_field_differs(&self, running: &Config, field: &str) -> bool {
         match field {
             "mode" => self.mode != running.mode,
-            "intelligence" => self.intelligence != running.intelligence,
             "run_id" => self.run_id != running.run_id,
             "serve_mcp" => self.serve_mcp != running.serve_mcp,
             "enable_exec" => self.enable_exec != running.enable_exec,
@@ -1635,6 +1698,7 @@ impl Config {
     pub fn effective_view(&self) -> serde_json::Value {
         serde_json::json!({
             "model": self.model,
+            "swap_policy": self.model_swap.as_str(),
             "max_tokens": self.max_tokens,
             "limits": {
                 "max_steps": self.max_steps,
@@ -1945,6 +2009,20 @@ fn apply_config_file(
     c: &mut Config,
     cf: crate::config_file::ConfigFile,
 ) -> Result<(), ConfigError> {
+    // RFC 0018 §5.1: the intelligence endpoint LIST is file-settable + reloadable
+    // (a ConfigMap repoint is a hot-swap). The transport scheme is data; the
+    // credential is NEVER inline here (env/`_FILE` only — the validate pass rejects
+    // a secret-shaped value just as for headers, RFC 0012 §3.7).
+    if let Some(intelligence) = cf.intelligence {
+        c.intelligence = Some(intelligence);
+    }
+    if let Some(policy) = cf.model_swap {
+        c.model_swap = crate::config::SwapPolicy::parse(&policy).ok_or_else(|| {
+            usage(format!(
+                "config file: invalid model_swap: {policy} (want finish-on-old|restart-turn)"
+            ))
+        })?;
+    }
     if let Some(model) = cf.model {
         c.model = Some(model);
     }
@@ -3481,7 +3559,6 @@ mod tests {
             },
             |c: &mut Config| c.serve_mcp = Some("unix:/run/x.sock".into()),
             |c: &mut Config| c.drain_timeout = Duration::from_secs(99),
-            |c: &mut Config| c.intelligence = Some("unix:/other.sock".into()),
         ] {
             let mut new = running.clone();
             mutate(&mut new);
@@ -3498,7 +3575,8 @@ mod tests {
 
     #[test]
     fn coherence_accepts_a_reloadable_diff() {
-        // RFC 0017 §5.1: log_level / model / subscribe are reloadable — a diff in
+        // RFC 0017 §5.1 + RFC 0018 §5.1: log_level / model / subscribe and now the
+        // intelligence endpoint list + model-swap policy are reloadable — a diff in
         // them passes the coherence check (no restart-only field touched).
         let running = reactive_base();
         for mutate in [
@@ -3507,6 +3585,9 @@ mod tests {
             |c: &mut Config| c.max_tokens = 999_999,
             |c: &mut Config| c.max_steps = 123,
             |c: &mut Config| c.subscribe = vec!["file:///in.json".into(), "file:///b.json".into()],
+            // RFC 0018 §5.1: an endpoint repoint is a reloadable hot-swap.
+            |c: &mut Config| c.intelligence = Some("unix:/other.sock".into()),
+            |c: &mut Config| c.model_swap = SwapPolicy::RestartTurn,
         ] {
             let mut new = running.clone();
             mutate(&mut new);
@@ -3515,6 +3596,42 @@ mod tests {
                 "a reloadable diff must be accepted",
             );
         }
+    }
+
+    #[test]
+    fn model_swap_flag_and_env_parse_and_default() {
+        // RFC 0018 §5.3: `--model-swap` / `AGENTD_MODEL_SWAP` selects the policy;
+        // the default is finish-on-old.
+        let def = Config::load(&args(&[]), &base_env()).unwrap();
+        assert_eq!(def.model_swap, SwapPolicy::FinishOnOld);
+        let flag = Config::load(&args(&["--model-swap", "restart-turn"]), &base_env()).unwrap();
+        assert_eq!(flag.model_swap, SwapPolicy::RestartTurn);
+        let mut env = base_env();
+        env.push(("AGENTD_MODEL_SWAP".into(), "restart-turn".into()));
+        let e = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(e.model_swap, SwapPolicy::RestartTurn);
+        // A bad value is exit 2 (Usage), like any other invalid scalar.
+        assert!(matches!(
+            Config::load(&args(&["--model-swap", "nope"]), &base_env()),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn intelligence_is_reloadable_not_restart_only() {
+        // RFC 0018 §5.1: `intelligence` (the endpoint list) was lifted out of the
+        // restart-only set — a repoint is APPLIED as a hot-swap, not rejected.
+        assert!(
+            !RESTART_ONLY_FIELDS.contains(&"intelligence"),
+            "intelligence must NOT be restart-only (RFC 0018 §5.1)"
+        );
+        let running = reactive_base();
+        let mut new = running.clone();
+        new.intelligence = Some("vsock:9:1234".into());
+        assert!(
+            Config::reload_coherence_check(&new, Some(&running), true).is_ok(),
+            "an endpoint repoint must pass the coherence check (it is reloadable)"
+        );
     }
 
     #[test]
@@ -3573,7 +3690,6 @@ mod tests {
             // Mutate the field on `a` and assert the diff is detected.
             match f {
                 "mode" => a.mode = Mode::Loop,
-                "intelligence" => a.intelligence = Some("unix:/z".into()),
                 "run_id" => a.run_id = "x".into(),
                 "serve_mcp" => a.serve_mcp = Some("unix:/s".into()),
                 "enable_exec" => a.enable_exec = true,

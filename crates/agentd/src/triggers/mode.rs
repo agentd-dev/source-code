@@ -20,6 +20,8 @@ use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
 use crate::report::{Refusals, RunReport, Usage};
 use crate::signals;
+#[cfg(feature = "hot-reload")]
+use crate::subagent::protocol::SwapIntel;
 use crate::subagent::protocol::{SeedMessage, SpawnPayload};
 use crate::supervisor::reactor::{SuperviseResult, supervise_once};
 use crate::supervisor::restart::{RestartAction, RestartConfig, RestartGovernor};
@@ -364,6 +366,54 @@ pub fn run_reactive(
                 &mut generation,
                 log,
             ) {
+                // RFC 0018 §5.2: an APPLIED reload whose diff touches the
+                // intelligence endpoint list / model / swap policy must REACH
+                // in-flight work — `apply_value_swaps` already repointed the spawn
+                // template (NEW spawns), but live children (warm `--continue`
+                // sessions + served runs) need the swap fanned to them. Build the
+                // swap frame from the new config and fan it BEFORE `running` is
+                // reassigned (we diff `running` → `new_cfg`).
+                let swap_needed = intel_swap_needed(&running, &new_cfg);
+                if swap_needed {
+                    let swap = SwapIntel {
+                        uri: new_cfg.intelligence.clone().unwrap_or_default(),
+                        token: new_cfg.intelligence_token.clone(),
+                        model: new_cfg.model.clone(),
+                        policy: new_cfg.model_swap,
+                    };
+                    // The reactive daemon's own warm `--continue` sessions.
+                    let warm_reached = warm.fan_swap_intel(&swap, log);
+                    // The served runs (warm + async) held by the serve-mcp ctx —
+                    // reached through the shared `LiveConfig` (serve-mcp only).
+                    #[cfg(feature = "serve-mcp")]
+                    let served_reached = live_config
+                        .as_ref()
+                        .map(|lc| lc.fan_swap_intel(swap.clone()))
+                        .unwrap_or(0);
+                    #[cfg(not(feature = "serve-mcp"))]
+                    let served_reached = 0u64;
+                    // The `intel.swap` event (RFC 0018 §8 + the §4.4 notify): the
+                    // SUPERVISOR-side audit anchor that feeds the events ring (RFC
+                    // 0016). Transport+index only — NO secret, NO URL (the `token`/
+                    // endpoint URL never appear in this event, only the model names
+                    // + policy + whether the endpoint list changed, §7).
+                    let endpoint_change = running.intelligence != new_cfg.intelligence
+                        || running.intelligence_token != new_cfg.intelligence_token;
+                    let from_model = running.model.clone().unwrap_or_default();
+                    let to_model = new_cfg.model.clone().unwrap_or_default();
+                    log.info(
+                        "intel.swap",
+                        json!({
+                            "kind": if from_model != to_model { "model" } else { "endpoint" },
+                            "model_from": from_model,
+                            "model_to": to_model,
+                            "endpoint_change": endpoint_change,
+                            "policy": new_cfg.model_swap.as_str(),
+                            "warm_reached": warm_reached,
+                            "served_reached": served_reached,
+                        }),
+                    );
+                }
                 // APPLIED reload (RFC 0017 §5.6): publish the new config onto the
                 // served `agentd://config/effective` view and push
                 // `resources/updated` so a subscribed agentctl learns push-style.
@@ -375,6 +425,12 @@ pub fn run_reactive(
                 if let Some(lc) = &live_config {
                     lc.swap(std::sync::Arc::new(new_cfg.clone()));
                     lc.notify_config_effective_updated();
+                    // RFC 0018 §4.4: after a swap, notify `agentd://intelligence`
+                    // subscribers to re-read the new endpoint topology / model /
+                    // swap policy (notify-then-read; no payload, no secret/URL).
+                    if swap_needed {
+                        lc.notify_intelligence_updated();
+                    }
                 }
                 running = new_cfg;
             }
@@ -770,7 +826,28 @@ fn reloadable_changes(running: &Config, new: &Config) -> Vec<&'static str> {
     if running.subscribe != new.subscribe {
         changed.push("subscribe");
     }
+    // RFC 0018 §5.1: the intelligence endpoint list + swap policy are reloadable.
+    // A change repoints NEW spawns (via `apply_value_swaps`) and is fanned to
+    // in-flight children as `ctrl/swap_intel` (the caller, `intel_swap_needed`).
+    if running.intelligence != new.intelligence
+        || running.intelligence_token != new.intelligence_token
+        || running.model_swap != new.model_swap
+    {
+        changed.push("intelligence");
+    }
     changed
+}
+
+/// Whether a reload's diff touches the hot-swappable intelligence config (RFC
+/// 0018 §5.1): the endpoint list, the resolved default credential, the model, or
+/// the swap policy. When true, the caller fans `ctrl/swap_intel` to every
+/// in-flight child + warm/served run and notifies `agentd://intelligence`. Pure.
+#[cfg(feature = "hot-reload")]
+fn intel_swap_needed(running: &Config, new: &Config) -> bool {
+    running.intelligence != new.intelligence
+        || running.intelligence_token != new.intelligence_token
+        || running.model != new.model
+        || running.model_swap != new.model_swap
 }
 
 /// Apply the low-risk value-swaps (RFC 0017 §5.3 step 4) into the working spawn
@@ -781,6 +858,12 @@ fn reloadable_changes(running: &Config, new: &Config) -> Vec<&'static str> {
 #[cfg(feature = "hot-reload")]
 fn apply_value_swaps(base: &mut SpawnPayload, new: &Config, log: &Logger) {
     base.intelligence.model = new.model.clone();
+    // RFC 0018 §5.1: repoint the endpoint list + default credential so a NEW spawn
+    // (or a warm session re-spawned after this reload) dials the new endpoints. An
+    // in-flight child is reached separately by the `ctrl/swap_intel` fan-out — this
+    // only updates the working template. The token is swapped but never logged.
+    base.intelligence.uri = new.intelligence.clone().unwrap_or_default();
+    base.intelligence.token = new.intelligence_token.clone();
     base.limits.max_tokens = new.max_tokens;
     base.limits.max_steps = new.max_steps;
     base.limits.max_depth = new.max_depth;

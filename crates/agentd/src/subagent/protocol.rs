@@ -13,7 +13,7 @@
 //! mechanics are `supervisor/spawn.rs`, the child side `subagent/control.rs`.
 
 use crate::agentloop::stop::Outcome;
-use crate::config::{A2aPeerSpec, McpServerSpec};
+use crate::config::{A2aPeerSpec, McpServerSpec, SwapPolicy};
 use crate::wire::intel::Usage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +44,40 @@ pub enum ControlMsg {
     /// Inject a message into the child's running warm session (parent `send` /
     /// reactive continue); forwarded to the loop by the control reader thread.
     Inject { message: String },
+    /// Hot-swap the child's intelligence config at its next turn boundary (RFC
+    /// 0018 §5.2). Sent by the supervisor's reload fan-out to every in-flight
+    /// child when a reload's diff touches `intelligence`/`model`/`model_swap` —
+    /// the same fan-out shape as [`ControlMsg::Pause`], with a payload. The
+    /// child's control thread stores it into a child-local LIVE handle; the
+    /// agentic loop reads it ONCE at the next turn boundary (where `pause_wait`
+    /// sits), rebuilds its [`crate::intel::client::IntelClient`] from the new
+    /// endpoint list (fresh health/breaker — a repointed endpoint starts CLOSED,
+    /// §5.2 step 2), and adopts the new model. An in-flight `complete_once` is
+    /// NEVER torn; the transcript is CONTINUOUS (§5.3, no context reset). The
+    /// `token` is a credential carried on the wire like [`SpawnPayload`]'s — it
+    /// is NEVER logged (the swap event/logs carry transport+index only).
+    SwapIntel(Box<SwapIntel>),
+}
+
+/// The intelligence config the child rebuilds its client from on a hot-swap (RFC
+/// 0018 §5.2). The endpoint-list URI + the default endpoint-1 credential + the
+/// model + the swap policy — exactly the parts [`IntelConfig`] carries plus the
+/// policy. Boxed in [`ControlMsg`] to keep the enum small (like [`SpawnPayload`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapIntel {
+    /// The new endpoint *list* URI (RFC 0018 §3.1) — a single element is RFC 0006.
+    pub uri: String,
+    /// Endpoint 1's resolved default credential when its env override is unset
+    /// (the same role as [`IntelConfig::token`]); NEVER logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The new model (`None` ⇒ unchanged from the spawn payload's resolved model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The model-swap policy (RFC 0018 §5.3): `finish-on-old` (default) |
+    /// `restart-turn`. Only matters when `model` actually changed.
+    #[serde(default)]
+    pub policy: SwapPolicy,
 }
 
 // ---- upward: subagent -> supervisor ----
@@ -263,6 +297,36 @@ mod tests {
             .unwrap()
             .contains("\"type\":\"cancel\"")
         );
+    }
+
+    #[test]
+    fn control_swap_intel_roundtrip_and_policy_default() {
+        // RFC 0018 §5.2: the swap frame carries the new list/model/policy. The
+        // token rides the wire (like Spawn) but is never logged — the resource
+        // body / events carry transport+index only.
+        let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
+            uri: "vsock:5:9090,vsock:5:9091".into(),
+            token: Some("rotated-secret".into()),
+            model: Some("claude-haiku-4".into()),
+            policy: SwapPolicy::RestartTurn,
+        }));
+        let s = serde_json::to_string(&swap).unwrap();
+        assert!(s.contains("\"type\":\"swap_intel\""));
+        assert!(s.contains("\"policy\":\"restart-turn\""));
+        let back: ControlMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ControlMsg::SwapIntel(p) => {
+                assert_eq!(p.uri, "vsock:5:9090,vsock:5:9091");
+                assert_eq!(p.model.as_deref(), Some("claude-haiku-4"));
+                assert_eq!(p.policy, SwapPolicy::RestartTurn);
+            }
+            other => panic!("expected swap_intel, got {other:?}"),
+        }
+        // A frame with no model/token defaults to finish-on-old (an endpoint
+        // repoint with no model change).
+        let minimal: SwapIntel = serde_json::from_str(r#"{"uri":"unix:/a"}"#).unwrap();
+        assert_eq!(minimal.policy, SwapPolicy::FinishOnOld);
+        assert!(minimal.model.is_none() && minimal.token.is_none());
     }
 
     #[test]

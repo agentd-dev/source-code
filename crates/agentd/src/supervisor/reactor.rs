@@ -30,6 +30,7 @@ use crate::supervisor::liveness::{Health, Liveness, LivenessConfig};
 use crate::supervisor::reap::{Reaped, WaitOutcome};
 use crate::supervisor::reaper;
 use crate::supervisor::spawn::{Subagent, spawn};
+use crate::supervisor::swap::SwapChannel;
 use crate::supervisor::tree::{Caps, NodeId, NodeStatus, Tree};
 use serde_json::json;
 use std::collections::HashMap;
@@ -124,6 +125,15 @@ pub struct Supervisor {
     /// forward so an edge fans exactly once, not every tick.
     paused: Option<Arc<AtomicBool>>,
     paused_sent: bool,
+    /// Optional per-run intelligence hot-swap channel (RFC 0018 §5.2). A hot
+    /// reload that touches `intelligence`/`model` publishes the new config here;
+    /// the reactor reads it each tick and fans `ctrl/swap_intel` to every live
+    /// child once per published swap — the async-run parallel of `paused`. `None`
+    /// for runs with no swap channel. `swap_sent_gen` debounces the fan so each
+    /// distinct published swap is forwarded exactly once (the parallel of
+    /// `paused_sent`).
+    swap: Option<SwapChannel>,
+    swap_sent_gen: u64,
     /// The per-run child cgroup (opt-in via `--cgroup`; `None` when off / not
     /// writable). The root subagent is placed here so its whole subtree can be
     /// torn down atomically with `cgroup.kill` — the backstop beyond killpg +
@@ -160,6 +170,8 @@ impl Supervisor {
             cancel: None,
             paused: None,
             paused_sent: false,
+            swap: None,
+            swap_sent_gen: 0,
             cgroup: None,
             log,
         }
@@ -247,6 +259,11 @@ impl Supervisor {
             // (RFC 0015 §4.3). Skipped during a drain — the kill ladder owns the
             // children then, and a paused tree must still drain.
             self.forward_pause();
+
+            // Forward a published intelligence hot-swap to every live child (RFC
+            // 0018 §5.2) — the async-run reach of a reload that repoints the
+            // endpoint list / changes the model. Same drain exclusion as pause.
+            self.forward_swap();
 
             self.maybe_send_pings(Instant::now());
             self.tick_liveness();
@@ -380,6 +397,38 @@ impl Supervisor {
             json!({"paused": want, "live": self.live.len()}),
         );
         self.paused_sent = want;
+    }
+
+    /// Forward a published intelligence hot-swap (RFC 0018 §5.2) to every live
+    /// child as a `ctrl/swap_intel` frame — the async-run parallel of how
+    /// `forward_pause` translates the `paused` edge. A hot reload that touches
+    /// `intelligence`/`model` publishes the new config into the run's
+    /// [`SwapChannel`]; this reads each tick and fans the LATEST config once per
+    /// published generation (debounced via `swap_sent_gen`). Each child drains it
+    /// at its next turn boundary — we never tear an in-flight `complete_once`.
+    /// Suspended during a drain: the kill ladder owns the children then. The
+    /// token rides the frame (like the spawn payload) but is NEVER logged — only
+    /// the bounded fan count + (non-secret) policy.
+    fn forward_swap(&mut self) {
+        if self.drain.is_some() {
+            return;
+        }
+        let Some(ch) = self.swap.as_ref() else {
+            return;
+        };
+        let Some((swap, generation)) = ch.take_newer(self.swap_sent_gen) else {
+            return; // no newer swap published since the last fan
+        };
+        let policy = swap.policy.as_str();
+        let msg = ControlMsg::SwapIntel(Box::new(swap));
+        for h in self.live.values_mut() {
+            let _ = h.send(&msg);
+        }
+        self.log.info(
+            "subagent.swap_intel",
+            json!({"live": self.live.len(), "policy": policy}),
+        );
+        self.swap_sent_gen = generation;
     }
 
     fn reap(&mut self) {
@@ -673,10 +722,31 @@ pub fn supervise_pausable(
     cancel: Option<Arc<AtomicBool>>,
     paused: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<SuperviseResult> {
+    supervise_swappable(exe, payload, drain_timeout, log, cancel, paused, None)
+}
+
+/// Like [`supervise_pausable`] but also with an optional per-run intelligence
+/// hot-swap channel (RFC 0018 §5.2): a hot reload that touches `intelligence`/
+/// `model` publishes the new config into the [`SwapChannel`], and this run's
+/// reactor fans `ctrl/swap_intel` to every live child at the next tick (each
+/// applies it at its turn boundary). The async-session swap channel, the parallel
+/// of `paused`. `None` for runs with no swap channel (a blocking once-mode run,
+/// or a build without hot reload) — the no-swap path is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn supervise_swappable(
+    exe: PathBuf,
+    payload: &SpawnPayload,
+    drain_timeout: Duration,
+    log: Logger,
+    cancel: Option<Arc<AtomicBool>>,
+    paused: Option<Arc<AtomicBool>>,
+    swap: Option<SwapChannel>,
+) -> std::io::Result<SuperviseResult> {
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.cancel = cancel;
     sup.paused = paused;
+    sup.swap = swap;
     // Per-run child cgroup (opt-in, best-effort): the root + its whole subtree
     // land here so teardown can `cgroup.kill` them atomically. `None` when the
     // feature is off or the tree isn't writable — the run then relies on

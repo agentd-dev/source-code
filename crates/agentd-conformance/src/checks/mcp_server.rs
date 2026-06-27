@@ -68,6 +68,18 @@ pub fn checks() -> Vec<Check> {
             run: resources_read_status,
         },
         Check {
+            id: "mcp-server/run-listed",
+            category: Category::McpServer,
+            desc: "resources/list advertises the stable agentd://run/<run_id> resource",
+            run: run_listed,
+        },
+        Check {
+            id: "mcp-server/resources-read-run",
+            category: Category::McpServer,
+            desc: "resources/read agentd://run/<run_id> returns a body with run_id + mode",
+            run: resources_read_run,
+        },
+        Check {
             id: "mcp-server/resources-read-unknown",
             category: Category::McpServer,
             desc: "resources/read of an unknown uri is RESOURCE_NOT_FOUND (-32002)",
@@ -254,6 +266,55 @@ fn resources_read_status(h: &Harness) -> Outcome {
         r["result"]["contents"].is_array(),
         format!("no contents: {r}"),
     )
+}
+
+/// Read this daemon's run id out of `agentd://status` (its body's `run_id`),
+/// then form the `agentd://run/<run_id>` uri the run resource is published under.
+fn run_uri_of(s: &mut crate::harness::Served) -> Option<String> {
+    let r = s
+        .client()
+        .call("resources/read", json!({"uri": "agentd://status"}));
+    let text = r["result"]["contents"][0]["text"].as_str()?;
+    let body: Value = serde_json::from_str(text).ok()?;
+    let run_id = body["run_id"].as_str()?;
+    Some(format!("agentd://run/{run_id}"))
+}
+
+fn run_listed(h: &Harness) -> Outcome {
+    let mut s = h.serve();
+    let Some(uri) = run_uri_of(&mut s) else {
+        return Outcome::fail("could not read run_id from agentd://status");
+    };
+    let r = s.client().call("resources/list", json!({}));
+    let has = r["result"]["resources"]
+        .as_array()
+        .map(|a| a.iter().any(|res| res["uri"] == json!(uri)))
+        .unwrap_or(false);
+    Outcome::require(has, format!("{uri} not listed: {r}"))
+}
+
+fn resources_read_run(h: &Harness) -> Outcome {
+    let mut s = h.serve();
+    let Some(uri) = run_uri_of(&mut s) else {
+        return Outcome::fail("could not read run_id from agentd://status");
+    };
+    let r = s.client().call("resources/read", json!({"uri": uri}));
+    let Some(text) = r["result"]["contents"][0]["text"].as_str() else {
+        return Outcome::fail(format!("no run contents body: {r}"));
+    };
+    let Ok(body) = serde_json::from_str::<Value>(text) else {
+        return Outcome::fail(format!("run body is not JSON: {text}"));
+    };
+    Outcome::require(
+        body["run_id"].is_string(),
+        format!("run body lacks run_id: {body}"),
+    )
+    .and(|| {
+        Outcome::require(
+            body["mode"].is_string(),
+            format!("run body lacks mode: {body}"),
+        )
+    })
 }
 
 fn resources_read_unknown(h: &Harness) -> Outcome {

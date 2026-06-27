@@ -274,12 +274,30 @@ pub fn record_shard_skipped() {
 }
 
 /// A claim was lost to another replica (RFC 0019 §5.1 `agentd_claims_lost_total`).
-/// **Frozen-but-unfed**: claim/lease (RFC 0019 §3) is DEFERRED (§12), so nothing
-/// increments this yet — the name is reserved now so the schema is stable when the
-/// claim mechanism lands (exactly like the other pre-frozen RFC 0016 series).
+/// Wired by the claim gate (`cluster` build): a `work.claim{granted:false}` drops
+/// the delivery and increments this — the over-provisioning signal a scaler reads
+/// (high & rising under low backlog ⇒ scale down).
 pub fn record_claim_lost() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.claims_lost.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A claim was granted (RFC 0019 §3.2 / §5.1 `agentd_claims_granted_total`): this
+/// replica won `work.claim` and proceeds to process the item. Wired by the claim
+/// gate in the `cluster` build.
+pub fn record_claim_granted() {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.claims_granted.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A held claim was released (RFC 0019 §3.3 / §6 `agentd_claims_released_total`):
+/// a non-terminal wind-down or a drain handed the item back to the fleet. Wired by
+/// the claim gate + the drain step-1.5 in the `cluster` build.
+pub fn record_claim_released() {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY
+        .claims_released
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Set the saturation gauge — `in_flight / capacity` in `[0.0, 1.0]` (RFC 0019
@@ -445,6 +463,8 @@ mod imp {
         saturation_bp: AtomicU64,
         pub(super) shard_skipped: AtomicU64,
         pub(super) claims_lost: AtomicU64,
+        pub(super) claims_granted: AtomicU64,
+        pub(super) claims_released: AtomicU64,
     }
 
     impl Registry {
@@ -484,6 +504,8 @@ mod imp {
                 saturation_bp: AtomicU64::new(0),
                 shard_skipped: AtomicU64::new(0),
                 claims_lost: AtomicU64::new(0),
+                claims_granted: AtomicU64::new(0),
+                claims_released: AtomicU64::new(0),
             }
         }
 
@@ -788,13 +810,26 @@ mod imp {
                 "Items dropped as out-of-shard (RFC 0019 §4.1).",
                 g(&self.shard_skipped),
             );
-            // Frozen-but-unfed: claim/lease is deferred (RFC 0019 §3/§12), so this
-            // reads 0; the name is reserved now so the schema is stable on landing.
+            // Claim lifecycle counters (RFC 0019 §5.1). Lost is the over-provision
+            // signal (high under low backlog ⇒ scale down); granted/released round
+            // out the claim outcome set. Wired by the `cluster` claim gate.
             counter(
                 &mut s,
                 "agentd_claims_lost_total",
-                "Work claims lost to another replica (RFC 0019 §5.1; claim deferred).",
+                "Work claims lost to another replica (RFC 0019 §5.1).",
                 g(&self.claims_lost),
+            );
+            counter(
+                &mut s,
+                "agentd_claims_granted_total",
+                "Work claims granted to this replica (RFC 0019 §3.2).",
+                g(&self.claims_granted),
+            );
+            counter(
+                &mut s,
+                "agentd_claims_released_total",
+                "Held claims released back to the fleet (RFC 0019 §3.3/§6).",
+                g(&self.claims_released),
             );
 
             // --- legacy bare series (RFC 0010 §3.8; retained, additive) ------
@@ -1092,9 +1127,19 @@ mod imp {
             assert!(out.contains("agentd_saturation 0.5468"));
             assert!(out.contains("# TYPE agentd_shard_skipped_total counter"));
             assert!(out.contains("agentd_shard_skipped_total 3"));
-            // claims-lost is frozen-but-unfed: present, reads 0.
+            // The claim lifecycle counters render (default 0 in a bare registry).
             assert!(out.contains("# TYPE agentd_claims_lost_total counter"));
             assert!(out.contains("agentd_claims_lost_total 0"));
+            assert!(out.contains("# TYPE agentd_claims_granted_total counter"));
+            assert!(out.contains("# TYPE agentd_claims_released_total counter"));
+            // And they increment.
+            r.claims_lost.fetch_add(2, Ordering::Relaxed);
+            r.claims_granted.fetch_add(5, Ordering::Relaxed);
+            r.claims_released.fetch_add(1, Ordering::Relaxed);
+            let out = r.render();
+            assert!(out.contains("agentd_claims_lost_total 2"));
+            assert!(out.contains("agentd_claims_granted_total 5"));
+            assert!(out.contains("agentd_claims_released_total 1"));
         }
 
         #[test]

@@ -8,10 +8,13 @@
 //!   * the `agentd://capacity` read surface lives in [`crate::mcp::server`]
 //!     (RFC 0019 §9), gated behind serve-mcp like the other served resources.
 //!
-//! The work-claim / lease convention (§3) and standby mode (§7) are **deferred**
-//! (RFC 0019 §12, the `work.*` tool contract is not yet frozen) — this module
-//! advertises neither.
+//! The work-claim / lease convention (§3) is the cross-instance-ownership half of
+//! this feature (RFC 0015 §5.6 froze the `work.*` contract): see [`claim`].
+//! Standby mode (§7) and the mock work-server are a separate follow-up — this
+//! module does not build them.
 
+pub mod claim;
 pub mod shard;
 
+pub use claim::{ClaimOutcome, ClaimSpec, advertises_work_tools, claim, derive_claim_key};
 pub use shard::{Shard, TimerShard};

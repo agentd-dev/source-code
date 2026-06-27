@@ -78,6 +78,58 @@ impl TimerShardMode {
     }
 }
 
+/// The wire shape a `claim` route uses to talk to its coordination server
+/// (RFC 0015 §5.6 "two styles", RFC 0019 §3.3). Always-compiled (so [`Config`]
+/// stays uniform across feature combos); only the `cluster`-gated claim client
+/// acts on it. `Tool` (the default) calls the four `work.*` tools directly;
+/// `Resource` models items as resources carrying a `lease` field and degenerates
+/// `work.claim` to a compare-and-set (the CAS path is a documented stub in v1 —
+/// see `cluster::claim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimStyle {
+    #[default]
+    Tool,
+    Resource,
+}
+
+impl ClaimStyle {
+    /// Parse the `:tool|:resource` suffix of a `--claim` value. `None` on an
+    /// unknown value (the caller maps it to a [`ConfigError::Usage`], exit 2).
+    fn parse(s: &str) -> Option<ClaimStyle> {
+        match s {
+            "tool" => Some(ClaimStyle::Tool),
+            "resource" => Some(ClaimStyle::Resource),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClaimStyle::Tool => "tool",
+            ClaimStyle::Resource => "resource",
+        }
+    }
+}
+
+/// A declared work-claim route (`--claim <uri>=<server>[:tool|resource]`, RFC
+/// 0019 §3, RFC 0015 §5.6). Before a reactive worker processes `uri`, it claims
+/// it against the coordination MCP server named `server` (a declared `--mcp`
+/// server) and proceeds only on a granted lease. Always-compiled (no dependency
+/// on the gated `cluster` types) so `Config` is uniform; the live, server-bound
+/// `ClaimSpec` is built in `run_reactive` under the `cluster` feature. A claim
+/// route's `uri` is ALSO added to the `subscribe` set (subscribed + routed as a
+/// Spawn) at load. **Exact-URI in v1** (prefix/glob-claim is a documented
+/// follow-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRoute {
+    /// The exact resource URI this route claims before processing.
+    pub uri: String,
+    /// The `--mcp` server name that advertises the `work.*` coordination tools.
+    pub server: String,
+    /// The wire style (`tool` default | `resource` CAS stub).
+    pub style: ClaimStyle,
+}
+
 /// Shard identity (`--shard K/N`, RFC 0019 §4). Held on [`Config`] in ALL feature
 /// combos as primitive fields (no dependency on the feature-gated `cluster`
 /// module's types), so `Config::load` compiles uniformly. The default `0/1` is a
@@ -399,6 +451,22 @@ pub struct Config {
     /// `0/1`, unsharded) so `Config` is uniform across feature combos; a
     /// requested `N > 1` needs the `cluster` build feature (validated, exit 2).
     pub shard: ShardCfg,
+    /// Declared work-claim routes (`--claim <uri>=<server>[:style]`, RFC 0019 §3
+    /// / RFC 0015 §5.6). Each route's `uri` is also added to `subscribe` at load.
+    /// Always-compiled (uniform `Config`); a non-empty list needs the `cluster`
+    /// build feature (validated, exit 2) and each `server` must be a declared
+    /// `--mcp` server. The live claim client is built in `run_reactive`.
+    pub claim_routes: Vec<ClaimRoute>,
+    /// Requested lease TTL for `work.claim` (`--claim-ttl` / `AGENTD_CLAIM_TTL`,
+    /// default 30s, RFC 0019 §3.6). The server is the authority; this is the
+    /// requested value. Always present (claim routes consult it under `cluster`).
+    pub claim_ttl: Duration,
+    /// The renew heartbeat fraction (`--claim-renew-fraction` /
+    /// `AGENTD_CLAIM_RENEW_FRACTION`, default 0.33, RFC 0019 §3.6): a long run
+    /// renews at `ttl * fraction`. In the synchronous-spawn v1 renew is a
+    /// documented no-op (see `run_reactive`); the value is carried for forward
+    /// compatibility and the manifest.
+    pub claim_renew_fraction: f64,
 }
 
 impl Default for Config {
@@ -437,6 +505,9 @@ impl Default for Config {
             events_ring: crate::obs::log::EVENTS_RING_DEFAULT,
             intelligence_headers: std::collections::BTreeMap::new(),
             shard: ShardCfg::default(),
+            claim_routes: Vec::new(),
+            claim_ttl: Duration::from_secs(30),
+            claim_renew_fraction: 0.33,
         }
     }
 }
@@ -486,6 +557,9 @@ impl fmt::Debug for Config {
                 &self.intelligence_headers.keys().collect::<Vec<_>>(),
             )
             .field("shard", &self.shard)
+            .field("claim_routes", &self.claim_routes)
+            .field("claim_ttl", &self.claim_ttl)
+            .field("claim_renew_fraction", &self.claim_renew_fraction)
             .finish()
     }
 }
@@ -649,6 +723,15 @@ impl Config {
             c.shard.timer = TimerShardMode::parse(v)
                 .ok_or_else(|| usage(format!("invalid AGENTD_SHARD_TIMER: {v}")))?;
         }
+        // Work-claim lease knobs (RFC 0019 §3.6). The requested TTL + the renew
+        // heartbeat fraction; the routes themselves are flag-only (`--claim`,
+        // repeatable + structured). A flag below overrides either.
+        if let Some(v) = envmap.get("AGENTD_CLAIM_TTL") {
+            c.claim_ttl = parse_duration(v).map_err(usage)?;
+        }
+        if let Some(v) = envmap.get("AGENTD_CLAIM_RENEW_FRACTION") {
+            c.claim_renew_fraction = parse_claim_fraction(v)?;
+        }
         // A single `AGENTD_A2A_PEER` env declares one peer (the env channel is
         // one value; declare more with repeated `--a2a-peer` flags). RFC 0020 §3.
         if let Some(v) = envmap.get("AGENTD_A2A_PEER") {
@@ -765,6 +848,19 @@ impl Config {
                     let v = take("--shard")?;
                     c.shard.parse_into(&v)?;
                 }
+                // Work-claim route (RFC 0019 §3 / RFC 0015 §5.6): `--claim
+                // <uri>=<server>[:tool|resource]`. The URI is also subscribed
+                // (routed as a Spawn) below. Repeatable.
+                "--claim" => {
+                    let v = take("--claim")?;
+                    c.claim_routes.push(parse_claim_route(&v)?);
+                }
+                "--claim-ttl" => {
+                    c.claim_ttl = parse_duration(&take("--claim-ttl")?).map_err(usage)?
+                }
+                "--claim-renew-fraction" => {
+                    c.claim_renew_fraction = parse_claim_fraction(&take("--claim-renew-fraction")?)?
+                }
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 "--report-file" => c.report_file = Some(take("--report-file")?),
@@ -792,6 +888,17 @@ impl Config {
 
         if c.run_id.is_empty() {
             c.run_id = generate_run_id();
+        }
+
+        // A claim route's URI is subscribed + routed as a Spawn (RFC 0019 §3.4):
+        // fold each route's URI into the subscribe set so it is subscribed and
+        // the router delivers it; the claim gate runs before the spawn acts
+        // (wired in `run_reactive`). Dedup against an explicit `--subscribe` of
+        // the same URI so it is not subscribed twice.
+        for r in &c.claim_routes {
+            if !c.subscribe.contains(&r.uri) {
+                c.subscribe.push(r.uri.clone());
+            }
         }
 
         // `--capabilities`: build the manifest from whatever config IS present +
@@ -1026,6 +1133,36 @@ impl Config {
         if self.shard.n > 1 && !cfg!(feature = "cluster") {
             return Err(usage("--shard requires the 'cluster' build feature".into()));
         }
+        // Work-claim routes (`--claim`, RFC 0019 §3 / RFC 0015 §5.6) need the
+        // `cluster` build feature — mirroring the `--shard` gate. A silently
+        // ignored claim directive would let every replica process every item
+        // unclaimed (the cross-instance-ownership bug claim exists to prevent).
+        if !self.claim_routes.is_empty() && !cfg!(feature = "cluster") {
+            return Err(usage("--claim requires the 'cluster' build feature".into()));
+        }
+        // Each claim route's coordination server MUST be a declared `--mcp`
+        // server (exit 2, RFC 0015 §5.6). The "server is up + advertises work.*"
+        // check is LIVE (post-handshake, in `run_reactive`) — exit 6 if down,
+        // exit 2 if up-but-missing-the-tools. Here we only resolve the wiring.
+        for r in &self.claim_routes {
+            if r.uri.is_empty() {
+                return Err(usage("--claim has an empty URI".into()));
+            }
+            if !self.mcp_servers.iter().any(|s| s.name == r.server) {
+                return Err(usage(format!(
+                    "--claim route '{}' names coordination server '{}', which is not a declared --mcp server",
+                    r.uri, r.server
+                )));
+            }
+        }
+        // The renew fraction must be a sane heartbeat ratio in (0, 1) (RFC 0019
+        // §3.6): 0 would never renew, >= 1 would renew only at/after expiry.
+        if !(self.claim_renew_fraction > 0.0 && self.claim_renew_fraction < 1.0) {
+            return Err(usage(format!(
+                "--claim-renew-fraction must be in (0, 1) (got: {})",
+                self.claim_renew_fraction
+            )));
+        }
         // Declared A2A delegation peers (RFC 0020 §3) need the `a2a` build
         // feature, and each endpoint scheme is validated up front (exit 2 before
         // any side effect) — mirroring the served-MCP target check.
@@ -1185,6 +1322,55 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
         command,
         tags: Vec::new(),
     })
+}
+
+/// Parse `--claim <uri>=<server>[:tool|resource]` into a [`ClaimRoute`] (RFC
+/// 0019 §3 / RFC 0015 §5.6). The URI is everything before the FIRST `=` (so a
+/// URI containing `=` in a query is unusual but the URIs claim routes target are
+/// resource ids without one). The remainder is `<server>` or `<server>:<style>`;
+/// the style defaults to `tool`. A `claim.style` other than `tool|resource` is
+/// exit 2. The server's existence is checked later in [`Config::validate`].
+fn parse_claim_route(spec: &str) -> Result<ClaimRoute, ConfigError> {
+    let (uri, rhs) = spec.split_once('=').ok_or_else(|| {
+        usage(format!(
+            "--claim must be <uri>=<server>[:style] (got: {spec})"
+        ))
+    })?;
+    if uri.is_empty() || rhs.is_empty() {
+        return Err(usage(format!(
+            "--claim '{spec}' has an empty URI or server"
+        )));
+    }
+    // Split the optional `:style` suffix off the server. The server name carries
+    // no `:`, so the first `:` (if any) begins the style.
+    let (server, style) = match rhs.split_once(':') {
+        Some((s, sty)) => {
+            let style = ClaimStyle::parse(sty).ok_or_else(|| {
+                usage(format!(
+                    "--claim '{spec}': unknown claim style '{sty}' (want tool|resource)"
+                ))
+            })?;
+            (s, style)
+        }
+        None => (rhs, ClaimStyle::Tool),
+    };
+    if server.is_empty() {
+        return Err(usage(format!("--claim '{spec}' has an empty server")));
+    }
+    Ok(ClaimRoute {
+        uri: uri.to_string(),
+        server: server.to_string(),
+        style,
+    })
+}
+
+/// Parse a `--claim-renew-fraction` value as an `f64`, mapping a non-numeric
+/// value to a [`ConfigError::Usage`] (exit 2). The `(0, 1)` range itself is
+/// enforced in [`Config::validate`] so `--validate-config` collects it uniformly.
+fn parse_claim_fraction(v: &str) -> Result<f64, ConfigError> {
+    v.trim()
+        .parse::<f64>()
+        .map_err(|_| usage(format!("invalid claim renew fraction: {v}")))
 }
 
 /// Parse `--a2a-peer name=endpoint` into an [`A2aPeerSpec`] (RFC 0020 §3). The
@@ -1411,6 +1597,9 @@ fn help_text() -> String {
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
          \x20 --cron <5-field>           schedule on a UTC cron expr (needs --features cron)\n\
          \x20 --shard K/N                 partition the URI/key space across a fleet (needs --features cluster; or AGENTD_SHARD)\n\
+         \x20 --claim <uri>=<srv>[:style] claim an item before processing it (style tool|resource; needs --features cluster; repeatable)\n\
+         \x20 --claim-ttl <dur>           requested lease TTL (default 30s; or AGENTD_CLAIM_TTL)\n\
+         \x20 --claim-renew-fraction <F>  renew heartbeat at ttl*F, F in (0,1) (default 0.33; or AGENTD_CLAIM_RENEW_FRACTION)\n\
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
@@ -1669,6 +1858,137 @@ mod tests {
         // parse error), and 0/1 validates with no feature.
         let c = Config::load(&args(&["--shard", "0/1"]), &base_env()).unwrap();
         assert_eq!(c.shard.n, 1);
+    }
+
+    // ───────────────────── RFC 0019 — work-claim leases (§3) ──────────────────
+
+    #[test]
+    fn claim_route_parses_styles_and_defaults_to_tool() {
+        assert_eq!(
+            parse_claim_route("file:///inbox/42.json=coord").unwrap(),
+            ClaimRoute {
+                uri: "file:///inbox/42.json".into(),
+                server: "coord".into(),
+                style: ClaimStyle::Tool,
+            }
+        );
+        assert_eq!(
+            parse_claim_route("db://orders/7=coord:tool").unwrap().style,
+            ClaimStyle::Tool
+        );
+        assert_eq!(
+            parse_claim_route("db://orders/7=coord:resource")
+                .unwrap()
+                .style,
+            ClaimStyle::Resource
+        );
+        // Unknown style / malformed forms are usage errors (exit 2).
+        assert!(matches!(
+            parse_claim_route("x://y=coord:bogus"),
+            Err(ConfigError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_claim_route("no-equals"),
+            Err(ConfigError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_claim_route("x://y="),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn claim_ttl_and_fraction_parse_from_flag_and_env() {
+        // Defaults.
+        let c = Config::load(&args(&[]), &base_env()).unwrap();
+        assert_eq!(c.claim_ttl, Duration::from_secs(30));
+        assert!((c.claim_renew_fraction - 0.33).abs() < 1e-9);
+
+        // Env sets both; a flag overrides the ttl (precedence: flag > env).
+        let mut env = base_env();
+        env.push(("AGENTD_CLAIM_TTL".into(), "45s".into()));
+        env.push(("AGENTD_CLAIM_RENEW_FRACTION".into(), "0.5".into()));
+        let c = Config::load(&args(&["--claim-ttl", "1m"]), &env).unwrap();
+        assert_eq!(c.claim_ttl, Duration::from_secs(60));
+        assert!((c.claim_renew_fraction - 0.5).abs() < 1e-9);
+
+        // An out-of-range fraction is exit 2.
+        let bad = Config::load(&args(&["--claim-renew-fraction", "1.5"]), &base_env()).unwrap_err();
+        assert!(matches!(bad, ConfigError::Usage(_)));
+        let zero = Config::load(&args(&["--claim-renew-fraction", "0"]), &base_env()).unwrap_err();
+        assert!(matches!(zero, ConfigError::Usage(_)));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn claim_route_subscribes_its_uri_and_requires_declared_server() {
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        // A claim route against a declared server validates and folds its URI
+        // into the subscribe set (so it is subscribed + routed as a Spawn).
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--mcp",
+                "coord=mcp-coord",
+                "--claim",
+                "file:///inbox/42.json=coord",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(c.claim_routes.len(), 1);
+        assert_eq!(c.claim_routes[0].server, "coord");
+        assert!(c.subscribe.contains(&"file:///inbox/42.json".to_string()));
+
+        // A claim route whose server is not a declared --mcp server is exit 2.
+        let e = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--claim",
+                "file:///inbox/42.json=ghost",
+            ]),
+            &env,
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => {
+                assert!(msg.contains("not a declared --mcp server"), "got: {msg}")
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[test]
+    fn claim_route_requires_cluster_feature() {
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        let e = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--mcp",
+                "coord=mcp-coord",
+                "--claim",
+                "file:///inbox/42.json=coord",
+            ]),
+            &env,
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--claim requires the 'cluster' build feature"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 
     #[test]

@@ -36,6 +36,43 @@ const TICK: Duration = Duration::from_millis(200);
 /// Default per-URI debounce (RFC 0008).
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// A lease this replica currently holds for a claim route (RFC 0019 §3.2).
+/// Held in a registry keyed by the route URI; carried so the post-react ack/
+/// release and the drain step-1.5 release have the lease id + the dedupe key.
+#[cfg(feature = "cluster")]
+struct HeldClaim {
+    /// Index of the coordination server in the connected `servers` vec.
+    server_idx: usize,
+    /// The opaque lease id `work.claim` granted (for renew/ack/release).
+    lease_id: String,
+    /// The item-derived claim key (== the spawned reaction's RUN_ID), carried on
+    /// `work.ack._meta.agentd/claim_key` so the server collapses the ack.
+    claim_key: String,
+}
+
+/// Build the frozen `work.*` `_meta` for a claim call (RFC 0015 §5.6). The ONLY
+/// keys are `agentd/claim_key`, `agentd/instance`, `agentd/shard` (omitted when
+/// unsharded), and `traceparent` (omitted when absent). **No secret, no URL** —
+/// the item URI is a `work.claim` argument, never a `_meta` value.
+#[cfg(feature = "cluster")]
+fn claim_meta(cfg: &Config, claim_key: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "agentd/claim_key".into(),
+        Value::String(claim_key.to_string()),
+    );
+    if let Some(instance) = crate::identity::Identity::from_env(&cfg.run_id).instance {
+        m.insert("agentd/instance".into(), Value::String(instance));
+    }
+    if let Some(shard) = cfg.shard.label() {
+        m.insert("agentd/shard".into(), Value::String(shard));
+    }
+    if let Some(tp) = &cfg.traceparent {
+        m.insert("traceparent".into(), Value::String(tp.clone()));
+    }
+    Value::Object(m)
+}
+
 /// Reactive mode: subscribe to the configured resources and act on updates
 /// until SIGTERM. `base` is the root payload whose `instruction` is the
 /// standing task; each reaction adds the changed resource as context.
@@ -64,6 +101,88 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
             }
         }
     }
+
+    // Work-claim live validation + wiring (RFC 0019 §3 / RFC 0015 §5.6),
+    // `cluster`-gated. The connect loop above already exited 6 if a server is
+    // down; here we check each distinct coordination server is *up and advertises*
+    // `work.claim`+`work.ack` (exit 2 if not), then build `claim_by_uri` resolving
+    // each route's server NAME → its connected index. The config layer already
+    // guaranteed the server is a declared `--mcp` server (exit 2) and the URI is
+    // in the subscribe set (routed as a Spawn).
+    #[cfg(feature = "cluster")]
+    let claim_by_uri: HashMap<String, crate::cluster::ClaimSpec> = {
+        use std::collections::HashSet;
+        let mut map: HashMap<String, crate::cluster::ClaimSpec> = HashMap::new();
+        let mut validated: HashSet<usize> = HashSet::new();
+        for route in &cfg.claim_routes {
+            let Some(idx) = servers.iter().position(|s| s.name() == route.server) else {
+                // Unreachable in practice (config validated it), but never panic.
+                log.error(
+                    "claim.server_missing",
+                    json!({"uri": route.uri, "server": route.server}),
+                );
+                return exit::USAGE;
+            };
+            if validated.insert(idx) {
+                // Live, post-handshake predicate (one list_tools per distinct
+                // coordination server). A transport failure here is a down server
+                // → exit 6 (retriable); up-but-missing-the-tools → exit 2.
+                match servers[idx].list_tools() {
+                    Ok(tools) if crate::cluster::advertises_work_tools(&tools) => {
+                        log.info(
+                            "claim.coord_ready",
+                            json!({"server": route.server, "tools": tools.len()}),
+                        );
+                    }
+                    Ok(_) => {
+                        log.error(
+                            "claim.coord_missing_tools",
+                            json!({"server": route.server, "want": ["work.claim", "work.ack"]}),
+                        );
+                        eprintln!(
+                            "agentd: claim coordination server '{}' is up but does not advertise work.claim/work.ack",
+                            route.server
+                        );
+                        return exit::USAGE;
+                    }
+                    Err(e) => {
+                        log.error(
+                            "claim.coord_unreachable",
+                            json!({"server": route.server, "err": e.to_string()}),
+                        );
+                        eprintln!(
+                            "agentd: claim coordination server '{}' is unreachable: {e}",
+                            route.server
+                        );
+                        return exit::MCP_REQUIRED_DOWN;
+                    }
+                }
+            }
+            map.insert(
+                route.uri.clone(),
+                crate::cluster::ClaimSpec {
+                    server_idx: idx,
+                    ttl: cfg.claim_ttl,
+                    renew_fraction: cfg.claim_renew_fraction,
+                    style: route.style,
+                    route_id: route.uri.clone(),
+                },
+            );
+        }
+        if !map.is_empty() {
+            log.info(
+                "claim.armed",
+                json!({"routes": map.len(), "ttl_ms": cfg.claim_ttl.as_millis() as u64}),
+            );
+        }
+        map
+    };
+
+    // The held-claim registry (keyed by route URI — claim routes are exact-URI in
+    // v1, so the synchronous spawn model holds at most one lease per URI at a
+    // time). Drain step 1.5 (RFC 0019 §6) releases whatever is still held.
+    #[cfg(feature = "cluster")]
+    let mut held_claims: HashMap<String, HeldClaim> = HashMap::new();
 
     // `--subscribe` URIs route to a fresh Spawn per event; `--continue` URIs
     // route to one warm session (Disposition::Continue, session_id = the URI),
@@ -170,6 +289,43 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
     loop {
         crate::obs::health::tick();
         if signals::draining() {
+            // Drain step 1.5 (RFC 0019 §6): release every held claim BEFORE
+            // winding down, so a surviving replica re-claims immediately rather
+            // than waiting out the lease TTL. Best-effort under a hard sub-budget
+            // (`min(2s, drain_timeout/4)` total) — never blocks drain past it; a
+            // failed release is logged + counted, never fatal (the TTL backstops).
+            #[cfg(feature = "cluster")]
+            if !held_claims.is_empty() {
+                let budget = std::cmp::min(Duration::from_secs(2), cfg.drain_timeout / 4);
+                let deadline = Instant::now() + budget;
+                let total = held_claims.len();
+                let mut released = 0usize;
+                for (uri, held) in held_claims.drain() {
+                    if Instant::now() >= deadline {
+                        log.warn(
+                            "drain.claim_release_budget",
+                            json!({"released": released, "total": total}),
+                        );
+                        break;
+                    }
+                    crate::obs::metrics::record_claim_released();
+                    match crate::cluster::claim::release(
+                        &servers[held.server_idx],
+                        &held.lease_id,
+                        "draining",
+                    ) {
+                        Ok(()) => {
+                            released += 1;
+                            log.info("claim.released", json!({"uri": uri, "reason": "draining"}));
+                        }
+                        Err(e) => log.warn(
+                            "drain.claim_release_failed",
+                            json!({"uri": uri, "lease": held.lease_id, "err": e}),
+                        ),
+                    }
+                }
+            }
+
             // Wind down warm sessions gracefully (cancel → let them emit a
             // terminal Result + exit, bounded by the drain timeout), then drop
             // any stragglers (kill + reap).
@@ -209,12 +365,80 @@ pub fn run_reactive(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logger
             match delivery.disposition {
                 Disposition::Spawn => {
                     // A fresh, independent reaction per event (synchronous v1).
-                    let payload = reactive_payload(&base, &delivery.uri, &content);
+                    // `mut` is needed only in a `cluster` build (the RUN_ID
+                    // narrowing override below the claim gate).
+                    #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+                    let mut payload = reactive_payload(&base, &delivery.uri, &content);
+
+                    // CLAIM GATE (RFC 0019 §3.4), `cluster`-gated: for a claim
+                    // route, claim the item BEFORE spawning and proceed only on a
+                    // granted lease. The spawned reaction then runs with the
+                    // item-derived RUN_ID so every downstream side-effect dedupes
+                    // on the same key (RFC 0019 §3.5 / RFC 0011 §6.2).
+                    #[cfg(feature = "cluster")]
+                    if let Some(spec) = claim_by_uri.get(&delivery.uri) {
+                        let claim_key =
+                            crate::cluster::derive_claim_key(&delivery.uri, &spec.route_id);
+                        let meta = claim_meta(cfg, &claim_key);
+                        let coord = &servers[spec.server_idx];
+                        match crate::cluster::claim(coord, &delivery.uri, spec.ttl, meta) {
+                            crate::cluster::ClaimOutcome::Lost { held_by } => {
+                                crate::obs::metrics::record_claim_lost();
+                                log.info(
+                                    "claim.lost",
+                                    json!({"uri": delivery.uri, "held_by": held_by}),
+                                );
+                                continue; // another replica owns it — skip.
+                            }
+                            crate::cluster::ClaimOutcome::Error(e) => {
+                                // A failed reaction never kills the daemon (RFC
+                                // 0019 §8 row 6): skip this delivery, keep serving.
+                                log.error("claim.error", json!({"uri": delivery.uri, "err": e}));
+                                continue;
+                            }
+                            crate::cluster::ClaimOutcome::Granted {
+                                lease_id,
+                                expires_in_ms,
+                            } => {
+                                crate::obs::metrics::record_claim_granted();
+                                log.info(
+                                    "claim.granted",
+                                    json!({"uri": delivery.uri, "expires_in_ms": expires_in_ms}),
+                                );
+                                held_claims.insert(
+                                    delivery.uri.clone(),
+                                    HeldClaim {
+                                        server_idx: spec.server_idx,
+                                        lease_id,
+                                        claim_key: claim_key.clone(),
+                                    },
+                                );
+                                // RUN_ID narrowing (RFC 0019 §3.5): the child
+                                // stamps `_meta.agentd/run_id` from this field
+                                // (subagent/control.rs), so overriding it routes
+                                // every side-effect dedupe onto the claim key.
+                                payload.telemetry.run_id = claim_key;
+                            }
+                        }
+                    }
+
                     log.info(
                         "trigger.fired",
                         json!({"uri": delivery.uri, "bytes": content.len()}),
                     );
-                    if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
+                    let outcome = react(&exe, &payload, cfg.drain_timeout, log);
+
+                    // Settle the claim (RFC 0019 §3.4): a terminal `completed`
+                    // run acks (the side effect is committed + deduped on the
+                    // claim key); anything else releases (the item is immediately
+                    // re-claimable). The synchronous spawn model means the claim
+                    // is claimed→settled within this one deliver iteration.
+                    #[cfg(feature = "cluster")]
+                    if let Some(held) = held_claims.remove(&delivery.uri) {
+                        settle_claim(&servers, &held, outcome.as_ref(), log);
+                    }
+
+                    if let Some(o) = outcome {
                         apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
                     }
                 }
@@ -544,6 +768,36 @@ fn sleep_interruptible(dur: Duration) {
     }
 }
 
+/// Settle a held claim after its reaction returns (RFC 0019 §3.4). A terminal
+/// `completed` outcome acks (`work.ack`, carrying `agentd/claim_key` so the server
+/// collapses a redelivered-but-already-acked item); any non-terminal / failed
+/// outcome releases (`work.release{reason:"wind-down"}`) so the item is immediately
+/// re-claimable. Best-effort: a failed ack/release is logged + counted, never
+/// fatal — the lease TTL is the backstop.
+#[cfg(feature = "cluster")]
+fn settle_claim(servers: &[McpClient], held: &HeldClaim, outcome: Option<&Outcome>, log: &Logger) {
+    let coord = &servers[held.server_idx];
+    let completed = outcome.is_some_and(|o| o.status == TerminalStatus::Completed);
+    if completed {
+        match crate::cluster::claim::ack(coord, &held.lease_id, &held.claim_key) {
+            Ok(()) => log.info("claim.acked", json!({"lease": held.lease_id})),
+            Err(e) => log.warn(
+                "claim.ack_failed",
+                json!({"lease": held.lease_id, "err": e}),
+            ),
+        }
+    } else {
+        crate::obs::metrics::record_claim_released();
+        match crate::cluster::claim::release(coord, &held.lease_id, "wind-down") {
+            Ok(()) => log.info("claim.released", json!({"lease": held.lease_id})),
+            Err(e) => log.warn(
+                "claim.release_failed",
+                json!({"lease": held.lease_id, "err": e}),
+            ),
+        }
+    }
+}
+
 /// Spawn + supervise one reaction synchronously, logging the outcome and
 /// returning its `Outcome` (only when it completed) so the daemon can apply the
 /// agent's self-scheduling / self-subscription requests (RFC 0008).
@@ -760,6 +1014,57 @@ mod tests {
         // keyed mode: every replica fires (the per-key gate is elsewhere).
         cfg.shard.timer = TimerShardMode::Keyed;
         assert!(fires_timers(&cfg));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn claim_meta_carries_only_the_frozen_keys_and_no_secret_or_url() {
+        use crate::config::{Config, ShardCfg, TimerShardMode};
+        // The downward-API instance var is process-global; set + clear around use.
+        unsafe { std::env::set_var("AGENTD_POD_NAME", "pod-abc") };
+        let cfg = Config {
+            run_id: "run-1".into(),
+            traceparent: Some("00-trace-span-01".into()),
+            shard: ShardCfg {
+                k: 3,
+                n: 8,
+                timer: TimerShardMode::Shard0,
+            },
+            // A token IS set; it must never reach the claim _meta.
+            intelligence_token: Some("super-secret".into()),
+            intelligence: Some("https://user:cred@api.example/v1".into()),
+            ..Config::default()
+        };
+        let m = claim_meta(&cfg, "deadbeef");
+        // Exactly the frozen set (RFC 0015 §5.6).
+        assert_eq!(m["agentd/claim_key"], json!("deadbeef"));
+        assert_eq!(m["agentd/instance"], json!("pod-abc"));
+        assert_eq!(m["agentd/shard"], json!("3/8"));
+        assert_eq!(m["traceparent"], json!("00-trace-span-01"));
+        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), 4, "only the 4 frozen keys: {keys:?}");
+        // No secret, no URL/host anywhere in the serialized meta.
+        let blob = serde_json::to_string(&m).unwrap();
+        assert!(!blob.contains("super-secret"), "token leaked into _meta");
+        assert!(!blob.contains("api.example"), "endpoint leaked into _meta");
+        assert!(!blob.contains("cred"), "credential leaked into _meta");
+        unsafe { std::env::remove_var("AGENTD_POD_NAME") };
+
+        // Unsharded ⇒ the shard key is OMITTED (not null).
+        let cfg2 = Config {
+            run_id: "run-2".into(),
+            ..Config::default()
+        };
+        let m2 = claim_meta(&cfg2, "k");
+        assert!(
+            m2.get("agentd/shard").is_none(),
+            "shard must be omitted when unsharded"
+        );
+        assert!(
+            m2.get("traceparent").is_none(),
+            "traceparent omitted when absent"
+        );
+        assert_eq!(m2["agentd/claim_key"], json!("k"));
     }
 
     #[test]

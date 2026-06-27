@@ -199,6 +199,30 @@ impl McpClient {
         self.request_as(method::TOOLS_CALL, Some(params))
     }
 
+    /// `tools/call` with **per-call** `_meta` merged on top of the persistent
+    /// [`Self::set_tool_meta`] for this one call only — without mutating the
+    /// stored meta. Used by the work-claim client (RFC 0019 §3 / RFC 0015 §5.6),
+    /// where `agentd/claim_key` is per-item and must ride the individual call,
+    /// never the persistent stamp. `extra_meta` (an object) wins key-by-key over
+    /// the persistent meta; a non-object `extra_meta` replaces it. The persistent
+    /// meta is left untouched.
+    pub fn call_tool_with_meta(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        extra_meta: Value,
+    ) -> Result<CallToolResult, McpError> {
+        if !self.caps.supports_tools() {
+            return Err(McpError::Capability(format!(
+                "server '{}' has no tools",
+                self.name
+            )));
+        }
+        let merged = merge_meta(self.tool_meta.as_ref(), extra_meta);
+        let params = build_call_params(name, arguments, Some(&merged));
+        self.request_as(method::TOOLS_CALL, Some(params))
+    }
+
     pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
         if !self.caps.supports_resources() {
             return Ok(Vec::new());
@@ -341,6 +365,23 @@ fn to_value<T: Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
+/// Merge `extra` over the persistent `base` meta for a single call, without
+/// mutating either. When both are objects, `extra` wins key-by-key (a shallow
+/// merge — the claim contract's keys are flat); a non-object `extra` replaces
+/// `base` wholesale; a `None`/non-object `base` yields `extra`. Pure.
+fn merge_meta(base: Option<&Value>, extra: Value) -> Value {
+    match (base, &extra) {
+        (Some(Value::Object(b)), Value::Object(e)) => {
+            let mut m = b.clone();
+            for (k, v) in e {
+                m.insert(k.clone(), v.clone());
+            }
+            Value::Object(m)
+        }
+        _ => extra,
+    }
+}
+
 // Safe because agentd only ever mints numeric ids (`next_id: AtomicI64`): a
 // string-id response cannot match a pending request and is dropped (the caller
 // times out), which cannot happen for our own requests. A server echoing a
@@ -422,6 +463,24 @@ mod tests {
         assert_eq!(p2["name"], "noop");
         assert!(p2.get("_meta").is_none());
         assert!(p2.get("arguments").is_none());
+    }
+
+    #[test]
+    fn merge_meta_overlays_extra_without_mutating_base() {
+        // Per-call claim_key rides on top of the persistent run_id stamp.
+        let base = json!({"agentd/run_id": "r1", "traceparent": "tp"});
+        let merged = merge_meta(
+            Some(&base),
+            json!({"agentd/claim_key": "ck", "traceparent": "tp2"}),
+        );
+        assert_eq!(merged["agentd/run_id"], "r1"); // persistent key preserved
+        assert_eq!(merged["agentd/claim_key"], "ck"); // per-call key added
+        assert_eq!(merged["traceparent"], "tp2"); // extra wins on conflict
+        // The base is untouched.
+        assert_eq!(base["traceparent"], "tp");
+        // No persistent base → the extra is the meta.
+        let only = merge_meta(None, json!({"agentd/claim_key": "ck"}));
+        assert_eq!(only["agentd/claim_key"], "ck");
     }
 
     #[test]

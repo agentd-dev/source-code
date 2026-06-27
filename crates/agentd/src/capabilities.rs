@@ -228,7 +228,9 @@ fn limits(cfg: &Config) -> Value {
 /// implemented in this chunk are reported `false`/empty; later RFC chunks flip
 /// them true. agentctl reads this and drives only what is declared.
 fn surfaces(cfg: &Config) -> Value {
-    json!({
+    // `mut` is needed only in a `cluster` build (the conditional `claim` insert).
+    #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+    let mut s = json!({
         // The served self-MCP management transport: its address string if
         // configured (and built), else false. RFC 0015 §3.
         "management": cfg.serve_mcp.clone().map_or(Value::Bool(false), Value::String),
@@ -270,13 +272,22 @@ fn surfaces(cfg: &Config) -> Value {
         // RFC 0019 horizontal-scaling surface. `cluster` is true in a `cluster`
         // build (sharding + the capacity resource are present). `shard` is this
         // instance's "K/N" identity, or null when unsharded (N==1) / no cluster.
-        // `standby` is always false — standby (RFC 0019 §7) is DEFERRED (§12). No
-        // `claim` key: the work-claim convention (§3) is not implemented, and
-        // capability-absence-not-error (RFC 0015 §2.5) means we don't advertise it.
+        // `standby` is always false — standby (RFC 0019 §7) is a separate
+        // follow-up. The `claim` key is added below only in a `cluster` build
+        // (capability-absence-not-error, RFC 0015 §2.5 — omitted, not false).
         "cluster": cfg!(feature = "cluster"),
         "shard": cfg.shard.label().map_or(Value::Null, Value::String),
         "standby": false,
-    })
+    });
+    // RFC 0019 §9 / RFC 0015 §5.6: a `cluster` build that has wired the claim
+    // path advertises the styles it speaks; a build without the feature OMITS the
+    // key entirely (agentctl places a `claim` route only on instances advertising
+    // it). Conditional insert keeps the key absent — never `false`.
+    #[cfg(feature = "cluster")]
+    if let Some(obj) = s.as_object_mut() {
+        obj.insert("claim".into(), json!({ "styles": ["tool", "resource"] }));
+    }
+    s
 }
 
 /// The operator tools this build advertises (RFC 0015 §4 / §5.2). Non-empty only
@@ -484,21 +495,21 @@ mod tests {
     #[test]
     fn surfaces_advertise_cluster_and_shard_per_build(/* RFC 0019 §9 */) {
         // Unsharded base: `standby` is always false; `cluster` mirrors the build;
-        // `shard` is null when N==1; there is NO `claim` key (claim is deferred).
+        // `shard` is null when N==1. The `claim` surface is present iff this is a
+        // `cluster` build (RFC 0015 §5.6 / §2.5 capability-absence-not-error).
         let cfg = base();
         let s = &manifest(&cfg, &Identity::from_env(&cfg.run_id), false)["surfaces"];
         assert_eq!(s["standby"], json!(false));
         assert_eq!(s["cluster"], json!(cfg!(feature = "cluster")));
         assert_eq!(s["shard"], Value::Null); // unsharded ⇒ null
-        assert!(
-            s.get("claim").is_none(),
-            "claim must not be advertised (deferred)"
-        );
 
-        // With a real shard (cluster build only — N>1 needs the feature), `shard`
-        // is the "K/N" string. Gated like surfaces_advertise_a2a_per_build.
         #[cfg(feature = "cluster")]
         {
+            // The claim path is wired: advertise the styles agentctl can place.
+            assert_eq!(s["claim"], json!({ "styles": ["tool", "resource"] }));
+
+            // With a real shard (N>1 needs the feature), `shard` is the "K/N"
+            // string. Gated like surfaces_advertise_a2a_per_build.
             let cfg = cfg_with(
                 &[
                     ("INSTRUCTION", "x"),
@@ -511,7 +522,14 @@ mod tests {
             assert_eq!(s["cluster"], json!(true));
             assert_eq!(s["shard"], json!("3/8"));
             assert_eq!(s["standby"], json!(false));
+            assert_eq!(s["claim"], json!({ "styles": ["tool", "resource"] }));
         }
+        // Without the feature the key is OMITTED, never `false`.
+        #[cfg(not(feature = "cluster"))]
+        assert!(
+            s.get("claim").is_none(),
+            "claim must be omitted without the cluster feature"
+        );
     }
 
     #[test]

@@ -19,7 +19,11 @@
 /// `0xcbf29ce484222325`, prime `0x00000100000001B3`, xor-then-multiply with
 /// wrapping. Stable across versions/languages/architectures — the property a
 /// shard hash needs (a fleet-wide deterministic partition).
-fn fnv1a64(bytes: &[u8]) -> u64 {
+///
+/// `pub(crate)` so the work-claim key derivation (`cluster::claim`) reuses the
+/// SAME hash (RFC 0019 §3.5 / RFC 0015 §5.6) — there is exactly one FNV in the
+/// tree; a second would risk a fleet-wide divergence.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= b as u64;

@@ -691,3 +691,124 @@ fn cancel_drains_a_live_async_run() {
     sigterm(child.id());
     let _ = child.wait();
 }
+
+/// RFC 0015 chunk 3: the operator surface over the unix MANAGEMENT transport.
+/// A unix peer is `PeerOrigin::Management`, so it sees + can call the operator
+/// tools (drain / lame-duck / cancel) and read `agentd://inventory`.
+#[test]
+fn management_peer_drives_the_operator_surface() {
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("agentd.sock");
+    // An idle reactive daemon that just serves the socket (intel unreachable; it
+    // never reacts, so nothing contends with the management calls).
+    let mut child = start_idle_daemon(exe, "unix:/nonexistent.sock", &sock);
+
+    let stream = connect(&sock);
+    let mut write = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+
+    // tools/list to a management peer includes the operator tools.
+    let list = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for t in ["drain", "lame-duck", "cancel"] {
+        assert!(names.contains(&t), "management sees {t}: {names:?}");
+    }
+    // pause/resume are deferred → never advertised.
+    assert!(!names.contains(&"pause"), "pause is deferred: {names:?}");
+    assert!(!names.contains(&"resume"), "resume is deferred: {names:?}");
+
+    // agentd://inventory is readable + carries the lifecycle flags.
+    let inv = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(inv["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["paused"], false, "pause deferred → false: {body}");
+    assert_eq!(body["draining"], false);
+    assert_eq!(body["ready"], true);
+    assert!(body["totals"]["total_spawned"].is_number());
+
+    // lame-duck flips readiness in the projection (no exit, no drain).
+    let ld = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"lame-duck"}}"#,
+    );
+    assert_eq!(ld["result"]["isError"], false, "lame-duck: {ld}");
+    assert_eq!(ld["result"]["structuredContent"]["ready"], false);
+    let inv2 = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+    );
+    let body2: serde_json::Value =
+        serde_json::from_str(inv2["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body2["ready"], false,
+        "lame-duck reflected in inventory: {body2}"
+    );
+
+    // cancel of an unknown handle is an isError result, not a protocol error.
+    let bad = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"cancel","arguments":{"handle":"0.9.9"}}}"#,
+    );
+    assert!(
+        bad["error"].is_null(),
+        "cancel is a result, not an error: {bad}"
+    );
+    assert_eq!(bad["result"]["isError"], true);
+
+    // drain returns a snapshot immediately and latches draining; the daemon then
+    // winds down and exits clean. (Tested last so the daemon can exit.)
+    let drain = rpc(
+        &mut reader,
+        &mut write,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"drain"}}"#,
+    );
+    assert_eq!(drain["result"]["isError"], false, "drain: {drain}");
+    assert_eq!(drain["result"]["structuredContent"]["draining"], true);
+    assert!(drain["result"]["structuredContent"]["drain_timeout_ms"].is_number());
+
+    // The drain drove a graceful shutdown — the daemon exits 0 on its own (no
+    // SIGTERM needed), proving `drain` reuses the SIGTERM choreography.
+    let code = wait_for_exit(&mut child, Duration::from_secs(15));
+    assert_eq!(code, Some(0), "a tool-driven drain exits clean 0");
+}
+// NOTE: the `Stdio`-origin containment (a stdio peer can't see/call the operator
+// tools, §3.4) is covered exhaustively by the server unit tests, which dispatch
+// with `PeerOrigin::Stdio` directly. There is no `--serve-mcp stdio` CLI form to
+// drive it end-to-end (the served transports are unix/vsock only), so it isn't
+// re-tested here.
+
+/// Wait up to `timeout` for `child` to exit; return its code (None on timeout).
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => return None,
+        }
+    }
+}

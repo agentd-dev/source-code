@@ -29,6 +29,9 @@ pub enum AgentdResource {
     /// `agentd://capabilities` — this agentd's self-description manifest
     /// (identity, declared capability surface, live counters). RFC 0015 §3.4.
     Capabilities,
+    /// `agentd://inventory` — the live subagent-tree projection (lifecycle flags,
+    /// totals, per-node status/usage). Management-only, subscribable. RFC 0015 §5.3.
+    Inventory,
     /// `agentd://subagent/<handle>` — an async child's status / distilled result.
     Subagent(String),
     /// `agentd://run/<run_id>` — the served run's aggregate (mode, spawn counts,
@@ -49,6 +52,9 @@ impl AgentdResource {
         }
         if rest == "capabilities" {
             return Some(AgentdResource::Capabilities);
+        }
+        if rest == "inventory" {
+            return Some(AgentdResource::Inventory);
         }
         if let Some(handle) = rest.strip_prefix("subagent/") {
             let handle = handle.trim();
@@ -89,6 +95,9 @@ pub fn run_uri(run_id: &str) -> String {
 pub fn session_uri(handle: &str) -> String {
     format!("{SCHEME}session/{handle}")
 }
+
+/// The `agentd://inventory` URI — the live subagent-tree projection (RFC 0015 §5.3).
+pub const INVENTORY_URI: &str = "agentd://inventory";
 
 #[cfg(test)]
 mod tests {
@@ -156,6 +165,18 @@ mod tests {
         assert_eq!(
             AgentdResource::parse("agentd://capabilities/"),
             Some(AgentdResource::Capabilities)
+        );
+    }
+
+    #[test]
+    fn parses_inventory() {
+        assert_eq!(
+            AgentdResource::parse(INVENTORY_URI),
+            Some(AgentdResource::Inventory)
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://inventory/"),
+            Some(AgentdResource::Inventory)
         );
     }
 

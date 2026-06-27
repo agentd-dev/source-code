@@ -26,6 +26,16 @@ use serde_json::{Value, json};
 /// not understand.
 const CONTRACT_VERSION: &str = "1.0";
 
+/// The operator tools this build actually serves on the management transport
+/// (RFC 0015 §4) — the authoritative `surfaces.operator_tools` list, which
+/// MIRRORS what `tools/list` returns to a `Management` peer (the served gate
+/// reads this same const, so the manifest and the live surface cannot drift,
+/// RFC 0015 §5.2). `pause`/`resume` are DEFERRED (they need a new `ctrl/pause`
+/// control message + loop turn-boundary suspension that does not yet exist), so
+/// they are intentionally absent until built — capability-absence-not-error
+/// (RFC 0015 §2.5 / §5.5).
+pub const OPERATOR_TOOLS: &[&str] = &["drain", "lame-duck", "cancel"];
+
 /// Build the capabilities manifest from resolved config + identity.
 ///
 /// `live` distinguishes the two emission paths: `false` is the one-shot
@@ -173,8 +183,12 @@ fn surfaces(cfg: &Config) -> Value {
         // The served self-MCP management transport: its address string if
         // configured (and built), else false. RFC 0015 §3.
         "management": cfg.serve_mcp.clone().map_or(Value::Bool(false), Value::String),
-        // Operator tools on the management transport — none in this chunk.
-        "operator_tools": Vec::<&str>::new(),
+        // Operator tools listed to a `Management` peer (RFC 0015 §4). They exist
+        // only on the management transport, so they're advertised only when this
+        // build can serve it (`serve-mcp`); otherwise the surface is empty —
+        // capability-absence-not-error (RFC 0015 §2.5). `pause`/`resume` are
+        // deferred (see OPERATOR_TOOLS).
+        "operator_tools": operator_tools(),
         // The /metrics addr if configured, else false. RFC 0010 / 0016.
         "metrics": cfg.metrics_addr.clone().map_or(Value::Bool(false), Value::String),
         "metrics_schema": "1.0",
@@ -185,6 +199,17 @@ fn surfaces(cfg: &Config) -> Value {
         // The exit-code table version this binary honours (RFC 0011 §5).
         "exit_codes": "RFC-0011-§5",
     })
+}
+
+/// The operator tools this build advertises (RFC 0015 §4 / §5.2). Non-empty only
+/// with the `serve-mcp` feature — without the management transport there is
+/// nothing to serve them on, so the surface is honestly empty.
+fn operator_tools() -> Vec<&'static str> {
+    if cfg!(feature = "serve-mcp") {
+        OPERATOR_TOOLS.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -279,8 +304,14 @@ mod tests {
         // Not configured ⇒ false.
         assert_eq!(s["management"], json!(false));
         assert_eq!(s["metrics"], json!(false));
-        // Not built in this chunk.
-        assert_eq!(s["operator_tools"], json!([]));
+        // operator_tools mirrors the built management surface (RFC 0015 §5.2):
+        // the drain/lame-duck/cancel set with `serve-mcp`, empty without it.
+        // pause/resume are deferred and never appear in either build.
+        if cfg!(feature = "serve-mcp") {
+            assert_eq!(s["operator_tools"], json!(["drain", "lame-duck", "cancel"]));
+        } else {
+            assert_eq!(s["operator_tools"], json!([]));
+        }
         assert_eq!(s["events"], json!(false));
         assert_eq!(s["hot_reload"], json!(false));
         assert_eq!(s["config_validate"], json!(false));

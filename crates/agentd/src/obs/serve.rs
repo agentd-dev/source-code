@@ -91,10 +91,29 @@ fn route(path: &str) -> (&'static str, &'static str, String) {
             super::metrics::render_prometheus(),
         ),
         "/healthz" => health_response(),
-        // Readiness: the surface is only bound after the daemon has initialized,
-        // so reaching it means the process is up and serving.
-        "/readyz" => ("200 OK", "text/plain", "ready\n".into()),
+        "/readyz" => readiness_response(),
         _ => ("404 Not Found", "text/plain", "not found\n".into()),
+    }
+}
+
+/// Readiness (RFC 0010 §3.7 / RFC 0015 §4.2). The surface is bound only after
+/// the daemon has initialized, so reaching it means the process is up. Readiness
+/// is then overridden NotReady when the operator has lame-ducked the instance
+/// (`lame-duck{ready:false}`) or a drain is in progress — both advertise "don't
+/// route new work here" without the process necessarily exiting. The override is
+/// toward NotReady only: clearing lame-duck restores Ready iff nothing else
+/// (drain) holds it down.
+fn readiness_response() -> (&'static str, &'static str, String) {
+    let lame_duck = crate::signals::lame_duck();
+    let draining = crate::signals::draining();
+    if lame_duck || draining {
+        (
+            "503 Service Unavailable",
+            "text/plain",
+            format!("not ready lame_duck={lame_duck} draining={draining}\n"),
+        )
+    } else {
+        ("200 OK", "text/plain", "ready\n".into())
     }
 }
 
@@ -134,12 +153,31 @@ mod tests {
         assert!(ct.contains("version=0.0.4"));
         assert!(body.contains("agentd_runs_started_total"));
 
-        let (s, _, body) = route("/readyz");
-        assert_eq!(s, "200 OK");
-        assert_eq!(body, "ready\n");
-
         let (s, _, _) = route("/nope");
         assert!(s.starts_with("404"));
+    }
+
+    #[test]
+    fn readyz_flips_503_under_lame_duck_then_clears() {
+        // Clean baseline (other tests share these process-global latches).
+        crate::signals::set_lame_duck(false);
+        // Pre-condition: not draining here (no SIGTERM in unit tests) → ready.
+        if !crate::signals::draining() {
+            let (s, _, body) = route("/readyz");
+            assert_eq!(s, "200 OK", "baseline /readyz is ready");
+            assert_eq!(body, "ready\n");
+        }
+        // Lame-duck → /readyz reports 503 while the process keeps running.
+        crate::signals::set_lame_duck(true);
+        let (s, _, body) = route("/readyz");
+        assert_eq!(s, "503 Service Unavailable", "lame-duck → NotReady");
+        assert!(body.contains("lame_duck=true"), "body: {body}");
+        // Clearing the override restores readiness (nothing else holds it down).
+        crate::signals::set_lame_duck(false);
+        if !crate::signals::draining() {
+            let (s, _, _) = route("/readyz");
+            assert_eq!(s, "200 OK", "clearing lame-duck restores Ready");
+        }
     }
 
     #[test]

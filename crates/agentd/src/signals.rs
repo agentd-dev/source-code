@@ -17,6 +17,13 @@ mod imp {
     static DRAINING: AtomicBool = AtomicBool::new(false);
     static FORCE: AtomicBool = AtomicBool::new(false);
     static CHILD_EXIT: AtomicBool = AtomicBool::new(false);
+    // Lame-duck override (RFC 0015 §4.2): a one-way-per-call readiness override
+    // toward NotReady, flipped by the `lame-duck` operator tool — NOT a signal.
+    // It rides here (not in a feature-gated module) so it is one process-global
+    // truth consulted by BOTH the `/readyz` probe (obs::serve, `metrics`) and the
+    // served operator tool (mcp::server, `serve-mcp`), with neither feature
+    // depending on the other. Distinct from `DRAINING`: lame-duck never exits.
+    static LAME_DUCK: AtomicBool = AtomicBool::new(false);
     // Self-pipe fds (-1 until install()). The write end is touched from signal
     // handlers; the read end is what the reactor waits on.
     static WAKE_R: AtomicI32 = AtomicI32::new(-1);
@@ -94,6 +101,30 @@ mod imp {
         FORCE.load(Ordering::SeqCst)
     }
 
+    /// Programmatically request a graceful drain (the `drain` operator tool,
+    /// RFC 0015 §4.1) — the SAME one-way latch SIGTERM sets, plus a wakeup so a
+    /// blocked reactor begins the drain choreography promptly. Idempotent and
+    /// monotonic: a request after drain has begun is a no-op that never escalates
+    /// to FORCE (force remains the *second signal*, RFC 0011 §4.3).
+    pub fn request_drain() {
+        DRAINING.store(true, Ordering::SeqCst);
+        // Reuse the signal-handler wakeup so the reactor leaves its blocking
+        // select and runs the drain state machine (RFC 0011 §4.2).
+        wake();
+    }
+
+    pub fn lame_duck() -> bool {
+        LAME_DUCK.load(Ordering::SeqCst)
+    }
+
+    /// Set/clear the lame-duck readiness override (RFC 0015 §4.2). `true` forces
+    /// `/readyz` NotReady while the supervisor keeps running; `false` clears the
+    /// override (readiness then reflects the genuine computed state). No drain,
+    /// no exit, reversible.
+    pub fn set_lame_duck(on: bool) {
+        LAME_DUCK.store(on, Ordering::SeqCst);
+    }
+
     /// Take and clear the SIGCHLD flag — the reactor then runs the waitpid loop.
     pub fn take_child_exit() -> bool {
         CHILD_EXIT.swap(false, Ordering::SeqCst)
@@ -128,6 +159,11 @@ mod imp {
     pub fn force() -> bool {
         false
     }
+    pub fn request_drain() {}
+    pub fn lame_duck() -> bool {
+        false
+    }
+    pub fn set_lame_duck(_on: bool) {}
     pub fn take_child_exit() -> bool {
         false
     }
@@ -151,6 +187,25 @@ pub fn draining() -> bool {
 /// Has a forced shutdown been requested (second SIGTERM/SIGINT)?
 pub fn force() -> bool {
     imp::force()
+}
+
+/// Request a graceful drain programmatically (the `drain` operator tool,
+/// RFC 0015 §4.1) — the same one-way `DRAINING` latch SIGTERM sets, plus a
+/// reactor wakeup. Idempotent/monotonic; never escalates to FORCE.
+pub fn request_drain() {
+    imp::request_drain()
+}
+
+/// Is the lame-duck readiness override active (RFC 0015 §4.2)? When true,
+/// `/readyz` reports NotReady even though the supervisor keeps running.
+pub fn lame_duck() -> bool {
+    imp::lame_duck()
+}
+
+/// Set or clear the lame-duck readiness override (the `lame-duck` operator tool,
+/// RFC 0015 §4.2). `true` overrides readiness toward NotReady; `false` clears it.
+pub fn set_lame_duck(on: bool) {
+    imp::set_lame_duck(on)
 }
 
 /// Take-and-clear the SIGCHLD flag — true if a child exited since last checked.

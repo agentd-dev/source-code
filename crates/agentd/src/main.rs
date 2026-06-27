@@ -68,6 +68,25 @@ fn run() -> i32 {
             print!("{s}");
             return exit::SUCCESS;
         }
+        // `--config-schema` (RFC 0017 §4.2): the JSON Schema of the config file
+        // to STDOUT, exit 0 — a side-effect-free schema export for agentctl.
+        Err(ConfigError::Schema(s)) => {
+            print!("{s}");
+            return exit::SUCCESS;
+        }
+        // `--validate-config` (RFC 0017 §4.1): the admission verdict to STDERR.
+        // Valid ⇒ one `config.valid` line, exit 0; invalid ⇒ N `config.invalid`
+        // lines, exit 2 — before any MCP connect / LLM call / socket bind.
+        Err(ConfigError::Validate(verdict)) => match verdict {
+            Ok(line) => {
+                eprintln!("{line}");
+                return exit::SUCCESS;
+            }
+            Err(lines) => {
+                eprintln!("{lines}");
+                return exit::USAGE;
+            }
+        },
         Err(ConfigError::Usage(s)) => {
             eprintln!("{s}");
             return exit::USAGE;

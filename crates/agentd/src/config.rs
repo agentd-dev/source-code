@@ -219,6 +219,12 @@ pub struct Config {
     pub instruction: Option<String>,
     pub intelligence: Option<String>,
     pub intelligence_token: Option<String>,
+    /// Path to a mounted file holding the intelligence credential
+    /// (`--intelligence-token-file` / `AGENTD_INTELLIGENCE_TOKEN_FILE`, RFC 0017
+    /// §6.1). The token is read+trimmed from this file at load (and re-readable
+    /// for rotation); the resolved value lands in `intelligence_token`, never in
+    /// a log. The `--intelligence-token` flag/env stays as the inline source.
+    pub intelligence_token_file: Option<String>,
     pub model: Option<String>,
     pub mcp_servers: Vec<McpServerSpec>,
     /// Declared remote-A2A delegation peers (`--a2a-peer name=endpoint`). The
@@ -286,6 +292,13 @@ pub struct Config {
     /// memory for the live-tail resource. Default 1024. Only consumed when the
     /// `events` surface is served (`--serve-mcp` + the `events` feature).
     pub events_ring: usize,
+    /// Declared intelligence HTTP headers (RFC 0006 §3, settable only via the
+    /// config file's `intelligence_headers`, RFC 0017 §3.3). Values are
+    /// **templates** that may carry `{{secret:NAME}}` / `{{secret-file:PATH}}`
+    /// refs (§6) — the NAMES/refs are structural; the resolved secret is never
+    /// stored here or logged. An inline secret-shaped value is rejected at
+    /// validation (§3.1). A `BTreeMap` so the order is deterministic.
+    pub intelligence_headers: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -294,6 +307,7 @@ impl Default for Config {
             instruction: None,
             intelligence: None,
             intelligence_token: None,
+            intelligence_token_file: None,
             model: None,
             mcp_servers: Vec::new(),
             a2a_peers: Vec::new(),
@@ -321,6 +335,7 @@ impl Default for Config {
             cron: None,
             report_file: None,
             events_ring: crate::obs::log::EVENTS_RING_DEFAULT,
+            intelligence_headers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -335,6 +350,7 @@ impl fmt::Debug for Config {
                 "intelligence_token",
                 &self.intelligence_token.as_ref().map(|_| "***"),
             )
+            .field("intelligence_token_file", &self.intelligence_token_file)
             .field("model", &self.model)
             .field("mcp_servers", &self.mcp_servers)
             .field("a2a_peers", &self.a2a_peers)
@@ -362,6 +378,12 @@ impl fmt::Debug for Config {
             .field("cron", &self.cron)
             .field("report_file", &self.report_file)
             .field("events_ring", &self.events_ring)
+            // Header NAMES only — a value may carry a {{secret:…}} ref, so redact
+            // the values defensively (RFC 0012 §3.7: never log a secret).
+            .field(
+                "intelligence_headers",
+                &self.intelligence_headers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -378,26 +400,65 @@ pub enum ConfigError {
     Version(String),
     Capabilities(String),
     Usage(String),
+    /// `--config-schema` (RFC 0017 §4.2): the JSON Schema of the config file,
+    /// printed to **stdout**, exit 0 — a side-effect-free schema export so
+    /// agentctl can validate a CR before applying it.
+    Schema(String),
+    /// `--validate-config` (RFC 0017 §4.1): the admission verdict. `Ok(line)` is
+    /// a valid config (one `config.valid` line, exit 0); `Err(lines)` is one or
+    /// more `config.invalid` diagnostics (exit 2). The caller prints to stderr.
+    Validate(Result<String, String>),
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Help(s) | ConfigError::Version(s) | ConfigError::Capabilities(s) => {
+            ConfigError::Help(s)
+            | ConfigError::Version(s)
+            | ConfigError::Capabilities(s)
+            | ConfigError::Schema(s) => {
                 write!(f, "{s}")
             }
             ConfigError::Usage(s) => write!(f, "{s}"),
+            ConfigError::Validate(Ok(s)) | ConfigError::Validate(Err(s)) => write!(f, "{s}"),
         }
     }
 }
 
 impl Config {
-    /// Resolve config from CLI args (excluding the leading program name) and the environment,
-    /// applying precedence (env then flags over defaults) and validating.
+    /// Resolve config from CLI args (excluding the leading program name) and the
+    /// environment, applying precedence (`built-in default < FILE < env < flag`,
+    /// RFC 0011 §2.1 / RFC 0017 §3.2) and validating.
     pub fn load(args: &[String], env: &[(String, String)]) -> Result<Config, ConfigError> {
         let envmap: HashMap<&str, &str> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        // `--config-schema` (RFC 0017 §4.2): a side-effect-free schema export.
+        // The schema is static (generated from the `ConfigFile` types), so it
+        // short-circuits BEFORE the file is even read — exit 0, JSON to stdout.
+        if args.iter().any(|a| a == "--config-schema") {
+            let schema = crate::config_file::config_schema();
+            let json = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string());
+            return Err(ConfigError::Schema(format!("{json}\n")));
+        }
+        // `--validate-config` (RFC 0017 §4.1): captured here, acted on at the end.
+        // It is the side-effect-free admission verdict — it validates whatever
+        // config is given and never requires an --instruction to *validate*.
+        let validate_config = args.iter().any(|a| a == "--validate-config");
+
         let mut c = Config::default();
+
+        // --- FILE layer (RFC 0017 §3, precedence layer 1) ---
+        // `--config <path>` / `AGENTD_CONFIG`. The file is the lowest non-default
+        // layer: env and flags below override it; repeatable list flags ADD to
+        // the file's lists (§3.2). A malformed/unreadable file is exit 2 BEFORE
+        // any side effect (it is parsed before the env/flag layers touch `c`).
+        let config_path = scan_flag_value(args, "--config")
+            .or_else(|| envmap.get("AGENTD_CONFIG").map(|v| v.to_string()));
+        if let Some(path) = &config_path {
+            let cf = crate::config_file::ConfigFile::load(path).map_err(usage)?;
+            apply_config_file(&mut c, cf)?;
+        }
 
         // --- env layer ---
         if let Some(v) = envmap.get("INSTRUCTION") {
@@ -408,6 +469,9 @@ impl Config {
         }
         if let Some(v) = envmap.get("AGENTD_INTELLIGENCE_TOKEN") {
             c.intelligence_token = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_INTELLIGENCE_TOKEN_FILE") {
+            c.intelligence_token_file = Some((*v).to_string());
         }
         if let Some(v) = envmap.get("AGENTD_MODEL") {
             c.model = Some((*v).to_string());
@@ -504,7 +568,19 @@ impl Config {
                     return Err(ConfigError::Version(format!("agentd {}\n", crate::VERSION)));
                 }
                 "--capabilities" => capabilities = true,
+                // Already resolved into the FILE layer above; consume its value
+                // here so the arg-loop doesn't reject it as unknown.
+                "--config" => {
+                    let _ = take("--config")?;
+                }
+                // Flags acted on outside the arg loop (schema short-circuits at the
+                // top of load; validate is acted on after full resolution). They
+                // take no value — accept and ignore here.
+                "--config-schema" | "--validate-config" => {}
                 "--instruction" => c.instruction = Some(take("--instruction")?),
+                "--intelligence-token-file" => {
+                    c.intelligence_token_file = Some(take("--intelligence-token-file")?)
+                }
                 "--instruction-file" => {
                     let p = take("--instruction-file")?;
                     c.instruction = Some(read_file(&p)?);
@@ -613,8 +689,106 @@ impl Config {
             return Err(ConfigError::Capabilities(format!("{json}\n")));
         }
 
+        // Resolve `--intelligence-token-file` into the token (RFC 0017 §6.1). An
+        // inline `--intelligence-token`/env wins (it is the higher-precedence
+        // source); the file is the fallback. Read+trimmed here, but a missing
+        // file is reported through `validate()` so `--validate-config` collects it
+        // with the rest, and the resolved value never reaches a log.
+        c.resolve_token_file()?;
+
+        // `--validate-config` (RFC 0017 §4.1): the side-effect-free admission
+        // verdict. Run the FULL validation pipeline, collecting EVERY diagnostic
+        // (not fast-failing on the first, unlike startup) so an operator/CI sees
+        // all problems in one pass, then short-circuit with the verdict. It does
+        // NOT require an --instruction to *validate* — it validates whatever it is
+        // given. The caller prints to stderr and maps the result to exit 0/2.
+        if validate_config {
+            return Err(ConfigError::Validate(c.validate_collect_all()));
+        }
+
         c.validate()?;
         Ok(c)
+    }
+
+    /// Resolve `--intelligence-token-file` into `intelligence_token` when no
+    /// inline token is set (RFC 0017 §6.1). A read failure is surfaced as a usage
+    /// error (exit 2 at startup; collected by `--validate-config`). The token is
+    /// never logged — the error carries only the path.
+    fn resolve_token_file(&mut self) -> Result<(), ConfigError> {
+        if self.intelligence_token.is_some() {
+            return Ok(()); // inline source wins (higher precedence)
+        }
+        if let Some(path) = self.intelligence_token_file.clone() {
+            let tok = crate::sec::secret::read_token_file(&path).map_err(usage)?;
+            self.intelligence_token = Some(tok);
+        }
+        Ok(())
+    }
+
+    /// Run the full validation pipeline collecting EVERY diagnostic as one NDJSON
+    /// `config.{valid,invalid}` line set (RFC 0017 §4.1). `Ok(line)` ⇒ valid
+    /// (exit 0); `Err(lines)` ⇒ one-or-more `config.invalid` lines (exit 2).
+    ///
+    /// Each independent check is run and its message collected, so the operator
+    /// sees all problems at once. The check SET is exactly `validate()`'s — there
+    /// is one validation authority, so the admission gate and the startup path
+    /// can never disagree (RFC 0017 §7).
+    fn validate_collect_all(&self) -> Result<String, String> {
+        let mut diags: Vec<String> = Vec::new();
+        // The single validate() pipeline is fast-fail; to collect ALL problems we
+        // re-run it after fixing each surfaced error would be O(n²) and brittle.
+        // Instead we run the independent declarative checks directly and append
+        // each failing one. The header/secret checks (this RFC) plus a final
+        // `validate()` pass (which catches anything not separately enumerated)
+        // give complete coverage with a single source of truth.
+        self.collect_header_diags(&mut diags);
+        // Run the authoritative validate() and, if it fails, record its message
+        // (it is fast-fail, so this is the first non-header structural problem).
+        // `validate()` also runs the header check, so skip a duplicate when the
+        // failure is a header diag we already collected.
+        if let Err(e) = self.validate() {
+            let msg = e.to_string();
+            if !diags.iter().any(|d| msg.ends_with(d.as_str())) {
+                diags.push(msg);
+            }
+        }
+        if diags.is_empty() {
+            Ok(config_valid_line())
+        } else {
+            Err(diags
+                .into_iter()
+                .map(|d| config_invalid_line(&d))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+    }
+
+    /// Validate the declared `intelligence_headers` (RFC 0017 §3.1/§6): a value
+    /// may be a plain scalar or carry `{{secret:NAME}}` / `{{secret-file:PATH}}`
+    /// refs, but an **inline secret-shaped value** (a header named like a
+    /// credential whose value is NOT a ref) is rejected — a secret must be a
+    /// reference, never a literal in the file. Every ref must also resolve
+    /// (the env var is set; the file exists), else exit 2 (§6.2).
+    fn collect_header_diags(&self, diags: &mut Vec<String>) {
+        let env = |k: &str| std::env::var(k).ok();
+        for (name, value) in &self.intelligence_headers {
+            // A credential-shaped header carrying a literal (non-ref) value is the
+            // "inline secret in the file" footgun — reject it (RFC 0017 §3.1).
+            if is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
+                diags.push(format!(
+                    "intelligence_headers['{name}'] looks like a credential but has an inline value; \
+                     use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}} (never an inline secret)"
+                ));
+                continue;
+            }
+            // Every secret ref must resolve at startup (§6.2): a missing env var
+            // or an unreadable file is exit 2 before any side effect.
+            if crate::sec::secret::has_secret_ref(value)
+                && let Err(e) = crate::sec::secret::refs_resolvable(value, &env)
+            {
+                diags.push(format!("intelligence_headers['{name}']: {e}"));
+            }
+        }
     }
 
     /// The capability-tag union of the root agent's grant, for the Rule-of-Two
@@ -745,8 +919,45 @@ impl Config {
             }
             A2aEndpoint::parse(&peer.endpoint)?;
         }
+        // Declared intelligence headers (RFC 0017 §3.1/§6): reject an inline
+        // secret-shaped value, and require every {{secret…}} ref to resolve. The
+        // `--validate-config` path runs the same check via `collect_header_diags`
+        // (collecting all), so the admission gate and startup never disagree.
+        let mut header_diags = Vec::new();
+        self.collect_header_diags(&mut header_diags);
+        if let Some(first) = header_diags.into_iter().next() {
+            return Err(usage(first));
+        }
         Ok(())
     }
+}
+
+/// Heuristic: is this header name credential-shaped (RFC 0011 §3.2 / RFC 0017
+/// §3.1)? A header so named must carry a `{{secret:…}}` *reference*, not an
+/// inline literal — so a secret can never be smuggled into the config file.
+fn is_secret_shaped_key(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "authorization"
+        || n == "x-api-key"
+        || n == "api-key"
+        || n == "token"
+        || n.ends_with("-token")
+        || n.ends_with("_token")
+        || n == "password"
+        || n == "secret"
+        || n.ends_with("-key")
+        || n.ends_with("_key")
+}
+
+/// The single-line `config.valid` verdict (RFC 0017 §4.1), to stderr, exit 0.
+fn config_valid_line() -> String {
+    serde_json::json!({"event": "config.valid"}).to_string()
+}
+
+/// One machine-actionable `config.invalid` diagnostic line (RFC 0017 §4.1),
+/// to stderr, exit 2. `msg` is the human-readable reason.
+fn config_invalid_line(msg: &str) -> String {
+    serde_json::json!({"event": "config.invalid", "msg": msg}).to_string()
 }
 
 fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
@@ -828,6 +1039,110 @@ fn read_file(path: &str) -> Result<String, ConfigError> {
         .map_err(|e| usage(format!("cannot read instruction file {path}: {e}")))
 }
 
+/// Scan `args` for the value following the first occurrence of `flag` (a
+/// `--flag VALUE` pair). Used to resolve `--config` BEFORE the main arg loop so
+/// the file can seed the lowest layer. Returns `None` if absent or value-less.
+fn scan_flag_value(args: &[String], flag: &str) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+/// Apply a parsed [`crate::config_file::ConfigFile`] onto `c` as the FILE layer
+/// (RFC 0017 §3.2, precedence layer 1). Only keys the file actually sets are
+/// written (field-wise); env/flags below override them. List-valued keys
+/// (`mcp_servers`, `subscribe`, `a2a_peers`) **seed** the list — repeatable
+/// flags ADD to them. Maps the file's `command`+`argv` into the runtime
+/// `McpServerSpec` argv, and flattens the glob→tags map to the server's tag set.
+fn apply_config_file(
+    c: &mut Config,
+    cf: crate::config_file::ConfigFile,
+) -> Result<(), ConfigError> {
+    if let Some(model) = cf.model {
+        c.model = Some(model);
+    }
+    if let Some(mt) = cf.max_tokens {
+        c.max_tokens = mt;
+    }
+    if let Some(limits) = cf.limits {
+        if let Some(s) = limits.max_steps {
+            c.max_steps = s;
+        }
+        if let Some(d) = limits.max_depth {
+            c.max_depth = d;
+        }
+        if let Some(secs) = limits.deadline_secs {
+            c.deadline = Some(Duration::from_secs(secs));
+        }
+    }
+    if let Some(level) = cf.log_level {
+        c.log_level = Level::parse(&level)
+            .ok_or_else(|| usage(format!("config file: invalid log_level: {level}")))?;
+    }
+    // mcp_servers: each file object → one McpServerSpec (command + argv → argv;
+    // the glob→tags map flattens to the union of declared tags). Seeds the list.
+    for s in cf.mcp_servers {
+        if s.name.is_empty() || s.command.is_empty() {
+            return Err(usage(format!(
+                "config file: mcp server '{}' has an empty name or command",
+                s.name
+            )));
+        }
+        if let Some(t) = &s.transport {
+            // stdio is the only transport the client speaks today; reject an
+            // unknown one at parse (exit 2) rather than silently ignoring it.
+            if t != "stdio" && t != "unix" {
+                return Err(usage(format!(
+                    "config file: mcp server '{}' has unsupported transport '{t}' (want stdio)",
+                    s.name
+                )));
+            }
+        }
+        let mut command = vec![s.command];
+        command.extend(s.argv);
+        let mut tags: Vec<TrifectaTag> = Vec::new();
+        for tag_list in s.tags.values() {
+            for t in tag_list {
+                let tag = TrifectaTag::parse(t).ok_or_else(|| {
+                    usage(format!(
+                        "config file: mcp server '{}' has unknown trifecta tag '{t}' \
+                         (want: untrusted_input|sensitive|egress)",
+                        s.name
+                    ))
+                })?;
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+        c.mcp_servers.push(McpServerSpec {
+            name: s.name,
+            command,
+            tags,
+        });
+    }
+    c.subscribe.extend(cf.subscribe);
+    for p in cf.a2a_peers {
+        if p.name.is_empty() || p.endpoint.is_empty() {
+            return Err(usage(format!(
+                "config file: a2a peer '{}' has an empty name or endpoint",
+                p.name
+            )));
+        }
+        c.a2a_peers.push(A2aPeerSpec {
+            name: p.name,
+            endpoint: p.endpoint,
+        });
+    }
+    // Declared intelligence headers (templates; secret-shaped values validated).
+    c.intelligence_headers.extend(cf.intelligence_headers);
+    Ok(())
+}
+
 fn usage(msg: String) -> ConfigError {
     ConfigError::Usage(format!("agentd: {msg}"))
 }
@@ -883,6 +1198,7 @@ fn help_text() -> String {
          \n\
          INTELLIGENCE:\n\
          \x20 --intelligence-token <T>    bearer/key (or AGENTD_INTELLIGENCE_TOKEN)\n\
+         \x20 --intelligence-token-file <PATH>  read the token from a mounted file (rotation; or AGENTD_INTELLIGENCE_TOKEN_FILE)\n\
          \x20 --model <NAME>              model id (or AGENTD_MODEL)\n\
          \n\
          TOOLS / MCP:\n\
@@ -920,6 +1236,11 @@ fn help_text() -> String {
          \x20 --report-file <PATH>        write the run-outcome report at terminal (atomic; inert for reactive)\n\
          \x20 --events-ring <N>           agentd://events ring size (default 1024; needs --serve-mcp + --features events)\n\
          \x20 --capabilities             print the capabilities manifest (JSON) and exit\n\
+         \n\
+         CONFIG FILE (RFC 0017):\n\
+         \x20 --config <PATH>             load a declarative JSON config file (or AGENTD_CONFIG)\n\
+         \x20 --validate-config          load+validate (file+env+flags), print the verdict, exit 0/2\n\
+         \x20 --config-schema            print the config-file JSON Schema and exit\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
     )
@@ -1360,5 +1681,347 @@ mod tests {
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("super-secret"));
         assert!(dbg.contains("***"));
+    }
+
+    // ───────────────────────── RFC 0017 — config file ─────────────────────────
+
+    use std::io::Write as _;
+
+    fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn config_file_loads_mcp_subscribe_a2a_and_limits() {
+        let file = write_tmp(
+            r#"{
+                "model": "claude-from-file",
+                "max_tokens": 1234567,
+                "limits": { "max_steps": 77, "max_depth": 3, "deadline_secs": 120 },
+                "mcp_servers": [
+                    { "name": "web", "command": "mcp-fetch", "argv": ["--timeout", "30"],
+                      "tags": { "*": ["untrusted_input"] } }
+                ],
+                "subscribe": ["fs:file:///watch/inbox"]
+            }"#,
+        );
+        let c = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.model.as_deref(), Some("claude-from-file"));
+        assert_eq!(c.max_tokens, 1_234_567);
+        assert_eq!(c.max_steps, 77);
+        assert_eq!(c.max_depth, 3);
+        assert_eq!(c.deadline, Some(Duration::from_secs(120)));
+        assert_eq!(c.mcp_servers.len(), 1);
+        assert_eq!(c.mcp_servers[0].name, "web");
+        assert_eq!(
+            c.mcp_servers[0].command,
+            vec!["mcp-fetch", "--timeout", "30"]
+        );
+        assert_eq!(c.mcp_servers[0].tags, vec![TrifectaTag::UntrustedInput]);
+        assert_eq!(c.subscribe, vec!["fs:file:///watch/inbox"]);
+    }
+
+    #[test]
+    fn env_and_flag_override_file_per_precedence() {
+        // built-in < FILE < env < flag (RFC 0011 §2.1 / RFC 0017 §3.2).
+        let file = write_tmp(r#"{ "model": "from-file", "max_tokens": 100 }"#);
+        let mut env = base_env();
+        env.push(("AGENTD_MODEL".into(), "from-env".into()));
+        // env beats file; a flag beats env.
+        let c = Config::load(
+            &args(&[
+                "--config",
+                file.path().to_str().unwrap(),
+                "--max-tokens",
+                "999",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(c.model.as_deref(), Some("from-env")); // env > file
+        assert_eq!(c.max_tokens, 999); // flag > file
+        // Without the env/flag, the file value stands.
+        let c2 = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c2.model.as_deref(), Some("from-file"));
+        assert_eq!(c2.max_tokens, 100);
+    }
+
+    #[test]
+    fn flag_mcp_and_subscribe_add_to_the_file_list() {
+        // Repeatable list flags ADD to the file's lists (the one documented
+        // deviation from pure last-writer-wins, RFC 0017 §3.2).
+        let file = write_tmp(
+            r#"{ "mcp_servers": [{ "name": "web", "command": "mcp-fetch" }],
+                "subscribe": ["fs:file:///a"] }"#,
+        );
+        let c = Config::load(
+            &args(&[
+                "--config",
+                file.path().to_str().unwrap(),
+                "--mcp",
+                "fs=mcp-fs",
+                "--subscribe",
+                "fs:file:///b",
+            ]),
+            &base_env(),
+        )
+        .unwrap();
+        let names: Vec<&str> = c.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["web", "fs"]); // file seeds, flag adds
+        assert_eq!(c.subscribe, vec!["fs:file:///a", "fs:file:///b"]);
+    }
+
+    #[test]
+    fn config_via_env_alias() {
+        let file = write_tmp(r#"{ "model": "env-config" }"#);
+        let mut env = base_env();
+        env.push(("AGENTD_CONFIG".into(), file.path().to_str().unwrap().into()));
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.model.as_deref(), Some("env-config"));
+    }
+
+    #[test]
+    fn malformed_config_file_is_usage_error() {
+        let file = write_tmp("{ this is not json ");
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn unreadable_config_file_is_usage_error() {
+        let e =
+            Config::load(&args(&["--config", "/no/such/config.json"]), &base_env()).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn config_file_unknown_key_is_usage_error() {
+        // deny_unknown_fields: a typo'd key fails at parse (exit 2).
+        let file = write_tmp(r#"{ "max_token": 5 }"#);
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    // ───────────────────────── RFC 0017 — --validate-config ───────────────────
+
+    fn validate_verdict(args_: &[&str], env: &[(String, String)]) -> Result<String, String> {
+        match Config::load(&args(args_), env).unwrap_err() {
+            ConfigError::Validate(v) => v,
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_config_valid_returns_ok_with_no_instruction_needed() {
+        // It validates whatever is given; a complete config returns the
+        // config.valid verdict. (Here instruction+intelligence are present.)
+        let v = validate_verdict(&["--validate-config"], &base_env());
+        let line = v.expect("a complete config validates");
+        assert!(line.contains("config.valid"));
+        let _: serde_json::Value = serde_json::from_str(&line).unwrap();
+    }
+
+    #[test]
+    fn validate_config_invalid_returns_err_exit2_shape() {
+        // reactive with no subscribe → invalid (RFC 0011 §3.3). Verdict is Err.
+        let v = validate_verdict(&["--validate-config", "--mode", "reactive"], &base_env());
+        let lines = v.unwrap_err();
+        assert!(lines.contains("config.invalid"));
+        // Each line is parseable NDJSON.
+        for line in lines.lines() {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_config_runs_without_an_instruction() {
+        // No INSTRUCTION at all: --validate-config still produces a verdict (it
+        // does not need an instruction to *run*); the missing-instruction shows
+        // up as an invalid diagnostic, not a crash.
+        let env = vec![("AGENTD_INTELLIGENCE".into(), "unix:/x".into())];
+        let v = match Config::load(&args(&["--validate-config"]), &env).unwrap_err() {
+            ConfigError::Validate(v) => v,
+            other => panic!("expected Validate, got {other:?}"),
+        };
+        let lines = v.unwrap_err();
+        assert!(lines.contains("config.invalid"));
+        assert!(lines.contains("instruction"));
+    }
+
+    #[test]
+    fn validate_config_rejects_bad_intelligence_scheme() {
+        let mut env = base_env();
+        env.retain(|(k, _)| k != "AGENTD_INTELLIGENCE");
+        let v = validate_verdict(&["--validate-config", "--intelligence", "ftp://nope"], &env);
+        assert!(v.unwrap_err().contains("config.invalid"));
+    }
+
+    // ───────────────────────── RFC 0017 — --config-schema ─────────────────────
+
+    #[test]
+    fn config_schema_emits_parseable_json_schema() {
+        let s = match Config::load(&args(&["--config-schema"]), &[]).unwrap_err() {
+            ConfigError::Schema(s) => s,
+            other => panic!("expected Schema, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&s).expect("schema is valid JSON");
+        assert_eq!(
+            v["$schema"],
+            serde_json::json!("https://json-schema.org/draft/2020-12/schema")
+        );
+        assert!(v["properties"].is_object());
+        // It short-circuits with NO instruction and NO config (static export).
+    }
+
+    // ───────────────────────── RFC 0017 — secret refs (§6) ────────────────────
+
+    #[test]
+    fn intelligence_token_file_reads_and_trims() {
+        let tok = write_tmp("file-token\n");
+        let mut env = base_env();
+        env.push((
+            "AGENTD_INTELLIGENCE_TOKEN_FILE".into(),
+            tok.path().to_str().unwrap().into(),
+        ));
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.intelligence_token.as_deref(), Some("file-token"));
+        // The token never appears in the redacted Debug.
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("file-token"));
+        assert!(dbg.contains("***"));
+    }
+
+    #[test]
+    fn inline_token_wins_over_token_file() {
+        let tok = write_tmp("from-file\n");
+        let mut env = base_env();
+        env.push(("AGENTD_INTELLIGENCE_TOKEN".into(), "from-inline".into()));
+        env.push((
+            "AGENTD_INTELLIGENCE_TOKEN_FILE".into(),
+            tok.path().to_str().unwrap().into(),
+        ));
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.intelligence_token.as_deref(), Some("from-inline"));
+    }
+
+    #[test]
+    fn token_file_flag_reads_via_cli() {
+        let tok = write_tmp("flag-token");
+        let c = Config::load(
+            &args(&["--intelligence-token-file", tok.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.intelligence_token.as_deref(), Some("flag-token"));
+    }
+
+    #[test]
+    fn missing_token_file_is_usage_error() {
+        let mut env = base_env();
+        env.push((
+            "AGENTD_INTELLIGENCE_TOKEN_FILE".into(),
+            "/no/such/token".into(),
+        ));
+        let e = Config::load(&args(&[]), &env).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn secret_file_ref_resolves_and_does_not_leak() {
+        // A declared header with a {{secret-file:PATH}} ref validates (the file
+        // exists) and the resolved secret never enters the manifest or the
+        // redacted Debug — only the structural ref/name does.
+        let secret = write_tmp("RESOLVED-SECRET-VALUE\n");
+        let path = secret.path().to_str().unwrap().to_string();
+        let file = write_tmp(&format!(
+            r#"{{ "intelligence_headers": {{
+                "authorization": "Bearer {{{{secret-file:{path}}}}}" }} }}"#
+        ));
+        let c = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        // The header TEMPLATE (the ref) is structural config and is stored…
+        assert_eq!(
+            c.intelligence_headers
+                .get("authorization")
+                .map(String::as_str),
+            Some(format!("Bearer {{{{secret-file:{path}}}}}").as_str())
+        );
+        // …but the resolved secret value is NOT stored or logged.
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("RESOLVED-SECRET-VALUE"));
+        // The resolver materializes it only at the moment of use.
+        let env = |_: &str| None;
+        let resolved =
+            crate::sec::secret::resolve(c.intelligence_headers.get("authorization").unwrap(), &env)
+                .unwrap();
+        assert_eq!(resolved, "Bearer RESOLVED-SECRET-VALUE");
+    }
+
+    #[test]
+    fn inline_secret_shaped_header_is_rejected() {
+        // A credential-shaped header with an inline (non-ref) value is the
+        // "secret in the file" footgun — exit 2 (RFC 0017 §3.1).
+        let file = write_tmp(r#"{ "intelligence_headers": { "x-api-key": "sk-inline-literal" } }"#);
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+        // A {{secret:NAME}} ref in the same header is fine (a reference, not a
+        // value). The ref resolves against the PROCESS env at startup (the runtime
+        // truth), so set the real var for this check.
+        // SAFETY: single-threaded test; the var is unique to this test.
+        unsafe {
+            std::env::set_var("AGENTD_TEST_HDR_KEY_0017", "k");
+        }
+        let file_ok = write_tmp(
+            r#"{ "intelligence_headers": { "x-api-key": "{{secret:AGENTD_TEST_HDR_KEY_0017}}" } }"#,
+        );
+        let c = Config::load(
+            &args(&["--config", file_ok.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        assert!(c.intelligence_headers.contains_key("x-api-key"));
+        unsafe {
+            std::env::remove_var("AGENTD_TEST_HDR_KEY_0017");
+        }
+    }
+
+    #[test]
+    fn unresolvable_secret_ref_in_header_is_rejected_at_validation() {
+        // A {{secret:NAME}} whose env var is unset → exit 2 at startup (§6.2).
+        let file = write_tmp(
+            r#"{ "intelligence_headers": { "x-api-key": "{{secret:DEFINITELY_UNSET_VAR_XYZ}}" } }"#,
+        );
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
     }
 }

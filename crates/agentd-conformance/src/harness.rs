@@ -44,10 +44,19 @@ impl Drop for TempDir {
 fn binaries() -> &'static (PathBuf, PathBuf) {
     static BINS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     BINS.get_or_init(|| {
-        // Ensure the agentd binary (with serve-mcp) and our recording reference
-        // MCP server both exist, regardless of whether we were invoked via
-        // `cargo test` (which builds them) or `cargo run` (which may not).
-        build(&["build", "-p", "agentd", "--features", "serve-mcp"]);
+        // Ensure the agentd binary (with serve-mcp + the mock LLM / mock MCP the
+        // suite drives) and our recording reference MCP server both exist,
+        // regardless of whether we were invoked via `cargo test` (which builds
+        // them) or `cargo run` (which may not). `internal-mocks` is implicit in a
+        // debug build but we ask for it explicitly so a `--release` conformance
+        // run still ships the mock re-exec modes.
+        build(&[
+            "build",
+            "-p",
+            "agentd",
+            "--features",
+            "serve-mcp,internal-mocks",
+        ]);
         build(&["build", "-p", "agentd-conformance", "--bin", "confmcp"]);
         let dir = target_dir();
         let agentd = dir.join("agentd");

@@ -39,6 +39,13 @@ metrics = []
 # existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
 # `--features otel` stays dependency-free (3 deps).
 otel = []
+# Built-in mock intelligence + mock MCP server (the hidden `--internal-mock-llm`
+# / `--internal-mock-mcp` re-exec modes) that the test + conformance suites drive.
+# Test scaffolding, never a shippable capability — so it's OFF in release and the
+# production binary carries none of it. Debug builds enable it automatically (the
+# `debug_assertions` cfg on the modules), so `cargo test` and the conformance
+# harness need no extra flag; an explicit `--release` test build can opt in here.
+internal-mocks = []
 
 [dependencies]
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.

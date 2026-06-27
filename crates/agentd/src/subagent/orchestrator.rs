@@ -30,7 +30,7 @@ use crate::subagent::protocol::{
 };
 use crate::supervisor::reactor::{SuperviseResult, supervise_once};
 use crate::supervisor::spawn::{Subagent, spawn};
-use crate::supervisor::tree::NodeId;
+use crate::supervisor::tree::{NodeId, TokenBucket};
 use crate::wire::intel::ToolDef;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -41,6 +41,11 @@ use std::time::{Duration, Instant};
 /// Conservative per-node breadth cap (depth comes from the payload's
 /// `max_depth`). RFC 0009.
 const MAX_CHILDREN: u32 = 8;
+/// Spawn-rate token bucket (RFC 0009 §3.6): 8 burst, 2 tokens/s refill. Catches a
+/// fast churn loop that stays under the absolute breadth cap — a wedged agent
+/// hammering `subagent.spawn` just keeps getting refusals, never a fork bomb.
+const SPAWN_RATE_BURST: u32 = 8;
+const SPAWN_RATE_PER_SEC: f64 = 2.0;
 /// Cap on the distilled result handed back to the parent model (~chars).
 const DISTILL_CAP: usize = 8_000;
 /// Cap on self-scheduled wake-ups per run (bounds a runaway self-scheduler).
@@ -80,6 +85,8 @@ pub struct Orchestrator {
     parent_path: String,
     max_depth: u32,
     child_count: u32,
+    /// Tree-wide spawn-rate limiter (RFC 0009 §3.6), checked in `spawn`.
+    spawn_bucket: TokenBucket,
     intelligence: IntelConfig,
     mcp_servers: Vec<McpServerSpec>,
     run_id: String,
@@ -114,6 +121,7 @@ impl Orchestrator {
             parent_path: payload.telemetry.agent_path.clone(),
             max_depth: payload.limits.max_depth,
             child_count: 0,
+            spawn_bucket: TokenBucket::new(SPAWN_RATE_BURST, SPAWN_RATE_PER_SEC),
             intelligence: payload.intelligence.clone(),
             mcp_servers: payload.mcp_servers.clone(),
             run_id: payload.telemetry.run_id.clone(),
@@ -213,6 +221,15 @@ impl Orchestrator {
         // Caps — refused as a tool result so the model adapts (RFC 0009).
         if !self.can_nest() {
             return refused("maximum subagent depth reached; do this step yourself");
+        }
+        // Spawn-rate cap (RFC 0009 §3.6): a fast churn loop is throttled by the
+        // token bucket *before* the absolute breadth count — so a runaway loop
+        // that spawns in a tight burst is refused on rate (the more actionable
+        // signal: "back off"), while the breadth cap below remains the hard
+        // tree-shape ceiling for a slow drip of spawns. Refused as a tool result,
+        // never a fork bomb.
+        if !self.spawn_bucket.try_take() {
+            return refused("spawn rate exceeded");
         }
         if self.child_count >= MAX_CHILDREN {
             return refused("maximum number of child subagents reached for this agent");
@@ -961,6 +978,31 @@ mod tests {
         assert!(
             props.get("detach").is_some(),
             "spawn schema must offer detach"
+        );
+    }
+
+    #[test]
+    fn spawn_rate_cap_refuses_after_burst() {
+        // The rate cap is checked before any child launch, so we can exhaust the
+        // burst straight from the bucket (no real processes) and assert that the
+        // next spawn is refused on rate — an isError tool result, never a crash.
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        for i in 0..SPAWN_RATE_BURST {
+            assert!(
+                o.spawn_bucket.try_take(),
+                "burst token {i} should be available"
+            );
+        }
+        let (msg, is_err) = o.spawn(&json!({"instruction": "churn"}));
+        assert!(is_err, "a rate-limited spawn is an error observation");
+        assert!(
+            msg.contains("spawn rate exceeded"),
+            "refusal must name the rate cap; got: {msg}"
         );
     }
 

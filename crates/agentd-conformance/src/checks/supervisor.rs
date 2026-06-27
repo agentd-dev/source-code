@@ -43,6 +43,12 @@ pub fn checks() -> Vec<Check> {
             desc: "SIGTERM drains a daemon gracefully → exit 0 (not 143)",
             run: drain_on_sigterm,
         },
+        Check {
+            id: "supervisor/spawn-rate-refused",
+            category: Category::Supervisor,
+            desc: "a fast subagent.spawn churn loop is throttled by the spawn-rate cap (refused as an isError tool result, never a crash)",
+            run: spawn_rate_refused,
+        },
     ]
 }
 
@@ -124,6 +130,59 @@ fn exit_mcp_down(h: &Harness) -> Outcome {
         r.code == Some(6),
         format!(
             "want exit 6 (required MCP down), got {:?}; stderr:\n{}",
+            r.code, r.stderr
+        ),
+    )
+}
+
+fn spawn_rate_refused(h: &Harness) -> Outcome {
+    // The `spawn-churn` mock LLM calls subagent.spawn on *every* turn, so an
+    // in-loop root run fires a rapid burst of spawns. The tree-wide spawn-rate
+    // token bucket (RFC 0009 §3.6: 8 burst, 2/s refill) must throttle the burst
+    // and refuse the excess as an isError tool result the model sees — never a
+    // crash or a fork bomb. `--max-depth 1` bounds the tree (children cannot
+    // re-nest), `--log-content` surfaces the refusal text in the tool.result
+    // telemetry, and the step budget terminates the never-converging loop.
+    let llm = h.mock_llm("spawn-churn");
+    let r = h.run(&[
+        "--instruction",
+        "spawn as fast as you can",
+        "--intelligence",
+        &llm.uri,
+        "--model",
+        "m",
+        "--max-depth",
+        "1",
+        "--max-steps",
+        "30",
+        "--log-level",
+        "info",
+        "--log-content",
+    ]);
+    // "Did not crash": a normal terminal exit code (here 7 = exhausted_steps,
+    // since the churn loop never answers). A signal-kill / abort would yield no
+    // exit code at all — that is the crash we are ruling out.
+    if r.code.is_none() {
+        return Outcome::fail(format!(
+            "run did not exit cleanly (killed by signal?); stderr:\n{}",
+            r.stderr
+        ));
+    }
+    // At least one subagent.spawn must have been refused on rate, surfaced to the
+    // model as an isError tool.result whose content names the rate cap.
+    let rate_refused = r.events().iter().any(|e| {
+        e["event"] == "tool.result"
+            && e["tool"] == "subagent.spawn"
+            && e["is_error"] == true
+            && e["content"]
+                .as_str()
+                .map(|c| c.contains("spawn rate") || c.contains("rate exceeded"))
+                .unwrap_or(false)
+    });
+    Outcome::require(
+        rate_refused,
+        format!(
+            "no subagent.spawn was refused on rate (want an isError tool.result mentioning the spawn-rate cap); exit {:?}; stderr:\n{}",
             r.code, r.stderr
         ),
     )

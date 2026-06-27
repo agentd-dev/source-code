@@ -55,11 +55,18 @@ metrics = []
 # log_level/subscribe), gated at a reactive quiesce boundary. Dependency-free —
 # raw `libc::sigaction` + the existing self-pipe (no signal-hook), reusing the
 # one `Config::load` validation pipeline. SIGHUP keeps its default disposition
-# when this feature is OFF. The inotify file-watch trigger (`--watch-config`) is
-# a documented follow-up; this build ships SIGHUP only. mcp_servers is treated as
-# restart-only here (the positional owner/claim map makes a live re-handshake too
-# invasive to do safely — RFC 0017 §5.3 "scope it out cleanly").
+# when this feature is OFF. mcp_servers is treated as restart-only here (the
+# positional owner/claim map makes a live re-handshake too invasive to do safely
+# — RFC 0017 §5.3 "scope it out cleanly").
 hot-reload = []
+# The inotify file-watch reload trigger (RFC 0017 §5.2): a `--watch-config`-armed
+# raw `inotify` watch on the config file's PARENT DIRECTORY that sets the SAME
+# RELOAD latch SIGHUP does, so a Kubernetes ConfigMap volume swap (an atomic
+# directory-symlink rename) reloads with no signal plumbing. Implies `hot-reload`
+# — the watch is useless without the reload routine it funnels into. Off by
+# default (SIGHUP is the portable, dependency-free default). Dependency-free: raw
+# `libc` inotify syscalls (no `notify`/`inotify` crate — the minimalism moat).
+config-watch = ["hot-reload"]
 # OTLP span export + GenAI semconv. Hand-rolled OTLP-over-HTTP/JSON over the
 # existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
 # `--features otel` stays dependency-free (3 deps).

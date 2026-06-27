@@ -26,6 +26,15 @@ mod imp {
     // the process is exiting. The handler is registered ONLY under the
     // `hot-reload` feature; without it SIGHUP keeps its default disposition.
     static RELOAD: AtomicBool = AtomicBool::new(false);
+    // Trigger-attribution latch for the `config.reload_requested` event (RFC 0017
+    // §5.6 — `{trigger:"sighup"|"watch"}`). The inotify file-watch thread
+    // (RFC 0017 §5.2) sets BOTH `RELOAD` and this flag via
+    // `request_reload_from_watch()`; the reactive apply step reads-and-clears it
+    // with `take_reload_was_watch()` to pick the trigger string, DEFAULTING to
+    // "sighup" when unset (the SIGHUP handler / `request_reload()` never set it).
+    // The watcher is a normal thread (not a signal handler), so a plain atomic
+    // store is fine — no async-signal-safety constraint here.
+    static RELOAD_FROM_WATCH: AtomicBool = AtomicBool::new(false);
     // Reload-in-progress guard (RFC 0017 §5.3 step 3). Set while the reactive
     // supervisor is APPLYING a validated reload; the served `subagent.spawn`
     // chokepoint consults it and returns a transient "reload in progress" error to
@@ -209,6 +218,25 @@ mod imp {
         wake();
     }
 
+    /// Request a hot reload attributed to the file-watch trigger (RFC 0017 §5.2):
+    /// set the SAME RELOAD latch SIGHUP/`request_reload` do, PLUS the
+    /// watch-attribution flag the apply step reads for the `config.reload_requested`
+    /// `{trigger:"watch"}` event (§5.6). Called by the inotify watcher thread; a
+    /// reactor wakeup follows. Inert on a build without the reactive reload loop.
+    pub fn request_reload_from_watch() {
+        RELOAD_FROM_WATCH.store(true, Ordering::SeqCst);
+        RELOAD.store(true, Ordering::SeqCst);
+        wake();
+    }
+
+    /// Take-and-clear the watch-attribution flag: `true` if the pending reload was
+    /// set by the file-watch trigger (RFC 0017 §5.2), `false` (the default) for
+    /// SIGHUP / a programmatic `request_reload`. The apply step calls this once per
+    /// reload to pick the `config.reload_requested` `trigger` string (§5.6).
+    pub fn take_reload_was_watch() -> bool {
+        RELOAD_FROM_WATCH.swap(false, Ordering::SeqCst)
+    }
+
     /// Is a validated reload mid-apply (RFC 0017 §5.3 step 3)? The served
     /// `subagent.spawn` chokepoint reads this and transiently refuses NEW spawns.
     pub fn reloading() -> bool {
@@ -279,6 +307,10 @@ mod imp {
     }
     pub fn clear_reload() {}
     pub fn request_reload() {}
+    pub fn request_reload_from_watch() {}
+    pub fn take_reload_was_watch() -> bool {
+        false
+    }
     pub fn reloading() -> bool {
         false
     }
@@ -364,6 +396,22 @@ pub fn request_reload() {
     imp::request_reload()
 }
 
+/// Request a hot reload attributed to the **file-watch** trigger (RFC 0017 §5.2):
+/// the same RELOAD latch SIGHUP/`request_reload` set, plus the watch-attribution
+/// flag the apply step reads for the `config.reload_requested{trigger:"watch"}`
+/// event (§5.6). Called by the inotify watcher thread (`config-watch`).
+pub fn request_reload_from_watch() {
+    imp::request_reload_from_watch()
+}
+
+/// Take-and-clear the watch-attribution flag — `true` if the pending reload came
+/// from the file-watch trigger (RFC 0017 §5.2), `false` (the default) for SIGHUP
+/// or a programmatic `request_reload`. The reactive apply step calls this once per
+/// reload to label the `config.reload_requested` `trigger` (§5.6).
+pub fn take_reload_was_watch() -> bool {
+    imp::take_reload_was_watch()
+}
+
 /// Is a validated reload mid-apply (RFC 0017 §5.3 step 3)? The served
 /// `subagent.spawn` chokepoint reads this to transiently refuse NEW spawns while
 /// the reloadable diff is being applied. Always `false` off the `hot-reload` path
@@ -408,6 +456,9 @@ pub fn reset_for_test() {
     set_paused(false);
     set_reloading(false);
     clear_reload();
+    // Clear the watch-attribution latch too (set by `request_reload_from_watch`),
+    // so a watcher test cannot leak `trigger:"watch"` into a later reload test.
+    let _ = take_reload_was_watch();
 }
 
 /// RAII guard from [`test_guard`]. Resets the signal state on BOTH acquire and

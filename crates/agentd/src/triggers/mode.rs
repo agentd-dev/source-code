@@ -313,6 +313,20 @@ pub fn run_reactive(
     #[cfg(feature = "hot-reload")]
     let mut generation: u64 = 0;
 
+    // Arm the inotify file-watch reload trigger (RFC 0017 §5.2) when
+    // `--watch-config` is set on a `config-watch` build. The watcher runs on its
+    // own thread for the process's life and sets the SAME RELOAD latch SIGHUP
+    // does (attributed `trigger:"watch"`), so it funnels into the identical reload
+    // routine below — one code path. Config validation already guaranteed a config
+    // file is present when `watch_config` is set (exit 2 otherwise), so the path
+    // resolves here.
+    #[cfg(all(unix, feature = "config-watch"))]
+    if cfg.watch_config
+        && let Some(path) = config_path_of(args, env)
+    {
+        crate::config_watch::spawn_config_watcher(Path::new(&path), log);
+    }
+
     loop {
         crate::obs::health::tick();
 
@@ -590,7 +604,16 @@ fn apply_reload(
     log: &Logger,
 ) -> Option<Config> {
     let started = Instant::now();
-    log.info("config.reload_requested", json!({"trigger": "sighup"}));
+    // Trigger attribution (RFC 0017 §5.6 — `{trigger:"sighup"|"watch"}`). The
+    // file-watch thread sets a watch-attribution flag alongside the RELOAD latch;
+    // take-and-clear it here to label this reload. Defaults to "sighup" (the
+    // SIGHUP handler / a programmatic `request_reload` never set the flag).
+    let trigger = if signals::take_reload_was_watch() {
+        "watch"
+    } else {
+        "sighup"
+    };
+    log.info("config.reload_requested", json!({"trigger": trigger}));
 
     // STEP 1 — re-load + re-validate (pure-CPU, no side effect). Re-read ONLY the
     // FILE, re-merge built-in<file<env<flag. `Config::reload` runs the FULL
@@ -826,6 +849,23 @@ fn apply_subscription_diff(
 #[cfg(feature = "hot-reload")]
 fn config_file_present(args: &[String], env: &[(String, String)]) -> bool {
     args.iter().any(|a| a == "--config") || env.iter().any(|(k, _)| k == "AGENTD_CONFIG")
+}
+
+/// Resolve the config file path the same way `Config::load` does (`--config`
+/// flag wins over `AGENTD_CONFIG`), for arming the inotify watcher (RFC 0017
+/// §5.2). Returns `None` when no file is in play. Pure.
+#[cfg(all(unix, feature = "config-watch"))]
+fn config_path_of(args: &[String], env: &[(String, String)]) -> Option<String> {
+    // `--config <PATH>`: the value follows the flag.
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--config" {
+            return it.next().cloned();
+        }
+    }
+    env.iter()
+        .find(|(k, _)| k == "AGENTD_CONFIG")
+        .map(|(_, v)| v.clone())
 }
 
 /// Whether the run id was EXPLICITLY set (`--run-id` / `AGENTD_RUN_ID`) rather

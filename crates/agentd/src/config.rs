@@ -536,6 +536,18 @@ pub struct Config {
     /// warm-child-pool build honours the operator's intent without a config
     /// break.
     pub warm_intel: bool,
+    /// Watch the config file for changes and reload (`--watch-config` /
+    /// `AGENTD_WATCH_CONFIG`, RFC 0017 §5.2). When set, the reactive supervisor
+    /// arms a raw `inotify` watch on the config file's PARENT DIRECTORY (so a
+    /// Kubernetes ConfigMap volume swap — an atomic directory-symlink rename —
+    /// is seen) and, on a change to the watched file, sets the SAME RELOAD latch
+    /// SIGHUP does (RFC 0017 §5.2 "both triggers funnel into the identical reload
+    /// routine"). Always-compiled (uniform `Config`); `true` needs the
+    /// `config-watch` build feature (validated, exit 2) AND a config file to
+    /// watch (`--config`/`AGENTD_CONFIG`, else exit 2 — watching nothing is a
+    /// usage error). Off by default; SIGHUP is the portable, dependency-free
+    /// default trigger.
+    pub watch_config: bool,
 }
 
 impl Default for Config {
@@ -582,6 +594,7 @@ impl Default for Config {
             // Off by default; flipped to `true` when `--standby` is set unless
             // `AGENTD_WARM_INTEL` explicitly overrides (resolved in `load`).
             warm_intel: false,
+            watch_config: false,
         }
     }
 }
@@ -637,6 +650,7 @@ impl fmt::Debug for Config {
             .field("standby", &self.standby)
             .field("assign_from", &self.assign_from)
             .field("warm_intel", &self.warm_intel)
+            .field("watch_config", &self.watch_config)
             .finish()
     }
 }
@@ -825,6 +839,12 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_WARM_INTEL") {
             warm_intel_env = Some(truthy(v));
         }
+        // File-watch reload trigger (RFC 0017 §5.2). `AGENTD_WATCH_CONFIG` is a
+        // bool; a `--watch-config` flag below overrides it. Needs the
+        // `config-watch` build feature + a config file (validated, exit 2).
+        if let Some(v) = envmap.get("AGENTD_WATCH_CONFIG") {
+            c.watch_config = truthy(v);
+        }
         // A single `AGENTD_A2A_PEER` env declares one peer (the env channel is
         // one value; declare more with repeated `--a2a-peer` flags). RFC 0020 §3.
         if let Some(v) = envmap.get("AGENTD_A2A_PEER") {
@@ -962,6 +982,12 @@ impl Config {
                 "--assign-from" => {
                     c.assign_from = Some(AssignFrom::parse(&take("--assign-from")?)?)
                 }
+                // File-watch reload trigger (RFC 0017 §5.2): watch the config
+                // file's directory and reload on a change. Needs the
+                // `config-watch` build feature + a `--config`/`AGENTD_CONFIG`
+                // file (both validated, exit 2). Off by default; SIGHUP is the
+                // portable default trigger.
+                "--watch-config" => c.watch_config = true,
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 "--report-file" => c.report_file = Some(take("--report-file")?),
@@ -1055,6 +1081,17 @@ impl Config {
         }
 
         c.validate()?;
+        // `--watch-config` requires a config FILE to watch (RFC 0017 §5.2):
+        // watching nothing is a usage error. This is the one check that needs the
+        // resolved file-presence (not a `Config` field), so it lives here in
+        // `load` (and is mirrored in `validate_collect_all` for the admission
+        // gate). Checked after `validate()` so the feature-gate error (in
+        // `validate()`) surfaces first when both are wrong.
+        if c.watch_config && config_path.is_none() {
+            return Err(usage(
+                "--watch-config requires a config file (--config / AGENTD_CONFIG)".into(),
+            ));
+        }
         Ok(c)
     }
 
@@ -1099,6 +1136,12 @@ impl Config {
             if !diags.iter().any(|d| msg.ends_with(d.as_str())) {
                 diags.push(msg);
             }
+        }
+        // `--watch-config` needs a config FILE to watch (RFC 0017 §5.2) — the one
+        // file-presence-dependent check, mirrored from `load`'s startup path so
+        // the admission gate (`--validate-config`) rejects it too.
+        if self.watch_config && !file_present {
+            diags.push("--watch-config requires a config file (--config / AGENTD_CONFIG)".into());
         }
         // RFC 0017 §5.4: the reload-coherence check (no running config at the
         // admission gate — `running = None`), so this reports the restart-only-
@@ -1228,6 +1271,15 @@ impl Config {
         if (self.standby || self.assign_from.is_some()) && !cfg!(feature = "cluster") {
             return Err(usage(
                 "--standby / --assign-from require the 'cluster' build feature".into(),
+            ));
+        }
+        // File-watch reload trigger (`--watch-config`, RFC 0017 §5.2) needs the
+        // `config-watch` build feature — mirroring the `--shard`/`--standby`
+        // gates. A silently-ignored `--watch-config` would leave the operator
+        // believing a ConfigMap swap reloads when it does not (only SIGHUP would).
+        if self.watch_config && !cfg!(feature = "config-watch") {
+            return Err(usage(
+                "--watch-config requires the 'config-watch' build feature".into(),
             ));
         }
         // Standby is mode-orthogonal but only MEANINGFUL in reactive mode (RFC
@@ -2078,6 +2130,7 @@ fn help_text() -> String {
          \x20 --config <PATH>             load a declarative JSON config file (or AGENTD_CONFIG)\n\
          \x20 --validate-config          load+validate (file+env+flags), print the verdict, exit 0/2\n\
          \x20 --config-schema            print the config-file JSON Schema and exit\n\
+         \x20 --watch-config             reload on config-file change via inotify (needs --config + --features config-watch; or AGENTD_WATCH_CONFIG)\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
     )
@@ -3114,6 +3167,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    // ──────────────────── RFC 0017 §5.2 — --watch-config ──────────────────────
+
+    /// Without the `config-watch` build feature, `--watch-config` (even WITH a
+    /// config file) is a usage error — never silently ignored (the operator would
+    /// believe a ConfigMap swap reloads when only SIGHUP would).
+    #[cfg(not(feature = "config-watch"))]
+    #[test]
+    fn watch_config_requires_config_watch_feature() {
+        let file = write_tmp(r#"{ "model": "m" }"#);
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap(), "--watch-config"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--watch-config requires the 'config-watch' build feature"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    /// With the feature, `--watch-config` + a `--config` file parses and sets the
+    /// always-compiled `watch_config` flag.
+    #[cfg(feature = "config-watch")]
+    #[test]
+    fn watch_config_parses_with_a_config_file() {
+        let file = write_tmp(r#"{ "model": "m" }"#);
+        let c = Config::load(
+            &args(&["--config", file.path().to_str().unwrap(), "--watch-config"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert!(c.watch_config);
+    }
+
+    /// `AGENTD_WATCH_CONFIG` env parses too (a flag would override it).
+    #[cfg(feature = "config-watch")]
+    #[test]
+    fn watch_config_parses_from_env() {
+        let file = write_tmp(r#"{ "model": "m" }"#);
+        let mut env = base_env();
+        env.push(("AGENTD_CONFIG".into(), file.path().to_str().unwrap().into()));
+        env.push(("AGENTD_WATCH_CONFIG".into(), "true".into()));
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert!(c.watch_config);
+    }
+
+    /// `--watch-config` with NO config file is a usage error — watching nothing is
+    /// meaningless (RFC 0017 §5.2). (Only exercised on a `config-watch` build; off
+    /// the feature the feature-gate error fires first.)
+    #[cfg(feature = "config-watch")]
+    #[test]
+    fn watch_config_requires_a_config_file() {
+        let e = Config::load(&args(&["--watch-config"]), &base_env()).unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--watch-config requires a config file"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    /// The admission gate (`--validate-config`) also rejects `--watch-config`
+    /// without a config file — the same diagnostic, collected.
+    #[cfg(feature = "config-watch")]
+    #[test]
+    fn validate_config_flags_watch_config_without_a_file() {
+        let v = validate_verdict(&["--validate-config", "--watch-config"], &base_env());
+        let lines = v.expect_err("watch-config without a file is invalid");
+        assert!(
+            lines.contains("--watch-config requires a config file"),
+            "got: {lines}"
+        );
     }
 
     // ───────────────────────── RFC 0017 — --validate-config ───────────────────

@@ -5,6 +5,16 @@
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the self-MCP server & control protocol (RFC 0005)
 
+> **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) builds two surfaces here
+> into the agent mesh, with no new source of truth: (1) the capabilities manifest
+> (§5.2) **is** the A2A **Agent Card** — the on-node gateway projects the manifest
+> into A2A's `agent.json` schema; one builder, one document (RFC 0020 §3/§5). (2) the
+> vsock serving transport (§3) also carries the A2A **server profile** (feature
+> `a2a`) alongside this management/self-MCP profile — same listener, same codec
+> (RFC 0004), same one trust domain (§3.3) where the vsock peer is the node-agent
+> (RFC 0020 §2/§4). agentd carries none of A2A's HTTP/SSE/OAuth/webhook machinery;
+> that lives in the gateway. See RFC 0020.
+
 ---
 
 ## 1. Problem / Context

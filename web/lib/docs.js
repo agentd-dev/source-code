@@ -37,6 +37,7 @@ export const DOCS = [
   { slug: "rfc-0017", file: "rfcs/0017-declarative-config-and-hot-reload.md", title: "rfc 0017 · config & hot reload" },
   { slug: "rfc-0018", file: "rfcs/0018-intelligence-transport-resilience.md", title: "rfc 0018 · intelligence resilience" },
   { slug: "rfc-0019", file: "rfcs/0019-horizontal-scaling.md", title: "rfc 0019 · horizontal scaling" },
+  { slug: "rfc-0020", file: "rfcs/0020-a2a-interop-over-vsock.md", title: "rfc 0020 · a2a over vsock" },
 ];
 
 // docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so

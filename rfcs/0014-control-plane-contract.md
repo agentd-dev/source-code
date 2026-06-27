@@ -5,6 +5,14 @@
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — extends the cloud-native contract (RFC 0011); umbrella for RFCs 0015–0019
 
+> **A2A alignment (RFC 0020).** A2A-over-vsock joins this track as the mesh's
+> agent↔agent *work* surface, orthogonal to the operator plane and complementary
+> to MCP. The **node-agent is also the A2A gateway** — a dumb HTTP↔vsock transport
+> bridge and policy-enforcement point (TLS/auth/webhooks/durable task history live
+> there, not in agentd; RFC 0020 §2–3). The capabilities manifest (§5) is also an
+> **A2A Agent Card** projection. RFC 0020 owns the binding; this RFC's core
+> (operator management — provision/scale/observe/config/intelligence) is unchanged.
+
 ---
 
 ## 1. Problem / Context
@@ -105,6 +113,7 @@ not a precondition.
 | **0017** Declarative config & hot reload | a declarative config file (lands the RFC 0011/0013 file layer), `agentd --validate-config` + a JSON-schema export, `SIGHUP`/file-watch **hot reload** (MCP servers / subscriptions / model), file-based secret refs | ConfigMap-driven, admission-validated, restart-free reconfiguration |
 | **0018** Intelligence transport resilience | multi-endpoint failover (`--intelligence vsock:a,vsock:b`), endpoint health as a metric/resource, **runtime model/endpoint hot-swap**, an optional model-discovery handshake | survive a host model-service move/upgrade with no restart; model-aware placement |
 | **0019** Horizontal scaling | work-**claim/lease** on reactive events (so N replicas don't double-process), `--shard K/N` partitioning, the autoscaling signal set, an optional warm-pool/standby mode | KEDA/HPA-driven horizontal scale of reactive workers; warm fast-start |
+| **0020** A2A interop over vsock | A2A served over vsock (manifest = Agent Card; a run = a Task), with the node-agent acting as a dumb HTTP↔vsock bridge + PEP (TLS/auth/SSE/webhooks/durable history) | the node-agent becomes the on-node **A2A gateway**; agentd is a first-class agent in the mesh, carrying no HTTP/auth/persistence |
 
 **Durability / checkpoint-restore** for long-lived stateful fleet agents (resume
 a warm session/run after a pod reschedule, rather than re-trigger idempotently)

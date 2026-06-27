@@ -39,8 +39,18 @@ const TICK: Duration = Duration::from_millis(200);
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// A lease this replica currently holds for a claim route (RFC 0019 §3.2).
-/// Held in a registry keyed by the route URI; carried so the post-react ack/
-/// release and the drain step-1.5 release have the lease id + the dedupe key.
+/// Carried so the post-react ack/release, the renew heartbeat, and the drain
+/// step-1.5 release have the lease id + the dedupe key + the TTL cadence,
+/// regardless of whether the claim is spawn-style or continue-style.
+///
+/// The `held_claims` registry mixes two key spaces (reconciled cleanly — the
+/// struct carries everything needed to ack/release either way):
+///   * **spawn-claim** entries are keyed by the route **URI** and live for at
+///     most one deliver iteration (claimed→settled inline). Their heartbeat
+///     fields are never consulted (settled before the tick's renew pass).
+///   * **continue-claim** entries are keyed by the warm **session id** and live
+///     for the session's whole life (many deliveries); the renew heartbeat
+///     keeps the lease (`last_renew`), and they settle when the session ENDS.
 #[cfg(feature = "cluster")]
 struct HeldClaim {
     /// Index of the coordination server in the connected `servers` vec.
@@ -50,6 +60,13 @@ struct HeldClaim {
     /// The item-derived claim key (== the spawned reaction's RUN_ID), carried on
     /// `work.ack._meta.agentd/claim_key` so the server collapses the ack.
     claim_key: String,
+    /// The requested lease TTL — the heartbeat renews at `ttl * renew_fraction`.
+    ttl: Duration,
+    /// The heartbeat cadence fraction of the TTL (RFC 0019 §3.6, default 0.33).
+    renew_fraction: f64,
+    /// When the lease was last claimed/renewed — the heartbeat compares
+    /// `now - last_renew >= ttl * renew_fraction` each tick (continue-claims).
+    last_renew: Instant,
 }
 
 /// Build the frozen `work.*` `_meta` for a claim call (RFC 0015 §5.6). The ONLY
@@ -195,6 +212,7 @@ pub fn run_reactive(
                     renew_fraction: cfg.claim_renew_fraction,
                     style: route.style,
                     route_id: route.uri.clone(),
+                    continue_session: route.continue_session,
                 },
             );
         }
@@ -455,7 +473,10 @@ pub fn run_reactive(
                 let deadline = Instant::now() + budget;
                 let total = held_claims.len();
                 let mut released = 0usize;
-                for (uri, held) in held_claims.drain() {
+                // The registry mixes key spaces — a spawn-claim is keyed by URI, a
+                // continue-claim by session id — but a `HeldClaim` carries the
+                // lease id + server regardless, so the release is identical.
+                for (key, held) in held_claims.drain() {
                     if Instant::now() >= deadline {
                         log.warn(
                             "drain.claim_release_budget",
@@ -471,11 +492,11 @@ pub fn run_reactive(
                     ) {
                         Ok(()) => {
                             released += 1;
-                            log.info("claim.released", json!({"uri": uri, "reason": "draining"}));
+                            log.info("claim.released", json!({"key": key, "reason": "draining"}));
                         }
                         Err(e) => log.warn(
                             "drain.claim_release_failed",
-                            json!({"uri": uri, "lease": held.lease_id, "err": e}),
+                            json!({"key": key, "lease": held.lease_id, "err": e}),
                         ),
                     }
                 }
@@ -525,18 +546,29 @@ pub fn run_reactive(
                     #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
                     let mut payload = reactive_payload(&base, &delivery.uri, &content);
 
-                    // CLAIM GATE (RFC 0019 §3.4), `cluster`-gated: for a claim
-                    // route, claim the item BEFORE spawning and proceed only on a
-                    // granted lease. The spawned reaction then runs with the
+                    // CLAIM GATE (RFC 0019 §3.4), `cluster`-gated: for a SPAWN
+                    // claim route, claim the item BEFORE spawning and proceed only
+                    // on a granted lease. The spawned reaction then runs with the
                     // item-derived RUN_ID so every downstream side-effect dedupes
-                    // on the same key (RFC 0019 §3.5 / RFC 0011 §6.2).
+                    // on the same key (RFC 0019 §3.5 / RFC 0011 §6.2). A
+                    // continue-claim route is handled in the Continue arm (its URI
+                    // routes there, never here) — guard it anyway so the spawn
+                    // path stays exclusively spawn-claims.
                     #[cfg(feature = "cluster")]
-                    if let Some(spec) = claim_by_uri.get(&delivery.uri) {
+                    if let Some(spec) = claim_by_uri.get(&delivery.uri)
+                        && !spec.continue_session
+                    {
                         let claim_key =
                             crate::cluster::derive_claim_key(&delivery.uri, &spec.route_id);
                         let meta = claim_meta(cfg, &claim_key);
                         let coord = &servers[spec.server_idx];
-                        match crate::cluster::claim(coord, &delivery.uri, spec.ttl, meta) {
+                        match crate::cluster::claim_styled(
+                            coord,
+                            spec.style,
+                            &delivery.uri,
+                            spec.ttl,
+                            meta,
+                        ) {
                             crate::cluster::ClaimOutcome::Lost { held_by } => {
                                 crate::obs::metrics::record_claim_lost();
                                 log.info(
@@ -566,6 +598,9 @@ pub fn run_reactive(
                                         server_idx: spec.server_idx,
                                         lease_id,
                                         claim_key: claim_key.clone(),
+                                        ttl: spec.ttl,
+                                        renew_fraction: spec.renew_fraction,
+                                        last_renew: Instant::now(),
                                     },
                                 );
                                 // RUN_ID narrowing (RFC 0019 §3.5): the child
@@ -601,8 +636,84 @@ pub fn run_reactive(
                     // Deliver into the one warm session for this route (spawn it
                     // on the first event, inject thereafter). Non-blocking — the
                     // session's turn outcomes are drained below.
-                    let payload = reactive_payload(&base, &delivery.uri, &content);
+                    #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+                    let mut payload = reactive_payload(&base, &delivery.uri, &content);
                     let event = changed_message(&delivery.uri, &content);
+
+                    // CONTINUE-CLAIM GATE (RFC 0019 §3.4), `cluster`-gated. A
+                    // continue-claim route claims the item BEFORE delivering into
+                    // the warm session, and HOLDS the lease for the session's life
+                    // (keyed by the session id, not the URI — a warm session spans
+                    // many deliveries). Mirrors the Spawn-arm gate, but the held
+                    // claim is settled when the session ENDS (terminal/drain), not
+                    // per delivery; the renew heartbeat (below) keeps a long
+                    // session's lease alive. A session that is already live holds
+                    // its lease → deliver directly (no re-claim).
+                    #[cfg(feature = "cluster")]
+                    if let Some(spec) = claim_by_uri.get(&delivery.uri)
+                        && spec.continue_session
+                        && !held_claims.contains_key(&session_id)
+                    {
+                        let claim_key =
+                            crate::cluster::derive_claim_key(&delivery.uri, &spec.route_id);
+                        let meta = claim_meta(cfg, &claim_key);
+                        let coord = &servers[spec.server_idx];
+                        match crate::cluster::claim_styled(
+                            coord,
+                            spec.style,
+                            &delivery.uri,
+                            spec.ttl,
+                            meta,
+                        ) {
+                            crate::cluster::ClaimOutcome::Lost { held_by } => {
+                                crate::obs::metrics::record_claim_lost();
+                                log.info(
+                                    "claim.lost",
+                                    json!({"uri": delivery.uri, "held_by": held_by, "session": session_id}),
+                                );
+                                continue; // another replica owns it — skip.
+                            }
+                            crate::cluster::ClaimOutcome::Error(e) => {
+                                // A failed claim never kills the daemon (RFC 0019
+                                // §8 row 6): skip this delivery, keep serving.
+                                log.error(
+                                    "claim.error",
+                                    json!({"uri": delivery.uri, "err": e, "session": session_id}),
+                                );
+                                continue;
+                            }
+                            crate::cluster::ClaimOutcome::Granted {
+                                lease_id,
+                                expires_in_ms,
+                            } => {
+                                crate::obs::metrics::record_claim_granted();
+                                log.info(
+                                    "claim.granted",
+                                    json!({"uri": delivery.uri, "expires_in_ms": expires_in_ms, "session": session_id}),
+                                );
+                                // Key the held claim by the SESSION id (it outlives
+                                // this delivery), carrying the TTL cadence so the
+                                // heartbeat can renew it while the session is live.
+                                held_claims.insert(
+                                    session_id.clone(),
+                                    HeldClaim {
+                                        server_idx: spec.server_idx,
+                                        lease_id,
+                                        claim_key: claim_key.clone(),
+                                        ttl: spec.ttl,
+                                        renew_fraction: spec.renew_fraction,
+                                        last_renew: Instant::now(),
+                                    },
+                                );
+                                // RUN_ID narrowing (RFC 0019 §3.5): the warm
+                                // session stamps every side-effect `_meta.agentd/
+                                // run_id` from this field, so a redelivered item
+                                // dedupes on the same item-derived claim key.
+                                payload.telemetry.run_id = claim_key;
+                            }
+                        }
+                    }
+
                     log.info(
                         "trigger.fired",
                         json!({"uri": delivery.uri, "bytes": content.len(), "session": session_id}),
@@ -618,9 +729,30 @@ pub fn run_reactive(
         }
 
         // Drain any warm continue-sessions: each completed turn may itself
-        // self-schedule / self-subscribe, applied like a Spawn reaction's.
-        for (_session, outcome) in warm.drain(log) {
+        // self-schedule / self-subscribe, applied like a Spawn reaction's. A
+        // session that ENDED this pass settles its continue-held claim (RFC 0019
+        // §3.4): a terminal `completed` acks, anything else releases.
+        let warm_drained = warm.drain(log);
+        for (_session, outcome) in warm_drained.turns {
             apply_effects(outcome, &mut wakes, &mut router, &mut owner, &servers, log);
+        }
+        #[cfg(feature = "cluster")]
+        for (session_id, terminal) in warm_drained.ended {
+            if let Some(held) = held_claims.remove(&session_id) {
+                settle_session_claim(&servers, &held, terminal, &session_id, log);
+            }
+        }
+        #[cfg(not(feature = "cluster"))]
+        let _ = warm_drained.ended;
+
+        // Renew heartbeat (RFC 0019 §3.3 / §8 row 7): keep every still-held
+        // (continue) claim's lease alive while its warm session runs. Cheap — a
+        // timestamp compare per held claim, a `work.renew` only on the cadence
+        // boundary (`ttl * renew_fraction`). A spawn-claim is settled inline
+        // before this pass, so only live continue-holds are ever renewed.
+        #[cfg(feature = "cluster")]
+        if !held_claims.is_empty() {
+            renew_held_claims(&servers, &mut held_claims, log);
         }
 
         // Fire due self-scheduled wake-ups: each runs its own instruction as a
@@ -1277,6 +1409,93 @@ fn settle_claim(servers: &[McpClient], held: &HeldClaim, outcome: Option<&Outcom
                 "claim.release_failed",
                 json!({"lease": held.lease_id, "err": e}),
             ),
+        }
+    }
+}
+
+/// Settle a continue-claim when its WARM SESSION ends (RFC 0019 §3.4). Unlike
+/// the spawn-claim (settled inline within one deliver iteration), a continue
+/// session holds its lease across many deliveries; this runs when the session
+/// reaches its END. `terminal` is the session's terminal disposition:
+/// `Some(Completed)` acks (the side effect is committed + collapses on a
+/// redelivered-but-already-acked item); any other terminal status — or a
+/// `None` (the session failed / its process died, no clean completion) —
+/// releases so the item is immediately re-claimable. Best-effort: a failed
+/// ack/release is logged + counted, never fatal (the lease TTL is the backstop).
+#[cfg(feature = "cluster")]
+fn settle_session_claim(
+    servers: &[McpClient],
+    held: &HeldClaim,
+    terminal: Option<TerminalStatus>,
+    session_id: &str,
+    log: &Logger,
+) {
+    let coord = &servers[held.server_idx];
+    if terminal == Some(TerminalStatus::Completed) {
+        match crate::cluster::claim::ack(coord, &held.lease_id, &held.claim_key) {
+            Ok(()) => log.info(
+                "claim.acked",
+                json!({"lease": held.lease_id, "session": session_id}),
+            ),
+            Err(e) => log.warn(
+                "claim.ack_failed",
+                json!({"lease": held.lease_id, "session": session_id, "err": e}),
+            ),
+        }
+    } else {
+        crate::obs::metrics::record_claim_released();
+        match crate::cluster::claim::release(coord, &held.lease_id, "wind-down") {
+            Ok(()) => log.info(
+                "claim.released",
+                json!({"lease": held.lease_id, "session": session_id}),
+            ),
+            Err(e) => log.warn(
+                "claim.release_failed",
+                json!({"lease": held.lease_id, "session": session_id, "err": e}),
+            ),
+        }
+    }
+}
+
+/// The renew heartbeat (RFC 0019 §3.3 / §3.6 / §8 row 7): each tick, for every
+/// continue-held claim whose work is still in flight (a live warm session),
+/// renew the lease when `now - last_renew >= ttl * renew_fraction` so a long
+/// session does not lose its lease to TTL expiry. Best-effort: a failed renew is
+/// logged + counted, never fatal — the item may redeliver if the lease expires
+/// (at-least-once + item-derived idempotency, §3.5, holds). Cheap: a timestamp
+/// compare per held claim per tick, a `work.renew` round-trip only on the
+/// cadence boundary. Spawn-claims never reach here (settled inline within a
+/// tick, before this pass).
+#[cfg(feature = "cluster")]
+fn renew_held_claims(
+    servers: &[McpClient],
+    held_claims: &mut HashMap<String, HeldClaim>,
+    log: &Logger,
+) {
+    let now = Instant::now();
+    for (key, held) in held_claims.iter_mut() {
+        let cadence = held.ttl.mul_f64(held.renew_fraction);
+        if now.duration_since(held.last_renew) < cadence {
+            continue; // not yet due — the cheap path most ticks take.
+        }
+        match crate::cluster::claim::renew(&servers[held.server_idx], &held.lease_id, held.ttl) {
+            Ok(()) => {
+                held.last_renew = now;
+                log.info("claim.renewed", json!({"lease": held.lease_id, "key": key}));
+            }
+            Err(e) => {
+                // Best-effort: log, but DO advance `last_renew` so we don't
+                // hammer a flapping coordination server every tick — the next
+                // cadence window retries. The lease TTL is the backstop, and a
+                // lease that expires merely redelivers the item (at-least-once +
+                // item-derived idempotency, §3.5). No NEW metric (the RFC 0016
+                // schema is frozen) — the `claim.renew_failed` log line counts it.
+                held.last_renew = now;
+                log.warn(
+                    "claim.renew_failed",
+                    json!({"lease": held.lease_id, "key": key, "err": e}),
+                );
+            }
         }
     }
 }

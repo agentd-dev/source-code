@@ -18,7 +18,7 @@
 //! because the reactive daemon is single-threaded (events are processed
 //! serially), so the daemon never races itself.
 
-use crate::agentloop::stop::Outcome;
+use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
 use crate::supervisor::spawn::{Subagent, spawn};
@@ -33,6 +33,21 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 struct Warm {
     sub: Subagent,
     rx: Receiver<(NodeId, AgentMsg)>,
+}
+
+/// What one [`WarmRegistry::drain`] pass yields: the completed turns to apply
+/// self-* effects for, and the sessions that ENDED this pass (with their
+/// terminal disposition) so a continue-claim holder can ack/release the lease
+/// keyed by the session (RFC 0019 §3.4).
+pub struct WarmDrain {
+    /// `(session_id, outcome)` for each completed turn (a warm session stays
+    /// alive after a turn — self-schedule / self-subscribe effects are applied).
+    pub turns: Vec<(String, Outcome)>,
+    /// `(session_id, terminal)` for each session that ended this pass.
+    /// `Some(status)` from a terminal `Result` (status drives ack vs release);
+    /// `None` from a `Failed` / channel disconnect (no clean completion → the
+    /// holder releases so the item is immediately re-claimable).
+    pub ended: Vec<(String, Option<TerminalStatus>)>,
 }
 
 /// The set of live warm continue-sessions, keyed by route `session_id`.
@@ -87,12 +102,20 @@ impl WarmRegistry {
         Ok(true)
     }
 
-    /// Drain a tick's frames from every live session: return each completed
-    /// turn's `(session_id, outcome)` for the daemon to apply self-* effects,
-    /// and reap any session that ended (terminal `Result`/`Failed`, or its
-    /// channel disconnected = the process died).
-    pub fn drain(&mut self, log: &Logger) -> Vec<(String, Outcome)> {
+    /// Drain a tick's frames from every live session, returning a
+    /// [`WarmDrain`]: each completed turn's `(session_id, outcome)` for the daemon
+    /// to apply self-* effects, AND each ENDED session's `(session_id, terminal)`
+    /// so a continue-claim holder can ack (terminal `completed`) or release
+    /// (anything else) the lease keyed by that session (RFC 0019 §3.4). A session
+    /// ends on a terminal `Result{outcome}` (its status is the terminal one), a
+    /// `Failed{..}` (infra death — no clean completion → `None` → release), or a
+    /// channel disconnect (the process died → `None` → release). Reaps every
+    /// ended session.
+    pub fn drain(&mut self, log: &Logger) -> WarmDrain {
         let mut turns = Vec::new();
+        // (session_id, terminal-status-if-clean): Some(status) from a terminal
+        // Result; None from a Failed / disconnect (no terminal outcome → release).
+        let mut ended: Vec<(String, Option<TerminalStatus>)> = Vec::new();
         let mut dead = Vec::new();
         for (id, w) in self.sessions.iter_mut() {
             loop {
@@ -104,8 +127,18 @@ impl WarmRegistry {
                         );
                         turns.push((id.clone(), outcome));
                     }
-                    Ok((_, AgentMsg::Result { .. })) | Ok((_, AgentMsg::Failed { .. })) => {
-                        log.info("warm.ended", json!({"session": id}));
+                    Ok((_, AgentMsg::Result { outcome })) => {
+                        log.info(
+                            "warm.ended",
+                            json!({"session": id, "status": outcome.status.as_str()}),
+                        );
+                        ended.push((id.clone(), Some(outcome.status)));
+                        dead.push(id.clone());
+                        break;
+                    }
+                    Ok((_, AgentMsg::Failed { .. })) => {
+                        log.info("warm.ended", json!({"session": id, "status": "failed"}));
+                        ended.push((id.clone(), None)); // infra death → release
                         dead.push(id.clone());
                         break;
                     }
@@ -113,6 +146,7 @@ impl WarmRegistry {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         log.warn("warm.died", json!({"session": id}));
+                        ended.push((id.clone(), None)); // process died → release
                         dead.push(id.clone());
                         break;
                     }
@@ -122,7 +156,7 @@ impl WarmRegistry {
         for id in &dead {
             self.sessions.remove(id); // Subagent::Drop kills + reaps (ECHILD-tolerant)
         }
-        turns
+        WarmDrain { turns, ended }
     }
 
     /// Fan an intelligence hot-swap (RFC 0018 §5.2) to every live warm session —
@@ -171,5 +205,30 @@ mod tests {
         let r = WarmRegistry::default();
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn drain_of_an_empty_registry_yields_no_turns_and_no_ended() {
+        // The continue-claim settle pass keys off `ended`; an empty registry must
+        // produce an empty `ended` (nothing to ack/release), not panic.
+        let mut r = WarmRegistry::default();
+        let d = r.drain(&test_logger());
+        assert!(d.turns.is_empty());
+        assert!(d.ended.is_empty());
+    }
+
+    fn test_logger() -> Logger {
+        use crate::obs::log::{Comp, Level, LogCtx};
+        Logger::new(
+            LogCtx {
+                run_id: "t".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: 0,
+                trace_id: None,
+            },
+            Level::Error,
+        )
     }
 }

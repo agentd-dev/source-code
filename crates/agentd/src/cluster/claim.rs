@@ -41,6 +41,13 @@ pub struct ClaimSpec {
     pub renew_fraction: f64,
     pub style: ClaimStyle,
     pub route_id: String,
+    /// Whether this claim route delivers into a warm `--continue` session (RFC
+    /// 0019 §3.4): the lease is held across many deliveries for the session's
+    /// life — claimed on the session's first delivery, renewed by the heartbeat
+    /// while live, acked/released when the session ENDS — rather than
+    /// claimed→settled within one synchronous spawn. Spawn-claims never need the
+    /// heartbeat (settled inline within a tick); continue-claims do.
+    pub continue_session: bool,
 }
 
 /// The outcome of a `work.claim` round-trip (RFC 0019 §3.2). `Granted` carries the
@@ -78,6 +85,49 @@ pub fn claim(client: &McpClient, item: &str, ttl: Duration, meta: Value) -> Clai
         }
         Err(e) => ClaimOutcome::Error(e.to_string()),
     }
+}
+
+/// Claim one item, dispatching on the route's [`ClaimStyle`] (RFC 0019 §3.3 / RFC
+/// 0015 §5.6). `Tool` (the default + implemented path) calls `work.claim`.
+///
+/// `Resource` is a **documented stub** in v1, and DELIBERATELY so: RFC 0015 §5.6
+/// freezes the *direction* ("`work.claim` degenerates to a conditional CAS
+/// `tools/call` the server exposes, observed after a `resources/read`") but does
+/// NOT freeze the CAS tool's NAME or its compare-and-set argument shape. Building
+/// it would mean inventing an unfrozen server-side contract that two servers
+/// could interpret differently — a path that could **double-grant**, which is the
+/// one thing the claim convention must never do (RFC 0019 §8 row 1 / §10). So
+/// rather than half-build it, a `resource`-style claim returns a loud `Error`
+/// (the daemon skips the delivery, keeps serving) — never a silent proceed.
+///
+/// A `resource`-style route also fails startup validation today
+/// (`advertises_work_tools` requires `work.claim`+`work.ack`, which a pure
+/// resource-lease server need not advertise → exit 2), so this is a
+/// belt-and-braces second guard, not the primary gate. When the CAS contract is
+/// frozen, the implementation slots in HERE behind the same `ClaimOutcome` so the
+/// gate (and the whole lifecycle) is untouched.
+pub fn claim_styled(
+    client: &McpClient,
+    style: ClaimStyle,
+    item: &str,
+    ttl: Duration,
+    meta: Value,
+) -> ClaimOutcome {
+    match style {
+        ClaimStyle::Tool => claim(client, item, ttl, meta),
+        ClaimStyle::Resource => resource_style_unimplemented(),
+    }
+}
+
+/// The `resource`-style (CAS) documented-stub outcome (RFC 0015 §5.6): a loud
+/// `Error`, never a silent grant. Factored out so the stub message has one home
+/// and a test can assert it without a live client.
+fn resource_style_unimplemented() -> ClaimOutcome {
+    ClaimOutcome::Error(
+        "claim.style=resource (CAS) is not implemented in v1 — the compare-and-set \
+         contract is not frozen (RFC 0015 §5.6); use claim.style=tool"
+            .into(),
+    )
 }
 
 /// Extend a held lease (RFC 0019 §3.3). Best-effort: returns the transport error
@@ -290,6 +340,22 @@ mod tests {
             parse_claim_result(&json!("nope")),
             ClaimOutcome::Error(_)
         ));
+    }
+
+    #[test]
+    fn resource_style_claim_is_a_loud_stub_never_a_silent_grant() {
+        // A `resource`-style claim must NEVER silently proceed (the CAS contract
+        // is unfrozen — RFC 0015 §5.6); it is a loud `Error` the gate skips on,
+        // so it can never double-grant. (The tool arm is covered end-to-end by
+        // the work_claim conformance suite, which needs a live coordination
+        // server.)
+        match resource_style_unimplemented() {
+            ClaimOutcome::Error(e) => {
+                assert!(e.contains("resource"), "stub error names the style: {e}");
+                assert!(e.contains("not frozen"), "stub error explains why: {e}");
+            }
+            other => panic!("resource-style must be a loud Error, got {other:?}"),
+        }
     }
 
     #[test]

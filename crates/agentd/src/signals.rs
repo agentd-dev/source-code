@@ -239,11 +239,23 @@ mod imp {
             }
         }
     }
+
+    /// Test-only: clear the one-way `DRAINING`/`FORCE` latches (production has no
+    /// clear — drain is monotonic for a process's life). The signals test guard
+    /// uses this so a draining test cannot poison readiness for later tests that
+    /// share this process (cargo runs tests multithreaded in one binary).
+    #[cfg(test)]
+    pub fn clear_drain_for_test() {
+        DRAINING.store(false, Ordering::SeqCst);
+        FORCE.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(not(unix))]
 mod imp {
     pub fn install() {}
+    #[cfg(test)]
+    pub fn clear_drain_for_test() {}
     pub fn draining() -> bool {
         false
     }
@@ -375,4 +387,54 @@ pub fn wakeup_fd() -> i32 {
 /// Drain pending wakeup bytes after a wake.
 pub fn drain_wakeup() {
     imp::drain_wakeup()
+}
+
+// ── Test isolation for the process-global signal state ──────────────────────
+// `DRAINING` is a one-way latch and `PAUSED`/`LAME_DUCK`/`RELOADING` are
+// process-global, so tests that touch them race + poison each other when cargo
+// runs them in parallel within one test binary (e.g. a drain test leaves
+// `DRAINING` set, breaking every later readiness assertion). Every test that
+// reads OR writes this state takes `test_guard()`: it serializes them on one
+// mutex and resets the state to a clean slate for the test body.
+#[cfg(test)]
+static SIGNALS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reset every process-global signal latch to its initial (unset) state.
+/// Test-only; called under the [`test_guard`] lock.
+#[cfg(test)]
+pub fn reset_for_test() {
+    imp::clear_drain_for_test();
+    set_lame_duck(false);
+    set_paused(false);
+    set_reloading(false);
+    clear_reload();
+}
+
+/// RAII guard from [`test_guard`]. Resets the signal state on BOTH acquire and
+/// drop — the drop reset runs while the mutex is still held (the inner
+/// `MutexGuard` field drops after this `Drop::drop`), so a test that latches
+/// `DRAINING` cannot leak it to the next test between lock-release and the next
+/// acquire's reset.
+#[cfg(test)]
+pub struct SignalsTestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for SignalsTestGuard {
+    fn drop(&mut self) {
+        reset_for_test();
+    }
+}
+
+/// Serialize + clean-slate a test that touches the process-global signal state.
+/// `let _g = crate::signals::test_guard();` at the top of the test, held for the
+/// whole body, so no other signals-touching test interleaves. State is reset on
+/// entry AND on drop (under the lock), so nothing leaks across tests. Recovers a
+/// poisoned lock (a panicking test should not wedge the rest of the suite).
+#[cfg(test)]
+pub fn test_guard() -> SignalsTestGuard {
+    let g = SIGNALS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    reset_for_test();
+    SignalsTestGuard(g)
 }

@@ -173,6 +173,7 @@ mod tests {
 
     #[test]
     fn readyz_flips_503_under_lame_duck_then_clears() {
+        let _g = crate::signals::test_guard();
         // Clean baseline (other tests share these process-global latches).
         crate::signals::set_lame_duck(false);
         // Pre-condition: not draining here (no SIGTERM in unit tests) → ready.
@@ -231,6 +232,7 @@ mod tests {
     // live and keeps its pod; only the reactor itself wedging flips liveness.
     #[test]
     fn healthz_reflects_only_the_reactor_heartbeat() {
+        let _sig = crate::signals::test_guard();
         // Hold the heartbeat lock so a concurrent test's `tick()` cannot race the
         // wedged-path assertion (the shared `LAST_TICK_MS` is process-global).
         let _g = crate::obs::health::HEARTBEAT_TEST_LOCK.lock().unwrap();

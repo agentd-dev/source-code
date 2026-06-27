@@ -42,7 +42,7 @@ RUN if [ -n "$FEATURES" ]; then \
 FROM scratch
 
 # OCI image metadata (populated by CI via --build-arg; harmless defaults locally).
-ARG VERSION="2.0.1"
+ARG VERSION="2.1.0"
 ARG REVISION="unknown"
 ARG CREATED="1970-01-01T00:00:00Z"
 LABEL org.opencontainers.image.title="agentd" \

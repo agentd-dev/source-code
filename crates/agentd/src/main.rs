@@ -267,24 +267,82 @@ fn serve_self_mcp(
     cfg: &Config,
     log: &Logger,
 ) -> Option<agentd::mcp::server::ServeHandle> {
-    let path = spec.strip_prefix("unix:").unwrap_or(spec);
-    let ctx = agentd::mcp::server::ServeCtx::new(
-        cfg.run_id.clone(),
-        cfg.mode.as_str().to_string(),
-        exe.to_path_buf(),
-        base,
-        cfg.drain_timeout,
-    );
-    match agentd::mcp::server::serve(path, ctx, log.clone()) {
+    use agentd::config::ServeTarget;
+    // The target is already validated at config load (exit 2 on a bad scheme/port),
+    // so a parse failure here is unexpected — surface it and stay inert rather than
+    // panic.
+    let target = match ServeTarget::parse(spec) {
+        Ok(t) => t,
+        Err(e) => {
+            log.error(
+                "mcp.serve_fail",
+                json!({"spec": spec, "err": e.to_string()}),
+            );
+            return None;
+        }
+    };
+    let new_ctx = || {
+        agentd::mcp::server::ServeCtx::new(
+            cfg.run_id.clone(),
+            cfg.mode.as_str().to_string(),
+            exe.to_path_buf(),
+            base.clone(),
+            cfg.drain_timeout,
+            std::sync::Arc::new(cfg.clone()),
+        )
+    };
+    match target {
+        ServeTarget::Unix(path) => {
+            let path = path.to_string_lossy().into_owned();
+            match agentd::mcp::server::serve(&path, new_ctx(), log.clone()) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    log.error(
+                        "mcp.serve_fail",
+                        json!({"path": path, "err": e.to_string()}),
+                    );
+                    None
+                }
+            }
+        }
+        ServeTarget::Vsock { cid, port } => serve_self_mcp_vsock(cid, port, new_ctx(), log),
+    }
+}
+
+/// Bind the served self-MCP over vsock when this build has the `vsock` feature;
+/// otherwise stay inert (config validation already rejects `vsock:` on a
+/// non-vsock build, so this arm is only reached on a `vsock` build).
+#[cfg(all(feature = "serve-mcp", feature = "vsock"))]
+fn serve_self_mcp_vsock(
+    cid: u32,
+    port: u32,
+    ctx: agentd::mcp::server::ServeCtx,
+    log: &Logger,
+) -> Option<agentd::mcp::server::ServeHandle> {
+    match agentd::mcp::server::serve_vsock(cid, port, ctx, log.clone()) {
         Ok(handle) => Some(handle),
         Err(e) => {
             log.error(
                 "mcp.serve_fail",
-                json!({"path": path, "err": e.to_string()}),
+                json!({"transport": "vsock", "cid": cid, "port": port, "err": e.to_string()}),
             );
             None
         }
     }
+}
+
+#[cfg(all(feature = "serve-mcp", not(feature = "vsock")))]
+fn serve_self_mcp_vsock(
+    cid: u32,
+    port: u32,
+    _ctx: agentd::mcp::server::ServeCtx,
+    log: &Logger,
+) -> Option<agentd::mcp::server::ServeHandle> {
+    log.warn(
+        "mcp.serve_unavailable",
+        json!({"transport": "vsock", "cid": cid, "port": port, "reason": "built without --features vsock"}),
+    );
+    None
 }
 
 #[cfg(not(feature = "serve-mcp"))]

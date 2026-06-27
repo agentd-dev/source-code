@@ -19,7 +19,7 @@ permissions:
 # config hot-reload — still a fully static, 3-dependency binary. (Need tls/vsock?
 # build from source; the default reaches intelligence over unix: to a sidecar.)
 env:
-  FEATURES: "metrics,serve-mcp,cron,otel,cluster,hot-reload"
+  FEATURES: "metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

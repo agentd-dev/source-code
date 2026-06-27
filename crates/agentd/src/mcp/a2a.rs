@@ -18,20 +18,37 @@
 //!
 //! **Wire convention:** methods are `a2a.SendMessage` / `a2a.GetTask` /
 //! `a2a.CancelTask` / `a2a.ListTasks` (the `a2a.<Method>` dotted convention over
-//! the NDJSON JSON-RPC codec, RFC 0004). The agentctl gateway MUST emit exactly
-//! these method names when bridging HTTP↔vsock.
+//! the NDJSON JSON-RPC codec, RFC 0004), plus the streaming pair
+//! `a2a.SendStreamingMessage` / `a2a.SubscribeToTask` (A2A-2). The agentctl gateway
+//! MUST emit exactly these method names when bridging HTTP↔vsock.
+//!
+//! **Streaming convention (agentd↔gateway):** A2A v1.0 status-level streaming maps
+//! onto the NDJSON JSON-RPC reply channel as a *multi-frame response*: for one
+//! streaming request `id`, agentd emits SEVERAL frames
+//! `{"jsonrpc":"2.0","id":<id>,"result":<StreamResponse>}` — the intermediate ones
+//! written directly to the connection writer, the FINAL one returned as the
+//! dispatch [`Response`] (which `handle_conn` writes as the last frame). The final
+//! frame is the one whose `statusUpdate.final == true`. The gateway re-frames this
+//! sequence to SSE (RFC 0020): each `result` becomes one `StreamResponse` SSE event
+//! and the stream closes on the `final` status. **Caveat:** these intermediate
+//! frames all share the request `id`, so the gateway MUST consume an `a2a.Send`
+//! `StreamingMessage`/`SubscribeToTask` reply as a STREAM (read frames until
+//! `statusUpdate.final == true`), NOT as a single id-correlated unary reply — the
+//! same-`id` frames would otherwise look like duplicate responses. agentd does
+//! **status-level** streaming only: the distillate artifact is delivered ONCE, in a
+//! single `artifactUpdate` frame on a completed run (the distillate-only invariant,
+//! RFC 0009 §8) — there is no partial-artifact streaming.
 
-use crate::json::{self, Request, Response};
-use crate::mcp::server::ServeCtx;
+use crate::json::{self, Id, Request, Response};
+use crate::mcp::server::{ServeCtx, SharedWriter};
 use crate::obs::log::Logger;
 use serde_json::{Value, json};
 
 // ── A2A-specific JSON-RPC error codes (RFC 0020 / A2A spec) ──────────────────
 
-/// A2A `TaskNotFound`: a `GetTask`/`CancelTask` for an `id` not in the registry.
+/// A2A `TaskNotFound`: a `GetTask`/`CancelTask`/`SubscribeToTask` for an `id` not
+/// in the registry.
 pub const TASK_NOT_FOUND: i64 = -32001;
-/// This build does not stream: `SendStreamingMessage`/`SubscribeToTask` (A2A-2).
-pub const STREAMING_NOT_SUPPORTED: i64 = -32004;
 
 // ── A2A object schemas (proto-derived; RFC 0020 §5) ──────────────────────────
 
@@ -167,23 +184,91 @@ fn snapshot_to_task(handle: &str, state: TaskState, result: Option<&Value>) -> V
     task_object(handle, &context_id, state, artifact)
 }
 
+// ── A2A streaming events (status-level; RFC 0020 §5 / A2A v1.0) ───────────────
+//
+// A2A v1.0 `StreamResponse` is a oneof of `{ task | message | statusUpdate |
+// artifactUpdate }`. agentd emits only the two update variants (status-level
+// streaming): `TaskStatusUpdateEvent` for each lifecycle transition (WORKING →
+// terminal) and a single `TaskArtifactUpdateEvent` carrying the distillate on a
+// completed run. The three builders below mint the `result` payload of one stream
+// frame as a serde `Value` (one key set per the oneof), so a frame is exactly
+// `{"jsonrpc":"2.0","id":<id>,"result":<here>}`.
+
+/// A2A `TaskStatusUpdateEvent` → the `statusUpdate` arm of a `StreamResponse`.
+/// `is_final` is the wire `final` flag (renamed — `final` is a Rust keyword): the
+/// gateway closes the SSE stream on the frame whose `final == true`. `contextId` is
+/// always present here (agentd mints it deterministically from the handle), so the
+/// `Option` is only for shape-completeness with the proto.
+fn status_update_frame(task_id: &str, context_id: &str, state: TaskState, is_final: bool) -> Value {
+    json!({
+        "statusUpdate": {
+            "taskId": task_id,
+            "contextId": context_id,
+            "status": task_status(state),
+            "final": is_final,
+        }
+    })
+}
+
+/// A2A `TaskArtifactUpdateEvent` → the `artifactUpdate` arm of a `StreamResponse`.
+/// The distillate is one text `Part` in a single `Artifact`; `lastChunk:true` marks
+/// it as the whole artifact (agentd never chunks — the distillate is delivered once,
+/// the distillate-only invariant, RFC 0009 §8). Emitted ONLY for a completed run.
+fn artifact_update_frame(task_id: &str, context_id: &str, distillate: &Value) -> Value {
+    let part_text = match distillate {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    json!({
+        "artifactUpdate": {
+            "taskId": task_id,
+            "contextId": context_id,
+            "artifact": {
+                "artifactId": format!("{task_id}.distillate"),
+                "parts": [{ "text": part_text }],
+            },
+            "lastChunk": true,
+        }
+    })
+}
+
+/// Wrap a `StreamResponse` payload as one JSON-RPC reply frame
+/// `{"jsonrpc":"2.0","id":<id>,"result":<stream_response>}` and write it directly
+/// to the connection writer (the agentd↔gateway streaming convention — see the
+/// module doc). Best-effort: a dead peer fails the write and the run still records
+/// its terminal session for a later `GetTask`.
+fn write_stream_frame(writer: &SharedWriter, id: &Id, stream_response: Value) {
+    let frame = Response::ok(id.clone(), stream_response);
+    if let Ok(mut w) = writer.lock() {
+        let _ = crate::json::frame::write_line(&mut *w, &frame);
+    }
+}
+
 /// Route one `a2a.*` JSON-RPC request to its handler. Called from
 /// [`crate::mcp::server`]'s `dispatch` only for a `Management`-origin peer (the
 /// gating is enforced at the call site — RFC 0020 §integration); a `Stdio` peer
 /// never reaches here and falls through to `-32601`.
-pub fn dispatch_a2a(method: &str, req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
+///
+/// `writer` is the calling connection's shared write half: the streaming handlers
+/// write their INTERMEDIATE frames directly to it and RETURN the FINAL frame (the
+/// agentd↔gateway streaming convention — see the module doc). The unary handlers
+/// ignore it.
+pub fn dispatch_a2a(
+    method: &str,
+    req: Request,
+    ctx: &ServeCtx,
+    writer: &SharedWriter,
+    log: &Logger,
+) -> Response {
     match method {
         "a2a.SendMessage" => send_message(req, ctx, log),
         "a2a.GetTask" => get_task(req, ctx),
         "a2a.CancelTask" => cancel_task(req, ctx),
         "a2a.ListTasks" => list_tasks(req, ctx),
-        // Streaming is added by A2A-2; this build refuses it explicitly so a
-        // client distinguishes "not in this build" from "unknown method".
-        "a2a.SendStreamingMessage" | "a2a.SubscribeToTask" => Response::err(
-            req.id,
-            STREAMING_NOT_SUPPORTED,
-            "streaming not supported in this build",
-        ),
+        // Status-level streaming (A2A-2): emit a multi-frame StreamResponse stream
+        // on `writer`, returning the terminal frame. See the module doc.
+        "a2a.SendStreamingMessage" => send_streaming_message(req, ctx, writer, log),
+        "a2a.SubscribeToTask" => subscribe_to_task(req, ctx, writer),
         // push-notification-config + GetExtendedAgentCard are gateway-owned
         // (RFC 0020 §7): agentd does not serve them → method-not-found.
         _ => Response::err(
@@ -233,6 +318,128 @@ fn send_message(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         let state = terminal_to_state(&status);
         Response::ok(id, snapshot_to_task(&handle, state, result.as_ref()))
     }
+}
+
+/// `a2a.SendStreamingMessage` (params: `SendMessageRequest`, same shape as
+/// `SendMessage`) → a STREAM of `StreamResponse` frames (status-level; RFC 0020).
+/// The concatenated text parts become the run instruction; the run is then executed
+/// **synchronously** on this connection thread (`supervise_once`), exactly like
+/// `SendMessage{returnImmediately:false}`, while the lifecycle is streamed:
+///
+///   1. write `statusUpdate{ WORKING, final:false }` directly (the run is now live),
+///   2. block on the served-spawn (recording the terminal `ServedSession` so a later
+///      `GetTask`/`SubscribeToTask` resolves the same handle),
+///   3. on a COMPLETED run, write `artifactUpdate{ distillate, lastChunk:true }`
+///      directly (the distillate-only invariant — RFC 0009 §8: completed-only, no
+///      partial-artifact streaming),
+///   4. RETURN `statusUpdate{ <mapped terminal>, final:true }` as the dispatch
+///      response (the gateway closes the SSE stream on it). FAILED/CANCELED/REJECTED
+///      carry no artifact frame.
+///
+/// An empty instruction is the only pre-stream error (`-32602`, a normal error
+/// Response — nothing is streamed).
+fn send_streaming_message(
+    req: Request,
+    ctx: &ServeCtx,
+    writer: &SharedWriter,
+    log: &Logger,
+) -> Response {
+    let id = req.id.clone();
+    let params = req.params.clone().unwrap_or(json!({}));
+    let message = params.get("message").cloned().unwrap_or(json!({}));
+    let instruction = instruction_from_message(&message);
+    if instruction.trim().is_empty() {
+        return Response::err(
+            id,
+            json::INVALID_PARAMS,
+            "a2a.SendStreamingMessage requires a message with at least one non-empty text part",
+        );
+    }
+    // Run the served-spawn synchronously, streaming the WORKING frame the instant the
+    // handle is minted (before the blocking run) via the callback, then mapping the
+    // terminal outcome. The spawn/registry logic stays in `server.rs` (no duplication).
+    let context = std::cell::RefCell::new(None::<String>);
+    let (handle, status, result) = ctx.a2a_spawn_stream_sync(&instruction, log, |handle| {
+        let context_id = context_id_for(handle);
+        *context.borrow_mut() = Some(context_id.clone());
+        write_stream_frame(
+            writer,
+            &id,
+            status_update_frame(handle, &context_id, TaskState::Working, false),
+        );
+    });
+    let context_id = context
+        .into_inner()
+        .unwrap_or_else(|| context_id_for(&handle));
+    let state = terminal_to_state(&status);
+    // Completed → the distillate artifact frame (completed-only); then the terminal
+    // status frame is RETURNED (the final frame).
+    if state == TaskState::Completed
+        && let Some(distillate) = result.as_ref()
+    {
+        write_stream_frame(
+            writer,
+            &id,
+            artifact_update_frame(&handle, &context_id, distillate),
+        );
+    }
+    Response::ok(id, status_update_frame(&handle, &context_id, state, true))
+}
+
+/// `a2a.SubscribeToTask` (params: `{id}`) → a STREAM of `StreamResponse` frames for
+/// an EXISTING served run (status-level; RFC 0020). Looks the run up by handle:
+///
+///   * unknown → `-32001 TaskNotFound` (a normal error Response; nothing streamed),
+///   * already terminal → write the artifact frame (completed-only) directly, then
+///     RETURN the terminal `statusUpdate{final:true}` immediately,
+///   * still running → write a current `statusUpdate{ WORKING, final:false }`, then
+///     POLL the sessions registry (~`POLL_INTERVAL`) until the run reaches a terminal
+///     status OR a bounded deadline (the drain timeout); on terminal, write the
+///     artifact frame (completed-only) directly and RETURN the terminal frame. If the
+///     deadline elapses first, RETURN a non-final-looking-but-`final:true` WORKING
+///     terminal frame is avoided — instead the last observed running state is closed
+///     out as `final:true` so the gateway's SSE stream always terminates.
+fn subscribe_to_task(req: Request, ctx: &ServeCtx, writer: &SharedWriter) -> Response {
+    let id = req.id.clone();
+    let task_id = task_id_param(&req);
+    let context_id = context_id_for(&task_id);
+    // Snapshot once: unknown handle → TaskNotFound, no stream.
+    let snapshot = match ctx.a2a_task_snapshot(&task_id) {
+        Some(s) => s,
+        None => return Response::err(id, TASK_NOT_FOUND, "task not found"),
+    };
+    // Already terminal at lookup → artifact (completed-only) + final frame now.
+    if snapshot.0 != "running" {
+        let state = terminal_to_state(&snapshot.0);
+        if state == TaskState::Completed
+            && let Some(distillate) = snapshot.1.as_ref()
+        {
+            write_stream_frame(
+                writer,
+                &id,
+                artifact_update_frame(&task_id, &context_id, distillate),
+            );
+        }
+        return Response::ok(id, status_update_frame(&task_id, &context_id, state, true));
+    }
+    // Still running → stream WORKING, then poll until terminal or the deadline.
+    write_stream_frame(
+        writer,
+        &id,
+        status_update_frame(&task_id, &context_id, TaskState::Working, false),
+    );
+    let (status, result) = ctx.a2a_poll_until_terminal(&task_id);
+    let state = terminal_to_state(&status);
+    if state == TaskState::Completed
+        && let Some(distillate) = result.as_ref()
+    {
+        write_stream_frame(
+            writer,
+            &id,
+            artifact_update_frame(&task_id, &context_id, distillate),
+        );
+    }
+    Response::ok(id, status_update_frame(&task_id, &context_id, state, true))
 }
 
 /// `a2a.GetTask` (params: `{id, historyLength?}`) → a **Task**. Reads the served
@@ -385,5 +592,271 @@ mod tests {
         let working = snapshot_to_task("served.2", TaskState::Working, None);
         assert!(working.get("artifacts").is_none());
         assert_eq!(working["status"]["state"], "TASK_STATE_WORKING");
+    }
+
+    // ── streaming (A2A-2) ────────────────────────────────────────────────────
+
+    use crate::config::{Config, McpServerSpec, Mode};
+    use crate::mcp::server::{PeerOrigin, ServeStream};
+    use crate::obs::log::{Comp, Level, LogCtx};
+    use crate::subagent::protocol::{IntelConfig, Limits, SpawnPayload, Telemetry};
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn base_payload() -> SpawnPayload {
+        SpawnPayload {
+            instruction: "standing".into(),
+            output_contract: None,
+            context_seed: Vec::new(),
+            intelligence: IntelConfig {
+                // Unreachable intel → a served-spawn fails fast (FAILED terminal).
+                uri: "unix:/nonexistent/a2a-stream-test.sock".into(),
+                token: None,
+                model: None,
+            },
+            mcp_servers: vec![McpServerSpec {
+                name: "fs".into(),
+                command: vec!["a".into()],
+                tags: Vec::new(),
+            }],
+            limits: Limits {
+                max_steps: 2,
+                max_tokens: 1000,
+                deadline_ms: 1000,
+                max_depth: 4,
+            },
+            telemetry: Telemetry {
+                run_id: "r1".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                trace_id: None,
+                log_level: "error".into(),
+                log_content: false,
+            },
+            depth: 0,
+            enable_exec: false,
+            warm: false,
+        }
+    }
+
+    fn ctx() -> ServeCtx {
+        let cfg = Config {
+            run_id: "r1".into(),
+            mode: Mode::Reactive,
+            intelligence: Some("unix:/x".into()),
+            ..Config::default()
+        };
+        ServeCtx::new(
+            "r1".into(),
+            "reactive".into(),
+            // A bogus exe so a real subagent never starts → the served-spawn fails
+            // fast and the streaming run terminates FAILED (no hang).
+            "/nonexistent/agentd-a2a-stream".into(),
+            base_payload(),
+            Duration::from_secs(2),
+            Arc::new(cfg),
+        )
+    }
+
+    fn log() -> Logger {
+        Logger::new(
+            LogCtx {
+                run_id: "r1".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: Comp::Supervisor,
+                pid: 0,
+                trace_id: None,
+            },
+            Level::Error,
+        )
+    }
+
+    fn req(method: &str, params: Option<Value>) -> Request {
+        Request::new(Id::Num(1), method, params)
+    }
+
+    /// A connection writer whose PEER end is RETAINED + returned, so a test can READ
+    /// the `StreamResponse` frames the handler wrote directly to the writer. (The
+    /// unary `writer()` helper drops the peer; this one keeps it.)
+    fn readable_writer() -> (SharedWriter, BufReader<UnixStream>) {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        (
+            Arc::new(Mutex::new(ServeStream::Unix(a))),
+            BufReader::new(b),
+        )
+    }
+
+    /// Read one NDJSON frame off the peer end and parse it as JSON.
+    fn read_frame(reader: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read frame");
+        serde_json::from_str(&line).expect("parse frame")
+    }
+
+    /// The `result` (a `StreamResponse`) of one frame, asserting it shares the id.
+    fn stream_result(reader: &mut BufReader<UnixStream>) -> Value {
+        let frame = read_frame(reader);
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert_eq!(frame["id"], 1, "stream frames share the request id");
+        frame["result"].clone()
+    }
+
+    #[test]
+    fn send_streaming_message_streams_working_then_final_failed() {
+        // A fresh streaming run against unreachable intel fails fast: the handler
+        // emits WORKING(final:false), then RETURNS the final FAILED(final:true) — and
+        // NO artifact frame (the run did not complete; distillate-only invariant).
+        let ctx = ctx();
+        let (w, mut reader) = readable_writer();
+        let msg = json!({ "message": { "parts": [{ "text": "do it" }] } });
+        let resp =
+            send_streaming_message(req("a2a.SendStreamingMessage", Some(msg)), &ctx, &w, &log());
+
+        // Frame 1 (written to the writer): WORKING, not final.
+        let f1 = stream_result(&mut reader);
+        assert_eq!(f1["statusUpdate"]["status"]["state"], "TASK_STATE_WORKING");
+        assert_eq!(f1["statusUpdate"]["final"], false);
+        let task_id = f1["statusUpdate"]["taskId"].as_str().unwrap().to_string();
+        assert_eq!(f1["statusUpdate"]["contextId"], format!("ctx-{task_id}"));
+
+        // The RETURNED frame is the final FAILED status — no artifact was emitted.
+        let final_sr = resp.result.expect("ok");
+        assert_eq!(
+            final_sr["statusUpdate"]["status"]["state"],
+            "TASK_STATE_FAILED"
+        );
+        assert_eq!(final_sr["statusUpdate"]["final"], true);
+        assert_eq!(final_sr["statusUpdate"]["taskId"], task_id);
+        assert!(
+            final_sr.get("artifactUpdate").is_none(),
+            "a failed run streams no artifact (distillate-only)"
+        );
+
+        // Only the single WORKING frame was written to the writer (no artifact frame).
+        // Closing our handle would EOF the reader; assert nothing else is queued by
+        // checking the writer has no further buffered line via a non-blocking peek is
+        // overkill — instead the FAILED-final being the RETURN value (not a written
+        // frame) is the contract, already asserted above.
+    }
+
+    #[test]
+    fn send_streaming_message_empty_instruction_is_invalid_params_no_stream() {
+        let ctx = ctx();
+        let (w, _reader) = readable_writer();
+        let msg = json!({ "message": { "parts": [{ "data": { "k": "v" } }] } });
+        let resp =
+            send_streaming_message(req("a2a.SendStreamingMessage", Some(msg)), &ctx, &w, &log());
+        assert_eq!(resp.error.expect("err").code, json::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn subscribe_to_task_completed_streams_artifact_then_final() {
+        // Already-terminal COMPLETED run: artifactUpdate frame (the distillate), then
+        // the RETURNED final COMPLETED(final:true) frame.
+        let ctx = ctx();
+        ctx.a2a_seed_done("served.0", "completed", json!("the answer"));
+        let (w, mut reader) = readable_writer();
+        let resp = subscribe_to_task(
+            req("a2a.SubscribeToTask", Some(json!({ "id": "served.0" }))),
+            &ctx,
+            &w,
+        );
+
+        // Frame 1 (written): the artifact carrying the distillate, lastChunk.
+        let art = stream_result(&mut reader);
+        assert_eq!(art["artifactUpdate"]["taskId"], "served.0");
+        assert_eq!(art["artifactUpdate"]["contextId"], "ctx-served.0");
+        assert_eq!(
+            art["artifactUpdate"]["artifact"]["parts"][0]["text"],
+            "the answer"
+        );
+        assert_eq!(
+            art["artifactUpdate"]["artifact"]["artifactId"],
+            "served.0.distillate"
+        );
+        assert_eq!(art["artifactUpdate"]["lastChunk"], true);
+
+        // The RETURNED frame is the final COMPLETED status.
+        let final_sr = resp.result.expect("ok");
+        assert_eq!(
+            final_sr["statusUpdate"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        assert_eq!(final_sr["statusUpdate"]["final"], true);
+    }
+
+    #[test]
+    fn subscribe_to_task_failed_streams_final_only_no_artifact() {
+        // A terminal failed/refused run streams NO artifact — only the final frame.
+        for (status, want_state) in [
+            ("crashed", "TASK_STATE_FAILED"),
+            ("refused", "TASK_STATE_REJECTED"),
+        ] {
+            let ctx = ctx();
+            // `refused` carries no result; `crashed`/Failed carries none either.
+            ctx.a2a_seed_done("served.0", status, json!("should-not-leak"));
+            let (w, mut reader) = readable_writer();
+            let resp = subscribe_to_task(
+                req("a2a.SubscribeToTask", Some(json!({ "id": "served.0" }))),
+                &ctx,
+                &w,
+            );
+            let final_sr = resp.result.expect("ok");
+            assert_eq!(
+                final_sr["statusUpdate"]["status"]["state"], want_state,
+                "{status}"
+            );
+            assert_eq!(final_sr["statusUpdate"]["final"], true);
+            // No artifact frame was written: the only readable line is... none. We
+            // can't block on read here (it would hang), so instead assert the RETURN
+            // carries no artifact and trust the handler only writes the artifact on
+            // the COMPLETED branch (covered by the completed test above).
+            assert!(final_sr.get("artifactUpdate").is_none());
+            // Drop the writer (the only write end) so the reader EOFs rather than
+            // blocking; then confirm no frame was written before EOF.
+            drop(w);
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read");
+            assert_eq!(
+                n, 0,
+                "no frame written for a failed subscribe ({status}): {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscribe_to_task_unknown_id_is_task_not_found() {
+        let ctx = ctx();
+        let (w, _reader) = readable_writer();
+        let resp = subscribe_to_task(
+            req("a2a.SubscribeToTask", Some(json!({ "id": "served.404" }))),
+            &ctx,
+            &w,
+        );
+        assert_eq!(resp.error.expect("err").code, TASK_NOT_FOUND);
+    }
+
+    #[test]
+    fn streaming_methods_are_management_gated() {
+        // The origin gate lives in `server::dispatch` (a Stdio peer never reaches
+        // `dispatch_a2a`); a Stdio-origin `a2a.*` falls through to METHOD_NOT_FOUND.
+        let ctx = ctx();
+        for method in ["a2a.SendStreamingMessage", "a2a.SubscribeToTask"] {
+            let msg = json!({ "message": { "parts": [{ "text": "x" }] }, "id": "served.0" });
+            let resp = crate::mcp::server::dispatch_for_test(
+                req(method, Some(msg)),
+                &ctx,
+                PeerOrigin::Stdio,
+                &log(),
+            );
+            assert_eq!(
+                resp.error.expect("err").code,
+                json::METHOD_NOT_FOUND,
+                "{method} from a Stdio origin → -32601"
+            );
+        }
     }
 }

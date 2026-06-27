@@ -221,9 +221,9 @@ fn operator_tools() -> Vec<&'static str> {
     }
 }
 
-/// The A2A surface advertisement (RFC 0020). The `a2a` build serves the four
-/// unary methods over the management transport with `streaming:false` (A2A-2 adds
-/// streaming); without the feature the surface is honestly `false`
+/// The A2A surface advertisement (RFC 0020). The `a2a` build serves the four unary
+/// methods plus the status-level streaming pair over the management transport with
+/// `streaming:true` (A2A-2); without the feature the surface is honestly `false`
 /// (capability-absence-not-error, RFC 0015 §2.5). The method names here MIRROR the
 /// `a2a.*` dispatch in [`crate::mcp::server`] / [`crate::mcp::a2a`] — the gateway
 /// reads this to build the Agent Card and to know which methods to bridge.
@@ -231,12 +231,16 @@ fn a2a_surface() -> Value {
     if cfg!(feature = "a2a") {
         json!({
             "version": "1.0",
-            "streaming": false,
+            // Status-level streaming: SendStreamingMessage + SubscribeToTask emit a
+            // StreamResponse frame stream (distillate-only artifact on completion).
+            "streaming": true,
             "methods": [
                 "a2a.SendMessage",
                 "a2a.GetTask",
                 "a2a.CancelTask",
                 "a2a.ListTasks",
+                "a2a.SendStreamingMessage",
+                "a2a.SubscribeToTask",
             ],
         })
     } else {
@@ -359,16 +363,19 @@ mod tests {
         let id = Identity::from_env(&cfg.run_id);
         let a2a = &manifest(&cfg, &id, false)["surfaces"]["a2a"];
         if cfg!(feature = "a2a") {
-            // The served unary method set + streaming honestly false (A2A-2 adds it).
+            // The served unary set + the A2A-2 status-level streaming pair, with
+            // streaming honestly true.
             assert_eq!(a2a["version"], json!("1.0"));
-            assert_eq!(a2a["streaming"], json!(false));
+            assert_eq!(a2a["streaming"], json!(true));
             assert_eq!(
                 a2a["methods"],
                 json!([
                     "a2a.SendMessage",
                     "a2a.GetTask",
                     "a2a.CancelTask",
-                    "a2a.ListTasks"
+                    "a2a.ListTasks",
+                    "a2a.SendStreamingMessage",
+                    "a2a.SubscribeToTask"
                 ])
             );
         } else {

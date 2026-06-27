@@ -248,7 +248,9 @@ type Registry = Arc<Mutex<HashMap<String, ServedSession>>>;
 /// A connection's shared write half — both replies and pushed notifications go
 /// through it, serialized by the Mutex (a reply and a notification can't interleave
 /// bytes). The [`ServeStream`] enum keeps this one type across unix + vsock peers.
-type SharedWriter = Arc<Mutex<ServeStream>>;
+/// `pub(crate)` so the A2A streaming handlers ([`crate::mcp::a2a`]) can write their
+/// intermediate `StreamResponse` frames directly to the calling connection.
+pub(crate) type SharedWriter = Arc<Mutex<ServeStream>>;
 
 /// A peer subscribed to an `agentd://` resource: which connection, and the writer
 /// to push a `notifications/resources/updated` to.
@@ -510,6 +512,37 @@ impl ServeCtx {
         instruction: &str,
         log: &Logger,
     ) -> (String, String, Option<Value>) {
+        self.a2a_spawn_sync_with(instruction, log, |_| {})
+    }
+
+    /// `a2a_spawn_sync` for the STREAMING path (`a2a.SendStreamingMessage`):
+    /// identical blocking served-spawn, but `on_handle` fires with the minted handle
+    /// the instant the run is registered + launched — BEFORE the blocking wait — so
+    /// the streaming handler can emit its `statusUpdate{WORKING}` frame while the run
+    /// is genuinely in flight. Returns the same `(handle, terminal_status, result?)`.
+    pub(crate) fn a2a_spawn_stream_sync(
+        &self,
+        instruction: &str,
+        log: &Logger,
+        on_handle: impl FnOnce(&str),
+    ) -> (String, String, Option<Value>) {
+        self.a2a_spawn_sync_with(instruction, log, on_handle)
+    }
+
+    /// Shared core of the A2A sync served-spawn (unary `SendMessage{!immediate}` +
+    /// streaming `SendStreamingMessage`): mint the handle, fire `on_handle` once it's
+    /// known (the stream's WORKING-frame hook; a no-op for the unary path), block on
+    /// `supervise_once`, and record the terminal `ServedSession` so a later
+    /// `GetTask`/`SubscribeToTask` resolves it. A cap/pressure refusal is a terminal
+    /// `crashed`-shaped status (the caller always gets a Task). `on_handle` runs even
+    /// on a refusal, so the stream still opens with a WORKING frame before the
+    /// immediately-terminal close.
+    fn a2a_spawn_sync_with(
+        &self,
+        instruction: &str,
+        log: &Logger,
+        on_handle: impl FnOnce(&str),
+    ) -> (String, String, Option<Value>) {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let handle = format!("served.{n}");
         notify_resource_updated_keep(
@@ -517,12 +550,20 @@ impl ServeCtx {
             &crate::agentd_uri::run_uri(&self.run_id),
         );
         notify_resource_updated_keep(&self.subscriptions, crate::agentd_uri::INVENTORY_URI);
+        on_handle(&handle);
         if cgroup::under_memory_pressure() {
+            self.record_terminal_session(&handle, ServedStatus::Failed("memory pressure".into()));
             return (handle, "crashed".to_string(), None);
         }
         let permit = match SpawnGuard::acquire(&self.inflight, MAX_INFLIGHT_SPAWNS) {
             Some(g) => g,
-            None => return (handle, "crashed".to_string(), None),
+            None => {
+                self.record_terminal_session(
+                    &handle,
+                    ServedStatus::Failed("spawn cap reached".into()),
+                );
+                return (handle, "crashed".to_string(), None);
+            }
         };
         log.info(
             "a2a.send_message",
@@ -535,19 +576,65 @@ impl ServeCtx {
         let status = run_to_status(result, false);
         // Record the terminal session so a later GetTask/ListTasks can read it.
         let (status_str, result_val) = a2a_status_and_result(&status);
-        {
-            let mut reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            evict_if_full(&mut reg);
-            reg.insert(
-                handle.clone(),
-                ServedSession {
-                    status,
-                    cancel: Arc::new(AtomicBool::new(false)),
-                    started: Instant::now(),
-                },
-            );
-        }
+        self.record_terminal_session(&handle, status);
         (handle, status_str, result_val)
+    }
+
+    /// Insert a terminal `ServedSession` under `handle` (evicting an old finished one
+    /// if the registry is full) so a later `GetTask`/`ListTasks`/`SubscribeToTask`
+    /// resolves it.
+    fn record_terminal_session(&self, handle: &str, status: ServedStatus) {
+        let mut reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        evict_if_full(&mut reg);
+        reg.insert(
+            handle.to_string(),
+            ServedSession {
+                status,
+                cancel: Arc::new(AtomicBool::new(false)),
+                started: Instant::now(),
+            },
+        );
+    }
+
+    /// Poll the sessions registry for a still-running served run until it reaches a
+    /// terminal status OR a bounded deadline elapses (the drain timeout — the same
+    /// cap `ServeHandle::drain` waits on). Used by `a2a.SubscribeToTask` to follow a
+    /// live run to completion. Returns `(status_string, result?)`: the real terminal
+    /// status on completion, or — if the deadline elapses while still running — the
+    /// synthetic `"running"` so the caller closes the stream honestly (a bounded
+    /// subscribe never hangs a connection thread forever). An evicted/unknown handle
+    /// mid-poll resolves as `"running"` too (it can't be re-read; the stream closes).
+    pub(crate) fn a2a_poll_until_terminal(&self, handle: &str) -> (String, Option<Value>) {
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
+        let deadline = Instant::now() + self.drain_timeout;
+        loop {
+            match self.a2a_task_snapshot(handle) {
+                // Terminal (or vanished) → done.
+                Some((status, result)) if status != "running" => return (status, result),
+                None => return ("running".to_string(), None),
+                Some(_) => {} // still running
+            }
+            if Instant::now() >= deadline {
+                return ("running".to_string(), None);
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Test-only: seed a terminal `Done` served session under `handle` with the
+    /// given terminal-status string + distillate, so the A2A binding's tests
+    /// ([`crate::mcp::a2a`]) can drive `GetTask`/`SubscribeToTask`/`ListTasks`
+    /// against a pre-existing run without spawning a real subagent.
+    #[cfg(test)]
+    pub(crate) fn a2a_seed_done(&self, handle: &str, status: &str, result: Value) {
+        self.record_terminal_session(
+            handle,
+            ServedStatus::Done {
+                status: status.to_string(),
+                partial: false,
+                result,
+            },
+        );
     }
 
     /// Read a served run by handle for an A2A `GetTask` → `(status_string,
@@ -808,6 +895,22 @@ fn handle_conn(stream: ServeStream, origin: PeerOrigin, ctx: &ServeCtx, log: &Lo
 /// caller's trust domain (RFC 0015 §3.4) — carried through so the next chunk's
 /// operator-tool gate can refuse `Stdio`-origin management calls; this chunk's
 /// surface (incl. `agentd://capabilities`) is readable on every origin.
+/// Test-only `dispatch` seam: routes one request at the given origin with a
+/// throwaway connection writer (its peer end is dropped). Lets sibling-module tests
+/// ([`crate::mcp::a2a`]) exercise the origin gate (e.g. a `Stdio`-origin `a2a.*`
+/// falling through to `-32601`) without re-plumbing a full connection.
+#[cfg(test)]
+pub(crate) fn dispatch_for_test(
+    req: Request,
+    ctx: &ServeCtx,
+    origin: PeerOrigin,
+    log: &Logger,
+) -> Response {
+    let (a, _b) = UnixStream::pair().expect("socketpair");
+    let writer: SharedWriter = Arc::new(Mutex::new(ServeStream::Unix(a)));
+    dispatch(req, ctx, origin, &writer, 0, log)
+}
+
 fn dispatch(
     req: Request,
     ctx: &ServeCtx,
@@ -857,7 +960,10 @@ fn dispatch(
         #[cfg(feature = "a2a")]
         m if m.starts_with("a2a.") && origin == PeerOrigin::Management => {
             let method = m.to_string(); // own it so `req` can move into the handler
-            crate::mcp::a2a::dispatch_a2a(&method, req, ctx, log)
+            // `writer` is threaded in so the streaming handlers
+            // (`a2a.SendStreamingMessage`/`a2a.SubscribeToTask`) can write their
+            // intermediate `StreamResponse` frames directly to this connection.
+            crate::mcp::a2a::dispatch_a2a(&method, req, ctx, writer, log)
         }
         other => Response::err(
             req.id,
@@ -3424,22 +3530,45 @@ mod tests {
         }
 
         #[test]
-        fn streaming_methods_are_refused_with_minus_32004() {
-            for m in ["a2a.SendStreamingMessage", "a2a.SubscribeToTask"] {
-                let r = dispatch(
-                    req(m, Some(json!({"id": "served.0"}))),
-                    &ctx(),
-                    PeerOrigin::Management,
-                    &writer(),
-                    0,
-                    &log(),
-                );
-                assert_eq!(
-                    r.error.expect("error").code,
-                    crate::mcp::a2a::STREAMING_NOT_SUPPORTED,
-                    "{m} → -32004"
-                );
-            }
+        fn send_streaming_message_dispatches_a_stream_then_final_frame() {
+            use std::io::{BufRead, BufReader};
+            // Through the full `dispatch` path at a Management origin: the streaming
+            // handler writes the WORKING frame to the connection writer and RETURNS
+            // the terminal frame (the run fails fast under the test config → FAILED).
+            let ctx = ctx();
+            let (a, b) = UnixStream::pair().unwrap();
+            let w: SharedWriter = Arc::new(Mutex::new(ServeStream::Unix(a)));
+            let r = dispatch(
+                req(
+                    "a2a.SendStreamingMessage",
+                    Some(json!({"message": {"parts": [{"text": "go"}]}})),
+                ),
+                &ctx,
+                PeerOrigin::Management,
+                &w,
+                0,
+                &log(),
+            );
+            // The returned frame is the FINAL statusUpdate (terminal, final:true).
+            let final_sr = r.result.expect("final frame");
+            assert_eq!(final_sr["statusUpdate"]["final"], true);
+            assert!(
+                final_sr["statusUpdate"]["status"]["state"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("TASK_STATE_")
+            );
+            // The first WRITTEN frame is the WORKING status (read off the peer end).
+            drop(w); // close the writer so the reader EOFs after the buffered frame
+            let mut reader = BufReader::new(b);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let f1: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                f1["result"]["statusUpdate"]["status"]["state"],
+                "TASK_STATE_WORKING"
+            );
+            assert_eq!(f1["result"]["statusUpdate"]["final"], false);
         }
 
         #[test]

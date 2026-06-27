@@ -81,7 +81,18 @@ fn claim_meta(cfg: &Config, claim_key: &str) -> Value {
 /// FIXED env/flag layers a hot reload (RFC 0017 §5) re-merges the new FILE over.
 /// They are only ever consulted under the `hot-reload` feature; without it the
 /// reload latch is never set and this loop is byte-for-byte the pre-reload path.
+///
+/// `live_config` (present only with `serve-mcp`) is the served
+/// `agentd://config/effective` view's live handle (RFC 0017 §4.2 / §5.6): on an
+/// APPLIED hot reload this loop swaps the new config into it (so a served read
+/// reflects the reload) and pushes `resources/updated` to subscribers. It is
+/// `None` when `--serve-mcp` is not configured, and is only acted on with the
+/// `hot-reload` feature — so without serve-mcp or without hot-reload it is inert.
 #[cfg_attr(not(feature = "hot-reload"), allow(unused_variables))]
+#[cfg_attr(
+    all(feature = "serve-mcp", not(feature = "hot-reload")),
+    allow(unused_variables)
+)]
 pub fn run_reactive(
     exe: PathBuf,
     base: SpawnPayload,
@@ -89,6 +100,9 @@ pub fn run_reactive(
     args: &[String],
     env: &[(String, String)],
     log: &Logger,
+    #[cfg(feature = "serve-mcp")] live_config: Option<
+        std::sync::Arc<crate::mcp::server::LiveConfig>,
+    >,
 ) -> i32 {
     // The supervisor owns the MCP connections used for subscriptions + reads.
     // (Each spawned reaction connects its own MCP for tool use, via the payload.)
@@ -350,6 +364,18 @@ pub fn run_reactive(
                 &mut generation,
                 log,
             ) {
+                // APPLIED reload (RFC 0017 §5.6): publish the new config onto the
+                // served `agentd://config/effective` view and push
+                // `resources/updated` so a subscribed agentctl learns push-style.
+                // A REJECTED reload returns `None` and never reaches here, so it
+                // fires nothing (the served view stays the prior config). Gated on
+                // `serve-mcp` (the served handle only exists then) — without it the
+                // local working-config swap below is the sole effect.
+                #[cfg(feature = "serve-mcp")]
+                if let Some(lc) = &live_config {
+                    lc.swap(std::sync::Arc::new(new_cfg.clone()));
+                    lc.notify_config_effective_updated();
+                }
                 running = new_cfg;
             }
             signals::clear_reload();
@@ -689,12 +715,12 @@ fn apply_reload(
 
     // STEP 5 — self-MCP surface refresh. The tool set is `mcp_servers`-derived
     // and `mcp_servers` is restart-only here, so it never changes on a reload —
-    // no `tools/list_changed` is warranted. `agentd://config/effective` is a
-    // documented follow-up as a SUBSCRIBABLE served resource (the effective view
-    // is already exposed via `Config::effective_view` for a one-shot read); we do
-    // not fire `resources/updated` for a resource the served surface does not yet
-    // subscribe, to avoid advertising a push that has no subscriber. (Noted in the
-    // report as the follow-up.)
+    // no `tools/list_changed` is warranted. The SUBSCRIBABLE served resource
+    // `agentd://config/effective` (RFC 0017 §4.2 / §5.6) IS now refreshed: the
+    // caller (`run_reactive`) swaps the live config + fires `resources/updated`
+    // on this applied return (and on the no-change applied return above), so a
+    // subscribed agentctl re-reads the post-reload view. Done in the caller (not
+    // here) because the served `LiveConfig` handle lives on the reactor side.
 
     // STEP 6 — clear the guard, emit success, bump the generation + metric.
     signals::set_reloading(false);

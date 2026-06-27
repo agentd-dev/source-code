@@ -268,6 +268,49 @@ struct Subscriber {
 /// reaches a terminal status). Arc-shared with each async run's background thread.
 type SubRegistry = Arc<Mutex<HashMap<String, Vec<Subscriber>>>>;
 
+/// The live, hot-reloadable config plus the served subscription registry, shared
+/// between the served self-MCP and the reactive supervisor's reload path (RFC 0017
+/// §4.2 / §5.6). The served `agentd://config/effective` read clones the current
+/// `Arc<Config>` (lock held only for the cheap clone, never across request
+/// handling); on an APPLIED hot reload the supervisor [`swap`](LiveConfig::swap)s
+/// in the new config (so the served view goes live) and fires
+/// `resources/updated{config/effective}` to subscribers via [`subs`](LiveConfig::subs).
+/// The SAME registry backs `ServeCtx.subscriptions` — there is exactly one.
+pub struct LiveConfig {
+    cfg: Mutex<Arc<Config>>,
+    subs: SubRegistry,
+}
+
+impl LiveConfig {
+    /// Build a live-config handle from the startup config snapshot and the served
+    /// subscription registry (the one [`ServeCtx`] also uses for push).
+    fn new(cfg: Arc<Config>, subs: SubRegistry) -> Arc<LiveConfig> {
+        Arc::new(LiveConfig {
+            cfg: Mutex::new(cfg),
+            subs,
+        })
+    }
+
+    /// The current (post-any-reload) config. Locks ONLY to clone the cheap
+    /// `Arc<Config>` — never held across request handling.
+    pub fn current(&self) -> Arc<Config> {
+        self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Adopt `cfg` as the live config (called by the reactive supervisor after an
+    /// applied hot reload, so the served `config/effective` view reflects it).
+    pub fn swap(&self, cfg: Arc<Config>) {
+        *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
+    }
+
+    /// Fire `notifications/resources/updated{uri: agentd://config/effective}` to
+    /// every current subscriber — the push half of the applied-reload path (RFC
+    /// 0017 §5.6). Subscriptions are KEPT (the resource fires on every reload).
+    pub fn notify_config_effective_updated(&self) {
+        notify_resource_updated_keep(&self.subs, crate::agentd_uri::CONFIG_EFFECTIVE_URI);
+    }
+}
+
 /// The structured state body for one session (shared by the `subagent.status`
 /// tool and the `agentd://subagent/<handle>` resource).
 fn session_body(handle: &str, s: &ServedSession) -> Value {
@@ -312,7 +355,19 @@ pub struct ServeCtx {
     /// The resolved daemon config — the source for the `agentd://capabilities`
     /// self-description manifest (RFC 0015 §3.4). Arc-shared so the per-read
     /// build borrows it without cloning the struct.
+    ///
+    /// This is the STARTUP SNAPSHOT: `capabilities` exposes compile-time /
+    /// restart-only fields and `capacity`'s config-derived fields are restart-only,
+    /// so a snapshot is correct for them. Only `agentd://config/effective` is about
+    /// RELOADABLE fields, and it reads [`live_config`](ServeCtx::live_config)
+    /// instead (the post-reload view).
     config: Arc<Config>,
+    /// The live, hot-reloadable config + the shared subscription registry (RFC
+    /// 0017 §4.2 / §5.6). Backs `agentd://config/effective` (the current,
+    /// post-reload redacted view) and is handed to the reactive supervisor so an
+    /// applied reload swaps it + pushes `resources/updated`. Its `subs` IS
+    /// `subscriptions` above (one registry, not two).
+    live_config: Arc<LiveConfig>,
     /// The terminal run-outcome report (RFC 0016 §6.2), once the run reaches a
     /// terminal status — `None` while running. Folded into `agentd://run/<run_id>`
     /// so a still-connected reader (vsock mgmt profile) learns the outcome without
@@ -330,6 +385,10 @@ impl ServeCtx {
         drain_timeout: Duration,
         config: Arc<Config>,
     ) -> ServeCtx {
+        // ONE subscription registry, shared by the served push helpers AND the
+        // live-config handle (the reload notify fires on the SAME registry).
+        let subscriptions: SubRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let live_config = LiveConfig::new(Arc::clone(&config), Arc::clone(&subscriptions));
         ServeCtx {
             run_id,
             mode,
@@ -341,11 +400,29 @@ impl ServeCtx {
             counter: Arc::new(AtomicU64::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             warm: Arc::new(Mutex::new(HashMap::new())),
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            subscriptions,
             conn_counter: Arc::new(AtomicU64::new(0)),
             config,
+            live_config,
             report: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The live-config + shared-subscription handle (RFC 0017 §4.2 / §5.6). The
+    /// reactive supervisor adopts this so an APPLIED hot reload swaps the served
+    /// `agentd://config/effective` view and pushes `resources/updated` to
+    /// subscribers — the SAME registry the rest of the served surface uses.
+    pub fn live_config(&self) -> Arc<LiveConfig> {
+        Arc::clone(&self.live_config)
+    }
+
+    /// The `agentd://config/effective` body (RFC 0017 §4.2): the CURRENT
+    /// (post-any-reload) redacted reloadable-config view. Carries NO secret / URL /
+    /// `{{secret:…}}` value — `Config::effective_view` guarantees the redaction
+    /// (header NAMES only, structural server names only). Reads the live config,
+    /// so a read after a reload reflects it.
+    fn config_effective_body(&self) -> Value {
+        self.live_config.current().effective_view()
     }
 
     /// The live `agentd://capabilities` manifest — this daemon's self-description
@@ -1197,6 +1274,19 @@ fn subscribe_resource(
                 );
             }
         }
+        // agentd://config/effective fires on each applied hot reload (RFC 0017
+        // §5.6) and is Management-only — reject a non-Management subscribe as
+        // not-found, matching the read gate. The subscription is *kept* (it fires
+        // on every reload, never consumed).
+        Some(crate::agentd_uri::AgentdResource::ConfigEffective) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("not a subscribable resource: {uri}"),
+                );
+            }
+        }
         Some(crate::agentd_uri::AgentdResource::Subagent(handle)) => {
             let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
             match reg.get(&handle) {
@@ -1425,6 +1515,16 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
             "description": "The intelligence-endpoint health view: the ordered endpoint list (transport + index, never the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, and the all-down flag. Subscribable — pushed on breaker / active / all-down transitions.",
             "mimeType": "application/json"
         }));
+        // agentd://config/effective — the live, redacted reloadable-config view
+        // (RFC 0017 §4.2 / §5.6), Management-only. model / limits / log level /
+        // subscribe set / structural server names / intelligence header NAMES —
+        // never a token/URL/secret. Subscribable: pushed on each applied hot reload.
+        list.push(json!({
+            "uri": crate::agentd_uri::CONFIG_EFFECTIVE_URI,
+            "name": "config_effective",
+            "description": "The live, redacted view of the running daemon's reloadable config: model, max_tokens, limits (max_steps/max_depth/deadline), log level, the subscribe set, structural MCP-server names+tags, and intelligence header NAMES — never a token, URL, or secret value. Subscribable — pushed on each applied hot reload.",
+            "mimeType": "application/json"
+        }));
         // agentd://capacity — the placement view (RFC 0019 §7.2/§9), Management-only
         // and present only in `cluster` builds. Identity, shard K/N, free slots,
         // active subagents, intelligence warmth, and saturation — what agentctl
@@ -1523,6 +1623,26 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
                 req.id,
                 json!({
                     "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.capacity_body().to_string()}]
+                }),
+            )
+        }
+        // agentd://config/effective — the live, redacted reloadable-config view
+        // (RFC 0017 §4.2). Management-only (the same gate as inventory/
+        // intelligence): a non-Management origin is refused as resource-not-found
+        // so a stdio peer can't even confirm it exists. The body is the CURRENT
+        // (post-any-reload) view, with NO secret / URL (`effective_view` redacts).
+        Some(crate::agentd_uri::AgentdResource::ConfigEffective) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::RESOURCE_NOT_FOUND,
+                    format!("resource not found: {uri}"),
+                );
+            }
+            Response::ok(
+                req.id,
+                json!({
+                    "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.config_effective_body().to_string()}]
                 }),
             )
         }
@@ -4161,6 +4281,161 @@ mod tests {
         assert!(
             subscribe_resource(
                 req("sub", Some(json!({"uri": "agentd://intelligence"}))),
+                &ctx,
+                PeerOrigin::Stdio,
+                &writer(),
+                1,
+            )
+            .error
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn config_effective_read_is_management_gated_and_reflects_a_reload() {
+        // A ctx whose live config has a redaction-worthy header + a model, so we can
+        // assert both the redaction and that a read reflects a swapped (reloaded)
+        // config (RFC 0017 §4.2 / §5.6).
+        let mut cfg = crate::config::Config {
+            run_id: "r1".into(),
+            mode: crate::config::Mode::Reactive,
+            intelligence: Some("unix:/x".into()),
+            model: Some("claude-opus-4".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.intelligence_headers
+            .insert("x-api-key".into(), "{{secret:SOME_NAME}}".into());
+        let ctx = ServeCtx::new(
+            "r1".into(),
+            "reactive".into(),
+            "agentd".into(),
+            base(),
+            Duration::from_secs(5),
+            Arc::new(cfg),
+        );
+
+        // Management read → the redacted reloadable view (RFC 0017 §4.2).
+        let r = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://config/effective"})),
+            ),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("config/effective readable for management");
+        let text = v["contents"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["model"], "claude-opus-4");
+        // Header NAMES only — the {{secret:…}} ref value is NEVER exposed.
+        assert_eq!(body["intelligence_headers"], json!(["x-api-key"]));
+        assert!(
+            !text.contains("SOME_NAME"),
+            "header ref value leaked: {text}"
+        );
+
+        // After a hot reload swaps the live config, a fresh read reflects it.
+        let reloaded = crate::config::Config {
+            run_id: "r1".into(),
+            mode: crate::config::Mode::Reactive,
+            intelligence: Some("unix:/x".into()),
+            model: Some("claude-sonnet-9".into()),
+            ..crate::config::Config::default()
+        };
+        ctx.live_config().swap(Arc::new(reloaded));
+        let r2 = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://config/effective"})),
+            ),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let text2 = r2.result.unwrap()["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body2: Value = serde_json::from_str(&text2).unwrap();
+        assert_eq!(
+            body2["model"], "claude-sonnet-9",
+            "read reflects the post-reload config"
+        );
+
+        // A stdio peer must NOT read it — 404, as if it didn't exist.
+        let denied = dispatch(
+            req(
+                "resources/read",
+                Some(json!({"uri": "agentd://config/effective"})),
+            ),
+            &ctx,
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert!(
+            denied.error.is_some(),
+            "stdio config/effective read is refused"
+        );
+    }
+
+    #[test]
+    fn config_effective_is_listed_and_subscribable_for_management_only() {
+        let ctx = ctx();
+        // listed to management, not to stdio
+        let mgmt = dispatch(
+            req("resources/list", None),
+            &ctx,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let uris: Vec<String> = mgmt.result.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["uri"].as_str().map(str::to_string))
+            .collect();
+        assert!(uris.contains(&"agentd://config/effective".to_string()));
+
+        let stdio = dispatch(
+            req("resources/list", None),
+            &ctx,
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        let stdio_uris: Vec<String> = stdio.result.unwrap()["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["uri"].as_str().map(str::to_string))
+            .collect();
+        assert!(!stdio_uris.contains(&"agentd://config/effective".to_string()));
+
+        // subscribable for management, refused for stdio
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://config/effective"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+            )
+            .error
+            .is_none()
+        );
+        assert!(
+            subscribe_resource(
+                req("sub", Some(json!({"uri": "agentd://config/effective"}))),
                 &ctx,
                 PeerOrigin::Stdio,
                 &writer(),

@@ -721,17 +721,17 @@ degrades to RFC 0008 single-instance behaviour and agentctl runs it as a singlet
 
 ## 12. Open items (for the umbrella author to reconcile)
 
-- **`work.*` tool names are a frozen contract — confirm ownership.** §3.3 defines
-  `work.claim`/`work.renew`/`work.ack`/`work.release` and the `agentd/claim_key`
-  `_meta` convention. These couple a fleet to its coordination server and so must
-  be frozen (RFC 0014 §3.4). Whether the canonical schema lives in **RFC 0015**
-  (management/work surface) or here needs the umbrella's call; agentctl needs one
-  authority to negotiate on.
-- **RUN_ID default narrowing for `claim` routes.** §3.5 changes the RFC 0011 §6.1
-  default (per-process random ULID) to an **item-derived** key for `claim` routes
-  only. RFC 0011 is Accepted/shipped; this is an additive, route-scoped override,
-  but the umbrella should confirm it is recorded as an extension to RFC 0011 §6
-  rather than a conflict.
+- **`work.*` tool names are a frozen contract — confirm ownership.** ✅ **Resolved:
+  frozen in RFC 0015 §5.6.** §3.3 defines `work.claim`/`work.renew`/`work.ack`/
+  `work.release` and the `agentd/claim_key` `_meta` convention; the umbrella ratified
+  RFC 0015 §5.6 as the single authority for the names + `_meta` keys + style variants
+  (RFC 0015 serves the management surface agentctl negotiates on, even though agentd
+  *calls* `work.*` rather than serving them). The schemas remain the server's,
+  discovered via `tools/list`.
+- **RUN_ID default narrowing for `claim` routes.** ✅ **Resolved: recorded in
+  RFC 0015 §5.6** as an additive, route-scoped extension to RFC 0011 §6.1 (not a
+  conflict) — §3.5's item-derived key applies to `claim` routes only; non-claim
+  RUN_ID semantics are unchanged.
 - **Backlog-signal definition belongs to RFC 0016.** §5.1 defines
   `agentd_reactive_backlog` operationally (queued + offered-not-claimed). RFC 0016
   owns the frozen schema; the exact derivation and `# HELP` text should land

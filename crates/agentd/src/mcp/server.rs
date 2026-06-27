@@ -454,6 +454,171 @@ impl ServeCtx {
     }
 }
 
+/// The A2A binding's access to the served-run machinery (RFC 0020 §5). These are
+/// the thin reuse seams the `a2a` module ([`crate::mcp::a2a`]) translates to/from
+/// A2A `Task` objects — they do NOT duplicate the spawn/cancel/registry code, they
+/// drive the SAME `sessions` registry + `launch_async_run`/`supervise_once` path
+/// the `subagent.*` tools use. A `Task` IS a served run. [feature: a2a]
+#[cfg(feature = "a2a")]
+impl ServeCtx {
+    /// Start a served run for an A2A `SendMessage` and return its handle (the
+    /// Task `id`). Mirrors `handle_spawn`'s async path: mint a `served.N` handle,
+    /// build the run payload from the daemon template + instruction, acquire a
+    /// concurrency permit, and launch it on the same `launch_async_run` thread the
+    /// `subagent.spawn{async}` tool uses. Pushes the run/inventory notifications a
+    /// new spawn always does. `Err` is the concurrency-cap or thread-spawn refusal.
+    pub(crate) fn a2a_spawn_async(
+        &self,
+        instruction: &str,
+        log: &Logger,
+    ) -> Result<String, String> {
+        // Backpressure mirrors the `subagent.spawn` chokepoint: refuse under
+        // memory.high rather than push the cgroup toward OOM (best-effort).
+        if cgroup::under_memory_pressure() {
+            return Err(
+                "spawn refused: memory pressure (cgroup at memory.high); retry shortly".to_string(),
+            );
+        }
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        notify_resource_updated_keep(
+            &self.subscriptions,
+            &crate::agentd_uri::run_uri(&self.run_id),
+        );
+        notify_resource_updated_keep(&self.subscriptions, crate::agentd_uri::INVENTORY_URI);
+        let handle = format!("served.{n}");
+        let args = json!({ "instruction": instruction });
+        let payload = build_served_payload(&self.base, &args, &handle);
+        let permit = SpawnGuard::acquire(&self.inflight, MAX_INFLIGHT_SPAWNS).ok_or_else(|| {
+            format!("spawn refused: {MAX_INFLIGHT_SPAWNS} concurrent served spawns in flight")
+        })?;
+        log.info(
+            "a2a.send_message",
+            json!({"handle": handle, "async": true, "servers": payload.mcp_servers.len()}),
+        );
+        launch_async_run(self, log, &handle, payload, permit)
+            .map(|()| handle)
+            .map_err(|()| "subagent could not start: thread spawn failed".to_string())
+    }
+
+    /// Start a BLOCKING served run for an A2A `SendMessage{returnImmediately:false}`
+    /// and return `(handle, terminal_status, result?)`. Mirrors `handle_spawn`'s
+    /// sync path (`supervise_once`); a cap/start failure is surfaced as a terminal
+    /// `crashed`/`refused`-shaped status so the caller always gets a Task, never a
+    /// crash. The handle is registered terminal so a later `GetTask` can read it.
+    pub(crate) fn a2a_spawn_sync(
+        &self,
+        instruction: &str,
+        log: &Logger,
+    ) -> (String, String, Option<Value>) {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        let handle = format!("served.{n}");
+        notify_resource_updated_keep(
+            &self.subscriptions,
+            &crate::agentd_uri::run_uri(&self.run_id),
+        );
+        notify_resource_updated_keep(&self.subscriptions, crate::agentd_uri::INVENTORY_URI);
+        if cgroup::under_memory_pressure() {
+            return (handle, "crashed".to_string(), None);
+        }
+        let permit = match SpawnGuard::acquire(&self.inflight, MAX_INFLIGHT_SPAWNS) {
+            Some(g) => g,
+            None => return (handle, "crashed".to_string(), None),
+        };
+        log.info(
+            "a2a.send_message",
+            json!({"handle": handle, "async": false}),
+        );
+        let args = json!({ "instruction": instruction });
+        let payload = build_served_payload(&self.base, &args, &handle);
+        let result = supervise_once(self.exe.clone(), &payload, self.drain_timeout, log.clone());
+        drop(permit);
+        let status = run_to_status(result, false);
+        // Record the terminal session so a later GetTask/ListTasks can read it.
+        let (status_str, result_val) = a2a_status_and_result(&status);
+        {
+            let mut reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            evict_if_full(&mut reg);
+            reg.insert(
+                handle.clone(),
+                ServedSession {
+                    status,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    started: Instant::now(),
+                },
+            );
+        }
+        (handle, status_str, result_val)
+    }
+
+    /// Read a served run by handle for an A2A `GetTask` → `(status_string,
+    /// result?)`, or `None` if the handle is unknown (→ A2A `TaskNotFound`). A
+    /// still-running run reports the synthetic `"running"` status the binding maps
+    /// to `WORKING`; a terminal run reports its real terminal status + (for a
+    /// completed run) its distillate result.
+    pub(crate) fn a2a_task_snapshot(&self, handle: &str) -> Option<(String, Option<Value>)> {
+        let reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        reg.get(handle).map(|s| match &s.status {
+            ServedStatus::Running => ("running".to_string(), None),
+            other => a2a_status_and_result(other),
+        })
+    }
+
+    /// Cancel a served run by handle for an A2A `CancelTask`. `Some(true)` = a live
+    /// run's cancel was requested (it drains via the kill ladder); `Some(false)` =
+    /// the run is already terminal (cancel-of-finished is a read); `None` = unknown
+    /// handle (→ A2A `TaskNotFound`). Wraps the same per-run cancel flag the
+    /// `subagent.cancel`/`cancel` tools set, and pushes the inventory notification.
+    pub(crate) fn a2a_cancel(&self, handle: &str) -> Option<bool> {
+        let requested = {
+            let mut reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match reg.get_mut(handle) {
+                None => return None,
+                Some(s) if s.status.is_terminal() => false,
+                Some(s) => {
+                    s.cancel.store(true, Ordering::Relaxed);
+                    true
+                }
+            }
+        };
+        if requested {
+            notify_resource_updated_keep(&self.subscriptions, crate::agentd_uri::INVENTORY_URI);
+        }
+        Some(requested)
+    }
+
+    /// List the live served-run registry for an A2A `ListTasks` → one
+    /// `(handle, status_string, result?)` per tracked run. The ephemeral
+    /// instance-local view only (durable history is gateway-held, RFC 0020 §7).
+    pub(crate) fn a2a_list(&self) -> Vec<(String, String, Option<Value>)> {
+        let reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .map(|(handle, s)| {
+                let (status, result) = match &s.status {
+                    ServedStatus::Running => ("running".to_string(), None),
+                    other => a2a_status_and_result(other),
+                };
+                (handle.clone(), status, result)
+            })
+            .collect()
+    }
+}
+
+/// Project a terminal [`ServedStatus`] to `(status_string, result?)` for the A2A
+/// binding: the run's terminal-status vocabulary (RFC 0007 §3.4) plus the
+/// distillate result for a `Done`/completed run. A `Failed`/`Cancelled` run
+/// carries no result (the distillate-only invariant — RFC 0009 §8). `Running` is
+/// never passed here (the callers special-case it to `"running"`).
+#[cfg(feature = "a2a")]
+fn a2a_status_and_result(status: &ServedStatus) -> (String, Option<Value>) {
+    match status {
+        ServedStatus::Done { status, result, .. } => (status.clone(), Some(result.clone())),
+        ServedStatus::Failed(_) => ("crashed".to_string(), None),
+        ServedStatus::Cancelled => ("cancelled".to_string(), None),
+        // Unreachable in practice (callers special-case Running), but total.
+        ServedStatus::Running => ("running".to_string(), None),
+    }
+}
+
 /// RAII concurrency permit for a served spawn; releases the slot on drop.
 struct SpawnGuard(Arc<AtomicUsize>);
 
@@ -684,6 +849,16 @@ fn dispatch(
         "resources/read" => resources_read(req, ctx, origin),
         "resources/subscribe" => subscribe_resource(req, ctx, origin, writer, conn),
         "resources/unsubscribe" => unsubscribe_resource(req, ctx, conn),
+        // The A2A external-agent surface (RFC 0020). Served only over the trusted
+        // management transport — the gateway is the PEP that already authenticated
+        // the client; a `Stdio` peer (a spawned subagent) must never reach it, so
+        // its `a2a.*` call falls through to the `-32601` catch-all below. Gated on
+        // the `a2a` feature: without it, `a2a.*` is just an unknown method.
+        #[cfg(feature = "a2a")]
+        m if m.starts_with("a2a.") && origin == PeerOrigin::Management => {
+            let method = m.to_string(); // own it so `req` can move into the handler
+            crate::mcp::a2a::dispatch_a2a(&method, req, ctx, log)
+        }
         other => Response::err(
             req.id,
             json::METHOD_NOT_FOUND,
@@ -1479,12 +1654,42 @@ fn spawn_async(
     payload: SpawnPayload,
     permit: SpawnGuard,
 ) -> Response {
+    if launch_async_run(ctx, log, &handle, payload, permit).is_err() {
+        return tool_error(
+            id,
+            "subagent could not start: thread spawn failed".to_string(),
+        );
+    }
+    let body = json!({"handle": handle, "status": "running", "done": false});
+    Response::ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": format!("spawned async (handle={handle}); poll subagent.status or read agentd://subagent/{handle}")}],
+            "structuredContent": body,
+            "isError": false
+        }),
+    )
+}
+
+/// Register an async run in the `sessions` registry and launch its supervising
+/// background thread (holding `permit` + the per-run cancel flag), pushing the
+/// usual resource notifications on completion. The shared core of `spawn_async`
+/// (the `subagent.spawn{async}` tool) and the A2A `a2a.SendMessage` path, so the
+/// served-run lifecycle is written once. Returns `Err(())` if the supervising
+/// thread could not be spawned (the half-registered handle is rolled back first).
+fn launch_async_run(
+    ctx: &ServeCtx,
+    log: &Logger,
+    handle: &str,
+    payload: SpawnPayload,
+    permit: SpawnGuard,
+) -> Result<(), ()> {
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
         evict_if_full(&mut reg);
         reg.insert(
-            handle.clone(),
+            handle.to_string(),
             ServedSession {
                 status: ServedStatus::Running,
                 cancel: Arc::clone(&cancel),
@@ -1498,7 +1703,7 @@ fn spawn_async(
         Arc::clone(&ctx.sessions),
         Arc::clone(&ctx.subscriptions),
         log.clone(),
-        handle.clone(),
+        handle.to_string(),
         crate::agentd_uri::run_uri(&ctx.run_id),
     );
     let spawned = thread::Builder::new()
@@ -1530,21 +1735,10 @@ fn spawn_async(
         ctx.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&handle);
-        return tool_error(
-            id,
-            "subagent could not start: thread spawn failed".to_string(),
-        );
+            .remove(handle);
+        return Err(());
     }
-    let body = json!({"handle": handle, "status": "running", "done": false});
-    Response::ok(
-        id,
-        json!({
-            "content": [{"type": "text", "text": format!("spawned async (handle={handle}); poll subagent.status or read agentd://subagent/{handle}")}],
-            "structuredContent": body,
-            "isError": false
-        }),
-    )
+    Ok(())
 }
 
 /// Map a finished async run + whether its cancel was requested to a
@@ -3024,5 +3218,255 @@ mod tests {
             .error
             .is_some()
         );
+    }
+
+    // ── RFC 0020: the A2A external-agent surface over the management transport. ──
+    // The TerminalStatus→TaskState mapping + the A2A Task schema are unit-tested in
+    // mcp::a2a; these drive the surface end-to-end through `dispatch` (routing,
+    // Management gating, the served-run reuse seams). [feature: a2a]
+    #[cfg(feature = "a2a")]
+    mod a2a_surface {
+        use super::*;
+
+        /// Seed a terminal `Done` session so `a2a.GetTask`/`ListTasks` can read it
+        /// without forking a real subagent.
+        fn insert_done(ctx: &ServeCtx, handle: &str, status: &str, result: Value) {
+            ctx.sessions.lock().unwrap().insert(
+                handle.to_string(),
+                ServedSession {
+                    status: ServedStatus::Done {
+                        status: status.into(),
+                        partial: false,
+                        result,
+                    },
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    started: Instant::now(),
+                },
+            );
+        }
+
+        #[test]
+        fn send_message_with_a_text_part_returns_a_working_task() {
+            // returnImmediately defaults true → an async Task with an id + a
+            // non-terminal (WORKING) state. (This DOES launch a background run; the
+            // mock-llm/mock-mcp child fails fast under the test config, but the
+            // SendMessage reply is synchronous + independent of the run outcome.)
+            let r = dispatch(
+                req(
+                    "a2a.SendMessage",
+                    Some(json!({
+                        "message": {"messageId": "m1", "role": "ROLE_USER",
+                                    "parts": [{"text": "summarize the doc"}]}
+                    })),
+                ),
+                &ctx(),
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            let task = r.result.expect("SendMessage → a Task");
+            assert!(
+                task["id"].as_str().unwrap().starts_with("served."),
+                "task id is the served handle: {task}"
+            );
+            assert_eq!(task["status"]["state"], "TASK_STATE_WORKING");
+            assert!(task["contextId"].as_str().is_some(), "contextId minted");
+        }
+
+        #[test]
+        fn send_message_without_text_parts_is_invalid_params() {
+            // No spawn happens — a malformed message is a JSON-RPC error.
+            let r = dispatch(
+                req(
+                    "a2a.SendMessage",
+                    Some(json!({"message": {"messageId": "m", "role": "ROLE_USER", "parts": []}})),
+                ),
+                &ctx(),
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            assert_eq!(r.error.expect("error").code, json::INVALID_PARAMS);
+        }
+
+        #[test]
+        fn get_task_on_a_finished_run_maps_state_and_attaches_the_distillate() {
+            let ctx = ctx();
+            insert_done(
+                &ctx,
+                "served.42",
+                "completed",
+                json!("the distilled answer"),
+            );
+            let r = dispatch(
+                req("a2a.GetTask", Some(json!({"id": "served.42"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            let task = r.result.expect("GetTask → a Task");
+            assert_eq!(task["id"], "served.42");
+            assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+            // The distillate is the single terminal artifact (distillate-only).
+            assert_eq!(
+                task["artifacts"][0]["parts"][0]["text"],
+                "the distilled answer"
+            );
+
+            // A budget-exhausted terminal run maps to FAILED with NO artifact.
+            insert_done(&ctx, "served.43", "exhausted_steps", json!("partial junk"));
+            let r = dispatch(
+                req("a2a.GetTask", Some(json!({"id": "served.43"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            let task = r.result.expect("ok");
+            assert_eq!(task["status"]["state"], "TASK_STATE_FAILED");
+            assert!(
+                task.get("artifacts").is_none(),
+                "no partial-artifact leakage on a failed task"
+            );
+        }
+
+        #[test]
+        fn get_task_unknown_id_is_task_not_found() {
+            let r = dispatch(
+                req("a2a.GetTask", Some(json!({"id": "served.404"}))),
+                &ctx(),
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            assert_eq!(
+                r.error.expect("error").code,
+                crate::mcp::a2a::TASK_NOT_FOUND
+            );
+        }
+
+        #[test]
+        fn cancel_task_of_a_running_run_returns_canceled_and_sets_the_flag() {
+            let ctx = ctx();
+            insert_running(&ctx, "served.7");
+            let r = dispatch(
+                req("a2a.CancelTask", Some(json!({"id": "served.7"}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            let task = r.result.expect("CancelTask → a Task");
+            assert_eq!(task["status"]["state"], "TASK_STATE_CANCELED");
+            assert!(
+                ctx.sessions.lock().unwrap()["served.7"]
+                    .cancel
+                    .load(Ordering::Relaxed),
+                "the run's cancel flag is now set"
+            );
+        }
+
+        #[test]
+        fn cancel_task_unknown_id_is_task_not_found() {
+            let r = dispatch(
+                req("a2a.CancelTask", Some(json!({"id": "served.404"}))),
+                &ctx(),
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            assert_eq!(
+                r.error.expect("error").code,
+                crate::mcp::a2a::TASK_NOT_FOUND
+            );
+        }
+
+        #[test]
+        fn list_tasks_returns_the_tasks_array() {
+            let ctx = ctx();
+            insert_running(&ctx, "served.0");
+            insert_done(&ctx, "served.1", "completed", json!("done"));
+            let r = dispatch(
+                req("a2a.ListTasks", Some(json!({}))),
+                &ctx,
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            let tasks = r.result.expect("ok")["tasks"].clone();
+            let arr = tasks.as_array().expect("tasks is an array");
+            assert_eq!(arr.len(), 2);
+            let ids: Vec<&str> = arr.iter().filter_map(|t| t["id"].as_str()).collect();
+            assert!(
+                ids.contains(&"served.0") && ids.contains(&"served.1"),
+                "{ids:?}"
+            );
+            // The running one is WORKING; the completed one carries its distillate.
+            for t in arr {
+                match t["id"].as_str().unwrap() {
+                    "served.0" => assert_eq!(t["status"]["state"], "TASK_STATE_WORKING"),
+                    "served.1" => {
+                        assert_eq!(t["status"]["state"], "TASK_STATE_COMPLETED");
+                        assert_eq!(t["artifacts"][0]["parts"][0]["text"], "done");
+                    }
+                    other => panic!("unexpected task {other}"),
+                }
+            }
+        }
+
+        #[test]
+        fn streaming_methods_are_refused_with_minus_32004() {
+            for m in ["a2a.SendStreamingMessage", "a2a.SubscribeToTask"] {
+                let r = dispatch(
+                    req(m, Some(json!({"id": "served.0"}))),
+                    &ctx(),
+                    PeerOrigin::Management,
+                    &writer(),
+                    0,
+                    &log(),
+                );
+                assert_eq!(
+                    r.error.expect("error").code,
+                    crate::mcp::a2a::STREAMING_NOT_SUPPORTED,
+                    "{m} → -32004"
+                );
+            }
+        }
+
+        #[test]
+        fn a2a_is_management_gated_stdio_gets_method_not_found() {
+            // A Stdio peer's a2a.* call falls through to the catch-all → -32601,
+            // never reaching the A2A handlers (the external-agent surface is for the
+            // trusted management transport only — the gateway is the PEP).
+            for m in [
+                "a2a.SendMessage",
+                "a2a.GetTask",
+                "a2a.CancelTask",
+                "a2a.ListTasks",
+            ] {
+                let r = dispatch(
+                    req(m, Some(json!({"id": "served.0"}))),
+                    &ctx(),
+                    PeerOrigin::Stdio,
+                    &writer(),
+                    0,
+                    &log(),
+                );
+                assert_eq!(
+                    r.error.expect("error").code,
+                    json::METHOD_NOT_FOUND,
+                    "{m} from stdio → -32601"
+                );
+            }
+        }
     }
 }

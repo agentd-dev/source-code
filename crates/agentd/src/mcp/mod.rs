@@ -11,3 +11,10 @@ pub mod mock;
 // no deps (blocking listener, thread-per-connection).
 #[cfg(feature = "serve-mcp")]
 pub mod server;
+
+// The A2A (Agent2Agent) v1.0 unary method surface, served over the same self-MCP
+// listener (RFC 0020). A thin binding onto the served-run machinery — a Task IS a
+// served run. Feature-gated (`a2a = ["serve-mcp"]`), no deps (reuses the RFC 0004
+// JSON-RPC codec + the vsock/unix management transport).
+#[cfg(feature = "a2a")]
+pub mod a2a;

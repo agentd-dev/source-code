@@ -130,6 +130,48 @@ pub struct ClaimRoute {
     pub style: ClaimStyle,
 }
 
+/// A standby worker's assignment channel (`--assign-from <server>:<uri>`, RFC
+/// 0019 §7.2 mechanism 1). The shared "pending work" resource a standby pool
+/// races `work.claim` on: on its `updated`, every standby member claims, exactly
+/// one wins. Always-compiled (uniform `Config`, no dependency on the gated
+/// `cluster` types); a non-`None` value needs the `cluster` build feature
+/// (validated, exit 2). At load it is desugared into a [`ClaimRoute`] on
+/// `(uri, server)` + folded into `subscribe`, so the standby pool reuses the
+/// EXISTING claim machinery — "no new code, just a claim route whose source is
+/// the assignment channel" (RFC 0019 §7.2 mechanism 1). `server` must be a
+/// declared `--mcp` server (the same exit-2 gate as a `--claim` route).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignFrom {
+    /// The `--mcp` server that owns the shared assignment resource + the `work.*`
+    /// coordination tools the standby pool races on.
+    pub server: String,
+    /// The shared "pending work" resource URI the pool subscribes to and claims.
+    pub uri: String,
+}
+
+impl AssignFrom {
+    /// Parse a `--assign-from <server>:<uri>` value. The split is on the FIRST
+    /// `:` — the server name carries no colon, and the rest (a `scheme://…` URI)
+    /// keeps its own colons intact. Rejects an empty server or URI with a
+    /// [`ConfigError::Usage`] (exit 2, before any side effect).
+    fn parse(spec: &str) -> Result<AssignFrom, ConfigError> {
+        let (server, uri) = spec.split_once(':').ok_or_else(|| {
+            usage(format!(
+                "--assign-from must be <server>:<uri> (got: {spec})"
+            ))
+        })?;
+        if server.is_empty() || uri.is_empty() {
+            return Err(usage(format!(
+                "--assign-from '{spec}' has an empty server or uri"
+            )));
+        }
+        Ok(AssignFrom {
+            server: server.to_string(),
+            uri: uri.to_string(),
+        })
+    }
+}
+
 /// Shard identity (`--shard K/N`, RFC 0019 §4). Held on [`Config`] in ALL feature
 /// combos as primitive fields (no dependency on the feature-gated `cluster`
 /// module's types), so `Config::load` compiles uniformly. The default `0/1` is a
@@ -467,6 +509,33 @@ pub struct Config {
     /// documented no-op (see `run_reactive`); the value is carried for forward
     /// compatibility and the manifest.
     pub claim_renew_fraction: f64,
+    /// Standby mode (`--standby` / `AGENTD_STANDBY`, RFC 0019 §7). A standby
+    /// worker is a reactive worker held warm and driven by an **assignment
+    /// channel** (`assign_from`) rather than its own content subscriptions: on
+    /// the shared pending resource's `updated`, it races `work.claim` (claim-pull,
+    /// §7.2 mechanism 1) and processes only what it wins. Always-compiled (uniform
+    /// `Config`); `true` needs the `cluster` build feature (validated, exit 2) and
+    /// is only meaningful in reactive mode. Reflected in `surfaces.standby` and
+    /// `agentd://capacity.standby`.
+    pub standby: bool,
+    /// The assignment channel a standby worker claim-pulls from
+    /// (`--assign-from <server>:<uri>` / `AGENTD_ASSIGN_FROM`, RFC 0019 §7.2
+    /// mechanism 1). At load it is desugared into a [`ClaimRoute`] on `(uri,
+    /// server)` and its `uri` is folded into `subscribe` — so the standby pool
+    /// reuses the existing claim machinery with NO new code path. `None` ⇒ no
+    /// assignment channel. Implies reactive mode (validated). Needs the `cluster`
+    /// build feature (the desugared claim route's gate).
+    pub assign_from: Option<AssignFrom>,
+    /// Keep the intelligence session warm while idle in standby
+    /// (`AGENTD_WARM_INTEL`, RFC 0019 §7.3; default `true` when `--standby`, else
+    /// `false`). **Forward-compat only in v1**: agentd's supervisor runs no LLM
+    /// loop — each reaction re-execs and connects its own intelligence — so there
+    /// is no supervisor-held intel session to keep warm and **no warm-child pool**
+    /// (that is a documented RFC 0019 §7 follow-up). The flag is accepted, stored,
+    /// and reported, but does not yet pre-warm anything; it exists so a future
+    /// warm-child-pool build honours the operator's intent without a config
+    /// break.
+    pub warm_intel: bool,
 }
 
 impl Default for Config {
@@ -508,6 +577,11 @@ impl Default for Config {
             claim_routes: Vec::new(),
             claim_ttl: Duration::from_secs(30),
             claim_renew_fraction: 0.33,
+            standby: false,
+            assign_from: None,
+            // Off by default; flipped to `true` when `--standby` is set unless
+            // `AGENTD_WARM_INTEL` explicitly overrides (resolved in `load`).
+            warm_intel: false,
         }
     }
 }
@@ -560,6 +634,9 @@ impl fmt::Debug for Config {
             .field("claim_routes", &self.claim_routes)
             .field("claim_ttl", &self.claim_ttl)
             .field("claim_renew_fraction", &self.claim_renew_fraction)
+            .field("standby", &self.standby)
+            .field("assign_from", &self.assign_from)
+            .field("warm_intel", &self.warm_intel)
             .finish()
     }
 }
@@ -732,6 +809,22 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_CLAIM_RENEW_FRACTION") {
             c.claim_renew_fraction = parse_claim_fraction(v)?;
         }
+        // Standby mode + its assignment channel (RFC 0019 §7). `AGENTD_STANDBY`
+        // is a bool; `AGENTD_ASSIGN_FROM` is `<server>:<uri>`. A `--standby` /
+        // `--assign-from` flag below overrides either.
+        if let Some(v) = envmap.get("AGENTD_STANDBY") {
+            c.standby = truthy(v);
+        }
+        if let Some(v) = envmap.get("AGENTD_ASSIGN_FROM") {
+            c.assign_from = Some(AssignFrom::parse(v)?);
+        }
+        // `AGENTD_WARM_INTEL` (RFC 0019 §7.3) — accepted + stored, forward-compat
+        // only in v1 (no warm-child pool). Tracked as an explicit override so the
+        // standby default (`true` when `--standby`) only applies when it is unset.
+        let mut warm_intel_env: Option<bool> = None;
+        if let Some(v) = envmap.get("AGENTD_WARM_INTEL") {
+            warm_intel_env = Some(truthy(v));
+        }
         // A single `AGENTD_A2A_PEER` env declares one peer (the env channel is
         // one value; declare more with repeated `--a2a-peer` flags). RFC 0020 §3.
         if let Some(v) = envmap.get("AGENTD_A2A_PEER") {
@@ -861,6 +954,14 @@ impl Config {
                 "--claim-renew-fraction" => {
                     c.claim_renew_fraction = parse_claim_fraction(&take("--claim-renew-fraction")?)?
                 }
+                // Standby mode (RFC 0019 §7): a warm, assignment-driven reactive
+                // worker. `--assign-from <server>:<uri>` names the shared pending
+                // resource it claim-pulls from (desugared into a claim route +
+                // subscribe below).
+                "--standby" => c.standby = true,
+                "--assign-from" => {
+                    c.assign_from = Some(AssignFrom::parse(&take("--assign-from")?)?)
+                }
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 "--report-file" => c.report_file = Some(take("--report-file")?),
@@ -888,6 +989,27 @@ impl Config {
 
         if c.run_id.is_empty() {
             c.run_id = generate_run_id();
+        }
+
+        // Resolve standby warm-intel (RFC 0019 §7.3): an explicit
+        // `AGENTD_WARM_INTEL` wins; otherwise default to ON when `--standby`, OFF
+        // otherwise. Forward-compat only in v1 — see the field doc + `warm_intel`.
+        c.warm_intel = warm_intel_env.unwrap_or(c.standby);
+
+        // Desugar a standby assignment channel into a claim route (RFC 0019 §7.2
+        // mechanism 1: "no new code, just a claim route whose source is the
+        // assignment channel"). The standby pool subscribes to the shared pending
+        // resource and races `work.claim` on it via the existing claim machinery.
+        // Default style is `tool`. Dedup against an explicit `--claim` of the same
+        // URI so the same channel isn't claimed twice.
+        if let Some(a) = &c.assign_from
+            && !c.claim_routes.iter().any(|r| r.uri == a.uri)
+        {
+            c.claim_routes.push(ClaimRoute {
+                uri: a.uri.clone(),
+                server: a.server.clone(),
+                style: ClaimStyle::Tool,
+            });
         }
 
         // A claim route's URI is subscribed + routed as a Spawn (RFC 0019 §3.4):
@@ -1075,6 +1197,40 @@ impl Config {
         // window (RFC 0016 §7.2). Off-by-default; only consumed when serving.
         if self.events_ring == 0 {
             return Err(usage("--events-ring must be > 0".into()));
+        }
+        // Standby mode + its assignment channel (RFC 0019 §7). Checked BEFORE the
+        // reactive-subscribe + `--claim` validations so the operator gets a
+        // message that names the flag they actually wrote (`--standby` /
+        // `--assign-from`), not a downstream "needs a subscribe" / desugared-claim
+        // error. A standby worker claim-pulls (§7.2 mechanism 1), so it is a
+        // `cluster` surface — mirroring the `--shard`/`--claim` gates; a
+        // silently-ignored `--standby` would mislead the operator into thinking
+        // the pool is warm-and-claiming when it isn't.
+        if (self.standby || self.assign_from.is_some()) && !cfg!(feature = "cluster") {
+            return Err(usage(
+                "--standby / --assign-from require the 'cluster' build feature".into(),
+            ));
+        }
+        // Standby is mode-orthogonal but only MEANINGFUL in reactive mode (RFC
+        // 0019 §7.3): it is `--mode reactive` + `--standby` + `--assign-from`. An
+        // assignment channel drives reactions, which only the reactive driver
+        // serves — so `--standby`/`--assign-from` outside reactive is a
+        // misconfiguration (the channel would never be claimed). Exit 2.
+        if (self.standby || self.assign_from.is_some()) && self.mode != Mode::Reactive {
+            return Err(usage(
+                "--standby / --assign-from are only valid with --mode reactive".into(),
+            ));
+        }
+        // `--assign-from`'s server must be a declared `--mcp` server (exit 2). The
+        // desugared claim route below validates this too, but this names the
+        // assignment flag the operator wrote for a clearer diagnostic.
+        if let Some(a) = &self.assign_from
+            && !self.mcp_servers.iter().any(|s| s.name == a.server)
+        {
+            return Err(usage(format!(
+                "--assign-from names server '{}', which is not a declared --mcp server",
+                a.server
+            )));
         }
         if self.mode == Mode::Reactive
             && self.subscribe.is_empty()
@@ -1600,6 +1756,8 @@ fn help_text() -> String {
          \x20 --claim <uri>=<srv>[:style] claim an item before processing it (style tool|resource; needs --features cluster; repeatable)\n\
          \x20 --claim-ttl <dur>           requested lease TTL (default 30s; or AGENTD_CLAIM_TTL)\n\
          \x20 --claim-renew-fraction <F>  renew heartbeat at ttl*F, F in (0,1) (default 0.33; or AGENTD_CLAIM_RENEW_FRACTION)\n\
+         \x20 --standby                   warm, assignment-driven reactive worker (needs --features cluster; or AGENTD_STANDBY)\n\
+         \x20 --assign-from <srv>:<uri>   shared assignment resource the standby pool claim-pulls (needs --features cluster; or AGENTD_ASSIGN_FROM)\n\
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
@@ -1989,6 +2147,228 @@ mod tests {
             ),
             other => panic!("expected Usage, got {other:?}"),
         }
+    }
+
+    // ───────────────────── RFC 0019 — standby / assignment (§7) ───────────────
+
+    #[test]
+    fn assign_from_parses_first_colon_split_and_rejects_empties() {
+        // The split is on the FIRST `:`; the URI keeps its own `scheme://` colons.
+        assert_eq!(
+            AssignFrom::parse("coord:work://pending").unwrap(),
+            AssignFrom {
+                server: "coord".into(),
+                uri: "work://pending".into(),
+            }
+        );
+        // No colon at all → usage error (the `<server>:<uri>` shape is required).
+        assert!(matches!(
+            AssignFrom::parse("noseparator"),
+            Err(ConfigError::Usage(_))
+        ));
+        // Empty server (leading colon) and empty uri (trailing colon) → exit 2.
+        assert!(matches!(
+            AssignFrom::parse(":work://pending"),
+            Err(ConfigError::Usage(_))
+        ));
+        assert!(matches!(
+            AssignFrom::parse("coord:"),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn standby_and_assign_from_parse_from_flag_and_env() {
+        // `--standby`/`--assign-from` desugar into a claim route + reactive
+        // subscribe, so a valid full config needs reactive mode + the declared
+        // coordination server (`Config::load` validates).
+        let mcp_env = || {
+            vec![
+                ("INSTRUCTION".to_string(), "x".to_string()),
+                ("AGENTD_INTELLIGENCE".to_string(), "unix:/x".to_string()),
+            ]
+        };
+        let reactive = |extra: &[&str]| -> Vec<String> {
+            let mut a = vec!["--mode", "reactive", "--mcp", "coord=mcp-coord"];
+            a.extend_from_slice(extra);
+            args(&a)
+        };
+
+        // Defaults: not standby, no assignment channel, warm_intel off.
+        let c = Config::load(&args(&[]), &base_env()).unwrap();
+        assert!(!c.standby);
+        assert!(c.assign_from.is_none());
+        assert!(!c.warm_intel);
+
+        // Flags set both; warm_intel defaults ON when --standby (no env override).
+        let c = Config::load(
+            &reactive(&["--standby", "--assign-from", "coord:work://pending"]),
+            &mcp_env(),
+        )
+        .unwrap();
+        assert!(c.standby);
+        assert_eq!(c.assign_from.as_ref().unwrap().server, "coord");
+        assert_eq!(c.assign_from.as_ref().unwrap().uri, "work://pending");
+        assert!(c.warm_intel, "warm_intel defaults true when --standby");
+
+        // Env sets standby + assignment; an explicit AGENTD_WARM_INTEL=0 wins over
+        // the standby default.
+        let mut env = mcp_env();
+        env.push(("AGENTD_STANDBY".into(), "1".into()));
+        env.push(("AGENTD_ASSIGN_FROM".into(), "coord:work://q".into()));
+        env.push(("AGENTD_WARM_INTEL".into(), "0".into()));
+        let c = Config::load(&reactive(&[]), &env).unwrap();
+        assert!(c.standby);
+        assert_eq!(c.assign_from.as_ref().unwrap().uri, "work://q");
+        assert!(
+            !c.warm_intel,
+            "explicit AGENTD_WARM_INTEL=0 overrides default"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn assign_from_becomes_a_claim_route_and_subscribed_uri() {
+        // RFC 0019 §7.2 mechanism 1: --assign-from desugars into a claim route on
+        // (uri, server) AND its URI is folded into subscribe — the standby pool
+        // claim-pulls via the EXISTING machinery, no new path.
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--standby",
+                "--mcp",
+                "coord=mcp-coord",
+                "--assign-from",
+                "coord:work://pending",
+            ]),
+            &env,
+        )
+        .unwrap();
+        // Exactly one claim route, on the assignment channel, default `tool` style.
+        assert_eq!(c.claim_routes.len(), 1);
+        assert_eq!(c.claim_routes[0].uri, "work://pending");
+        assert_eq!(c.claim_routes[0].server, "coord");
+        assert_eq!(c.claim_routes[0].style, ClaimStyle::Tool);
+        // And the URI is subscribed (routed as a Spawn; the claim gate precedes it).
+        assert!(c.subscribe.contains(&"work://pending".to_string()));
+
+        // An explicit --claim on the SAME uri is not duplicated by the desugar.
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--standby",
+                "--mcp",
+                "coord=mcp-coord",
+                "--claim",
+                "work://pending=coord:resource",
+                "--assign-from",
+                "coord:work://pending",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(c.claim_routes.len(), 1, "no duplicate claim route");
+        // The explicit --claim's style is preserved (the desugar didn't overwrite).
+        assert_eq!(c.claim_routes[0].style, ClaimStyle::Resource);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn standby_requires_reactive_and_a_declared_server() {
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        // --assign-from naming an undeclared server is exit 2 (clear message).
+        let e = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--standby",
+                "--assign-from",
+                "ghost:work://pending",
+            ]),
+            &env,
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--assign-from names server 'ghost'"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // --standby outside reactive mode is exit 2 (the channel would never be
+        // claimed). Default mode is `once`.
+        let e = Config::load(
+            &args(&[
+                "--standby",
+                "--mcp",
+                "coord=mcp-coord",
+                "--assign-from",
+                "coord:work://pending",
+            ]),
+            &env,
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("only valid with --mode reactive"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    #[test]
+    fn standby_requires_cluster_feature() {
+        // A standby directive must NOT be silently ignored without the feature.
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        let e = Config::load(&args(&["--mode", "reactive", "--standby"]), &env).unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--standby / --assign-from require the 'cluster' build feature"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn standby_reflected_in_capabilities_surface() {
+        // surfaces.standby + agentd://capacity.standby both reflect cfg.standby.
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "reactive",
+                "--standby",
+                "--mcp",
+                "coord=mcp-coord",
+                "--assign-from",
+                "coord:work://pending",
+            ]),
+            &env,
+        )
+        .unwrap();
+        let id = crate::identity::Identity::from_env(&c.run_id);
+        let s = &crate::capabilities::manifest(&c, &id, false)["surfaces"];
+        assert_eq!(s["standby"], serde_json::json!(true));
     }
 
     #[test]

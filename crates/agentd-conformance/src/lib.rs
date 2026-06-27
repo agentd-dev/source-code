@@ -30,6 +30,10 @@ pub enum Category {
     AgentLoop,
     /// Security posture: trifecta refusal, secret redaction, tool scoping.
     Security,
+    /// The work-claim / lease convention (RFC 0019 §3, the frozen `work.*`
+    /// contract RFC 0015 §5.6): atomic single-grant + the claim→ack lifecycle a
+    /// `cluster` agentd drives against a coordination server.
+    WorkClaim,
 }
 
 impl Category {
@@ -40,6 +44,7 @@ impl Category {
             Category::Supervisor => "supervisor",
             Category::AgentLoop => "agent-loop",
             Category::Security => "security",
+            Category::WorkClaim => "work-claim",
         }
     }
 }
@@ -124,5 +129,6 @@ pub fn all_checks() -> Vec<Check> {
     v.extend(checks::supervisor::checks());
     v.extend(checks::agent_loop::checks());
     v.extend(checks::security::checks());
+    v.extend(checks::work_claim::checks());
     v
 }

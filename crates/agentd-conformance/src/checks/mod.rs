@@ -5,3 +5,4 @@ pub mod mcp_client;
 pub mod mcp_server;
 pub mod security;
 pub mod supervisor;
+pub mod work_claim;

@@ -272,12 +272,13 @@ fn surfaces(cfg: &Config) -> Value {
         // RFC 0019 horizontal-scaling surface. `cluster` is true in a `cluster`
         // build (sharding + the capacity resource are present). `shard` is this
         // instance's "K/N" identity, or null when unsharded (N==1) / no cluster.
-        // `standby` is always false — standby (RFC 0019 §7) is a separate
-        // follow-up. The `claim` key is added below only in a `cluster` build
+        // `standby` reflects `--standby` (RFC 0019 §7): agentctl routes a
+        // directed assignment only to instances reporting `standby:true`. The
+        // `claim` key is added below only in a `cluster` build
         // (capability-absence-not-error, RFC 0015 §2.5 — omitted, not false).
         "cluster": cfg!(feature = "cluster"),
         "shard": cfg.shard.label().map_or(Value::Null, Value::String),
-        "standby": false,
+        "standby": cfg.standby,
     });
     // RFC 0019 §9 / RFC 0015 §5.6: a `cluster` build that has wired the claim
     // path advertises the styles it speaks; a build without the feature OMITS the

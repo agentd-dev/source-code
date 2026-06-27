@@ -196,19 +196,26 @@ impl fmt::Debug for Config {
     }
 }
 
-/// What `load()` can short-circuit with. `Help`/`Version` are *not* errors
-/// (exit 0); `Usage` is a validation/parse failure (exit 2, RFC 0011 §5).
+/// What `load()` can short-circuit with. `Help`/`Version`/`Capabilities` are
+/// *not* errors (exit 0); `Usage` is a validation/parse failure (exit 2,
+/// RFC 0011 §5). `Capabilities` carries the pretty-printed manifest JSON — the
+/// side-effect-free admission probe (`agentd --capabilities`, RFC 0015 §5.2),
+/// short-circuited before run-required validation so it succeeds even with no
+/// instruction (agentctl probes an image without a full run config).
 #[derive(Debug)]
 pub enum ConfigError {
     Help(String),
     Version(String),
+    Capabilities(String),
     Usage(String),
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Help(s) | ConfigError::Version(s) => write!(f, "{s}"),
+            ConfigError::Help(s) | ConfigError::Version(s) | ConfigError::Capabilities(s) => {
+                write!(f, "{s}")
+            }
             ConfigError::Usage(s) => write!(f, "{s}"),
         }
     }
@@ -296,6 +303,11 @@ impl Config {
         // `--mcp-tags` may precede or follow its `--mcp`; collect and apply once
         // every server is known.
         let mut mcp_tags: Vec<(String, Vec<TrifectaTag>)> = Vec::new();
+        // `--capabilities` is the admission probe (RFC 0015 §5.2): captured here
+        // and resolved after the whole config is parsed but BEFORE run-required
+        // validation, so it reflects whatever config is present and succeeds with
+        // no instruction.
+        let mut capabilities = false;
         let mut it = args.iter().peekable();
         while let Some(arg) = it.next() {
             let mut take = |name: &str| -> Result<String, ConfigError> {
@@ -308,6 +320,7 @@ impl Config {
                 "-V" | "--version" => {
                     return Err(ConfigError::Version(format!("agentd {}\n", crate::VERSION)));
                 }
+                "--capabilities" => capabilities = true,
                 "--instruction" => c.instruction = Some(take("--instruction")?),
                 "--instruction-file" => {
                     let p = take("--instruction-file")?;
@@ -393,6 +406,19 @@ impl Config {
         if c.run_id.is_empty() {
             c.run_id = generate_run_id();
         }
+
+        // `--capabilities`: build the manifest from whatever config IS present +
+        // the downward-API identity, and short-circuit BEFORE run-required
+        // validation (RFC 0015 §5.2). This is the side-effect-free admission
+        // probe — it must succeed with no --instruction, so it never reaches the
+        // `validate()` below. The caller prints the JSON and exits 0.
+        if capabilities {
+            let identity = crate::identity::Identity::from_env(&c.run_id);
+            let manifest = crate::capabilities::manifest(&c, &identity, false);
+            let json = serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string());
+            return Err(ConfigError::Capabilities(format!("{json}\n")));
+        }
+
         c.validate()?;
         Ok(c)
     }
@@ -643,6 +669,7 @@ fn help_text() -> String {
          \x20 --cgroup-memory-max <SIZE>  per-run memory.max (max|512M|2G|bytes; needs --cgroup + delegation)\n\
          \x20 --cgroup-pids-max <N>       per-run pids.max (max|count of THREADS; needs --cgroup + delegation)\n\
          \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
+         \x20 --capabilities             print the capabilities manifest (JSON) and exit\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
     )
@@ -789,6 +816,43 @@ mod tests {
     fn help_short_circuits() {
         let e = Config::load(&args(&["--help"]), &[]).unwrap_err();
         assert!(matches!(e, ConfigError::Help(_)));
+    }
+
+    #[test]
+    fn capabilities_emits_parseable_json_with_no_instruction() {
+        // The admission probe must succeed with NO --instruction and NO
+        // intelligence — it never reaches run-required validation.
+        let e = Config::load(&args(&["--capabilities"]), &[]).unwrap_err();
+        let json = match e {
+            ConfigError::Capabilities(s) => s,
+            other => panic!("expected Capabilities, got {other:?}"),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&json).expect("manifest must be valid JSON");
+        // It reflects the resolved config (a minted run id is always present).
+        assert_eq!(v["contract_version"], serde_json::json!("1.0"));
+        assert!(
+            v["identity"]["run_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(v.get("surfaces").is_some());
+    }
+
+    #[test]
+    fn capabilities_reflects_present_config() {
+        // With config present, the manifest reflects it (no validation needed).
+        let c = Config::load(
+            &args(&["--capabilities", "--mcp", "fs=cmd", "--enable-exec"]),
+            &base_env(),
+        );
+        let json = match c.unwrap_err() {
+            ConfigError::Capabilities(s) => s,
+            other => panic!("expected Capabilities, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["exec_enabled"], serde_json::json!(true));
+        assert_eq!(v["mcp_servers"][0]["name"], serde_json::json!("fs"));
     }
 
     #[test]

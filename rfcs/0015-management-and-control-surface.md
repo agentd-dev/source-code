@@ -488,7 +488,7 @@ Full schema (jsonc; every field is part of the frozen contract — §6 of RFC 00
 
   "limits": {                            // the bounding box (RFC 0007/0009/0003)
     "max_depth": 4, "max_children": 8, "max_total_subagents": 64,
-    "max_steps": 200, "max_tokens": 2000000, "tree_token_budget": 4000000,
+    "max_steps": 200, "max_tokens": 2000000, "tree_token_budget": 2000000,
     "deadline_ms": 1800000, "drain_timeout_ms": 25000
   },
 

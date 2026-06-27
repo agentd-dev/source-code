@@ -2802,6 +2802,7 @@ mod tests {
 
     #[test]
     fn status_call_returns_structured_state() {
+        let _g = crate::signals::test_guard();
         let r = dispatch(
             req("tools/call", Some(json!({"name": "status"}))),
             &ctx(),
@@ -3685,6 +3686,7 @@ mod tests {
 
     #[test]
     fn drain_latches_draining_and_returns_a_snapshot_idempotently() {
+        let _g = crate::signals::test_guard();
         let ctx = ctx();
         let call = || {
             dispatch(
@@ -3736,6 +3738,7 @@ mod tests {
 
     #[test]
     fn lame_duck_flips_the_readiness_override_and_clears() {
+        let _g = crate::signals::test_guard();
         let ctx = ctx();
         crate::signals::set_lame_duck(false); // clean baseline (process-global)
         let on = dispatch(
@@ -3778,6 +3781,7 @@ mod tests {
 
     #[test]
     fn pause_resume_fans_to_async_sessions_and_sets_the_flag() {
+        let _g = crate::signals::test_guard();
         let ctx = ctx();
         crate::signals::set_paused(false); // clean baseline (process-global)
         insert_running(&ctx, "served.0");
@@ -3835,6 +3839,7 @@ mod tests {
 
     #[test]
     fn pause_is_not_drain_or_lame_duck_readiness_unchanged() {
+        let _g = crate::signals::test_guard();
         // §4.3: a paused instance is NOT lame-duck/draining — readiness reflects
         // only those, never pause.
         let ctx = ctx();
@@ -3921,6 +3926,7 @@ mod tests {
 
     #[test]
     fn inventory_read_is_management_gated_and_projects_the_lifecycle_flags() {
+        let _g = crate::signals::test_guard();
         let ctx = ctx();
         crate::signals::set_lame_duck(false);
         insert_running(&ctx, "served.0");

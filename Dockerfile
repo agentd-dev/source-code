@@ -3,12 +3,13 @@
 # agentd cloud-native appliance image — a fully static musl binary on `scratch`.
 #
 # The image ships the **dependency-free cloud-native feature set**
-# (`metrics,serve-mcp,cron,otel,cluster,hot-reload`): the `/healthz`+`/readyz`+
-# `/metrics` HTTP probe surface (so k8s liveness/readiness probes work), agentd
-# serving its own MCP for composability, UTC-cron scheduling, OTLP trace export,
-# horizontal scaling (sharding + work-claim leases + autoscaling signals + the
-# capacity surface), and SIGHUP config hot-reload. Every one of those is
-# hand-rolled and adds NO dependency, so the binary stays the minimalism target —
+# (`metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch`): the `/healthz`+
+# `/readyz`+`/metrics` HTTP probe surface (so k8s liveness/readiness probes work),
+# agentd serving its own MCP for composability, UTC-cron scheduling, OTLP trace
+# export, horizontal scaling (sharding + work-claim leases + autoscaling signals +
+# the capacity surface), and SIGHUP + inotify config hot-reload (a ConfigMap volume
+# swap reloads in place). Every one of those is hand-rolled and adds NO dependency,
+# so the binary stays the minimalism target —
 # serde/serde_json + libc only (3 deps), no async runtime, no TLS, no C toolchain
 # — links statically against musl, and ships on an empty base: ~1.3 MB, no shell,
 # no libc, no package manager. Nothing to attack or patch.
@@ -22,7 +23,7 @@
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.88-alpine AS builder
-ARG FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload"
+ARG FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one
@@ -44,7 +45,7 @@ RUN if [ -n "$FEATURES" ]; then \
 FROM scratch
 
 # OCI image metadata (populated by CI via --build-arg; harmless defaults locally).
-ARG VERSION="2.5.0"
+ARG VERSION="2.6.0"
 ARG REVISION="unknown"
 ARG CREATED="1970-01-01T00:00:00Z"
 LABEL org.opencontainers.image.title="agentd" \

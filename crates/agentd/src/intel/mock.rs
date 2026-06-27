@@ -106,6 +106,14 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         ("schedule", true) => final_answer("scheduled a follow-up"),
         ("subscribe", false) => tool_call("subscribe", r#"{"uri":"file:///watch.json"}"#),
         ("subscribe", true) => final_answer("now watching the resource"),
+        // Delegate an objective to a declared remote A2A peer named "peer"
+        // (RFC 0020 §3), then — once the distillate comes back as a tool result —
+        // answer. Drives the agentd-as-A2A-client path end to end.
+        ("a2a-delegate", false) => tool_call(
+            "a2a.delegate",
+            r#"{"peer":"peer","objective":"summarize the mesh","output_contract":"one line"}"#,
+        ),
+        ("a2a-delegate", true) => final_answer("delegated over a2a"),
         // Unlike read/schedule (which answer once a tool result is seen),
         // spawn-churn ignores `saw_tool_result` and keeps emitting a
         // `subagent.spawn` call every turn — so an in-loop run fires many rapid,

@@ -27,6 +27,7 @@ fn bogus_payload() -> SpawnPayload {
             model: Some("test-model".into()),
         },
         mcp_servers: Vec::new(),
+        a2a_peers: Vec::new(),
         limits: Limits {
             max_steps: 3,
             max_tokens: 10_000,

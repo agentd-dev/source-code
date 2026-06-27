@@ -116,6 +116,88 @@ impl ServeTarget {
     }
 }
 
+/// A declared **A2A peer**: a name and a client transport endpoint to reach a
+/// remote A2A agent (or the on-node gateway that forwards into the mesh). This
+/// is the delegation-backend axis of RFC 0020 §3 — `a2a.delegate` looks a peer
+/// up here and runs the A2A client against `endpoint`. The endpoint is one of
+/// agentd's existing client transports: `unix:/path` or `vsock:CID:PORT`. No
+/// secrets live here (the gateway is the PEP; the vsock peer is trusted, RFC
+/// 0012 §3.8). Serializable so it travels in the spawn payload to subagents,
+/// exactly like `mcp_servers` (RFC 0009 §spawn-payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2aPeerSpec {
+    pub name: String,
+    pub endpoint: String,
+}
+
+impl A2aPeerSpec {
+    /// Resolve this peer's endpoint string to a parsed [`A2aEndpoint`] for the
+    /// A2A client to dial. Returns the validation message (without the `agentd:`
+    /// prefix) on a bad scheme. The endpoint is validated at startup, so at run
+    /// time this is expected to succeed; the `Result` keeps the call total.
+    pub fn endpoint_of(&self) -> Result<A2aEndpoint, String> {
+        A2aEndpoint::parse(&self.endpoint).map_err(|e| e.to_string())
+    }
+}
+
+/// The client transport an [`A2aPeerSpec`] endpoint resolves to. Parsed once
+/// (scheme-validated at startup), then the A2A client dials it. `vsock:CID:PORT`
+/// requires both forms of a cid+port (no wildcard — a client dials a concrete
+/// peer, unlike the `--serve-mcp` listen form which may wildcard).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2aEndpoint {
+    /// Connect to a unix-domain socket at this path.
+    Unix(std::path::PathBuf),
+    /// Connect to AF_VSOCK `(cid, port)`.
+    Vsock { cid: u32, port: u32 },
+}
+
+impl A2aEndpoint {
+    /// Parse an `--a2a-peer` endpoint. Validates the scheme/port and, for
+    /// `vsock:`, that this build has the `vsock` feature — mirroring
+    /// [`ServeTarget::parse`]. Returns a [`ConfigError::Usage`] (exit 2, before
+    /// any side effect) on any problem.
+    pub fn parse(spec: &str) -> Result<A2aEndpoint, ConfigError> {
+        if let Some(path) = spec.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err(usage("--a2a-peer: unix path is empty".into()));
+            }
+            return Ok(A2aEndpoint::Unix(path.into()));
+        }
+        if let Some(rest) = spec.strip_prefix("vsock:") {
+            if !cfg!(feature = "vsock") {
+                return Err(usage(
+                    "--a2a-peer: scheme unsupported: vsock requires the 'vsock' build feature"
+                        .into(),
+                ));
+            }
+            // A client dials a concrete peer: CID:PORT is required (no wildcard).
+            let (cid_str, port_str) = rest.split_once(':').ok_or_else(|| {
+                usage(format!(
+                    "--a2a-peer: vsock endpoint must be vsock:CID:PORT (got: vsock:{rest})"
+                ))
+            })?;
+            let cid = cid_str.parse::<u32>().map_err(|_| {
+                usage(format!(
+                    "--a2a-peer: invalid vsock cid '{cid_str}' (want a number)"
+                ))
+            })?;
+            let port = port_str.parse::<u32>().map_err(|_| {
+                usage(format!(
+                    "--a2a-peer: invalid vsock port '{port_str}' (want a number)"
+                ))
+            })?;
+            if port == 0 {
+                return Err(usage("--a2a-peer: vsock port must be > 0".into()));
+            }
+            return Ok(A2aEndpoint::Vsock { cid, port });
+        }
+        Err(usage(format!(
+            "--a2a-peer: scheme unsupported (want unix:PATH | vsock:CID:PORT): {spec}"
+        )))
+    }
+}
+
 /// A declared MCP server: a name and the argv to spawn it (stdio transport).
 /// Serializable because it travels in the subagent spawn payload as the
 /// child's scoped server subset (RFC 0005, RFC 0009).
@@ -139,6 +221,10 @@ pub struct Config {
     pub intelligence_token: Option<String>,
     pub model: Option<String>,
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Declared remote-A2A delegation peers (`--a2a-peer name=endpoint`). The
+    /// delegation-backend axis of RFC 0020 §3: `a2a.delegate` dials these. Only
+    /// honoured in `--features a2a` builds (validated at startup).
+    pub a2a_peers: Vec<A2aPeerSpec>,
     pub mode: Mode,
     pub subscribe: Vec<String>,
     /// Subscriptions routed to a **warm continue-session** rather than a fresh
@@ -199,6 +285,7 @@ impl Default for Config {
             intelligence_token: None,
             model: None,
             mcp_servers: Vec::new(),
+            a2a_peers: Vec::new(),
             mode: Mode::Once,
             subscribe: Vec::new(),
             continue_subscribe: Vec::new(),
@@ -237,6 +324,7 @@ impl fmt::Debug for Config {
             )
             .field("model", &self.model)
             .field("mcp_servers", &self.mcp_servers)
+            .field("a2a_peers", &self.a2a_peers)
             .field("mode", &self.mode)
             .field("subscribe", &self.subscribe)
             .field("continue_subscribe", &self.continue_subscribe)
@@ -362,6 +450,11 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
+        // A single `AGENTD_A2A_PEER` env declares one peer (the env channel is
+        // one value; declare more with repeated `--a2a-peer` flags). RFC 0020 §3.
+        if let Some(v) = envmap.get("AGENTD_A2A_PEER") {
+            c.a2a_peers.push(parse_a2a_peer_spec(v)?);
+        }
         if let Some(v) = envmap.get("AGENTD_TRACEPARENT") {
             c.traceparent = Some((*v).to_string());
         }
@@ -401,6 +494,10 @@ impl Config {
                 "--mcp" => {
                     let spec = take("--mcp")?;
                     c.mcp_servers.push(parse_mcp_spec(&spec)?);
+                }
+                "--a2a-peer" => {
+                    let spec = take("--a2a-peer")?;
+                    c.a2a_peers.push(parse_a2a_peer_spec(&spec)?);
                 }
                 "--mode" => {
                     let v = take("--mode")?;
@@ -590,6 +687,28 @@ impl Config {
         if let Some(spec) = &self.serve_mcp {
             ServeTarget::parse(spec)?;
         }
+        // Declared A2A delegation peers (RFC 0020 §3) need the `a2a` build
+        // feature, and each endpoint scheme is validated up front (exit 2 before
+        // any side effect) — mirroring the served-MCP target check.
+        if !self.a2a_peers.is_empty() && !cfg!(feature = "a2a") {
+            return Err(usage("--a2a-peer requires the 'a2a' build feature".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for peer in &self.a2a_peers {
+            if peer.name.is_empty() || peer.endpoint.is_empty() {
+                return Err(usage(format!(
+                    "--a2a-peer '{}' has an empty name or endpoint",
+                    peer.name
+                )));
+            }
+            if !seen.insert(peer.name.as_str()) {
+                return Err(usage(format!(
+                    "--a2a-peer name '{}' is declared more than once",
+                    peer.name
+                )));
+            }
+            A2aEndpoint::parse(&peer.endpoint)?;
+        }
         Ok(())
     }
 }
@@ -623,6 +742,25 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
         name: name.to_string(),
         command,
         tags: Vec::new(),
+    })
+}
+
+/// Parse `--a2a-peer name=endpoint` into an [`A2aPeerSpec`] (RFC 0020 §3). The
+/// endpoint is the remainder after the FIRST `=` (so `unix:`/`vsock:` schemes —
+/// which contain no `=` — pass through verbatim); the scheme itself is validated
+/// later in [`Config::validate`] via [`A2aEndpoint::parse`].
+fn parse_a2a_peer_spec(spec: &str) -> Result<A2aPeerSpec, ConfigError> {
+    let (name, endpoint) = spec
+        .split_once('=')
+        .ok_or_else(|| usage(format!("--a2a-peer must be name=endpoint (got: {spec})")))?;
+    if name.is_empty() || endpoint.is_empty() {
+        return Err(usage(format!(
+            "--a2a-peer '{spec}' has an empty name or endpoint"
+        )));
+    }
+    Ok(A2aPeerSpec {
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
     })
 }
 
@@ -714,6 +852,7 @@ fn help_text() -> String {
          TOOLS / MCP:\n\
          \x20 --mcp name=command          declare an MCP server (repeatable; stdio)\n\
          \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
+         \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: unix:/path | vsock:CID:PORT (repeatable; needs --features a2a)\n\
          \x20 --enable-exec               expose the gated exec tool\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
          \x20 --allow-trifecta            permit all three capability legs in one agent\n\
@@ -1041,6 +1180,99 @@ mod tests {
         // a foreign scheme is rejected at load (exit 2) before any side effect.
         let e = Config::load(&args(&["--serve-mcp", "tcp:9000"]), &base_env()).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn a2a_peer_spec_parses_name_and_endpoint() {
+        // The endpoint is the remainder after the first '=', so the unix:/vsock:
+        // scheme passes through verbatim (no second '=' to confuse the split).
+        let spec = parse_a2a_peer_spec("mesh=unix:/run/peer.sock").unwrap();
+        assert_eq!(spec.name, "mesh");
+        assert_eq!(spec.endpoint, "unix:/run/peer.sock");
+        // Missing '=' / empty halves are usage errors.
+        assert!(matches!(
+            parse_a2a_peer_spec("noequals"),
+            Err(ConfigError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_a2a_peer_spec("=unix:/x"),
+            Err(ConfigError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_a2a_peer_spec("mesh="),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a2a_peer_flag_parses_and_validates_on_a2a_build() {
+        // A valid unix peer loads through full validation.
+        let c = Config::load(
+            &args(&["--a2a-peer", "mesh=unix:/run/peer.sock"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.a2a_peers.len(), 1);
+        assert_eq!(c.a2a_peers[0].name, "mesh");
+        assert_eq!(c.a2a_peers[0].endpoint, "unix:/run/peer.sock");
+
+        // A bad endpoint scheme is rejected at load (exit 2) before any side effect.
+        let bad = Config::load(&args(&["--a2a-peer", "mesh=tcp:9000"]), &base_env()).unwrap_err();
+        assert!(matches!(bad, ConfigError::Usage(_)));
+
+        // An empty unix path is a usage error too.
+        let empty = Config::load(&args(&["--a2a-peer", "mesh=unix:"]), &base_env()).unwrap_err();
+        assert!(matches!(empty, ConfigError::Usage(_)));
+
+        // A duplicate peer name is rejected.
+        let dup = Config::load(
+            &args(&[
+                "--a2a-peer",
+                "mesh=unix:/a.sock",
+                "--a2a-peer",
+                "mesh=unix:/b.sock",
+            ]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(dup, ConfigError::Usage(_)));
+    }
+
+    #[cfg(not(feature = "a2a"))]
+    #[test]
+    fn a2a_peer_requires_the_a2a_feature() {
+        // The flag parses, but validation rejects it without the build feature.
+        let e = Config::load(
+            &args(&["--a2a-peer", "mesh=unix:/run/peer.sock"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(msg) => assert!(
+                msg.contains("--a2a-peer requires the 'a2a' build feature"),
+                "got: {msg}"
+            ),
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "a2a", feature = "vsock"))]
+    #[test]
+    fn a2a_peer_vsock_endpoint_requires_cid_and_port() {
+        // vsock:CID:PORT parses; the wildcard/bare forms do not (a client dials a
+        // concrete peer).
+        let c = Config::load(&args(&["--a2a-peer", "g=vsock:2:5005"]), &base_env()).unwrap();
+        assert_eq!(c.a2a_peers[0].endpoint, "vsock:2:5005");
+        for bad in ["g=vsock:5005", "g=vsock:2:0", "g=vsock:x:5005"] {
+            assert!(
+                matches!(
+                    Config::load(&args(&["--a2a-peer", bad]), &base_env()),
+                    Err(ConfigError::Usage(_))
+                ),
+                "{bad} must be a usage error"
+            );
+        }
     }
 
     #[test]

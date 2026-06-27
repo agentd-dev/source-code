@@ -57,6 +57,11 @@ const MAX_SCHEDULE_SECS: u64 = 30 * 24 * 3600;
 const MAX_SUBSCRIPTIONS: usize = 16;
 /// Poll granularity while awaiting an async child.
 const AWAIT_POLL: Duration = Duration::from_millis(50);
+/// Bounded per-delegation deadline for a remote A2A delegation (RFC 0020 §3):
+/// the `a2a.delegate` SendMessage→poll loop is capped here so it never hangs the
+/// agentic loop. The remote agent owns its own budget; this is agentd's backstop.
+#[cfg(feature = "a2a")]
+const A2A_DELEGATE_DEADLINE: Duration = Duration::from_secs(120);
 /// Bounded `subagent.await` window: a single call blocks at most this long, then
 /// hands control back ("still running") so the loop stays responsive to cancel.
 const AWAIT_MAX: Duration = Duration::from_secs(30);
@@ -89,6 +94,11 @@ pub struct Orchestrator {
     spawn_bucket: TokenBucket,
     intelligence: IntelConfig,
     mcp_servers: Vec<McpServerSpec>,
+    /// Declared remote-A2A delegation peers (RFC 0020 §3), propagated from the
+    /// payload so children inherit them and the `a2a.delegate` self-tool can dial
+    /// them by name. Carried on every build (it is inert config) but only
+    /// surfaced as a tool under `--features a2a`.
+    a2a_peers: Vec<crate::config::A2aPeerSpec>,
     run_id: String,
     trace_id: Option<String>,
     log_level: String,
@@ -124,6 +134,7 @@ impl Orchestrator {
             spawn_bucket: TokenBucket::new(SPAWN_RATE_BURST, SPAWN_RATE_PER_SEC),
             intelligence: payload.intelligence.clone(),
             mcp_servers: payload.mcp_servers.clone(),
+            a2a_peers: payload.a2a_peers.clone(),
             run_id: payload.telemetry.run_id.clone(),
             trace_id: payload.telemetry.trace_id.clone(),
             log_level: payload.telemetry.log_level.clone(),
@@ -272,6 +283,7 @@ impl Orchestrator {
             context_seed,
             intelligence: self.intelligence.clone(),
             mcp_servers,
+            a2a_peers: self.a2a_peers.clone(),
             limits: self.child_limits.clone(),
             telemetry: Telemetry {
                 run_id: self.run_id.clone(),
@@ -310,6 +322,87 @@ impl Orchestrator {
             Ok(SuperviseResult::Failed(e)) => (format!("subagent failed: {e}"), true),
             Ok(SuperviseResult::Killed(r)) => (format!("subagent terminated ({r:?})"), true),
             Err(e) => (format!("subagent could not start: {e}"), true),
+        }
+    }
+
+    /// `a2a.delegate` — delegate an objective to a declared **remote A2A agent**
+    /// (RFC 0020 §3), the remote backend beside the local `subagent.spawn`. Looks
+    /// the named peer up in `a2a_peers`, then runs the A2A client (SendMessage →
+    /// poll GetTask → distillate) bounded by [`A2A_DELEGATE_DEADLINE`]. A remote
+    /// delegation counts against the SAME breadth cap a local spawn does (it *is*
+    /// a delegation), and the spawn-rate bucket throttles churn. Every failure —
+    /// an unknown peer, a transport error, a non-completed remote terminal — is an
+    /// `isError` tool result (an observation the model adapts to), never a crash.
+    #[cfg(feature = "a2a")]
+    fn delegate(&mut self, args: &Value) -> (String, bool) {
+        // Breadth + rate caps: a remote delegation is a delegation, counted like a
+        // local spawn so the node's fan-out ceiling bounds both backends together.
+        if !self.spawn_bucket.try_take() {
+            return a2a_refused("delegation rate exceeded");
+        }
+        if self.child_count >= MAX_CHILDREN {
+            return a2a_refused("maximum number of delegations reached for this agent");
+        }
+        let peer_name = args
+            .get("peer")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if peer_name.is_empty() {
+            return (
+                "error: a2a.delegate requires a non-empty 'peer' name".into(),
+                true,
+            );
+        }
+        let objective = args
+            .get("objective")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if objective.is_empty() {
+            return (
+                "error: a2a.delegate requires a non-empty 'objective'".into(),
+                true,
+            );
+        }
+        let output_contract = str_arg(args, "output_contract");
+
+        // Resolve the peer endpoint. An unknown peer name is an observation (the
+        // model may have hallucinated a peer), not a crash.
+        let Some(peer) = self.a2a_peers.iter().find(|p| p.name == peer_name) else {
+            let known: Vec<&str> = self.a2a_peers.iter().map(|p| p.name.as_str()).collect();
+            return (
+                format!(
+                    "error: no A2A peer named '{peer_name}' (declared peers: {})",
+                    known.join(", ")
+                ),
+                true,
+            );
+        };
+        // The endpoint scheme was validated at startup; a parse error here is
+        // surfaced as an observation rather than trusted to be infallible.
+        let endpoint = match peer.endpoint_of() {
+            Ok(e) => e,
+            Err(msg) => return (format!("error: a2a peer '{peer_name}': {msg}"), true),
+        };
+
+        // Count this delegation against the breadth cap (like a spawned child).
+        self.child_count += 1;
+        let deadline = Instant::now() + A2A_DELEGATE_DEADLINE;
+        self.log.info(
+            "a2a.delegate",
+            json!({"peer": peer_name, "endpoint": peer.endpoint}),
+        );
+        match crate::mcp::a2a_client::delegate(
+            &endpoint,
+            objective,
+            output_contract.as_deref(),
+            deadline,
+        ) {
+            crate::mcp::a2a_client::DelegateOutcome::Distillate(s) => {
+                (distill(&Value::String(s)), false)
+            }
+            crate::mcp::a2a_client::DelegateOutcome::Error(e) => (e, true),
         }
     }
 
@@ -500,6 +593,16 @@ impl SelfHandler for Orchestrator {
             t.push(status_tool_def());
             t.push(await_tool_def());
         }
+        // Remote-A2A delegation (RFC 0020 §3): advertised ONLY when peers are
+        // declared (and the `a2a` feature is on). It is a delegation backend, so —
+        // like local spawn — it shares the breadth/rate caps; advertising it
+        // independently of `can_nest` is deliberate: delegating to a remote agent
+        // does not deepen the LOCAL supervised tree (the remote owns its own
+        // depth), it only counts against this node's fan-out breadth.
+        #[cfg(feature = "a2a")]
+        if !self.a2a_peers.is_empty() {
+            t.push(a2a_delegate_tool_def(&self.a2a_peers));
+        }
         // Self-scheduling + self-subscription are root-agent capabilities: a
         // nested child's request would be lost to its parent, which only
         // distills the child's result.
@@ -518,6 +621,11 @@ impl SelfHandler for Orchestrator {
     fn handle(&mut self, name: &str, args: &Value) -> Option<(String, bool)> {
         match name {
             "subagent.spawn" => Some(self.spawn(args)),
+            // Remote-A2A delegation (RFC 0020 §3) — routed only when peers are
+            // declared (else it falls through to MCP / unknown-tool, same as a
+            // non-advertised tool). Feature-gated.
+            #[cfg(feature = "a2a")]
+            "a2a.delegate" if !self.a2a_peers.is_empty() => Some(self.delegate(args)),
             // Collection tools accept a handle regardless of depth budget — an
             // agent at its breadth cap still needs to await its in-flight children.
             "subagent.status" => Some(self.status(args)),
@@ -583,6 +691,11 @@ impl Drop for Orchestrator {
 
 fn refused(why: &str) -> (String, bool) {
     (format!("subagent.spawn refused: {why}"), true)
+}
+
+#[cfg(feature = "a2a")]
+fn a2a_refused(why: &str) -> (String, bool) {
+    (format!("a2a.delegate refused: {why}"), true)
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
@@ -658,6 +771,36 @@ fn await_tool_def() -> ToolDef {
             "type": "object",
             "properties": {"handle": {"type": "string", "description": "the handle returned by subagent.spawn async=true"}},
             "required": ["handle"]
+        }),
+    }
+}
+
+/// The `a2a.delegate` tool def (RFC 0020 §3). Lists the declared peer names in
+/// the description + as a schema `enum` so the model can only pick a real peer.
+#[cfg(feature = "a2a")]
+fn a2a_delegate_tool_def(peers: &[crate::config::A2aPeerSpec]) -> ToolDef {
+    let names: Vec<String> = peers.iter().map(|p| p.name.clone()).collect();
+    let peer_list = names.join(", ");
+    ToolDef {
+        name: "a2a.delegate".into(),
+        description: format!(
+            "Delegate a focused objective to a REMOTE agent over A2A (Agent2Agent) and get its \
+            distilled result back. This is the cross-mesh alternative to subagent.spawn: instead \
+            of a local supervised child, the work runs on another agent reachable through a \
+            declared peer. BLOCKS until the remote task reaches a terminal state (bounded by a \
+            deadline), then returns its final artifact (the distillate) — or an error observation \
+            if the remote failed/rejected/timed out. Give a clear 'objective' and (strongly \
+            recommended) an 'output_contract' stating exactly what to return. Available peers: \
+            {peer_list}."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "peer": {"type": "string", "enum": names, "description": "the declared A2A peer to delegate to"},
+                "objective": {"type": "string", "description": "the objective for the remote agent"},
+                "output_contract": {"type": "string", "description": "exactly what the remote agent should return"}
+            },
+            "required": ["peer", "objective"]
         }),
     }
 }
@@ -752,6 +895,7 @@ mod tests {
                     tags: Vec::new(),
                 },
             ],
+            a2a_peers: Vec::new(),
             limits: Limits {
                 max_steps: 10,
                 max_tokens: 1000,
@@ -1038,5 +1182,126 @@ mod tests {
         let big = Value::String("x".repeat(DISTILL_CAP + 100));
         assert!(distill(&big).ends_with("[truncated]"));
         assert_eq!(distill(&Value::String("short".into())), "short");
+    }
+
+    // ── a2a.delegate (RFC 0020 §3) ───────────────────────────────────────────
+
+    #[cfg(feature = "a2a")]
+    fn payload_with_peers(peers: Vec<crate::config::A2aPeerSpec>) -> SpawnPayload {
+        let mut p = payload(0, 4);
+        p.a2a_peers = peers;
+        p
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a2a_delegate_advertised_only_when_peers_configured() {
+        // No peers → the tool is not advertised and handle() declines it.
+        let mut bare = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(
+            !bare.tools().iter().any(|t| t.name == "a2a.delegate"),
+            "a2a.delegate must not be advertised with no peers"
+        );
+        assert!(
+            bare.handle("a2a.delegate", &json!({"peer": "p", "objective": "x"}))
+                .is_none(),
+            "a2a.delegate must fall through to MCP when no peers are declared"
+        );
+
+        // One declared peer → the tool is advertised, with the peer in its enum.
+        let peers = vec![crate::config::A2aPeerSpec {
+            name: "mesh".into(),
+            endpoint: "unix:/run/peer.sock".into(),
+        }];
+        let with = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload_with_peers(peers),
+            Duration::from_secs(5),
+            logger(),
+        );
+        let def = with
+            .tools()
+            .into_iter()
+            .find(|t| t.name == "a2a.delegate")
+            .expect("a2a.delegate advertised with a peer");
+        assert_eq!(def.input_schema["properties"]["peer"]["enum"][0], "mesh");
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a2a_delegate_unknown_peer_is_an_error_observation() {
+        let peers = vec![crate::config::A2aPeerSpec {
+            name: "mesh".into(),
+            endpoint: "unix:/run/peer.sock".into(),
+        }];
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload_with_peers(peers),
+            Duration::from_secs(5),
+            logger(),
+        );
+        let (msg, is_err) = o
+            .handle(
+                "a2a.delegate",
+                &json!({"peer": "ghost", "objective": "do x"}),
+            )
+            .expect("a2a.delegate is a self-tool when peers exist");
+        assert!(is_err, "unknown peer → isError, not a crash: {msg}");
+        assert!(msg.contains("no A2A peer named 'ghost'"), "got: {msg}");
+        // The breadth count is NOT consumed by an unknown-peer refusal.
+        assert_eq!(o.child_count, 0, "a failed lookup must not consume breadth");
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a2a_delegate_missing_args_are_errors() {
+        let peers = vec![crate::config::A2aPeerSpec {
+            name: "mesh".into(),
+            endpoint: "unix:/run/peer.sock".into(),
+        }];
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload_with_peers(peers),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(
+            o.delegate(&json!({"objective": "x"})).1,
+            "missing peer → error"
+        );
+        assert!(
+            o.delegate(&json!({"peer": "mesh"})).1,
+            "missing objective → error"
+        );
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a2a_delegate_refuses_at_the_breadth_cap() {
+        // The remote delegation shares the local-spawn breadth cap: at the cap it
+        // is refused-as-tool-result, never attempted. We saturate child_count by
+        // hand (no real peer is dialed) and assert the refusal.
+        let peers = vec![crate::config::A2aPeerSpec {
+            name: "mesh".into(),
+            endpoint: "unix:/run/peer.sock".into(),
+        }];
+        let mut o = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload_with_peers(peers),
+            Duration::from_secs(5),
+            logger(),
+        );
+        o.child_count = MAX_CHILDREN;
+        let (msg, is_err) = o.delegate(&json!({"peer": "mesh", "objective": "do x"}));
+        assert!(is_err, "at the breadth cap a delegation is refused: {msg}");
+        assert!(
+            msg.contains("maximum number of delegations"),
+            "refusal must name the breadth cap; got: {msg}"
+        );
     }
 }

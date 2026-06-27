@@ -56,6 +56,7 @@ pub fn manifest(cfg: &Config, identity: &Identity, live: bool) -> Value {
         "intelligence": intelligence(cfg, live),
         "intelligence_summary": intelligence_summary(),
         "mcp_servers": mcp_servers(cfg),
+        "a2a_peers": a2a_peers(cfg),
         "exec_enabled": cfg.enable_exec,
         "allow_trifecta": cfg.allow_trifecta,
         "limits": limits(cfg),
@@ -152,6 +153,28 @@ fn mcp_servers(cfg: &Config) -> Value {
         .map(|s| json!({ "name": s.name, "tags": s.tags }))
         .collect();
     Value::Array(servers)
+}
+
+/// Operator-declared remote-A2A delegation peers (RFC 0020 §3): name + structural
+/// transport scheme only — never the endpoint path/cid (no addressing leak,
+/// mirroring the intelligence/mcp blocks). The `a2a.delegate` self-tool dials
+/// these; the operator/gateway can see which peers a pod is wired to.
+fn a2a_peers(cfg: &Config) -> Value {
+    let peers: Vec<Value> = cfg
+        .a2a_peers
+        .iter()
+        .map(|p| {
+            let transport = if p.endpoint.starts_with("vsock:") {
+                "vsock"
+            } else if p.endpoint.starts_with("unix:") {
+                "unix"
+            } else {
+                "unknown"
+            };
+            json!({ "name": p.name, "transport": transport })
+        })
+        .collect();
+    Value::Array(peers)
 }
 
 /// The bounding box (RFC 0007/0009/0003). The per-run limits come from config;

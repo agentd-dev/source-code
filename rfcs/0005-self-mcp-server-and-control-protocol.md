@@ -7,6 +7,17 @@
 
 ---
 
+> **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) makes **A2A the
+> standards-aligned PRIMARY external agent surface** — the manifest *is* an Agent
+> Card, a run/subagent *is* an A2A Task, and `SendMessage`/`GetTask`/`CancelTask`
+> are spawn/status/cancel. The served self-MCP `subagent.*` surface specified here
+> is reclassified as the **compat** surface for MCP-ecosystem peers: kept and
+> feature-gated, **not** removed (RFC 0020 §2.8, §3, §8). The **private
+> supervisor↔subagent control protocol** (§4 — the length-framed channel) is
+> **UNAFFECTED**: it is neither MCP nor A2A, and A2A has no process supervision.
+
+---
+
 ## 1. Problem / Context
 
 agentd carries two JSON-RPC surfaces that are easy to conflate and must not be:

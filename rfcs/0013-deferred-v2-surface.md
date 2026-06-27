@@ -12,6 +12,14 @@
 > fleet agent would use to resume across a pod reschedule (RFC 0014 §4). The track
 > does **not** pull either forward; it references them as the named v2 path.
 
+> **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) reframes **D7b — self-MCP-
+> over-HTTP serving** from *deferred for agentd* to **out of scope for agentd**.
+> Serving A2A and the management surface over vsock behind an on-node HTTP↔vsock
+> gateway (RFC 0020 §2–§3; the gateway is the agentctl node-agent, RFC 0014) puts
+> HTTP termination in the gateway — so agentd **may never need an HTTP server at
+> all**. D7b's v2 server work is thus the gateway's concern, not a deferred agentd
+> surface; see RFC 0020 §8. (D7a inbound HTTP-client reactivity is untouched.)
+
 ---
 
 ## 1. Problem / Context

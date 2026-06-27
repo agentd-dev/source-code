@@ -5,6 +5,17 @@
 **Date:** 2026-06-25
 **Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
+> **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) records two forward
+> alignments on this model. (1) **A2A-Task-mappable** (RFC 0020 §5): a run /
+> subagent handle *is* an A2A Task, the distillate (§3.4/§3.7) *is* the final A2A
+> Artifact, and the `TerminalStatus` enum (RFC 0007 §3.4) maps to A2A Task states —
+> `completed`→COMPLETED, `refused`→REJECTED, `cancelled`→CANCELED, the rest→FAILED.
+> (2) **Delegation gains a backend axis** (RFC 0020 §3): a delegation target may be
+> a LOCAL re-exec'd supervised subagent (the default, unchanged — the OS-supervision
+> moat) OR a REMOTE A2A peer in the mesh. Same abstraction (objective + scope +
+> budget → distilled result), two backends; the local subagent process model in
+> this RFC is untouched. See RFC 0020 §3, §5, §8.
+
 ---
 
 ## 1. Problem / Context

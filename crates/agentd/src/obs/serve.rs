@@ -1,11 +1,17 @@
 //! Opt-in HTTP probe/scrape surface: `/metrics` + `/healthz` + `/readyz`.
-//! RFC 0010 §health + §metrics. [feature: metrics]
+//! RFC 0010 §health + §metrics; RFC 0016 §10 (fleet liveness). [feature: metrics]
 //!
 //! One blocking-accept thread, one thread-per-connection — no async, matching
 //! the supervisor's processes-plus-threads model. GET-only, unauthenticated,
-//! read-only; bound only when `--metrics-addr` is set (default off). `/healthz`
-//! reuses the supervisor-heartbeat liveness (`obs::health`) so a wedged
-//! supervisor reads unhealthy even while subagents churn.
+//! read-only; bound only when `--metrics-addr` is set (default off).
+//!
+//! `/healthz` (the k8s `livenessProbe` target, RFC 0016 §10) reuses the
+//! **supervisor reactor heartbeat** (`obs::health::tick_age_ms`): a wedged
+//! reactor reads unhealthy and k8s restarts the pod, while a healthy tree with
+//! one *stuck subagent* keeps reading healthy (the reactor is the one detecting
+//! and killing that child — RFC 0003 — so it is still ticking). `/readyz` (the
+//! `readinessProbe` target) is the orthogonal lame-duck/drain gate and is left
+//! intact below.
 
 use crate::obs::log::Logger;
 use serde_json::json;
@@ -117,6 +123,14 @@ fn readiness_response() -> (&'static str, &'static str, String) {
     }
 }
 
+/// Liveness (RFC 0010 §3.7 / RFC 0016 §10). The verdict is a function of the
+/// **supervisor reactor heartbeat** alone (`obs::health::tick_age_ms`) — a fresh
+/// tick means the reactor loop is making progress, so the pod is live. It does
+/// **not** consult any per-subagent stuck state: a wedged child is detected and
+/// killed by the reactor itself (RFC 0003), which keeps ticking while it does,
+/// so a stuck subagent never flips liveness and never costs a healthy tree its
+/// pod. Only the *reactor* wedging (ticks stop, age grows past `STALE_AFTER_MS`)
+/// — or a drain in progress — reads unhealthy so k8s restarts the pod.
 fn health_response() -> (&'static str, &'static str, String) {
     let draining = crate::signals::draining();
     let age = crate::obs::health::tick_age_ms();
@@ -205,5 +219,42 @@ mod tests {
     fn metrics_path_ignores_query_string() {
         let (s, _, _) = route("/metrics?foo=bar");
         assert!(s.starts_with("200"));
+    }
+
+    // The `/healthz` reactor-heartbeat contract (RFC 0016 §10). One test drives
+    // the whole fresh→wedged→fresh transition sequentially: `LAST_TICK_MS` is a
+    // single process-global the supervisor heartbeat shares, so the stale and
+    // fresh phases must not be split across two `#[test]`s that the harness may
+    // interleave in the same process (one's stale-stamp would race the other's
+    // fresh-tick). The verdict consults *only* the reactor heartbeat — never any
+    // per-subagent stuck state — so a healthy tree with one wedged leaf stays
+    // live and keeps its pod; only the reactor itself wedging flips liveness.
+    #[test]
+    fn healthz_reflects_only_the_reactor_heartbeat() {
+        // Hold the heartbeat lock so a concurrent test's `tick()` cannot race the
+        // wedged-path assertion (the shared `LAST_TICK_MS` is process-global).
+        let _g = crate::obs::health::HEARTBEAT_TEST_LOCK.lock().unwrap();
+        crate::signals::set_lame_duck(false); // unrelated to liveness, but a shared latch
+        if crate::signals::draining() {
+            return; // a SIGTERM in the test process would dominate the verdict
+        }
+        // Fresh reactor tick → live.
+        crate::obs::health::tick();
+        let (s, _, body) = route("/healthz");
+        assert_eq!(s, "200 OK", "fresh reactor tick → live");
+        assert!(body.starts_with("ok tick_age_ms="), "body: {body}");
+
+        // Wedged reactor (heartbeat aged past the window) → unhealthy so k8s
+        // restarts the pod. Driven deterministically via the test seam.
+        crate::obs::health::set_tick_age_for_test(STALE_AFTER_MS + 1_000);
+        let (s, _, body) = route("/healthz");
+        assert_eq!(s, "503 Service Unavailable", "wedged reactor → unhealthy");
+        assert!(body.starts_with("unhealthy"), "body: {body}");
+
+        // A renewed reactor tick restores liveness (and unpoisons the shared
+        // heartbeat for any sibling test that reads it after this one).
+        crate::obs::health::tick();
+        let (s, _, _) = route("/healthz");
+        assert_eq!(s, "200 OK", "a renewed reactor tick restores liveness");
     }
 }

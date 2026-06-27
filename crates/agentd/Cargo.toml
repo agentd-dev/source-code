@@ -37,6 +37,11 @@ a2a = ["serve-mcp"]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
+# The agentd://events live-event resource (RFC 0016 §7): a bounded in-memory
+# ring of the RFC 0010 §3.2 JSON lines, served over the self-MCP with the RFC
+# 0005 notify-then-read cursor. Rides serve-mcp (it's a served resource); no dep
+# — reuses the existing serde_json serializer + the served listener.
+events = ["serve-mcp"]
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
 # OTLP span export + GenAI semconv. Hand-rolled OTLP-over-HTTP/JSON over the

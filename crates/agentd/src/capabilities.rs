@@ -221,15 +221,21 @@ fn surfaces(cfg: &Config) -> Value {
         // else `false`. The Agent Card itself is the gateway's projection of this
         // manifest (RFC 0020 §2.3) — agentd only advertises the capability here.
         "a2a": a2a_surface(),
-        // The /metrics addr if configured, else false. RFC 0010 / 0016.
+        // The /metrics addr if configured, else false. RFC 0010 / 0016. The
+        // frozen metrics-schema version (RFC 0016 §4/§8.1) is read from its owning
+        // module — never hardcoded — so the manifest can't drift from the surface.
         "metrics": cfg.metrics_addr.clone().map_or(Value::Bool(false), Value::String),
-        "metrics_schema": "1.0",
-        // Not yet built in this chunk (later RFC chunks flip these true).
-        "events": false,
+        "metrics_schema": crate::obs::metrics::METRICS_SCHEMA,
+        // The agentd://events stream (RFC 0016 §7): served only when this build has
+        // the `events` feature AND a management transport to serve it on.
+        "events": cfg!(feature = "events") && cfg.serve_mcp.is_some(),
+        // Run-outcome reports (RFC 0016 §6) — the report schema this binary writes.
+        "report_schema": crate::report::REPORT_SCHEMA,
+        // The frozen exit-code contract version (RFC 0016 §5, around RFC 0011 §5).
+        "exit_codes": crate::exit::EXIT_CODES,
+        // Not yet built (later RFC chunks flip these true).
         "hot_reload": false,
         "config_validate": false,
-        // The exit-code table version this binary honours (RFC 0011 §5).
-        "exit_codes": "RFC-0011-§5",
     })
 }
 
@@ -372,12 +378,18 @@ mod tests {
         } else {
             assert_eq!(s["operator_tools"], json!([]));
         }
+        // events needs `events` + a management transport (neither configured here).
         assert_eq!(s["events"], json!(false));
+        // Not yet built (RFC 0017).
         assert_eq!(s["hot_reload"], json!(false));
         assert_eq!(s["config_validate"], json!(false));
-        // Frozen strings.
-        assert_eq!(s["metrics_schema"], json!("1.0"));
-        assert_eq!(s["exit_codes"], json!("RFC-0011-§5"));
+        // Frozen contract versions, read from their owning modules (RFC 0016).
+        assert_eq!(
+            s["metrics_schema"],
+            json!(crate::obs::metrics::METRICS_SCHEMA)
+        );
+        assert_eq!(s["report_schema"], json!(crate::report::REPORT_SCHEMA));
+        assert_eq!(s["exit_codes"], json!(crate::exit::EXIT_CODES));
     }
 
     #[test]

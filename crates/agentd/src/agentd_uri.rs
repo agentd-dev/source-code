@@ -40,13 +40,78 @@ pub enum AgentdResource {
     /// `agentd://session/<handle>` — a served warm session's turn state.
     /// Subscribable; fires on each warm-turn boundary.
     Session(String),
+    /// `agentd://events[?after=<seq>&level=<lvl>&event=<prefixes>]` — the
+    /// bounded live-event ring (RFC 0016 §7). Subscribable; fires on each new
+    /// event (notify-then-read). The cursor + filters ride the query string.
+    Events(EventsQuery),
+}
+
+/// The parsed query of an `agentd://events?…` read (RFC 0016 §7.2/§7.3). All
+/// fields are optional; an empty query is "the whole window from seq 0".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventsQuery {
+    /// Return only entries with `seq > after` — the cursor the subscriber
+    /// advances to the last `seq` it saw. `0` (default) ⇒ the whole window.
+    pub after: u64,
+    /// Server-side level filter (`?level=warn`): exact match on the line `level`.
+    pub level: Option<String>,
+    /// Server-side event-prefix filter (`?event=subagent.,limit.`): a comma-list
+    /// of dotted prefixes — an entry matches if its `event` starts with any.
+    pub event_prefixes: Vec<String>,
+}
+
+impl EventsQuery {
+    /// Parse the `key=value&key=value` query after the `?`. Unknown keys are
+    /// ignored (forward-compatible); a malformed `after` falls back to `0` (the
+    /// safe full-window default — a cursor read never errors on a bad number).
+    fn parse(query: &str) -> EventsQuery {
+        let mut q = EventsQuery::default();
+        for pair in query.split('&') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            match k {
+                "after" => q.after = v.trim().parse().unwrap_or(0),
+                "level" => {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        q.level = Some(v.to_string());
+                    }
+                }
+                "event" => {
+                    q.event_prefixes = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
+                _ => {} // unknown key — ignore (forward-compatible)
+            }
+        }
+        q
+    }
 }
 
 impl AgentdResource {
     /// Parse an `agentd://` URI. `None` for a non-agentd scheme or an
     /// unrecognized/empty path.
     pub fn parse(uri: &str) -> Option<AgentdResource> {
-        let rest = uri.trim().strip_prefix(SCHEME)?.trim_end_matches('/');
+        let rest = uri.trim().strip_prefix(SCHEME)?;
+        // Split the optional `?query` off the path (only `agentd://events` uses
+        // one today — the cursor/filters, RFC 0016 §7). Path-only resources see
+        // identical behaviour: their `rest` has no `?`, so `path == rest`.
+        let (path, query) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        let path = path.trim_end_matches('/');
+        if path == "events" {
+            return Some(AgentdResource::Events(
+                query.map(EventsQuery::parse).unwrap_or_default(),
+            ));
+        }
+        let rest = path;
         if rest == "status" {
             return Some(AgentdResource::Status);
         }
@@ -98,6 +163,11 @@ pub fn session_uri(handle: &str) -> String {
 
 /// The `agentd://inventory` URI — the live subagent-tree projection (RFC 0015 §5.3).
 pub const INVENTORY_URI: &str = "agentd://inventory";
+
+/// The `agentd://events` URI — the bounded live-event ring (RFC 0016 §7). The
+/// bare base URI (subscribe/list/notify use it); a read appends `?after=<seq>`
+/// and the optional `?level=`/`?event=` filters.
+pub const EVENTS_URI: &str = "agentd://events";
 
 #[cfg(test)]
 mod tests {
@@ -177,6 +247,43 @@ mod tests {
         assert_eq!(
             AgentdResource::parse("agentd://inventory/"),
             Some(AgentdResource::Inventory)
+        );
+    }
+
+    #[test]
+    fn parses_events_base_and_query() {
+        // Bare base URI → an empty (default) query: whole window from seq 0.
+        assert_eq!(
+            AgentdResource::parse(EVENTS_URI),
+            Some(AgentdResource::Events(EventsQuery::default()))
+        );
+        assert_eq!(
+            AgentdResource::parse("agentd://events/"),
+            Some(AgentdResource::Events(EventsQuery::default()))
+        );
+        // The cursor + filters ride the query string (RFC 0016 §7.2/§7.3).
+        let parsed =
+            AgentdResource::parse("agentd://events?after=4821&level=warn&event=subagent.,limit.");
+        assert_eq!(
+            parsed,
+            Some(AgentdResource::Events(EventsQuery {
+                after: 4821,
+                level: Some("warn".into()),
+                event_prefixes: vec!["subagent.".into(), "limit.".into()],
+            }))
+        );
+        // A malformed cursor falls back to the safe full-window default (0).
+        assert_eq!(
+            AgentdResource::parse("agentd://events?after=notanumber"),
+            Some(AgentdResource::Events(EventsQuery::default()))
+        );
+        // An unknown query key is ignored (forward-compatible).
+        assert_eq!(
+            AgentdResource::parse("agentd://events?nonsense=1&after=7"),
+            Some(AgentdResource::Events(EventsQuery {
+                after: 7,
+                ..EventsQuery::default()
+            }))
         );
     }
 

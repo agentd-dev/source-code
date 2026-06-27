@@ -50,6 +50,16 @@ events = ["serve-mcp"]
 cluster = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
+# Restart-free reconfiguration (RFC 0017 §5): a SIGHUP-triggered, validate-first,
+# quiesce-and-reapply hot reload of the reloadable config subset (model/limits/
+# log_level/subscribe), gated at a reactive quiesce boundary. Dependency-free —
+# raw `libc::sigaction` + the existing self-pipe (no signal-hook), reusing the
+# one `Config::load` validation pipeline. SIGHUP keeps its default disposition
+# when this feature is OFF. The inotify file-watch trigger (`--watch-config`) is
+# a documented follow-up; this build ships SIGHUP only. mcp_servers is treated as
+# restart-only here (the positional owner/claim map makes a live re-handshake too
+# invasive to do safely — RFC 0017 §5.3 "scope it out cleanly").
+hot-reload = []
 # OTLP span export + GenAI semconv. Hand-rolled OTLP-over-HTTP/JSON over the
 # existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
 # `--features otel` stays dependency-free (3 deps).

@@ -322,6 +322,31 @@ pub fn set_saturation(numerator: u64, denominator: u64) {
     let _ = (numerator, denominator);
 }
 
+/// A config hot reload reached a terminal disposition (RFC 0017 §5.6). Drives
+/// `agentd_config_reload_total{result}` with the closed domain
+/// `applied`\|`rejected` (an unknown value buckets `other`). A `rejected` reload
+/// is a clean no-op (the running config is unchanged); `applied` bumps the
+/// generation gauge via [`set_config_generation`].
+pub fn record_config_reload(result: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.record_config_reload(result);
+    #[cfg(not(feature = "metrics"))]
+    let _ = result;
+}
+
+/// Point-in-time set of the config-generation gauge (`agentd_config_generation`,
+/// RFC 0017 §5.6): the count of successfully-applied reloads, so a scraper can
+/// detect "this instance has picked up generation N" against agentctl's desired
+/// generation. Monotonic in practice (the reload loop only ever increments it).
+pub fn set_config_generation(generation: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY
+        .config_generation
+        .store(generation, Ordering::Relaxed);
+    #[cfg(not(feature = "metrics"))]
+    let _ = generation;
+}
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -393,6 +418,12 @@ mod imp {
 
     /// `agentd_tokens_total{type}` direction label domain (RFC 0016 §4.3).
     const TOKEN_TYPES: &[&str] = &["in", "out"];
+
+    /// `agentd_config_reload_total{result}` label domain (RFC 0017 §5.6). A hot
+    /// reload either `applied` (the reloadable diff took effect) or was `rejected`
+    /// (invalid / restart-only / inconsistent → a clean no-op); `other` is the
+    /// catch-all that keeps the series bounded (RFC 0016 §4.2).
+    const RELOAD_RESULTS: &[&str] = &["applied", "rejected", "other"];
 
     /// A fixed-domain labelled counter family: one atomic per known label value.
     /// `N` matches the backing domain slice length; the trailing slot is the
@@ -479,6 +510,10 @@ mod imp {
         pub(super) claims_lost: AtomicU64,
         pub(super) claims_granted: AtomicU64,
         pub(super) claims_released: AtomicU64,
+
+        // --- RFC 0017 §5.6: hot-reload outcome counter + generation gauge -----
+        config_reloads: LabelCounter<{ RELOAD_RESULTS.len() }>,
+        pub(super) config_generation: AtomicU64,
     }
 
     impl Registry {
@@ -521,6 +556,8 @@ mod imp {
                 claims_lost: AtomicU64::new(0),
                 claims_granted: AtomicU64::new(0),
                 claims_released: AtomicU64::new(0),
+                config_reloads: LabelCounter::new(),
+                config_generation: AtomicU64::new(0),
             }
         }
 
@@ -586,6 +623,10 @@ mod imp {
 
         pub(super) fn record_drain(&self, phase: &str) {
             self.drains.inc(DRAIN_PHASES, phase);
+        }
+
+        pub(super) fn record_config_reload(&self, result: &str) {
+            self.config_reloads.inc(RELOAD_RESULTS, result);
         }
 
         pub(super) fn set_tree_shape(&self, active: u64, depth: u64, breadth: u64) {
@@ -790,6 +831,25 @@ mod imp {
                 "agentd_reactor_stalls_total",
                 "Wedged-reactor liveness trips (RFC 0003).",
                 g(&self.reactor_stalls),
+            );
+
+            // --- hot reload (RFC 0017 §5.6) ----------------------------------
+            // `agentd_config_reload_total{result}` over the closed applied/rejected
+            // domain, plus `agentd_config_generation` (applied-reload count) so a
+            // scraper detects "generation N is effective" against the desired one.
+            labelled_counter(
+                &mut s,
+                "agentd_config_reload_total",
+                "Hot reloads by result (RFC 0017 §5.6).",
+                "result",
+                RELOAD_RESULTS,
+                &self.config_reloads,
+            );
+            gauge(
+                &mut s,
+                "agentd_config_generation",
+                "Successfully-applied config reloads (the live generation).",
+                g(&self.config_generation),
             );
 
             // --- reactive backlog — the RFC 0019 scaling signal set (§4.3) ---
@@ -1209,6 +1269,38 @@ mod imp {
             let out = r.render();
             assert!(out.contains("agentd_drains_total{phase=\"completed\"} 1"));
             assert!(out.contains("agentd_drains_total{phase=\"forced\"} 1"));
+        }
+
+        #[test]
+        fn config_reload_total_renders_both_label_values_and_generation() {
+            // RFC 0017 §5.6: the reload counter has the closed applied/rejected
+            // domain (every value rendered, zero-valued included), and the
+            // generation gauge tracks applied reloads.
+            let r = Registry::new();
+            let out = r.render();
+            // Both closed-domain series are present even at zero.
+            assert!(out.contains("# TYPE agentd_config_reload_total counter"));
+            assert!(out.contains("agentd_config_reload_total{result=\"applied\"} 0"));
+            assert!(out.contains("agentd_config_reload_total{result=\"rejected\"} 0"));
+            assert!(out.contains("# TYPE agentd_config_generation gauge"));
+            assert!(out.contains("agentd_config_generation 0"));
+            // They increment over the closed domain; an unknown buckets `other`.
+            r.record_config_reload("applied");
+            r.record_config_reload("rejected");
+            r.record_config_reload("rejected");
+            r.record_config_reload("totally_made_up");
+            r.config_generation.store(1, Ordering::Relaxed);
+            let out = r.render();
+            assert!(out.contains("agentd_config_reload_total{result=\"applied\"} 1"));
+            assert!(out.contains("agentd_config_reload_total{result=\"rejected\"} 2"));
+            assert!(out.contains("agentd_config_reload_total{result=\"other\"} 1"));
+            assert!(out.contains("agentd_config_generation 1"));
+            // Exactly one HELP/TYPE header for the counter family.
+            assert_eq!(
+                out.matches("# TYPE agentd_config_reload_total counter")
+                    .count(),
+                1
+            );
         }
 
         #[test]

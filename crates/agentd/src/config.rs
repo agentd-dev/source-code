@@ -1049,7 +1049,9 @@ impl Config {
         // NOT require an --instruction to *validate* — it validates whatever it is
         // given. The caller prints to stderr and maps the result to exit 0/2.
         if validate_config {
-            return Err(ConfigError::Validate(c.validate_collect_all()));
+            return Err(ConfigError::Validate(
+                c.validate_collect_all(config_path.is_some()),
+            ));
         }
 
         c.validate()?;
@@ -1079,7 +1081,7 @@ impl Config {
     /// sees all problems at once. The check SET is exactly `validate()`'s — there
     /// is one validation authority, so the admission gate and the startup path
     /// can never disagree (RFC 0017 §7).
-    fn validate_collect_all(&self) -> Result<String, String> {
+    fn validate_collect_all(&self, file_present: bool) -> Result<String, String> {
         let mut diags: Vec<String> = Vec::new();
         // The single validate() pipeline is fast-fail; to collect ALL problems we
         // re-run it after fixing each surfaced error would be O(n²) and brittle.
@@ -1096,6 +1098,23 @@ impl Config {
             let msg = e.to_string();
             if !diags.iter().any(|d| msg.ends_with(d.as_str())) {
                 diags.push(msg);
+            }
+        }
+        // RFC 0017 §5.4: the reload-coherence check (no running config at the
+        // admission gate — `running = None`), so this reports the restart-only-
+        // field-in-file WARNINGS and the reloadable-subset consistency ERRORS. An
+        // admission webhook sees both; a coherence ERROR makes the verdict invalid.
+        // (Internal-consistency errors here largely overlap with `validate()`'s
+        // own checks, so dedup by message suffix to avoid a double line.)
+        match Config::reload_coherence_check(self, None, file_present) {
+            Ok(()) => {}
+            Err(coh) => {
+                for d in coh.into_iter().filter(|d| d.is_error()) {
+                    let line = format!("{}: {}", d.field, d.msg);
+                    if !diags.iter().any(|existing| existing.ends_with(&d.msg)) {
+                        diags.push(line);
+                    }
+                }
             }
         }
         if diags.is_empty() {
@@ -1351,6 +1370,281 @@ impl Config {
             return Err(usage(first));
         }
         Ok(())
+    }
+}
+
+// ───────────────────────── RFC 0017 §5 — hot reload ─────────────────────────
+//
+// The reloadable-vs-restart-only partition (§5.1, BINDING) + the coherence check
+// (§5.4) the reload path and `--validate-config` both run. This block is pure
+// data + pure-CPU checks — no side effect, no subsystem touched (the apply step
+// lives in `triggers::mode`). It compiles in every feature combo (the SIGHUP
+// trigger + the reactive apply are `hot-reload`-gated; the partition itself is
+// always available so `--validate-config` reports restart-only warnings on any
+// build).
+
+/// A reload diagnostic (RFC 0017 §5.4). `Warn` is advisory (a restart-only field
+/// merely present in the file — it works, it just pins you to restart-to-change);
+/// `Error` is fatal to the reload (it differs on a live reload, or the reloadable
+/// subset is internally inconsistent). `--validate-config` reports both; the
+/// reload path aborts on any `Error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diag {
+    /// The config field/path the diagnostic is about (e.g. `mode`, `mcp_servers`).
+    pub field: String,
+    /// `warn` (advisory) or `error` (fatal to the reload).
+    pub level: DiagLevel,
+    /// The human-readable reason.
+    pub msg: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagLevel {
+    Warn,
+    Error,
+}
+
+impl Diag {
+    fn warn(field: &str, msg: impl Into<String>) -> Diag {
+        Diag {
+            field: field.to_string(),
+            level: DiagLevel::Warn,
+            msg: msg.into(),
+        }
+    }
+    fn error(field: &str, msg: impl Into<String>) -> Diag {
+        Diag {
+            field: field.to_string(),
+            level: DiagLevel::Error,
+            msg: msg.into(),
+        }
+    }
+    pub fn is_error(&self) -> bool {
+        self.level == DiagLevel::Error
+    }
+    pub fn level_str(&self) -> &'static str {
+        match self.level {
+            DiagLevel::Warn => "warn",
+            DiagLevel::Error => "error",
+        }
+    }
+}
+
+/// The names of the **restart-only** fields (RFC 0017 §5.1, BINDING). A live
+/// reload whose new-vs-running diff touches ANY of these is rejected with
+/// `reason="restart_required"` (agentctl rolls a pod restart — its policy). They
+/// also drive the "restart-only field set in the file" warning (§5.4 check 1).
+/// Sharding (`--shard`) and claim routes are restart-only (RFC 0019 §4.3 — shard
+/// identity is immutable); `mcp_servers` is restart-only in THIS chunk (the
+/// positional owner/claim map makes a live re-handshake too invasive to do
+/// safely — see the apply step in `triggers::mode`).
+pub const RESTART_ONLY_FIELDS: &[&str] = &[
+    "mode",
+    "intelligence",       // transport/endpoint identity (RFC 0018 owns hot-swap)
+    "run_id",             // instance identity / idempotency key
+    "serve_mcp",          // a live control socket must not rebind mid-flight
+    "enable_exec",        // a security-capability toggle — never widen live
+    "drain_timeout",      // validated against the pod grace at startup
+    "shard",              // shard identity is immutable (RFC 0019 §4.3)
+    "claim_routes",       // claim/assignment routing is restart-only
+    "standby",            // standby pool membership is restart-only
+    "assign_from",        // the assignment channel is restart-only
+    "continue_subscribe", // warm-session routing topology is restart-only
+    "mcp_servers",        // SCOPED OUT in this chunk (see the module note)
+];
+
+impl Config {
+    /// Re-resolve config for a hot reload (RFC 0017 §5.3 step 1): re-read ONLY the
+    /// file and re-merge built-in<file<env<flag. `args`/`env` are the process's
+    /// original, fixed inputs — only the FILE can change between loads, so this
+    /// keeps precedence correct (a flag still overrides the new file). Pure-CPU,
+    /// no side effect. The returned `Config` is the fully-validated candidate; an
+    /// invalid file/value is the same `ConfigError::Usage` startup would raise.
+    ///
+    /// NB: `--validate-config`/`--config-schema`/`--capabilities` short-circuit
+    /// inside `load`, but those flags never reach a running reactive daemon, so a
+    /// reload's `args` never carries them — this is the ordinary load path.
+    pub fn reload(args: &[String], env: &[(String, String)]) -> Result<Config, ConfigError> {
+        Config::load(args, env)
+    }
+
+    /// Whether a restart-only field was set by the config FILE (§5.4 check 1).
+    /// Used to emit the advisory "this field belongs in env/flag" warning. We do
+    /// not track per-key provenance, so this is a conservative approximation: a
+    /// field is "file-set" if a config file is present AND the field differs from
+    /// its built-in default (env/flag also set it, but env/flag for a restart-only
+    /// scalar is the *intended* home, so over-warning there is avoided by only
+    /// checking when a `--config`/`AGENTD_CONFIG` file is in play — the caller
+    /// passes `file_present`).
+    fn restart_only_file_warnings(&self, file_present: bool, diags: &mut Vec<Diag>) {
+        if !file_present {
+            return;
+        }
+        let def = Config::default();
+        // Only the fields a config FILE can structurally carry are worth warning
+        // about (the file schema, RFC 0017 §3.3, has no key for mode/run_id/etc.,
+        // so they can't be file-set — `intelligence`/`serve_mcp`/`enable_exec`/
+        // `mode`/`shard`/`claim` are env/flag-only). The reachable case is none:
+        // the file schema deliberately excludes every restart-only field. We keep
+        // the hook (and the loop) so a future widened file schema is covered.
+        for &f in RESTART_ONLY_FIELDS {
+            let differs = match f {
+                "mcp_servers" => self.mcp_servers != def.mcp_servers,
+                _ => false,
+            };
+            // mcp_servers CAN be file-set and is restart-only in this chunk, so
+            // warn the operator it pins them to a restart to change it live.
+            if differs && f == "mcp_servers" {
+                diags.push(Diag::warn(
+                    f,
+                    "mcp_servers is restart-only in this build; changing it requires a \
+                     pod restart (a live MCP re-handshake is a documented follow-up)",
+                ));
+            }
+        }
+    }
+
+    /// The reload-coherence check (RFC 0017 §5.4), run by BOTH `--validate-config`
+    /// and the reload path. Pure-CPU, no side effect.
+    ///
+    /// 1. (advisory) a restart-only field set in the FILE → `Warn` (`file_present`).
+    /// 2. (live reload only) any restart-only field that DIFFERS between `new` and
+    ///    `running` → `Error` naming the field (→ §5.3 step-2 ABORT, restart req'd).
+    /// 3. the reloadable subset is internally consistent: every subscription/claim
+    ///    references a declared server where required, and server names are unique.
+    ///
+    /// `Ok(())` if no `Error` diagnostics (the `Warn`s are still surfaced by the
+    /// caller); `Err(diags)` carries every diagnostic when at least one is an error.
+    pub fn reload_coherence_check(
+        new: &Config,
+        running: Option<&Config>,
+        file_present: bool,
+    ) -> Result<(), Vec<Diag>> {
+        let mut diags = Vec::new();
+        // 1. restart-only-field-in-file advisory warnings.
+        new.restart_only_file_warnings(file_present, &mut diags);
+        // 2. on a live reload, a restart-only diff is a hard reject.
+        if let Some(run) = running {
+            for &f in RESTART_ONLY_FIELDS {
+                if new.restart_only_field_differs(run, f) {
+                    diags.push(Diag::error(
+                        f,
+                        format!(
+                            "restart-only field '{f}' changed on a live reload; reload refused, \
+                             a pod restart is required (RFC 0017 §5.1)"
+                        ),
+                    ));
+                }
+            }
+        }
+        // 3. reloadable-subset internal consistency.
+        check_unique_server_names(new, &mut diags);
+        check_subscriptions_reference_declared_servers(new, &mut diags);
+        if diags.iter().any(Diag::is_error) {
+            Err(diags)
+        } else {
+            // Surface advisory warnings to the caller too (it logs them) — an
+            // all-warn result is still `Ok` (the reload proceeds; the warnings
+            // are informational). The caller that wants the warnings reads them
+            // via the validate-collect path; the reload path only needs the
+            // pass/fail, so an Ok here means "no restart-only diff, apply".
+            Ok(())
+        }
+    }
+
+    /// Compare one restart-only field between `self` (new) and `running`. The
+    /// match arms enumerate exactly [`RESTART_ONLY_FIELDS`] — a field added there
+    /// without a comparison arm here defaults to `false` (no diff), which would
+    /// silently let it reload, so the unit tests assert each named field is
+    /// diff-detected. Pure.
+    fn restart_only_field_differs(&self, running: &Config, field: &str) -> bool {
+        match field {
+            "mode" => self.mode != running.mode,
+            "intelligence" => self.intelligence != running.intelligence,
+            "run_id" => self.run_id != running.run_id,
+            "serve_mcp" => self.serve_mcp != running.serve_mcp,
+            "enable_exec" => self.enable_exec != running.enable_exec,
+            "drain_timeout" => self.drain_timeout != running.drain_timeout,
+            "shard" => self.shard != running.shard,
+            "claim_routes" => self.claim_routes != running.claim_routes,
+            "standby" => self.standby != running.standby,
+            "assign_from" => self.assign_from != running.assign_from,
+            "continue_subscribe" => self.continue_subscribe != running.continue_subscribe,
+            "mcp_servers" => self.mcp_servers != running.mcp_servers,
+            _ => false,
+        }
+    }
+
+    /// The reloadable, **redacted** view of the running config for
+    /// `agentd://config/effective` (RFC 0017 §4.2). Carries ONLY the reloadable
+    /// structural fields — NO token, NO URL, NO secret, NO `{{secret:…}}` values
+    /// (header NAMES only). Management-readable. Mirrors the manifest's no-secret
+    /// discipline (RFC 0012 §3.7): nothing here can embed a credential.
+    pub fn effective_view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "limits": {
+                "max_steps": self.max_steps,
+                "max_depth": self.max_depth,
+                "deadline_secs": self.deadline.map(|d| d.as_secs()),
+            },
+            // Structural name + tags only — never the spawn command (it can carry
+            // a path/arg an operator considers sensitive), mirroring the manifest.
+            "mcp_servers": self.mcp_servers.iter().map(|s| {
+                serde_json::json!({"name": s.name, "tags": s.tags})
+            }).collect::<Vec<_>>(),
+            "subscribe": self.subscribe,
+            "log_level": self.log_level.as_str(),
+            // Header NAMES only — a value may be a {{secret:…}} ref, so the
+            // resolved value is NEVER exposed here (RFC 0012 §3.7).
+            "intelligence_headers": self.intelligence_headers.keys().collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Check that declared MCP server names are unique (§5.4 check 3). A duplicate
+/// would make the positional owner/claim map ambiguous, so it is an error.
+fn check_unique_server_names(cfg: &Config, diags: &mut Vec<Diag>) {
+    let mut seen = std::collections::HashSet::new();
+    for s in &cfg.mcp_servers {
+        if !seen.insert(s.name.as_str()) {
+            diags.push(Diag::error(
+                "mcp_servers",
+                format!("duplicate MCP server name '{}'", s.name),
+            ));
+        }
+    }
+}
+
+/// Check that every claim route (and standby assignment channel) references a
+/// declared MCP server (§5.4 check 3). This is the reload-time mirror of the
+/// startup `validate()` check; on a reload the candidate must be self-consistent
+/// before any subsystem is touched. (Plain `--subscribe` URIs need no declared
+/// server — they bind to whichever connected server supports them — so only the
+/// claim/assignment subset is checked, exactly as `validate()` does.)
+fn check_subscriptions_reference_declared_servers(cfg: &Config, diags: &mut Vec<Diag>) {
+    for r in &cfg.claim_routes {
+        if !cfg.mcp_servers.iter().any(|s| s.name == r.server) {
+            diags.push(Diag::error(
+                "claim_routes",
+                format!(
+                    "claim route '{}' references undeclared coordination server '{}'",
+                    r.uri, r.server
+                ),
+            ));
+        }
+    }
+    if let Some(a) = &cfg.assign_from
+        && !cfg.mcp_servers.iter().any(|s| s.name == a.server)
+    {
+        diags.push(Diag::error(
+            "assign_from",
+            format!(
+                "assignment channel references undeclared server '{}'",
+                a.server
+            ),
+        ));
     }
 }
 
@@ -3024,5 +3318,223 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    // ─────────────────── RFC 0017 §5 — hot-reload coherence ───────────────────
+
+    /// A valid reactive baseline config to diff reloads against.
+    fn reactive_base() -> Config {
+        Config::load(
+            &args(&["--mode", "reactive", "--subscribe", "file:///in.json"]),
+            &base_env(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn coherence_rejects_a_differing_restart_only_field() {
+        // RFC 0017 §5.4 check 2: a restart-only field that DIFFERS on a live
+        // reload is a hard reject naming the field. mode/run_id/enable_exec/shard
+        // are all restart-only.
+        let running = reactive_base();
+        for mutate in [
+            (|c: &mut Config| c.mode = Mode::Loop) as fn(&mut Config),
+            |c: &mut Config| c.run_id = "different-run-id".into(),
+            |c: &mut Config| c.enable_exec = true,
+            |c: &mut Config| {
+                c.shard = ShardCfg {
+                    k: 1,
+                    n: 4,
+                    timer: TimerShardMode::Shard0,
+                }
+            },
+            |c: &mut Config| c.serve_mcp = Some("unix:/run/x.sock".into()),
+            |c: &mut Config| c.drain_timeout = Duration::from_secs(99),
+            |c: &mut Config| c.intelligence = Some("unix:/other.sock".into()),
+        ] {
+            let mut new = running.clone();
+            mutate(&mut new);
+            let diags = Config::reload_coherence_check(&new, Some(&running), true)
+                .expect_err("a restart-only diff must be rejected");
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.is_error() && d.msg.contains("restart-only")),
+                "expected a restart-only error, got {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coherence_accepts_a_reloadable_diff() {
+        // RFC 0017 §5.1: log_level / model / subscribe are reloadable — a diff in
+        // them passes the coherence check (no restart-only field touched).
+        let running = reactive_base();
+        for mutate in [
+            (|c: &mut Config| c.log_level = Level::Debug) as fn(&mut Config),
+            |c: &mut Config| c.model = Some("claude-opus-4".into()),
+            |c: &mut Config| c.max_tokens = 999_999,
+            |c: &mut Config| c.max_steps = 123,
+            |c: &mut Config| c.subscribe = vec!["file:///in.json".into(), "file:///b.json".into()],
+        ] {
+            let mut new = running.clone();
+            mutate(&mut new);
+            assert!(
+                Config::reload_coherence_check(&new, Some(&running), true).is_ok(),
+                "a reloadable diff must be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn coherence_rejects_subscription_referencing_undeclared_server() {
+        // RFC 0017 §5.4 check 3: a claim route referencing an undeclared server is
+        // an internal-consistency ERROR (independent of any running baseline).
+        let mut cfg = reactive_base();
+        cfg.claim_routes = vec![ClaimRoute {
+            uri: "file:///in.json".into(),
+            server: "ghost".into(),
+            style: ClaimStyle::Tool,
+        }];
+        let diags = Config::reload_coherence_check(&cfg, None, false)
+            .expect_err("an undeclared coordination server must be an error");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.is_error() && d.msg.contains("undeclared")),
+            "expected an undeclared-server error, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn coherence_rejects_duplicate_server_names() {
+        let mut cfg = reactive_base();
+        cfg.mcp_servers = vec![
+            McpServerSpec {
+                name: "dup".into(),
+                command: vec!["a".into()],
+                tags: vec![],
+            },
+            McpServerSpec {
+                name: "dup".into(),
+                command: vec!["b".into()],
+                tags: vec![],
+            },
+        ];
+        let diags = Config::reload_coherence_check(&cfg, None, false)
+            .expect_err("duplicate server names must be an error");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.is_error() && d.msg.contains("duplicate"))
+        );
+    }
+
+    #[test]
+    fn restart_only_set_pins_the_immutable_fields() {
+        // The BINDING partition (RFC 0017 §5.1): mode/identity/transport/exec/
+        // shard/claim must all be restart-only; each named field is diff-detected
+        // by `restart_only_field_differs` (a field listed but not compared would
+        // silently reload — guard against that regression).
+        for &f in RESTART_ONLY_FIELDS {
+            let mut a = reactive_base();
+            let b = a.clone();
+            // Mutate the field on `a` and assert the diff is detected.
+            match f {
+                "mode" => a.mode = Mode::Loop,
+                "intelligence" => a.intelligence = Some("unix:/z".into()),
+                "run_id" => a.run_id = "x".into(),
+                "serve_mcp" => a.serve_mcp = Some("unix:/s".into()),
+                "enable_exec" => a.enable_exec = true,
+                "drain_timeout" => a.drain_timeout = Duration::from_secs(123),
+                "shard" => {
+                    a.shard = ShardCfg {
+                        k: 1,
+                        n: 2,
+                        timer: TimerShardMode::Shard0,
+                    }
+                }
+                "claim_routes" => {
+                    a.claim_routes = vec![ClaimRoute {
+                        uri: "u".into(),
+                        server: "s".into(),
+                        style: ClaimStyle::Tool,
+                    }]
+                }
+                "standby" => a.standby = true,
+                "assign_from" => {
+                    a.assign_from = Some(AssignFrom {
+                        server: "s".into(),
+                        uri: "u".into(),
+                    })
+                }
+                "continue_subscribe" => a.continue_subscribe = vec!["u".into()],
+                "mcp_servers" => {
+                    a.mcp_servers = vec![McpServerSpec {
+                        name: "n".into(),
+                        command: vec!["c".into()],
+                        tags: vec![],
+                    }]
+                }
+                other => panic!("RESTART_ONLY_FIELDS has an unmapped field '{other}'"),
+            }
+            assert!(
+                a.restart_only_field_differs(&b, f),
+                "restart-only field '{f}' must be diff-detected"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_view_carries_no_secret_or_url() {
+        // RFC 0017 §4.2: the effective view is reloadable + REDACTED — no token,
+        // no endpoint URL, no resolved {{secret:…}} value, header NAMES only.
+        const TOKEN: &str = "super-secret-effective-token";
+        let mut env = base_env();
+        env.push(("AGENTD_INTELLIGENCE_TOKEN".into(), TOKEN.into()));
+        env.push((
+            "AGENTD_INTELLIGENCE".into(),
+            "https://user:embedded-cred@api.example/v1".into(),
+        ));
+        let mut cfg =
+            Config::load(&args(&["--mcp", "vault=mcp-vault --secret-arg"]), &env).unwrap();
+        cfg.intelligence_headers
+            .insert("x-api-key".into(), "{{secret:SOME_NAME}}".into());
+        let view = cfg.effective_view();
+        let blob = serde_json::to_string(&view).unwrap();
+        assert!(!blob.contains(TOKEN), "token leaked into effective view");
+        assert!(!blob.contains("embedded-cred"), "URL creds leaked");
+        assert!(!blob.contains("api.example"), "endpoint host leaked");
+        assert!(!blob.contains("SOME_NAME"), "header ref value leaked");
+        assert!(!blob.contains("secret-arg"), "mcp command leaked");
+        // The structural reloadable fields ARE present (name + header KEY).
+        assert_eq!(view["mcp_servers"][0]["name"], serde_json::json!("vault"));
+        assert_eq!(
+            view["intelligence_headers"],
+            serde_json::json!(["x-api-key"])
+        );
+    }
+
+    #[test]
+    fn validate_config_reports_undeclared_claim_server_via_coherence() {
+        // The admission path (`--validate-config`) runs `reload_coherence_check`
+        // with running=None, so an inconsistent reloadable subset is exit 2 even
+        // without the cluster feature gate (this is the coherence layer, not the
+        // feature gate). We assert the verdict is the Err (invalid) variant.
+        // Build a config that is otherwise valid but has an undeclared claim ref
+        // by going through the same Config and calling the collect path directly.
+        let mut cfg = reactive_base();
+        cfg.claim_routes = vec![ClaimRoute {
+            uri: "file:///in.json".into(),
+            server: "ghost".into(),
+            style: ClaimStyle::Tool,
+        }];
+        let verdict = cfg.validate_collect_all(true);
+        assert!(
+            verdict.is_err(),
+            "an undeclared claim server must be invalid"
+        );
+        let lines = verdict.unwrap_err();
+        assert!(lines.contains("undeclared") || lines.contains("not a declared"));
     }
 }

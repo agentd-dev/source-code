@@ -233,9 +233,13 @@ fn surfaces(cfg: &Config) -> Value {
         "report_schema": crate::report::REPORT_SCHEMA,
         // The frozen exit-code contract version (RFC 0016 §5, around RFC 0011 §5).
         "exit_codes": crate::exit::EXIT_CODES,
-        // Not yet built (later RFC chunks flip these true).
+        // RFC 0017 control-plane surfaces. `config_validate` (--validate-config,
+        // §4.1) and `config_schema` (--config-schema, §4.2) are dependency-free
+        // default-build flags — always available, so always advertised true.
+        // `hot_reload` (§5) is chunk B (still deferred).
         "hot_reload": false,
-        "config_validate": false,
+        "config_validate": true,
+        "config_schema": true,
     })
 }
 
@@ -380,9 +384,11 @@ mod tests {
         }
         // events needs `events` + a management transport (neither configured here).
         assert_eq!(s["events"], json!(false));
-        // Not yet built (RFC 0017).
+        // RFC 0017: config_validate/config_schema are always-available default-build
+        // flags (true); hot_reload is chunk B (still deferred).
         assert_eq!(s["hot_reload"], json!(false));
-        assert_eq!(s["config_validate"], json!(false));
+        assert_eq!(s["config_validate"], json!(true));
+        assert_eq!(s["config_schema"], json!(true));
         // Frozen contract versions, read from their owning modules (RFC 0016).
         assert_eq!(
             s["metrics_schema"],

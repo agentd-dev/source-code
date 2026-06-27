@@ -259,6 +259,10 @@ fn surfaces(cfg: &Config) -> Value {
         // failover/health core is always on, but the observable resource rides the
         // management transport, so it's advertised only with `serve-mcp`.
         "intelligence": cfg!(feature = "serve-mcp"),
+        // The agentd://config/effective resource (RFC 0017 §4.2 / §5.6): the live,
+        // redacted reloadable-config view, Management-only + subscribable. Rides the
+        // management transport, so it's advertised only with `serve-mcp`.
+        "config_effective": cfg!(feature = "serve-mcp"),
         // RFC 0017 control-plane surfaces. `config_validate` (--validate-config,
         // §4.1) and `config_schema` (--config-schema, §4.2) are dependency-free
         // default-build flags — always available, so always advertised true.
@@ -460,6 +464,9 @@ mod tests {
         assert_eq!(s["hot_reload"], json!(cfg!(feature = "hot-reload")));
         assert_eq!(s["config_validate"], json!(true));
         assert_eq!(s["config_schema"], json!(true));
+        // RFC 0017 §4.2 / §5.6: the agentd://config/effective resource rides the
+        // management transport, so it's advertised only with `serve-mcp`.
+        assert_eq!(s["config_effective"], json!(cfg!(feature = "serve-mcp")));
         // Frozen contract versions, read from their owning modules (RFC 0016).
         assert_eq!(
             s["metrics_schema"],

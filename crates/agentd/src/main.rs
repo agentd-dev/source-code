@@ -258,19 +258,36 @@ fn run() -> i32 {
             // the reactor's drain choreography, and the served inventory all read
             // one truth — and `lame-duck` flips the readiness override that both
             // `/readyz` and `agentd://inventory.ready` consult.
-            let serve_handle = cfg
+            let serve_wiring = cfg
                 .serve_mcp
                 .as_ref()
                 .and_then(|spec| serve_self_mcp(spec, &exe, root_payload(&cfg), &cfg, &log));
+            // Split the wiring: the shutdown handle (drained below) and the
+            // live-config handle the reactive supervisor adopts so an applied hot
+            // reload swaps the served `agentd://config/effective` view + pushes
+            // `resources/updated` (RFC 0017 §4.2 / §5.6). Without serve-mcp the
+            // wiring is `Option<()>` and there is no live-config handle to thread.
+            #[cfg(feature = "serve-mcp")]
+            let (serve_handle, live_config) = match serve_wiring {
+                Some((h, lc)) => (Some(h), Some(lc)),
+                None => (None, None),
+            };
             let code = match cfg.mode {
                 // The reactive driver re-reads the config FILE on SIGHUP (RFC 0017
                 // §5), so it needs the process's original argv + env (the fixed
                 // env/flag layers; only the FILE can change between loads). These
                 // are inert without the `hot-reload` feature (the loop never
                 // consults the reload latch), so the no-reload path is unchanged.
-                Mode::Reactive => {
-                    run_reactive(exe, root_payload(&cfg), &cfg, &argv[1..], &env, &log)
-                }
+                Mode::Reactive => run_reactive(
+                    exe,
+                    root_payload(&cfg),
+                    &cfg,
+                    &argv[1..],
+                    &env,
+                    &log,
+                    #[cfg(feature = "serve-mcp")]
+                    live_config,
+                ),
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
             };
             // On shutdown, let in-flight served runs drain before we exit (their
@@ -281,7 +298,7 @@ fn run() -> i32 {
                 log.info("mcp.drained", json!({}));
             }
             #[cfg(not(feature = "serve-mcp"))]
-            let _ = serve_handle;
+            let _ = serve_wiring;
             code
         }
     }
@@ -338,6 +355,17 @@ fn serve_metrics(addr: &str, log: &Logger) {
 /// Start the served self-MCP (composability, RFC 0005), or warn this build can't.
 /// The `status` tool reports `cfg`; `subagent.spawn` runs fresh agents from the
 /// daemon's root payload template (`base`).
+/// The served-MCP wiring handed back to `main`: the shutdown [`ServeHandle`] plus
+/// the [`LiveConfig`](agentd::mcp::server::LiveConfig) handle the reactive
+/// supervisor adopts so an applied hot reload swaps the served
+/// `agentd://config/effective` view and pushes `resources/updated` (RFC 0017
+/// §4.2 / §5.6). The SAME registry backs both — one subscription set.
+#[cfg(feature = "serve-mcp")]
+type ServeWiring = (
+    agentd::mcp::server::ServeHandle,
+    std::sync::Arc<agentd::mcp::server::LiveConfig>,
+);
+
 #[cfg(feature = "serve-mcp")]
 fn serve_self_mcp(
     spec: &str,
@@ -345,7 +373,7 @@ fn serve_self_mcp(
     base: SpawnPayload,
     cfg: &Config,
     log: &Logger,
-) -> Option<agentd::mcp::server::ServeHandle> {
+) -> Option<ServeWiring> {
     use agentd::config::ServeTarget;
     // The target is already validated at config load (exit 2 on a bad scheme/port),
     // so a parse failure here is unexpected — surface it and stay inert rather than
@@ -373,8 +401,12 @@ fn serve_self_mcp(
     match target {
         ServeTarget::Unix(path) => {
             let path = path.to_string_lossy().into_owned();
-            match agentd::mcp::server::serve(&path, new_ctx(), log.clone()) {
-                Ok(handle) => Some(handle),
+            // Capture the live-config handle BEFORE the ctx is moved into `serve`
+            // (its `subs` is the same registry `serve` shares into the ServeHandle).
+            let ctx = new_ctx();
+            let live_config = ctx.live_config();
+            match agentd::mcp::server::serve(&path, ctx, log.clone()) {
+                Ok(handle) => Some((handle, live_config)),
                 Err(e) => {
                     log.error(
                         "mcp.serve_fail",
@@ -397,9 +429,11 @@ fn serve_self_mcp_vsock(
     port: u32,
     ctx: agentd::mcp::server::ServeCtx,
     log: &Logger,
-) -> Option<agentd::mcp::server::ServeHandle> {
+) -> Option<ServeWiring> {
+    // Capture the live-config handle before the ctx moves into `serve_vsock`.
+    let live_config = ctx.live_config();
     match agentd::mcp::server::serve_vsock(cid, port, ctx, log.clone()) {
-        Ok(handle) => Some(handle),
+        Ok(handle) => Some((handle, live_config)),
         Err(e) => {
             log.error(
                 "mcp.serve_fail",
@@ -416,7 +450,7 @@ fn serve_self_mcp_vsock(
     port: u32,
     _ctx: agentd::mcp::server::ServeCtx,
     log: &Logger,
-) -> Option<agentd::mcp::server::ServeHandle> {
+) -> Option<ServeWiring> {
     log.warn(
         "mcp.serve_unavailable",
         json!({"transport": "vsock", "cid": cid, "port": port, "reason": "built without --features vsock"}),

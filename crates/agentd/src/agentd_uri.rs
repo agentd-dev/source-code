@@ -54,6 +54,13 @@ pub enum AgentdResource {
     /// warmth/health, and saturation. Management-only. The read surface agentctl
     /// uses to place work. Present only in `cluster` builds.
     Capacity,
+    /// `agentd://config/effective` — the live, redacted view of the running
+    /// daemon's RELOADABLE config subset (RFC 0017 §4.2 / §5.6): model, limits,
+    /// log level, subscribe set, structural MCP-server names, and intelligence
+    /// header NAMES — NEVER a token / URL / secret value. Management-only,
+    /// subscribable; fires `resources/updated` on each APPLIED hot reload so a
+    /// subscriber re-reads the post-reload view. Served only with `serve-mcp`.
+    ConfigEffective,
 }
 
 /// The parsed query of an `agentd://events?…` read (RFC 0016 §7.2/§7.3). All
@@ -137,6 +144,9 @@ impl AgentdResource {
         if rest == "capacity" {
             return Some(AgentdResource::Capacity);
         }
+        if rest == "config/effective" {
+            return Some(AgentdResource::ConfigEffective);
+        }
         if let Some(handle) = rest.strip_prefix("subagent/") {
             let handle = handle.trim();
             if handle.is_empty() {
@@ -187,6 +197,11 @@ pub const INTELLIGENCE_URI: &str = "agentd://intelligence";
 /// The `agentd://capacity` URI — the live capacity/placement view (RFC 0019
 /// §7.2/§9). Management-only; present only in `cluster` builds.
 pub const CAPACITY_URI: &str = "agentd://capacity";
+
+/// The `agentd://config/effective` URI — the live, redacted reloadable-config
+/// view (RFC 0017 §4.2 / §5.6). Management-only; subscribable; fires
+/// `resources/updated` on each applied hot reload. Served only with `serve-mcp`.
+pub const CONFIG_EFFECTIVE_URI: &str = "agentd://config/effective";
 
 /// The `agentd://events` URI — the bounded live-event ring (RFC 0016 §7). The
 /// bare base URI (subscribe/list/notify use it); a read appends `?after=<seq>`
@@ -295,6 +310,19 @@ mod tests {
         assert_eq!(
             AgentdResource::parse("agentd://capacity/"),
             Some(AgentdResource::Capacity)
+        );
+    }
+
+    #[test]
+    fn parses_config_effective() {
+        assert_eq!(
+            AgentdResource::parse(CONFIG_EFFECTIVE_URI),
+            Some(AgentdResource::ConfigEffective)
+        );
+        // a trailing slash is trimmed like the other arms
+        assert_eq!(
+            AgentdResource::parse("agentd://config/effective/"),
+            Some(AgentdResource::ConfigEffective)
         );
     }
 

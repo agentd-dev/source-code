@@ -1,7 +1,7 @@
-# agentd conformance suite.
+# agent conformance suite.
 #
-# A BLACK-BOX validator of the agentd runtime: it knows agentd only as a binary
-# plus the MCP / JSON-RPC 2.0 spec, never linking the agentd library — so it can
+# A BLACK-BOX validator of the agent runtime: it knows agent only as a binary
+# plus the MCP / JSON-RPC 2.0 spec, never linking the agent library — so it can
 # catch real protocol/behaviour regressions instead of agreeing with the
 # implementation's own types. It drives the real binary (served self-MCP, the
 # backing-MCP client, the supervisor, the ReAct loop) and asserts each contract.
@@ -14,7 +14,7 @@ name = "agentd-conformance"
 version = "3.0.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Black-box conformance suite for the agentd runtime (MCP client/server + supervisor + agent loop)"
+description = "Black-box conformance suite for the agent runtime (MCP client/server + supervisor + agent loop)"
 license = "Apache-2.0"
 publish = false
 # `cargo run -p agentd-conformance` → the report runner (not the confmcp helper).
@@ -29,7 +29,7 @@ name = "agentd-conformance"
 path = "src/main.rs"
 
 # A minimal recording MCP reference server, used by the MCP-client conformance
-# family to capture exactly what agentd sends a backing server.
+# family to capture exactly what agent sends a backing server.
 [[bin]]
 name = "confmcp"
 path = "src/bin/confmcp.rs"

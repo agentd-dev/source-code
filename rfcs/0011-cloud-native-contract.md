@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-`agentd` is a single binary that an external scheduler (K8s `Job`/`CronJob`/`Deployment`, Knative, a Nomad task, a bare-metal supervisor) *starts, stops, replicates, and watches*. The orchestrator itself is out of scope (assessment §2.11: "composition is MCP, not a control plane we own"). What is in scope — and what this RFC nails down — is the **contract `agentd` honours so an orchestrator can drive it correctly**: how config is sourced and validated, how it behaves on signals, what its exit codes *mean* to a `podFailurePolicy`, and how a retried run avoids duplicating side effects.
+`agent` is a single binary that an external scheduler (K8s `Job`/`CronJob`/`Deployment`, Knative, a Nomad task, a bare-metal supervisor) *starts, stops, replicates, and watches*. The orchestrator itself is out of scope (assessment §2.11: "composition is MCP, not a control plane we own"). What is in scope — and what this RFC nails down — is the **contract `agent` honours so an orchestrator can drive it correctly**: how config is sourced and validated, how it behaves on signals, what its exit codes *mean* to a `podFailurePolicy`, and how a retried run avoids duplicating side effects.
 
 This RFC covers assessment §2.10 in implementation depth. The central tension it resolves (per `notes-review-cloud-native-unit.md` §0) is the apparent opposition between two identities:
 
@@ -26,11 +26,11 @@ This RFC owns: the config-precedence rule and validate-at-startup discipline; th
 
 1. **Config precedence is a hard rule, top wins:** `built-in default < config file < env var < CLI flag`. Everything is env-settable (12-factor III). The file is only for verbose structural lists (MCP servers), **never** for per-environment values, **never** for secrets. Validate fully at startup **before any side effect** → bad config exits `2` in milliseconds, not after an LLM round-trip. **Never read config from the network.**
 
-2. **Signals:** `SIGTERM`/`SIGINT` → flip a one-way `DRAINING` flag → bounded drain (disarm triggers → wind down subagents at turn boundaries → ladder stragglers → flush logs → exit). A **second** `SIGTERM`/`SIGINT` → `force` → immediate `SIGKILL` of all groups. `SIGCHLD` → reap loop. `SIGPIPE` → ignored. `SIGHUP`/reload is **dropped** (restart-to-reload in v1). `AGENTD_DRAIN_TIMEOUT` **MUST be < pod `terminationGracePeriodSeconds`** (default 25 s vs 30 s; validated and warned at startup).
+2. **Signals:** `SIGTERM`/`SIGINT` → flip a one-way `DRAINING` flag → bounded drain (disarm triggers → wind down subagents at turn boundaries → ladder stragglers → flush logs → exit). A **second** `SIGTERM`/`SIGINT` → `force` → immediate `SIGKILL` of all groups. `SIGCHLD` → reap loop. `SIGPIPE` → ignored. `SIGHUP`/reload is **dropped** (restart-to-reload in v1). `AGENT_DRAIN_TIMEOUT` **MUST be < pod `terminationGracePeriodSeconds`** (default 25 s vs 30 s; validated and warned at startup).
 
 3. **The exit-code table (§5) is a public, machine-actionable API** for `podFailurePolicy`. A clean SIGTERM drain returns **0, not 143.** One-shot maps the root subagent's terminal status to a code. loop/reactive daemons exit only `0`, `143`, or a fatal class.
 
-4. **Idempotency:** accept `AGENTD_RUN_ID`/`--run-id` (default a per-process ULID); propagate it into every MCP tool-call `_meta` so backing services dedupe retries. Encourage read-modify-write-through-MCP and make "already done" cheap → exit `0`. `agentd` introduces **no local non-idempotent side effects** — it has no built-in tools, so all durable output is externalized through MCP, and this property falls out structurally.
+4. **Idempotency:** accept `AGENT_RUN_ID`/`--run-id` (default a per-process ULID); propagate it into every MCP tool-call `_meta` so backing services dedupe retries. Encourage read-modify-write-through-MCP and make "already done" cheap → exit `0`. `agent` introduces **no local non-idempotent side effects** — it has no built-in tools, so all durable output is externalized through MCP, and this property falls out structurally.
 
 These decisions are final for v1. Each defers to the assessment doc where it defers (noted inline).
 
@@ -89,25 +89,25 @@ Every row is env-settable (12-factor III). Flag overrides env overrides file ove
 | Concern | Env | Flag | Notes |
 |---|---|---|---|
 | Instruction | `INSTRUCTION` | `--instruction "…"` / `@file` | `@file` = ConfigMap/Secret projection |
-| Intelligence transport | `AGENTD_INTELLIGENCE` | `--intelligence unix:│https:│vsock:` | see RFC 0006 |
-| Intelligence creds | `AGENTD_INTELLIGENCE_TOKEN` | `--intelligence-token` | secret-env or file; **never logged** |
-| Model / params | `AGENTD_MODEL`, `AGENTD_MAX_TOKENS` | `--model`, `--max-tokens` | |
-| MCP servers | `AGENTD_MCP_CONFIG` (file path) | `--mcp name=cmd`, `--mcp-config` | file = ConfigMap volume |
-| Mode | `AGENTD_MODE` | `--mode once│loop│reactive│schedule` | selects exit predicate (RFC 0008) |
-| Interval | `AGENTD_INTERVAL` | `--interval` | loop/schedule modes |
-| Subscriptions | `AGENTD_SUBSCRIBE` (csv) | repeated `--subscribe URI` | reactive mode (RFC 0008) |
-| Serve self-MCP | `AGENTD_SERVE_MCP` | `--serve-mcp unix:…` | opt-in; off for one-shot (RFC 0005) |
-| Enable exec | `AGENTD_ENABLE_EXEC` | `--enable-exec [allowlist]` | off by default (RFC 0012) |
-| Limits | `AGENTD_MAX_STEPS`/`_MAX_TOKENS`/`_DEADLINE`/`_MAX_DEPTH`/`_TREE_TOKEN_BUDGET` | `--max-steps` etc. | bound the model loop (RFC 0007/0009) |
-| **Drain timeout** | `AGENTD_DRAIN_TIMEOUT` | `--drain-timeout` | **MUST be < pod `terminationGracePeriodSeconds`** |
-| Log format | `AGENTD_LOG_FORMAT` | `--log-format` | json default in container |
-| Log level | `AGENTD_LOG_LEVEL` / `RUST_LOG` | `--log-level` | (RFC 0010) |
-| Health file | `AGENTD_HEALTH_FILE` | `--health-file` | exec-probe target (RFC 0010) |
-| Health addr | `AGENTD_HEALTH_ADDR` | `--health-addr` | off ⇒ no listener (RFC 0010) |
-| **Run ID** | `AGENTD_RUN_ID` | `--run-id` | idempotency key (§6) |
-| Cgroup path | `AGENTD_CGROUP` (auto-detect) | `--cgroup` | subagent placement (RFC 0003) |
+| Intelligence transport | `AGENT_INTELLIGENCE` | `--intelligence unix:│https:│vsock:` | see RFC 0006 |
+| Intelligence creds | `AGENT_INTELLIGENCE_TOKEN` | `--intelligence-token` | secret-env or file; **never logged** |
+| Model / params | `AGENT_MODEL`, `AGENT_MAX_TOKENS` | `--model`, `--max-tokens` | |
+| MCP servers | `AGENT_MCP_CONFIG` (file path) | `--mcp name=cmd`, `--mcp-config` | file = ConfigMap volume |
+| Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule` | selects exit predicate (RFC 0008) |
+| Interval | `AGENT_INTERVAL` | `--interval` | loop/schedule modes |
+| Subscriptions | `AGENT_SUBSCRIBE` (csv) | repeated `--subscribe URI` | reactive mode (RFC 0008) |
+| Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp unix:…` | opt-in; off for one-shot (RFC 0005) |
+| Enable exec | `AGENT_ENABLE_EXEC` | `--enable-exec [allowlist]` | off by default (RFC 0012) |
+| Limits | `AGENT_MAX_STEPS`/`_MAX_TOKENS`/`_DEADLINE`/`_MAX_DEPTH`/`_TREE_TOKEN_BUDGET` | `--max-steps` etc. | bound the model loop (RFC 0007/0009) |
+| **Drain timeout** | `AGENT_DRAIN_TIMEOUT` | `--drain-timeout` | **MUST be < pod `terminationGracePeriodSeconds`** |
+| Log format | `AGENT_LOG_FORMAT` | `--log-format` | json default in container |
+| Log level | `AGENT_LOG_LEVEL` / `RUST_LOG` | `--log-level` | (RFC 0010) |
+| Health file | `AGENT_HEALTH_FILE` | `--health-file` | exec-probe target (RFC 0010) |
+| Health addr | `AGENT_HEALTH_ADDR` | `--health-addr` | off ⇒ no listener (RFC 0010) |
+| **Run ID** | `AGENT_RUN_ID` | `--run-id` | idempotency key (§6) |
+| Cgroup path | `AGENT_CGROUP` (auto-detect) | `--cgroup` | subagent placement (RFC 0003) |
 
-**The file (`AGENTD_MCP_CONFIG`) carries only verbose structural bits — MCP server lists.** It MUST NOT carry secrets (the validator rejects a `token`/`*_token`/`password`/`secret` key appearing in the file with a hard error, exit `2`) and MUST NOT carry per-environment scalars that belong in env (this is a documented convention, not enforced — env simply wins anyway).
+**The file (`AGENT_MCP_CONFIG`) carries only verbose structural bits — MCP server lists.** It MUST NOT carry secrets (the validator rejects a `token`/`*_token`/`password`/`secret` key appearing in the file with a hard error, exit `2`) and MUST NOT carry per-environment scalars that belong in env (this is a documented convention, not enforced — env simply wins anyway).
 
 ### 3.3 Validate-fully-at-startup → exit 2 in milliseconds, before any side effect
 
@@ -143,7 +143,7 @@ fn validate(&self) -> Result<(), ConfigError> {
 }
 ```
 
-**Drain-vs-grace validation.** `terminationGracePeriodSeconds` is not visible to the process by default. The operator is documented to inject it via the downward API as `AGENTD_POD_GRACE_SECONDS` (or it is passed as `--pod-grace`); when present, `drain_timeout >= grace` is a **hard validation error (exit 2)**. When absent, a `drain_timeout >= 30s` (the K8s default grace) emits a loud `config.warn` line but does not fail — we cannot prove the coupling is wrong, only flag the likely footgun. Default `AGENTD_DRAIN_TIMEOUT=25s` against the recommended `terminationGracePeriodSeconds: 30` leaves headroom for the SIGKILL rung plus log flush.
+**Drain-vs-grace validation.** `terminationGracePeriodSeconds` is not visible to the process by default. The operator is documented to inject it via the downward API as `AGENT_POD_GRACE_SECONDS` (or it is passed as `--pod-grace`); when present, `drain_timeout >= grace` is a **hard validation error (exit 2)**. When absent, a `drain_timeout >= 30s` (the K8s default grace) emits a loud `config.warn` line but does not fail — we cannot prove the coupling is wrong, only flag the likely footgun. Default `AGENT_DRAIN_TIMEOUT=25s` against the recommended `terminationGracePeriodSeconds: 30` leaves headroom for the SIGKILL rung plus log flush.
 
 **Fast-fail rationale:** a config-broken pod must crash in milliseconds with a clear stderr message, so `CrashLoopBackoff` is fast and the failure is unambiguously "operator error" (exit `2` = non-retriable, §5). It must never burn a 30 s LLM round-trip before discovering a typo'd flag.
 
@@ -208,11 +208,11 @@ The supervisor runs a single state machine: `RUNNING → DRAINING → EXITING`. 
 On entering `DRAINING` the reactor runs the bounded drain (assessment §2.10 choreography; ladder mechanics in RFC 0003):
 
 1. **Disarm triggers.** Stop the interval/cron timer; stop routing new `notifications/resources/updated` into spawn/continue (RFC 0008); set the tree-wide `draining` flag so the self-MCP `subagent.spawn` tool returns `-32000 "shutting down"` to any new spawn — including spawns a child attempts mid-teardown (this is the "parent can't spawn replacements mid-teardown" guard from assessment §2.8). Flip readiness to not-ready (RFC 0010).
-2. **Wind down in-flight subagents at turn boundaries.** Send each in-flight root subagent a `ctrl:cancel` (cooperative "wind down"); the agentic loop checks the cancel flag at each turn boundary (RFC 0007) and returns a labeled partial. Budget: `min(AGENTD_DRAIN_TIMEOUT, remaining deadline)`.
+2. **Wind down in-flight subagents at turn boundaries.** Send each in-flight root subagent a `ctrl:cancel` (cooperative "wind down"); the agentic loop checks the cancel flag at each turn boundary (RFC 0007) and returns a labeled partial. Budget: `min(AGENT_DRAIN_TIMEOUT, remaining deadline)`.
 3. **Ladder the stragglers.** Subagents still alive at the soft deadline go through the bounded **depth-first, deepest-first** kill ladder: `killpg(SIGTERM)` → grace ~5 s → `killpg(SIGKILL)` → `waitpid` until reaped or `ECHILD` (full mechanics in RFC 0003). stdio MCP server children get close-stdin → SIGTERM → SIGKILL (RFC 0004).
 4. **Flush logs, exit.** Flush the JSON-lines logger and any gated trace/metric exporter (RFC 0010), then `exit(code)` with the §5 code — **`0` for a clean drain**, not `143`.
 
-The **total drain budget is bounded by `AGENTD_DRAIN_TIMEOUT`** and the per-rung graces sum to less than it; this is why the timeout MUST be smaller than the pod grace (§3.3). If the kubelet's own SIGKILL lands first, we lose the clean exit — so our internal budget is always the smaller number.
+The **total drain budget is bounded by `AGENT_DRAIN_TIMEOUT`** and the per-rung graces sum to less than it; this is why the timeout MUST be smaller than the pod grace (§3.3). If the kubelet's own SIGKILL lands first, we lose the clean exit — so our internal budget is always the smaller number.
 
 ### 4.3 Second signal → force
 
@@ -223,7 +223,7 @@ A second `SIGTERM`/`SIGINT` during drain sets `FORCE`. The reactor, on its next 
 No code runs on `SIGKILL`. Safety therefore comes from design, not cleanup:
 
 - The supervisor holds **no durable state** a SIGKILL can corrupt (assessment §2.8 — stateless supervisor; §4 below). Nothing to flush ⇒ nothing to corrupt.
-- Orphaned subagents are reaped by `PR_SET_PDEATHSIG, SIGKILL` on every child (immediate-parent chaining) plus cgroup `cgroup.kill` for tree-wide teardown where delegated (RFC 0003). agentd never hard-requires cgroup write access.
+- Orphaned subagents are reaped by `PR_SET_PDEATHSIG, SIGKILL` on every child (immediate-parent chaining) plus cgroup `cgroup.kill` for tree-wide teardown where delegated (RFC 0003). agent never hard-requires cgroup write access.
 - Everything a SIGKILL interrupts mid-flight is recovered by an **idempotent retried re-run** (§6), not by cleanup.
 
 ---
@@ -306,13 +306,13 @@ A reactive `Deployment` rolled by the operator must therefore look like a **clea
 
 ## 6. Mechanisms — idempotency
 
-A scheduler retries (`backoffLimit`, exponential backoff, at-least-once). A one-shot run must therefore be **safe to execute more than once.** `agentd` cannot *make* an arbitrary instruction idempotent — but it provides the mechanism and introduces no non-idempotency of its own.
+A scheduler retries (`backoffLimit`, exponential backoff, at-least-once). A one-shot run must therefore be **safe to execute more than once.** `agent` cannot *make* an arbitrary instruction idempotent — but it provides the mechanism and introduces no non-idempotency of its own.
 
 ### 6.1 `RUN_ID` — the idempotency key
 
 ```rust
 // resolved in config.rs
-let run_id: Ulid = env_or_flag("AGENTD_RUN_ID", "--run-id")
+let run_id: Ulid = env_or_flag("AGENT_RUN_ID", "--run-id")
     .map(Ulid::from_str).transpose()?     // operator-supplied stable key
     .unwrap_or_else(Ulid::new);           // default: per-process random ULID
 ```
@@ -332,14 +332,14 @@ let run_id: Ulid = env_or_flag("AGENTD_RUN_ID", "--run-id")
     "name": "queue.enqueue",
     "arguments": { "topic": "digests", "body": "…" },
     "_meta": {
-      "agentd/run_id": "01J8Z3K2Qn7…",          // the idempotency key
+      "agent/run_id": "01J8Z3K2Qn7…",          // the idempotency key
       "traceparent": "00-<trace_id>-<span_id>-01" // trace-context (RFC 0010)
     }
   }
 }
 ```
 
-A backing service that supports idempotency keys (a queue with dedupe, an HTTP API honouring `Idempotency-Key`) reads `agentd/run_id` from `_meta` and collapses a retried side effect to a single effect. This is the only hook `agentd` needs to offer; the dedupe lives in the backing service, by design (assessment §2.11).
+A backing service that supports idempotency keys (a queue with dedupe, an HTTP API honouring `Idempotency-Key`) reads `agent/run_id` from `_meta` and collapses a retried side effect to a single effect. This is the only hook `agent` needs to offer; the dedupe lives in the backing service, by design (assessment §2.11).
 
 ### 6.3 Read-modify-write through MCP; "already done" is cheap
 
@@ -347,9 +347,9 @@ The default system prompt and docs encourage the level-triggered pattern: the ag
 
 ### 6.4 No local non-idempotent side effects — structural
 
-`agentd` itself writes nothing durable locally except logs (stdout = the agent's result; stderr = telemetry — both append-only event streams, harmless to duplicate, 12-factor XI). **All durable output goes through MCP backing services** where the idempotency key can act. This is not a discipline we must police — it falls out structurally from the assessment's "**no built-in tools**" decision (§2.11): the only way `agentd` can persist anything is to call an MCP server, which is by construction an external backing service. There is no local file write, no local DB, no hidden side effect path for a retry to duplicate.
+`agent` itself writes nothing durable locally except logs (stdout = the agent's result; stderr = telemetry — both append-only event streams, harmless to duplicate, 12-factor XI). **All durable output goes through MCP backing services** where the idempotency key can act. This is not a discipline we must police — it falls out structurally from the assessment's "**no built-in tools**" decision (§2.11): the only way `agent` can persist anything is to call an MCP server, which is by construction an external backing service. There is no local file write, no local DB, no hidden side effect path for a retry to duplicate.
 
-**Honest scope statement.** True idempotency is a property of *the instruction + the MCP tools it uses*, which `agentd` does not own. Our contract is exactly three guarantees: (1) provide and propagate a stable idempotency key; (2) introduce no non-idempotent local side effects; (3) make "already done" cheap to detect and exit `0` on. Beyond that, idempotency is the operator's composition responsibility — consistent with "composition is MCP, not a control plane we own" (assessment §2.11).
+**Honest scope statement.** True idempotency is a property of *the instruction + the MCP tools it uses*, which `agent` does not own. Our contract is exactly three guarantees: (1) provide and propagate a stable idempotency key; (2) introduce no non-idempotent local side effects; (3) make "already done" cheap to detect and exit `0` on. Beyond that, idempotency is the operator's composition responsibility — consistent with "composition is MCP, not a control plane we own" (assessment §2.11).
 
 ---
 
@@ -400,7 +400,7 @@ The two deploy shapes are thus the **same binary, same loop, same config machine
 - **No SIGHUP/reload, no live reconfiguration.** Restart-to-reload in v1 (§4.1). Config is a frozen, validated snapshot for a process's lifetime.
 - **No remote/network config.** All input is env + flags + a local file (§3.1).
 - **No warm-session checkpointing in v1.** Restart = rebuild + reconcile (§7); the optional MCP-backed checkpoint is deferred to RFC 0013.
-- **`agentd` does not guarantee instruction-level idempotency.** It provides the key, propagates it, and adds no local non-idempotency (§6.4); end-to-end idempotency is the operator's MCP composition.
+- **`agent` does not guarantee instruction-level idempotency.** It provides the key, propagates it, and adds no local non-idempotency (§6.4); end-to-end idempotency is the operator's MCP composition.
 - **cgroup write access is never required** (degrade to rlimit + PDEATHSIG; mechanics in RFC 0003).
 - **The health surface, log schema, and trace propagation** are RFC 0010, referenced not re-specified.
 
@@ -408,5 +408,5 @@ The two deploy shapes are thus the **same binary, same loop, same config machine
 
 ## 10. Open items
 
-- **Downward-API grace hint key.** §3.3 assumes the operator injects `terminationGracePeriodSeconds` as `AGENTD_POD_GRACE_SECONDS` (or `--pod-grace`) so the drain-vs-grace check can be a hard error rather than a warning. The exact env-var name is a documentation convention to settle in M5; if unset we fall back to the `>= 30s` warning. This is a naming convention, not a design gap.
-- **`agentd/run_id` `_meta` key namespace.** §6.2 uses `agentd/run_id`; whether to additionally mirror it as a conventional `Idempotency-Key` for HTTP-bridging MCP servers (so they need no agentd-specific awareness) is a small documented convention to confirm with the first backing-service integration. Does not block M5.
+- **Downward-API grace hint key.** §3.3 assumes the operator injects `terminationGracePeriodSeconds` as `AGENT_POD_GRACE_SECONDS` (or `--pod-grace`) so the drain-vs-grace check can be a hard error rather than a warning. The exact env-var name is a documentation convention to settle in M5; if unset we fall back to the `>= 30s` warning. This is a naming convention, not a design gap.
+- **`agent/run_id` `_meta` key namespace.** §6.2 uses `agent/run_id`; whether to additionally mirror it as a conventional `Idempotency-Key` for HTTP-bridging MCP servers (so they need no agent-specific awareness) is a small documented convention to confirm with the first backing-service integration. Does not block M5.

@@ -1,7 +1,7 @@
 name: DCO
 
 # Enforces a Developer Certificate of Origin sign-off on every commit in a PR.
-# agentd is Apache-2.0 (inbound = outbound), so DCO sign-off — not a CLA — is the
+# agent is Apache-2.0 (inbound = outbound), so DCO sign-off — not a CLA — is the
 # provenance mechanism. See CONTRIBUTING.md.
 
 on:

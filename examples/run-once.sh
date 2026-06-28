@@ -4,7 +4,7 @@
 # Targets v1 behavior (see docs/design/PLAN.md). The binary today validates
 # config + logs + exits with a scaffold notice for run modes; the agentic loop,
 # supervisor, and MCP client land across milestones M1-M3. The flags below are
-# the stable v1 surface (all exist in crates/agent/src/config.rs).
+# the stable v1 surface (all exist in crates/agentd/src/config.rs).
 #
 # Deploy shape: a Job or a CLI invocation. Exit code maps the root subagent's
 # terminal status (completed -> 0, refused -> 5, budget/exhausted -> 7, ...).

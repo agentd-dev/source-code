@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-agentd is a process tree, not a thread pool, and it is reactive — it spends
+agent is a process tree, not a thread pool, and it is reactive — it spends
 most of its life asleep. Three architectural facts dominate the observability
 design and break the usual web-service assumptions:
 
@@ -219,7 +219,7 @@ Mirrors the OTel GenAI stance and RFC 0012 secrets rule exactly:
   `instruction_hash`, `tokens_in`/`tokens_out`. Never raw content.
   `*_hash` is the first 8 hex chars of a non-cryptographic FNV-1a / xxHash-style
   digest (a stable correlation aid, not a security primitive).
-- **`--log-content` (env `AGENTD_LOG_CONTENT`)** opts in to capturing the
+- **`--log-content` (env `AGENT_LOG_CONTENT`)** opts in to capturing the
   prompt/tool-arg/result bodies (the `gen_ai.input.messages` /
   `gen_ai.output.messages` / `gen_ai.tool.call.arguments` / `...result`
   equivalents). It is loud, gated, and **redaction-aware**: it still strips
@@ -273,7 +273,7 @@ need `tracing`'s implicit context machinery.
 
 - **(A) default — each process writes its own stderr.** The container
   runtime/collector already captures it. Because every line self-identifies,
-  agentd does no aggregation and never becomes a logging bottleneck. Cleanest for
+  agent does no aggregation and never becomes a logging bottleneck. Cleanest for
   K8s. Reassemble by `run_id` + `agent_path` prefix.
 - **(B) `--aggregate-logs`** — child telemetry is framed up the existing control
   channel (RFC 0005) and the supervisor re-emits it on its own stderr. For
@@ -295,8 +295,8 @@ JSON/header fields and is therefore free; only span *export* is heavy and gated.
 
 **Ingest (mint-or-adopt):**
 
-- If an inbound `traceparent` arrives — on an inbound MCP request to agentd's
-  self-MCP server (RFC 0005), or via the **`AGENTD_TRACEPARENT`** env var when an
+- If an inbound `traceparent` arrives — on an inbound MCP request to agent's
+  self-MCP server (RFC 0005), or via the **`AGENT_TRACEPARENT`** env var when an
   orchestrator starts the pod — adopt its `trace_id` and use its `span_id` as the
   root `parent_span_id`.
 - Else **mint a `trace_id` per `run_id`** (16 random bytes) so the run is
@@ -311,7 +311,7 @@ bad trace header).
 
 - **MCP calls:** set `_meta.traceparent` (+ `tracestate`/`baggage` when present)
   on every outbound `tools/call` and `resources/*` (RFC 0004). Two fields in a
-  frame we already build → downstream MCP servers' spans line up even if agentd
+  frame we already build → downstream MCP servers' spans line up even if agent
   only logs.
 - **LLM call:** set the standard `traceparent` HTTP header on the intelligence
   request (RFC 0006).
@@ -393,18 +393,18 @@ default.
 The metrics that matter (derivable from logs by default; emitted directly under
 the `metrics`/`otel` features):
 
-- **Gauges:** `agentd_active_subagents`, `agentd_tree_depth`,
-  `agentd_subscriptions_active`, `agentd_warm_sessions`, `agentd_ready` (0/1),
-  `agentd_up` (1 while alive).
-- **Counters:** `agentd_loop_steps_total`, `agentd_intel_calls_total{model}`,
-  `agentd_tokens_total{model,type=in|out}`, `agentd_tool_calls_total{server,tool,ok}`,
-  `agentd_resource_events_total{server}`, `agentd_triggers_total{kind,route}`,
-  `agentd_subagents_spawned_total`, `agentd_subagents_exited_total{status}`,
-  `agentd_subagent_restarts_total{reason}`,
-  `agentd_subagent_stuck_kills_total{signal}` (the reliability headline metric),
-  `agentd_limit_exceeded_total{limit}`, `agentd_mcp_connect_failures_total{server}`.
+- **Gauges:** `agent_active_subagents`, `agent_tree_depth`,
+  `agent_subscriptions_active`, `agent_warm_sessions`, `agent_ready` (0/1),
+  `agent_up` (1 while alive).
+- **Counters:** `agent_loop_steps_total`, `agent_intel_calls_total{model}`,
+  `agent_tokens_total{model,type=in|out}`, `agent_tool_calls_total{server,tool,ok}`,
+  `agent_resource_events_total{server}`, `agent_triggers_total{kind,route}`,
+  `agent_subagents_spawned_total`, `agent_subagents_exited_total{status}`,
+  `agent_subagent_restarts_total{reason}`,
+  `agent_subagent_stuck_kills_total{signal}` (the reliability headline metric),
+  `agent_limit_exceeded_total{limit}`, `agent_mcp_connect_failures_total{server}`.
 - **Histograms (otel only):** `gen_ai.client.operation.duration`,
-  `agentd_tool_duration_ms{server,tool}`, `agentd_loop_step_duration_ms`.
+  `agent_tool_duration_ms{server,tool}`, `agent_loop_step_duration_ms`.
 
 **Cardinality discipline (binding):** **never** put `run_id`, `agent_id`,
 `agent_path`, `call_id`, or resource URIs into metric labels — those are
@@ -433,7 +433,7 @@ grpc-tonic** — keeps tokio out of the default build; see assessment §2.2). Ma
 our event taxonomy onto the OTel GenAI semantic conventions (experimental; gate
 behind `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental`):
 
-| agentd event/span | `gen_ai.operation.name` | Span name | Key attributes |
+| agent event/span | `gen_ai.operation.name` | Span name | Key attributes |
 |---|---|---|---|
 | `subagent.spawn` → `loop.final` | `invoke_agent` | `invoke_agent {agent.name}` | `gen_ai.agent.id`, `gen_ai.agent.name`, `gen_ai.conversation.id` (= run/session id) |
 | `intel.call` / `intel.result` | `chat` | `chat {model}` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons`, `gen_ai.request.max_tokens` |
@@ -442,24 +442,24 @@ behind `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental`):
 
 Required metric `gen_ai.client.operation.duration`; recommended
 `gen_ai.client.token.usage` (filtered by `gen_ai.token.type`). Supervisor
-spawn/limit/stuck spans are agentd-namespaced custom spans nested under the
+spawn/limit/stuck spans are agent-namespaced custom spans nested under the
 GenAI ones.
 
-**Instrument the client side; do not double-instrument.** agentd is an MCP
+**Instrument the client side; do not double-instrument.** agent is an MCP
 *client*; the server on the other side may also emit `execute_tool`/MCP spans.
-agentd instruments the **client side** of the tool call ("I called this tool and
+agent instruments the **client side** of the tool call ("I called this tool and
 waited") and *propagates* context (§3.6) so the server's spans nest underneath —
 the SEP-414 single-span-tree model. No duplicate spans.
 
 **Export mechanics:** OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`, pushed to a
-**local collector / sidecar** so agentd stays thin and needs no batching/retry
+**local collector / sidecar** so agent stays thin and needs no batching/retry
 sophistication (mirrors the terminate-complexity-at-the-sidecar pattern). Using
 `tracing` + `tracing-opentelemetry` *inside this gate* is acceptable precisely
 because it is opt-in and invisible to the default build.
 
 **Token-accounting honesty (open item alignment):** tokens come from the
 intelligence response `usage` (RFC 0006). A normalising gateway may reshape it;
-agentd reads from the normalised response and logs `0`/`null` (never a guess)
+agent reads from the normalised response and logs `0`/`null` (never a guess)
 when absent, to keep `tokens_total` trustworthy.
 
 ---
@@ -487,7 +487,7 @@ when absent, to keep `tokens_total` trustworthy.
 - **RFC 0007 (agentic loop):** emits `loop.start/step/final/error`, `intel.call/result`,
   `tool.call/result`; `result_status` maps to terminal statuses.
 - **RFC 0008 (modes/routing):** `trigger.armed/fired{route}`,
-  `subscribe/unsubscribe/resource.updated`; `agentd_warm_sessions` and
+  `subscribe/unsubscribe/resource.updated`; `agent_warm_sessions` and
   `trigger.fired{route}` align with the spawn-vs-continue routing rule.
 - **RFC 0009 (subagent model):** the spawn `telemetry` block rides the spawn
   payload; depth/`agent_path` are supervisor-minted, never child-trusted.
@@ -495,7 +495,7 @@ when absent, to keep `tokens_total` trustworthy.
   precedence/validation, and drain choreography. This RFC consumes the exit-code
   table for terminal health and adds the obs flags
   (`--log-level/--log-content/--aggregate-logs/--health-file/--health-http`,
-  `AGENTD_TRACEPARENT`, `OTEL_EXPORTER_OTLP_ENDPOINT`).
+  `AGENT_TRACEPARENT`, `OTEL_EXPORTER_OTLP_ENDPOINT`).
 - **RFC 0012 (security):** the secrets field-allowlist and `Debug=***` rule;
   content capture is off by default per the untrusted-content stance.
 
@@ -509,7 +509,7 @@ when absent, to keep `tokens_total` trustworthy.
   metrics ride `otel`.
 - **No span export in the default build.** Propagation is on; export is gated.
 - **No MCP `logging` capability.** The MCP 2026-07-28 RC deprecates it in favor
-  of stderr + OpenTelemetry; agentd does not implement or advertise it.
+  of stderr + OpenTelemetry; agent does not implement or advertise it.
 - **No log file management / rotation / shipping in-binary.** stderr only; the
   container runtime / collector owns capture and rotation.
 - **No second scheduling/aggregation subsystem.** Mode B reuses the existing

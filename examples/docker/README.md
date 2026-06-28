@@ -31,7 +31,7 @@ docker build -f examples/docker/Dockerfile \
   --build-arg FEATURES=tls,vsock,cron -t agent:full .
 ```
 
-Feature flags map to the crate's `[features]` (see `crates/agent/Cargo.toml`):
+Feature flags map to the crate's `[features]` (see `crates/agentd/Cargo.toml`):
 `tls` (rustls+ring, bundled roots), `vsock`, `serve-mcp`, `cron`, `metrics`,
 `otel`. The default build has none of these on.
 
@@ -50,7 +50,7 @@ docker run --rm \
 ```
 
 `AGENT_INTELLIGENCE_TOKEN` is a secret — it is **never** logged and is
-redacted in any debug output (see `crates/agent/src/config.rs`). Pass it via
+redacted in any debug output (see `crates/agentd/src/config.rs`). Pass it via
 env or `--intelligence-token`, never via a config file.
 
 With the default (no-TLS) image, point at a plaintext-terminating endpoint:

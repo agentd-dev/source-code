@@ -294,7 +294,7 @@ agent \
 ```
 
 > **Status.** `--enable-exec <abs-path>` (repeatable) builds the operator allowlist of binaries
-> and defaults off (see `crates/agent/src/config.rs` / `crates/agent/src/sec/exec.rs`). The
+> and defaults off (see `crates/agentd/src/config.rs` / `crates/agentd/src/sec/exec.rs`). The
 > runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the MCP
 > client, and all four run modes — is implemented.
 
@@ -348,7 +348,7 @@ agent --instruction "…" --intelligence https://api.example/v1 --model my-model
 ## 8. The actual v1 flag surface
 
 These security-relevant knobs exist in the binary today
-(`crates/agent/src/config.rs`).
+(`crates/agentd/src/config.rs`).
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|

@@ -8,7 +8,7 @@ reactive) + time-scheduled runs + subagent spawn semantics.
 This is a durable design artifact. It makes concrete, opinionated
 recommendations — not a survey. Where the RFC left an open question (§14), I
 take a position and justify it. Where the 2024–2026 production literature has a
-clear answer, I cite it and adapt it to agentd's minimalism bar.
+clear answer, I cite it and adapt it to agent's minimalism bar.
 
 ---
 
@@ -37,7 +37,7 @@ clear answer, I cite it and adapt it to agentd's minimalism bar.
    `spawn`-per-event or bound to one warm session; bursts are coalesced by a
    per-resource debounce window; events are a bounded per-route queue with an
    explicit overflow policy. This is the part the ecosystem has *not* solved —
-   it is agentd's opportunity, so it must be specified precisely.
+   it is agent's opportunity, so it must be specified precisely.
 6. **Context management is minimal and lever-ordered:** (a) drop stale tool
    results first, (b) then summarize-and-restart (compaction) at a high-water
    mark. No vector DB, no memory service in core — a `note.write`/`note.read`
@@ -98,12 +98,12 @@ Each request is assembled fresh from a small set of parts, in this order:
 5. **Running transcript** — prior turns: assistant messages, tool calls, and
    tool results, *as managed by §5 compaction*.
 
-The tool catalogue (scoped MCP tools + agentd self-tools) is passed in the
+The tool catalogue (scoped MCP tools + agent self-tools) is passed in the
 provider's `tools` field (native tool-calling), not stuffed into the system
 text, *when the gateway supports it*. Tool definitions must be unambiguous and
 non-overlapping — Anthropic's test: "if a human engineer can't say which tool to
-use, neither can the agent." Since agentd ships **no** tools of its own beyond
-the self-MCP, tool quality is the MCP server author's responsibility; agentd's
+use, neither can the agent." Since agent ships **no** tools of its own beyond
+the self-MCP, tool quality is the MCP server author's responsibility; agent's
 job is to pass them through faithfully and cheaply (token-efficiently).
 
 ### 1.3 Stopping conditions (the heart of "when does it stop")
@@ -125,11 +125,11 @@ This is the question the brief asks most pointedly. The answer is the same for
 | Crash | `crashed` | process exit / panic | supervisor observes via exit code |
 
 Two of these are routinely forgotten and *are* the production-failure stories
-of 2024–2026, so they are mandatory in agentd:
+of 2024–2026, so they are mandatory in agent:
 
 - **The global step/token/deadline cap is non-negotiable.** The literature's
   cautionary tale: four agents ran 11 days and billed \$47K on a missing
-  `max_steps`. agentd already has the bones for this in the retired
+  `max_steps`. agent already has the bones for this in the retired
   `BudgetTracker` (`crates/agentd/src/budget.rs`: cumulative token cap with a
   `check_*_budget()` BEFORE the call, `add_*` AFTER) — reuse that exact
   check-before / record-after discipline.
@@ -163,8 +163,8 @@ For each tool call in an assistant turn:
    RFC)? If not, return a tool *result* saying so (recoverable), do not abort.
    The retired loop_node does exactly this ("not in this loop's allowed set")
    and it is the right behavior — keep it.
-2. **Route** — resolve the owning MCP server (or the agentd self-MCP) and call
-   `tools/call`. agentd self-tools (`subagent.*`, `subscribe`, `exec`) route
+2. **Route** — resolve the owning MCP server (or the agent self-MCP) and call
+   `tools/call`. agent self-tools (`subagent.*`, `subscribe`, `exec`) route
    internally.
 3. **Result back as an observation** — append the result (or the error) to the
    transcript as a tool-result message. **Tool errors are observations, not
@@ -299,8 +299,8 @@ both implemented as **internal time events fed into the same reactive router**:
 
 Do **not** build calendars, timezones-with-DST gymnastics, or a job store in
 core. An external scheduler (the K8s operator, *not in this repo*) is the real
-cron for production; agentd's in-process cron is for standalone/daemon
-convenience. If timezones matter, the operator passes them; agentd computes in a
+cron for production; agent's in-process cron is for standalone/daemon
+convenience. If timezones matter, the operator passes them; agent computes in a
 single configured TZ (default UTC) and stops there.
 
 ---
@@ -484,7 +484,7 @@ the order Anthropic recommends applying levers:
    plan; drop redundant chatter." Start a fresh transcript = `[system] +
    [summary] + [last M verbatim tool results/files]`. Tune by *recall first*
    (capture everything relevant), then precision. This is exactly Claude Code's
-   compaction and Anthropic now ships a compaction API — but agentd does it with
+   compaction and Anthropic now ships a compaction API — but agent does it with
    one ordinary model call and a prompt, **no new dependency**.
 3. **Lever 3 — externalize to notes (optional, opt-in).** For long-horizon work,
    a `note.write(text)` / `note.read()` self-tool pair backed by a single file
@@ -650,7 +650,7 @@ recover, stay stable.
 ## 9. Determinism / replay
 
 Full determinism is impossible (the model is non-deterministic, tools touch the
-world). What agentd *can* and *should* guarantee is **replayable observability**,
+world). What agent *can* and *should* guarantee is **replayable observability**,
 not bit-identical re-execution:
 
 - **Append-only event log per run.** Every turn emits structured JSON-line

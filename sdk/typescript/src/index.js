@@ -1,4 +1,4 @@
-// @agentd/sdk — author agentd workflows in TypeScript, compile to the
+// @agent/sdk — author agent workflows in TypeScript, compile to the
 // signed TOML the runtime executes. TOML stays the compile target; this
 // is the authoring surface. Zero runtime dependencies.
 

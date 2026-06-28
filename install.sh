@@ -1,24 +1,24 @@
 #!/bin/sh
-# agentd installer — https://agentd.dev/install.sh
+# agent installer — https://agentd.dev/install.sh
 #
 #   curl -fsSL https://agentd.dev/install.sh | sh
 #
 # Detects OS + architecture, downloads the matching binary from the
-# latest GitHub release (or $AGENTD_VERSION), verifies it runs, and
+# latest GitHub release (or $AGENT_VERSION), verifies it runs, and
 # installs to /usr/local/bin (or ~/.local/bin without root).
 # No sudo is invoked on your behalf.
 #
 # Options (env vars):
-#   AGENTD_VERSION=v1.0.0     pin a release instead of latest
-#   AGENTD_INSTALL_DIR=/path  override the install directory
+#   AGENT_VERSION=v1.0.0     pin a release instead of latest
+#   AGENT_INSTALL_DIR=/path  override the install directory
 
 set -eu
 
 REPO="agentd-dev/source-code"
 API="https://api.github.com/repos/${REPO}/releases"
 
-say()  { printf '\033[1magentd\033[0m %s\n' "$*"; }
-fail() { printf '\033[1magentd\033[0m error: %s\n' "$*" >&2; exit 1; }
+say()  { printf '\033[1magent\033[0m %s\n' "$*"; }
+fail() { printf '\033[1magent\033[0m error: %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || fail "required tool '$1' not found"; }
 need uname
@@ -50,20 +50,20 @@ case "$OS" in
       *) fail "unsupported macOS arch '$ARCH' (Apple Silicon only today; build from source: cargo build --release -p agentd)" ;;
     esac ;;
   MINGW*|MSYS*|CYGWIN*|Windows_NT)
-    fail "on Windows, grab agentd-<version>-x86_64-pc-windows-msvc.zip from https://github.com/${REPO}/releases" ;;
+    fail "on Windows, grab agent-<version>-x86_64-pc-windows-msvc.zip from https://github.com/${REPO}/releases" ;;
   *)
     fail "unsupported OS '$OS'; build from source: cargo build --release -p agentd" ;;
 esac
 
 # --- resolve version --------------------------------------------------------
-if [ "${AGENTD_VERSION:-}" ]; then
-  VERSION="$AGENTD_VERSION"
+if [ "${AGENT_VERSION:-}" ]; then
+  VERSION="$AGENT_VERSION"
 else
   VERSION=$(fetch "${API}/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
   [ "$VERSION" ] || fail "could not resolve the latest release tag"
 fi
 
-ASSET="agentd-${VERSION}-${TARGET}.tar.gz"
+ASSET="agent-${VERSION}-${TARGET}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
 
 # --- download + unpack -------------------------------------------------------
@@ -73,13 +73,13 @@ trap 'rm -rf "$TMP"' EXIT
 say "downloading ${ASSET} ..."
 fetch_to "$URL" "$TMP/$ASSET" || fail "download failed: $URL"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
-[ -x "$TMP/agentd" ] || fail "archive did not contain an executable 'agentd'"
+[ -x "$TMP/agent" ] || fail "archive did not contain an executable 'agent'"
 
 # Smoke-check the binary actually runs on this machine.
-"$TMP/agentd" --version >/dev/null 2>&1 || fail "downloaded binary failed to execute"
+"$TMP/agent" --version >/dev/null 2>&1 || fail "downloaded binary failed to execute"
 
 # --- install -----------------------------------------------------------------
-DIR="${AGENTD_INSTALL_DIR:-}"
+DIR="${AGENT_INSTALL_DIR:-}"
 if [ -z "$DIR" ]; then
   if [ -w /usr/local/bin ]; then
     DIR=/usr/local/bin
@@ -89,15 +89,15 @@ if [ -z "$DIR" ]; then
   fi
 fi
 
-install -m 0755 "$TMP/agentd" "$DIR/agentd" 2>/dev/null || {
-  cp "$TMP/agentd" "$DIR/agentd" && chmod 0755 "$DIR/agentd"
+install -m 0755 "$TMP/agent" "$DIR/agent" 2>/dev/null || {
+  cp "$TMP/agent" "$DIR/agent" && chmod 0755 "$DIR/agent"
 }
 
-say "installed $("$DIR/agentd" --version | head -1) to ${DIR}/agentd"
+say "installed $("$DIR/agent" --version | head -1) to ${DIR}/agent"
 
 case ":$PATH:" in
   *":$DIR:"*) : ;;
   *) say "note: ${DIR} is not on your PATH — add: export PATH=\"${DIR}:\$PATH\"" ;;
 esac
 
-say "next: agentd --help · docs: https://agentd-dev.github.io/source-code/"
+say "next: agent --help · docs: https://agentd-dev.github.io/source-code/"

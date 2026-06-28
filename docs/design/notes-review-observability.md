@@ -50,7 +50,7 @@ RFC 0001 has three properties that dominate the observability design, and they a
 not the usual web-service properties:
 
 - **It is a process tree, not a thread pool.** The unit of intelligence is a child
-  *process* (`agentd` re-exec'd, RFC §4.2), nesting to a supervised tree (§6.3).
+  *process* (`agent` re-exec'd, RFC §4.2), nesting to a supervised tree (§6.3).
   Correlation therefore has to survive a **process boundary** and reconstruct a
   *tree*, not just a request. `ps`/`pstree` already show the OS tree; our job is to
   make the *logs* reassemble the same tree off-box.
@@ -80,7 +80,7 @@ Everything below is shaped by those three facts.
   non-trivial dependency cone (`tracing-core`, `sharded-slab`, `thread_local`,
   `nu-ansi-term`/`matchers`/`regex` via the env-filter, etc.). It is excellent and
   idiomatic, but it is **designed for an async, in-process, many-threaded** world.
-  `agentd` is deliberately *processes + a few threads* (§12: "no async runtime").
+  `agent` is deliberately *processes + a few threads* (§12: "no async runtime").
   We do not get the payoff that justifies `tracing`'s weight.
 - The thing `tracing` buys you — span context plumbed implicitly through async tasks
   — we get **for free from the process tree**: a subagent's span context is just its
@@ -109,7 +109,7 @@ just do that injection by hand from `LogCtx` instead of via an SDK.
 A hard rule for a good cloud-native citizen and for one-shot CLI ergonomics:
 
 - **stdout = the agent's *answer* only** (the final result of a one-shot run, or the
-  control-channel JSON when in subagent mode). This keeps `agentd --instruction … |
+  control-channel JSON when in subagent mode). This keeps `agent --instruction … |
   jq` clean and keeps the result machine-parseable.
 - **stderr = all structured telemetry** (every log line / event). Log collectors in
   K8s capture both streams anyway; separating them means a human or a pipe gets the
@@ -206,7 +206,7 @@ tool arguments are captured… these can contain sensitive data"**
 
 - Default: log **hashes/lengths** (`args_hash`, `result_bytes`, `instruction_hash`),
   never raw content. This is also forced by RFC §13 (no secrets in transcripts).
-- `--log-content` (env `AGENTD_LOG_CONTENT`) opts in to capturing
+- `--log-content` (env `AGENT_LOG_CONTENT`) opts in to capturing
   `gen_ai.input.messages` / `gen_ai.output.messages` / `gen_ai.tool.call.arguments`
   / `gen_ai.tool.call.result` equivalents, for debugging. Loud, gated, redaction-
   aware (still strip the known-secret fields).
@@ -245,7 +245,7 @@ Offer the cheapest thing that works, escalating only on opt-in:
    final signal for daemons. Define a **stable exit-code table** (§3.3). This alone
    satisfies a K8s `Job`/`CronJob`.
 2. **Liveness file (default for daemon/reactive).** The supervisor writes
-   `--health-file PATH` (e.g. `/run/agentd/health.json`) every heartbeat:
+   `--health-file PATH` (e.g. `/run/agent/health.json`) every heartbeat:
    `{"status":"ready|draining","ts":…,"hb":N,"active_subagents":K,"run_id":…}`. A
    K8s `livenessProbe`/`readinessProbe` can `exec` a 5-line script that checks
    `status` and `ts` freshness. **No socket, no HTTP, no port** — just a file and an
@@ -294,28 +294,28 @@ Drawn straight from the RFC's moving parts and the hard requirements (stuck-kill
 restarts, tree size):
 
 **Gauges (point-in-time):**
-- `agentd_active_subagents` — current live children in the tree.
-- `agentd_tree_depth` — current max depth.
-- `agentd_subscriptions_active` — live MCP resource subscriptions.
-- `agentd_warm_sessions` — suspended reactive sessions held warm (§5.3).
-- `agentd_ready` (0/1) and `agentd_up` (always 1 while process lives).
+- `agent_active_subagents` — current live children in the tree.
+- `agent_tree_depth` — current max depth.
+- `agent_subscriptions_active` — live MCP resource subscriptions.
+- `agent_warm_sessions` — suspended reactive sessions held warm (§5.3).
+- `agent_ready` (0/1) and `agent_up` (always 1 while process lives).
 
 **Counters (monotonic):**
-- `agentd_loop_steps_total{agent_path}` — agentic iterations.
-- `agentd_intel_calls_total{model}` / `agentd_tokens_total{model,type=in|out}`.
-- `agentd_tool_calls_total{server,tool,ok}`.
-- `agentd_resource_events_total{server}` — `notifications/resources/updated` seen.
-- `agentd_triggers_total{kind,route}` — spawn vs continue.
-- `agentd_subagents_spawned_total` / `agentd_subagents_exited_total{status}`.
-- `agentd_subagent_restarts_total{reason}`.
-- `agentd_subagent_stuck_kills_total{signal}` — **the reliability headline metric**.
-- `agentd_limit_exceeded_total{limit}`.
-- `agentd_mcp_connect_failures_total{server}`.
+- `agent_loop_steps_total{agent_path}` — agentic iterations.
+- `agent_intel_calls_total{model}` / `agent_tokens_total{model,type=in|out}`.
+- `agent_tool_calls_total{server,tool,ok}`.
+- `agent_resource_events_total{server}` — `notifications/resources/updated` seen.
+- `agent_triggers_total{kind,route}` — spawn vs continue.
+- `agent_subagents_spawned_total` / `agent_subagents_exited_total{status}`.
+- `agent_subagent_restarts_total{reason}`.
+- `agent_subagent_stuck_kills_total{signal}` — **the reliability headline metric**.
+- `agent_limit_exceeded_total{limit}`.
+- `agent_mcp_connect_failures_total{server}`.
 
 **Histograms (opt-in, otel build only — keep the default cheap):**
-- `agentd_intel_duration_ms` (maps to GenAI `gen_ai.client.operation.duration`).
-- `agentd_tool_duration_ms{server,tool}`.
-- `agentd_loop_step_duration_ms`.
+- `agent_intel_duration_ms` (maps to GenAI `gen_ai.client.operation.duration`).
+- `agent_tool_duration_ms{server,tool}`.
+- `agent_loop_step_duration_ms`.
 
 ### 4.2 Exposition: prefer "metrics are derivable from logs," gate a Prometheus endpoint
 
@@ -355,25 +355,25 @@ and `baggage`** ([MCP RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-
 A trace that starts upstream "can follow a tool call through the client SDK, the MCP
 server, and whatever the server calls downstream, and show up as a single span tree."
 
-This is a gift to `agentd`'s design: **trace propagation into tools is now a protocol
+This is a gift to `agent`'s design: **trace propagation into tools is now a protocol
 feature, not something we invent.** And the same RC **deprecates MCP's own `logging`
 capability in favor of stderr + OpenTelemetry** — which validates our default
 (stderr JSON) and our gated `otel` path as exactly the two halves the ecosystem
 chose.
 
-### 5.2 What `agentd` propagates, and where
+### 5.2 What `agent` propagates, and where
 
 Even in the **default (no-otel) build**, do the cheap half of context propagation:
 
-- **Ingest.** If a `traceparent` arrives — on an inbound MCP request to `agentd`'s
-  self-MCP server (§8), or via `AGENTD_TRACEPARENT` env when an orchestrator starts
+- **Ingest.** If a `traceparent` arrives — on an inbound MCP request to `agent`'s
+  self-MCP server (§8), or via `AGENT_TRACEPARENT` env when an orchestrator starts
   the pod — adopt its `trace_id` and use the incoming `span_id` as `parent_span_id`.
   If none arrives, **mint a `trace_id` per `run_id`** so the run is self-correlated.
 - **Propagate outward in `_meta`.** On every outbound MCP `tools/call` and
   `resources/*`, set `_meta.traceparent` (+ `tracestate`/`baggage`) to the current
   span. This is *just two JSON fields in a frame we already build* — essentially free
   and worth doing always, because it makes downstream MCP servers' traces line up
-  even if `agentd` itself only logs.
+  even if `agent` itself only logs.
 - **Propagate to intelligence.** On the LLM HTTP call, set the standard
   `traceparent` HTTP header. Same near-zero cost.
 - **Propagate to subagents.** The spawn payload (§6.2) carries the parent's
@@ -395,7 +395,7 @@ Honeycomb/New Relic; gate behind `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_ex
 [OTel GenAI blog](https://opentelemetry.io/blog/2026/genai-observability/),
 [techbytes cheat sheet](https://techbytes.app/posts/opentelemetry-genai-agent-semconv-cheat-sheet-2026/)):
 
-| `agentd` event/span | GenAI `gen_ai.operation.name` | Span name | Key attributes |
+| `agent` event/span | GenAI `gen_ai.operation.name` | Span name | Key attributes |
 |---|---|---|---|
 | subagent run (`subagent.spawn`→`loop.final`) | `invoke_agent` | `invoke_agent {agent.name}` | `gen_ai.agent.id`, `gen_ai.agent.name`, `gen_ai.conversation.id` (= our session/run id) |
 | `intel.call`/`intel.result` | `chat` (inference) | `chat {model}` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons`, `gen_ai.request.max_tokens` |
@@ -405,12 +405,12 @@ Honeycomb/New Relic; gate behind `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_ex
 Metrics in the otel build follow the conventions too: the **required**
 `gen_ai.client.operation.duration` histogram and the **recommended**
 `gen_ai.client.token.usage` histogram (filter by `gen_ai.token.type`). The
-supervisor's spawn/limit/stuck spans are `agentd`-namespaced custom spans nested
+supervisor's spawn/limit/stuck spans are `agent`-namespaced custom spans nested
 under the GenAI ones.
 
-**Important nuance — capture, don't double-instrument.** `agentd` is an MCP *client*.
+**Important nuance — capture, don't double-instrument.** `agent` is an MCP *client*.
 The MCP server on the other side may *also* emit `execute_tool`/MCP spans. To avoid
-duplicate spans, `agentd` instruments the **client side of the tool call** (the
+duplicate spans, `agent` instruments the **client side of the tool call** (the
 `execute_tool` span representing "I called this tool and waited") and *propagates*
 context so the server's own spans (if any) nest underneath — exactly the SEP-414
 single-span-tree model. The conventions explicitly anticipate this layering.
@@ -418,7 +418,7 @@ single-span-tree model. The conventions explicitly anticipate this layering.
 ### 5.4 Export mechanics (otel feature only)
 
 - **OTLP/HTTP** (protobuf or JSON) to a collector endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT`.
-  Prefer pushing to a **local collector / sidecar** so `agentd` itself stays thin and
+  Prefer pushing to a **local collector / sidecar** so `agent` itself stays thin and
   doesn't need batching/retry sophistication. This mirrors RFC §7.2's "terminate
   complexity at the sidecar" pattern.
 - Implementation may legitimately use `tracing` + `tracing-opentelemetry` + the OTel
@@ -468,7 +468,7 @@ Two viable wirings; recommend **(A) for K8s, (B) available for nesting depth**:
 - **(A) Child writes its own stderr.** Each subagent writes JSON lines directly to
   *its* stderr, which the container runtime/collector already captures. Because every
   line self-identifies (`run_id`/`agent_path`/`trace_id`), no aggregation in
-  `agentd` is needed. Cleanest for a cloud-native collector; the supervisor never
+  `agent` is needed. Cleanest for a cloud-native collector; the supervisor never
   becomes a logging bottleneck.
 - **(B) Child telemetry framed up the control channel.** Telemetry events also ride
   the existing event stream the child sends its parent (§6.1 "every loop turn streams
@@ -501,11 +501,11 @@ to act on, and those signals must also be *emitted* so an operator sees them:
   a cheap `agent.heartbeat`) on a bounded cadence. The supervisor tracks
   `last_event_age_ms` per child. Past a threshold (or past the child's deadline), it
   emits `subagent.stuck` then escalates `SIGTERM`→`SIGKILL`, emitting
-  `subagent.signal`/`subagent.exit`. Increment `agentd_subagent_stuck_kills_total`.
+  `subagent.signal`/`subagent.exit`. Increment `agent_subagent_stuck_kills_total`.
 - **Dead detection.** `waitpid`/exit-pipe closure → `subagent.exit{code}`; an
   unexpected exit (non-zero, no `loop.final`) → `subagent.restart` decision logged
   with `reason`.
-- **Restart accounting.** `agentd_subagent_restarts_total{reason}` + a restart-storm
+- **Restart accounting.** `agent_subagent_restarts_total{reason}` + a restart-storm
   guard (if a session restarts >N times in a window, stop and surface
   `limit.exceeded{limit:"restart_storm"}` rather than thrash).
 - **Supervisor self-watchdog.** The supervisor heartbeat (§3.1) is the top-level
@@ -521,7 +521,7 @@ construction, not bolted on.
 
 ## 8. Configuration surface (additions to RFC §10)
 
-Keep flat and small, matching the RFC's style. Proposed knobs (all with `AGENTD_*`
+Keep flat and small, matching the RFC's style. Proposed knobs (all with `AGENT_*`
 env equivalents):
 
 | Concern | Flag | Default |
@@ -533,7 +533,7 @@ env equivalents):
 | HTTP health | `--health-http ADDR` | off |
 | Prometheus metrics | `--metrics` (needs `metrics` feature + a surface) | off |
 | OTLP export | `OTEL_EXPORTER_OTLP_ENDPOINT` (needs `otel` feature) | off |
-| Inbound trace | `AGENTD_TRACEPARENT` | none (mint per run) |
+| Inbound trace | `AGENT_TRACEPARENT` | none (mint per run) |
 
 Cargo features: `metrics` (Prometheus text exposition), `otel` (OTLP + GenAI
 semconv + `tracing` pipeline). The **default build has neither**, carrying only the
@@ -548,12 +548,12 @@ hand-rolled JSON logger and the file/exit-code health.
    (§2.3) is *ours* and stable regardless. Gate the experimental opt-in explicitly.
 2. **Token accounting source of truth.** Tokens come from the intelligence response
    (`usage`), but a normalising gateway (RFC §7.2) may reshape it. Decide that
-   `agentd` reads usage from the *normalised* gateway response and logs `0`/`null`
+   `agent` reads usage from the *normalised* gateway response and logs `0`/`null`
    (not a guess) when absent — never estimate, to keep `tokens_total` trustworthy.
 3. **Content-capture redaction completeness.** Even with `--log-content`, secrets in
    tool args (e.g. a token passed to an MCP tool) must be redacted. Needs an explicit
    redaction allow/deny rule, or content capture stays a debug-only, non-prod switch.
-4. **`agentd_warm_sessions` and reactive routing (RFC §14 Q5).** The metric and the
+4. **`agent_warm_sessions` and reactive routing (RFC §14 Q5).** The metric and the
    `trigger.fired{route}` event depend on the still-open spawn-vs-continue routing
    rule; align names once that lands.
 5. **Aggregation ordering (mode B).** Forwarded child logs can arrive out of order

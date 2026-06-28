@@ -22,7 +22,7 @@ class.
 > below describe real behaviour.
 
 Every flag and env var on this page is taken verbatim from
-[`crates/agent/src/config.rs`](../crates/agent/src/config.rs) (`agent --help`).
+[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agent --help`).
 If a flag is not in `--help`, it does not exist. See
 [`configuration.md`](configuration.md) for the **complete** flag/env reference,
 the config-file schema, and the reloadable-vs-restart-only partition.
@@ -342,7 +342,7 @@ live in [`examples/`](../examples/).
 
 This table is a **stable, machine-actionable API** — author `podFailurePolicy`
 against it (RFC 0011 §5; constants in
-[`crates/agent/src/exit.rs`](../crates/agent/src/exit.rs)):
+[`crates/agentd/src/exit.rs`](../crates/agentd/src/exit.rs)):
 
 | Code | Meaning | Scheduler hint |
 |---|---|---|

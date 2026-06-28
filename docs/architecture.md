@@ -219,7 +219,7 @@ The single `agent` binary plays three roles from one artifact: supervisor
 The crate layout (from assessment §4.0):
 
 ```
-crates/agent/src/
+crates/agentd/src/
   main.rs            arg parse → mode dispatch (supervisor vs subagent re-exec)
   config.rs          precedence (default<file<env<flag), validate-at-startup, exit 2
   exit.rs            the public exit-code table + terminal-status→code mapping
@@ -530,7 +530,7 @@ agent's only obligation to an external scheduler is to be a clean citizen:
   the supervisor writes each tick.
 
 The actual CLI/env surface is in
-[`crates/agent/src/config.rs`](../crates/agent/src/config.rs) (run
+[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (run
 `agent --help`). Only flags/env vars defined there exist.
 
 ---

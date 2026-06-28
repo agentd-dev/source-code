@@ -107,9 +107,9 @@ tree. No fancy structure required.
 
 ---
 
-## 3. Reaping zombies — agentd as PID 1 is a first-class scenario the RFC ignores
+## 3. Reaping zombies — agent as PID 1 is a first-class scenario the RFC ignores
 
-RFC §11 deploys agentd in a container an operator starts. In a container agentd is frequently
+RFC §11 deploys agent in a container an operator starts. In a container agent is frequently
 **PID 1**, and the RFC says nothing about it. Two distinct duties:
 
 1. **Reap your own children.** A child that exits but is not `waitpid`'d becomes a zombie
@@ -129,13 +129,13 @@ RFC §11 deploys agentd in a container an operator starts. In a container agentd
 **Fix:**
 - The supervisor's SIGCHLD handler **must `waitpid(-1, WNOHANG)` for *any* child**, not only
   known PIDs. Unknown reaped PIDs are logged and discarded.
-- When agentd detects it is PID 1 (`getpid() == 1`), it enables **subreaper-equivalent
+- When agent detects it is PID 1 (`getpid() == 1`), it enables **subreaper-equivalent
   behavior by default**. On non-PID-1 deployments, call
   `prctl(PR_SET_CHILD_SUBREAPER, 1)` so that grandchildren orphaned by a dying subagent
-  reparent to **agentd**, not to the host's init — keeping the whole tree inside agentd's
+  reparent to **agent**, not to the host's init — keeping the whole tree inside agent's
   reaping domain even when it is not PID 1. This is the single most important PID-discipline
   addition. (`prctl` is a `libc` call, no dependency.)
-- Document that the recommended container entrypoint is agentd itself (it *is* a tini-class
+- Document that the recommended container entrypoint is agent itself (it *is* a tini-class
   init for its tree); we do **not** require an external `tini`, because we reap properly.
 
 Without `PR_SET_CHILD_SUBREAPER`, killing a subtree (§5) cannot be guaranteed: orphaned
@@ -214,13 +214,13 @@ On spawn, put each subagent in its **own process group** via `setpgid` (or `pre_
 `setsid` for the root subagent). Then a subtree can be signalled atomically with
 `killpg(pgid, SIG)`. **But** a child may create its own new groups for *its* children, so
 `killpg` of one group is not guaranteed to reach grandchildren. Two complementary defenses:
-- `PR_SET_CHILD_SUBREAPER` (§3) keeps orphans reparenting to agentd so none escape.
+- `PR_SET_CHILD_SUBREAPER` (§3) keeps orphans reparenting to agent so none escape.
 - The supervisor walks its own tree (parent edges in the `Child` table) and signals each
   group depth-first. Combining "walk the table" with `killpg` per node covers both the
   cooperative and the orphaned case.
 
 ### 5.2 Escalation ladder (the bounded part the RFC omits)
-On SIGTERM-to-agentd, or a child deadline/stuck verdict, run a fixed, time-bounded ladder per
+On SIGTERM-to-agent, or a child deadline/stuck verdict, run a fixed, time-bounded ladder per
 target subtree:
 ```
 t0:            send ctrl:cancel (graceful) to the subagent; mark Draining
@@ -304,7 +304,7 @@ but the supervisor stops `spawn → spawn → spawn`.
 - **The enforcement point is structural and unforgeable:** because every subagent process is
   created only through the supervisor-owned `subagent.spawn` tool (RFC §8 — the self-MCP is
   *the* spawn path), there is exactly one chokepoint. **This must be stated as an invariant:**
-  a subagent has no other way to create an agentd child than calling back into the
+  a subagent has no other way to create an agent child than calling back into the
   supervisor's self-MCP. (The `exec` tool, §9, is a separate escape hatch — see §9 below.)
 
 Defaults must be **finite and conservative** and shipped as such; "unbounded unless
@@ -431,7 +431,7 @@ deterministically to exactly one of {spawn-fresh, continue-session, drop}. Speci
 ## 12. The `exec` escape hatch is a supervision hole (RFC §9)
 
 RFC §9 gates `exec` but treats it as "the OS/container is the sandbox" and stops. From a
-process-supervision view, `exec` spawns a child **outside the agentd subagent protocol**:
+process-supervision view, `exec` spawns a child **outside the agent subagent protocol**:
 - It has no control channel, so the §4 stuck-detectors (no-progress events, ping/pong) **do
   not apply** — only the hard deadline + kill does. The RFC must state that `exec` children get
   a **mandatory deadline and process-group kill**, reusing the §5 ladder, and are counted
@@ -450,7 +450,7 @@ process-supervision view, `exec` spawns a child **outside the agentd subagent pr
 2. **`signal(SIGPIPE, SIG_IGN)`** (§2.1) — one line; prevents the supervisor dying with a
    child. *Trivial, critical.*
 3. **`PR_SET_CHILD_SUBREAPER` + `waitpid(-1, WNOHANG)` reap loop on SIGCHLD** (§3) — keeps the
-   whole tree (incl. orphaned grandchildren) in agentd's reaping/kill domain. *Foundational.*
+   whole tree (incl. orphaned grandchildren) in agent's reaping/kill domain. *Foundational.*
 4. **`PR_SET_PDEATHSIG` on every subagent + mandatory self-enforced deadline** (§9.2) — makes
    "in-memory only" safe against supervisor crash (no orphan leak). *Critical.*
 5. **Three-detector stuck model (deadline + no-progress + ping/pong), control thread separate

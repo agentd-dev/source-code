@@ -14,7 +14,7 @@ milliseconds, not after an LLM round-trip or an MCP handshake.
 > intelligence failover are all live (see [`docs/design/PLAN.md`](design/PLAN.md)).
 > The flag/env surface below is derived verbatim from the binary's `--help`
 > (`help_text()`) and the actual flag/env parsing in
-> [`crates/agent/src/config.rs`](../crates/agent/src/config.rs). Where a flag
+> [`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs). Where a flag
 > needs a build feature, that is called out — a feature-gated flag that is set
 > in a build without its feature exits `2`, never silently no-ops.
 

@@ -1,10 +1,10 @@
-# Research notes — Rust crate choices for a near-zero-dependency agentd
+# Research notes — Rust crate choices for a near-zero-dependency agent
 
 **Status:** Research artifact (input to RFC 0001 implementation).
 **Author:** generated for Andrii Tsok.
 **Date:** 2026-06-25.
 **Scope:** Concrete crate selection for the rewritten, minimal, MCP-native,
-reactive `agentd` runtime (see `rfcs/0001-mcp-native-agent-runtime.md`,
+reactive `agent` runtime (see `rfcs/0001-mcp-native-agent-runtime.md`,
 especially §12 "Dependency budget"). Bias throughout: *fewest transitive
 crates, no async runtime, no C build toolchain unless forced, std-first.*
 
@@ -191,7 +191,7 @@ builds carry no TLS at all** — TLS must be feature-gated.
   Rejected for core; not worth a feature.
 
 ### Sidecar-terminated / none
-- The RFC-preferred default: `agentd` speaks **plaintext to localhost**, a
+- The RFC-preferred default: `agent` speaks **plaintext to localhost**, a
   sidecar/gateway does TLS. In this mode the binary links **no TLS crates**.
   This should be the default container recommendation and the default Cargo
   build (TLS off).

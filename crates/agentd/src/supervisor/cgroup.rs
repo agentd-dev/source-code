@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! cgroup v2 memory awareness (read-only). Assessment §4 M5.
 //!
 //! Best-effort, **never required**: a cloud-native unit reports the memory

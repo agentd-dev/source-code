@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! A minimal blocking HTTP/1.1 client over any `Read + Write`. RFC 0006.
 //!
 //! This is the single highest-leverage minimalism decision (RFC 0002): one

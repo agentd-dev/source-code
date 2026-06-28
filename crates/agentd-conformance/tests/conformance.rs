@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The conformance suite as `cargo test`: one test per family, each running its
 //! checks against a freshly-built agentd and asserting every check passes. The
 //! same checks back the `agentd-conformance` runner binary.

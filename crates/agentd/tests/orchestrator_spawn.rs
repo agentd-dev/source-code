@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! End-to-end test of self-orchestration (M2): the `subagent.spawn` self-tool.
 //!
 //! Drives the `Orchestrator` directly (standing in for the model calling the

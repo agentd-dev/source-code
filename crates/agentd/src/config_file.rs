@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The declarative config **file** (RFC 0017 §3) + its JSON Schema (§4.2).
 //!
 //! A single **JSON** document (NOT YAML — `serde_yaml` is a dependency the

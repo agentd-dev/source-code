@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 pub mod budget;
 pub mod cgroup;
 pub mod kill;

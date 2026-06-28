@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in HTTP probe/scrape surface: `/metrics` + `/healthz` + `/readyz`.
 //! RFC 0010 §health + §metrics; RFC 0016 §10 (fleet liveness). [feature: metrics]
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The async-run intelligence hot-swap channel (RFC 0018 §5.2).
 //!
 //! A served async run is supervised by its own reactor (`reactor.rs`), which owns

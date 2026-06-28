@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! AF_VSOCK transport for enclave/microVM intelligence. RFC 0006 §transports.
 //! [feature: vsock]
 //!

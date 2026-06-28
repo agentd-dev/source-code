@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Horizontal scaling — sharding + autoscaling signals + the capacity surface
 //! (RFC 0019). [feature = "cluster"]
 //!

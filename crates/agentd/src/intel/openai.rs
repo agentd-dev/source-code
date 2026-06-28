@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! OpenAI-compatible `/chat/completions` adapter with native tool-calling.
 //! RFC 0006 §canonical-wire.
 //!

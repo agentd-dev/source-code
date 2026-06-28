@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Intelligence wire types — the **provider-neutral** representation the
 //! agentic loop reasons over. RFC 0006.
 //!

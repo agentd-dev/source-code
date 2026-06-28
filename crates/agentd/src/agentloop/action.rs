@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Self-tool dispatch. RFC 0005 §self-tools, RFC 0007.
 //!
 //! The agentic loop's tools come from connected MCP servers *plus* agentd's own

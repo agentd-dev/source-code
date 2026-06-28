@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The observe-to-validate E2E suite (M7, the operator ask): drive *real* agentd
 //! runs against the built-in mock LLM (+ mock MCP) and assert on the **observed**
 //! JSON-lines telemetry + outcome. This is the first end-to-end exercise of the

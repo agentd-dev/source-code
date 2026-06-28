@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Dead/stuck detection — the three-detector model + the EOF×pong classifier.
 //! RFC 0003 §dead-stuck.
 //!

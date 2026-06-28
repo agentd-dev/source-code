@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The self-orchestration handler: the `subagent.spawn` self-tool. RFC 0005
 //! §self-tools, RFC 0009 §nesting, RFC 0001 §self-orchestration.
 //!

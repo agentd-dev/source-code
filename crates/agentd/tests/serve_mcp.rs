@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Composability E2E: a peer drives agentd's served self-MCP. RFC 0005. Runs
 //! only under `cargo test --features serve-mcp`.
 #![cfg(all(unix, feature = "serve-mcp"))]

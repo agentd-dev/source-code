@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The public exit-code contract. RFC 0011 §5 — this is a stable,
 //! machine-actionable API (e.g. for a Kubernetes `podFailurePolicy`); treat
 //! changes as breaking.

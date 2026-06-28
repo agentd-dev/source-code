@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The ReAct agentic loop. RFC 0007.
 //!
 //! A turn: assemble the request (system + instruction + transcript + the

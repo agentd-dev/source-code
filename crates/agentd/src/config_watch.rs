@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The inotify file-watch reload trigger (RFC 0017 §5.2).
 //!
 //! A `--watch-config`-armed, dependency-free (raw `libc` inotify) watch that sets

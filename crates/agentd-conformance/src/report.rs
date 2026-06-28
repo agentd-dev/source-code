@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Aggregate result of a conformance run, with text + JSON renderings.
 
 use crate::{Category, Outcome};

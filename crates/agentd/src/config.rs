@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Configuration: precedence + validate-at-startup. RFC 0011 §2-§3.
 //!
 //! Precedence, top wins: `built-in default < env var < CLI flag`. Everything

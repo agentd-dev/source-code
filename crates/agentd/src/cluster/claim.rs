@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The work-claim / lease client — agentd's participant half of the cross-instance
 //! ownership convention (RFC 0019 §3; the `work.*` names + `_meta` keys are FROZEN
 //! in RFC 0015 §5.6). [feature = "cluster"]

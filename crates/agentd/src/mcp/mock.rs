@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! A minimal built-in MCP server, for tests and for operators kicking the
 //! tyres on reactive setups. Hidden mode: `agentd --internal-mock-mcp <uri>`.
 //!

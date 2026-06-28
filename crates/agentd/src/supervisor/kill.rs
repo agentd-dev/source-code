@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The bounded teardown ladder. RFC 0003 §kill-ladder.
 //!
 //! When a subtree must die (SIGTERM-to-agentd, a deadline/stuck verdict, or a

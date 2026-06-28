@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The work-claim / lease convention (RFC 0019 §3; the frozen `work.*` contract
 //! RFC 0015 §5.6). Two levels:
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Process-local counters → Prometheus text. RFC 0010 §metrics. [feature: metrics]
 //!
 //! Off the default path: the public `record_*` fns are **no-ops unless built

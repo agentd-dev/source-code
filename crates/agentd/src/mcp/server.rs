@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! agentd serving its own MCP over a unix socket — composability. RFC 0005. [feature: serve-mcp]
 //!
 //! A peer (another agentd, an MCP client, or a driving harness) `initialize`s

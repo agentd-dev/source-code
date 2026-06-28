@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The supervisor↔subagent control protocol. RFC 0005 §control-protocol,
 //! RFC 0009 §spawn-payload.
 //!

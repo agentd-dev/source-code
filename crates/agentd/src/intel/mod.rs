@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 pub mod anthropic;
 pub mod client;
 // RFC 0018 intelligence transport resilience — the endpoint list, per-endpoint

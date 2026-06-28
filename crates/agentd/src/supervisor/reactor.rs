@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The supervisor reactor — the single loop that owns the process tree.
 //! RFC 0002 §reactor, RFC 0003 §supervision.
 //!

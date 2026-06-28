@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Optional model discovery (capability-negotiated). RFC 0018 §5.4.
 //!
 //! agentd may learn what an endpoint serves via a tiny handshake — **off unless

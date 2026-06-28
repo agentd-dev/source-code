@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The conformance check families. Each module exposes `checks() -> Vec<Check>`.
 
 pub mod agent_loop;

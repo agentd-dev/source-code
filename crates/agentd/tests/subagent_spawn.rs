@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! End-to-end test of the supervisor↔subagent process plumbing (M2).
 //!
 //! Launches a *real* `agentd` subagent process (re-exec of the built binary),

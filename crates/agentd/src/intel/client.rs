@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Intelligence client — endpoint *list* selection + one round-trip. RFC 0006 + RFC 0018.
 //!
 //! The transport (unix / https / vsock) is chosen by each `AGENTD_INTELLIGENCE`

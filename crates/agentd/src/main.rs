@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! agentd entry point.
 //!
 //! Dispatches between three roles of the one binary: the **supervisor** (the

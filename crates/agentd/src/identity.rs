@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Instance identity from the Kubernetes downward API (RFC 0015 §6, RFC 0014 §6.4).
 //!
 //! agentd surfaces pod identity by reading **operator-injected environment

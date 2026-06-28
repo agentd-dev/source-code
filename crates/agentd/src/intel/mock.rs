@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! A minimal built-in mock LLM for the observe-to-validate E2E suite (M7).
 //! Hidden mode: `agentd --internal-mock-llm <socket> [script]`.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! SSRF classifier (RFC 0012 — security posture, §"SSRF guard").
 //!
 //! A *pure* address classifier plus a DNS-resolving host guard. The

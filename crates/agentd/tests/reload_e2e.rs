@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! E2E test of SIGHUP hot reload (RFC 0017 §5) — observe-to-validate.
 //!
 //! A real reactive agentd with a `--config` file must, on SIGHUP, re-read the

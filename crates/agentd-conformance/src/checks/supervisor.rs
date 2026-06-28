@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The supervisor contract: the documented exit-code table (RFC 0011 §5) and the
 //! SIGTERM graceful-drain choreography. Driven by running the real binary and
 //! observing the exit code.

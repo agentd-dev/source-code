@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Run-outcome reports — the machine-readable terminal-outcome object for a
 //! `once`/`loop`/`schedule`-bounded run (RFC 0016 §6). This is the structured
 //! backend for `kubectl agents results`: a `Job`'s pod is gone seconds after it

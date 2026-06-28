@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! W3C Trace Context propagation. RFC 0010 §context-propagation.
 //!
 //! **Propagation is default-on and dependency-free** — a `trace_id` shared

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Black-box conformance suite for the agentd runtime.
 //!
 //! The suite is a flat list of named [`Check`]s grouped into [`Category`]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The `agentd://` resource scheme — agentd exposing its own state as MCP
 //! resources. RFC 0004 §custom-scheme, RFC 0009 §async (completion-as-resource).
 //!

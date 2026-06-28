@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! MCP client over a stdio child process. RFC 0004.
 //!
 //! Spawns a server (`Command`), speaks newline-delimited JSON-RPC 2.0 over its

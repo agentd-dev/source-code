@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Two framings over a byte stream, sharing the JSON-RPC codec in the parent
 //! module (`crate::json`).
 //!

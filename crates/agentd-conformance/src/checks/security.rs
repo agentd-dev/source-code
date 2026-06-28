@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Security posture (RFC 0012): the Rule-of-Two lethal-trifecta refusal and its
 //! explicit override, plus secret redaction in telemetry.
 

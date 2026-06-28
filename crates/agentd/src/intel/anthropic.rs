@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Anthropic Messages API adapter. RFC 0006 §two-adapters.
 //!
 //! The second (and last) in-binary dialect. Pure translation, no I/O. Differs

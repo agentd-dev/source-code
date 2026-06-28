@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Child reaping + orphan discipline. RFC 0003 §pid1-orphan.
 //!
 //! Two responsibilities:

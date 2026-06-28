@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Restart governor — backoff + jitter + circuit breaker + crash-on-spawn.
 //! RFC 0003 §3.7; assessment §2.8 / §4 M2 ("a crash-looping child trips the
 //! breaker and is marked failed").

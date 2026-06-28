@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The failover decision — sticky-primary with bounded sweep. RFC 0018 §3.3.
 //!
 //! The client's `complete()` is wrapped: try the **active** endpoint; on a

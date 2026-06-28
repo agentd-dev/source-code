@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! 5-field UTC cron schedule — a standalone-mode convenience. RFC 0008. [feature: cron]
 //!
 //! Hand-rolled (no `croner` dep — the minimalism moat, rfcs/0002): a tiny parser

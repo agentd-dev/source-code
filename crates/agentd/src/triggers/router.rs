@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Reactive routing — the rule that turns MCP resource updates into runs.
 //! RFC 0008 §reactive-routing.
 //!

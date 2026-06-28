@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Health / liveness. RFC 0010 §health; RFC 0016 §10 (the fleet-liveness
 //! contract reading).
 //!

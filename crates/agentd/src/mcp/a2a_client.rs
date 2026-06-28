@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The A2A (Agent2Agent) **client** — agentd-as-A2A-client, the remote-A2A-agent
 //! delegation backend. RFC 0020 §3. [feature: a2a]
 //!

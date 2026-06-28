@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Execution-mode drivers. RFC 0008 §modes.
 //!
 //! `once` is `main::run_once` (spawn + supervise one root). This module hosts

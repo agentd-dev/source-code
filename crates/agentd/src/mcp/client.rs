@@ -142,8 +142,18 @@ impl McpClient {
     }
 
     /// MCP lifecycle handshake: `initialize` → store capabilities →
-    /// `notifications/initialized`.
+    /// `notifications/initialized`. Uses the default per-request timeout.
     pub fn initialize(&mut self) -> Result<(), McpError> {
+        self.initialize_within(self.timeout)
+    }
+
+    /// [`Self::initialize`] with a caller-supplied timeout for the `initialize`
+    /// round-trip (the SHORT management bound, RFC 0016 §10). Used by the
+    /// hot-reload re-handshake, which adds a server ON the reactor thread mid-loop:
+    /// a slow-but-alive added server must not block the reactor (and starve the
+    /// liveness heartbeat) for the full ~60s — a timeout is a contained
+    /// `mcp.connect.fail` (the server is simply absent, RFC 0007 / RFC 0017 §5.3).
+    pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities::default(),
@@ -153,7 +163,8 @@ impl McpClient {
                 title: None,
             },
         };
-        let result = self.request(method::INITIALIZE, Some(to_value(&params)))?;
+        let result =
+            self.request_with_timeout(method::INITIALIZE, Some(to_value(&params)), timeout)?;
         let init: InitializeResult = serde_json::from_value(result)
             .map_err(|e| McpError::Transport(format!("bad initialize result: {e}")))?;
         self.caps = init.capabilities;
@@ -162,8 +173,20 @@ impl McpClient {
     }
 
     /// `tools/list`, following cursor pagination to completion. Empty when the
-    /// server doesn't advertise `tools`.
+    /// server doesn't advertise `tools`. Uses the default per-request timeout.
     pub fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
+        self.list_tools_within(self.timeout)
+    }
+
+    /// `tools/list` with a caller-supplied per-request timeout (the SHORT
+    /// management bound, RFC 0016 §10) instead of the default ~60s. Used by the
+    /// reactor-thread management path (hot-reload re-handshake, claim coordination
+    /// re-validation) so a slow-but-alive coordination server cannot outrun the
+    /// liveness heartbeat. A timeout surfaces as the usual [`McpError::Timeout`],
+    /// which the callers already treat as a best-effort failure. The timeout is
+    /// applied to EACH page (each pagination round-trip is bounded), matching the
+    /// per-request contract of [`Self::request_with_timeout`].
+    pub fn list_tools_within(&self, timeout: Duration) -> Result<Vec<Tool>, McpError> {
         if !self.caps.supports_tools() {
             return Ok(Vec::new());
         }
@@ -171,7 +194,8 @@ impl McpClient {
         let mut cursor: Option<String> = None;
         loop {
             let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
-            let page: ListToolsResult = self.request_as(method::TOOLS_LIST, params)?;
+            let page: ListToolsResult =
+                self.request_as_within(method::TOOLS_LIST, params, timeout)?;
             tools.extend(page.tools);
             match page.next_cursor {
                 Some(c) => cursor = Some(c),
@@ -212,6 +236,24 @@ impl McpClient {
         arguments: Option<Value>,
         extra_meta: Value,
     ) -> Result<CallToolResult, McpError> {
+        self.call_tool_with_meta_within(name, arguments, extra_meta, self.timeout)
+    }
+
+    /// `tools/call` with per-call `_meta` AND a caller-supplied per-request
+    /// timeout (the SHORT management bound, RFC 0016 §10) instead of the default
+    /// ~60s. Used by the reactor-thread lease management path (claim
+    /// renew/ack/release) — a slow coordination server must not block the reactor
+    /// past the liveness staleness window. Behaviour is otherwise identical to
+    /// [`Self::call_tool_with_meta`]; a timeout surfaces as [`McpError::Timeout`],
+    /// which the lease callers already treat as a best-effort failure. The data
+    /// path (subagent tool calls) never uses this — it keeps the default timeout.
+    pub fn call_tool_with_meta_within(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        extra_meta: Value,
+        timeout: Duration,
+    ) -> Result<CallToolResult, McpError> {
         if !self.caps.supports_tools() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no tools",
@@ -220,7 +262,7 @@ impl McpClient {
         }
         let merged = merge_meta(self.tool_meta.as_ref(), extra_meta);
         let params = build_call_params(name, arguments, Some(&merged));
-        self.request_as(method::TOOLS_CALL, Some(params))
+        self.request_as_within(method::TOOLS_CALL, Some(params), timeout)
     }
 
     pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
@@ -242,31 +284,63 @@ impl McpClient {
     }
 
     pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+        self.read_resource_within(uri, self.timeout)
+    }
+
+    /// `resources/read` with a caller-supplied per-request timeout (the SHORT
+    /// management bound, RFC 0016 §10) instead of the default ~60s. The reactor
+    /// thread's notify-then-read (`read_current`) blocks on this; a slow-but-alive
+    /// resource server must not outrun the liveness heartbeat. A timeout surfaces
+    /// as [`McpError::Timeout`]; the level-triggered reactor treats a timed-out
+    /// read exactly like any read failure (act on empty / skip), so a transient
+    /// slow read is recovered on the next `updated` notification or re-read.
+    pub fn read_resource_within(
+        &self,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<ReadResourceResult, McpError> {
         let params = ReadResourceParams {
             uri: uri.to_string(),
         };
-        self.request_as(method::RESOURCES_READ, Some(to_value(&params)))
+        self.request_as_within(method::RESOURCES_READ, Some(to_value(&params)), timeout)
     }
 
     /// `resources/subscribe` — gated on the server advertising it (RFC 0004).
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
+        self.subscribe_within(uri, self.timeout)
+    }
+
+    /// [`Self::subscribe`] with a caller-supplied timeout (the SHORT management
+    /// bound, RFC 0016 §10) — for the reactor-thread reload re-handshake, where a
+    /// slow-but-alive server arming a subscription must not block the reactor.
+    pub fn subscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
         if !self.caps.supports_subscribe() {
             return Err(McpError::Capability(format!(
                 "server '{}' does not support resource subscriptions",
                 self.name
             )));
         }
-        self.request(
+        self.request_with_timeout(
             method::RESOURCES_SUBSCRIBE,
             Some(to_value(&SubscribeParams { uri: uri.into() })),
+            timeout,
         )?;
         Ok(())
     }
 
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
-        self.request(
+        self.unsubscribe_within(uri, self.timeout)
+    }
+
+    /// [`Self::unsubscribe`] with a caller-supplied timeout (the SHORT management
+    /// bound, RFC 0016 §10) — for the reactor-thread reload reconcile + the drain
+    /// unsubscribe, both best-effort: a slow server here must not block the reactor
+    /// or the drain past the liveness window / drain budget.
+    pub fn unsubscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
+        self.request_with_timeout(
             method::RESOURCES_UNSUBSCRIBE,
             Some(to_value(&SubscribeParams { uri: uri.into() })),
+            timeout,
         )?;
         Ok(())
     }
@@ -286,12 +360,30 @@ impl McpClient {
         method: &str,
         params: Option<Value>,
     ) -> Result<T, McpError> {
-        let v = self.request(method, params)?;
+        self.request_as_within(method, params, self.timeout)
+    }
+
+    fn request_as_within<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<T, McpError> {
+        let v = self.request_with_timeout(method, params, timeout)?;
         serde_json::from_value(v)
             .map_err(|e| McpError::Transport(format!("bad {method} result: {e}")))
     }
 
-    fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
+    /// Send one JSON-RPC request and block up to `timeout` for the matching
+    /// response. The default-timeout `request` delegates here with `self.timeout`;
+    /// the reactor-thread management path passes the SHORT bound (RFC 0016 §10) so
+    /// a slow-but-alive server cannot block the reactor past the liveness window.
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, McpError> {
         // Fail FAST if the reader thread has already exited (the server's stdout
         // hit EOF / a read error). Without this, a request after the reader is gone
         // registers a pending sender nothing will ever resolve, so `recv_timeout`
@@ -314,7 +406,7 @@ impl McpClient {
             return Err(McpError::Transport(e.to_string()));
         }
 
-        match rx.recv_timeout(self.timeout) {
+        match rx.recv_timeout(timeout) {
             Ok(resp) => match resp.error {
                 Some(err) => Err(McpError::Rpc(err)),
                 None => Ok(resp.result.unwrap_or(Value::Null)),
@@ -499,6 +591,73 @@ mod tests {
     fn error_display() {
         let e = McpError::Timeout("tools/call on 'fs'".into());
         assert!(e.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn management_timeout_bounds_a_call_on_a_non_responding_server() {
+        // A server that is ALIVE but never replies: `sleep` reads nothing and
+        // writes nothing, so its stdout never produces a frame, the reader thread
+        // stays blocked on the read (alive — so the fast-fail-on-dead-reader path
+        // does NOT trip), and a request blocks until its per-request timeout. We
+        // spawn with the DEFAULT 60s timeout but issue the request with the SHORT
+        // management bound, proving the per-call timeout — not the default —
+        // governs: the call returns ~200ms even though the default is 60s.
+        let mut client = McpClient::spawn(
+            "hung",
+            &["sleep".to_string(), "3600".to_string()],
+            Duration::from_secs(60),
+        )
+        .expect("spawn the hung server");
+
+        let short = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let r = client.request_with_timeout("ping", None, short);
+        let elapsed = started.elapsed();
+
+        match r {
+            Err(McpError::Timeout(_)) => {}
+            other => panic!("expected a Timeout within the short bound, got {other:?}"),
+        }
+        // Returned within the short bound (generous slack for CI), NOT the 60s
+        // default. If the default had governed this would be ~60s.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the short per-call timeout must govern, not the 60s default (took {elapsed:?})"
+        );
+        // The public management entry points thread the same short bound through.
+        // `initialize_within` issues a real request, so it also times out fast.
+        let started = std::time::Instant::now();
+        let r = client.initialize_within(short);
+        assert!(
+            matches!(r, Err(McpError::Timeout(_))),
+            "initialize_within must honour the short bound: {r:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "initialize_within must return within the short bound"
+        );
+    }
+
+    #[test]
+    fn management_timeout_const_is_under_the_liveness_window() {
+        // The pinned invariant (RFC 0016 §10): the reactor-thread management-call
+        // timeout MUST stay under the `/healthz` + health-file liveness staleness
+        // window, or a single management call could itself age the heartbeat past
+        // the threshold — the starvation the short bound exists to prevent. The
+        // authority is the compile-time `const _: () = assert!(...)` in `obs::health`
+        // (it fails the BUILD if the invariant is broken); this test documents the
+        // relationship where a reader of the client sees it, via the runtime
+        // `Duration` accessor (not a const-foldable comparison).
+        let mgmt = crate::obs::health::management_timeout();
+        let window = Duration::from_millis(crate::obs::health::LIVENESS_STALE_AFTER_MS);
+        assert!(
+            mgmt < window,
+            "management timeout {mgmt:?} must be under the liveness window {window:?}"
+        );
+        assert_eq!(
+            mgmt,
+            Duration::from_millis(crate::obs::health::MANAGEMENT_TIMEOUT_MS),
+        );
     }
 
     #[test]

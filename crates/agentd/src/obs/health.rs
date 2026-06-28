@@ -34,6 +34,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The liveness staleness window (ms): a supervisor tick older than this reads
+/// unhealthy on `/healthz` and in the `--health-file` (`alive:false`), so k8s
+/// SIGKILLs the pod (RFC 0016 §10). The single source of truth for the window —
+/// `obs::serve`'s `/healthz` and the `--health-file` writer both read it, and the
+/// reactor-thread MANAGEMENT timeout below is sized strictly under it.
+pub const LIVENESS_STALE_AFTER_MS: u64 = 5_000;
+
+/// The SHORT per-request timeout (ms) for reactor-thread MANAGEMENT calls — the
+/// hot-reload re-handshake (`list_tools`), the claim lease calls (renew / ack /
+/// release / the coordination re-validation), the drain step-1.5 release, and the
+/// reactor's notify-then-read (`read_resource`). It is deliberately FAR under the
+/// liveness window ([`LIVENESS_STALE_AFTER_MS`]): a slow-but-alive coordination /
+/// resource server blocks the single reactor thread for at most this long, so a
+/// management call can never starve the heartbeat past the staleness window and
+/// get a healthy daemon SIGKILLed (audit Finding 1), nor blow the drain budget
+/// (audit Finding 2). The data path (subagent tool calls, `resources/read` on the
+/// agentloop) keeps the default ~60s — only the reactor MANAGEMENT path is bounded.
+pub const MANAGEMENT_TIMEOUT_MS: u64 = 2_000;
+
+/// The reactor-thread management-call timeout as a [`Duration`].
+pub const fn management_timeout() -> Duration {
+    Duration::from_millis(MANAGEMENT_TIMEOUT_MS)
+}
+
+// The management timeout MUST stay strictly under the liveness window, or a single
+// management call could itself age the heartbeat past the staleness threshold —
+// the exact starvation the short bound exists to prevent (RFC 0016 §10). Pin the
+// invariant at compile time so a later edit to either constant can't silently
+// break it (a generous 2x margin leaves room for a couple of back-to-back calls
+// between ticks; the per-block `health::tick()` insurance covers longer runs).
+const _: () = assert!(
+    MANAGEMENT_TIMEOUT_MS * 2 <= LIVENESS_STALE_AFTER_MS,
+    "management call timeout must be well under the liveness staleness window"
+);
+
 /// Last time a supervisor loop proved progress (ms since epoch). Bumped from
 /// every hot loop; read by the writer thread. Cheap (one relaxed store).
 static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);

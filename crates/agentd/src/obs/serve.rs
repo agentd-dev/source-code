@@ -22,8 +22,11 @@ use std::thread;
 use std::time::Duration;
 
 /// Liveness window for `/healthz`: a supervisor tick older than this — i.e. the
-/// reactor loop has not made progress recently — reads unhealthy.
-const STALE_AFTER_MS: u64 = 5_000;
+/// reactor loop has not made progress recently — reads unhealthy. The single
+/// source of truth lives in `obs::health` (shared with the `--health-file` writer
+/// and asserted to exceed the reactor-thread management-call timeout, RFC 0016
+/// §10), so a reactor management call can never outrun this window.
+const STALE_AFTER_MS: u64 = crate::obs::health::LIVENESS_STALE_AFTER_MS;
 
 /// Bind `addr` and serve probes on a background thread. Returns the bind error
 /// (so the caller decides whether a failed bind is fatal). Accepts the bare

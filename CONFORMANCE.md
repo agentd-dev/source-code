@@ -22,7 +22,8 @@ deferred.
 | `cargo test -p agentd` (default features) | **406 passed / 0 failed** |
 | Black-box conformance suite (`cargo run -p agentd-conformance`) | **38 passed / 0 failed** |
 | ACC schema+behavior harness (drives the real binary; see *Validation report*) | **22 passed / 0 failed** |
-| Golden `--capabilities` fixtures vs `manifest.schema.json` | **4 / 4 valid** |
+| Golden `--capabilities` fixtures vs `manifest.schema.json` (all 4, agentctl-owned) | **4 / 4 valid** |
+| agentctl `agent-contract-client` fixture tests | **6 / 6 pass** (cross-repo consistency) |
 | `cargo clippy --all-targets -D warnings` (default + full) | clean |
 
 Hard invariants preserved: the manifest is built `json!`→`Value` (the `Secret`
@@ -89,26 +90,35 @@ PY
 done
 ```
 
-## Golden fixtures (regenerated from v2.8.1)
+## Golden fixtures (agentctl-owned; conformance proven by the live binary)
 
-`fixtures/capabilities/default.json` and `full-features.json` were re-captured from
-the current binary's `--capabilities` and validate against `manifest.schema.json`.
-Together they exercise **both branches of every capturable sum-type surface key**:
+The golden corpus in `contract/fixtures/capabilities/` is **owned by the agentctl
+contract repo** and pinned by its `agent-contract-client` fixture tests
+(`tests/fixtures.rs`), which assert exact content — `default.json` `version ==
+"2.5.0"` and `surfaces.claim` as an object, plus the `full-features.json` surface
+values. They remain the **real `--capabilities` captures from agentd 2.5.0** and
+all four validate against the *current* `manifest.schema.json`.
 
-| sum-type key | `default.json` (release, surfaces off) | `full-features.json` (debug, surfaces on) |
-|---|---|---|
-| `surfaces.management` | `false` | `"vsock:7000"` |
-| `surfaces.metrics` | `false` | `"127.0.0.1:9090"` |
-| `surfaces.a2a` | `false` | object |
-| `surfaces.claim` | **omitted** | object |
-| `surfaces.shard` | `null` | `"0/3"` |
-| `surfaces.events_schema` | omitted | `"1.0"` |
-| `agent_version` / `agentd_version` | both present | both present |
+The current binary's `--capabilities` is a **superset** of the 2.5.0 capture
+(it adds the additive `agent_version`, `surfaces.events_schema`, and
+`intelligence.discovery`/`models`) and is validated **live** against
+`manifest.schema.json` — that live validation, plus the behavioral suites, is the
+authoritative conformance proof, not a static fixture. Both sum-type branches of
+every capturable key are covered: the off/null branches by `default` +
+`minimal-degraded`, the string/object branches by `full-features` + `reference-full`.
 
-The two synthetic fixtures (`reference-full.json`, `minimal-degraded.json`) are
-untouched. `intelligence.healthy` is `"unknown"` in both real captures — its
-boolean branch is reachable only on the live resource after a connection (the
-one-shot probe is network-free admission, ACC SPEC §3); it is unit-tested there.
+> **Re-capture is a coordinated agentctl-side change, intentionally not forced
+> here.** Regenerating `default.json`/`full-features.json` from the v2.8.1 binary
+> was attempted (deliverable #2) but reverted by the contract owner, because the
+> capture would move `version` 2.5.0→2.8.1 and `default.json`'s `claim` from object
+> to *omitted* (a bare release build has no `cluster` feature), breaking the pinned
+> `fixtures.rs` assertions. Since the agentctl repo owns the fixtures **and** their
+> tests, re-capturing must move both in lockstep there; the regenerated v2.8.1
+> captures are available for adoption. Forcing them from agentd would make the two
+> repos inconsistent (a failing agentctl test), so they are deliberately left to
+> the owner. `intelligence.healthy` stays `"unknown"` in any one-shot capture (the
+> probe is network-free admission, ACC SPEC §3) — its boolean branch is reachable
+> only on the live resource and is unit-tested there.
 
 ## Gaps closed in this pass
 
@@ -155,7 +165,7 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
 | Ask | Disposition |
 |---|---|
 | **CC/P6** — manifest/config as consumable schemas; `--config-schema`/`--validate-config` round-trip | **RESOLVED.** Draft-2020-12 closed `--config-schema`; `--validate-config` 0/2; drift tests pin it to the struct + `contract_version`. |
-| **P3b** — versioned golden corpus per feature-set | **RESOLVED for the two real captures** (default = off/omitted/null branches; full = string/object branches; both validate). A broader per-feature matrix keyed by `(major.minor + digest)` remains a downstream corpus task. |
+| **P3b** — versioned golden corpus per feature-set | **PARTIAL (owner-pinned).** The four-fixture corpus exists and validates against the current schema, exercising both branches of every capturable sum-type. The corpus is agentctl-owned and currently pinned to the 2.5.0 captures by `fixtures.rs`; a broader per-feature matrix keyed by `(major.minor + digest)`, and re-capture to the current version, are coordinated agentctl-side tasks (see *Golden fixtures*). |
 | **P2** — freeze A2A wire strings + `surfaces.a2a` | **RESOLVED (reference binding).** `surfaces.a2a` emitted; reference PascalCase `a2a.*` served. Normative spelling stays open per the contract; a gateway translates. |
 | **P10** — reconcile autoscaling metric names | **RESOLVED (source wins).** Only `agent_pending_events` emitted; `agent_reactive_backlog` an alias-only, never on the scrape; `agent_tokens_per_sec`/`agent_intelligence_latency_ms` stay provisional/not-emitted. |
 | **P-pause** — pause/resume served | **RESOLVED.** Both ship (frozen order), Management-gated, reflected in `agent_paused`. |

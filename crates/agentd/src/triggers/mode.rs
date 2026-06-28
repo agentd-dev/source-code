@@ -109,11 +109,11 @@ fn claim_meta(cfg: &Config, claim_key: &str) -> Value {
 /// reflects the reload) and pushes `resources/updated` to subscribers. It is
 /// `None` when `--serve-mcp` is not configured, and is only acted on with the
 /// `hot-reload` feature — so without serve-mcp or without hot-reload it is inert.
+// `not(hot-reload)` already covers the serve-mcp-without-hot-reload case (where
+// `live_config` is the unused param), so a single attr suffices — a second
+// `all(serve-mcp, not(hot-reload))` attr would be a clippy::duplicated-attributes
+// in the `a2a` (serve-mcp, no hot-reload) combo.
 #[cfg_attr(not(feature = "hot-reload"), allow(unused_variables))]
-#[cfg_attr(
-    all(feature = "serve-mcp", not(feature = "hot-reload")),
-    allow(unused_variables)
-)]
 pub fn run_reactive(
     exe: PathBuf,
     base: SpawnPayload,

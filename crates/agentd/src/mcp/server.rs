@@ -449,7 +449,21 @@ pub struct ServeCtx {
     /// the file (§6.3). The driver publishes it through [`ServeHandle::publish_report`]
     /// at the terminal transition. Arc-shared so the read borrows it cheaply.
     report: Arc<Mutex<Option<Value>>>,
+    /// RFC 0018 §5.4 lazy + cached model discovery. `None` until the served
+    /// `agentd://intelligence` / live `agentd://capabilities` surface is FIRST
+    /// read; then the probe runs, the result is cached with a read `Instant`, and
+    /// is reused for [`DISCOVERY_TTL`]. NEVER probed at startup before validation
+    /// (RFC 0011 §3.3 — it is a network call); the probe runs only on a served
+    /// read, off the hot path, and degrades silently (§5.4). Arc-shared so the
+    /// per-read borrow is cheap; the `Instant` keys staleness for the refresh.
+    discovery_cache: Arc<Mutex<Option<(Instant, crate::intel::discovery::DiscoveryResult)>>>,
 }
+
+/// RFC 0018 §5.4 discovery-cache TTL: a served `agentd://intelligence` /
+/// `agentd://capabilities` read older than this re-probes; within it, the cached
+/// model set is reused (the reads are operator-driven + infrequent, so a small
+/// TTL keeps the additive field fresh without re-probing on every read).
+const DISCOVERY_TTL: Duration = Duration::from_secs(60);
 
 impl ServeCtx {
     pub fn new(
@@ -489,6 +503,7 @@ impl ServeCtx {
             config,
             live_config,
             report: Arc::new(Mutex::new(None)),
+            discovery_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -517,7 +532,25 @@ impl ServeCtx {
         // resource, so they never drift (RFC 0015 §5.2). Identity is env-only and
         // cheap, so build it per read rather than threading it through ServeCtx.
         let identity = crate::identity::Identity::from_env(&self.run_id);
-        crate::capabilities::manifest(&self.config, &identity, true)
+        let mut manifest = crate::capabilities::manifest(&self.config, &identity, true);
+        // RFC 0018 §5.4: overlay the LIVE discovery probe onto the manifest's
+        // `intelligence.models`. The one-shot `--capabilities` (live=false) is
+        // network-free and skips this (RFC 0015 §5.2 side-effect-free admission);
+        // only this served read probes — lazily + cached, off the hot path. Read
+        // the LIVE (post-reload) intelligence config so a hot-swap is reflected.
+        let cfg = self.live_config.current();
+        let uri = cfg.intelligence.as_deref().unwrap_or_default();
+        if let Ok(list) =
+            crate::intel::endpoints::EndpointList::parse(uri, cfg.intelligence_token.clone())
+        {
+            let disc = self.discovery(&list, cfg.model.as_deref());
+            crate::capabilities::intelligence_discovery_overlay(
+                &mut manifest,
+                disc.discovery,
+                &disc.models,
+            );
+        }
+        manifest
     }
 
     /// This agentd's own run/health state — the single source of truth for both
@@ -639,6 +672,13 @@ impl ServeCtx {
                 // The active swap policy (§4.4 / §5) — non-secret, read on demand.
                 if let Value::Object(m) = &mut body {
                     m.insert("swap_policy".into(), json!(cfg.model_swap.as_str()));
+                    // RFC 0018 §5.4: the discovery surface — `discovery` (did any
+                    // endpoint answer /v1/models) + `models` (union of discovered +
+                    // configured). Lazy + cached (probed only on THIS read, off the
+                    // hot path), silent-degrade. `[]`/false if none discovered.
+                    let disc = self.discovery(&list, cfg.model.as_deref());
+                    m.insert("discovery".into(), json!(disc.discovery));
+                    m.insert("models".into(), json!(disc.models));
                 }
                 body
             }
@@ -646,6 +686,40 @@ impl ServeCtx {
             // validated it) degrades to an empty, honest body rather than erroring.
             Err(_) => json!({ "active": 0, "all_down": true, "endpoints": [] }),
         }
+    }
+
+    /// RFC 0018 §5.4 lazy + cached model discovery for the served surfaces. On a
+    /// fresh (`None`) or stale (older than [`DISCOVERY_TTL`]) cache, run the
+    /// best-effort probe over the endpoint `list` (each OpenAI-compatible endpoint
+    /// gets one `GET /v1/models` over the existing transport; anthropic → none),
+    /// cache it with the read `Instant`, and return it; otherwise reuse the cache.
+    ///
+    /// This is the ONLY caller of the probe. It runs supervisor-side, exclusively
+    /// on a served `agentd://intelligence` / live `agentd://capabilities` read —
+    /// NEVER at startup before validation (RFC 0011 §3.3), NEVER on the hot path.
+    /// The probe degrades silently (§5.4): a 404 / connection / non-JSON yields no
+    /// models + `discovery:false`, never fatal, never a failover-class error.
+    fn discovery(
+        &self,
+        list: &crate::intel::endpoints::EndpointList,
+        model: Option<&str>,
+    ) -> crate::intel::discovery::DiscoveryResult {
+        let mut cache = self
+            .discovery_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, result)) = cache.as_ref()
+            && at.elapsed() < DISCOVERY_TTL
+        {
+            return result.clone();
+        }
+        let result = crate::intel::discovery::discover(
+            list,
+            model,
+            crate::intel::discovery::DEFAULT_TIMEOUT,
+        );
+        *cache = Some((Instant::now(), result.clone()));
+        result
     }
 
     /// The `agentd://capacity` body (RFC 0019 §7.2/§9): this instance's placement
@@ -4378,6 +4452,77 @@ mod tests {
             &log(),
         );
         assert!(denied.error.is_some(), "stdio intelligence read is refused");
+    }
+
+    // --- RFC 0018 §5.4 model discovery on the served surfaces ----------------
+
+    #[test]
+    fn intelligence_body_carries_discovery_surface_and_degrades_silently() {
+        // The endpoints (vsock unsupported in this build / a dead unix path) are
+        // unreachable, so the lazy probe degrades silently: `discovery:false`, and
+        // `models` holds only the configured model (always usable, §5.4). Never an
+        // error, never fatal — the body is otherwise the normal §4.4 view.
+        let ctx = ctx_multi_endpoint();
+        let body = ctx.intelligence_body();
+        assert_eq!(body["discovery"], json!(false), "no endpoint answered");
+        assert_eq!(
+            body["models"],
+            json!(["claude-opus-4"]),
+            "configured model is the union when none discovered"
+        );
+        // The rest of the §4.4 body is intact alongside the additive fields.
+        assert_eq!(body["active"], 0);
+        assert_eq!(body["model"], "claude-opus-4");
+    }
+
+    #[test]
+    fn discovery_probe_is_cached_within_ttl() {
+        // Two reads in quick succession must reuse the cached probe (one probe,
+        // not two) — the cache is populated on the FIRST read, reused under the
+        // TTL. We assert identity of the result rather than timing.
+        let ctx = ctx_multi_endpoint();
+        let first = ctx.intelligence_body();
+        let second = ctx.intelligence_body();
+        assert_eq!(first["discovery"], second["discovery"]);
+        assert_eq!(first["models"], second["models"]);
+        // The cache is populated (the first read primed it).
+        let cache = ctx.discovery_cache.lock().unwrap();
+        assert!(
+            cache.is_some(),
+            "first served read primed the discovery cache"
+        );
+    }
+
+    #[test]
+    fn capabilities_intelligence_carries_discovery_on_the_served_read() {
+        // The LIVE served `agentd://capabilities` overlays the (degraded) probe
+        // onto `intelligence.models` — additive, RFC 0018 §5.4.
+        let ctx = ctx_multi_endpoint();
+        let body = ctx.capabilities_body();
+        assert_eq!(body["intelligence"]["discovery"], json!(false));
+        assert_eq!(body["intelligence"]["models"], json!(["claude-opus-4"]));
+        // The structural fields the manifest already carried are untouched.
+        assert_eq!(body["intelligence"]["endpoints"], json!(2));
+        assert_eq!(body["intelligence"]["transport"], json!("vsock"));
+    }
+
+    #[test]
+    fn one_shot_capabilities_is_network_free_and_does_not_probe() {
+        // RFC 0015 §5.2: the one-shot `--capabilities` manifest (`live=false`) is
+        // side-effect-free admission — it must NOT probe the network. The
+        // discovery field is the network-free baseline: `discovery:false`, `models`
+        // is the configured model only, and the cache stays EMPTY (no probe ran).
+        let ctx = ctx_multi_endpoint();
+        let identity = crate::identity::Identity::from_env("r1");
+        let manifest = crate::capabilities::manifest(&ctx.config, &identity, false);
+        assert_eq!(manifest["intelligence"]["discovery"], json!(false));
+        assert_eq!(manifest["intelligence"]["models"], json!(["claude-opus-4"]));
+        // The one-shot path never touched the supervisor discovery cache.
+        let cache = ctx.discovery_cache.lock().unwrap();
+        assert!(
+            cache.is_none(),
+            "the one-shot --capabilities manifest must not probe (cache empty)"
+        );
     }
 
     #[test]

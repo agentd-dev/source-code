@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The bounded teardown ladder. RFC 0003 §kill-ladder.
 //!
 //! When a subtree must die (SIGTERM-to-agentd, a deadline/stuck verdict, or a

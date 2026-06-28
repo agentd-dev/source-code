@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Unix-domain-socket transport. RFC 0006 §transports.
 //!
 //! The common same-pod case: a model gateway (or an MCP server) listening on

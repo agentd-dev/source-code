@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The inotify file-watch reload trigger (RFC 0017 §5.2).
 //!
 //! A `--watch-config`-armed, dependency-free (raw `libc` inotify) watch that sets

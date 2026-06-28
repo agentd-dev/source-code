@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Observability. The default build ships three dependency-free things: a
 //! hand-rolled JSON-lines logger to stderr, a tiny health surface, and W3C
 //! trace-context propagation. Only the heavier surfaces (metrics, OTLP export)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Transports. One hand-rolled HTTP/1.1 client over `Read + Write` (the single
 //! highest-leverage minimalism decision — avoids the url→IDNA→ICU and
 //! async-runtime taxes), plus unix-socket and the feature-gated tls/vsock

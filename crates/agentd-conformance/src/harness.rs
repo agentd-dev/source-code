@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The black-box harness: locate + build the real `agentd` binary, then drive it
 //! as a peer would — a served-MCP JSON-RPC client, a once-mode runner, the mock
 //! LLM / mock MCP helpers — with no link against the agentd library.

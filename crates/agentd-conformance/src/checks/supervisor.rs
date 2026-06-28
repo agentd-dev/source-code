@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The supervisor contract: the documented exit-code table (RFC 0011 §5) and the
 //! SIGTERM graceful-drain choreography. Driven by running the real binary and
 //! observing the exit code.

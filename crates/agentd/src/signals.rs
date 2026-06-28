@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Signal handling + the self-pipe wakeup. RFC 0003 §signals, RFC 0011 §signals.
 //!
 //! Handlers are async-signal-safe — they only touch atomics and `write()` one

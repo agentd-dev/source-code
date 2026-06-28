@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Opt-in HTTP probe/scrape surface: `/metrics` + `/healthz` + `/readyz`.
 //! RFC 0010 §health + §metrics; RFC 0016 §10 (fleet liveness). [feature: metrics]
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 pub mod client;
 // Built-in mock MCP server (the hidden `--internal-mock-mcp` mode) for the test
 // + conformance suites. In debug it's always present (so `cargo test` works with

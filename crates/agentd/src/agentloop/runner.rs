@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The ReAct agentic loop. RFC 0007.
 //!
 //! A turn: assemble the request (system + instruction + transcript + the

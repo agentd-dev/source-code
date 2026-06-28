@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared JSON-RPC 2.0 codec.
 //!
 //! One set of wire types serves three surfaces: the MCP client (to external

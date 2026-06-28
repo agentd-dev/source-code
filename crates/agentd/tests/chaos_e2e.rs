@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Chaos / reliability E2E (M7): prove a supervision guarantee by observing a
 //! real process tree under failure — **the tree leaks no process**. RFC 0003.
 //!

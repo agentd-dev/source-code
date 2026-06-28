@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Horizontal scaling — sharding + autoscaling signals + the capacity surface
 //! (RFC 0019). [feature = "cluster"]
 //!

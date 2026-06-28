@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Warm continue-session E2E (M3): a `Disposition::Continue` route delivers
 //! every event into ONE live warm subagent — the first event spawns the session,
 //! each later event injects into the SAME live process (no re-spawn), and the

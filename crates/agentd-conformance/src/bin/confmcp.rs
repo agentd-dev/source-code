@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `confmcp <record-file> [resource-uri]` — a minimal, spec-correct MCP server
 //! that agentd connects to as a client, used by the MCP-client conformance
 //! family. It speaks stdio NDJSON JSON-RPC, answers the handshake + discovery +

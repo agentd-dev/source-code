@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Intelligence wire types — the **provider-neutral** representation the
 //! agentic loop reasons over. RFC 0006.
 //!

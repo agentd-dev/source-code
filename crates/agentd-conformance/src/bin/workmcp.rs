@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `workmcp <state-file> [item-uri]` — a minimal, spec-correct MCP server that
 //! serves the FROZEN `work.*` coordination contract (RFC 0015 §5.6) with
 //! **atomic single-grant** lease semantics, so the cross-instance claim

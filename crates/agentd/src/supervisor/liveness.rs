@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Dead/stuck detection — the three-detector model + the EOF×pong classifier.
 //! RFC 0003 §dead-stuck.
 //!

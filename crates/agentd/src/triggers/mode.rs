@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Execution-mode drivers. RFC 0008 §modes.
 //!
 //! `once` is `main::run_once` (spawn + supervise one root). This module hosts

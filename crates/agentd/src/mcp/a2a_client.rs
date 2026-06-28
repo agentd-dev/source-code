@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The A2A (Agent2Agent) **client** — agentd-as-A2A-client, the remote-A2A-agent
 //! delegation backend. RFC 0020 §3. [feature: a2a]
 //!

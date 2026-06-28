@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `agentd://` resource scheme — agentd exposing its own state as MCP
 //! resources. RFC 0004 §custom-scheme, RFC 0009 §async (completion-as-resource).
 //!

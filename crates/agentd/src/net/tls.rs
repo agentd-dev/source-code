@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! TLS client wiring for `https://` intelligence/MCP. RFC 0006 §transports.
 //! [feature: tls]
 //!

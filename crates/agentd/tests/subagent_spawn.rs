@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end test of the supervisor↔subagent process plumbing (M2).
 //!
 //! Launches a *real* `agentd` subagent process (re-exec of the built binary),

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! agentd as an MCP **client**: the requests it sends a backing server during
 //! the handshake + discovery + subscribe. A `confmcp` reference server records
 //! every request agentd makes; the checks assert the client side of the spec.

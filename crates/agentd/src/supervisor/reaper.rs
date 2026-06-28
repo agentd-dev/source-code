@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The process-global child reaper. RFC 0003 §pid1-orphan.
 //!
 //! `waitpid(-1)` is process-global — it reaps *any* child (including

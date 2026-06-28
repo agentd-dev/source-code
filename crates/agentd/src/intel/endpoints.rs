@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The intelligence endpoint *list* and per-endpoint credentials. RFC 0018 §3.1/§3.2.
 //!
 //! `--intelligence` / `AGENTD_INTELLIGENCE` is an **ordered, comma-separated

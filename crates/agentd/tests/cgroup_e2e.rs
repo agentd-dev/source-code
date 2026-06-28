@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Black-box test of the opt-in cgroup-v2 active enforcement (`--cgroup auto`):
 //! a once-mode run arms a per-run child cgroup, places its root subagent there,
 //! completes normally, and removes the cgroup on the way out. The atomic

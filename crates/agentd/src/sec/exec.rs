@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The gated `exec` self-tool — the one non-MCP capability. RFC 0005 §exec,
 //! RFC 0012 §exec.
 //!

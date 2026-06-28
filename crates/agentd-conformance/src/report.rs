@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Aggregate result of a conformance run, with text + JSON renderings.
 
 use crate::{Category, Outcome};

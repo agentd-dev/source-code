@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! File-based secret refs (RFC 0017 §6, riding RFC 0006 §6 / RFC 0012 §3.7).
 //!
 //! Secrets are env/file only — **never** in the config file, **never** logged

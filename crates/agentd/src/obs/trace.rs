@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! W3C Trace Context propagation. RFC 0010 §context-propagation.
 //!
 //! **Propagation is default-on and dependency-free** — a `trace_id` shared

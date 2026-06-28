@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Spawning a subagent process. RFC 0009 §re-exec, RFC 0003 §process-group.
 //!
 //! A subagent is the **same binary re-exec'd** with `AGENTD_SUBAGENT` set, so

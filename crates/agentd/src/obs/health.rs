@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Health / liveness. RFC 0010 §health; RFC 0016 §10 (the fleet-liveness
 //! contract reading).
 //!

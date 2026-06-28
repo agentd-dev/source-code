@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The conformance suite as `cargo test`: one test per family, each running its
 //! checks against a freshly-built agentd and asserting every check passes. The
 //! same checks back the `agentd-conformance` runner binary.

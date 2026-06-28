@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Capability scoping — the granted MCP subset, interpreted as a Rule-of-Two
 //! trust budget. RFC 0012 §capability-scoping.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! AF_VSOCK transport for enclave/microVM intelligence. RFC 0006 §transports.
 //! [feature: vsock]
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Security posture (RFC 0012): the Rule-of-Two lethal-trifecta refusal and its
 //! explicit override, plus secret redaction in telemetry.
 

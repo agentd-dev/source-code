@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Two framings over a byte stream, sharing the JSON-RPC codec in the parent
 //! module (`crate::json`).
 //!

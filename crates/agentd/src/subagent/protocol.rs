@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The supervisor↔subagent control protocol. RFC 0005 §control-protocol,
 //! RFC 0009 §spawn-payload.
 //!

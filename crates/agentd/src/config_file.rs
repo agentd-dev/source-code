@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The declarative config **file** (RFC 0017 §3) + its JSON Schema (§4.2).
 //!
 //! A single **JSON** document (NOT YAML — `serde_yaml` is a dependency the

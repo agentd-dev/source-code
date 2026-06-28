@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The capabilities manifest — the shared spine of the agentctl control-plane
 //! track (RFC 0015 §5.2, RFC 0014 §5). One builder feeds two surfaces (the
 //! one-shot `agentd --capabilities` and, later, the live `agentd://capabilities`

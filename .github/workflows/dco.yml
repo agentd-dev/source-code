@@ -1,0 +1,36 @@
+name: DCO
+
+# Enforces a Developer Certificate of Origin sign-off on every commit in a PR.
+# agentd is Apache-2.0 (inbound = outbound), so DCO sign-off — not a CLA — is the
+# provenance mechanism. See CONTRIBUTING.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check Signed-off-by on every commit
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          fail=0
+          for c in $(git rev-list "$base..$head"); do
+            if ! git log -1 --format=%B "$c" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::commit $c is missing a Signed-off-by line — use 'git commit -s' (DCO, see CONTRIBUTING.md)"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more commits are missing a DCO sign-off."
+            exit 1
+          fi
+          echo "All commits are signed off."

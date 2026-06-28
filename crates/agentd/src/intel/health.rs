@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-endpoint health record + circuit breaker. RFC 0018 §4.1/§4.2.
 //!
 //! Core (always compiled, dependency-free): the failover policy (§3.3) consults

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OpenAI-compatible `/chat/completions` adapter with native tool-calling.
 //! RFC 0006 §canonical-wire.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! SSRF classifier (RFC 0012 — security posture, §"SSRF guard").
 //!
 //! A *pure* address classifier plus a DNS-resolving host guard. The

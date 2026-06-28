@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! MCP wire types — the Model Context Protocol surface agentd's client and
 //! self-server speak. Target **2025-11-25** (interop down to 2024-11-05).
 //! RFC 0004 (client), RFC 0005 (server).

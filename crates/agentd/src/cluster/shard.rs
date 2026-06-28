@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The shard predicate — static partitioning of the URI/key space across a
 //! fleet (RFC 0019 §4). [feature = "cluster"]
 //!

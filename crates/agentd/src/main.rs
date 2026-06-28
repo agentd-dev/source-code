@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! agentd entry point.
 //!
 //! Dispatches between three roles of the one binary: the **supervisor** (the

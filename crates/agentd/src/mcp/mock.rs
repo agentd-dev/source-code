@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A minimal built-in MCP server, for tests and for operators kicking the
 //! tyres on reactive setups. Hidden mode: `agentd --internal-mock-mcp <uri>`.
 //!

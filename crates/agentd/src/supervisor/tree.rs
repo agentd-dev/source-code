@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The supervision tree — the in-memory record of the subagent process tree.
 //! RFC 0002 §supervision-record, RFC 0003 §accounting, RFC 0009 §caps.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OTLP span export with the GenAI semantic conventions. RFC 0010. [feature: otel]
 //!
 //! Hand-rolled OTLP-over-HTTP/**JSON** — no `opentelemetry` crate, no protobuf.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The public exit-code contract. RFC 0011 §5 — this is a stable,
 //! machine-actionable API (e.g. for a Kubernetes `podFailurePolicy`); treat
 //! changes as breaking.

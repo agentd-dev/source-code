@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The subagent side of the control channel. RFC 0005, RFC 0003, RFC 0009.
 //!
 //! Entered when `main` sees `AGENTD_SUBAGENT` set. The child:

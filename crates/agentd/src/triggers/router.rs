@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Reactive routing — the rule that turns MCP resource updates into runs.
 //! RFC 0008 §reactive-routing.
 //!

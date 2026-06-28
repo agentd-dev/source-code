@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Hand-rolled JSON-lines logger. ~150 lines reusing the `serde_json`
 //! serializer — deliberately not `tracing` (its implicit async span context
 //! is moot for a processes-plus-threads design, and the process tree gives

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A2A v1.0 unary method surface, served over the existing self-MCP listener.
 //! RFC 0020. [feature: a2a]
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! MCP client over a stdio child process. RFC 0004.
 //!
 //! Spawns a server (`Command`), speaks newline-delimited JSON-RPC 2.0 over its

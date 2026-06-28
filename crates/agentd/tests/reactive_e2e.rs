@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Observe-to-validate E2E tests of reactivity (M3 / the M7 observe-suite seed).
 //!
 //! Runs a real reactive agentd against the built-in mock MCP server and

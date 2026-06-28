@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Configuration: precedence + validate-at-startup. RFC 0011 §2-§3.
 //!
 //! Precedence, top wins: `built-in default < env var < CLI flag`. Everything

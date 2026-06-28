@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Black-box CLI test of supervised once-mode (M2): the binary spawns a root
 //! subagent, supervises it, and maps the outcome to an exit code. With an
 //! unreachable intelligence endpoint the run fails fast with exit 4 (intel

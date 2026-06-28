@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End-to-end test of self-orchestration (M2): the `subagent.spawn` self-tool.
 //!
 //! Drives the `Orchestrator` directly (standing in for the model calling the

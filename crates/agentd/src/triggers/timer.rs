@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! 5-field UTC cron schedule — a standalone-mode convenience. RFC 0008. [feature: cron]
 //!
 //! Hand-rolled (no `croner` dep — the minimalism moat, rfcs/0002): a tiny parser

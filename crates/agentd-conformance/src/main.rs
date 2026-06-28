@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The conformance runner: run every check against a freshly-built agentd and
 //! render a PASS/FAIL report. `--json` emits the machine-readable record. Exits
 //! non-zero if any check fails (so it doubles as a CI gate).

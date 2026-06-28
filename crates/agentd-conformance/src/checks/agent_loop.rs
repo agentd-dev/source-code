@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The agentic ReAct loop end-to-end: the agent must take the LLM's tool calls,
 //! execute them, feed results back, and converge on a final answer. Driven with
 //! the built-in mock LLM (scripted tool calls) + the mock MCP (a resource to

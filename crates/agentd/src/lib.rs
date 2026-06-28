@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! agentd — a minimal, MCP-native, reactive agent runtime.
 //!
 //! One binary that is CLI, daemon, and subagent re-exec. A **supervisor**

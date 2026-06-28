@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 pub mod mode;
 pub mod router;
 pub mod warm;

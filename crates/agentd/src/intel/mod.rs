@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 pub mod anthropic;
 pub mod client;
 // RFC 0018 intelligence transport resilience — the endpoint list, per-endpoint

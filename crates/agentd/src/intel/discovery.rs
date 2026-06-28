@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Optional model discovery (capability-negotiated). RFC 0018 §5.4.
 //!
 //! agentd may learn what an endpoint serves via a tiny handshake — **off unless

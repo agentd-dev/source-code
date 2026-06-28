@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Terminal statuses — the stop-condition disjunction.
 //!
 //! RFC 0007 §3.4 is the **single authority** for this enum; RFC 0011 §5.2

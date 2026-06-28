@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Observe-to-validate E2E test of the long-lived `loop`/`schedule` modes (M4).
 //!
 //! A real agentd in `loop` mode must fire independent runs on its interval and,

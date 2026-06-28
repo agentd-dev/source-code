@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Black-box conformance suite for the agentd runtime.
 //!
 //! The suite is a flat list of named [`Check`]s grouped into [`Category`]

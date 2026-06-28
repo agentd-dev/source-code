@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-run budget: step / token / wall-clock bounds. RFC 0007 §budgets.
 //!
 //! This is the *per-run* budget enforced inside one agent loop (step / token /

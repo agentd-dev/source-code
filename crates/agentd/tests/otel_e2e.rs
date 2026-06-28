@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! OTLP export E2E (M6/M7, deferred): a real agentd run under `--features otel`
 //! must POST an `invoke_agent` span (GenAI semconv) to the configured collector.
 //! Runs only under `cargo test --features otel`.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! agentd as an MCP **server** (`--serve-mcp`): the JSON-RPC 2.0 + MCP protocol
 //! it must speak to a peer. Every check connects a raw line-delimited client to
 //! a live served daemon and asserts the wire contract.

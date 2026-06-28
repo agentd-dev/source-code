@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Daemon-held **warm continue-sessions** (RFC 0008 §spawn-vs-continue).
 //!
 //! A `Disposition::Continue(session_id)` route delivers every event on its URI

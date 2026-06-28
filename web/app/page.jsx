@@ -43,7 +43,7 @@ function Card({ tag, title, children }) {
 
 /* ── content ─────────────────────────────────────────────────────── */
 
-const HERO_CMD = `$ agentd \\
+const HERO_CMD = `$ agent \\
     --instruction "triage new GitHub issues and label them" \\
     --mcp "github=mcp-server-github" \\
     --intelligence unix:/run/intel.sock \\
@@ -78,7 +78,7 @@ const CAPS = [
   {
     tag: "composition",
     title: "Agents that compose",
-    body: "A running agent spawns subagents — sync, async, detached, or warm (multi-turn) — and awaits or messages them. Completions are agentd:// resources a parent can read or subscribe to. Orchestration is just more MCP.",
+    body: "A running agent spawns subagents — sync, async, detached, or warm (multi-turn) — and awaits or messages them. Completions are agent:// resources a parent can read or subscribe to. Orchestration is just more MCP.",
   },
   {
     tag: "cloud-native",
@@ -129,13 +129,13 @@ export default function Home() {
       {/* ── hero ─────────────────────────────────────────────── */}
       <section className="mx-auto max-w-5xl px-4 pt-16 pb-10 sm:pt-24">
         <div className="chip mb-6">
-          <span className="pulse" /> a daemon, not a framework
+          <span className="pulse" /> a runtime, not a framework
         </div>
         <h1 className="text-4xl font-bold leading-tight tracking-tight text-[var(--fg-strong)] sm:text-6xl">
-          agentd<span className="cursor" aria-hidden="true" />
+          agent<span className="cursor" aria-hidden="true" />
         </h1>
         <p className="mt-5 max-w-2xl text-lg text-[var(--fg)] sm:text-xl">
-          A small, cloud-native AI agent daemon. Give it an{" "}
+          A small, cloud-native AI agent runtime. Give it an{" "}
           <span className="text-[var(--fg-strong)]">instruction</span> and{" "}
           <span className="text-[var(--fg-strong)]">tools from MCP</span> — it runs the agentic
           loop, calls tools, reads resources, and self-corrects, as a one-shot, a daemon, or a
@@ -143,7 +143,7 @@ export default function Home() {
         </p>
         <p className="mt-4 max-w-2xl text-[var(--dim)]">
           Minimal and MCP-native to the core: tools come only from{" "}
-          <span className="text-[var(--green)]">MCP servers</span>, agentd{" "}
+          <span className="text-[var(--green)]">MCP servers</span>, agent{" "}
           <span className="text-[var(--green)]">is</span> an MCP server, and it{" "}
           <span className="text-[var(--green)]">reacts</span> to MCP resource subscriptions. One
           static binary — supervised, bounded, observable.
@@ -165,7 +165,7 @@ export default function Home() {
         </div>
 
         <div className="mt-10">
-          <Term title="agentd — once mode">{HERO_CMD}</Term>
+          <Term title="agent — once mode">{HERO_CMD}</Term>
         </div>
       </section>
 
@@ -173,7 +173,7 @@ export default function Home() {
       <Section
         eyebrow="the model"
         title="An instruction, some tools, one loop"
-        intro="agentd is deliberately small. You give it three things; it does one thing well and tells you exactly what happened."
+        intro="agent is deliberately small. You give it three things; it does one thing well and tells you exactly what happened."
       >
         <div className="grid gap-4 md:grid-cols-3">
           <Card tag="you provide" title="An instruction + MCP servers + a model">
@@ -198,7 +198,7 @@ export default function Home() {
         id="mcp"
         eyebrow="model context protocol"
         title="MCP-native, three ways"
-        intro="The Model Context Protocol is not an integration in agentd — it is the substrate. Tools, composition, and reactivity all ride one protocol."
+        intro="The Model Context Protocol is not an integration in agent — it is the substrate. Tools, composition, and reactivity all ride one protocol."
       >
         <div className="grid gap-4 md:grid-cols-3">
           <div className="panel lift p-5">
@@ -206,20 +206,20 @@ export default function Home() {
             <h3 className="font-semibold text-[var(--fg-strong)]">Tools come from MCP</h3>
             <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
               Every tool the agent can call is exposed by an MCP server you declare with{" "}
-              <span className="kbd">--mcp name=cmd</span>. agentd connects over stdio, discovers
+              <span className="kbd">--mcp name=cmd</span>. agent connects over stdio, discovers
               the tools, and offers exactly that set to the model. Want filesystem access? Wire an
               fs server. Want none? Wire none.
             </p>
           </div>
           <div className="panel lift p-5">
             <div className="mb-3 font-mono text-xs text-[var(--green)]">02 · serves</div>
-            <h3 className="font-semibold text-[var(--fg-strong)]">agentd is an MCP server</h3>
+            <h3 className="font-semibold text-[var(--fg-strong)]">agent is an MCP server</h3>
             <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
               With <span className="kbd">--serve-mcp</span> it speaks MCP back: a peer calls{" "}
               <span className="kbd">subagent.spawn</span> (sync · async · detach · warm),{" "}
               <span className="kbd">subagent.send</span>/<span className="kbd">status</span>/
               <span className="kbd">cancel</span>, and reads{" "}
-              <span className="kbd">agentd://</span> resources. One agent orchestrates others over
+              <span className="kbd">agent://</span> resources. One agent orchestrates others over
               the same wire.
             </p>
           </div>
@@ -227,7 +227,7 @@ export default function Home() {
             <div className="mb-3 font-mono text-xs text-[var(--green)]">03 · reacts</div>
             <h3 className="font-semibold text-[var(--fg-strong)]">Reactive on resources</h3>
             <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
-              <span className="kbd">--subscribe &lt;uri&gt;</span> and agentd idles until the
+              <span className="kbd">--subscribe &lt;uri&gt;</span> and agent idles until the
               server pushes <span className="kbd">notifications/resources/updated</span> — then it
               reads the resource and runs. Event-driven agents with no polling, no glue.
             </p>
@@ -236,13 +236,13 @@ export default function Home() {
 
         <div className="mt-6 grid gap-4 lg:grid-cols-2">
           <Term title="give it tools — and let it serve its own">{`# the agent's toolset = the union of its MCP servers
-# (quote each name=command so agentd passes the flags to the server)
-$ agentd --instruction "reconcile the inbox" \\
+# (quote each name=command so agent passes the flags to the server)
+$ agent --instruction "reconcile the inbox" \\
     --mcp "fs=mcp-server-fs --root /data" \\
     --mcp "gh=mcp-server-github" \\
-    --serve-mcp unix:/run/agentd.sock      # ← now agentd is itself an MCP server`}</Term>
+    --serve-mcp unix:/run/agent.sock      # ← now agent is itself an MCP server`}</Term>
           <Term title="react to a resource changing">{`# wake on every change to the watched resource
-$ agentd --mode reactive \\
+$ agent --mode reactive \\
     --subscribe file:///data/inbox \\
     --mcp "fs=mcp-server-fs --root /data" \\
     --instruction "classify each new item and route it"
@@ -257,7 +257,7 @@ $ agentd --mode reactive \\
         id="capabilities"
         eyebrow="capabilities"
         title="Small surface, serious guarantees"
-        intro="agentd is minimal where it can be and uncompromising where it must be — supervision, budgets, security, and observability are not add-ons."
+        intro="agent is minimal where it can be and uncompromising where it must be — supervision, budgets, security, and observability are not add-ons."
       >
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {CAPS.map((c) => (
@@ -318,9 +318,9 @@ $ agentd --mode reactive \\
             ))}
           </div>
           <Term title="the whole image">{`FROM scratch
-COPY agentd /agentd        # one static musl binary, ~1.3 MB
+COPY agent /agent        # one static musl binary, ~1.3 MB
 USER 65532:65532           # nonroot
-ENTRYPOINT ["/agentd"]
+ENTRYPOINT ["/agent"]
 
 # no shell · no libc · no package manager · nothing to attack or patch
 # opt-in k8s probes: --metrics-addr :9090 → /healthz /readyz /metrics
@@ -337,24 +337,24 @@ ENTRYPOINT ["/agentd"]
         intro="Pull the image, or build from source. Point it at an MCP server and a model, and go."
       >
         <div className="grid gap-4 lg:grid-cols-2">
-          <Term title="docker">{`$ docker run --rm ghcr.io/agentd-dev/agentd \\
+          <Term title="docker">{`$ docker run --rm ghcr.io/agentd-dev/agent \\
     --instruction "summarize /data/report.txt and write a digest" \\
     --mcp "fs=mcp-server-fs --root /data" \\
     --intelligence unix:/run/intel.sock --model claude-sonnet-4-6`}</Term>
           <Term title="kubernetes — a one-shot Job">{`apiVersion: batch/v1
 kind: Job
-metadata: { name: agentd-digest }
+metadata: { name: agent-digest }
 spec:
   template:
     spec:
       restartPolicy: Never
       containers:
-        - name: agentd
-          image: ghcr.io/agentd-dev/agentd:latest
+        - name: agent
+          image: ghcr.io/agentd-dev/agent:latest
           args: ["--mcp", "fs=mcp-server-fs --root /data"]
           env:
             - { name: INSTRUCTION, value: "digest the report" }
-      # podFailurePolicy maps agentd's exit codes → retriable vs terminal`}</Term>
+      # podFailurePolicy maps agent's exit codes → retriable vs terminal`}</Term>
         </div>
         <div className="mt-6 flex flex-wrap items-center gap-3 text-sm">
           <a href="https://github.com/agentd-dev/source-code" className="btn btn-primary">

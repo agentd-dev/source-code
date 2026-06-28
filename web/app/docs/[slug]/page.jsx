@@ -10,7 +10,7 @@ export function generateStaticParams() {
 export async function generateMetadata({ params }) {
   const { slug } = await params;
   const doc = DOCS.find((d) => d.slug === slug);
-  return { title: `agentd docs — ${doc ? doc.title : slug}` };
+  return { title: `agent docs — ${doc ? doc.title : slug}` };
 }
 
 // Map markdown links to the right destination: a `*.md` doc the site hosts → its
@@ -107,7 +107,7 @@ export default async function DocPage({ params }) {
           </ul>
         </div>
       </aside>
-      <article className="prose prose-invert prose-agentd min-w-0 max-w-none flex-1 prose-pre:text-xs sm:prose-pre:text-sm">
+      <article className="prose prose-invert prose-agent min-w-0 max-w-none flex-1 prose-pre:text-xs sm:prose-pre:text-sm">
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: MdLink }}>
           {doc.raw}
         </ReactMarkdown>

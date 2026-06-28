@@ -1533,10 +1533,13 @@ fn subscribe_resource(
         // as not-found, matching the read gate.
         Some(crate::agentd_uri::AgentdResource::Inventory) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7 / management-profile.json `gating`: a non-Management
+                // caller of an operator resource gets METHOD_NOT_FOUND (-32601),
+                // uniform with the read gate — it can't even confirm it exists.
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
-                    format!("not a subscribable resource: {uri}"),
+                    json::METHOD_NOT_FOUND,
+                    format!("method not found: {uri}"),
                 );
             }
         }
@@ -1549,10 +1552,11 @@ fn subscribe_resource(
         // this supervisor-side view — see `intelligence_body`'s honesty note.)
         Some(crate::agentd_uri::AgentdResource::Intelligence) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7: non-Management → METHOD_NOT_FOUND, uniform with read.
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
-                    format!("not a subscribable resource: {uri}"),
+                    json::METHOD_NOT_FOUND,
+                    format!("method not found: {uri}"),
                 );
             }
         }
@@ -1562,10 +1566,11 @@ fn subscribe_resource(
         // on every reload, never consumed).
         Some(crate::agentd_uri::AgentdResource::ConfigEffective) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7: non-Management → METHOD_NOT_FOUND, uniform with read.
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
-                    format!("not a subscribable resource: {uri}"),
+                    json::METHOD_NOT_FOUND,
+                    format!("method not found: {uri}"),
                 );
             }
         }
@@ -1595,7 +1600,17 @@ fn subscribe_resource(
         // events-less build is rejected as not-found, matching the read gate. The
         // subscription is *kept* (the keep-variant fires it on every new event).
         Some(crate::agentd_uri::AgentdResource::Events(_)) => {
-            if origin != PeerOrigin::Management || !cfg!(feature = "events") {
+            if origin != PeerOrigin::Management {
+                // ACC SPEC L7: a non-Management caller of the operator events
+                // resource gets METHOD_NOT_FOUND (-32601), uniform with the read
+                // gate. (An events-less build is a separate honest-absence case.)
+                return Response::err(
+                    req.id,
+                    json::METHOD_NOT_FOUND,
+                    format!("method not found: {uri}"),
+                );
+            }
+            if !cfg!(feature = "events") {
                 return Response::err(
                     req.id,
                     json::RESOURCE_NOT_FOUND,
@@ -2027,11 +2042,11 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
 }
 
 /// `resources/read` for `agentd://events` (RFC 0016 §7). Management-only (the
-/// live-tail is an operator surface): a non-mgmt origin gets RESOURCE_NOT_FOUND
-/// (the same shape as an unknown uri, so a stdio peer can't even confirm it
-/// exists — matching the inventory gate). With the `events` feature it serves the
-/// §7.2 envelope from the bounded ring; an installed-but-empty window is still a
-/// valid read. Without the ring (no `events` feature, or never installed) it
+/// live-tail is an operator surface): a non-mgmt origin gets METHOD_NOT_FOUND
+/// (-32601) per ACC SPEC L7 — a stdio peer can't even confirm it exists, uniform
+/// with the inventory/intelligence read gate. With the `events` feature it serves
+/// the §7.2 envelope from the bounded ring; an installed-but-empty window is still
+/// a valid read. Without the ring (no `events` feature, or never installed) it
 /// 404s — capability-absence-not-error (RFC 0015 §2.5).
 fn events_read(
     req: Request,
@@ -2040,10 +2055,12 @@ fn events_read(
     ctx: &ServeCtx,
 ) -> Response {
     if origin != PeerOrigin::Management {
+        // ACC SPEC L7: a non-Management caller of the operator events resource gets
+        // METHOD_NOT_FOUND (-32601), uniform with the other operator-resource gates.
         return Response::err(
             req.id,
-            json::RESOURCE_NOT_FOUND,
-            "resource not found: agentd://events".to_string(),
+            json::METHOD_NOT_FOUND,
+            "method not found: agentd://events".to_string(),
         );
     }
     #[cfg(feature = "events")]
@@ -3633,8 +3650,9 @@ mod tests {
     #[test]
     fn events_resource_is_management_only() {
         // A Stdio peer (a spawned subagent) must not even confirm the events
-        // resource exists — it 404s like any unknown uri (RFC 0016 §7; matches the
-        // inventory gate). This holds with or without the `events` feature.
+        // resource exists — ACC SPEC L7: a non-Management caller of an operator
+        // resource gets METHOD_NOT_FOUND (-32601), uniform with the inventory/
+        // intelligence read gate. This holds with or without the `events` feature.
         let r = dispatch(
             req("resources/read", Some(json!({"uri": "agentd://events"}))),
             &ctx(),
@@ -3643,7 +3661,7 @@ mod tests {
             0,
             &log(),
         );
-        assert_eq!(r.error.expect("err").code, json::RESOURCE_NOT_FOUND);
+        assert_eq!(r.error.expect("err").code, json::METHOD_NOT_FOUND);
     }
 
     #[cfg(feature = "events")]
@@ -3678,7 +3696,8 @@ mod tests {
     #[test]
     fn events_subscribe_is_management_only_and_kept() {
         // Management may subscribe to the live events resource; a Stdio peer is
-        // rejected as not-subscribable (RFC 0016 §7.2).
+        // rejected (ACC SPEC L7: a non-Management caller of an operator resource
+        // gets METHOD_NOT_FOUND (-32601), uniform with the read gate).
         let ctx = ctx();
         crate::obs::log::install_event_ring(8);
         let ok = subscribe_resource(
@@ -3696,7 +3715,7 @@ mod tests {
             &writer(),
             1,
         );
-        assert_eq!(denied.error.expect("err").code, json::RESOURCE_NOT_FOUND);
+        assert_eq!(denied.error.expect("err").code, json::METHOD_NOT_FOUND);
     }
 
     #[test]

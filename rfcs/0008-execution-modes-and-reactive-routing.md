@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-agentd must serve four operational shapes — a one-shot CLI/Job run, a long-lived
+agent must serve four operational shapes — a one-shot CLI/Job run, a long-lived
 polling daemon, an event-reactive daemon, and a time-scheduled run — without
 forking the codebase into divergent daemons. The architecture-decision document
 (§2.6) is explicit and binding: **one supervisor loop, one inner agentic loop,
@@ -18,7 +18,7 @@ else reproduces the "the daemon and the job have separate code" footgun and
 destroys the cloud-native simplification.
 
 The second half of this RFC is the part the ecosystem has *not* built and which
-the assessment names agentd's edge (§1.1, §2.6): **reactive routing.** MCP
+the assessment names agent's edge (§1.1, §2.6): **reactive routing.** MCP
 supports `resources/subscribe` + `notifications/resources/updated`, but the
 notification is **payload-less** — it carries only `{uri}` (optionally `title`),
 no diff (§1.3.1, RFC 0004). So the reactive loop is intrinsically
@@ -220,7 +220,7 @@ alive by the orchestrator.
 `schedule` is `loop` with the re-entry cadence supplied by a clock event source
 (§3.6) rather than completion-driven backoff. Per fire it behaves identically to
 `once` (spawn a root, run, map status). The recommended production path is an
-**external** CronJob invoking `agentd --mode once …` (robust to clock skew /
+**external** CronJob invoking `agent --mode once …` (robust to clock skew /
 restart / 12-factor). The internal form (`--mode schedule --interval D` or
 `--mode schedule --cron "<5-field>"` behind the `cron` feature) is a standalone
 convenience for non-orchestrated deployments. There is **no second scheduling
@@ -521,7 +521,7 @@ impl ClockSource {
 
 **No calendars, no DST gymnastics, no job store, no per-fire persistence in core.**
 Default TZ = UTC. If timezones matter, the external operator passes the schedule;
-the recommended production cron is the orchestrator's CronJob → `agentd --mode
+the recommended production cron is the orchestrator's CronJob → `agent --mode
 once`, not the in-process `cron` feature.
 
 A clock `Timer` event carries no URI; it is routed to the *single* timer-bound
@@ -555,7 +555,7 @@ at startup before any side effect:
 | Knob | Flag / env | Default | Notes |
 |---|---|---|---|
 | mode | `--mode once\|loop\|reactive\|schedule` | `once` | the driver |
-| interval | `--interval D` / `AGENTD_INTERVAL` | unset | loop/schedule; `0`=immediate |
+| interval | `--interval D` / `AGENT_INTERVAL` | unset | loop/schedule; `0`=immediate |
 | cron | `--cron "<5-field>"` | unset | `cron` feature only; UTC |
 | session | `--session fresh\|warm` | per §3.1.2 | loop re-entry style |
 | subscribe | `--subscribe server:uri` (repeatable) | none | static subscriptions |

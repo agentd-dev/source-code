@@ -373,7 +373,7 @@ surfaces are opt-in and never on for a one-shot.
 
 > `--health-file`, `--log-level` (plus `AGENT_LOG_LEVEL`), `--log-content`,
 > `--serve-mcp`, and `--metrics-addr` (behind `metrics`) are all live; see
-> [`config.rs`](../crates/agent/src/config.rs) for the authoritative flag/env
+> [`config.rs`](../crates/agentd/src/config.rs) for the authoritative flag/env
 > list. `--aggregate-logs` and `--health-http` remain roadmap items tracked in
 > [`docs/design/PLAN.md`](design/PLAN.md).
 
@@ -465,7 +465,7 @@ the features below):
 
 > **What the `metrics` build actually renders.** The list above is what an
 > agentctl dashboard counts; under `--features metrics` the **emitted** series are
-> exactly those in [`obs/metrics.rs::render`](../crates/agent/src/obs/metrics.rs)
+> exactly those in [`obs/metrics.rs::render`](../crates/agentd/src/obs/metrics.rs)
 > and the frozen RFC 0016 §4.3 set below. Three §4.3 names are **reserved**, not
 > emitted in this build (rendered as a `# HELP`/`# TYPE` marker with no sample, the
 > same honest-absence shape as `agent_mcp_up`):

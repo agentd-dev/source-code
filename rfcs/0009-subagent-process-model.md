@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 > **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) records two forward
 > alignments on this model. (1) **A2A-Task-mappable** (RFC 0020 §5): a run /
@@ -73,7 +73,7 @@ enum Mode { Supervisor(SupervisorConfig), Subagent }
 /// string matching alone (a model-controlled instruction could otherwise
 /// try to influence it); the marker is an env var the supervisor controls.
 fn dispatch_mode() -> Mode {
-    if env::var_os("AGENTD_SUBAGENT").is_some() {
+    if env::var_os("AGENT_SUBAGENT").is_some() {
         Mode::Subagent
     } else {
         Mode::Supervisor(SupervisorConfig::load_and_validate()) // exit 2 on bad config
@@ -81,7 +81,7 @@ fn dispatch_mode() -> Mode {
 }
 ```
 
-**Spawn is `/proc/self/exe` re-exec, not a fork-only child.** The supervisor builds the child `Command` from `current_exe()`, sets `AGENTD_SUBAGENT=1`, wires three pipes (control-in on the child's stdin, control-out on its stdout, stderr for the child's own telemetry per assessment §2.9), and applies `pre_exec` hooks (`setpgid`, `setrlimit`, `PR_SET_PDEATHSIG` — all owned by RFC 0003). Rationale (assessment §2.7): one artifact to ship and audit; `SIGKILL` works the instant the process exists; OS isolation is free; `pstree` shows the agent tree.
+**Spawn is `/proc/self/exe` re-exec, not a fork-only child.** The supervisor builds the child `Command` from `current_exe()`, sets `AGENT_SUBAGENT=1`, wires three pipes (control-in on the child's stdin, control-out on its stdout, stderr for the child's own telemetry per assessment §2.9), and applies `pre_exec` hooks (`setpgid`, `setrlimit`, `PR_SET_PDEATHSIG` — all owned by RFC 0003). Rationale (assessment §2.7): one artifact to ship and audit; `SIGKILL` works the instant the process exists; OS isolation is free; `pstree` shows the agent tree.
 
 The subagent's **early `main`** (before any loop work) sets `prctl(PR_SET_PDEATHSIG, SIGKILL)` so a supervisor crash collapses the tree from the leaves up (assessment §2.8; RFC 0003 owns the mechanism — this RFC only notes that subagent mode is where it is armed, because PDEATHSIG is cleared across `execve` and must be re-set in the re-exec'd child).
 
@@ -134,7 +134,7 @@ struct ContextSeed {
     slices: Vec<SeedSlice>,
 }
 struct SeedSlice { label: String, content: SeedContent }
-enum SeedContent { Text(String), ResourceRef(String) /* agentd:// or server uri */ }
+enum SeedContent { Text(String), ResourceRef(String) /* agent:// or server uri */ }
 
 struct ToolScope {
     /// Allowed (server, tool) pairs — a SUBSET of the parent's granted scope.
@@ -208,7 +208,7 @@ enum ResultBody {
 }
 ```
 
-**Store-and-reference (notes §6.2).** When the distillate would exceed the ~1–2k budget, the child writes the bulk to a resource via a scoped MCP tool (or an `agentd://` self-resource) and returns `ResultBody::Reference { uri, summary }`. The parent appends the `summary` and reads `uri` only if it needs the bulk — keeping the coordinator's window lean.
+**Store-and-reference (notes §6.2).** When the distillate would exceed the ~1–2k budget, the child writes the bulk to a resource via a scoped MCP tool (or an `agent://` self-resource) and returns `ResultBody::Reference { uri, summary }`. The parent appends the `summary` and reads `uri` only if it needs the bulk — keeping the coordinator's window lean.
 
 **The parent appends the distillate, not the transcript.** This is enforced structurally: the control channel only ever carries `SubagentResult` upward; the child's transcript never leaves the child process. There is no protocol path for a raw transcript to flow up.
 
@@ -283,9 +283,9 @@ enum Disposition { Sync, Async, Detach }   // default = Sync
 
 - **`Sync` (default, v1).** The handler blocks the parent's *tool call* until the child reaches a terminal status, then returns `SubagentResult` as the tool result. The parent's loop is between turns, so the parent process is cheaply paused — no orphan management, deterministic mental model (notes §6.3; Anthropic's lead-agent default). Concretely: the supervisor does not return the JSON-RPC response for the `subagent.spawn` request until the child's result frame arrives (or the child is killed, in which case it returns the terminal status that the kill produced, e.g. `deadline`/`cancelled`/`crashed`).
 
-- **`Async` (shipped in M3).** Returns a **handle** immediately: `{ handle, resource_uri }`. The parent keeps reasoning and later calls `subagent.status(handle)` / `subagent.await(handle)`, **or** subscribes to `resource_uri` — the child's completion *is* an `agentd://` resource update the parent reacts to (closing the loop with the reactive router, RFC 0008). Bounded by the route/parent `max_inflight` (default 4).
+- **`Async` (shipped in M3).** Returns a **handle** immediately: `{ handle, resource_uri }`. The parent keeps reasoning and later calls `subagent.status(handle)` / `subagent.await(handle)`, **or** subscribes to `resource_uri` — the child's completion *is* an `agent://` resource update the parent reacts to (closing the loop with the reactive router, RFC 0008). Bounded by the route/parent `max_inflight` (default 4).
 
-- **`Detach` (shipped in M3).** Fire-and-forget: returns a handle, the parent does not await. The child **still** counts against the tree budget, the depth cap, and the breadth/rate caps, and is **still reaped** by the supervisor (notes §6.3). It reports to logs and an `agentd://` resource. Use sparingly.
+- **`Detach` (shipped in M3).** Fire-and-forget: returns a handle, the parent does not await. The child **still** counts against the tree budget, the depth cap, and the breadth/rate caps, and is **still reaped** by the supervisor (notes §6.3). It reports to logs and an `agent://` resource. Use sparingly.
 
 **Streaming partials into the parent's reasoning is out of scope for v1** (notes §6.3): it complicates the parent's context management. The child always streams loop events up the control channel for *observability and supervision* (RFC 0003/0005), but those partials do not enter the parent's context — only the final distillate does. The async-handle + await/subscribe covers the real fan-out need.
 

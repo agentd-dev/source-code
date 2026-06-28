@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
@@ -20,15 +20,15 @@
 
 ## 1. Problem / Context
 
-agentd carries two JSON-RPC surfaces that are easy to conflate and must not be:
+agent carries two JSON-RPC surfaces that are easy to conflate and must not be:
 
-1. **The public self-MCP server** (assessment §2.5 SERVER half, §2.3). agentd
+1. **The public self-MCP server** (assessment §2.5 SERVER half, §2.3). agent
    is symmetric: as well as being an MCP *client* to external servers (RFC
-   0004), it *is* an MCP server. This is what makes agentd composable — a
-   parent agentd, a peer agentd, or a driving harness `initialize`s against
-   agentd and gets a real MCP catalogue: tools to spawn/steer subagents, tools
+   0004), it *is* an MCP server. This is what makes agent composable — a
+   parent agent, a peer agent, or a driving harness `initialize`s against
+   agent and gets a real MCP catalogue: tools to spawn/steer subagents, tools
    to read and subscribe to state, an optional gated `exec`, and a set of
-   **subscribable `agentd://` state resources** whose `notifications/resources/updated`
+   **subscribable `agent://` state resources** whose `notifications/resources/updated`
    emissions are the substrate for agent-to-agent reactivity and for
    async-subagent completion (assessment §2.6, §2.7). This surface is real MCP,
    capability-negotiated, spec-conformant against 2025-11-25.
@@ -66,7 +66,7 @@ references them.
   `resources:{subscribe:true,listChanged:true}` and nothing else. It exposes the
   tools `subagent.spawn` / `subagent.send` / `subagent.cancel` / `subagent.status`,
   `subscribe` / `unsubscribe`, `resource.read`, and a gated `exec`; and a tree
-  of readable + subscribable `agentd://…` resources for session / run / subagent
+  of readable + subscribable `agent://…` resources for session / run / subagent
   state. It serves over **stdio always**, and over a **unix socket** (NDJSON,
   stdio-like framing) when `--serve-mcp unix:PATH` is given. **Streamable HTTP
   serving is DEFERRED** (assessment §2.5, §2.13; RFC 0013) — the full
@@ -108,9 +108,9 @@ incompatible).
     "tools":     { "listChanged": true },
     "resources": { "subscribe": true, "listChanged": true }
   },
-  "serverInfo":{ "name":"agentd", "title":"agentd",
+  "serverInfo":{ "name":"agent", "title":"agent",
                  "version":"1.x" },
-  "instructions":"agentd self-MCP: spawn/steer subagents, read+subscribe agentd:// state."
+  "instructions":"agent self-MCP: spawn/steer subagents, read+subscribe agent:// state."
 }}
 ```
 
@@ -197,7 +197,7 @@ assessment §2.7; RFC 0008):
   "content":[{"type":"text","text":"spawned handle 0.2 (async)"}],
   "structuredContent":{
     "handle":"0.2", "status":"working",
-    "result_resource":"agentd://subagent/0.2/result"   // subscribe to learn completion
+    "result_resource":"agent://subagent/0.2/result"   // subscribe to learn completion
   }}}
 ```
 
@@ -224,11 +224,11 @@ is `isError:true` inside a successful result so the caller's model adapts; a
 target binary exists (assessment §2.11; RFC 0012). When absent it is simply not
 listed (capability absence, not a runtime error).
 
-### 3.3 Subscribable `agentd://` state resources
+### 3.3 Subscribable `agent://` state resources
 
 The server exposes session/run/subagent state as readable **and subscribable**
-resources under the custom `agentd://` scheme (legal per RFC 3986; semantics
-understood only by other agentd instances — review §4 caveat 2). This is the
+resources under the custom `agent://` scheme (legal per RFC 3986; semantics
+understood only by other agent instances — review §4 caveat 2). This is the
 mechanism for agent-to-agent reactivity: a peer or parent subscribes to one of
 our state URIs, and on each state transition we emit
 `notifications/resources/updated{uri}` — the peer then `resources/read`s to
@@ -239,20 +239,20 @@ Canonical resource tree (`resources/list`):
 
 | URI | Body (on `resources/read`) |
 |---|---|
-| `agentd://run/{run_id}` | run-level status, mode, root handle, aggregate usage, exit-disposition |
-| `agentd://session/{session_id}` | warm-session status, current turn, last activity |
-| `agentd://subagent/{handle}` | per-node status, depth, scope summary, usage, last terminal status |
-| `agentd://subagent/{handle}/result` | distilled result once terminal (the async-completion handle) |
+| `agent://run/{run_id}` | run-level status, mode, root handle, aggregate usage, exit-disposition |
+| `agent://session/{session_id}` | warm-session status, current turn, last activity |
+| `agent://subagent/{handle}` | per-node status, depth, scope summary, usage, last terminal status |
+| `agent://subagent/{handle}/result` | distilled result once terminal (the async-completion handle) |
 
 `resources/list` (one page; cap + prefix-summarize if a deep tree explodes —
 assessment §2.6 "list vs read"):
 
 ```jsonc
 { "result":{ "resources":[
-  {"uri":"agentd://run/01J…","name":"run 01J…","mimeType":"application/json"},
-  {"uri":"agentd://subagent/0","name":"root subagent","mimeType":"application/json"},
-  {"uri":"agentd://subagent/0.2","name":"subagent 0.2","mimeType":"application/json"},
-  {"uri":"agentd://subagent/0.2/result","name":"subagent 0.2 result","mimeType":"application/json"}
+  {"uri":"agent://run/01J…","name":"run 01J…","mimeType":"application/json"},
+  {"uri":"agent://subagent/0","name":"root subagent","mimeType":"application/json"},
+  {"uri":"agent://subagent/0.2","name":"subagent 0.2","mimeType":"application/json"},
+  {"uri":"agent://subagent/0.2/result","name":"subagent 0.2 result","mimeType":"application/json"}
 ]}}
 ```
 
@@ -261,7 +261,7 @@ text item:
 
 ```jsonc
 { "result":{ "contents":[
-  {"uri":"agentd://subagent/0.2","mimeType":"application/json",
+  {"uri":"agent://subagent/0.2","mimeType":"application/json",
    "text":"{\"handle\":\"0.2\",\"status\":\"working\",\"depth\":1,\"usage\":{…}}"}
 ]}}
 ```
@@ -273,7 +273,7 @@ peer:
 
 ```rust
 struct SelfResourceState {
-    /// concrete agentd:// URI -> set of peer connection ids subscribed to it
+    /// concrete agent:// URI -> set of peer connection ids subscribed to it
     subs: HashMap<String, HashSet<ConnId>>,
     /// peers that negotiated resources.subscribe at initialize
     sub_capable: HashSet<ConnId>,
@@ -313,13 +313,13 @@ machine of RFC 0007 and the supervision events of RFC 0003):
 
 | Transition | URI emitted |
 |---|---|
-| node status change (working→stalled→…→terminal) | `agentd://subagent/{handle}` |
-| node reaches a **terminal** status | `agentd://subagent/{handle}` **and** `agentd://subagent/{handle}/result` |
-| warm session turn boundary / new activity | `agentd://session/{session_id}` |
-| run aggregate usage / disposition change | `agentd://run/{run_id}` |
+| node status change (working→stalled→…→terminal) | `agent://subagent/{handle}` |
+| node reaches a **terminal** status | `agent://subagent/{handle}` **and** `agent://subagent/{handle}/result` |
+| warm session turn boundary / new activity | `agent://session/{session_id}` |
+| run aggregate usage / disposition change | `agent://run/{run_id}` |
 
 The completion case is the async-subagent close-the-loop: a parent that called
-`subagent.spawn{async}` subscribes to `agentd://subagent/{handle}/result`; when
+`subagent.spawn{async}` subscribes to `agent://subagent/{handle}/result`; when
 the child reaches terminal, the supervisor emits `updated` on that URI; the
 parent (woken via RFC 0008 routing) `resources/read`s it to collect the
 distillate. **At-least-once + idempotent via re-read-current-state** (assessment
@@ -341,10 +341,10 @@ review §1).
 Two distinct subscribe surfaces meet here and must not be confused:
 
 - **MCP `resources/subscribe`** (a *method* a peer calls on our server) — the
-  peer wants `updated` notifications for one of *our* `agentd://` URIs (§3.3).
+  peer wants `updated` notifications for one of *our* `agent://` URIs (§3.3).
 - **The `subscribe` *tool*** (in `tools/list`) — a *running subagent* calls this
   via `tools/call` to ask the supervisor to subscribe **the agent itself** to an
-  *external* MCP resource `(server, uri)` reachable through agentd's client side
+  *external* MCP resource `(server, uri)` reachable through agent's client side
   (RFC 0004). When a running agent subscribes, the supervisor auto-creates a
   `continue(this_session)` route — **self-subscribe = self-scheduling**, the
   signature capability (assessment §2.6; routing in RFC 0008).
@@ -355,7 +355,7 @@ Two distinct subscribe surfaces meet here and must not be confused:
 { "name":"subscribe","title":"Subscribe to a resource",
   "inputSchema":{ "type":"object",
     "properties":{
-      "server":{"type":"string"},     // MCP server name from agentd's client registry
+      "server":{"type":"string"},     // MCP server name from agent's client registry
       "uri":{"type":"string"}         // concrete URI (not a template)
     },
     "required":["server","uri"],
@@ -367,8 +367,8 @@ Returns `{}` on success; `isError:true` if the named server didn't advertise
 
 ### 3.6 Transports — stdio always; unix when `--serve-mcp unix:…`
 
-- **stdio (always on).** When a parent/peer spawns agentd as a subprocess, the
-  self-MCP is served on agentd's own stdin/stdout using **NDJSON** (`read_line`/
+- **stdio (always on).** When a parent/peer spawns agent as a subprocess, the
+  self-MCP is served on agent's own stdin/stdout using **NDJSON** (`read_line`/
   `write_line`): one compact JSON object per line, `\n`-terminated, no embedded
   newlines, UTF-8 (MCP stdio rules — RFC 0004). **stdout is sacred for MCP
   messages only**; all telemetry goes to stderr (assessment §2.9). Note: a
@@ -402,7 +402,7 @@ struct PeerConn { id: ConnId, stream: FramedNdjson, caps: PeerCaps }
 ### 3.7 Liveness and cancellation on the served side
 
 The server answers `ping` with `{}` promptly (it is a good citizen, and ping is
-a driver's liveness probe of agentd — RFC 0004). It accepts
+a driver's liveness probe of agent — RFC 0004). It accepts
 `notifications/cancelled{requestId,reason?}` for an in-flight served request
 (e.g. a long sync `subagent.spawn`): on receipt it requests graceful cancel of
 the spawned subtree via the kill ladder (RFC 0003) and sends no response for the
@@ -580,7 +580,7 @@ Notes:
   ceiling → drain tree.
 - **`ev/result`** is the terminal frame; after it the child exits and is reaped
   (`waitpid`, RFC 0003). The supervisor maps it both to the parent's
-  `subagent.spawn` return value / `agentd://subagent/{handle}/result` resource
+  `subagent.spawn` return value / `agent://subagent/{handle}/result` resource
   (§3.4) and, for a one-shot root, to the process exit code (RFC 0011).
 - **`pong`** uses a JSON-RPC *result* shape (it answers the `ctrl/ping`
   *request*); everything else upward is a notification.
@@ -621,7 +621,7 @@ where the control protocol must agree.)
 
 ## 5. Interactions with other RFCs
 
-- **RFC 0001 (core).** This RFC realizes the "agentd is both MCP client and its
+- **RFC 0001 (core).** This RFC realizes the "agent is both MCP client and its
   own MCP server" thesis (server half) and the private supervision wire.
 - **RFC 0002 (reactor & concurrency).** The supervisor's per-child control-out
   reader thread and each unix peer-conn reader thread forward onto the merged
@@ -633,14 +633,14 @@ where the control protocol must agree.)
   accounting fed by `ev/usage`.
 - **RFC 0004 (MCP client subset & codec).** Shares `json/` + `frame.rs`
   (`read_line`/`write_line` here too); the `subscribe`/`resource.read` self-tools
-  drive agentd's *client*-side subscriptions and reads; capability-gating and
+  drive agent's *client*-side subscriptions and reads; capability-gating and
   notify-then-read are defined there.
 - **RFC 0007 (agentic loop).** The child loop consumes forwarded `DownMsg`,
   emits `UpMsg`; terminal-status enum and VERIFY-grounded `ev/result` come from
   there.
 - **RFC 0008 (modes & reactive routing).** Self-subscribe → auto
   `continue(this_session)` route; async-subagent completion delivered as an
-  `agentd://…/result` `updated` event routed back to the parent; the
+  `agent://…/result` `updated` event routed back to the parent; the
   exactly-one-owner / debounce / coalesce rules govern those wakes.
 - **RFC 0009 (subagent process model).** Owns the `SpawnPayload` schema, the
   rich output contract, narrowed seed, depth-minting, and the caps refused at the
@@ -668,7 +668,7 @@ where the control protocol must agree.)
   task-augmented requests. `subagent.spawn` does **not** declare
   `execution.taskSupport`.
 - **`sampling/createMessage` in either direction** — deferred (assessment §1.3
-  item 5; review §5). agentd declares no `sampling` client capability and serves
+  item 5; review §5). agent declares no `sampling` client capability and serves
   no sampling; intelligence-sharing is a v2 feature wired as a client capability,
   not a server one.
 - **`prompts/*`, `roots/*`, `elicitation/*`, `completion/*`, `logging` server

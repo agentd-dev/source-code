@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Multi-stage build for the `agentd` workflow runtime.
+# Multi-stage build for the `agent` workflow runtime.
 #
 # Build stage uses the official Rust image; runtime is distroless/cc
 # for a small, shell-free, nonroot image that still carries glibc +
@@ -30,20 +30,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p agentd \
         --all-features \
         --locked \
- && cp target/release/agentd /usr/local/bin/agentd
+ && cp target/release/agent /usr/local/bin/agent
 
 # Runtime: distroless/cc:nonroot — ~25 MB, no shell, uid:gid=65532:65532.
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 # OCI metadata — surfaces in `docker inspect` and on GHCR's UI.
-LABEL org.opencontainers.image.title="agentd" \
+LABEL org.opencontainers.image.title="agent" \
       org.opencontainers.image.description="Bounded workflow runtime (DAG of typed nodes, TOML-driven)" \
       org.opencontainers.image.source="https://github.com/agentd-dev/source-code" \
       org.opencontainers.image.documentation="https://github.com/agentd-dev/source-code/tree/main/docs" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="agentd.dev"
 
-COPY --from=builder /usr/local/bin/agentd /usr/local/bin/agentd
+COPY --from=builder /usr/local/bin/agent /usr/local/bin/agent
 
 # /healthz + /metrics expose on whatever `--bind` is; 8080 matches
 # the runtime default when no override is passed.
@@ -52,5 +52,5 @@ EXPOSE 8080
 USER nonroot:nonroot
 
 # No default CMD — callers supply `--config` / `--bind` / etc., or
-# the image ships with `AGENTD_EMBED_CONFIG` baked at build time.
-ENTRYPOINT ["/usr/local/bin/agentd"]
+# the image ships with `AGENT_EMBED_CONFIG` baked at build time.
+ENTRYPOINT ["/usr/local/bin/agent"]

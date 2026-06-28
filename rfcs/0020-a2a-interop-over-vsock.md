@@ -1,9 +1,9 @@
-# RFC 0020: A2A interoperability over vsock — agentd as a first-class agent in the mesh
+# RFC 0020: A2A interoperability over vsock — agent as a first-class agent in the mesh
 
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the self-MCP surface (RFC 0005) and the vsock management transport (RFC 0015)
+**Part of:** the agent rewrite — control-plane track (RFC 0014); extends the self-MCP surface (RFC 0005) and the vsock management transport (RFC 0015)
 
 ---
 
@@ -15,35 +15,35 @@ vertical **agent↔tools**. The industry consensus is now settled: *MCP for tool
 A2A for agents.* A2A's model — an **Agent Card** (capability discovery), a **Task**
 with a lifecycle (`submitted → working → completed | failed | canceled | rejected`),
 and methods `SendMessage` / `GetTask` / `CancelTask` / `SubscribeToTask` — is, almost
-exactly, the surface agentd already exposes as MCP self-tools (`subagent.spawn/send/
-status/cancel` + the `agentd://run|subagent` resources, RFC 0005/0009). **agentd is
+exactly, the surface agent already exposes as MCP self-tools (`subagent.spawn/send/
+status/cancel` + the `agent://run|subagent` resources, RFC 0005/0009). **agent is
 already task-shaped; A2A is the standardized wire for what it already does.**
 
 The obstacle is transport. A2A's bindings are JSON-RPC 2.0 / gRPC / REST over
 **HTTP**, with **SSE** streaming, **webhooks**, and **enforced auth** (OAuth2 / OIDC /
-mTLS). agentd is the deliberate opposite (RFC 0011/0012/0014): blocking stdio/unix/
+mTLS). agent is the deliberate opposite (RFC 0011/0012/0014): blocking stdio/unix/
 **vsock**, no HTTP server (deferred, RFC 0013), notify-then-read instead of SSE, **no
 network auth** ("the transport is the boundary", RFC 0012 §3.8), and **stateless**
-(distillate-only, RFC 0011). A naïve "agentd runs an A2A HTTP server" would import an
+(distillate-only, RFC 0011). A naïve "agent runs an A2A HTTP server" would import an
 HTTP stack, SSE, OAuth, a webhook registry, and task persistence — a frontal assault
 on the minimalism moat.
 
 This RFC resolves the tension with the same boundary the whole control-plane track
-uses (RFC 0014 §3: *primitives in agentd, the network surface in the gateway*):
+uses (RFC 0014 §3: *primitives in agent, the network surface in the gateway*):
 
-> **agentd serves real A2A over vsock; an on-node gateway bridges HTTP↔vsock.**
+> **agent serves real A2A over vsock; an on-node gateway bridges HTTP↔vsock.**
 
-Because agentd serves *real* A2A (not a bespoke surface), the gateway is a **dumb
+Because agent serves *real* A2A (not a bespoke surface), the gateway is a **dumb
 transport bridge** — it re-envelopes A2A JSON-RPC frames between HTTP/SSE and vsock,
 terminates TLS, and enforces auth — **not** a protocol translator. The heavy network
 machinery (HTTP, SSE, OAuth, webhooks, durable task history) lives in the gateway,
-exactly where network concerns belong; agentd carries none of it.
+exactly where network concerns belong; agent carries none of it.
 
 ---
 
 ## 2. Decision
 
-1. **A2A is served over vsock/unix, never HTTP-in-agentd.** A new `a2a` feature adds
+1. **A2A is served over vsock/unix, never HTTP-in-agent.** A new `a2a` feature adds
    an A2A server profile to the existing self-MCP listener (RFC 0015 §3 — same
    blocking, thread-per-connection, JSON-RPC-2.0-codec machinery, RFC 0004). The
    default build and the cloud-native image set are unchanged; A2A is opt-in.
@@ -53,18 +53,18 @@ exactly where network concerns belong; agentd carries none of it.
    authenticates the cluster/cross-vendor A2A client (OAuth/OIDC/mTLS), re-frames
    JSON-RPC between HTTP/SSE and vsock, holds the **webhook registry** and the
    **durable task history** (`ListTasks`), and forwards trusted requests over vsock.
-   agentd carries **zero** of that.
+   agent carries **zero** of that.
 
 3. **The Agent Card is the capabilities manifest (RFC 0015 §5.2), projected.** One
    builder; the A2A `agent.json` is a re-serialization of the manifest into A2A's
    schema. No second source of truth.
 
-4. **An A2A Task is an agentd run / subagent handle.** `SendMessage` starts a run
+4. **An A2A Task is an agent run / subagent handle.** `SendMessage` starts a run
    (the async-subagent machinery, RFC 0005/0009); `GetTask`/`SubscribeToTask` read
-   `agentd://run|subagent/{handle}`; `CancelTask` is `subagent.cancel`. The
+   `agent://run|subagent/{handle}`; `CancelTask` is `subagent.cancel`. The
    **TerminalStatus enum (RFC 0007 §3.4) maps to A2A Task states** (§5).
 
-5. **Streaming is status-level over vsock; the gateway makes SSE.** agentd emits Task
+5. **Streaming is status-level over vsock; the gateway makes SSE.** agent emits Task
    *status* transitions (and the final artifact = the distillate) as line-framed
    JSON-RPC notifications over vsock; it does **not** stream partial artifacts (the
    distillate-only invariant, RFC 0009 §8, holds). The gateway re-frames the vsock
@@ -74,15 +74,15 @@ exactly where network concerns belong; agentd carries none of it.
    model; make A2A the external surface; add remote-A2A as a delegation backend.* See
    §3 — this is binding and is the answer to "do subagents become A2A?"
 
-7. **This likely obviates RFC 0013's deferred "Streamable HTTP serving" for agentd.**
-   The gateway does HTTP; agentd never needs an HTTP server. RFC 0013's item is
-   reclassified as *the gateway's concern, not agentd's* (§8).
+7. **This likely obviates RFC 0013's deferred "Streamable HTTP serving" for agent.**
+   The gateway does HTTP; agent never needs an HTTP server. RFC 0013's item is
+   reclassified as *the gateway's concern, not agent's* (§8).
 
-8. **MCP is unchanged and retained.** agentd stays an MCP **client** (consuming tools
+8. **MCP is unchanged and retained.** agent stays an MCP **client** (consuming tools
    — that is what MCP is for) and keeps its MCP **self-serving** surface (RFC 0005) as
    a gated **compat** surface for MCP-ecosystem peers. A2A is the *standards-aligned*
    external agent surface; MCP-self-serving is not removed, just no longer the only
-   way to drive agentd.
+   way to drive agent.
 
 ---
 
@@ -92,9 +92,9 @@ exactly where network concerns belong; agentd carries none of it.
 
 | Layer | Today | Decision |
 |---|---|---|
-| **Internal control** — supervisor ↔ re-exec'd child over the private length-framed channel (ctrl/ready, ping/pong, spawn payload, distillate up) | a private control protocol (**not** MCP) | **Unchanged.** A2A has no process supervision, PDEATHSIG, kill ladder, or cgroup bounds — the very guarantees that are agentd's reason to exist (RFC 0003/0009). Routing in-process supervision through a network task protocol is wrong by construction. |
-| **External agent surface** — a peer/orchestrator drives agentd | served self-MCP `subagent.*` tools (MCP reused for agent-control) | **A2A-over-vsock becomes primary**; MCP-self-serving becomes a gated **compat** surface. A2A is purpose-built for "drive a remote agent"; the manifest *is* an Agent Card; a run *is* a Task. |
-| **Delegation targets** — a coordinator spins up sub-work | always a local re-exec'd subagent | **Add a remote-A2A-agent backend** beside the local subagent. Same abstraction (objective + scope + budget → distilled result); the model/coordinator picks the backend. agentd becomes an A2A **client**. Local subagents stay the default for tight, supervised, bounded sub-tasks. |
+| **Internal control** — supervisor ↔ re-exec'd child over the private length-framed channel (ctrl/ready, ping/pong, spawn payload, distillate up) | a private control protocol (**not** MCP) | **Unchanged.** A2A has no process supervision, PDEATHSIG, kill ladder, or cgroup bounds — the very guarantees that are agent's reason to exist (RFC 0003/0009). Routing in-process supervision through a network task protocol is wrong by construction. |
+| **External agent surface** — a peer/orchestrator drives agent | served self-MCP `subagent.*` tools (MCP reused for agent-control) | **A2A-over-vsock becomes primary**; MCP-self-serving becomes a gated **compat** surface. A2A is purpose-built for "drive a remote agent"; the manifest *is* an Agent Card; a run *is* a Task. |
+| **Delegation targets** — a coordinator spins up sub-work | always a local re-exec'd subagent | **Add a remote-A2A-agent backend** beside the local subagent. Same abstraction (objective + scope + budget → distilled result); the model/coordinator picks the backend. agent becomes an A2A **client**. Local subagents stay the default for tight, supervised, bounded sub-tasks. |
 
 **Net:** the moat (supervised local subagents) is untouched; A2A is added where it is
 purpose-built (the external surface + cross-mesh delegation). MCP keeps the
@@ -108,18 +108,18 @@ Serving A2A-over-vsock, who carries what:
 
 | A2A requirement | Home |
 |---|---|
-| JSON-RPC 2.0 | **agentd** — has the codec (RFC 0004) |
-| vsock transport | **agentd** — already serves it (RFC 0015 §3) |
-| Agent Card | **agentd** — = the manifest (RFC 0015 §5.2) |
-| Task lifecycle (`SendMessage`/`GetTask`/`CancelTask`) | **agentd** — the async-subagent/`agentd://run\|subagent` machinery |
+| JSON-RPC 2.0 | **agent** — has the codec (RFC 0004) |
+| vsock transport | **agent** — already serves it (RFC 0015 §3) |
+| Agent Card | **agent** — = the manifest (RFC 0015 §5.2) |
+| Task lifecycle (`SendMessage`/`GetTask`/`CancelTask`) | **agent** — the async-subagent/`agent://run\|subagent` machinery |
 | HTTP server, SSE framing | **gateway** |
-| OAuth/OIDC/mTLS auth | **gateway** (PEP) — agentd trusts the vsock peer (one trust domain, RFC 0012 §3.8) |
+| OAuth/OIDC/mTLS auth | **gateway** (PEP) — agent trusts the vsock peer (one trust domain, RFC 0012 §3.8) |
 | Webhooks / push-notification registry | **gateway** |
-| Durable task history / `ListTasks` | **gateway** (agentd serves only *live* tasks from its ephemeral registry) |
+| Durable task history / `ListTasks` | **gateway** (agent serves only *live* tasks from its ephemeral registry) |
 
-agentd gains an A2A method surface (feature-gated) over a transport, codec, and
+agent gains an A2A method surface (feature-gated) over a transport, codec, and
 manifest it already has, and carries **no** HTTP/SSE/OAuth/webhook/persistence code.
-This is the **intelligence-sidecar pattern inverted** (RFC 0006): agentd dials
+This is the **intelligence-sidecar pattern inverted** (RFC 0006): agent dials
 intelligence *out* over vsock behind a TLS-terminating sidecar; it serves A2A *in*
 over vsock behind an HTTP-terminating gateway. The strongest posture it enables: a
 pod with **no cluster network at all** — vsock-out for the model, vsock-in for
@@ -127,13 +127,13 @@ management + A2A.
 
 ---
 
-## 5. A2A ↔ agentd mapping (normative)
+## 5. A2A ↔ agent mapping (normative)
 
-| A2A | agentd | Owner |
+| A2A | agent | Owner |
 |---|---|---|
 | Agent Card (`/.well-known/agent.json`, served by the gateway) | capabilities manifest, projected | RFC 0015 |
 | `SendMessage` / `SendStreamingMessage` | start a run (`subagent.spawn{async}` machinery) | RFC 0009 |
-| `GetTask` / `SubscribeToTask` | read/subscribe `agentd://run\|subagent/{handle}` | RFC 0005 |
+| `GetTask` / `SubscribeToTask` | read/subscribe `agent://run\|subagent/{handle}` | RFC 0005 |
 | `CancelTask` | `subagent.cancel` → kill ladder | RFC 0003/0005 |
 | multi-turn (`contextId`/`taskId`) | warm session (`subagent.send`) | RFC 0005 |
 | `Artifact` (final) | the **distillate** | RFC 0009 §7 |
@@ -142,8 +142,8 @@ management + A2A.
 
 Topology note: vsock is point-to-point guest↔host, so the gateway is **on-node** (the
 node-agent DaemonSet); a cluster A2A service fronts the per-node gateways. The gateway
-passes the authenticated client/tenant identity to agentd as **descriptive metadata**
-(like the downward-API identity, RFC 0015 §6) — agentd labels/scopes by it but never
+passes the authenticated client/tenant identity to agent as **descriptive metadata**
+(like the downward-API identity, RFC 0015 §6) — agent labels/scopes by it but never
 re-verifies it (the gateway already did).
 
 ---
@@ -151,14 +151,14 @@ re-verifies it (the gateway already did).
 ## 6. Failure semantics & versioning
 
 - **Auth handoff.** The gateway is the PEP: an unauthenticated/over-quota/forbidden
-  client never reaches vsock. agentd trusts every vsock request absolutely (RFC 0012
+  client never reaches vsock. agent trusts every vsock request absolutely (RFC 0012
   §3.8). A compromised gateway is a compromised node trust domain — the same blast
   radius as a compromised node-agent for management (RFC 0015 §7).
 - **A2A version negotiation** is the gateway's job (`A2A-Version`, `VersionNotSupported`);
-  agentd serves one A2A version, surfaced in the manifest/`surfaces` (RFC 0015 §5.2).
-- **Stateless agentd, stateful gateway.** A pod reschedule loses live tasks; the
+  agent serves one A2A version, surfaced in the manifest/`surfaces` (RFC 0015 §5.2).
+- **Stateless agent, stateful gateway.** A pod reschedule loses live tasks; the
   gateway re-drives idempotently (RFC 0011 §6 RUN_ID) or surfaces FAILED. Durable
-  history survives in the gateway, never in agentd.
+  history survives in the gateway, never in agent.
 - **Streaming subset.** Clients requesting partial-artifact streaming get status-level
   streaming + a single final artifact; the Agent Card advertises this honestly
   (`capabilities.streaming: true` meaning status streaming).
@@ -173,15 +173,15 @@ re-verifies it (the gateway already did).
   `/.well-known/agent.json` endpoint.
 - Discovery/registries, the cluster A2A ingress/service.
 
-agentd contributes the A2A-mappable primitives it already has (manifest, run/subagent
+agent contributes the A2A-mappable primitives it already has (manifest, run/subagent
 task handles, JSON-RPC, vsock) and the thin `a2a` method surface that binds them.
 
 ---
 
 ## 8. What this changes in the rest of the set
 
-- **RFC 0013** — "Streamable HTTP serving" is reclassified: **not agentd's job; the
-  gateway's**. agentd may never implement an HTTP server. (Alignment note added there.)
+- **RFC 0013** — "Streamable HTTP serving" is reclassified: **not agent's job; the
+  gateway's**. agent may never implement an HTTP server. (Alignment note added there.)
 - **RFC 0005** — the self-MCP `subagent.*` surface is now the **compat** external
   agent surface; A2A-over-vsock is the standards-aligned primary. (Alignment note.)
 - **RFC 0009** — the subagent/TerminalStatus model is declared **A2A-Task-mappable**,
@@ -207,7 +207,7 @@ orthogonal to the operator plane and complementary to MCP.
 - RFC 0009 — subagent model (= A2A Task; gains the delegation-backend axis)
 - RFC 0011 — statelessness / idempotency / exit codes
 - RFC 0012 §3.8 — the trust-domain / no-network-auth posture (the gateway is the PEP)
-- RFC 0013 — deferred HTTP serving (obviated for agentd by the gateway)
+- RFC 0013 — deferred HTTP serving (obviated for agent by the gateway)
 - RFC 0014 — control-plane umbrella (the node-agent gateway, the boundary)
 - RFC 0015 — vsock serving + the capabilities manifest (= Agent Card)
 - [A2A specification](https://a2a-protocol.org/latest/specification/)

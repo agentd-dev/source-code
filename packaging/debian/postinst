@@ -1,11 +1,11 @@
 #!/bin/sh
 # cargo-deb `maintainer-scripts` — runs on install / upgrade.
-# Creates /etc/agentd/ (empty) for any operator config (e.g. an instruction
-# file referenced via --instruction-file in /etc/default/agentd).
+# Creates /etc/agent/ (empty) for any operator config (e.g. an instruction
+# file referenced via --instruction-file in /etc/default/agent).
 
 set -e
 
-install -d -m 0755 /etc/agentd
+install -d -m 0755 /etc/agent
 
 if [ -x /usr/bin/systemctl ]; then
     /usr/bin/systemctl daemon-reload || true

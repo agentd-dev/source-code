@@ -1,9 +1,9 @@
-# agentd workspace.
+# agent workspace.
 #
 # `crates/agentd` is the runtime — a single binary that is CLI, daemon, and
 # subagent re-exec in one. `crates/agentd-conformance` is the black-box
 # conformance suite: it drives the real binary (MCP client/server, supervisor,
-# the ReAct loop) and asserts each contract, never linking the agentd library.
+# the ReAct loop) and asserts each contract, never linking the agent library.
 [workspace]
 resolver = "3"
 members = ["crates/agentd", "crates/agentd-conformance"]
@@ -11,7 +11,7 @@ members = ["crates/agentd", "crates/agentd-conformance"]
 # Release profile for a distributable single binary: size-first, LTO'd, stripped,
 # abort-on-panic. This is a cloud appliance shipped on `scratch`, so a smaller
 # static binary (faster pulls, smaller attack surface) beats peak CPU — and
-# agentd is IO/syscall/JSON-bound, with no numeric hot loops `opt-level` would
+# agent is IO/syscall/JSON-bound, with no numeric hot loops `opt-level` would
 # help. `z` + a single codegen unit let LTO see the whole crate graph.
 # A panic is a bug, not a recoverable state — the supervisor's job is to keep the
 # *tree* healthy, and a panicking supervisor should die loudly (its children are

@@ -3,16 +3,16 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the intelligence transport & wire (RFC 0006)
+**Part of:** the agent rewrite — control-plane track (RFC 0014); extends the intelligence transport & wire (RFC 0006)
 
 ---
 
 ## 1. Problem / Context
 
 RFC 0006 nails the intelligence wire to **exactly one endpoint** named by a
-single URI in `AGENTD_INTELLIGENCE`, dialed fresh per call with `Connection:
+single URI in `AGENT_INTELLIGENCE`, dialed fresh per call with `Connection:
 close`. That is the right primitive for the data plane, but it is brittle under
-the deployment shape RFC 0014 introduces: a fleet of agentd pods whose
+the deployment shape RFC 0014 introduces: a fleet of agent pods whose
 intelligence is supplied by a **host-side model service over vsock** (the
 node-agent's job, RFC 0014 §2). In that world the single endpoint is a moving,
 fallible thing:
@@ -45,13 +45,13 @@ move (RFC 0014 §6 — provisioning the vsock device and host model service is t
 node-agent's job).
 
 This RFC slots under RFC 0014 as sub-RFC **0018** and couples to four contracts it
-does **not** redefine: the metrics schema and the `agentd://` resource surface
+does **not** redefine: the metrics schema and the `agent://` resource surface
 that agentctl scrapes (RFC 0016 / RFC 0015), the hot-reload mechanism (RFC 0017),
-and the capabilities manifest (RFC 0015). It owns one thing: **how agentd survives
+and the capabilities manifest (RFC 0015). It owns one thing: **how agent survives
 its model endpoint moving, flapping, or being swapped.**
 
 This RFC owns: the `--intelligence` endpoint *list* and its failover policy; the
-per-endpoint health/circuit-breaker state machine; the `agentd://intelligence`
+per-endpoint health/circuit-breaker state machine; the `agent://intelligence`
 resource and the endpoint health metrics' *semantics* (the metric *schema* is
 frozen by RFC 0016); the quiesce-switch-resume hot-swap choreography on top of RFC
 0017; and the optional model-discovery handshake surfaced into the RFC 0015
@@ -89,7 +89,7 @@ metric exposition format (RFC 0010 §3.8 / RFC 0016).
    **half-open** decides re-close or re-open. A flapping host model service is thus
    *removed from rotation*, not retried into the ground — the loop never wedges on
    it. Health is exposed as **metrics (schema frozen in RFC 0016)** and as the
-   **`agentd://intelligence`** resource (RFC 0015 surface), so agentctl sees which
+   **`agent://intelligence`** resource (RFC 0015 surface), so agentctl sees which
    endpoint is active and why.
 
 4. **The endpoint list and the model are hot-swappable at runtime via RFC 0017**,
@@ -104,7 +104,7 @@ metric exposition format (RFC 0010 §3.8 / RFC 0016).
    CID/host) is always finish-on-old: it is invisible to the run.
 
 5. **Model discovery is optional and capability-negotiated.** If an endpoint
-   advertises it, agentd performs a tiny handshake (`GET /v1/models`, the
+   advertises it, agent performs a tiny handshake (`GET /v1/models`, the
    OpenAI-compatible shape RFC 0006 already speaks) to learn which models it
    serves, and surfaces the result into the RFC 0015 capabilities manifest
    (`intelligence.models`) so agentctl can do **model-aware placement**. An endpoint
@@ -115,7 +115,7 @@ metric exposition format (RFC 0010 §3.8 / RFC 0016).
    is unavailable after the bounded budget: **`once` exits `4` (`EXIT_INTELLIGENCE`,
    RFC 0011 §5)** exactly as today — the scheduler retries. **`loop`/`reactive`
    daemons do not exit**; they enter a **bounded, jittered all-down backoff**,
-   surfaced as the `intel.all_endpoints_down` event + an `agentd_intel_all_down`
+   surfaced as the `intel.all_endpoints_down` event + an `agent_intel_all_down`
    gauge, and resume the instant any endpoint half-opens healthy. Liveness is **not**
    failed (RFC 0010 §3.7 — a stuck *upstream* is not a stuck *supervisor*);
    readiness flips **not-ready** while all-down so the orchestrator stops routing
@@ -131,7 +131,7 @@ on failure.
 
 ### 3.1 Parsing the list (`intel/endpoints.rs`)
 
-`AGENTD_INTELLIGENCE` / `--intelligence` is split on `,` into an ordered
+`AGENT_INTELLIGENCE` / `--intelligence` is split on `,` into an ordered
 `Vec<IntelEndpoint>`, each element parsed by RFC 0006's `parse_intelligence_uri`
 verbatim. Config precedence is unchanged (RFC 0011 §3.1 — flag > env > file >
 default); the list is a single scalar, so it lives in env/flags, **not** the
@@ -156,7 +156,7 @@ pub struct Endpoint {
 
 Validation at startup (RFC 0011 §3.3, exit `2` before any side effect):
 
-- empty list → `ConfigError::missing("AGENTD_INTELLIGENCE")`;
+- empty list → `ConfigError::missing("AGENT_INTELLIGENCE")`;
 - any element fails `parse_intelligence_uri` → exit `2` with the bad element;
 - any `https:` element without the `tls` feature, or any `vsock:` without the
   `vsock` feature → exit `2` (RFC 0006 scheme-supported check, per element);
@@ -172,8 +172,8 @@ paths are never entered; it is RFC 0006 with one extra `AtomicUsize` read per ca
 Each endpoint resolves its own credential **by name** through `secrets::resolve`
 (RFC 0006 §6) **per request**, so a file-backed rotating secret (k8s Secret mount /
 Vault sidecar) is picked up with no reload. Endpoint-specific key *names* are set
-via env, e.g. `AGENTD_INTELLIGENCE_TOKEN` (the default applied to every endpoint)
-or per-endpoint overrides `AGENTD_INTELLIGENCE_TOKEN_1`, `_2`, … (1-indexed by list
+via env, e.g. `AGENT_INTELLIGENCE_TOKEN` (the default applied to every endpoint)
+or per-endpoint overrides `AGENT_INTELLIGENCE_TOKEN_1`, `_2`, … (1-indexed by list
 position) when fallbacks live behind different gateways. **The list URI carries no
 key**; the secret value is never in env-as-list, never in the file, never logged
 (RFC 0006 §6 / RFC 0012). This is the only credential surface — RFC 0018 adds no
@@ -270,8 +270,8 @@ pub struct HealthRecord {
 Error rate is derived (`total_fail / total_calls` over the process, plus the cheap
 `consec_fail` for the breaker decision); a windowed rate is **not** kept in-binary
 — agentctl computes rates from the scraped counters over its own window (RFC 0016),
-keeping cardinality and state out of agentd (the same discipline as RFC 0010 §3.8:
-agentd emits counters, the collector computes rates).
+keeping cardinality and state out of agent (the same discipline as RFC 0010 §3.8:
+agent emits counters, the collector computes rates).
 
 ### 4.2 The circuit breaker
 
@@ -311,10 +311,10 @@ Defaults (all overridable; names are the public contract):
 
 | Knob | Env | Flag | Default |
 |---|---|---|---|
-| open threshold | `AGENTD_INTEL_BREAKER_THRESHOLD` | `--intel-breaker-threshold` | `3` |
-| initial cooldown | `AGENTD_INTEL_BREAKER_COOLDOWN` | `--intel-breaker-cooldown` | `5s` |
-| cooldown cap | `AGENTD_INTEL_BREAKER_COOLDOWN_MAX` | `--intel-breaker-cooldown-max` | `60s` |
-| all-down backoff | `AGENTD_INTEL_ALLDOWN_BACKOFF` | `--intel-alldown-backoff` | `1s..30s` jittered (§6) |
+| open threshold | `AGENT_INTEL_BREAKER_THRESHOLD` | `--intel-breaker-threshold` | `3` |
+| initial cooldown | `AGENT_INTEL_BREAKER_COOLDOWN` | `--intel-breaker-cooldown` | `5s` |
+| cooldown cap | `AGENT_INTEL_BREAKER_COOLDOWN_MAX` | `--intel-breaker-cooldown-max` | `60s` |
+| all-down backoff | `AGENT_INTEL_ALLDOWN_BACKOFF` | `--intel-alldown-backoff` | `1s..30s` jittered (§6) |
 
 ### 4.3 Health as metrics (semantics; schema frozen in RFC 0016)
 
@@ -327,19 +327,19 @@ cardinality and leak topology):
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `agentd_intel_endpoint_up` | gauge 0/1 | `endpoint` | breaker not OPEN (i.e. in rotation) |
-| `agentd_intel_endpoint_active` | gauge 0/1 | `endpoint` | currently the sticky-primary `active` index |
-| `agentd_intel_calls_total` | counter | `endpoint`,`result` | `result` ∈ `ok`/`failover`/`fatal` |
-| `agentd_intel_failovers_total` | counter | `from`,`to` | a sweep advanced from one index to another |
-| `agentd_intel_breaker_opens_total` | counter | `endpoint` | breaker open transitions |
-| `agentd_intel_endpoint_latency_ms` | gauge | `endpoint` | EWMA round-trip latency (success only) |
-| `agentd_intel_all_down` | gauge 0/1 | — | every endpoint unavailable (§6) |
+| `agent_intel_endpoint_up` | gauge 0/1 | `endpoint` | breaker not OPEN (i.e. in rotation) |
+| `agent_intel_endpoint_active` | gauge 0/1 | `endpoint` | currently the sticky-primary `active` index |
+| `agent_intel_calls_total` | counter | `endpoint`,`result` | `result` ∈ `ok`/`failover`/`fatal` |
+| `agent_intel_failovers_total` | counter | `from`,`to` | a sweep advanced from one index to another |
+| `agent_intel_breaker_opens_total` | counter | `endpoint` | breaker open transitions |
+| `agent_intel_endpoint_latency_ms` | gauge | `endpoint` | EWMA round-trip latency (success only) |
+| `agent_intel_all_down` | gauge 0/1 | — | every endpoint unavailable (§6) |
 
 These extend, and do not collide with, the RFC 0010 §3.8 intelligence counters
-(`agentd_intel_calls_total{model}` etc. remain; this set is `endpoint`-keyed and
+(`agent_intel_calls_total{model}` etc. remain; this set is `endpoint`-keyed and
 RFC-0018-owned). The exact registration lives in RFC 0016's frozen schema.
 
-### 4.4 Health as a resource — `agentd://intelligence`
+### 4.4 Health as a resource — `agent://intelligence`
 
 A new readable + subscribable resource on the self-MCP surface (RFC 0005 §3.3
 resource tree; the *operator profile* that lists it is RFC 0015's management
@@ -348,10 +348,10 @@ in the notification** — notify-then-read, exactly RFC 0005 §3.4:
 
 | URI | Body (on `resources/read`) |
 |---|---|
-| `agentd://intelligence` | endpoint list, the active index, per-endpoint health/breaker/latency, all-down state, discovered models (§5) |
+| `agent://intelligence` | endpoint list, the active index, per-endpoint health/breaker/latency, all-down state, discovered models (§5) |
 
 ```jsonc
-// resources/read agentd://intelligence  → contents[0].text (application/json)
+// resources/read agent://intelligence  → contents[0].text (application/json)
 {
   "active": 0,
   "all_down": false,
@@ -373,7 +373,7 @@ in the notification** — notify-then-read, exactly RFC 0005 §3.4:
 ```
 
 **Emission rule (RFC 0005 §3.4, extended by the closed set below).** The supervisor
-emits `notifications/resources/updated{uri:"agentd://intelligence"}` to every
+emits `notifications/resources/updated{uri:"agent://intelligence"}` to every
 subscribed peer on any of these transitions — and *only* these (no per-call spam):
 
 | Transition | Emit? |
@@ -456,9 +456,9 @@ Choreography on a validated reload whose diff includes `intelligence`/`model`:
 ### 5.3 What a model swap means for an in-flight run
 
 A model swap mid-run is the subtle case (an endpoint repoint is invisible). The
-**transcript is continuous** across the swap — agentd does not reset context — but
+**transcript is continuous** across the swap — agent does not reset context — but
 the next turn is served by a *different model*. Two policies, `--model-swap` /
-`AGENTD_MODEL_SWAP`:
+`AGENT_MODEL_SWAP`:
 
 - **`finish-on-old` (default).** The turn in flight when the reload lands completes
   on the old model; the **next** turn uses the new model with the full existing
@@ -473,7 +473,7 @@ the next turn is served by a *different model*. Two policies, `--model-swap` /
 
 Neither policy changes the **terminal-status vocabulary** (RFC 0007 §3.4) or the
 exit codes (RFC 0011 §5) — a swapped run still ends `Completed`/`Refused`/budget/etc.
-A swap event is logged (`intel.swap`, §8) and emitted on `agentd://intelligence`
+A swap event is logged (`intel.swap`, §8) and emitted on `agent://intelligence`
 (§4.4). **Reactive warm sessions** (RFC 0008) read `LIVE` at each turn like any
 loop, so a swap applies to all warm sessions at their next turn with no extra
 machinery — and survives a daemon restart only via re-read of config (RFC 0011 §7;
@@ -481,14 +481,14 @@ warm-session checkpointing stays deferred, RFC 0013).
 
 **Out of scope (stays in agentctl / RFC 0014 §6):** *deciding* to swap (small↔large
 policy, cost/latency triggers, rolling a fleet's model) is policy — agentctl writes
-the new ConfigMap and signals the reload (RFC 0017). agentd only executes the
+the new ConfigMap and signals the reload (RFC 0017). agent only executes the
 quiesce-switch-resume primitive.
 
 > **Resolved / implemented (§5.1–§5.3).** Shipped. RFC 0017 §5.1 now lists
 > `intelligence`/`model`/`model_swap` as **reloadable via this RFC's swap
 > primitive** (no longer restart-only). **Process-boundary adaptation:** the §5.2
 > sketch models `LIVE` as a single supervisor-held `RwLock<Arc<IntelConfig>>` that
-> "subagents read per turn" — but agentd re-execs each subagent as its own
+> "subagents read per turn" — but agent re-execs each subagent as its own
 > **process**, so a supervisor-side `RwLock` cannot reach a child's loop. The
 > faithful implementation makes `LIVE` **child-local**: a new
 > `ControlMsg::SwapIntel` (the same fan-out shape as `pause`/`resume`, with a
@@ -506,7 +506,7 @@ quiesce-switch-resume primitive.
 > sessions (snapshot the pre-turn transcript, let the in-flight turn finish, then
 > discard its appended messages and re-run on the new model from the pre-turn
 > state — bounded by the step budget; a one-shot has a single turn so the policy is
-> moot for it). The `intel.swap` event (§8) and the `agentd://intelligence` notify
+> moot for it). The `intel.swap` event (§8) and the `agent://intelligence` notify
 > (§4.4) fire on a swap; **no secret/URL** appears in either (transport+index +
 > non-secret model names + policy only — RFC 0012 §3.7). Zero new dependencies
 > (std `Arc`/`Mutex`; no `arc_swap`). The endpoint **list** is now file-settable in
@@ -515,7 +515,7 @@ quiesce-switch-resume primitive.
 
 ### 5.4 Optional model discovery (capability-negotiated)
 
-agentd may learn what an endpoint serves via a tiny handshake — **off unless an
+agent may learn what an endpoint serves via a tiny handshake — **off unless an
 endpoint looks discovery-capable, and silent on failure** (decision 5):
 
 - **Probe.** `GET /v1/models` (OpenAI-compatible, the dialect RFC 0006 already
@@ -531,7 +531,7 @@ endpoint looks discovery-capable, and silent on failure** (decision 5):
   `models: []`, **never** a failover-class failure and **never** fatal. An endpoint
   is fully usable with discovery unsupported — the configured `model` is dialed
   regardless.
-- **Surface.** Discovered models populate `agentd://intelligence` (§4.4) and the
+- **Surface.** Discovered models populate `agent://intelligence` (§4.4) and the
   **capabilities manifest** `intelligence.models` (RFC 0015 §capabilities), so
   agentctl does **model-aware placement** ("route the opus job to a pod whose
   endpoint serves opus"). The manifest field is **optional and additive** (RFC 0014
@@ -582,8 +582,8 @@ available set or every attempt failed-over.
   do useful work). The orchestrator stops routing new work to the pod; it flips
   ready again on recovery. This is the right backpressure signal without a crash.
 - **Surfaced as event + metric + resource.** `intel.all_endpoints_down` /
-  `intel.recovered` events (§8), the `agentd_intel_all_down` gauge (§4.3), and an
-  `agentd://intelligence` `updated` emission (§4.4) on enter/exit — so agentctl
+  `intel.recovered` events (§8), the `agent_intel_all_down` gauge (§4.3), and an
+  `agent://intelligence` `updated` emission (§4.4) on enter/exit — so agentctl
   alerts on a *fleet-wide* all-down (likely the host service is down, not the pod)
   without any pod crashing.
 - **Bounded by the run deadline.** All-down backoff for a `loop` run with a
@@ -616,7 +616,7 @@ error — that would mask a misconfiguration as a transient outage.
   breaker is checked synchronously against a clock on the existing reactor wake; no
   timer thread). **No connection pool** (still one dial per call). **No
   service-discovery / k8s / DNS-SRV client** — agentctl supplies the endpoint list
-  and moves it via RFC 0017 reload; agentd only *uses* the list it is given (RFC
+  and moves it via RFC 0017 reload; agent only *uses* the list it is given (RFC
   0014 §6). **No new TLS/gRPC stack** — TLS stays the existing feature-gated rustls
   path (RFC 0006 §2). A resilience feature that would pull any of those is wrong by
   construction and belongs in agentctl.
@@ -651,7 +651,7 @@ existing `chat` span, not a new span).
 
 ## 9. Interactions with other RFCs
 
-- **RFC 0005 (self-MCP & control protocol).** `agentd://intelligence` (§4.4) is a
+- **RFC 0005 (self-MCP & control protocol).** `agent://intelligence` (§4.4) is a
   new resource on the existing resource tree (§3.3) with the existing
   notify-then-read emission contract (§3.4); the management profile that *lists* it
   to operators is RFC 0015.
@@ -678,11 +678,11 @@ existing `chat` span, not a new span).
   a restart (§5.3).
 - **RFC 0014 (control-plane umbrella).** This is sub-RFC 0018; the
   primitives-not-policy split (§3) governs the agentctl boundary (§5.3, §7);
-  agentctl supplies/moves endpoints and decides swaps, agentd executes the
+  agentctl supplies/moves endpoints and decides swaps, agent executes the
   primitives.
 - **RFC 0015 (management & control surface).** Owns the capabilities manifest this
   extends (`intelligence` block, §5.4) and the operator MCP profile that lists
-  `agentd://intelligence`.
+  `agent://intelligence`.
 - **RFC 0016 (telemetry & lifecycle contract).** **Freezes** the metric schema this
   defines the semantics of (§4.3); agentctl scrapes/alerts against that frozen set.
 - **RFC 0017 (declarative config & hot reload).** Owns the reload trigger
@@ -696,7 +696,7 @@ existing `chat` span, not a new span).
 
 - **No load-balancing across healthy endpoints.** The list is **priority-ordered
   failover**, not round-robin/weighted balancing. Spreading load across replicas is
-  agentctl's job (place pods on different endpoints); agentd prefers the
+  agentctl's job (place pods on different endpoints); agent prefers the
   lowest-index healthy endpoint (sticky-primary). Weighted/least-latency selection
   is a possible later flag, not v1.
 - **No connection pooling or keep-alive.** One dial per call stays (RFC 0006);
@@ -705,7 +705,7 @@ existing `chat` span, not a new span).
   clock on the existing call path / reactor wake; we do not actively poll endpoints
   on a timer (discovery is lazy, §5.4). An always-on active health-prober is
   rejected as it would add a thread and constant traffic for an idle daemon.
-- **No service discovery.** agentd does not resolve DNS-SRV, watch a registry, or
+- **No service discovery.** agent does not resolve DNS-SRV, watch a registry, or
   learn endpoints from the network — it uses the list it is given and is repointed
   by reload (RFC 0017). "Where is the model service" is agentctl's (RFC 0014 §6).
 - **No mid-request repoint / no streaming-aware swap.** A swap seam is a turn
@@ -713,7 +713,7 @@ existing `chat` span, not a new span).
   so a request is short). If streaming `/chat/completions` is ever adopted (RFC 0006
   open item), swap-mid-stream is a follow-up, not v1.
 - **No per-endpoint distinct dialect *negotiation*.** A per-endpoint dialect
-  override is allowed in config (§3.1), but agentd does not *probe* an endpoint's
+  override is allowed in config (§3.1), but agent does not *probe* an endpoint's
   dialect; misconfigured dialect is a non-failover request error (§3.3).
 - **No durable health state across restart.** Health/breaker records are in-memory;
   a restarted pod starts every endpoint CLOSED and re-learns (cheap, and correct —
@@ -724,7 +724,7 @@ existing `chat` span, not a new span).
 
 ## 11. Open items (for the umbrella author — RFC 0014 — to reconcile)
 
-- **Per-endpoint key env naming (`AGENTD_INTELLIGENCE_TOKEN_<N>`).** §3.2 proposes
+- **Per-endpoint key env naming (`AGENT_INTELLIGENCE_TOKEN_<N>`).** §3.2 proposes
   1-indexed-by-list-position overrides. RFC 0017's file-based secret refs may want a
   different keying (by endpoint *name* rather than index). Reconcile the naming with
   RFC 0017's secret-ref convention so an operator has one mental model. A naming

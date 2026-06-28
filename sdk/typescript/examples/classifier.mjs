@@ -1,14 +1,14 @@
-// Author a workflow in TypeScript/JavaScript, print the TOML agentd runs.
+// Author a workflow in TypeScript/JavaScript, print the TOML agent runs.
 //
 //   node examples/classifier.mjs > classifier.toml
-//   agentd --config classifier.toml --validate-only
-//   agentd --config classifier.toml --input doc.json
+//   agent --config classifier.toml --validate-only
+//   agent --config classifier.toml --input doc.json
 
 import { workflow, node } from "../src/index.js";
 
 const wf = workflow("doc_classifier")
   .policy({
-    fs: { write: ["/tmp/agentd-classified/**"] },
+    fs: { write: ["/tmp/agent-classified/**"] },
   })
   .start("main", "classify")
   .node(

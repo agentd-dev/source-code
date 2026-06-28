@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-agentd's entire action space and reactive surface ride on MCP. Every
+agent's entire action space and reactive surface ride on MCP. Every
 capability is a tool on some external MCP server; every reactive trigger is a
 `resources/subscribe` + `notifications/resources/updated` round-trip. There are
 no built-in tools. So the MCP **client** half is load-bearing, and it must be
@@ -19,11 +19,11 @@ implemented with the same minimalism bar as the rest of the binary: `std` +
 This RFC specifies (a) the shared JSON-RPC 2.0 **codec** (reader-thread +
 pending-request map + notification dispatch) that both the MCP layer and the
 supervisor↔subagent control channel (RFC 0005) reuse, and (b) the **MCP client
-subset** agentd speaks to external servers: lifecycle, tools, resources,
+subset** agent speaks to external servers: lifecycle, tools, resources,
 subscriptions, liveness, and the stdio transport with its shutdown ladder.
 
 This covers assessment §2.5 (the CLIENT half) and the §1.3 protocol
-corrections. The self-MCP **server** half — `agentd://` resources,
+corrections. The self-MCP **server** half — `agent://` resources,
 `subagent.*` self-tools, unix-socket serving — lives in RFC 0005 and is
 explicitly out of scope here. This document targets MCP **2025-11-25** and
 interoperates down to **2024-11-05**.
@@ -241,7 +241,7 @@ before the handshake completes):
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
   "protocolVersion":"2025-11-25",
   "capabilities":{},
-  "clientInfo":{"name":"agentd","title":"agentd","version":"1.x"}
+  "clientInfo":{"name":"agent","title":"agent","version":"1.x"}
 }}
 // ← result
 { "jsonrpc":"2.0","id":1,"result":{
@@ -381,7 +381,7 @@ All blocks may carry optional `annotations` (`audience`, `priority`,
 
 **THE load-bearing distinction (§1.3 #7):**
 
-| Wire shape | Meaning | agentd handling |
+| Wire shape | Meaning | agent handling |
 |---|---|---|
 | `result.isError == true` | tool-execution error, *successful* JSON-RPC | feed the `content[]` to the model as an **observation**; the model self-corrects; **consumes a step** (RFC 0007) |
 | JSON-RPC `error` (top-level) | protocol/transport fault (unknown tool, bad params, server fault) | a `CallError::Rpc` → **transport/abort policy** (§3.5 error policy below) |
@@ -471,7 +471,7 @@ fn handle_inbound_request(&self, req: Request) {
         "roots/list"            => self.reply_result(req.id, json!({"roots":[]})), // empty list
         "sampling/createMessage"
         | "elicitation/create"  => self.reply_error(req.id, -32601,
-                                       "method not found: agentd declares no client capabilities"),
+                                       "method not found: agent declares no client capabilities"),
         _                       => self.reply_error(req.id, -32601, "method not found"),
     }
 }
@@ -480,7 +480,7 @@ fn handle_inbound_request(&self, req: Request) {
 `ping` is answered promptly with `{}` regardless of state — it is our and the
 server's liveness probe (§3.9). `roots/list` gets `{"roots":[]}` (cheaper than
 arguing; we simply expose no filesystem scope). `sampling/createMessage` is
-**rejected** with `-32601` — agentd does not act as a sampling-capable client
+**rejected** with `-32601` — agent does not act as a sampling-capable client
 in v1 (the intelligence-sharing direction is deferred to RFC 0013, v2). Every
 other unsolicited method → `-32601`.
 
@@ -547,7 +547,7 @@ for that server (the operator/router degrades to polling or drops the route).
 { "jsonrpc":"2.0","id":"p7","result":{} }        // empty, prompt
 ```
 
-agentd **pings outbound** on an interval (default `mcp_ping_interval = 30s`)
+agent **pings outbound** on an interval (default `mcp_ping_interval = 30s`)
 when a connection is otherwise idle, with a per-ping timeout (default **10s**).
 N consecutive missed pongs (default **3**) → the server is declared stale → the
 shutdown ladder (§3.11). This is the stdio-MCP slice of the dead/stuck detection
@@ -627,9 +627,9 @@ sequence and §2.5):**
 
 `SIGKILL`/`SIGTERM` use the exact syscalls (`libc::kill(pid, SIGTERM)` /
 `SIGKILL`); the MCP server is a single child (not its own process group from
-agentd's view), so we signal the pid directly here. Subagent process-group kill
+agent's view), so we signal the pid directly here. Subagent process-group kill
 (`killpg`) is a different concern (RFC 0003/0009). The whole MCP-server drain is
-bounded and counts inside `AGENTD_DRAIN_TIMEOUT` (RFC 0011). The reader thread's
+bounded and counts inside `AGENT_DRAIN_TIMEOUT` (RFC 0011). The reader thread's
 `McpEof` confirms exit. A server MAY self-initiate shutdown by closing its
 stdout (we observe EOF and run from step 2).
 
@@ -678,7 +678,7 @@ omitted from the catalogue.
   (parse/classify/dispatch/pending-map); diverges only in `frame.rs`
   (length-prefix vs NDJSON) and in having no MCP lifecycle on the private
   control pipe. The server half (answering `initialize`, emitting
-  `agentd://…updated`) is RFC 0005's, not this one's.
+  `agent://…updated`) is RFC 0005's, not this one's.
 - **RFC 0006 (intelligence transport):** orthogonal — carries the LLM wire
   (OpenAI-compatible/anthropic), not MCP. Its `net/http.rs` is not an MCP
   transport in v1. Do not conflate.
@@ -724,7 +724,7 @@ Explicit DEFER set for the MCP **client** (per §2.5):
   the *server* half — RFC 0005.
 
 The self-MCP **server** subset (lifecycle answer, `subagent.*` tools,
-subscribable `agentd://` resources, unix-socket serving) is entirely RFC 0005.
+subscribable `agent://` resources, unix-socket serving) is entirely RFC 0005.
 
 ---
 

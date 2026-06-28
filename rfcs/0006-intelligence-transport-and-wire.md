@@ -3,12 +3,12 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 > **A2A alignment (RFC 0020).** Note the transport symmetry RFC 0020 exploits:
-> here agentd dials intelligence **out** over vsock behind a TLS-terminating
+> here agent dials intelligence **out** over vsock behind a TLS-terminating
 > sidecar; RFC 0020 serves A2A **in** over vsock behind an HTTP-terminating
-> gateway. Same posture — agentd network-isolated, the gateway/sidecar owns
+> gateway. Same posture — agent network-isolated, the gateway/sidecar owns
 > TLS/auth/HTTP — inverted direction. The vsock transport this RFC defines for
 > the client is mirrored on the serving side (RFC 0015 §3, RFC 0020).
 
@@ -18,7 +18,7 @@
 
 The agentic ReAct loop (RFC 0007), running inside a subagent process, must reach
 exactly **one** LLM endpoint and get back text *and* structured tool calls. That
-endpoint is named by a single URI in `AGENTD_INTELLIGENCE`, and it may sit
+endpoint is named by a single URI in `AGENT_INTELLIGENCE`, and it may sit
 behind three different transports depending on the deployment: a unix-socket
 gateway sidecar, a direct `https://` endpoint, or a `vsock` channel to a host
 LLM service from inside an enclave/microVM. This is the **intelligence wire** —
@@ -58,7 +58,7 @@ Non-negotiable constraints from the assessment:
 ## Decision
 
 1. **One transport-agnostic client.** A single `Transport: Read + Write + Send`
-   trait. Three implementors selected by the `AGENTD_INTELLIGENCE` URI scheme:
+   trait. Three implementors selected by the `AGENT_INTELLIGENCE` URI scheme:
    `unix:/path` (core), `https://…` (feature `tls`), `vsock:<cid>:<port>`
    (feature `vsock`). All three drive the *same* hand-rolled HTTP/1.1 request
    writer and response reader (assessment §2.4). `unix:` and `vsock:` may carry
@@ -73,10 +73,10 @@ Non-negotiable constraints from the assessment:
 3. **Exactly two in-binary adapters.** `openai-compatible` (the canonical
    default, also serves OpenAI proper) and `anthropic`. Both salvaged from the
    retired `intelligence/providers.rs`, widened for tool-calling. Selected by
-   `AGENTD_INTELLIGENCE_DIALECT` (default `openai`).
+   `AGENT_INTELLIGENCE_DIALECT` (default `openai`).
 
 4. **JSON-action fallback.** When a gateway/model lacks native tool-calling
-   (declared via `AGENTD_INTELLIGENCE_TOOLMODE=json`, or auto-detected when a
+   (declared via `AGENT_INTELLIGENCE_TOOLMODE=json`, or auto-detected when a
    response carries no `tool_calls` but parses as a `{"action":…}` object), the
    loop falls back to the retired `{"action":"tool"|"final"}` shape parsed with
    `extract_json_object` (balanced-brace, prose-tolerant — lifted verbatim from
@@ -313,7 +313,7 @@ RFC 0011); connection refused/reset → fatal intelligence-unreachable (exit 4).
 
 **Legacy framed `complete` over unix/vsock.** For the existing sidecar that
 speaks the retired JSON-RPC `complete` envelope over 4-byte-LE length framing
-rather than HTTP, the client supports `AGENTD_INTELLIGENCE_WIRE=framed`
+rather than HTTP, the client supports `AGENT_INTELLIGENCE_WIRE=framed`
 selecting `read_frame`/`write_frame` (KEEP-AS-IS from
 `intelligence/protocol.rs:88-120`) instead of `round_trip`. Default is `http`.
 The same `read_frame`/`write_frame` helpers are the control-channel codec in
@@ -389,7 +389,7 @@ with the `tool_use`/`stop_reason` arms).
 The retired **gemini** and bare **openai** arms collapse: gemini is **dropped
 from the binary** (lives behind the gateway, assessment §2.4); `openai` and
 `openai-compatible` are one adapter (they already share the build/parse arms,
-`providers.rs:155`). Dialect selected by `AGENTD_INTELLIGENCE_DIALECT` ∈
+`providers.rs:155`). Dialect selected by `AGENT_INTELLIGENCE_DIALECT` ∈
 {`openai`, `anthropic`}, default `openai`.
 
 ### 5. JSON-action fallback — `loop/action.rs`
@@ -421,7 +421,7 @@ object is dispatched:
 Toolmode is decided per-endpoint:
 
 ```
-AGENTD_INTELLIGENCE_TOOLMODE = native (default) | json | auto
+AGENT_INTELLIGENCE_TOOLMODE = native (default) | json | auto
 ```
 
 `auto` tries native first; if the first response carries no `tool_calls` **and**
@@ -464,7 +464,7 @@ env/flag (§2.10, §2.11).
 
 Credential plumbing into the intelligence client:
 
-- `AGENTD_INTELLIGENCE_TOKEN` — the generic bearer / `x-api-key` value (resolved
+- `AGENT_INTELLIGENCE_TOKEN` — the generic bearer / `x-api-key` value (resolved
   by name through `resolve`, so it may be a file-backed rotating secret).
 - Provider-specific names accepted as aliases for clarity but resolved through
   the same front door.

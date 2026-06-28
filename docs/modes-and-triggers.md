@@ -119,7 +119,7 @@ child won't self-terminate.)
 > continuation of the prior session is a planned `--session fresh|warm` knob
 > (RFC 0008 §3.1.2; default fresh for `--interval D>0`, warm for `--interval 0`).
 > **(roadmap)** — not yet on the CLI surface in
-> [`config.rs`](../crates/agent/src/config.rs); v1 re-enters fresh.
+> [`config.rs`](../crates/agentd/src/config.rs); v1 re-enters fresh.
 
 ---
 
@@ -377,7 +377,7 @@ limit class.
 > **Internal cron.** A 5-field cron expression (`--mode schedule --cron
 > "<min hour dom mon dow>"`, UTC, RFC 0008 §3.6) ships behind the `cron` build
 > feature. The `--cron` flag is on the CLI surface today
-> ([`config.rs`](../crates/agent/src/config.rs)); build with `--features cron`
+> ([`config.rs`](../crates/agentd/src/config.rs)); build with `--features cron`
 > to enable it. For production, prefer an external CronJob → `once`, or
 > `--interval`.
 
@@ -386,7 +386,7 @@ limit class.
 ## CLI / env surface for modes & triggers
 
 These are the flags that actually exist today
-([`crates/agent/src/config.rs`](../crates/agent/src/config.rs)). Precedence is
+([`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs)). Precedence is
 built-in default < (config file, later) < env var < flag, validated **before any
 side effect** (a bad config exits `2` in milliseconds, RFC 0011).
 
@@ -445,7 +445,7 @@ See `agent --help` for the full flag list.
 - RFC 0011 — cloud-native contract (exit codes, config precedence, drain)
 - Binding decisions — `docs/design/00-architecture-assessment.md`
 - Build progress — `docs/design/PLAN.md`
-- The live CLI/env surface — `crates/agent/src/config.rs`
+- The live CLI/env surface — `crates/agentd/src/config.rs`
 - [Horizontal scaling](scaling.md) — running the reactive worker as a *fleet*:
   `--shard K/N` partitioning + work-claim leases extend the exactly-one-owner rule
   from intra- to **inter**-instance (RFC 0019).

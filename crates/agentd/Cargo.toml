@@ -37,13 +37,13 @@ a2a = ["serve-mcp"]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
-# The agentd://events live-event resource (RFC 0016 §7): a bounded in-memory
+# The agent://events live-event resource (RFC 0016 §7): a bounded in-memory
 # ring of the RFC 0010 §3.2 JSON lines, served over the self-MCP with the RFC
 # 0005 notify-then-read cursor. Rides serve-mcp (it's a served resource); no dep
 # — reuses the existing serde_json serializer + the served listener.
 events = ["serve-mcp"]
 # Horizontal scaling (RFC 0019): `--shard K/N` partitioning + the autoscaling
-# signal set + the agentd://capacity read surface. Dependency-free — the shard
+# signal set + the agent://capacity read surface. Dependency-free — the shard
 # predicate is a hand-rolled FNV-1a (no hashbrown/siphash/sha2), pure CPU; the
 # capacity resource rides serve-mcp (gated like events/intelligence). Also the
 # work-claim/lease cross-instance ownership (RFC 0015 §5.6 work.* contract; spawn-
@@ -109,7 +109,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 
-# Unix-only test helper: send SIGTERM to a spawned agentd to exercise the
+# Unix-only test helper: send SIGTERM to a spawned agent to exercise the
 # graceful-drain → exit-0 contract for the long-lived (loop/schedule/reactive)
 # modes. `libc` is already a runtime dependency on Unix; this adds no new crate.
 [target.'cfg(unix)'.dev-dependencies]

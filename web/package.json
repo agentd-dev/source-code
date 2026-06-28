@@ -1,5 +1,5 @@
 {
-  "name": "agentd-site",
+  "name": "agent-site",
   "private": true,
   "scripts": {
     "dev": "next dev",

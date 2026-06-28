@@ -8,7 +8,7 @@ instruction files and MCP server config they use.
 > supervisor + subagent process tree, the MCP client, served self-MCP, and all
 > four run modes ship; the commands below run real agent runs (given an
 > intelligence endpoint + MCP servers). Every flag and env var used here exists
-> in `crates/agent/src/config.rs` (the authoritative surface).
+> in `crates/agentd/src/config.rs` (the authoritative surface).
 
 ---
 
@@ -239,7 +239,7 @@ redacted (`***`) in all agent output, including panic messages.
 
 ## Flag reference (used by these samples)
 
-Every flag below is in `crates/agent/src/config.rs`; run `agent --help` for the
+Every flag below is in `crates/agentd/src/config.rs`; run `agent --help` for the
 full list. Anything env-settable (12-factor) is shown with its env var.
 
 | Flag | Env | Meaning |

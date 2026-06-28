@@ -9,7 +9,7 @@ import { workflow, node } from "../src/index.js";
 
 function classifier() {
   return workflow("doc_classifier")
-    .policy({ fs: { write: ["/tmp/agentd-out/**"] } })
+    .policy({ fs: { write: ["/tmp/agent-out/**"] } })
     .start("main", "classify")
     .node("classify", node.llmInfer({ backend: "claude", prompt: "Classify the document.", inputFrom: "trigger", outputSchema: "inline" }))
     .node("route", node.switch({ expr: "classify.parsed.decision" }))
@@ -24,7 +24,7 @@ function classifier() {
 test("emits the expected TOML shape", () => {
   const toml = classifier().toToml();
   assert.match(toml, /name = "doc_classifier"/);
-  assert.match(toml, /\[policy\.fs\]\nwrite = \["\/tmp\/agentd-out\/\*\*"\]/);
+  assert.match(toml, /\[policy\.fs\]\nwrite = \["\/tmp\/agent-out\/\*\*"\]/);
   assert.match(toml, /\[\[nodes\]\]\nid = "classify"\ntype = "llm_infer"/);
   assert.match(toml, /backend = "claude"/);
   assert.match(toml, /when = "invoice"/);
@@ -36,13 +36,13 @@ test("rejects duplicate node ids", () => {
   assert.throws(() => workflow("x").node("a", node.merge()).node("a", node.terminate()));
 });
 
-// If a built `agentd` binary is reachable, prove the generated TOML is
+// If a built `agent` binary is reachable, prove the generated TOML is
 // not just well-shaped but *accepted by the real runtime*.
-test("generated TOML validates against agentd (when available)", (t) => {
+test("generated TOML validates against agent (when available)", (t) => {
   const candidates = [
-    process.env.AGENTD_BIN,
-    "../../../target/debug/agentd",
-    "../../target/debug/agentd",
+    process.env.AGENT_BIN,
+    "../../../target/debug/agent",
+    "../../target/debug/agent",
   ].filter(Boolean);
   let bin;
   for (const c of candidates) {
@@ -54,9 +54,9 @@ test("generated TOML validates against agentd (when available)", (t) => {
       /* try next */
     }
   }
-  if (!bin) return t.skip("agentd binary not found");
+  if (!bin) return t.skip("agent binary not found");
 
-  const dir = mkdtempSync(join(tmpdir(), "agentd-sdk-"));
+  const dir = mkdtempSync(join(tmpdir(), "agent-sdk-"));
   const file = join(dir, "wf.toml");
   writeFileSync(file, classifier().toToml());
   // --validate-only exits 0 only if the workflow parses + validates.

@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
@@ -13,7 +13,7 @@ RFC 0001 §3/§4.1 states supervision as a one-line responsibility — "spawn,
 track, reap, enforce limits." That is a slogan. The reliability review found
 twelve concrete gaps; the architecture-decision document elevates them to
 binding mechanisms in §2.8. This RFC is the implementation-ready specification
-for those mechanisms: how agentd, as the crash-resilient root of a process
+for those mechanisms: how agent, as the crash-resilient root of a process
 tree, **detects** that a child is dead or stuck, **kills** a subtree without
 killing itself, **recovers** after its own crash, and **accounts** for spend
 across the whole tree.
@@ -129,7 +129,7 @@ let is_pid1 = (unsafe { libc::getpid() } == 1); // first-class container case
 
 `is_pid1` changes nothing functionally — `PR_SET_CHILD_SUBREAPER` already routes
 orphans to us — but it is logged (`proc.start`) and documented: **the
-recommended container entrypoint is agentd itself; we are a tini-class init for
+recommended container entrypoint is agent itself; we are a tini-class init for
 our tree and do not require an external `tini`.**
 
 `SIGCHLD`, `SIGTERM`, `SIGINT` are installed via `sigaction` with `SA_RESTART`
@@ -141,8 +141,8 @@ the self-pipe (RFC 0002 owns the self-pipe; this RFC consumes its wake).
 
 Every `Child` carries `deadline: Instant`, minted at spawn from `limits`
 (RFC 0009). **A deadline is mandatory and finite** — never infinity. Default
-`AGENTD_CHILD_DEADLINE = 600s` for subagents; `exec` children get
-`AGENTD_EXEC_DEADLINE = 120s` (override per-spawn, but never to "none").
+`AGENT_CHILD_DEADLINE = 600s` for subagents; `exec` children get
+`AGENT_EXEC_DEADLINE = 120s` (override per-spawn, but never to "none").
 
 The reactor (RFC 0002) arms its `recv_timeout` to the minimum deadline across
 all non-terminal children:
@@ -179,7 +179,7 @@ if now.duration_since(child.last_event_at) > self.progress_timeout(child) {
 ```
 
 `progress_timeout` must exceed the longest legitimate single tool/model call, so
-it is a **coarse** net: default `AGENTD_PROGRESS_TIMEOUT = 120s` (≈ 2× the model
+it is a **coarse** net: default `AGENT_PROGRESS_TIMEOUT = 120s` (≈ 2× the model
 request timeout). It reuses the existing event stream — no new wire mechanism —
 and fires even if the child's control thread is *also* wedged (Detector C would
 go silent too, but B does not depend on the child answering). Detector C makes
@@ -194,7 +194,7 @@ on a **dedicated thread, decoupled from the agentic loop**, so ping/pong
 liveness survives a long in-flight model/tool call.
 
 Supervisor side — periodic ping on the control channel
-(`AGENTD_PING_INTERVAL = 5s`):
+(`AGENT_PING_INTERVAL = 5s`):
 
 ```rust
 // length-framed JSON-RPC notification, downward (RFC 0005 codec)
@@ -207,7 +207,7 @@ Child control thread replies **immediately**, never touching the loop:
 {"jsonrpc":"2.0","method":"ctrl/pong","params":{"seq": <u64>}}
 ```
 
-Verdict: after `AGENTD_PING_MISS = 3` consecutive unanswered pings
+Verdict: after `AGENT_PING_MISS = 3` consecutive unanswered pings
 (`last_ping_seq - last_pong_seq >= 3` with the oldest outstanding ping older
 than `PING_INTERVAL`), the child's control thread is wedged or the process is in
 uninterruptible `D` state → declare stuck (`StuckReason::PongTimeout`).
@@ -233,7 +233,7 @@ enum Liveness { Healthy, BusyHealthy, Stuck, Exiting, Dead }
 
 fn classify(c: &Child, now: Instant) -> Liveness {
     let eof = c.ctrl_eof;
-    let pongs_ok = (c.last_ping_seq - c.last_pong_seq) < AGENTD_PING_MISS;
+    let pongs_ok = (c.last_ping_seq - c.last_pong_seq) < AGENT_PING_MISS;
     let recent_event = now.duration_since(c.last_event_at) <= c.progress_timeout;
     match (eof, pongs_ok, recent_event) {
         (true,  _,     _)     => Liveness::Exiting, // confirm via waitpid → Dead
@@ -288,12 +288,12 @@ failure, §3.7). Non-zero exit, signal death, or a stuck-kill = failure.
 
 `ready_at` is stamped on the first `ctrl/ready` frame the child emits in early
 `main` (§3.9). A child that reaches `Exited` before `ready_at` within
-`AGENTD_SPAWN_READY = 2s` is a **crash-on-spawn** (§3.7) — the fork-bomb early
+`AGENT_SPAWN_READY = 2s` is a **crash-on-spawn** (§3.7) — the fork-bomb early
 warning.
 
 ### 3.5 (kill) The bounded depth-first kill ladder
 
-Triggered by: SIGTERM/SIGINT to agentd (drain — RFC 0011 owns the choreography,
+Triggered by: SIGTERM/SIGINT to agent (drain — RFC 0011 owns the choreography,
 this RFC owns the ladder), a Detector A/B/C verdict on one subtree, or a budget
 breach (§3.8). Each subagent is its own **process group** (`setpgid(0,0)` in
 `pre_exec`, §3.9) so a subtree is signalled atomically with `killpg`.
@@ -303,10 +303,10 @@ mid-teardown, so set a **tree-wide draining flag** first that makes
 `subagent.spawn` (RFC 0005/0009) error, then tear down leaves before roots:
 
 ```rust
-const DRAIN_GRACE: Duration = Duration::from_secs(5);   // AGENTD_DRAIN_GRACE
-const KILL_GRACE:  Duration = Duration::from_secs(2);   // AGENTD_KILL_GRACE
+const DRAIN_GRACE: Duration = Duration::from_secs(5);   // AGENT_DRAIN_GRACE
+const KILL_GRACE:  Duration = Duration::from_secs(2);   // AGENT_KILL_GRACE
 // per-subtree budget = DRAIN_GRACE + KILL_GRACE = 7s nominal;
-// AGENTD_DRAIN_TIMEOUT = 25s caps the WHOLE tree and MUST be
+// AGENT_DRAIN_TIMEOUT = 25s caps the WHOLE tree and MUST be
 // < terminationGracePeriodSeconds (rec 30s) — validated at startup (RFC 0011).
 
 fn kill_subtree(&mut self, root: Handle, force: bool) {
@@ -385,7 +385,7 @@ to reactive-session-backing children (RFC 0008). Per-handle state:
 
 ```rust
 struct RestartHistory {
-    window: Duration,                 // AGENTD_RESTART_WINDOW = 60s
+    window: Duration,                 // AGENT_RESTART_WINDOW = 60s
     failures: VecDeque<Instant>,      // failure timestamps inside the window
     consecutive: u32,
     breaker_open_until: Option<Instant>,
@@ -408,12 +408,12 @@ fn backoff(&self) -> Duration {
   timer, §3.2).
 - **Circuit breaker.** More than `BREAKER_THRESHOLD` failures inside `window` →
   open the breaker for that handle: stop respawning, mark the session **failed**,
-  surface it as a self-MCP resource (`agentd://session/<id>` state=failed,
+  surface it as a self-MCP resource (`agent://session/<id>` state=failed,
   RFC 0005) so a watcher/operator sees it, and **drop routed reactive events**
   that would target the broken session (RFC 0008) — do not spawn into a known-bad
   loop.
 - **Crash-on-spawn fast-fail.** A child that exits before its `ctrl/ready` frame
-  within `AGENTD_SPAWN_READY = 2s` (§3.6) is a spawn failure weighted
+  within `AGENT_SPAWN_READY = 2s` (§3.6) is a spawn failure weighted
   `SPAWN_FAIL_WEIGHT` heavier — the fork-bomb early warning.
 - **Success ≠ failure.** Clean exit 0 + a received `final` result does not count
   against the breaker; only non-zero exit, signal death, or stuck-kill does.
@@ -487,14 +487,14 @@ after PDEATHSIG + getppid recheck succeed.
 
 ### 3.10 cgroup-v2 awareness (not requirement)
 
-agentd is cgroup-v2-**aware** but **never hard-requires cgroup write access**
+agent is cgroup-v2-**aware** but **never hard-requires cgroup write access**
 (assessment §2.8). At startup:
 
 - **Read** `/sys/fs/cgroup/memory.max` and `memory.high` if present; log them
   (`config.loaded`) and use `memory.high` as a backpressure hint (slow new
   spawns when approaching it).
 - **Place the tree in a child cgroup** only when the cgroup is writable: create
-  `…/agentd.<run_id>/`, write the supervisor PID to `cgroup.procs`; on drain,
+  `…/agent.<run_id>/`, write the supervisor PID to `cgroup.procs`; on drain,
   `echo 1 > cgroup.kill` reaps the entire subtree atomically (covers `D`-state
   and orphans the ladder might miss).
 - **Fallback when not writable** (the common unprivileged case): rlimit
@@ -553,7 +553,7 @@ write + `fsync` of file **and** dir) is a **deferred v2 extension**
 - **RFC 0005 (Self-MCP server & control protocol):** defines the length-framed
   JSON-RPC control channel carrying `ctrl/ping`, `ctrl/pong`, `ctrl/cancel`,
   `ctrl/ready`, lifecycle and `usage` frames consumed here; and the
-  `agentd://session/<id>` resource the breaker surfaces (§3.7).
+  `agent://session/<id>` resource the breaker surfaces (§3.7).
 - **RFC 0007 (Agentic loop):** the loop runs in the subagent on a thread
   **separate** from the control reader (the §3.4 hard requirement); it emits the
   `usage` and progress events that drive Detectors B/C and §3.8.
@@ -569,7 +569,7 @@ write + `fsync` of file **and** dir) is a **deferred v2 extension**
   event — `subagent.spawn/exit/signal/stuck/restart`, `limit.exceeded`; the
   stuck-leak and breaker-open counters; the supervisor heartbeat / health file.
 - **RFC 0011 (Cloud-native contract):** owns the drain *choreography*, the
-  `AGENTD_DRAIN_TIMEOUT < terminationGracePeriodSeconds` startup validation, and
+  `AGENT_DRAIN_TIMEOUT < terminationGracePeriodSeconds` startup validation, and
   the exit-code table this RFC's verdicts map to (0/7/124/137/143). This RFC owns
   the *ladder* the choreography invokes.
 - **RFC 0012 (Security posture):** `exec` children are folded into the same
@@ -607,7 +607,7 @@ write + `fsync` of file **and** dir) is a **deferred v2 extension**
 None that block implementation. Two values are tunable and may be revised by a
 milestone acceptance test, not by redesign:
 
-- The exact `AGENTD_PROGRESS_TIMEOUT` (§3.3) default relative to the model
+- The exact `AGENT_PROGRESS_TIMEOUT` (§3.3) default relative to the model
   request timeout — set conservatively at 120s; M2 chaos testing may tighten it.
 - The `BREAKER_THRESHOLD` / `SPAWN_FAIL_WEIGHT` (§3.7) — chosen conservatively;
   M2 fork-bomb chaos test confirms they trip before resource exhaustion.

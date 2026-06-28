@@ -3,13 +3,13 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends observability (RFC 0010) and the exit-code contract (RFC 0011 §5)
+**Part of:** the agent rewrite — control-plane track (RFC 0014); extends observability (RFC 0010) and the exit-code contract (RFC 0011 §5)
 
 ---
 
 ## 1. Problem / Context
 
-RFC 0010 gave agentd a complete *self-contained* observability story: a closed
+RFC 0010 gave agent a complete *self-contained* observability story: a closed
 JSON-lines log schema, a closed `event` vocabulary, mode-aware health, W3C
 trace-context propagation, and a default "metrics-from-logs" posture with an
 optional hand-rolled Prometheus exposition behind the `metrics` feature. RFC
@@ -23,7 +23,7 @@ results` and `kubectl agents top`; it tails live activity across pods. Every one
 of those couples *tightly* to the exact spelling of a metric name, a label set,
 an exit code, a report field, an event name. The moment any of those is a
 "documented default" rather than a **frozen, versioned contract**, the control
-plane breaks silently on an agentd upgrade — the exact failure RFC 0014 §3.4
+plane breaks silently on an agent upgrade — the exact failure RFC 0014 §3.4
 ("freeze and version what agentctl builds against") exists to prevent.
 
 This RFC does **not** add a new telemetry mechanism. RFC 0010 already owns the
@@ -37,8 +37,8 @@ a contract surface agentctl can build against:
 2. the **exit-code *contract*** around RFC 0011 §5's table — frozen, versioned,
    surfaced in the manifest, and mapped to `podFailurePolicy` intent;
 3. **machine-readable run-outcome reports** for `once`/`Job` runs (`--report-file`
-   and `agentd://run/{run_id}`) — what powers `kubectl agents results`;
-4. the **`agentd://events` stream** — a subscribable live event resource so
+   and `agent://run/{run_id}`) — what powers `kubectl agents results`;
+4. the **`agent://events` stream** — a subscribable live event resource so
    agentctl tails activity over the self-MCP without scraping stderr;
 5. **stuck-liveness** — surfacing RFC 0003's internal stuck-detector through
    `/healthz` so k8s restarts a *wedged* instance (a live PID is not a live
@@ -55,7 +55,7 @@ report reuse the existing `serde_json` serializer and the existing self-MCP
 transports. **Nothing here pulls an async runtime, a Kubernetes client, or a
 TLS/gRPC stack.** The Kubernetes-facing translation — the dashboards, the
 alert-rule YAML, the HPA/KEDA scaler objects, the `podFailurePolicy` documents,
-the `kubectl` rendering — lives entirely in agentctl. agentd exposes the
+the `kubectl` rendering — lives entirely in agentctl. agent exposes the
 primitives; agentctl owns the policy (RFC 0014 §3).
 
 ---
@@ -85,15 +85,15 @@ primitives; agentctl owns the policy (RFC 0014 §3).
    `once`/`loop`-bounded/`schedule`-tick run writes a single JSON object —
    `{run_id, status, exit_code, usage{tokens_in,tokens_out,steps}, duration_ms,
    distillate_ref, started_at, ended_at, …}` — to `--report-file PATH` (atomic
-   write) when configured, and serves the same object as `agentd://run/{run_id}`
+   write) when configured, and serves the same object as `agent://run/{run_id}`
    (RFC 0005 §3.3). `status` is the RFC 0007 §3.4 terminal-status string;
    `exit_code` is the RFC 0011 §5 code. This is the structured backend for
    `kubectl agents results`. **Reactive daemons do not emit a final report**
    (they have no single terminal outcome); their per-reaction outcomes live in
    the event stream and metrics.
 
-4. **Serve `agentd://events`: a subscribable, bounded live-event resource (§7).**
-   A new read-only `agentd://` resource (RFC 0005 scheme) carrying the RFC 0010
+4. **Serve `agent://events`: a subscribable, bounded live-event resource (§7).**
+   A new read-only `agent://` resource (RFC 0005 scheme) carrying the RFC 0010
    §3.2 line schema over the RFC 0005 **notify-then-read** semantics, backed by a
    **bounded in-memory ring** the subscriber drains. agentctl tails live activity
    over the self-MCP (vsock or unix), never by scraping container stderr. It is
@@ -110,7 +110,7 @@ primitives; agentctl owns the policy (RFC 0014 §3).
 6. **Correlation is RFC 0010 §3.6, restated for the fleet (§9).** W3C
    `traceparent` adopted-or-minted on ingest, propagated on every MCP call, LLM
    call, and spawn payload, means a multi-pod agentctl-driven flow stitches into
-   one trace with no new agentd work. This RFC adds nothing; it points agentctl
+   one trace with no new agent work. This RFC adds nothing; it points agentctl
    at the existing fields.
 
 7. **Hold the moat and version everything agentctl couples to (§8).** Every
@@ -130,22 +130,22 @@ RFC freezes and exposes, it does not re-implement.
 
 | Concern | Owner | This RFC's role |
 |---|---|---|
-| JSON-lines log schema + `event` vocabulary | **RFC 0010 §3.2/§3.3** | reuse verbatim as the `agentd://events` body and the report's provenance |
+| JSON-lines log schema + `event` vocabulary | **RFC 0010 §3.2/§3.3** | reuse verbatim as the `agent://events` body and the report's provenance |
 | Metric exposition mechanism (Prometheus text) | **RFC 0010 §3.8** | reuse; **freeze + version** the *name/label set* |
 | Health surface (`/healthz`, `/readyz`, health file) | **RFC 0010 §3.7** | reuse; state the control-plane *liveness intent* only |
 | W3C trace-context propagation | **RFC 0010 §3.6** | reuse; restate for multi-pod stitching |
 | Exit-code table | **RFC 0011 §5** | reuse; **freeze + version**, add `podFailurePolicy` intent |
 | Drain choreography / signals | **RFC 0011 §4** | reuse; report a clean drain as `0` and `drain`/`restart` as metrics |
-| Terminal-status vocabulary | **RFC 0007 §3.4** | reuse as `report.status` and the `agentd_runs_total{status}` label |
+| Terminal-status vocabulary | **RFC 0007 §3.4** | reuse as `report.status` and the `agent_runs_total{status}` label |
 | Stuck-detector (3-detector model, EOF×pong) | **RFC 0003 §3.2–3.5** | reuse; surface the wedged-reactor verdict to `/healthz` and a metric |
-| MCP wire / codec | **RFC 0004** | reuse for the `agentd://events` notify-then-read frames |
-| Self-MCP `agentd://` resources + control protocol | **RFC 0005** | reuse the scheme + notify-then-read; add `agentd://events` |
+| MCP wire / codec | **RFC 0004** | reuse for the `agent://events` notify-then-read frames |
+| Self-MCP `agent://` resources + control protocol | **RFC 0005** | reuse the scheme + notify-then-read; add `agent://events` |
 | Capabilities manifest | **RFC 0014 §5 / RFC 0015** | extend `surfaces` with `metrics_schema` + `exit_codes` versions |
 
 If a row says "reuse," this RFC must not redefine it. The new artifacts this RFC
 *introduces* are exactly four: the frozen `metrics_schema` enumeration (§4), the
 exit-code→`podFailurePolicy` intent mapping + versioning (§5), the run-outcome
-report object + `--report-file` flag (§6), and the `agentd://events` resource +
+report object + `--report-file` flag (§6), and the `agent://events` resource +
 its ring (§7).
 
 ---
@@ -180,24 +180,24 @@ report (§6) or the event stream (§7), never a metric.
 
 ### 4.3 The enumerated set (the contract)
 
-Grouped by what an agentctl dashboard/alert/scaler consumes. `agentd_up` and
-`agentd_ready` are the liveness/readiness gauges; everything else is keyed to a
+Grouped by what an agentctl dashboard/alert/scaler consumes. `agent_up` and
+`agent_ready` are the liveness/readiness gauges; everything else is keyed to a
 closed-vocabulary event (RFC 0010 §3.3) so the derived and emitted forms agree.
 
 **Run lifecycle & terminal-status (the `kubectl agents results`/alert inputs):**
 
 | Metric | Type | Labels | Source event |
 |---|---|---|---|
-| `agentd_up` | gauge | — | `1` while the process is alive |
-| `agentd_ready` | gauge | — | `0/1`; `proc.ready` / drain (RFC 0010 §3.7) |
-| `agentd_runs_total` | counter | `status` | `loop.final` / one-shot terminal — `status` ∈ RFC 0007 §3.4 closed set |
-| `agentd_run_duration_ms` | histogram | `status` | run start → terminal |
-| `agentd_loop_steps_total` | counter | — | `loop.step` |
+| `agent_up` | gauge | — | `1` while the process is alive |
+| `agent_ready` | gauge | — | `0/1`; `proc.ready` / drain (RFC 0010 §3.7) |
+| `agent_runs_total` | counter | `status` | `loop.final` / one-shot terminal — `status` ∈ RFC 0007 §3.4 closed set |
+| `agent_run_duration_ms` | histogram | `status` | run start → terminal |
+| `agent_loop_steps_total` | counter | — | `loop.step` |
 
 `status` is the **RFC 0007 §3.4** closed vocabulary verbatim —
 `completed`/`refused`/`exhausted_steps`/`exhausted_tokens`/`deadline`/`stalled`/
 `loop_detected`/`cancelled`/`crashed`. agentctl's "terminal-status histogram"
-dashboard is `sum by (status) (agentd_runs_total)`. No new status strings are
+dashboard is `sum by (status) (agent_runs_total)`. No new status strings are
 minted here; introducing one is RFC 0007's job, and would bump `metrics_schema`
 only if it changes the closed label domain (it does — see §8).
 
@@ -205,25 +205,25 @@ only if it changes the closed label domain (it does — see §8).
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_tokens_total` | counter | `model`, `type` | `intel.result.usage`; `type` ∈ `in`\|`out` |
-| `agentd_intel_calls_total` | counter | `model` | `intel.call` |
-| `agentd_intel_call_duration_ms` | histogram | `model` | `intel.call`→`intel.result` |
+| `agent_tokens_total` | counter | `model`, `type` | `intel.result.usage`; `type` ∈ `in`\|`out` |
+| `agent_intel_calls_total` | counter | `model` | `intel.call` |
+| `agent_intel_call_duration_ms` | histogram | `model` | `intel.call`→`intel.result` |
 
 Token accounting honesty (RFC 0010 §3.9): tokens come from the intelligence
 `usage` (RFC 0006); when a gateway omits it, the counter is **not incremented
-with a guess** — absence is `0`, never an estimate, so `agentd_tokens_total`
-stays trustworthy for cost aggregation. agentd emits *tokens*, not currency;
-**cost = tokens × a price table agentctl owns** — agentd never learns a price
+with a guess** — absence is `0`, never an estimate, so `agent_tokens_total`
+stays trustworthy for cost aggregation. agent emits *tokens*, not currency;
+**cost = tokens × a price table agentctl owns** — agent never learns a price
 (no pricing in the data plane).
 
 **Refusal / bound counters by reason (the safety + alert inputs):**
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_refusals_total` | counter | `reason` | the model/loop refused or a guard tripped |
-| `agentd_limit_exceeded_total` | counter | `limit` | `limit.exceeded` (RFC 0010 §3.3) |
+| `agent_refusals_total` | counter | `reason` | the model/loop refused or a guard tripped |
+| `agent_limit_exceeded_total` | counter | `limit` | `limit.exceeded` (RFC 0010 §3.3) |
 
-`agentd_refusals_total{reason}` is the headline safety metric. `reason` is a
+`agent_refusals_total{reason}` is the headline safety metric. `reason` is a
 **closed** label domain spanning the trust-budget and bound refusals:
 
 ```
@@ -234,7 +234,7 @@ depth       — a max-depth spawn refusal (RFC 0009)
 mcp         — an MCP scope / unavailable-tool refusal (RFC 0007 §3.6)
 ```
 
-`agentd_limit_exceeded_total{limit}` mirrors the `limit.exceeded` event's
+`agent_limit_exceeded_total{limit}` mirrors the `limit.exceeded` event's
 `limit` field (`steps`/`tokens`/`deadline`/`depth`/`tree_tokens`/`restart_storm`/
 `spawn_rate`) — these are the *hard bound* trips; `refusals_total` is the
 *model/guard verdict* layer. They are kept distinct so an alert can separate "the
@@ -244,44 +244,44 @@ model declined" from "a safety cap fired."
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_active_subagents` | gauge | — | `subagent.spawn`/`exit` delta |
-| `agentd_tree_depth` | gauge | — | current max depth |
-| `agentd_tree_breadth` | gauge | — | current max siblings at any node |
-| `agentd_subagents_spawned_total` | counter | — | `subagent.spawn` |
-| `agentd_subagents_exited_total` | counter | `status` | `subagent.exit` (RFC 0007 §3.4 status) |
-| `agentd_subagent_restarts_total` | counter | `reason` | `subagent.restart` (RFC 0003 §3.7) |
-| `agentd_subagent_stuck_kills_total` | counter | `signal` | `subagent.stuck` — the reliability headline (RFC 0003) |
+| `agent_active_subagents` | gauge | — | `subagent.spawn`/`exit` delta |
+| `agent_tree_depth` | gauge | — | current max depth |
+| `agent_tree_breadth` | gauge | — | current max siblings at any node |
+| `agent_subagents_spawned_total` | counter | — | `subagent.spawn` |
+| `agent_subagents_exited_total` | counter | `status` | `subagent.exit` (RFC 0007 §3.4 status) |
+| `agent_subagent_restarts_total` | counter | `reason` | `subagent.restart` (RFC 0003 §3.7) |
+| `agent_subagent_stuck_kills_total` | counter | `signal` | `subagent.stuck` — the reliability headline (RFC 0003) |
 
 **Intelligence health (the model-endpoint inputs RFC 0018 also reads):**
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_intel_up` | gauge | — | `0/1` — intelligence endpoint reachable (RFC 0006/0018) |
-| `agentd_intel_errors_total` | counter | `reason` | `unreachable`\|`auth`\|`timeout`\|`5xx` |
+| `agent_intel_up` | gauge | — | `0/1` — intelligence endpoint reachable (RFC 0006/0018) |
+| `agent_intel_errors_total` | counter | `reason` | `unreachable`\|`auth`\|`timeout`\|`5xx` |
 
-`agentd_intel_call_duration_ms` (above) doubles as the intelligence latency
+`agent_intel_call_duration_ms` (above) doubles as the intelligence latency
 histogram. RFC 0018 owns multi-endpoint failover; this RFC only freezes
-`agentd_intel_up`/`_errors_total` so an alert/scaler has them at `metrics_schema`
+`agent_intel_up`/`_errors_total` so an alert/scaler has them at `metrics_schema`
 `1.0` regardless of whether the `intelligence-resilience` feature is built.
 
 **MCP server health (the dependency inputs):**
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_mcp_up` | gauge | `server` | `0/1` per declared MCP server (RFC 0004) |
-| `agentd_mcp_connect_failures_total` | counter | `server` | `mcp.connect.fail` |
-| `agentd_tool_calls_total` | counter | `server`, `tool`, `ok` | `tool.result` |
-| `agentd_tool_call_duration_ms` | histogram | `server`, `tool` | `tool.call`→`tool.result` |
+| `agent_mcp_up` | gauge | `server` | `0/1` per declared MCP server (RFC 0004) |
+| `agent_mcp_connect_failures_total` | counter | `server` | `mcp.connect.fail` |
+| `agent_tool_calls_total` | counter | `server`, `tool`, `ok` | `tool.result` |
+| `agent_tool_call_duration_ms` | histogram | `server`, `tool` | `tool.call`→`tool.result` |
 
 **Lifecycle events (the rollout / drain inputs):**
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_drains_total` | counter | `phase` | drain entered/completed (RFC 0011 §4) |
-| `agentd_restarts_total` | counter | — | supervisor process restarts observed (rebuild+reconcile, RFC 0003 §3.11) |
-| `agentd_reactor_stalls_total` | counter | — | wedged-reactor liveness trips (RFC 0003/§5 below) |
+| `agent_drains_total` | counter | `phase` | drain entered/completed (RFC 0011 §4) |
+| `agent_restarts_total` | counter | — | supervisor process restarts observed (rebuild+reconcile, RFC 0003 §3.11) |
+| `agent_reactor_stalls_total` | counter | — | wedged-reactor liveness trips (RFC 0003/§5 below) |
 
-`agentd_drains_total{phase}` with `phase` ∈ `started`\|`completed`\|`forced`
+`agent_drains_total{phase}` with `phase` ∈ `started`\|`completed`\|`forced`
 lets agentctl distinguish a clean rolling drain (`completed`, exit `0`) from a
 forced one (`forced`, exit `143`) — the dashboard counterpart to the exit-code
 distinction in §5.
@@ -290,37 +290,37 @@ distinction in §5.
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `agentd_pending_events` | gauge | — | events received but not yet routed to a turn (RFC 0008) |
-| `agentd_inflight_reactions` | gauge | — | reactions currently executing |
-| `agentd_subscriptions_active` | gauge | — | reconciled declared subscriptions (RFC 0008) |
-| `agentd_reaction_lag_ms` | gauge | — | age of the oldest un-routed pending event |
+| `agent_pending_events` | gauge | — | events received but not yet routed to a turn (RFC 0008) |
+| `agent_inflight_reactions` | gauge | — | reactions currently executing |
+| `agent_subscriptions_active` | gauge | — | reconciled declared subscriptions (RFC 0008) |
+| `agent_reaction_lag_ms` | gauge | — | age of the oldest un-routed pending event |
 
 These four are the **scaling signal set** RFC 0019 builds a KEDA/HPA scaler on
-(scale on `agentd_pending_events` / `agentd_reaction_lag_ms`). They are frozen
+(scale on `agent_pending_events` / `agent_reaction_lag_ms`). They are frozen
 *here* so RFC 0019's scaler is authored against a stable name at `metrics_schema`
-`1.0`. agentd exposes the gauge; **the scaler object, the target value, and the
-scale-up/down policy are agentctl's** (RFC 0019). agentd never learns it is being
+`1.0`. agent exposes the gauge; **the scaler object, the target value, and the
+scale-up/down policy are agentctl's** (RFC 0019). agent never learns it is being
 scaled.
 
 ### 4.4 Example exposition
 
 ```
-# HELP agentd_runs_total Runs by terminal status (RFC 0007 §3.4).
-# TYPE agentd_runs_total counter
-agentd_runs_total{status="completed"} 184
-agentd_runs_total{status="refused"} 3
-agentd_runs_total{status="deadline"} 1
-# HELP agentd_tokens_total Model tokens by direction and model.
-# TYPE agentd_tokens_total counter
-agentd_tokens_total{model="claude-opus-4",type="in"} 9412233
-agentd_tokens_total{model="claude-opus-4",type="out"} 412044
-# HELP agentd_pending_events Reactive events received but not yet routed.
-# TYPE agentd_pending_events gauge
-agentd_pending_events 7
-# HELP agentd_refusals_total Refusals/guard trips by reason.
-# TYPE agentd_refusals_total counter
-agentd_refusals_total{reason="trifecta"} 2
-agentd_refusals_total{reason="depth"} 1
+# HELP agent_runs_total Runs by terminal status (RFC 0007 §3.4).
+# TYPE agent_runs_total counter
+agent_runs_total{status="completed"} 184
+agent_runs_total{status="refused"} 3
+agent_runs_total{status="deadline"} 1
+# HELP agent_tokens_total Model tokens by direction and model.
+# TYPE agent_tokens_total counter
+agent_tokens_total{model="claude-opus-4",type="in"} 9412233
+agent_tokens_total{model="claude-opus-4",type="out"} 412044
+# HELP agent_pending_events Reactive events received but not yet routed.
+# TYPE agent_pending_events gauge
+agent_pending_events 7
+# HELP agent_refusals_total Refusals/guard trips by reason.
+# TYPE agent_refusals_total counter
+agent_refusals_total{reason="trifecta"} 2
+agent_refusals_total{reason="depth"} 1
 ```
 
 A scrape carries no `metrics_schema` label (it would be unbounded churn across a
@@ -348,7 +348,7 @@ a major it does not understand.
 
 Each RFC 0011 §5 code carries a **control-plane intent** — what a
 `podFailurePolicy` *should* do — so agentctl can mechanically emit `onExitCodes`
-rules. agentd emits the code; agentctl owns the actual `FailJob`/`Ignore`/`Count`
+rules. agent emits the code; agentctl owns the actual `FailJob`/`Ignore`/`Count`
 choice and any operator override.
 
 | Code (RFC 0011 §5) | Name | Intent | agentctl `podFailurePolicy` hint |
@@ -373,25 +373,25 @@ when present. `infra` codes are never authored as a retry rule — they signal a
 
 ### 5.3 OS-set 137/143 semantics (the clean-drain distinction)
 
-`137` and `143` are **kernel-set** (`128 + signo`); agentd never returns them
+`137` and `143` are **kernel-set** (`128 + signo`); agent never returns them
 (RFC 0011 §5.1 — `ExitCode` enum tops out at `124`). The control-plane-critical
 invariant, owned by RFC 0011 §4: **a clean SIGTERM drain returns `0`, not `143`**.
 Therefore:
 
-- **`0` after SIGTERM** = the drain completed within `AGENTD_DRAIN_TIMEOUT`
+- **`0` after SIGTERM** = the drain completed within `AGENT_DRAIN_TIMEOUT`
   (RFC 0011 §4.2). A rolling `Deployment` update must look like `0` in agentctl
-  dashboards, paired with `agentd_drains_total{phase="completed"}`.
+  dashboards, paired with `agent_drains_total{phase="completed"}`.
 - **`143`** = SIGTERM forced *past* the drain budget (the kubelet's own SIGKILL,
   or our force-collapse) — ungraceful, paired with
-  `agentd_drains_total{phase="forced"}`. agentctl alerts on `143` (and on
-  `agentd_drains_total{phase="forced"} > 0`) because it means
-  `terminationGracePeriodSeconds` is too tight relative to `AGENTD_DRAIN_TIMEOUT`
+  `agent_drains_total{phase="forced"}`. agentctl alerts on `143` (and on
+  `agent_drains_total{phase="forced"} > 0`) because it means
+  `terminationGracePeriodSeconds` is too tight relative to `AGENT_DRAIN_TIMEOUT`
   (RFC 0011 §3.3) — a config fix, not a retry.
 - **`137`** = OOM or kubelet hard-kill. agentctl maps it to "raise
   `resources.limits.memory`," distinct from any retry rule.
 
-These three are surfaced as metrics (`agentd_drains_total`,
-`agentd_reactor_stalls_total`, and the kernel exit code via the report's
+These three are surfaced as metrics (`agent_drains_total`,
+`agent_reactor_stalls_total`, and the kernel exit code via the report's
 `exit_code`) so an agentctl alert never has to parse pod-termination reasons by
 hand.
 
@@ -440,7 +440,7 @@ pod is gone seconds after it exits, so the outcome must be captured to a
   "duration_ms": 84213,
   "started_at": "2026-06-27T10:00:00.012Z",
   "ended_at":   "2026-06-27T10:01:24.225Z",
-  "distillate_ref": "agentd://subagent/0/result",  // RFC 0005 §3.3 — where the result body lives
+  "distillate_ref": "agent://subagent/0/result",  // RFC 0005 §3.3 — where the result body lives
   "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",   // RFC 0010 §3.6 — stitch to the trace
   "refusals": { "trifecta": 0, "rate": 0, "budget": 0, "depth": 0, "mcp": 0 }  // §4.3 reasons, this run
 }
@@ -452,7 +452,7 @@ Field rules:
   RFC 0011 §5 projection. They are *both* present so agentctl can show the
   precise status and still author exit-code policy.
 - **`distillate_ref` points; it does not embed.** The result *body* is the
-  distilled return (RFC 0007 §3.9 / RFC 0005 §3.3 `agentd://subagent/{handle}/result`).
+  distilled return (RFC 0007 §3.9 / RFC 0005 §3.3 `agent://subagent/{handle}/result`).
   The report stays small and bounded; the body is read on demand. For a one-shot
   CLI run the body is also on **stdout** (RFC 0010 §2: stdout = the agent's
   result); `distillate_ref` is the structured handle for fleet readers.
@@ -466,14 +466,14 @@ Field rules:
 
 Two delivery surfaces, both optional, both off for a bare CLI run:
 
-1. **`--report-file PATH`** (env `AGENTD_REPORT_FILE`; a new config row that
+1. **`--report-file PATH`** (env `AGENT_REPORT_FILE`; a new config row that
    slots into RFC 0011 §3.2's table). On reaching a terminal status, the
    supervisor writes the §6.2 object via an **atomic write** (temp + `rename`,
    the same primitive RFC 0010 §3.7 uses for the health file) so a reader never
    sees a torn file. agentctl mounts an `emptyDir`/PVC at `PATH` and reads it
    after the pod terminates (or a node-agent reads it over vsock). Written
    **once**, at the terminal transition, *before* the `proc.exit` log line.
-2. **`agentd://run/{run_id}`** (RFC 0005 §3.3 — *already* a declared resource
+2. **`agent://run/{run_id}`** (RFC 0005 §3.3 — *already* a declared resource
    carrying "run-level status, mode, root handle, aggregate usage,
    exit-disposition"). This RFC **freezes that resource's body to the §6.2
    schema** and emits a final `notifications/resources/updated` on it at the
@@ -482,7 +482,7 @@ Two delivery surfaces, both optional, both off for a bare CLI run:
    served only while the process is alive; the durable copy is `--report-file`.
 
 A run report is **idempotent to read** and carries the same `run_id` across a
-retried Job (when the operator sets a stable `AGENTD_RUN_ID`, RFC 0011 §6), so
+retried Job (when the operator sets a stable `AGENT_RUN_ID`, RFC 0011 §6), so
 agentctl can collapse a retried unit's reports.
 
 ### 6.4 Reactive daemons emit no final report
@@ -490,7 +490,7 @@ agentctl can collapse a retried unit's reports.
 A `reactive` `Deployment` has **no single terminal outcome** — it processes an
 unbounded stream and exits only on drain (`0`) or fatal infra (RFC 0011 §5.4). It
 therefore writes **no** `--report-file`. Its per-reaction outcomes are in (a) the
-metrics (`agentd_runs_total{status}` increments per reaction), and (b) the event
+metrics (`agent_runs_total{status}` increments per reaction), and (b) the event
 stream (§7). `kubectl agents results` for a reactive workload reads the event
 stream / metrics, not a report file. Attempting `--report-file` with `--mode
 reactive` is a **config warning** (not a hard error) at startup (RFC 0011 §3.3
@@ -498,7 +498,7 @@ validate step) — the flag is simply inert.
 
 ---
 
-## 7. The `agentd://events` stream
+## 7. The `agent://events` stream
 
 ### 7.1 Purpose and the anti-goal
 
@@ -506,23 +506,23 @@ agentctl wants to **tail live activity** — loop steps, refusals, spawns, drain
 progress — across a fleet, over the same self-MCP channel it already uses for
 control (RFC 0015), **without** scraping each pod's container stderr (which on a
 vsock-only pod, RFC 0014 §2, it cannot even reach). The anti-goal is equally
-firm: this is **not a second telemetry path**. `agentd://events` is a *projection
+firm: this is **not a second telemetry path**. `agent://events` is a *projection
 of the same stderr stream* — identical lines, identical closed vocabulary (RFC
 0010 §3.2/§3.3) — surfaced as a subscribable resource. stderr remains the source
-of truth and the durable record; `agentd://events` is the live-tail convenience.
+of truth and the durable record; `agent://events` is the live-tail convenience.
 
 ### 7.2 The resource (RFC 0005 scheme, notify-then-read, bounded ring)
 
-`agentd://events` is a read-only `agentd://` resource (RFC 0005 §3.3 scheme)
+`agent://events` is a read-only `agent://` resource (RFC 0005 §3.3 scheme)
 added to the served resource list, gated behind `serve-mcp` + a new `events`
-feature. agentd's reactive substrate is **notify-then-read** (RFC 0005 §3.3: the
+feature. agent's reactive substrate is **notify-then-read** (RFC 0005 §3.3: the
 notification carries *no payload*; the peer `resources/read`s to learn new
 state). Because a live event stream is a *sequence* (not a single current-state
 value), the read returns a **bounded window from an in-memory ring**, and the
 subscriber drives a cursor:
 
 - **Backing store:** a fixed-size in-memory ring buffer of the last **N** emitted
-  log lines (default `AGENTD_EVENTS_RING = 1024`, env-tunable). It is the same
+  log lines (default `AGENT_EVENTS_RING = 1024`, env-tunable). It is the same
   `serde_json::Value` lines written to stderr, captured into the ring as they are
   emitted. Bounded ⇒ no unbounded memory growth on a slow subscriber; **lossy by
   design** — an overrun drops the oldest and bumps a `dropped` counter the read
@@ -531,16 +531,16 @@ subscriber drives a cursor:
   subscriber reads, precisely because notify-then-read is current-state, not a
   durable queue.
 - **Notify:** on each new event (or a small coalescing batch), emit
-  `notifications/resources/updated{uri:"agentd://events"}` to subscribed peers
+  `notifications/resources/updated{uri:"agent://events"}` to subscribed peers
   (RFC 0005 §3.3). No payload in the notification.
-- **Read:** `resources/read("agentd://events?after=<seq>")` returns the ring
+- **Read:** `resources/read("agent://events?after=<seq>")` returns the ring
   slice with `seq > after`, plus the current `dropped` count and the ring's
   oldest/newest `seq`. The subscriber advances `after` to the last `seq` it saw.
   This is the standard MCP cursor pattern (RFC 0004 pagination), reused — **no new
   protocol** (RFC 0014 §3.2).
 
 ```jsonc
-// resources/read("agentd://events?after=4821") result body
+// resources/read("agent://events?after=4821") result body
 {
   "events_schema": "1.0",                 // bumped only on a breaking envelope change (§8)
   "oldest_seq": 3801, "newest_seq": 4840, // ring window currently held
@@ -571,9 +571,9 @@ job (cheap, additive). The `events_schema` versions only the *envelope*
   prefixes) so a subscriber tailing only security/lifecycle events does not pull
   every `loop.step`. The filter is a cheap prefix match over the ring; no query
   engine.
-- **Fan-out is the subscriber's job.** agentd serves *one instance's* ring.
+- **Fan-out is the subscriber's job.** agent serves *one instance's* ring.
   Cross-instance aggregation, a fleet event bus, long-term storage, and replay
-  beyond the ring are **agentctl's** (RFC 0014 §6 non-goals). agentd never
+  beyond the ring are **agentctl's** (RFC 0014 §6 non-goals). agent never
   buffers beyond N lines and never ships events anywhere — it serves a read.
 - **No new transport.** The resource rides the existing self-MCP over unix/vsock
   (and future HTTP, RFC 0013); a vsock-only pod's node-agent (RFC 0014 §2) tails
@@ -582,11 +582,11 @@ job (cheap, additive). The `events_schema` versions only the *envelope*
 ### 7.4 Relationship to `--aggregate-logs`
 
 RFC 0010 §3.5 mode B (`--aggregate-logs`) forwards *child* telemetry **up to the
-supervisor's stderr** for single-stream capture. `agentd://events` is orthogonal
+supervisor's stderr** for single-stream capture. `agent://events` is orthogonal
 and complementary: mode B is about *getting the whole tree onto one stderr*;
-`agentd://events` is about *exposing that one stream as a subscribable resource*.
+`agent://events` is about *exposing that one stream as a subscribable resource*.
 With both on, the supervisor's ring already contains the forwarded child lines,
-so a subscriber sees the full tree over `agentd://events` with no extra wiring.
+so a subscriber sees the full tree over `agent://events` with no extra wiring.
 
 ---
 
@@ -618,7 +618,7 @@ an independent version, surfaced in the manifest (RFC 0014 §5):
 - a **removed or renamed** report/envelope field;
 - a change to the `status` closed domain that drops/renames a value (RFC 0007 §3.4
   — adding a status is additive, *removing/renaming* one is breaking and bumps
-  `metrics_schema` because it changes the `agentd_runs_total{status}` label
+  `metrics_schema` because it changes the `agent_runs_total{status}` label
   domain agentctl built a dashboard on);
 - any change to the RFC 0011 §5 exit-code→meaning mapping (bumps `exit_codes`).
 
@@ -637,7 +637,7 @@ each surface it compares the major it understands against the advertised major:
   ⇒ the binary did not build that feature; agentctl manages what remains
   (liveness + exit code + logs), exactly as RFC 0014 §7 specifies.
 
-### 8.4 Telemetry-path failure semantics (agentd never dies for telemetry)
+### 8.4 Telemetry-path failure semantics (agent never dies for telemetry)
 
 Inherited from RFC 0010 §3.1 and made explicit for the new surfaces:
 
@@ -652,7 +652,7 @@ Inherited from RFC 0010 §3.1 and made explicit for the new surfaces:
   `--report-file` fails (disk full, RO mount), the supervisor logs `report.write.fail`
   (a `warn` line) and **still exits with the correct exit code** — the exit code
   is the floor contract (RFC 0011 §5) and never depends on the report landing.
-- **`/metrics`, `agentd://events`, and `--report-file` are side-effect-free with
+- **`/metrics`, `agent://events`, and `--report-file` are side-effect-free with
   respect to the run** — disabling any of them changes nothing about the agentic
   result, only what a fleet reader can see (RFC 0010 §3.7 side-effect-free
   principle).
@@ -666,10 +666,10 @@ MCP) to a `Job` pod another agentctl reconcile created. **RFC 0010 §3.6 already
 makes these one trace** — this RFC adds nothing, it points agentctl at the
 existing fields:
 
-- **Ingest (mint-or-adopt).** agentd adopts an inbound `traceparent` — on an
+- **Ingest (mint-or-adopt).** agent adopts an inbound `traceparent` — on an
   inbound self-MCP request (RFC 0005, the surface agentctl drives) or via
-  `AGENTD_TRACEPARENT` when agentctl starts the pod — else mints one per `run_id`
-  (RFC 0010 §3.6). So agentctl sets `AGENTD_TRACEPARENT` (or the inbound `_meta`)
+  `AGENT_TRACEPARENT` when agentctl starts the pod — else mints one per `run_id`
+  (RFC 0010 §3.6). So agentctl sets `AGENT_TRACEPARENT` (or the inbound `_meta`)
   once at the flow root and **every downstream pod's trace stitches in**.
 - **Propagate.** Every outbound MCP call carries `_meta.traceparent`, the LLM
   call carries the `traceparent` header, and the spawn payload carries
@@ -699,12 +699,12 @@ fleet intent and the mapping to k8s probes:
   `last_loop_tick` advances on every wake, including idle `recv_timeout`
   expiries). Stale ⇒ the **reactor itself is wedged** ⇒ `503` ⇒ k8s restarts the
   pod. agentctl wires a `livenessProbe` to `/healthz`. The wedged-reactor trip is
-  also a metric, `agentd_reactor_stalls_total` (§4.3), so an alert fires even
+  also a metric, `agent_reactor_stalls_total` (§4.3), so an alert fires even
   where the probe's restart masks it.
 - **A stuck *subagent* must NOT flip `/healthz`** (RFC 0010 §3.7, RFC 0003). The
   supervisor detects it (RFC 0003's 3-detector model + EOF×pong classifier) and
   kills it (the kill ladder), emitting `subagent.stuck` →
-  `agentd_subagent_stuck_kills_total{signal}` (§4.3). The pod stays live; failing
+  `agent_subagent_stuck_kills_total{signal}` (§4.3). The pod stays live; failing
   liveness here would destroy a whole healthy tree for one wedged leaf. agentctl
   alerts on the stuck-kill *metric*, it does not restart the pod.
 - **`/readyz` (readiness)** = `proc.ready` reached and declared subscriptions
@@ -730,12 +730,12 @@ default (RFC 0011 §2.1). All are off by default for a bare one-shot CLI run.
 
 | Concern | Env | Flag | Notes |
 |---|---|---|---|
-| Run report file | `AGENTD_REPORT_FILE` | `--report-file PATH` | atomic write at terminal status (§6.3); inert for `reactive` (warn) |
-| Events ring size | `AGENTD_EVENTS_RING` | `--events-ring N` | default 1024; bounds `agentd://events` memory (§7.2) |
-| Events surface | `AGENTD_SERVE_EVENTS` | (implied by `--serve-mcp` + `events` feature) | gates `agentd://events` (§7.2) |
+| Run report file | `AGENT_REPORT_FILE` | `--report-file PATH` | atomic write at terminal status (§6.3); inert for `reactive` (warn) |
+| Events ring size | `AGENT_EVENTS_RING` | `--events-ring N` | default 1024; bounds `agent://events` memory (§7.2) |
+| Events surface | `AGENT_SERVE_EVENTS` | (implied by `--serve-mcp` + `events` feature) | gates `agent://events` (§7.2) |
 
 `/metrics`, `/healthz`, `/readyz`, `--health-file`, `--health-http`,
-`AGENTD_TRACEPARENT`, and `OTEL_EXPORTER_OTLP_ENDPOINT` are **already** RFC 0010
+`AGENT_TRACEPARENT`, and `OTEL_EXPORTER_OTLP_ENDPOINT` are **already** RFC 0010
 config rows — not re-added here. `--budget-exit-code` (the §5.2 `policy` override)
 is **already** an RFC 0011 §5.2 row.
 
@@ -743,17 +743,17 @@ is **already** an RFC 0011 §5.2 row.
 
 ## 12. Non-goals (these stay in agentctl)
 
-- **Dashboards, alert-rule YAML, recording rules.** agentd freezes the metric
+- **Dashboards, alert-rule YAML, recording rules.** agent freezes the metric
   names; the Grafana/Prometheus rule objects are agentctl's (RFC 0014 §6).
-- **HPA/KEDA scaler objects, target values, scale policies.** agentd exposes
-  `agentd_pending_events`/`agentd_reaction_lag_ms` (§4.3); the scaler that reads
+- **HPA/KEDA scaler objects, target values, scale policies.** agent exposes
+  `agent_pending_events`/`agent_reaction_lag_ms` (§4.3); the scaler that reads
   them is RFC 0019 / agentctl.
-- **`podFailurePolicy` documents.** agentd freezes the exit-code intent (§5.2);
+- **`podFailurePolicy` documents.** agent freezes the exit-code intent (§5.2);
   the compiled `onExitCodes` rules and any operator override are agentctl's.
-- **A cost/price table.** agentd emits `agentd_tokens_total`; tokens × price =
+- **A cost/price table.** agent emits `agent_tokens_total`; tokens × price =
   cost is agentctl's table (no pricing in the data plane, §4.3).
 - **Cross-instance aggregation, a fleet event bus, long-term metric/trace/event
-  storage, replay beyond the ring.** RFC 0014 §6 non-goals; agentd serves one
+  storage, replay beyond the ring.** RFC 0014 §6 non-goals; agent serves one
   instance's metrics/ring/report.
 - **An OTLP collector / metrics backend.** Span/metric *export* is the `otel`
   feature pushing to a sidecar (RFC 0010 §3.9); the collector is infra agentctl
@@ -768,9 +768,9 @@ is **already** an RFC 0011 §5.2 row.
 
 - **Purely additive, fully feature-gated.** The metrics freeze is a *contract
   statement* over series RFC 0010 §3.8 already defined — no code change beyond
-  emitting the new `agentd_pending_events`/`agentd_reaction_lag_ms`/`agentd_intel_up`
-  /`agentd_mcp_up`/`agentd_drains_total` gauges/counters under the existing
-  `metrics` feature. `--report-file` and `agentd://events` are new, each behind a
+  emitting the new `agent_pending_events`/`agent_reaction_lag_ms`/`agent_intel_up`
+  /`agent_mcp_up`/`agent_drains_total` gauges/counters under the existing
+  `metrics` feature. `--report-file` and `agent://events` are new, each behind a
   gate (`metrics` is unaffected; `events` is new; the report rides the default
   serializer). A binary that builds none of them reports them absent in the
   manifest and agentctl degrades (§8.3).
@@ -780,7 +780,7 @@ is **already** an RFC 0011 §5.2 row.
   removal/rename (§8.2).
 - **Lands in the track after RFC 0015** (which unlocks `--serve-mcp` + the
   manifest the version surfacing depends on, RFC 0014 §4/§7). The metrics freeze
-  and exit-code contract can land independently of `agentd://events` (which needs
+  and exit-code contract can land independently of `agent://events` (which needs
   the served surface); the run report needs only the existing supervisor exit
   path.
 
@@ -790,17 +790,17 @@ is **already** an RFC 0011 §5.2 row.
 
 - **RFC 0003** — process supervision & recovery: owns the 3-detector stuck model
   + EOF×pong classifier (§10 surfaces the wedged-reactor verdict) and
-  rebuild+reconcile (the `agentd_restarts_total` source).
-- **RFC 0004** — MCP client subset & codec: the wire/codec the `agentd://events`
+  rebuild+reconcile (the `agent_restarts_total` source).
+- **RFC 0004** — MCP client subset & codec: the wire/codec the `agent://events`
   notify-then-read frames and the cursor pagination reuse.
-- **RFC 0005** — self-MCP server & control protocol: owns the `agentd://` scheme,
-  notify-then-read semantics, and `agentd://run/{run_id}`; `agentd://events` is a
+- **RFC 0005** — self-MCP server & control protocol: owns the `agent://` scheme,
+  notify-then-read semantics, and `agent://run/{run_id}`; `agent://events` is a
   resource added to that surface.
 - **RFC 0006** — intelligence transport & wire: source of the `usage` that feeds
-  `agentd_tokens_total` and of the intelligence-health signals.
+  `agent_tokens_total` and of the intelligence-health signals.
 - **RFC 0007** — agentic loop & terminal status: **sole authority** for the
   `TerminalStatus` closed set used as `report.status` and the
-  `agentd_runs_total{status}` label domain.
+  `agent_runs_total{status}` label domain.
 - **RFC 0008** — execution modes & reactive routing: defines the reactive
   pending/in-flight/backlog state the §4.3 scaling gauges measure.
 - **RFC 0009** — subagent process model: source of the tree gauges (depth/breadth/
@@ -814,13 +814,13 @@ is **already** an RFC 0011 §5.2 row.
 - **RFC 0012** — security posture: the trifecta/Rule-of-Two refusal feeding
   `refusals_total{reason="trifecta"}`; the secrets allowlist applied to reports.
 - **RFC 0013** — deferred v2 surface: HTTP serving (an alternative transport for
-  `/metrics` and `agentd://events`); deferred session checkpointing.
+  `/metrics` and `agent://events`); deferred session checkpointing.
 - **RFC 0014** — control-plane contract (umbrella): the data/control-plane split,
   the capabilities manifest (§5) this RFC versions surfaces in, and the
   primitives-not-policy / freeze-and-version principles (§3).
 - **RFC 0015** — management & control surface (sibling): the `--serve-mcp` profile
-  + manifest this RFC's `agentd://events` resource and version surfacing slot into.
+  + manifest this RFC's `agent://events` resource and version surfacing slot into.
 - **RFC 0018** — intelligence transport resilience (sibling): consumes the frozen
-  `agentd_intel_up`/`agentd_intel_errors_total` this RFC pins.
+  `agent_intel_up`/`agent_intel_errors_total` this RFC pins.
 - **RFC 0019** — horizontal scaling (sibling): consumes the frozen
-  `agentd_pending_events`/`agentd_reaction_lag_ms` scaling signal set (§4.3).
+  `agent_pending_events`/`agent_reaction_lag_ms` scaling signal set (§4.3).

@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  # Format, lint, and the full test suite. agentd is a Linux-native daemon
+  # Format, lint, and the full test suite. agent is a Linux-native daemon
   # (PR_SET_PDEATHSIG, the subreaper, waitpid, cgroups, unix sockets), so CI is
   # Linux-only — there is no macOS/Windows runtime target. `--all-features` so the
   # feature-gated modules (tls/vsock/serve-mcp/cron/metrics/otel) are linted and
@@ -27,7 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # The whole workspace under all features: agentd's feature-gated tests
+      # The whole workspace under all features: agent's feature-gated tests
       # (serve_mcp / otel_e2e / …) and the black-box agentd-conformance suite,
       # which builds + drives the real binary, both run here.
       - run: cargo test --workspace --all-features
@@ -83,7 +83,7 @@ jobs:
         run: |
           # `--prefix none` lists one package per line with no tree glyphs, so the
           # count is charset-independent (cargo tree emits ASCII art off a TTY, so
-          # a `├`/`└` grep counts 0 in CI). First line is the agentd root; drop it.
+          # a `├`/`└` grep counts 0 in CI). First line is the agent root; drop it.
           deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -c .)
           echo "direct deps: $deps"
           if [ "$deps" -ne 3 ]; then

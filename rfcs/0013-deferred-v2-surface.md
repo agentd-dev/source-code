@@ -3,7 +3,7 @@
 **Status:** Accepted (v2 surface, deferred)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 > **Forward note (control-plane track).** Two items here are dependencies of the
 > agentctl control-plane track (RFC 0014): **Streamable HTTP serving** is the
@@ -13,11 +13,11 @@
 > does **not** pull either forward; it references them as the named v2 path.
 
 > **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) reframes **D7b — self-MCP-
-> over-HTTP serving** from *deferred for agentd* to **out of scope for agentd**.
+> over-HTTP serving** from *deferred for agent* to **out of scope for agent**.
 > Serving A2A and the management surface over vsock behind an on-node HTTP↔vsock
 > gateway (RFC 0020 §2–§3; the gateway is the agentctl node-agent, RFC 0014) puts
-> HTTP termination in the gateway — so agentd **may never need an HTTP server at
-> all**. D7b's v2 server work is thus the gateway's concern, not a deferred agentd
+> HTTP termination in the gateway — so agent **may never need an HTTP server at
+> all**. D7b's v2 server work is thus the gateway's concern, not a deferred agent
 > surface; see RFC 0020 §8. (D7a inbound HTTP-client reactivity is untouched.)
 
 ---
@@ -71,7 +71,7 @@ fallback, it cross-references it.
 
 | # | Deferred item | Direction / locus | v1 fallback (RFC) |
 |---|---|---|---|
-| D1 | MCP `tasks/*` — durable/pollable requests | client + server, MCP wire | request/response + `progress` + `cancelled` (RFC 0004); self-MCP async via subscribable `agentd://` resource (RFC 0005/0008) |
+| D1 | MCP `tasks/*` — durable/pollable requests | client + server, MCP wire | request/response + `progress` + `cancelled` (RFC 0004); self-MCP async via subscribable `agent://` resource (RFC 0005/0008) |
 | D2 | `sampling/createMessage` | server→client; CLIENT capability | declare no client caps; reject if sent; own the LLM directly in the loop (RFC 0006/0007) |
 | D3 | `roots/*` | server→client; CLIENT capability | declare no `roots`; answer `roots/list`→`{"roots":[]}` (RFC 0004) |
 | D4 | `elicitation/*` | server→client; CLIENT capability | declare no `elicitation`; headless, no interactive turn (RFC 0004) |
@@ -131,9 +131,9 @@ anything v1 deployments require.
   fabricate a task lifecycle).
 - *As server* (RFC 0005/0008): the external "spawn a child and await its
   result" surface is the `subagent.spawn` self-tool, **not** `tasks`. Async
-  completion is delivered the agentd-native way: an `{async:true}` spawn
+  completion is delivered the agent-native way: an `{async:true}` spawn
   returns a handle and the parent subscribes to a subscribable
-  `agentd://subagent/{id}/result` resource; completion arrives as
+  `agent://subagent/{id}/result` resource; completion arrives as
   `notifications/resources/updated{uri}` → `resources/read` (assessment §2.7,
   §2.5; notes §3.5). This reuses the reactive machinery (RFC 0008) instead of a
   parallel task store.
@@ -150,10 +150,10 @@ never leak the internal supervision wire outward as `tasks`.
 **WHAT.** Sampling is a **reverse** MCP call: the *server* asks the *client*
 to run an LLM generation (`sampling/createMessage`, notes §5). Critically,
 **sampling is a CLIENT capability** — server→client direction. "A peer uses
-agentd's intelligence" therefore means agentd would have to act as a
+agent's intelligence" therefore means agent would have to act as a
 *sampling-capable client* that services inbound `sampling/createMessage`
 requests by calling its own intelligence endpoint and returning the
-completion. agentd **cannot serve sampling as an MCP server** — that is the
+completion. agent **cannot serve sampling as an MCP server** — that is the
 wrong directionality (assessment §1.3.5).
 
 Wire shape (notes §5.1–§5.2): `params.{messages[], modelPreferences{hints[],
@@ -165,7 +165,7 @@ client declaring `sampling.tools`.
 
 **WHY deferred — both directions.**
 
-- *As client (servicing inbound sampling):* extra surface — agentd's agentic
+- *As client (servicing inbound sampling):* extra surface — agent's agentic
   loop already owns the LLM directly (RFC 0006/0007); servicing
   server-initiated sampling adds a second, externally-triggered path into the
   intelligence endpoint with its own budget/credential/injection concerns.
@@ -183,7 +183,7 @@ not our case). The agentic loop calls the intelligence endpoint itself; no MCP
 peer borrows it.
 
 **v2 entry point.** `mcp/client.rs` inbound dispatch + a new servicing path
-into `intel/client.rs`. `modelPreferences.hints`/priorities map onto agentd's
+into `intel/client.rs`. `modelPreferences.hints`/priorities map onto agent's
 `--model`/gateway routing (notes §5.3). v2 must add per-peer budget accounting
 and treat sampled prompts as untrusted (RFC 0012 trust budget).
 
@@ -194,7 +194,7 @@ and treat sampled prompts as untrusted (RFC 0012 trust budget).
 filesystem boundaries; notifies `notifications/roots/list_changed` on change
 (notes §6). Not-supported ⇒ `-32601`.
 
-**WHY deferred.** A filesystem-scope *signal* to servers; agentd is headless
+**WHY deferred.** A filesystem-scope *signal* to servers; agent is headless
 and does not need to negotiate filesystem boundaries with the servers it
 drives. Marginal value, real surface.
 
@@ -219,11 +219,11 @@ the client renders/answers. Declared as `elicitation:{form:{}, url:{}}`
 in a headless agent. A server's elicitation request has no one to answer it.
 
 **v1 FALLBACK** (assessment §2.5; notes §10.3). Declare no `elicitation`.
-agentd never offers an interactive turn. If a server depends on elicitation,
+agent never offers an interactive turn. If a server depends on elicitation,
 that tool is simply unusable in this deployment — surfaced as a tool-domain
 error/observation to the model (RFC 0007 error taxonomy), not a crash.
 
-**v2 entry point.** Only meaningful if agentd ever gains an operator-facing
+**v2 entry point.** Only meaningful if agent ever gains an operator-facing
 interactive channel; no concrete v2 plan. Listed for completeness of the
 defer record.
 
@@ -234,7 +234,7 @@ and resource-template URIs; gated on the server's `completions` capability
 (notes §1.4).
 
 **WHY deferred.** Autocomplete is an interactive editor/UX feature. Headless
-agentd composes full requests; it never needs to autocomplete an argument.
+agent composes full requests; it never needs to autocomplete an argument.
 
 **v1 FALLBACK** (assessment §2.5; notes §10.3). Never call `completion/*`.
 Ignore the server's `completions` capability. No fallback behaviour is needed
@@ -282,7 +282,7 @@ SSE GET stream** (`GET /mcp`, `Accept: text/event-stream`), parse `event:`/
 §9.2). This is materially more than "a tiny blocking HTTP client" — it is a
 streaming, resumable, reconnecting consumer (assessment §1.3.4, risk #1).
 
-**WHY deferred.** The reactive thesis — agentd's edge — is delivered fully
+**WHY deferred.** The reactive thesis — agent's edge — is delivered fully
 over **stdio resource subscriptions** (assessment §1.3.4: "v1 keeps reactivity
 on stdio only"). An SSE GET client is a large, fiddly addition for a transport
 v1 deployments do not need: the recommended shape connects MCP servers as
@@ -300,7 +300,7 @@ surfaced (notes §10.4 capability gating: "degrade gracefully if a server lacks
 
 #### D7b — Self-MCP-over-HTTP serving (full Streamable HTTP server)
 
-**WHAT.** Serving agentd's own self-MCP (RFC 0005) over Streamable HTTP is a
+**WHAT.** Serving agent's own self-MCP (RFC 0005) over Streamable HTTP is a
 real server: POST + GET on one endpoint, single-`application/json` **and**
 SSE-upgrade responses, `MCP-Session-Id` assignment + echo (400 on missing,
 404 on ended), `MCP-Protocol-Version` header (400 on invalid), `Origin`
@@ -318,7 +318,7 @@ Origin-hardening surface for a transport most builds do not use.
 **v1 FALLBACK** (assessment §2.5, §2.13; notes §10.2). The self-MCP serves on
 **stdio always**, and on **unix-socket** (NDJSON, stdio-like framing) when
 `--serve-mcp unix:…` is set (RFC 0005). Agent-to-agent reactivity (a peer
-agentd subscribing to our `agentd://…` state resources) works over unix-socket
+agent subscribing to our `agent://…` state resources) works over unix-socket
 — full symmetry without HTTP. HTTP serving is behind the (default-off,
 v1-unimplemented) `serve-mcp` feature's HTTP path; v1 ships unix only.
 
@@ -375,7 +375,7 @@ checkpoint is an optimization, never the source of truth).
 
 ### D9 — Emitting `notifications/message` / `notifications/progress` from our server
 
-**WHAT.** As an MCP server, agentd could declare `logging` and emit
+**WHAT.** As an MCP server, agent could declare `logging` and emit
 `notifications/message` (RFC 5424 severities; notes §7) and emit
 `notifications/progress` against inbound `progressToken`s (notes §8.2) to
 stream its internals to a driving client.
@@ -385,7 +385,7 @@ observability story without it.
 
 **v1 FALLBACK** (assessment §2.5 defer line; RFC 0010). Internals go to
 **stderr as JSON-lines** (assessment §2.9: stdout = result only; stderr = all
-telemetry) and to **subscribable `agentd://` state resources** (RFC 0005) — a
+telemetry) and to **subscribable `agent://` state resources** (RFC 0005) — a
 driving peer subscribes to our state resources for progress rather than
 receiving server-pushed `message`/`progress`. Note v1 *consumes* inbound
 `notifications/message` and `notifications/progress` as a **client** (RFC
@@ -437,7 +437,7 @@ tool-calling — covers vLLM/Ollama/LM-Studio/most hosted gateways) and
 **`anthropic`**. A model lacking native tool-calling falls back to the
 JSON-action `{"action":"tool"|"final"}` shape via `extract_json_object`
 (balanced-brace, prose-tolerant). **Other providers live behind the gateway,
-not in the binary** — point `AGENTD_INTELLIGENCE` at a gateway that exposes the
+not in the binary** — point `AGENT_INTELLIGENCE` at a gateway that exposes the
 OpenAI-compatible shape.
 
 **v2 entry point.** `intel/` — a new `intel/<provider>.rs` adapter behind the
@@ -460,7 +460,7 @@ extension point.
   (D7a). The capability map in `wire/mcp.rs` is where each deferred capability
   is *not* declared.
 - **RFC 0005 (self-MCP server & control protocol).** Owns: stdio/unix-only
-  serving instead of HTTP (D7b); self-resources / `agentd://` state instead of
+  serving instead of HTTP (D7b); self-resources / `agent://` state instead of
   emitting `message`/`progress` (D9); async-subagent-as-subscribable-resource
   instead of `tasks` server-side (D1). The internal control protocol stays a
   minimal JSON-RPC sibling — risk #10 — and is never leaked outward as `tasks`.

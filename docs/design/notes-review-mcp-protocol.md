@@ -17,18 +17,18 @@ The RFC's core MCP assumptions are **broadly correct**, and the headline "reacti
 resource subscriptions" trigger model **is supported by the spec** — with one important
 nuance the RFC currently glosses over. The biggest *protocol-correctness* gaps are:
 
-1. **agentd-as-server "subscribable session/state resources" is the weakest claim.**
+1. **agent-as-server "subscribable session/state resources" is the weakest claim.**
    `resources/subscribe` is spec-defined and fine, BUT the spec deliberately under-specifies
    *what* `notifications/resources/updated` carries (just the `uri`), and **`subscribe` is an
    item-level mechanism only** — there is **no list-level subscribe**. The RFC conflates
    item subscriptions with list-changed notifications in a couple of places. Both exist; they
    are different mechanisms with different shapes. This is fixable by being precise.
 
-2. **The RFC ignores two 2025-11-25 features that are almost purpose-built for agentd:**
+2. **The RFC ignores two 2025-11-25 features that are almost purpose-built for agent:**
    **Tasks** (durable, pollable, deferred-result requests — SEP-1686) and **sampling with
    tools** (SEP-1577). Tasks in particular are a far better fit for "long-running subagent
    work behind an MCP server" than the RFC's hand-rolled control channel, and **sampling**
-   is the *correct* spec mechanism for "a peer uses agentd's intelligence" — the RFC mentions
+   is the *correct* spec mechanism for "a peer uses agent's intelligence" — the RFC mentions
    this use case (§8 intro, and §7 framing) without naming `sampling/createMessage`.
 
 3. **Transport minimalism is sound but the RFC's "HTTP/SSE" wording is stale.** The current
@@ -89,9 +89,9 @@ Example client `initialize` params (abridged from spec):
 }
 ```
 
-### Implications for agentd
+### Implications for agent
 
-- **agentd-as-client** to N MCP servers: it MUST run the full handshake per connection and
+- **agent-as-client** to N MCP servers: it MUST run the full handshake per connection and
   store each server's *negotiated* capabilities. The RFC's "perform the MCP handshake, and
   hold the catalogue of available tools and resources" (§4.1) is correct but must be
   capability-gated: only call `resources/subscribe` on servers that advertised
@@ -100,11 +100,11 @@ Example client `initialize` params (abridged from spec):
   should, because subscribing to a server that didn't advertise `subscribe` is a protocol
   violation and will (correctly) be rejected.
 
-- **agentd-as-server**: to expose subscribable resources it MUST advertise
+- **agent-as-server**: to expose subscribable resources it MUST advertise
   `resources: { subscribe: true, listChanged: true }`. To let a peer use its intelligence it
   must understand that **sampling is a *client* capability** — see §5.
 
-- **Protocol version pinning:** agentd should pin a known protocol version (recommend
+- **Protocol version pinning:** agent should pin a known protocol version (recommend
   `2025-11-25`, fall back to `2025-06-18`) and implement the version-mismatch path. The RFC
   is silent on which version it targets — it should state one, because feature availability
   (tasks, sampling-with-tools, structured tool output) is version-gated.
@@ -124,14 +124,14 @@ The RFC's claim "`resources/list` + `resources/read`" is **correct**. Precise sh
 - **`resources/templates/list`** → `params: { cursor? }`; result `{ resourceTemplates: [ { uriTemplate, name, title?, description?, mimeType? } ], nextCursor? }`.
   RFC 6570 URI templates. **The RFC never mentions resource templates.** This matters for
   reactivity: you cannot `subscribe` to a *template* (e.g. `db://query/{id}`) — you can only
-  subscribe to *concrete* URIs. If agentd wants to react to "any new row," it must first
+  subscribe to *concrete* URIs. If agent wants to react to "any new row," it must first
   enumerate/resolve concrete URIs (via `resources/list` or template expansion) and subscribe
   to each. **Flag:** §5.3's `db://query/...` example implies template-level reactivity that
   the protocol does not provide.
 
 Standard schemes: `https://`, `file://`, `git://`, plus custom schemes (must satisfy
-RFC 3986). agentd's `db://`, and any "another agentd's exposed resource" scheme, are *custom*
-schemes — legal, but agentd defines their semantics; no interop guarantee with third parties.
+RFC 3986). agent's `db://`, and any "another agent's exposed resource" scheme, are *custom*
+schemes — legal, but agent defines their semantics; no interop guarantee with third parties.
 
 Error codes worth handling: resource-not-found `-32002`, internal `-32603`.
 
@@ -159,7 +159,7 @@ This is the load-bearing claim. **It is supported. The details matter.**
   spec's canonical flow is: receive `updated` → the client then issues a fresh
   `resources/read` to get new contents. **Flag:** the RFC's §5.3 phrasing "reads what
   changed" and "deliver the event into an existing session" implies the notification carries
-  the change. It does **not**. agentd must `resources/read` on wake to learn *what* changed.
+  the change. It does **not**. agent must `resources/read` on wake to learn *what* changed.
   This is a real design consequence: the reactive loop is **notify-then-read**, two round
   trips, and the read can race (resource may change again before the read). The RFC should
   state the notify-then-read pattern explicitly and decide its read-coalescing/debounce rule.
@@ -173,7 +173,7 @@ This is the load-bearing claim. **It is supported. The details matter.**
 - **Flag:** The task brief and the RFC both speak of "resource **list** updates" as a trigger
   alongside item updates. That is legitimate, but the *mechanism is different*: item updates
   require an explicit `resources/subscribe` per URI and yield `…/updated{uri}`; list updates
-  require **no subscribe** and yield `…/list_changed{}` (no uri). agentd's trigger layer must
+  require **no subscribe** and yield `…/list_changed{}` (no uri). agent's trigger layer must
   treat these as two distinct event sources. The RFC currently blurs them (e.g. "resource /
   resource-list updates" as if one subscription covers both). Corrected model:
 
@@ -205,37 +205,37 @@ subscribe to templates, only concrete URIs; (d) HTTP transport needs a real SSE 
 
 ---
 
-## 4. agentd as an MCP server exposing subscribable session/state (RFC §8)
+## 4. agent as an MCP server exposing subscribable session/state (RFC §8)
 
 **Feasible and spec-compliant — with caveats.**
 
 - Exposing run/session/subagent state as **readable resources** (`resources/read`) and
   **subscribable** (`resources/subscribe` + emitting `notifications/resources/updated` when
-  state changes) is exactly what the resources capability is for. agentd advertises
+  state changes) is exactly what the resources capability is for. agent advertises
   `resources: { subscribe: true, listChanged: true }` and emits `…/updated{uri}` on state
   transitions. **This works and is the right design for agent-to-agent reactivity.**
 - Caveat 1 — **payload-less notifications** (§3.1): peer agent Y subscribes to agent X's
-  `agentd://session/123/status`; on change, X emits `…/updated{uri}`; Y must `resources/read`
+  `agent://session/123/status`; on change, X emits `…/updated{uri}`; Y must `resources/read`
   to get the new status. Design X's resource granularity so a single read is cheap and
   meaningful.
-- Caveat 2 — **custom URI scheme**: `agentd://…` is a custom scheme; legal, but only other
-  agentd instances will understand its semantics. Fine for self-wiring; not a generic interop
+- Caveat 2 — **custom URI scheme**: `agent://…` is a custom scheme; legal, but only other
+  agent instances will understand its semantics. Fine for self-wiring; not a generic interop
   surface.
 - Caveat 3 — **transport** (§7 below): subscribable resources are only useful to a *peer* if
-  agentd serves them over a transport the peer can hold an SSE stream on (Streamable HTTP) or
-  over stdio (only works if the peer *spawned* agentd as its subprocess). A sibling agentd in
+  agent serves them over a transport the peer can hold an SSE stream on (Streamable HTTP) or
+  over stdio (only works if the peer *spawned* agent as its subprocess). A sibling agent in
   another pod ⇒ Streamable HTTP server ⇒ the heavier server stack.
-- Caveat 4 — **`tools/list_changed` for dynamic scope**: when agentd narrows/grants a
-  subagent's tool scope at runtime, and agentd is the server the subagent talks to, agentd
+- Caveat 4 — **`tools/list_changed` for dynamic scope**: when agent narrows/grants a
+  subagent's tool scope at runtime, and agent is the server the subagent talks to, agent
   **SHOULD** emit `notifications/tools/list_changed` (and advertise `tools.listChanged`).
   The RFC's dynamic scoping (§6.3) implies this but never says it.
 
 ---
 
-## 5. Sampling — the *correct* mechanism for "a peer uses agentd's intelligence" (RFC §7, §8)
+## 5. Sampling — the *correct* mechanism for "a peer uses agent's intelligence" (RFC §7, §8)
 
-The RFC frames agentd-as-server as letting "*other* MCP clients … wire to it" and the task
-brief explicitly calls out "agentd-as-server could let a peer use agentd's intelligence."
+The RFC frames agent-as-server as letting "*other* MCP clients … wire to it" and the task
+brief explicitly calls out "agent-as-server could let a peer use agent's intelligence."
 **The spec has a first-class feature for exactly this, and the RFC never names it.**
 
 - **`sampling/createMessage`** is a **server→client** request: a *server* asks the *client*
@@ -246,21 +246,21 @@ brief explicitly calls out "agentd-as-server could let a peer use agentd's intel
   `intelligencePriority`), `systemPrompt`, `maxTokens`, optional `tools[]` + `toolChoice`
   (`{mode: auto|required|none}`). Result: `{ role:"assistant", content, model, stopReason }`
   where `stopReason` ∈ `endTurn` | `toolUse` | …
-- **The directionality is the catch.** agentd-as-MCP-*server* cannot *serve* sampling — only
-  a client serves sampling. For a peer to "use agentd's intelligence," the relationship must
-  be: **the peer acts as the MCP server and agentd acts as the MCP client that fulfils
+- **The directionality is the catch.** agent-as-MCP-*server* cannot *serve* sampling — only
+  a client serves sampling. For a peer to "use agent's intelligence," the relationship must
+  be: **the peer acts as the MCP server and agent acts as the MCP client that fulfils
   `sampling/createMessage` using its configured intelligence endpoint.** That is a coherent
-  and powerful pattern (agentd becomes a sampling-capable client / "intelligence provider"),
-  but it is the **opposite wiring** from the RFC's "agentd exposes a server; peer connects as
-  client." **Recommendation:** add an explicit design note: agentd should optionally declare
+  and powerful pattern (agent becomes a sampling-capable client / "intelligence provider"),
+  but it is the **opposite wiring** from the RFC's "agent exposes a server; peer connects as
+  client." **Recommendation:** add an explicit design note: agent should optionally declare
   the **`sampling` client capability** on its outbound MCP client connections, so any server
-  it connects to (including another agentd-as-server) can request generations from it. This
-  is the spec-blessed way to share intelligence between agents, and it reuses agentd's single
-  intelligence endpoint. Conversely, if agentd wants its *own* subagents to obtain
+  it connects to (including another agent-as-server) can request generations from it. This
+  is the spec-blessed way to share intelligence between agents, and it reuses agent's single
+  intelligence endpoint. Conversely, if agent wants its *own* subagents to obtain
   intelligence via MCP rather than a direct LLM transport, the subagent-as-server /
   parent-as-sampling-client shape is available — relevant to open question §14.1.
 - **Human-in-the-loop SHOULD:** the sampling spec says there SHOULD be a human able to deny
-  sampling requests. agentd is autonomous; document the conscious deviation (auto-approve
+  sampling requests. agent is autonomous; document the conscious deviation (auto-approve
   under budget caps) — it is a SHOULD, not a MUST, so this is permissible but should be
   explicit, and gated by the per-call budgets the RFC already defines.
 
@@ -271,12 +271,12 @@ brief explicitly calls out "agentd-as-server could let a peer use agentd's intel
 - **`roots/list`** is a **server→client** request; **roots is a CLIENT capability**
   (`roots: { listChanged: true }`). Client returns `{ roots: [ { uri, name? } ] }`; `uri`
   **MUST** be a `file://` URI. Client emits `notifications/roots/list_changed` on change.
-- Relevance to agentd:
-  - As a **client**, agentd MAY declare `roots` to tell servers (e.g. a filesystem MCP
+- Relevance to agent:
+  - As a **client**, agent MAY declare `roots` to tell servers (e.g. a filesystem MCP
     server) which directories are in scope. This is a clean, spec-native way to express the
     "tool scope" boundary for filesystem-like servers — complementary to the RFC's
     granted-subset model (§6.3). Worth a sentence.
-  - As a **server**, if agentd ever consumes a filesystem-style relationship from a peer, it
+  - As a **server**, if agent ever consumes a filesystem-style relationship from a peer, it
     could *request* `roots/list` from that peer. Lower priority.
 - **Not a gap that breaks anything**, but roots is the idiomatic "scope of the filesystem"
   signal and the RFC's scoping section would be stronger for referencing it.
@@ -318,7 +318,7 @@ brief explicitly calls out "agentd-as-server could let a peer use agentd's intel
   deprecated HTTP+SSE" anywhere would be a bug.
 - **Minimal client claim (§12):** "a tiny blocking HTTP/1.1 client" is sufficient for a
   *request/response-only* HTTP MCP client that never needs server-initiated messages. The
-  moment agentd wants **resource-update notifications over HTTP**, it needs an **SSE-capable
+  moment agent wants **resource-update notifications over HTTP**, it needs an **SSE-capable
   client** (long-lived GET stream, SSE framing, reconnection). The dependency budget should
   acknowledge this as a feature-flagged addition, or restrict reactive-over-HTTP out of v1
   and keep reactivity to stdio servers (recommended for minimalism). For stdio, notifications
@@ -327,7 +327,7 @@ brief explicitly calls out "agentd-as-server could let a peer use agentd's intel
   over HTTP is **not trivial** — it requires the full Streamable HTTP server surface above
   (POST+GET endpoint, SSE upgrade, session header, protocol-version header, Origin/403,
   resumability). This is more than the RFC's minimalism framing implies. **Recommendation:**
-  for v1, serve the self-MCP **only over stdio** (peer/parent spawns agentd as a subprocess)
+  for v1, serve the self-MCP **only over stdio** (peer/parent spawns agent as a subprocess)
   and/or a **Unix socket** carrying newline-delimited JSON-RPC (a "stdio-like" framing the
   spec permits as a custom transport). Defer Streamable HTTP serving to a later phase behind
   a flag — which is already roughly the RFC's phase 4, but the *cost* of HTTP serving is
@@ -359,16 +359,16 @@ RFC misses. Tasks make a request **durable, pollable, and deferred-result**:
   `tasks.requests.sampling.createMessage` / `…elicitation.create`.
 - Every task-related message carries `_meta["io.modelcontextprotocol/related-task"].taskId`.
 
-### Why agentd should care
+### Why agent should care
 
-- **Long-running MCP tool calls:** agentd's agentic loop will call MCP tools that take
+- **Long-running MCP tool calls:** agent's agentic loop will call MCP tools that take
   minutes (builds, deployments, queries). Without tasks, a `tools/call` ties up the request
-  and relies on connection liveness + `notifications/progress` (see §9). With tasks, agentd
+  and relies on connection liveness + `notifications/progress` (see §9). With tasks, agent
   can fire-and-poll, survive transport reconnects, and the spec gives it a durable handle —
   directly supporting RFC requirement (8) "detect dead/stuck subprocesses, recover state."
-  **Recommendation:** agentd-as-client SHOULD declare and use `tasks` (poll model) for tools
+  **Recommendation:** agent-as-client SHOULD declare and use `tasks` (poll model) for tools
   whose `execution.taskSupport` is `optional`/`required`.
-- **agentd-as-server exposing its own long work:** when agentd serves an `exec` or
+- **agent-as-server exposing its own long work:** when agent serves an `exec` or
   "spawn-subagent-and-wait" tool to a peer, it SHOULD expose those with
   `execution.taskSupport: "required"` and back them with tasks. This is the **spec-native
   alternative to the RFC's bespoke `subagent.*` status polling and the open-question §14.1
@@ -389,14 +389,14 @@ own goal) by reusing a spec mechanism.
 - **Progress:** requester attaches `params._meta.progressToken` (string|int, unique across
   active requests) to a request; receiver MAY emit `notifications/progress` with
   `{ progressToken, progress, total?, message? }`. `progress` **MUST** strictly increase.
-  Either side may send. agentd's "stream events (thought/tool-call/…) up the control channel"
-  (§6.1) is an *internal* concern, but for **MCP tool calls** agentd SHOULD pass a
+  Either side may send. agent's "stream events (thought/tool-call/…) up the control channel"
+  (§6.1) is an *internal* concern, but for **MCP tool calls** agent SHOULD pass a
   `progressToken` so it can render tool progress and **reset request timeouts on progress**
   (the lifecycle spec allows resetting the timeout clock on progress, with a hard ceiling) —
   directly useful for the "stuck subprocess" detection requirement.
 - **Cancellation:** `notifications/cancelled { requestId, reason? }`, fire-and-forget, races
   allowed; **`initialize` MUST NOT be cancelled**; task-augmented requests use `tasks/cancel`
-  instead. agentd's hard-kill of subagents is OS-level (SIGKILL) and separate, but when it
+  instead. agent's hard-kill of subagents is OS-level (SIGKILL) and separate, but when it
   abandons an in-flight **MCP** request it SHOULD emit `notifications/cancelled` to let the
   server free resources rather than just dropping the socket.
 
@@ -430,9 +430,9 @@ The RFC keeps the supervisor↔subagent channel "MCP-flavoured (JSON-RPC shapes)
 | §7.1, §11, §12 | "HTTP/SSE" transport | **Stale name** | Use **Streamable HTTP**; old **HTTP+SSE is deprecated**. SSE is an internal detail of Streamable HTTP. |
 | §12 | "tiny blocking HTTP/1.1 client" suffices for HTTP MCP | **Incomplete** | Receiving notifications over HTTP needs a long-lived **SSE GET stream** + framing + resumption. Blocking req/resp can't get unsolicited notifications. |
 | §8, §11 | serve self-MCP over HTTP as a light add-on | **Understated cost** | Streamable HTTP server = single POST+GET endpoint, SSE upgrade, `MCP-Session-Id`, `MCP-Protocol-Version`, `Origin`→403, resumability. Prefer stdio/unix for v1. |
-| §8 intro, §7 | peer "uses agentd's intelligence" via agentd-as-server | **Wrong directionality** | Intelligence sharing = **`sampling/createMessage`**, a server→client request; **sampling is a CLIENT capability**. agentd must act as a **sampling-capable client** to provide intelligence to a peer-server. |
+| §8 intro, §7 | peer "uses agent's intelligence" via agent-as-server | **Wrong directionality** | Intelligence sharing = **`sampling/createMessage`**, a server→client request; **sampling is a CLIENT capability**. agent must act as a **sampling-capable client** to provide intelligence to a peer-server. |
 | §8 | `subagent.status(handle)` polling, custom | **Reinventing** | Prefer MCP **tasks** (`execution.taskSupport:"required"`, `tasks/get`/`tasks/result`/`tasks/cancel`) for the *external* long-running surface. |
-| §6.3 | dynamic tool scope narrowing | **Missing notify** | If agentd serves these tools, advertise `tools.listChanged` and emit `notifications/tools/list_changed` on scope change. |
+| §6.3 | dynamic tool scope narrowing | **Missing notify** | If agent serves these tools, advertise `tools.listChanged` and emit `notifications/tools/list_changed` on scope change. |
 | §4.1 | "perform the MCP handshake, hold catalogue" | **Correct, underspecified** | Must store per-server negotiated capabilities; gate subscribe/list-changed on them; follow pagination cursors on `*/list`. |
 | §7.2 | intelligence over `vsock:`/`unix:`/`https:` | **Correct & non-MCP** | These carry the LLM wire, not MCP; don't conflate with MCP transports. Fine as-is. |
 | — (absent) | resource **templates**, **roots**, **tasks**, **sampling-with-tools**, **structured tool output / outputSchema** | **Gaps** | All exist in 2025-11-25; at least acknowledge templates (reactivity limit), sampling (intelligence sharing), tasks (durable work). |
@@ -450,11 +450,11 @@ The RFC keeps the supervisor↔subagent channel "MCP-flavoured (JSON-RPC shapes)
 3. **Keep reactivity on stdio for v1**; treat reactive-over-HTTP (SSE client) and
    self-MCP-over-HTTP (full Streamable HTTP server) as later, feature-flagged phases. This
    honors the minimalism bar honestly.
-4. **Adopt `tasks`** for both consuming long-running MCP tool calls and exposing agentd's own
+4. **Adopt `tasks`** for both consuming long-running MCP tool calls and exposing agent's own
    long-running operations to peers — instead of bespoke status polling. Strong fit for the
    stability/recovery requirements.
 5. **Use `sampling/createMessage` (client-side capability)** as the spec-native way to share
-   agentd's single intelligence endpoint with peer agents; document the auto-approval
+   agent's single intelligence endpoint with peer agents; document the auto-approval
    deviation from the human-in-the-loop SHOULD, bounded by existing budgets.
 6. **Wire `notifications/progress` into MCP tool calls** (progressToken + timeout reset) and
    emit `notifications/cancelled` when abandoning in-flight MCP requests — both feed the

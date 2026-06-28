@@ -3,7 +3,7 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the cloud-native contract (RFC 0011) — specifically its config-precedence, validate-at-startup, signal, and secrets-out-of-the-file rules.
+**Part of:** the agent rewrite — control-plane track (RFC 0014); extends the cloud-native contract (RFC 0011) — specifically its config-precedence, validate-at-startup, signal, and secrets-out-of-the-file rules.
 
 ---
 
@@ -11,7 +11,7 @@
 
 RFC 0011 §2.1 names a **config file layer** in the precedence chain
 (`built-in default < config file < env var < CLI flag`) but ships only the
-narrow `AGENTD_MCP_CONFIG` MCP-server list as its concrete instance, and RFC 0013
+narrow `AGENT_MCP_CONFIG` MCP-server list as its concrete instance, and RFC 0013
 records the broader declarative-config surface as a *deferred* line. Two things
 have since changed the calculus, both from RFC 0014:
 
@@ -23,7 +23,7 @@ have since changed the calculus, both from RFC 0014:
    `--validate-config`, no schema export, and RFC 0011 §2.2 explicitly **drops
    SIGHUP** ("restart-to-reload in v1").
 
-2. **The minimalism boundary is now codified** (RFC 0014 §3): agentd exposes
+2. **The minimalism boundary is now codified** (RFC 0014 §3): agent exposes
    *primitives* (a file to read, a config to validate, a schema to emit, a signal
    to honour); agentctl owns *policy* (the CRD, the operator reconcile loop, the
    admission webhook wiring, the rollout strategy). This RFC supplies exactly the
@@ -31,8 +31,8 @@ have since changed the calculus, both from RFC 0014:
 
 This RFC therefore (a) lands the full **declarative config file** the RFC 0011
 precedence chain always reserved a slot for — verbose *structural* config only,
-**never** secrets or per-environment values; (b) adds **`agentd
---validate-config`** and **`agentd --config-schema`** so an external admission
+**never** secrets or per-environment values; (b) adds **`agent
+--validate-config`** and **`agent --config-schema`** so an external admission
 gate can reject a bad config in milliseconds and validate a CR against a JSON
 Schema before applying; and (c) **revisits RFC 0011 §2.2's SIGHUP drop** to
 specify a *bounded, validate-first, quiesce-and-reapply* **hot reload** of a
@@ -73,7 +73,7 @@ construction (RFC 0014 §3, §6).
    error (RFC 0011 §3.2, RFC 0012 §3.7), and per-environment scalars are
    documented to stay in env/flag (env wins anyway).
 
-2. **`agentd --validate-config` is the admission primitive.** It loads and *fully*
+2. **`agent --validate-config` is the admission primitive.** It loads and *fully*
    resolves the config (file + env + flags), runs the complete RFC 0011 §3.3
    `Config::validate()` plus this RFC's reload-coherence checks, and exits **0 if
    valid** or **2 with structured diagnostics on stderr** if not — **before any
@@ -81,11 +81,11 @@ construction (RFC 0014 §3, §6).
    sub-millisecond. It is the backend an agentctl admission webhook / CI gate
    calls.
 
-3. **`agentd --config-schema` emits the JSON Schema (Draft 2020-12) of the config
+3. **`agent --config-schema` emits the JSON Schema (Draft 2020-12) of the config
    *file* to stdout and exits 0.** The schema is generated from the same Rust types
    the loader deserializes (single source of truth), carries the
    `contract_version` from the capabilities manifest (RFC 0014 §5), and lets
-   agentctl validate a CR's embedded config against agentd's own schema *before*
+   agentctl validate a CR's embedded config against agent's own schema *before*
    it ever reaches a pod. The schema is a **frozen, versioned public API** (RFC
    0014 §3 principle 4): additive within a major, breaking changes bump the major.
 
@@ -116,7 +116,7 @@ construction (RFC 0014 §3, §6).
    a no-op + error event; a precedence conflict resolves by the RFC 0011 rule and
    is logged, never errored.** No path half-applies config. (§7.)
 
-These decisions are **additive and feature-gated**; a default `agentd` build that
+These decisions are **additive and feature-gated**; a default `agent` build that
 ships none of the control-plane surfaces reports `hot_reload:false` in its manifest
 (RFC 0014 §5) and behaves exactly as RFC 0011 specifies (restart-to-reload).
 
@@ -149,8 +149,8 @@ structural bits."* This RFC widens *which* structural bits, never the *kind*.
 
 ### 3.2 Source, format, precedence
 
-- **Source.** `--config <path>` (and `AGENTD_CONFIG=<path>`) name the file;
-  `AGENTD_MCP_CONFIG` (RFC 0011 §3.2) remains a recognized alias whose document is
+- **Source.** `--config <path>` (and `AGENT_CONFIG=<path>`) name the file;
+  `AGENT_MCP_CONFIG` (RFC 0011 §3.2) remains a recognized alias whose document is
   the `mcp_servers` sub-object only, for back-compat. Resolution is **local-only**
   via `read_local` (RFC 0011 §3.1) — an absolute or cwd-relative filesystem path;
   no URL scheme. "Never read config from the network" is closed at the type level,
@@ -217,11 +217,11 @@ shape:
   // each string == one `--subscribe URI`.
   "subscribe": [
     "fs:file:///watch/inbox",
-    "queue:agentd://topic/digests"
+    "queue:agent://topic/digests"
   ],
 
   // ── reloadable: observability knobs that are safe to change live ──
-  "log_level": "info",                       // == --log-level / AGENTD_LOG_LEVEL
+  "log_level": "info",                       // == --log-level / AGENT_LOG_LEVEL
 
   // ── reloadable: declared intelligence HTTP headers (RFC 0006 §3) ──
   // values MAY interpolate {{secret:NAME}} / {{secret-file:PATH}} (§6).
@@ -243,7 +243,7 @@ is the same surface, organized):
 | `limits.*` | `--max-steps` / `--max-depth` / `--deadline` / `--tree-token-budget` / … | yes |
 | `mcp_servers[]` | repeated `--mcp name=cmd`, `--mcp-tags`, `--mcp-config` | yes |
 | `subscribe[]` | repeated `--subscribe URI` | yes |
-| `log_level` | `--log-level` / `AGENTD_LOG_LEVEL` | yes (live) |
+| `log_level` | `--log-level` / `AGENT_LOG_LEVEL` | yes (live) |
 | `intelligence_headers` | the declared-header set (RFC 0006 §3) | yes |
 | *(absent — restart-only)* | `--mode`, `--intelligence`, `--serve-mcp`, `--enable-exec`, `--run-id` | **no** (§5) |
 
@@ -278,13 +278,13 @@ common config footgun, closed at parse time.
 
 ## 4. Mechanisms — validation & schema export
 
-### 4.1 `agentd --validate-config` — the admission primitive
+### 4.1 `agent --validate-config` — the admission primitive
 
 `--validate-config` is the RFC 0011 §3.3 `Config::validate()` pipeline run as a
 standalone, side-effect-free command:
 
 ```
-agentd --validate-config [--config FILE]      # plus any env/flags to resolve against
+agent --validate-config [--config FILE]      # plus any env/flags to resolve against
   → load (built-in < file < env < flag)        # RFC 0011 §3.1 — same loader, no shortcuts
   → Config::validate()                          # RFC 0011 §3.3 — the full check
   → reload_coherence_check()                    # §5.4 — this RFC's additional checks
@@ -311,11 +311,11 @@ operator/CI sees every problem in one pass:
  "msg":"key 'x-api-key' has an inline secret-shaped value; use {{secret:NAME}} or env"}
 ```
 
-**agentctl usage (policy, not in agentd).** agentctl's admission webhook shells the
-config object into `agentd --validate-config` (or links the same crate) and maps
+**agentctl usage (policy, not in agent).** agentctl's admission webhook shells the
+config object into `agent --validate-config` (or links the same crate) and maps
 exit `2` → admission *deny* with the diagnostics surfaced to the `kubectl apply`
 caller. The reconcile loop runs it as a pre-flight before it rolls a new
-`ConfigMap`. agentd ships the verdict; agentctl owns the wiring.
+`ConfigMap`. agent ships the verdict; agentctl owns the wiring.
 
 The check set `--validate-config` runs is exactly the union of:
 
@@ -329,7 +329,7 @@ The check set `--validate-config` runs is exactly the union of:
 - **This RFC §5.4:** reload-coherence (restart-only fields not file-set without a
   warning; the reloadable subset is internally consistent).
 
-### 4.2 `agentd --config-schema` — the JSON Schema export
+### 4.2 `agent --config-schema` — the JSON Schema export
 
 `--config-schema` emits the **JSON Schema (Draft 2020-12)** of the config *file*
 to stdout and exits `0`. The schema is **generated from the `ConfigFile` Rust
@@ -340,11 +340,11 @@ The derive walks the same `#[derive(Deserialize)]` structs and emits a `serde_js
 truth, deserializer and schema generated from the same type.
 
 ```jsonc
-// `agentd --config-schema` → stdout (abridged)
+// `agent --config-schema` → stdout (abridged)
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agentd.dev/schema/config/1.0",
-  "x-agentd-contract-version": "1.0",          // ties to the manifest (RFC 0014 §5)
+  "x-agent-contract-version": "1.0",          // ties to the manifest (RFC 0014 §5)
   "type": "object",
   "additionalProperties": false,               // mirrors deny_unknown_fields (§3.3)
   "properties": {
@@ -382,7 +382,7 @@ truth, deserializer and schema generated from the same type.
 ```
 
 **Freeze + version (RFC 0014 §3 principle 4).** The schema is a public API
-agentctl couples to. It carries `x-agentd-contract-version` (the manifest's
+agentctl couples to. It carries `x-agent-contract-version` (the manifest's
 `contract_version`, RFC 0014 §5) and `$id` pins the major. Changes are **additive
 within a major** (new optional fields, widened enums in a back-compatible
 direction); any breaking change (removing/renaming a field, narrowing an enum,
@@ -391,10 +391,10 @@ the schema whose major matches the instance's manifest, and refuses to drive an
 instance whose schema major it does not understand.
 
 `--config-schema` is also exposed as a **live self-MCP resource**,
-`agentd://config/schema` (RFC 0005 §3.3, `mimeType:"application/schema+json"`), so
+`agent://config/schema` (RFC 0005 §3.3, `mimeType:"application/schema+json"`), so
 agentctl can fetch the schema *from a running instance* it is already managing over
 vsock/unix, not just from a one-shot exec — same single-source-of-truth bytes.
-Alongside it, `agentd://config/effective` exposes the **resolved, redacted**
+Alongside it, `agent://config/effective` exposes the **resolved, redacted**
 running config (secrets shown as `***`, file/env/flag provenance per key) so
 `kubectl agent <x> describe` can show what an instance is *actually* running. Both
 resources are read-only and emit `notifications/resources/updated` on a successful
@@ -417,7 +417,7 @@ transport, or the exit-predicate **restart-only**. The partition is binding:
 | `mcp_servers[]` (add/remove/edit a server) | **reloadable** | re-handshake at a quiesce boundary; RFC 0003 §3.11 rebuild machinery already does this on restart |
 | `subscribe[]` (add/remove a subscription) | **reloadable** | re-subscribe + **read-after-subscribe** (RFC 0003 §3.11) on add; unsubscribe on remove |
 | `model`, `max_tokens`, `intelligence_headers` | **reloadable** | next intel call uses the new value; no in-flight corruption |
-| **`intelligence` (endpoint list) + `model_swap` policy** | **reloadable** | **resolved/implemented via RFC 0018 §5** (the runtime hot-swap primitive): a reload that repoints the endpoint list / changes the swap policy is **applied** at a turn boundary — the supervisor fans `ctrl/swap_intel` to in-flight children (warm `--continue` sessions + served runs), re-points new spawns, and notifies `agentd://intelligence`. A repointed endpoint starts with **fresh** health/breaker (no stale state carries to a new CID). The per-endpoint **credential** stays env/`_FILE`-only (never inline in the file, RFC 0012 §3.7). |
+| **`intelligence` (endpoint list) + `model_swap` policy** | **reloadable** | **resolved/implemented via RFC 0018 §5** (the runtime hot-swap primitive): a reload that repoints the endpoint list / changes the swap policy is **applied** at a turn boundary — the supervisor fans `ctrl/swap_intel` to in-flight children (warm `--continue` sessions + served runs), re-points new spawns, and notifies `agent://intelligence`. A repointed endpoint starts with **fresh** health/breaker (no stale state carries to a new CID). The per-endpoint **credential** stays env/`_FILE`-only (never inline in the file, RFC 0012 §3.7). |
 | `limits.*` | **reloadable** | applied to **new** spawns/turns; in-flight children keep their minted budgets (§5.5) |
 | `log_level` | **reloadable (live)** | applied immediately, no quiesce needed — it gates emission only |
 | **`mode`** (once/loop/reactive/schedule) | **restart-only** | changes the **exit predicate** (RFC 0008 / RFC 0011 §7) — the whole shape of the process |
@@ -429,8 +429,8 @@ transport, or the exit-predicate **restart-only**. The partition is binding:
 A reload whose diff touches **any** restart-only field is **rejected** — the whole
 reload is a no-op, the old config stays, and a `config.reload_rejected` event names
 the offending field(s) (§5.3, §7). agentctl, seeing that event (or by diffing the
-desired vs `agentd://config/effective`), performs a **rolling restart** for those
-fields — its policy, not agentd's.
+desired vs `agent://config/effective`), performs a **rolling restart** for those
+fields — its policy, not agent's.
 
 ### 5.2 Reload triggers
 
@@ -469,7 +469,7 @@ validated, and it **never** half-applies.
    ├─ Config::validate()  +  reload_coherence_check()      # §4.1 — the full check
    └─ on ANY error → ABORT: keep old config verbatim,
         emit {"event":"config.reload_rejected","reason":…,"diagnostics":[…]} (warn),
-        bump agentd_config_reload_total{result="rejected"}.  DONE. (no-op — §7)
+        bump agent_config_reload_total{result="rejected"}.  DONE. (no-op — §7)
 
 2. DIFF + GATE on the restart-only set (§5.1)
    └─ if the new vs running diff touches any restart-only field →
@@ -481,7 +481,7 @@ validated, and it **never** half-applies.
    │    returns -32000 "reload in progress" to NEW spawns (mirrors the `draining`
    │    guard, but transient — cleared in step 6).
    ├─ let in-flight subagent turns reach a TURN BOUNDARY (RFC 0007 loop invariant).
-   │    we do NOT cancel in-flight work; we wait up to AGENTD_RELOAD_QUIESCE
+   │    we do NOT cancel in-flight work; we wait up to AGENT_RELOAD_QUIESCE
    │    (default 10s, MUST be < drain_timeout) for a natural quiesce point.
    └─ in reactive mode, quiesce = the idle point between routed events (RFC 0008).
 
@@ -502,12 +502,12 @@ validated, and it **never** half-applies.
 
 5. SELF-MCP surface refresh
    ├─ emit notifications/tools/list_changed if the tool set changed (RFC 0005 §3.1).
-   ├─ emit notifications/resources/updated for agentd://config/effective (§4.2).
-   └─ (server schema agentd://config/schema is unchanged unless the binary changed.)
+   ├─ emit notifications/resources/updated for agent://config/effective (§4.2).
+   └─ (server schema agent://config/schema is unchanged unless the binary changed.)
 
 6. CLEAR `reloading`, EMIT SUCCESS
    └─ {"event":"config.reloaded","changed":["mcp_servers","subscribe"],"ts":…} (info),
-        bump agentd_config_reload_total{result="applied"}.
+        bump agent_config_reload_total{result="applied"}.
 ```
 
 Key invariants:
@@ -525,7 +525,7 @@ Key invariants:
   We never leave config in a state that did not validate.
 - **In-flight work is preserved where possible** (step 3): we quiesce to a turn
   boundary rather than cancelling, so a reload mid-run does not discard partial
-  results. If quiesce times out (`AGENTD_RELOAD_QUIESCE`), we still apply — the
+  results. If quiesce times out (`AGENT_RELOAD_QUIESCE`), we still apply — the
   applied diff only affects *new* turns/spawns, so a slow in-flight turn finishes
   on the old MCP set and the next turn sees the new one (§5.5).
 
@@ -590,13 +590,13 @@ schema; this RFC names the members):
 - `config.reload_requested` (info) — `{trigger:"sighup"|"watch"}`.
 - `config.reloaded` (info) — `{changed:[…field groups…], applied_ms}` on success.
 - `config.reload_rejected` (warn) — `{reason:"invalid"|"restart_required", field?, diagnostics[]}`.
-- Metric: **`agentd_config_reload_total{result="applied"|"rejected"}`** (counter,
-  RFC 0010 naming convention `agentd_*_total`), and a gauge
-  **`agentd_config_generation`** incremented on each applied reload so a scraper
+- Metric: **`agent_config_reload_total{result="applied"|"rejected"}`** (counter,
+  RFC 0010 naming convention `agent_*_total`), and a gauge
+  **`agent_config_generation`** incremented on each applied reload so a scraper
   can detect "this instance has picked up generation N" against the desired
   generation agentctl tracks. The reload **never** flips `/healthz` (liveness) or
   trips the stuck-detector; a rejected reload leaves a healthy, running process
-  (RFC 0010 §health). On a successful reload `agentd://config/effective` fires
+  (RFC 0010 §health). On a successful reload `agent://config/effective` fires
   `notifications/resources/updated` (§4.2) so a subscribed agentctl learns the new
   generation push-style.
 
@@ -610,13 +610,13 @@ Secrets remain env/file-only, never in the config file, never logged (RFC 0012
 
 ### 6.1 `--intelligence-token-file <path>`
 
-A sibling to `--intelligence-token` / `AGENTD_INTELLIGENCE_TOKEN` (RFC 0011 §3.2)
+A sibling to `--intelligence-token` / `AGENT_INTELLIGENCE_TOKEN` (RFC 0011 §3.2)
 that reads the intelligence credential from a **mounted file** rather than an env
 var — the idiomatic shape for a Kubernetes `Secret` volume:
 
 ```
 --intelligence-token-file /var/run/secrets/intel/token
-AGENTD_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/intel/token
+AGENT_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/intel/token
 ```
 
 - Resolved through `secrets::resolve()` (RFC 0006 §6) into the same `Secret`
@@ -681,10 +681,10 @@ fully, then either apply atomically or no-op cleanly — never half-apply.**
 | **Reload touches a restart-only field** (§5.1) | **no-op**: keep old config; signal that a restart is required | stays running; `config.reload_rejected{reason:"restart_required",field}` (warn) |
 | **Reload valid; a single added MCP server fails to handshake at apply** | apply the rest; mark that server unavailable (tool-domain absence to the model, RFC 0007) | `config.reloaded` (info) + `mcp.connect.fail` (warn) for the one server; not a rollback |
 | **Reload while `DRAINING`** | ignored — drain wins (the process is exiting) | no event beyond the drain's own |
-| **Quiesce times out** (`AGENTD_RELOAD_QUIESCE`) | apply anyway; the diff affects only new turns/spawns (§5.5) | `config.reloaded` with `quiesce_timeout:true` |
+| **Quiesce times out** (`AGENT_RELOAD_QUIESCE`) | apply anyway; the diff affects only new turns/spawns (§5.5) | `config.reloaded` with `quiesce_timeout:true` |
 | **Secret file missing/unreadable** at startup | config error before side effect | exit `2`, `config.invalid` |
 | **Secret file missing/unreadable** at use/reload | per-request error; one-shot → `EXIT_INTELLIGENCE` (4); daemon → logged retry | (RFC 0011 §5) |
-| **Precedence conflict** (env/flag override a file value, or `--mcp`/`--subscribe` add to the file list) | resolve by RFC 0011 §3.1 (flag>env>file>default); list-add for repeatable flags (§3.2) | **not an error** — `config.loaded` records the resolved set; provenance per key is visible in `agentd://config/effective` |
+| **Precedence conflict** (env/flag override a file value, or `--mcp`/`--subscribe` add to the file list) | resolve by RFC 0011 §3.1 (flag>env>file>default); list-add for repeatable flags (§3.2) | **not an error** — `config.loaded` records the resolved set; provenance per key is visible in `agent://config/effective` |
 
 Two non-negotiables, restated:
 
@@ -696,11 +696,11 @@ Two non-negotiables, restated:
    unchanged, stays healthy, and emits one `config.reload_rejected` event. agentctl
    treats that as "desired config not yet effective" and either fixes the config
    (for `invalid`) or rolls a restart (for `restart_required`) — its policy, on
-   agentd's primitive.
+   agent's primitive.
 
 ---
 
-## 8. Minimalism & the agentd/agentctl boundary
+## 8. Minimalism & the agent/agentctl boundary
 
 Holding the moat (RFC 0014 §3 principle 3), per surface:
 
@@ -720,13 +720,13 @@ The reload path runs on the existing single-threaded `recv_timeout` reactor (RFC
 supervisor uses. There is no watcher thread pool, no inotify *crate*, no schema
 *crate*.
 
-**What is explicitly agentctl's, not agentd's** (RFC 0014 §6): the CRD
+**What is explicitly agentctl's, not agent's** (RFC 0014 §6): the CRD
 (`Agent`/`AgentFleet`) and its config sub-object; the **admission webhook** that
-*calls* `--validate-config`/the schema (agentd ships the verdict, not the webhook);
+*calls* `--validate-config`/the schema (agent ships the verdict, not the webhook);
 the operator **reconcile loop** that decides *when* to push a new `ConfigMap` and
 whether to SIGHUP vs roll a restart on a `restart_required` reject; the **rollout
 strategy** (surge/maxUnavailable) for restart-only changes; the
-`ConfigMap`-to-volume projection. agentd exposes the file, the validator, the
+`ConfigMap`-to-volume projection. agent exposes the file, the validator, the
 schema, the signal, and the reload — never the Kubernetes-facing policy that
 composes them.
 
@@ -753,10 +753,10 @@ composes them.
 - **No config templating / env-substitution language in the file** beyond the two
   secret-ref tokens (§6). The file is data, not a template engine; environment
   variation is env/flag's job (12-factor III).
-- **No durable config history / rollback store.** agentd holds the *current*
+- **No durable config history / rollback store.** agent holds the *current*
   resolved config (and the prior one only long enough to diff a reload); versioning,
   history, and rollback are agentctl/GitOps concerns (the `ConfigMap` is the source
-  of truth, not an agentd-side store). This is consistent with the stateless-
+  of truth, not an agent-side store). This is consistent with the stateless-
   supervisor stance (RFC 0011 §7, RFC 0003 §3.11).
 - **No checkpoint of dynamic (self-MCP `subscribe`) subscriptions across reload.**
   As with restart (RFC 0011 §7, RFC 0013 D8), only **declared** subscriptions are
@@ -773,8 +773,8 @@ composes them.
   read-after-subscribe** (§3.11) that the subscription reload reuses verbatim.
 - **RFC 0004** — MCP client subset & codec: connecting/handshaking added MCP servers
   and the stdio-child shutdown for removed ones on reload; the wire is owned there.
-- **RFC 0005** — self-MCP server & control protocol: the `agentd://config/schema`
-  and `agentd://config/effective` resources, `notifications/tools/list_changed` on a
+- **RFC 0005** — self-MCP server & control protocol: the `agent://config/schema`
+  and `agent://config/effective` resources, `notifications/tools/list_changed` on a
   changed tool set, the `reloading`/`draining` spawn guard; the surface is owned there.
 - **RFC 0006** — intelligence transport & wire: owns `secrets::resolve()` and the
   `{{secret:NAME}}` declared-header interpolation this RFC extends with
@@ -787,7 +787,7 @@ composes them.
   gates; reloaded `limits` are a spawn-time template, not a retroactive shrink.
 - **RFC 0010** — observability, health & telemetry: **owns** the event vocabulary
   (`config.reloaded`/`config.reload_rejected`/`config.loaded`) and metric naming
-  (`agentd_config_reload_total`, `agentd_config_generation`) this RFC's events slot
+  (`agent_config_reload_total`, `agent_config_generation`) this RFC's events slot
   into; reload never flips `/healthz`.
 - **RFC 0011** — cloud-native contract: **the RFC this extends** — owns config
   precedence (§3.1), validate-at-startup → exit 2 (§3.3), the signal table (§4.1,

@@ -198,8 +198,13 @@ pub fn run() -> i32 {
     // next turn, so `restart-turn` is moot for it (the run ends after this turn).
     apply_pending_swap(&pending_swap, &mut intel, &mut input.model, &up, &log);
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
-        Ok(outcome) => {
+        Ok((outcome, usage)) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
+            // Roll the run's total tokens up to the supervisor BEFORE the terminal
+            // Result, so hierarchical accounting (`agentd_tokens_total`) sees them.
+            // One Usage per run (a one-shot is a single turn) — never cumulative
+            // AND per-turn, so `record_tokens`' fetch_add can't double-count.
+            send_up(&up, &AgentMsg::Usage(usage));
             send_up(&up, &AgentMsg::Result { outcome });
             code
         }
@@ -276,8 +281,9 @@ fn run_warm(
         // budget (a new deadline each turn, so the session isn't globally capped).
         let deadline = Instant::now() + Duration::from_millis(limits.deadline_ms.max(1));
         let mut budget = Budget::new(limits.max_steps, limits.max_tokens, deadline);
-        let outcome = match session.run_turn(&intel, orch, log, &mut budget, Some(cancel)) {
-            Ok(o) => o,
+        let (outcome, usage) = match session.run_turn(&intel, orch, log, &mut budget, Some(cancel))
+        {
+            Ok(ou) => ou,
             Err(LoopAbort::Intel(m)) => {
                 return fail(
                     up,
@@ -311,6 +317,14 @@ fn run_warm(
             );
             continue;
         }
+        // Roll this turn's tokens up to the supervisor BEFORE the Turn event, so
+        // hierarchical accounting (`agentd_tokens_total`) sees each warm turn's
+        // usage. This `usage` is exactly ONE turn's delta (`run_turn` accumulates
+        // per-turn `tok_in`/`tok_out` against a fresh per-event budget), and
+        // `record_tokens` fetch_adds — so one Usage per emitted turn never
+        // double-counts (a cancelled or restart-discarded turn emits no Turn and
+        // no Usage here).
+        send_up(up, &AgentMsg::Usage(usage));
         send_up(up, &AgentMsg::Turn { outcome });
         if cancel.load(Ordering::Relaxed) {
             break;

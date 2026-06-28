@@ -19,7 +19,7 @@ use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
 use crate::supervisor::budget::Budget;
-use crate::wire::intel::{Message, Request, ToolDef};
+use crate::wire::intel::{Message, Request, ToolDef, Usage};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt;
@@ -173,6 +173,13 @@ impl<'a> Session<'a> {
     /// boundary. Every assistant/tool message (including the final answer) is
     /// appended to the transcript, so a subsequent turn continues the same
     /// conversation.
+    ///
+    /// Returns the turn's [`Outcome`] together with the turn's token [`Usage`]
+    /// (the sum of every model call in this turn — `input_tokens`/`output_tokens`).
+    /// The control layer rolls this DELTA up to the supervisor as
+    /// [`crate::subagent::protocol::AgentMsg::Usage`] so hierarchical token
+    /// accounting (`agentd_tokens_total`) is non-zero — but the loop itself never
+    /// touches the control channel (the `up` handle stays in `control.rs`).
     pub fn run_turn(
         &mut self,
         intel: &IntelClient,
@@ -180,7 +187,7 @@ impl<'a> Session<'a> {
         log: &Logger,
         budget: &mut Budget,
         cancel: Option<&Arc<AtomicBool>>,
-    ) -> Result<Outcome, LoopAbort> {
+    ) -> Result<(Outcome, Usage), LoopAbort> {
         let mut last_text: Option<String> = None;
         // otel run trace: the `invoke_agent` span plus a `chat` child per model
         // call and an `execute_tool` child per tool call. No-op without
@@ -201,24 +208,36 @@ impl<'a> Session<'a> {
                     json!({"status": "cancelled", "steps": budget.steps()}),
                 );
                 run_span.finish(&self.model, tok_in, tok_out, false);
-                return Ok(Outcome {
-                    status: TerminalStatus::Cancelled,
-                    partial: last_text.is_some(),
-                    result: json!(last_text.unwrap_or_default()),
-                    scheduled: self_handler.take_scheduled(),
-                    subscriptions: self_handler.take_subscriptions(),
-                });
+                return Ok((
+                    Outcome {
+                        status: TerminalStatus::Cancelled,
+                        partial: last_text.is_some(),
+                        result: json!(last_text.unwrap_or_default()),
+                        scheduled: self_handler.take_scheduled(),
+                        subscriptions: self_handler.take_subscriptions(),
+                    },
+                    Usage {
+                        input_tokens: tok_in,
+                        output_tokens: tok_out,
+                    },
+                ));
             }
             if let Some(status) = budget.exceeded() {
                 log.warn("loop.final", json!({"status": status.as_str(), "steps": budget.steps(), "tokens": budget.tokens()}));
                 run_span.finish(&self.model, tok_in, tok_out, false);
-                return Ok(Outcome {
-                    status,
-                    partial: last_text.is_some(),
-                    result: json!(last_text.unwrap_or_default()),
-                    scheduled: self_handler.take_scheduled(),
-                    subscriptions: self_handler.take_subscriptions(),
-                });
+                return Ok((
+                    Outcome {
+                        status,
+                        partial: last_text.is_some(),
+                        result: json!(last_text.unwrap_or_default()),
+                        scheduled: self_handler.take_scheduled(),
+                        subscriptions: self_handler.take_subscriptions(),
+                    },
+                    Usage {
+                        input_tokens: tok_in,
+                        output_tokens: tok_out,
+                    },
+                ));
             }
 
             // Per-turn audit anchor (RFC 0010 §2.9 `loop.step`): the running
@@ -335,13 +354,19 @@ impl<'a> Session<'a> {
                 json!({"status": "completed", "steps": budget.steps(), "tokens": budget.tokens()}),
             );
             run_span.finish(&self.model, tok_in, tok_out, true);
-            return Ok(Outcome {
-                status: TerminalStatus::Completed,
-                partial: false,
-                result: json!(text),
-                scheduled: self_handler.take_scheduled(),
-                subscriptions: self_handler.take_subscriptions(),
-            });
+            return Ok((
+                Outcome {
+                    status: TerminalStatus::Completed,
+                    partial: false,
+                    result: json!(text),
+                    scheduled: self_handler.take_scheduled(),
+                    subscriptions: self_handler.take_subscriptions(),
+                },
+                Usage {
+                    input_tokens: tok_in,
+                    output_tokens: tok_out,
+                },
+            ));
         }
     }
 }
@@ -351,13 +376,18 @@ impl<'a> Session<'a> {
 /// `self_handler` supplies agentd's in-process self-tools (e.g. `subagent.spawn`);
 /// the loop tries it before MCP. A warm continue-session instead drives
 /// [`Session`] directly across many turns.
+///
+/// Returns the run's [`Outcome`] together with the run's total token [`Usage`].
+/// A one-shot run is exactly one turn, so the run total IS that turn's usage;
+/// the control layer emits it once per run as a single
+/// [`crate::subagent::protocol::AgentMsg::Usage`] (no double-count).
 pub fn run_loop(
     intel: &IntelClient,
     servers: &[McpClient],
     input: &LoopInput,
     self_handler: &mut dyn SelfHandler,
     log: &Logger,
-) -> Result<Outcome, LoopAbort> {
+) -> Result<(Outcome, Usage), LoopAbort> {
     let mut session = Session::prepare(servers, input, self_handler)?;
     let mut budget = Budget::new(input.max_steps, input.max_tokens, input.deadline);
     session.run_turn(intel, self_handler, log, &mut budget, input.cancel.as_ref())
@@ -629,5 +659,136 @@ mod tests {
         // multi-byte safety: never panics on a char boundary
         let multi = "é".repeat(CONTENT_LOG_CAP + 10);
         let _ = truncate_for_log(&multi);
+    }
+
+    // ---- the run_turn / run_loop token-usage producer (metrics-honesty) ----
+    //
+    // `run_turn`/`run_loop` now return the turn's/run's `Usage` so `control.rs`
+    // can roll it up to the supervisor as `AgentMsg::Usage` — the missing PRODUCER
+    // half of the producer→consumer→`agentd_tokens_total` chain. These drive the
+    // *real* loop against the built-in mock LLM (over a unix socket) and assert the
+    // returned `Usage` carries the model's reported tokens. The consumer→counter
+    // half is covered by the `obs::metrics` `record_tokens` tests and (end to end)
+    // by the reactive `/metrics` scrape in `reactive_e2e`.
+    #[cfg(unix)]
+    mod usage_producer {
+        use super::*;
+        use crate::intel::client::IntelClient;
+        use crate::obs::log::{Comp, Level, LogCtx, Logger};
+        use std::time::{Duration, Instant};
+
+        /// A SelfHandler that advertises no self-tools and handles nothing — the
+        /// loop falls through to MCP (here: no servers), so a `final` script's
+        /// answer ends the turn at once.
+        struct NoopHandler;
+        impl SelfHandler for NoopHandler {
+            fn tools(&self) -> Vec<ToolDef> {
+                Vec::new()
+            }
+            fn handle(&mut self, _name: &str, _args: &Value) -> Option<(String, bool)> {
+                None
+            }
+        }
+
+        fn test_log() -> Logger {
+            Logger::new(
+                LogCtx {
+                    run_id: "r".into(),
+                    agent_id: "0".into(),
+                    agent_path: "0".into(),
+                    comp: Comp::Agent,
+                    pid: 0,
+                    trace_id: None,
+                },
+                Level::Error, // keep the test quiet
+            )
+        }
+
+        /// Spawn the built-in mock LLM on `socket` with `script`, blocking until it
+        /// binds (so the first `complete()` connects, not races).
+        fn start_mock_llm(socket: &std::path::Path, script: &'static str) {
+            let s = socket.to_str().unwrap().to_string();
+            std::thread::spawn(move || {
+                crate::intel::mock::run(&s, script);
+            });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !socket.exists() {
+                assert!(Instant::now() < deadline, "mock-llm never bound");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn input(instruction: &str) -> LoopInput {
+            LoopInput {
+                instruction: instruction.into(),
+                output_contract: None,
+                seed: Vec::new(),
+                model: "mock".into(),
+                max_steps: 8,
+                max_tokens: 100_000,
+                deadline: Instant::now() + Duration::from_secs(10),
+                cancel: None,
+            }
+        }
+
+        #[test]
+        fn run_turn_returns_the_turns_token_usage() {
+            // The `final` script answers in one model call reporting
+            // usage{prompt_tokens: 11, completion_tokens: 5} (intel::mock). The turn
+            // surfaces exactly that split, NON-zero — the value control.rs emits up.
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("llm.sock");
+            start_mock_llm(&sock, "final");
+
+            let intel = IntelClient::from_parts(&format!("unix:{}", sock.display()), None).unwrap();
+            let inp = input("do the thing");
+            let mut handler = NoopHandler;
+            let mut session = Session::prepare(&[], &inp, &mut handler).unwrap();
+            let mut budget = Budget::new(inp.max_steps, inp.max_tokens, inp.deadline);
+
+            let (outcome, usage) = session
+                .run_turn(&intel, &mut handler, &test_log(), &mut budget, None)
+                .expect("turn runs against the mock LLM");
+
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+            // The producer half: the turn's reported tokens, non-zero, so the
+            // AgentMsg::Usage control.rs sends carries real tokens (not silent 0).
+            assert_eq!(
+                usage.input_tokens, 11,
+                "input tokens surfaced from the model"
+            );
+            assert_eq!(
+                usage.output_tokens, 5,
+                "output tokens surfaced from the model"
+            );
+            assert!(usage.total() > 0, "the rolled-up Usage is non-zero");
+        }
+
+        #[test]
+        fn run_loop_returns_the_runs_total_token_usage() {
+            // The one-shot path: run_loop is a single turn, so its returned Usage IS
+            // that turn's usage — one Usage per run (no double-count). The `read`
+            // script makes a tool call then answers: two model calls, so the run
+            // total SUMS both turns' tokens (each reports 11 in; 7 then 5 out).
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("llm.sock");
+            start_mock_llm(&sock, "read");
+
+            let intel = IntelClient::from_parts(&format!("unix:{}", sock.display()), None).unwrap();
+            let inp = input("read the resource");
+            let mut handler = NoopHandler;
+
+            let (outcome, usage) =
+                run_loop(&intel, &[], &inp, &mut handler, &test_log()).expect("one-shot run");
+
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+            // Two model calls in the run (tool call then final answer) — the run
+            // total accumulates both, proving run_loop sums across its turns' calls.
+            assert_eq!(usage.input_tokens, 22, "summed input over both model calls");
+            assert_eq!(
+                usage.output_tokens, 12,
+                "summed output over both model calls"
+            );
+        }
     }
 }

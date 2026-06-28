@@ -154,6 +154,11 @@ pub fn run_reactive(
                 server_order.push(spec.name.clone());
             }
             Err(e) => {
+                // Frozen §4.3 `agentd_mcp_connect_failures_total{server}` — the
+                // daemon's startup connect runs in THIS (supervisor) process, so
+                // the bump reaches the scrape (the child-side connect is process-
+                // local; see the metrics.rs caveat).
+                crate::obs::metrics::record_mcp_connect_failure(&spec.name);
                 log.error(
                     "mcp.connect.fail",
                     json!({"server": spec.name, "err": e.to_string()}),
@@ -586,6 +591,11 @@ pub fn run_reactive(
                     let _ = s.unsubscribe_within(uri, crate::obs::health::management_timeout());
                 }
             }
+            // Frozen §4.3 `agentd_drains_total{phase="completed"}` — the reactive
+            // daemon finished its graceful wind-down (warm sessions cancelled,
+            // claims released, subscriptions dropped) in THIS (supervisor) process.
+            // The block runs once before returning, so this counts each drain once.
+            crate::obs::metrics::record_drain("completed");
             log.info("proc.exit", json!({"reason": "drain", "mode": "reactive"}));
             return exit::SUCCESS;
         }
@@ -1402,6 +1412,9 @@ fn apply_mcp_server_diff(
             Err(e) => {
                 // CONTAINED FAILURE: a failed add is a tool-domain absence (RFC
                 // 0007), logged, NOT a rollback, NOT a daemon abort (RFC 0017 §5.3).
+                // Frozen §4.3 `agentd_mcp_connect_failures_total{server}` — the
+                // hot-reload add runs on the reactor (supervisor) thread.
+                crate::obs::metrics::record_mcp_connect_failure(&spec.name);
                 log.error(
                     "mcp.connect.fail",
                     json!({"server": spec.name, "kind": "reload", "err": e.to_string()}),
@@ -1627,6 +1640,9 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
             crate::obs::health::tick();
             std::thread::sleep(Duration::from_millis(100));
         }
+        // Frozen §4.3 `agentd_drains_total{phase="completed"}` (supervisor process;
+        // each drain-exit path is mutually exclusive, so a daemon drains once).
+        crate::obs::metrics::record_drain("completed");
         log.info(
             "proc.exit",
             json!({"reason": "drain", "mode": cfg.mode.as_str()}),
@@ -1638,6 +1654,8 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
     loop {
         crate::obs::health::tick();
         if signals::draining() {
+            // Frozen §4.3 `agentd_drains_total{phase="completed"}` (supervisor).
+            crate::obs::metrics::record_drain("completed");
             log.info(
                 "proc.exit",
                 json!({"reason": "drain", "mode": cfg.mode.as_str()}),
@@ -1661,6 +1679,8 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
                 .unwrap_or(Duration::from_secs(60));
             sleep_interruptible(wait);
             if signals::draining() {
+                // Frozen §4.3 `agentd_drains_total{phase="completed"}` (supervisor).
+                crate::obs::metrics::record_drain("completed");
                 log.info(
                     "proc.exit",
                     json!({"reason": "drain", "mode": cfg.mode.as_str()}),
@@ -1717,7 +1737,17 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         let now = Instant::now();
         match governor.on_outcome(ok, now.duration_since(started), now) {
             _ if ok => sleep_interruptible(post_wait),
-            RestartAction::Backoff(d) => sleep_interruptible(d.max(post_wait)),
+            RestartAction::Backoff(d) => {
+                // Frozen §4.3 `agentd_subagent_restarts_total{reason}` — the
+                // `loop`/`schedule` governor is about to respawn a FAILED run
+                // (the `ok` arm above handles a clean run, which is not a restart).
+                // The governor exposes no finer cause at this site, so the coarse
+                // `crashed` reason is used (the closed domain also carries
+                // `stuck`/`rate`, driven where that detail is known). This runs in
+                // the daemon (supervisor) process, so it reaches the scrape.
+                crate::obs::metrics::record_subagent_restart("crashed");
+                sleep_interruptible(d.max(post_wait));
+            }
             RestartAction::Tripped => {
                 crate::obs::metrics::record_restart_tripped();
                 log.warn(

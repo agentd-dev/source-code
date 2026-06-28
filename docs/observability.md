@@ -453,22 +453,41 @@ The metrics that matter (derivable from logs by default; emitted directly under
 the features below):
 
 - **Gauges:** `agentd_active_subagents`, `agentd_tree_depth`,
-  `agentd_subscriptions_active`, `agentd_warm_sessions`, `agentd_ready` (0/1),
+  `agentd_tree_breadth`, `agentd_subscriptions_active`, `agentd_ready` (0/1),
   `agentd_up`.
-- **Counters:** `agentd_loop_steps_total`, `agentd_intel_calls_total{model}`,
-  `agentd_tokens_total{model,type=in|out}`,
-  `agentd_tool_calls_total{server,tool,ok}`,
-  `agentd_resource_events_total{server}`, `agentd_triggers_total{kind,route}`,
+- **Counters:** `agentd_loop_steps_total`, `agentd_intel_calls_total`,
+  `agentd_tokens_total{type=in|out}`, `agentd_reactions_total`,
   `agentd_subagents_spawned_total`, `agentd_subagents_exited_total{status}`,
   `agentd_subagent_restarts_total{reason}`,
   `agentd_subagent_stuck_kills_total{signal}` (the reliability headline),
   `agentd_limit_exceeded_total{limit}`,
   `agentd_mcp_connect_failures_total{server}`.
 
+> **What the `metrics` build actually renders.** The list above is what an
+> agentctl dashboard counts; under `--features metrics` the **emitted** series are
+> exactly those in [`obs/metrics.rs::render`](../crates/agentd/src/obs/metrics.rs)
+> and the frozen RFC 0016 §4.3 set below. Three §4.3 names are **reserved**, not
+> emitted in this build (rendered as a `# HELP`/`# TYPE` marker with no sample, the
+> same honest-absence shape as `agentd_mcp_up`):
+> `agentd_tool_calls_total{server,tool,ok}` (the tool-call boundary runs in the
+> child loop, so a supervisor scrape can't reflect it — derive from `tool.result`
+> log lines), and the three latency **histograms** `agentd_run_duration_ms`,
+> `agentd_intel_call_duration_ms`, `agentd_tool_call_duration_ms` (no histogram
+> exposition machinery in this build — use the `dur_ms` log field). The frozen
+> `model` label on `agentd_tokens_total` / `agentd_intel_calls_total` is likewise
+> **deferred**: the call sites carry no model identifier, so the label is reserved
+> and intentionally absent (never faked) — per-model splits come from
+> `intel.result.usage` log lines. `agentd_loop_steps_total`, `agentd_refusals_total`,
+> and the steps/tokens/deadline/depth legs of `agentd_limit_exceeded_total` are
+> **process-local** — emitted in the re-exec'd child loop, so the supervisor scrape
+> reflects only its own process (cross-process rollup is a v1 non-goal); the
+> `tree_tokens` leg is the supervisor's own bound and is live.
+
 **Cardinality discipline (binding):** **never** put `run_id`, `agent_id`,
 `agent_path`, `call_id`, or resource URIs into metric labels — they are unbounded
 and live in logs/traces only. Labels use bounded values only: `server`, `tool`,
-`model`, `kind`, `route`, `status`, `limit`, `signal`, `reason`, `type`.
+`kind`, `route`, `status`, `limit`, `signal`, `reason`, `type` (the `model` label
+is reserved by RFC 0016 §4.3 but not yet emitted — see the note above).
 
 ### `metrics` feature — Prometheus text (`--features metrics`)
 
@@ -507,13 +526,24 @@ The management/hot-reload surfaces add these to the frozen set:
   terminal-status vocabulary (`completed`, `refused`, `exhausted_steps`,
   `exhausted_tokens`, `deadline`, `stalled`, `loop_detected`, `cancelled`,
   `crashed`, `other`).
-- **`agentd_refusals_total{reason}`** *(counter)* — guard trips by reason
-  (`trifecta` | `rate` | `budget` | `depth` | `mcp` | `other`).
+- **`agentd_refusals_total{reason}`** *(counter; **process-local**)* — guard trips
+  by reason (`trifecta` | `rate` | `budget` | `depth` | `mcp` | `other`). Refusals
+  trip in the re-exec'd child loop, so this reflects only the scraped process — the
+  headline safety signal is the refusal / `scope.trifecta_refused` log line.
 - **`agentd_intel_up`** *(gauge, 0/1)* and **`agentd_intel_errors_total{reason}`**
   *(counter; `unreachable`|`auth`|`timeout`|`5xx`|`other`)* — intelligence-endpoint
   reachability + error breakdown.
-- **`agentd_restarts_total`**, **`agentd_reactor_stalls_total`** *(counters)* —
-  supervisor process restarts observed, and wedged-reactor liveness trips.
+- **`agentd_intel_all_down`** *(gauge, 0/1)* — `1` while **every** model endpoint
+  is down (the latched last-child-experience truth that also flips `/readyz`
+  NotReady, RFC 0018 §6); distinct from `agentd_intel_up` (the active endpoint's
+  reachability).
+- **`agentd_restarts_total`**, **`agentd_reactor_stalls_total`** *(counters;
+  **reserved** in `metrics_schema 1.0`)* — supervisor process restarts observed
+  (rebuild+reconcile), and wedged-reactor liveness trips. Both are rendered but
+  **not emitted** in this build: there is no in-process rebuild+reconcile path for
+  the former (a pod restart is a fresh zeroed process the orchestrator counts), and
+  a wedged reactor surfaces as a `/healthz` 503 (a per-scrape heartbeat-age read),
+  not a one-shot in-process event, for the latter.
 - **`agentd_tree_breadth`** *(gauge)* — current max siblings at any tree node
   (alongside the existing `agentd_active_subagents` / `agentd_tree_depth`).
 - **`agentd_memory_max_bytes`** / **`agentd_memory_current_bytes`** *(gauges)* —

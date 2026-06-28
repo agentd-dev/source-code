@@ -344,6 +344,59 @@ impl Endpoint {
         .map_err(IntelError::Parse)?;
         Ok((parsed, latency))
     }
+
+    /// RFC 0018 §5.4 model-discovery probe: one hand-rolled HTTP **GET** to the
+    /// `/v1/models` sibling of this endpoint's chat path, over the SAME transport
+    /// (unix / tcp+tls / vsock) + the SAME bearer auth the chat call uses — no new
+    /// client, no streaming. Returns the discovered model `id`s.
+    ///
+    /// **Best-effort, silent-degrade (§5.4):** the `anthropic` dialect has no list
+    /// endpoint → `vec![]`; for OpenAI-compatible, a connection/transport failure,
+    /// a non-2xx (e.g. 404 — discovery unsupported), or a non-JSON/unexpected body
+    /// all yield `vec![]`. NEVER a failover-class error, NEVER fatal — the endpoint
+    /// is fully usable with discovery unsupported (the configured model is dialed
+    /// regardless). The caller bounds it with a SHORT timeout (off the hot path).
+    pub(super) fn discover_models(&self, timeout: Duration) -> Vec<String> {
+        use super::openai;
+        use crate::net::http;
+
+        // Dialect detection is already known from the provider (§5.4 — reuse, don't
+        // re-detect). Anthropic has no list endpoint.
+        if self.provider != Provider::OpenAiCompatible {
+            return Vec::new();
+        }
+
+        let path = openai::models_path(&self.http_path);
+        // Same auth header the chat call sends (`Authorization: Bearer …`), no body.
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(tok) = self.token.as_deref() {
+            headers.push(("authorization".into(), format!("Bearer {tok}")));
+        }
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        // Connect → GET → parse. Any error degrades to [] (silent, never fatal).
+        let Ok(mut stream) = self.transport.connect(timeout) else {
+            return Vec::new();
+        };
+        let Ok(resp) = http::send(
+            stream.as_mut(),
+            &self.host_header,
+            "GET",
+            &path,
+            &header_refs,
+            &[],
+        ) else {
+            return Vec::new();
+        };
+        if !resp.is_success() {
+            // 404 / 4xx / 5xx → discovery unsupported for this endpoint.
+            return Vec::new();
+        }
+        openai::parse_models(&resp.body)
+    }
 }
 
 #[cfg(test)]

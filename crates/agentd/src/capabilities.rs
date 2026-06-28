@@ -106,6 +106,13 @@ fn identity_block(id: &Identity) -> Value {
 /// count + reachability. Never the endpoint URL (no embedded creds), never the
 /// token (RFC 0012 §3.7). `healthy` is `"unknown"` on the pre-connect one-shot
 /// path; the count/transport are static config.
+///
+/// RFC 0018 §5.4 model-discovery (`discovery`/`models`) is **NOT** probed here:
+/// this builder is network-free so the one-shot `agentd --capabilities`
+/// (`live == false`) is side-effect-free admission (RFC 0015 §5.2 — no socket).
+/// The one-shot reports `discovery:false` and `models` as the configured model
+/// only (a config-capability view). The LIVE served read overlays the actual
+/// probed discovery via [`intelligence_discovery_overlay`] (gated on `live`).
 fn intelligence(cfg: &Config, live: bool) -> Value {
     // `live` is the live-resource path (a later RFC chunk), which will fill in
     // last-known reachability; the one-shot pre-connect probe (`live == false`)
@@ -123,7 +130,39 @@ fn intelligence(cfg: &Config, live: bool) -> Value {
         // only the bounded count.
         "endpoints": endpoint_count(cfg.intelligence.as_deref()),
         "healthy": "unknown",
+        // RFC 0018 §5.4 discovery — additive (RFC 0014 §3; absent/false ⇒ agentctl
+        // assumes only the configured model). Network-free baseline: NOT probed on
+        // the one-shot admission path; `false` + the configured model only. The
+        // served read overlays the real probe ([`intelligence_discovery_overlay`]).
+        "discovery": false,
+        "models": configured_models(cfg.model.as_deref()),
     })
+}
+
+/// The configured model as a one-element list (`[]` when unset) — the
+/// network-free `intelligence.models` baseline for the one-shot manifest (RFC
+/// 0018 §5.4: the configured model is always usable, even with discovery off).
+fn configured_models(model: Option<&str>) -> Vec<String> {
+    model
+        .filter(|m| !m.is_empty())
+        .map(|m| vec![m.to_string()])
+        .unwrap_or_default()
+}
+
+/// Overlay RFC 0018 §5.4 discovery (`discovery` + `models`) onto an already-built
+/// manifest's `intelligence` block, for the LIVE served `agentd://capabilities`
+/// read ONLY. The supervisor probes lazily + cached (off the hot path) and passes
+/// the result here; the one-shot admission manifest never calls this (it stays
+/// network-free, RFC 0015 §5.2). `models` is the union of discovered + configured
+/// (already folded by [`crate::intel::discovery::discover`]).
+pub fn intelligence_discovery_overlay(manifest: &mut Value, discovery: bool, models: &[String]) {
+    if let Some(intel) = manifest
+        .get_mut("intelligence")
+        .and_then(Value::as_object_mut)
+    {
+        intel.insert("discovery".into(), json!(discovery));
+        intel.insert("models".into(), json!(models));
+    }
 }
 
 /// The first (primary) element of the comma-list `--intelligence` value, for the
@@ -414,6 +453,57 @@ mod tests {
         let id = Identity::from_env(&cfg.run_id);
         let m = manifest(&cfg, &id, false);
         assert_eq!(m["intelligence"]["healthy"], json!("unknown"));
+        assert_eq!(m["intelligence"]["transport"], json!("https"));
+        assert_eq!(m["intelligence"]["endpoints"], json!(1));
+    }
+
+    #[test]
+    fn one_shot_intelligence_discovery_is_network_free_baseline() {
+        // RFC 0018 §5.4 + RFC 0015 §5.2: the one-shot manifest builder is
+        // network-free. `discovery` is `false` (no probe ran) and `models` is the
+        // configured model only — the served read overlays the real probe.
+        let cfg = cfg_with(
+            &[
+                ("INSTRUCTION", "x"),
+                ("AGENTD_INTELLIGENCE", "https://api.example/v1"),
+            ],
+            &["--model", "claude-opus-4"],
+        );
+        let id = Identity::from_env(&cfg.run_id);
+        let m = manifest(&cfg, &id, false);
+        assert_eq!(m["intelligence"]["discovery"], json!(false));
+        assert_eq!(m["intelligence"]["models"], json!(["claude-opus-4"]));
+    }
+
+    #[test]
+    fn intelligence_models_is_empty_when_no_model_configured() {
+        // No `--model`: the network-free baseline `models` is `[]` (RFC 0018 §5.4
+        // — `[]` if none discovered AND no configured model).
+        let cfg = base();
+        let id = Identity::from_env(&cfg.run_id);
+        let m = manifest(&cfg, &id, false);
+        assert_eq!(m["intelligence"]["models"], json!([]));
+    }
+
+    #[test]
+    fn discovery_overlay_replaces_the_baseline_on_the_served_read() {
+        // The supervisor overlays the probed discovery onto the manifest's
+        // `intelligence` block (the LIVE served path). The additive keys take the
+        // probed values; the structural keys are untouched.
+        let cfg = base();
+        let id = Identity::from_env(&cfg.run_id);
+        let mut m = manifest(&cfg, &id, true);
+        intelligence_discovery_overlay(
+            &mut m,
+            true,
+            &["claude-opus-4".to_string(), "claude-haiku-4".to_string()],
+        );
+        assert_eq!(m["intelligence"]["discovery"], json!(true));
+        assert_eq!(
+            m["intelligence"]["models"],
+            json!(["claude-opus-4", "claude-haiku-4"])
+        );
+        // Structural fields stay intact under the overlay.
         assert_eq!(m["intelligence"]["transport"], json!("https"));
         assert_eq!(m["intelligence"]["endpoints"], json!(1));
     }

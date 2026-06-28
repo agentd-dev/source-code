@@ -20,8 +20,14 @@ use std::time::Duration;
 use super::client::{IntelError, Provider, Transport, resolve};
 use super::health::{BreakerConfig, HealthRecord};
 
-/// The default per-endpoint credential env var (≡ endpoint 1, RFC 0018 §3.2).
+/// The default per-endpoint credential env var (≡ endpoint 1, RFC 0018 §3.2) —
+/// the branded spelling agentd documents/emits.
 const TOKEN_ENV: &str = "AGENTD_INTELLIGENCE_TOKEN";
+
+/// The neutral (de-branded) credential env var (ACC SPEC L4 / env-convention.json)
+/// accepted as an input alias for [`TOKEN_ENV`]. Credentials path only — the
+/// resolved value is still held opaquely and never logged/serialized (L5).
+const TOKEN_ENV_NEUTRAL: &str = "AGENT_INTELLIGENCE_TOKEN";
 
 /// A single resolved endpoint: its transport + the per-request HTTP framing +
 /// its resolved credential + live health/breaker state.
@@ -254,19 +260,31 @@ fn resolve_token(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, IntelError> {
     // Endpoint 1 (idx 0) uses the bare names; later endpoints are 1-indexed
-    // (`_2`, `_3`, …).
-    let (inline_var, file_var) = if idx == 0 {
-        (TOKEN_ENV.to_string(), format!("{TOKEN_ENV}_FILE"))
+    // (`_2`, `_3`, …). Each branded `AGENTD_*` name has a neutral `AGENT_*` alias
+    // (ACC SPEC L4) accepted on input — branded never dropped.
+    let (inline_var, file_var, inline_var_n, file_var_n) = if idx == 0 {
+        (
+            TOKEN_ENV.to_string(),
+            format!("{TOKEN_ENV}_FILE"),
+            TOKEN_ENV_NEUTRAL.to_string(),
+            format!("{TOKEN_ENV_NEUTRAL}_FILE"),
+        )
     } else {
         let n = idx + 1;
-        (format!("{TOKEN_ENV}_{n}"), format!("{TOKEN_ENV}_{n}_FILE"))
+        (
+            format!("{TOKEN_ENV}_{n}"),
+            format!("{TOKEN_ENV}_{n}_FILE"),
+            format!("{TOKEN_ENV_NEUTRAL}_{n}"),
+            format!("{TOKEN_ENV_NEUTRAL}_{n}_FILE"),
+        )
     };
     // Precedence: explicit inline env override > file override > the resolved
-    // default (only for endpoint 0). Higher-precedence inline wins.
-    if let Some(v) = env(&inline_var) {
+    // default (only for endpoint 0). Higher-precedence inline wins. At each tier
+    // the neutral `AGENT_*` spelling is read first, then the branded `AGENTD_*`.
+    if let Some(v) = env(&inline_var_n).or_else(|| env(&inline_var)) {
         return Ok(Some(v));
     }
-    if let Some(path) = env(&file_var) {
+    if let Some(path) = env(&file_var_n).or_else(|| env(&file_var)) {
         let tok = crate::sec::secret::read_token_file(&path).map_err(IntelError::Unsupported)?;
         return Ok(Some(tok));
     }
@@ -487,6 +505,36 @@ mod tests {
         let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "from-env")]);
         let list = EndpointList::parse_with_env("unix:/a", Some("default".into()), &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn neutral_token_env_is_accepted_as_an_alias() {
+        // ACC SPEC L4: the neutral `AGENT_INTELLIGENCE_TOKEN[_N]` spelling is
+        // accepted on input (endpoint 1 bare; later endpoints 1-indexed).
+        let env = env_of(&[
+            ("AGENT_INTELLIGENCE_TOKEN", "neutral-a"),
+            ("AGENT_INTELLIGENCE_TOKEN_2", "neutral-b"),
+        ]);
+        let list = EndpointList::parse_with_env("unix:/a,unix:/b", None, &env).unwrap();
+        assert_eq!(list.ep(0).token.as_deref(), Some("neutral-a"));
+        assert_eq!(list.ep(1).token.as_deref(), Some("neutral-b"));
+    }
+
+    #[test]
+    fn branded_token_env_wins_over_neutral_on_conflict() {
+        // Both spellings set ⇒ neutral-first is read; the branded form is still
+        // accepted when the neutral one is absent (alias, never dropped).
+        let env = env_of(&[
+            ("AGENT_INTELLIGENCE_TOKEN", "neutral"),
+            ("AGENTD_INTELLIGENCE_TOKEN", "branded"),
+        ]);
+        let list = EndpointList::parse_with_env("unix:/a", None, &env).unwrap();
+        assert_eq!(list.ep(0).token.as_deref(), Some("neutral"));
+
+        // Branded-only still resolves (back-compat).
+        let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "branded")]);
+        let list = EndpointList::parse_with_env("unix:/a", None, &env).unwrap();
+        assert_eq!(list.ep(0).token.as_deref(), Some("branded"));
     }
 
     #[test]

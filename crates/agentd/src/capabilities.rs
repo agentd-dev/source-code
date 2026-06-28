@@ -46,6 +46,10 @@ pub fn manifest(cfg: &Config, identity: &Identity, live: bool) -> Value {
     json!({
         "contract_version": CONTRACT_VERSION,
         "agentd_version": crate::VERSION,
+        // De-branding (ACC SPEC L4): emit the neutral `agent_version` ALONGSIDE the
+        // branded `agentd_version` (never dropped) — the manifest root anyOf-requires
+        // one of the two, so this lets a neutral-only consumer read it pre-GA.
+        "agent_version": crate::VERSION,
         "build_features": build_features(),
         "identity": identity_block(identity),
         "mode": cfg.mode.as_str(),
@@ -265,7 +269,11 @@ fn limits(cfg: &Config) -> Value {
 /// implemented in this chunk are reported `false`/empty; later RFC chunks flip
 /// them true. agentctl reads this and drives only what is declared.
 fn surfaces(cfg: &Config) -> Value {
-    // `mut` is needed only in a `cluster` build (the conditional `claim` insert).
+    // The events stream is served only with the `events` feature AND a management
+    // transport to serve it on (RFC 0016 §7). Computed once: it gates both the
+    // `events` bool and the `events_schema` envelope-version insert below.
+    let events_served = cfg!(feature = "events") && cfg.serve_mcp.is_some();
+    // `mut` is needed for the conditional `claim` / `events_schema` inserts below.
     #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
     let mut s = json!({
         // The served self-MCP management transport: its address string if
@@ -288,8 +296,9 @@ fn surfaces(cfg: &Config) -> Value {
         "metrics": cfg.metrics_addr.clone().map_or(Value::Bool(false), Value::String),
         "metrics_schema": crate::obs::metrics::METRICS_SCHEMA,
         // The agentd://events stream (RFC 0016 §7): served only when this build has
-        // the `events` feature AND a management transport to serve it on.
-        "events": cfg!(feature = "events") && cfg.serve_mcp.is_some(),
+        // the `events` feature AND a management transport to serve it on. The
+        // envelope-version `events_schema` is emitted alongside it below (when served).
+        "events": events_served,
         // Run-outcome reports (RFC 0016 §6) — the report schema this binary writes.
         "report_schema": crate::report::REPORT_SCHEMA,
         // The frozen exit-code contract version (RFC 0016 §5, around RFC 0011 §5).
@@ -330,6 +339,16 @@ fn surfaces(cfg: &Config) -> Value {
     #[cfg(feature = "cluster")]
     if let Some(obj) = s.as_object_mut() {
         obj.insert("claim".into(), json!({ "styles": ["tool", "resource"] }));
+    }
+    // The events ENVELOPE schema version (RFC 0016 §7), emitted ALONGSIDE
+    // surfaces.events when the stream is actually served — exactly like
+    // metrics/metrics_schema. Sourced from the owning obs module (never hardcoded);
+    // OMITTED when events is unserved (capability-absence-not-error, RFC 0015 §2.5).
+    if events_served && let Some(obj) = s.as_object_mut() {
+        obj.insert(
+            "events_schema".into(),
+            json!(crate::obs::log::EVENTS_SCHEMA),
+        );
     }
     s
 }
@@ -404,6 +423,7 @@ mod tests {
         for key in [
             "contract_version",
             "agentd_version",
+            "agent_version",
             "build_features",
             "identity",
             "mode",
@@ -420,6 +440,9 @@ mod tests {
         }
         assert_eq!(m["contract_version"], json!("1.0"));
         assert_eq!(m["agentd_version"], json!(crate::VERSION));
+        // De-branding (ACC SPEC L4): the neutral `agent_version` is emitted next to
+        // the branded `agentd_version` (both present, same value; neither dropped).
+        assert_eq!(m["agent_version"], json!(crate::VERSION));
         // run_id is always present in identity.
         assert_eq!(m["identity"]["run_id"], json!(cfg.run_id));
     }
@@ -549,6 +572,12 @@ mod tests {
         }
         // events needs `events` + a management transport (neither configured here).
         assert_eq!(s["events"], json!(false));
+        // events_schema is emitted ONLY alongside a served events surface — here it
+        // is unserved, so the key is OMITTED (not false/null), like surfaces.claim.
+        assert!(
+            s.get("events_schema").is_none(),
+            "events_schema must be omitted when events is unserved"
+        );
         // RFC 0017: config_validate/config_schema are always-available default-build
         // flags (true); hot_reload reflects the `hot-reload` build feature (§5).
         assert_eq!(s["hot_reload"], json!(cfg!(feature = "hot-reload")));
@@ -631,6 +660,26 @@ mod tests {
             s.get("claim").is_none(),
             "claim must be omitted without the cluster feature"
         );
+    }
+
+    #[cfg(feature = "events")]
+    #[test]
+    fn events_schema_is_emitted_alongside_a_served_events_surface() {
+        // With the `events` feature + a management transport, the events surface is
+        // served, so events_schema (the envelope version) is emitted next to it —
+        // sourced from the owning obs module, mirroring metrics/metrics_schema.
+        let cfg = cfg_with(
+            &[
+                ("INSTRUCTION", "x"),
+                ("AGENTD_INTELLIGENCE", "unix:/x"),
+                ("AGENTD_SERVE_MCP", "unix:/run/agentd.sock"),
+            ],
+            &[],
+        );
+        let id = Identity::from_env(&cfg.run_id);
+        let s = &manifest(&cfg, &id, false)["surfaces"];
+        assert_eq!(s["events"], json!(true));
+        assert_eq!(s["events_schema"], json!(crate::obs::log::EVENTS_SCHEMA));
     }
 
     #[test]

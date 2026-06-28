@@ -106,10 +106,47 @@ pub fn pod_failure_intent(code: i32) -> &'static str {
     }
 }
 
+/// Apply the operator's `--budget-exit-code` remap (RFC 0011 §5.2; ACC
+/// exit-codes.table.json `x-budget-exit-code-remap`). ONLY the two
+/// operator-tunable `policy`-intent budget codes are remappable — `EXIT_PARTIAL`
+/// (3) and `EXIT_BUDGET` (7); every other code (a clean `0`, a terminal refusal
+/// `5`, the `policy` deadline `124`, a kernel `137`) is returned UNCHANGED. With
+/// no remap configured (`None`) the canonical table applies verbatim.
+///
+/// This is applied ONLY to the final *process* exit code a Job's
+/// `podFailurePolicy` observes — the run report keeps the canonical 3/7
+/// projection (and the precise terminal `status`), so the durable record stays
+/// truthful and `report.schema`-valid regardless of the remap.
+pub fn apply_budget_remap(code: i32, budget_exit_code: Option<i32>) -> i32 {
+    match (code, budget_exit_code) {
+        (PARTIAL | BUDGET, Some(remapped)) => remapped,
+        _ => code,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agentloop::stop::TerminalStatus::*;
+
+    #[test]
+    fn budget_remap_touches_only_partial_and_budget() {
+        // The two operator-tunable `policy` budget codes remap…
+        assert_eq!(apply_budget_remap(PARTIAL, Some(0)), 0);
+        assert_eq!(apply_budget_remap(BUDGET, Some(0)), 0);
+        assert_eq!(apply_budget_remap(BUDGET, Some(1)), 1);
+        // …and NOTHING else does, even though some share the `policy` intent.
+        for code in [SUCCESS, GENERIC, USAGE, INTEL_UNAVAILABLE, REFUSED, MCP_REQUIRED_DOWN, DEADLINE] {
+            assert_eq!(
+                apply_budget_remap(code, Some(0)),
+                code,
+                "code {code} must never be remapped by --budget-exit-code"
+            );
+        }
+        // No remap configured ⇒ the canonical table is verbatim.
+        assert_eq!(apply_budget_remap(PARTIAL, None), PARTIAL);
+        assert_eq!(apply_budget_remap(BUDGET, None), BUDGET);
+    }
 
     #[test]
     fn mapping_matches_table() {

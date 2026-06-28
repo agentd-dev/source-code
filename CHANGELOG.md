@@ -6,6 +6,46 @@ versions are the released git tags (`vX.Y.Z`) and the published image
 remains `1.0` and surfaces evolve additively, but **breaking changes are called
 out explicitly** below.
 
+## v2.9.0 — Agent Control Contract (ACC) v1 conformance
+
+agentd is now fully conformant to **ACC v1** — the neutral, language-neutral
+contract the agentctl control plane consumes (`contract_version` stays `1.0`).
+Additive + backward-compatible; the default image feature set is unchanged; still a
+static 3-dependency musl binary. A `CONFORMANCE.md` records the per-surface
+PASS/FAIL, the live validation, and the deferred items.
+
+### Added
+
+- **`--budget-exit-code <N>`** (RFC 0011 §5.2): remap the two operator-tunable
+  *policy* budget codes — `EXIT_PARTIAL` (3) and `EXIT_BUDGET` (7), and **only**
+  those — to `N` at the process exit a Job's `podFailurePolicy` observes (`N` ∈
+  `0..=255`). The run report keeps the canonical 3/7 projection, so it stays
+  truthful and schema-valid.
+- **De-branding input acceptance (ACC SPEC L4)** — neutral spellings are now also
+  accepted on input, while the branded forms stay accepted **and emitted** (none
+  dropped): neutral `AGENT_*` env vars (branded `AGENTD_*` wins on conflict, so
+  fielded deployments are byte-for-byte unchanged), `agent://` resource URIs,
+  neutral downward-API identity + per-endpoint token vars. The manifest now also
+  emits the neutral `agent_version` next to `agentd_version`, and the additive
+  `surfaces.events_schema` envelope version when the events stream is served.
+
+### Changed
+
+- **Operator-surface gating (ACC SPEC L7)** — a non-Management caller of an
+  operator tool **or** resource (`inventory`/`intelligence`/`capacity`/
+  `config/effective`/`events`) now uniformly gets `-32601` METHOD_NOT_FOUND on both
+  read and subscribe (some operator-resource reads/subscribes previously returned
+  `-32002`), so a stdio peer can't even confirm an operator surface exists.
+- **`cancel{handle:"0"}` / omitted** now cancels the whole run (root subtree).
+
+### Notes
+
+- No ACC schema was edited by agentd; two contract asks are recorded in
+  `CONFORMANCE.md` (the SPEC §4.4 metric count; the `run_id` "ULID" wording). The
+  contract's config/metrics/exit-codes schemas were reconciled upstream
+  (source-wins) to match agentd; the golden `--capabilities` fixtures remain the
+  agentctl-owned captures and validate against the current schema.
+
 ## v2.8.1 — graceful `--enable-exec` migration
 
 A docs/UX patch over v2.8.0's breaking exec change (no behavior change beyond the

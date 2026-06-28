@@ -106,18 +106,24 @@ split into e.g. a `read_*` subset that is `sensitive` but not `egress`):
 }
 ```
 
-### The Rule-of-Two check at startup
+### The Rule-of-Two check — one validation authority
 
-The trifecta check runs **once, at startup**, over the **root grant** — the OR of the capability
-tags across every granted MCP server (an untagged server counts conservatively as
-`untrusted_input`; `--enable-exec` counts as `egress`). Because scope narrows **monotonically**
-down the tree (a child's grant is always a subset of its parent's, RFC 0009), bounding the root
-bounds every descendant — so the single root check suffices and the per-spawn path never has to
-re-evaluate it.
+The trifecta check lives **inside `Config::validate()`** — the single validation authority (RFC
+0017 §7) that both startup and `--validate-config` run — over the **root grant**, the OR of the
+capability tags across every granted MCP server (an untagged server counts conservatively as
+`untrusted_input`; `--enable-exec` counts as `egress`). Because it is part of `validate()`,
+`--validate-config` and startup can never disagree: a trifecta-only config that startup refuses
+is also reported `config.invalid` (exit 2) by the admission gate. Because scope narrows
+**monotonically** down the tree (a child's grant is always a subset of its parent's, RFC 0009),
+bounding the root bounds every descendant — so the single root check suffices and the per-spawn
+path never has to re-evaluate it. On a **hot reload** the check re-runs over the new config: a
+reload that would newly form a complete trifecta without `--allow-trifecta` is rejected
+(`config.reload_rejected{reason:"trifecta_required"}`) and the running config is kept verbatim —
+the live capability set can never be widened into a trifecta without a restart.
 
 - **Refuse** (default): a root grant that co-locates all three trifecta legs makes agentd
-  **refuse to start** — it logs `scope.trifecta_refused`, prints the reason, and exits `2` (a
-  config-usage refusal; the daemon never comes up):
+  **refuse to start** — `validate()` rejects it as a config error, so it prints the reason and
+  exits `2` (a config-usage refusal; the daemon never comes up):
 
   ```text
   agentd: refused — this grant gives one agent all three lethal-trifecta legs
@@ -126,7 +132,7 @@ re-evaluate it.
   ```
 
 - **Warn** (with `--allow-trifecta`): startup proceeds and the supervisor emits an auditable
-  log event so the override is never silent:
+  log event so the override is never silent (also emitted if a reload lands an allowed trifecta):
 
   ```json
   {"level":"warn","event":"scope.trifecta_grant","allowed":true,
@@ -255,15 +261,20 @@ no-ICU dependency stance.
 
 `exec` is the strongest egress leg and therefore the most dangerous trifecta member. Rules:
 
-- **Off by default.** Absent `--enable-exec`, the `exec` self-tool is **not registered** in the
-  self-MCP `tools/list` — the model never sees it, so it cannot be discovered or poisoned into
-  existence. (Absent, not "present but erroring.")
-- **Capability-checked at startup.** `--enable-exec` validates the allowed binary exists and is
-  executable; a missing binary is a **config error → exit 2**, never a mid-loop surprise.
-- **No model-named binaries.** The executable path is fixed by config; arguments may be
-  model-supplied, but the binary is not. No shell interpretation by default (`execve`, not
-  `/bin/sh -c`), so the model cannot inject shell metacharacters. A shell opt-in for the cases
-  that genuinely need it is loudly documented as widening the surface.
+- **Off by default.** Absent any `--enable-exec`, the `exec` self-tool is **not registered** in
+  the self-MCP `tools/list` — the model never sees it, so it cannot be discovered or poisoned
+  into existence. (Absent, not "present but erroring.")
+- **Operator allowlist of binaries.** `--enable-exec <abs-path>` (repeatable; or
+  `AGENTD_ENABLE_EXEC` as a `:`-separated path list) names the absolute binaries the tool may
+  invoke. A bare `--enable-exec` with no path is a usage error (exit 2).
+- **Capability-checked at startup.** Each allowed path is validated to exist and be executable;
+  a missing/non-executable allowed binary is a **config error → exit 2** (in `Config::validate()`,
+  so `--validate-config` and startup agree), never a mid-loop surprise.
+- **No model-named binaries.** A tool call whose resolved `argv[0]` is not an exact-path match
+  against the allowlist is an `isError` observation (the model adapts). The executable is fixed
+  by config; arguments may be model-supplied, but the binary is not. No shell interpretation by
+  default (`execve`, not `/bin/sh -c`), so the model cannot inject shell metacharacters. A shell
+  opt-in for the cases that genuinely need it is loudly documented as widening the surface.
 - **Same OS regime.** Each `exec` child is its own process group (`setpgid`), carries a
   mandatory finite deadline, counts against the subtree token/depth/breadth caps, and is torn
   down by the same bounded SIGTERM→SIGKILL kill ladder as any child (RFC 0003).
@@ -278,12 +289,14 @@ Enable it explicitly:
 agentd \
   --instruction "build and run the test suite, report failures" \
   --intelligence unix:/run/intel.sock \
-  --enable-exec
+  --enable-exec /usr/bin/cargo \
+  --enable-exec /usr/bin/git
 ```
 
-> **Status.** `--enable-exec` parses today and defaults off (see `crates/agentd/src/config.rs`).
-> The runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the
-> MCP client, and all four run modes — is implemented.
+> **Status.** `--enable-exec <abs-path>` (repeatable) builds the operator allowlist of binaries
+> and defaults off (see `crates/agentd/src/config.rs` / `crates/agentd/src/sec/exec.rs`). The
+> runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the MCP
+> client, and all four run modes — is implemented.
 
 ---
 
@@ -323,7 +336,7 @@ These security-relevant knobs exist in the binary today
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|
-| `--enable-exec` | `AGENTD_ENABLE_EXEC` | off | register the gated `exec` self-tool |
+| `--enable-exec <abs-path>` | `AGENTD_ENABLE_EXEC` (`:`-list) | off | allow the gated `exec` self-tool to run this absolute binary (repeatable; the operator allowlist — argv[0] must match exactly) |
 | `--allow-trifecta` | — | off | permit all three capability legs in one subagent (audited override) |
 | `--mcp-tags name=tag,tag` | — | — | tag a server's tools `untrusted_input` / `sensitive` / `egress` for the Rule-of-Two |
 | `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | — | bearer/key for the intelligence endpoint (redacted in logs) |

@@ -150,7 +150,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 | `--mcp name=command` | — | *(none)* | Declare an MCP server (stdio). Repeatable. See §5. **Reloadable** (§11). |
 | `--serve-mcp <TARGET>` | `AGENTD_SERVE_MCP` | *(off)* | Serve agentd's own MCP so agents compose: `unix:/path` \| `vsock:PORT` \| `vsock:CID:PORT` (`vsock` needs `--features vsock`; bare `vsock:PORT` binds the wildcard CID). Needs `--features serve-mcp`. |
 | `--a2a-peer name=<ENDPOINT>` | `AGENTD_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `unix:/path` \| `vsock:CID:PORT`. Repeatable (the env channel declares one). Needs `--features a2a`. |
-| `--enable-exec` | `AGENTD_ENABLE_EXEC` | `false` | Expose the gated `exec` tool (off by default; RFC 0012). Env accepts `1`/`true`/`yes`/`on`. |
+| `--enable-exec <abs-path>` | `AGENTD_ENABLE_EXEC` | *(off)* | Allow the gated `exec` tool to run this absolute binary (off by default; RFC 0012 §3.6). Repeatable — each flag adds one binary to the operator allowlist; the tool refuses any `argv[0]` not on it. Each path must exist + be executable at startup (else exit 2). Env is a `:`-separated path list (a bare/empty value is a usage error). |
 | `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server (order-independent). Repeatable. |
 | `--allow-trifecta` | `AGENTD_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
 

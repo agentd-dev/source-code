@@ -14,6 +14,7 @@ use crate::sec::scope::TrifectaTag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Execution mode — one supervisor loop, four exit predicates (RFC 0008).
@@ -484,7 +485,19 @@ pub struct Config {
     pub run_id: String,
     pub log_level: Level,
     pub drain_timeout: Duration,
+    /// Whether the gated `exec` self-tool is exposed — DERIVED: `true` iff
+    /// `exec_allow` is non-empty (RFC 0012 §3.6). Kept as a field so the manifest,
+    /// the `config.loaded` event, and the restart-only reload diff read one bool.
     pub enable_exec: bool,
+    /// The operator allowlist of absolute binary paths the `exec` tool may invoke
+    /// (`--enable-exec <abs-path>`, repeatable; or `AGENTD_ENABLE_EXEC` as a
+    /// `:`-separated path list). The executable is FIXED by config (RFC 0012 §3.6 /
+    /// RFC 0005 §3.2: "No model-named binaries"); the model supplies only the
+    /// arguments. Empty ⇒ exec is off (the tool is never advertised). Each path is
+    /// validated to exist + be executable at startup (exit 2 on a miss). The list
+    /// is restart-only (it rides `enable_exec` in the partition — a security
+    /// capability never widened live).
+    pub exec_allow: Vec<PathBuf>,
     pub serve_mcp: Option<String>,
     pub health_file: Option<String>,
     /// Inbound W3C `traceparent` to continue (else a trace is minted from the
@@ -623,6 +636,7 @@ impl Default for Config {
             log_level: Level::Info,
             drain_timeout: Duration::from_secs(25),
             enable_exec: false,
+            exec_allow: Vec::new(),
             serve_mcp: None,
             health_file: None,
             traceparent: None,
@@ -655,7 +669,18 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("instruction", &self.instruction.as_deref().map(|_| "<set>"))
-            .field("intelligence", &self.intelligence)
+            // The raw `--intelligence` URI can be a credential-bearing
+            // `http://user:pass@host` (RFC 0012 §3.7). Redact it to its transport
+            // SCHEME only — mirroring `effective_view()` / the `config.loaded`
+            // event, which already log scheme-only — so a Debug render can never
+            // leak an inline endpoint credential.
+            .field(
+                "intelligence",
+                &self
+                    .intelligence
+                    .as_deref()
+                    .map(|u| format!("{}:<redacted>", u.split(':').next().unwrap_or(""))),
+            )
             .field(
                 "intelligence_token",
                 &self.intelligence_token.as_ref().map(|_| "***"),
@@ -677,6 +702,7 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("drain_timeout", &self.drain_timeout)
             .field("enable_exec", &self.enable_exec)
+            .field("exec_allow", &self.exec_allow)
             .field("serve_mcp", &self.serve_mcp)
             .field("health_file", &self.health_file)
             .field("traceparent", &self.traceparent)
@@ -828,8 +854,26 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_DRAIN_TIMEOUT") {
             c.drain_timeout = parse_duration(v).map_err(usage)?;
         }
+        // `AGENTD_ENABLE_EXEC` is now a `:`-separated **path list** (the operator
+        // allowlist of absolute binaries), reconciling the old bare-bool env with
+        // the allowlist model (RFC 0012 §3.6). A flag-supplied `--enable-exec
+        // <path>` below ADDS to this list (allowlists are additive across layers,
+        // like `--mcp`). An empty value is a usage error — a present-but-empty env
+        // is an operator footgun (they meant to enable exec but named nothing).
         if let Some(v) = envmap.get("AGENTD_ENABLE_EXEC") {
-            c.enable_exec = truthy(v);
+            let paths: Vec<PathBuf> = v
+                .split(':')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if paths.is_empty() {
+                return Err(usage(
+                    "AGENTD_ENABLE_EXEC requires at least one allowed binary path (':'-separated)"
+                        .into(),
+                ));
+            }
+            c.exec_allow.extend(paths);
         }
         if let Some(v) = envmap.get("AGENTD_LOG_CONTENT") {
             c.log_content = truthy(v);
@@ -1014,7 +1058,22 @@ impl Config {
                 "--drain-timeout" => {
                     c.drain_timeout = parse_duration(&take("--drain-timeout")?).map_err(usage)?
                 }
-                "--enable-exec" => c.enable_exec = true,
+                // `--enable-exec <abs-path>` (repeatable) supplies the operator
+                // allowlist of binaries the `exec` tool may invoke (RFC 0012 §3.6:
+                // the executable is fixed by config). A bare `--enable-exec` with no
+                // path is a usage error (caught here: `take` fails when the next
+                // token is missing or another flag). Each path's existence +
+                // executability is checked in `validate()` (exit 2 on a miss).
+                "--enable-exec" => {
+                    let p = take("--enable-exec")?;
+                    if p.starts_with('-') {
+                        return Err(usage(
+                            "--enable-exec requires an allowed binary path (e.g. --enable-exec /usr/bin/git)"
+                                .into(),
+                        ));
+                    }
+                    c.exec_allow.push(PathBuf::from(p));
+                }
                 "--log-content" => c.log_content = true,
                 "--allow-trifecta" => c.allow_trifecta = true,
                 "--mcp-tags" => mcp_tags.push(parse_mcp_tags(&take("--mcp-tags")?)?),
@@ -1083,6 +1142,17 @@ impl Config {
         if c.run_id.is_empty() {
             c.run_id = generate_run_id();
         }
+
+        // Derive `enable_exec` from the allowlist (RFC 0012 §3.6): exec is on iff
+        // at least one binary is allowed. Dedup the merged env+flag list (stable
+        // first-seen order) so a repeated path isn't double-listed in the
+        // manifest/logs. The per-path existence + executability check lives in
+        // `validate()`.
+        {
+            let mut seen = std::collections::HashSet::new();
+            c.exec_allow.retain(|p| seen.insert(p.clone()));
+        }
+        c.enable_exec = !c.exec_allow.is_empty();
 
         // Resolve standby warm-intel (RFC 0019 §7.3): an explicit
         // `AGENTD_WARM_INTEL` wins; otherwise default to ON when `--standby`, OFF
@@ -1339,6 +1409,14 @@ impl Config {
         if self.max_steps == 0 {
             return Err(usage("--max-steps must be > 0".into()));
         }
+        // exec allowlist (RFC 0012 §3.6 / RFC 0005 §3.2): every allowed binary must
+        // be an ABSOLUTE path that EXISTS and is EXECUTABLE at startup — a missing
+        // or non-executable allowed binary is a config error (exit 2), never a
+        // mid-loop surprise. This is the one validation authority, so the same
+        // check fires for startup and `--validate-config`.
+        for p in &self.exec_allow {
+            validate_exec_allow_path(p)?;
+        }
         // A zero events ring would hold nothing (every push instantly evicts) —
         // reject it so an operator who wants the live-tail surface gets a usable
         // window (RFC 0016 §7.2). Off-by-default; only consumed when serving.
@@ -1505,6 +1583,25 @@ impl Config {
         self.collect_header_diags(&mut header_diags);
         if let Some(first) = header_diags.into_iter().next() {
             return Err(usage(first));
+        }
+        // Rule of Two — the lethal-trifecta gate (RFC 0012 §3.2). This lives in
+        // `validate()` so it is THE single validation authority (RFC 0017 §7):
+        // startup and `--validate-config` share it and can never disagree. A grant
+        // co-locating all three legs (untrusted input + sensitive data + egress)
+        // with no `--allow-trifecta` is refused as a config error (exit 2). The
+        // allowed-with-`--allow-trifecta` case is NOT an error — it passes here, and
+        // the supervisor (`main.rs`) emits the auditable `scope.trifecta_grant`
+        // warn. Scope narrows monotonically (RFC 0009), so the root union bounds
+        // the whole subagent tree.
+        if crate::sec::scope::check_trifecta(self.trifecta_grant_tags(), self.allow_trifecta)
+            .is_refused()
+        {
+            return Err(usage(
+                "refused — this grant gives one agent all three lethal-trifecta legs \
+                 (untrusted input + sensitive data + egress). Split the capabilities across \
+                 subagents, or relaunch with --allow-trifecta."
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -1803,6 +1900,36 @@ fn config_valid_line() -> String {
 /// to stderr, exit 2. `msg` is the human-readable reason.
 fn config_invalid_line(msg: &str) -> String {
     serde_json::json!({"event": "config.invalid", "msg": msg}).to_string()
+}
+
+/// Validate one `--enable-exec` allowed-binary path (RFC 0012 §3.6): it must be
+/// an absolute path to an existing, executable file. A relative path, a missing
+/// file, a non-file, or a non-executable file is exit 2 at startup (and a
+/// `config.invalid` line under `--validate-config`) — never a mid-loop surprise.
+fn validate_exec_allow_path(p: &std::path::Path) -> Result<(), ConfigError> {
+    let disp = p.display();
+    if !p.is_absolute() {
+        return Err(usage(format!(
+            "--enable-exec path '{disp}' must be absolute"
+        )));
+    }
+    let meta = std::fs::metadata(p)
+        .map_err(|_| usage(format!("--enable-exec binary '{disp}' does not exist")))?;
+    if !meta.is_file() {
+        return Err(usage(format!(
+            "--enable-exec binary '{disp}' is not a file"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(usage(format!(
+                "--enable-exec binary '{disp}' is not executable"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate the `--intelligence` value as an ORDERED, comma-separated endpoint
@@ -2177,12 +2304,13 @@ fn help_text() -> String {
          \x20 --intelligence-token <T>    bearer/key (or AGENTD_INTELLIGENCE_TOKEN)\n\
          \x20 --intelligence-token-file <PATH>  read the token from a mounted file (rotation; or AGENTD_INTELLIGENCE_TOKEN_FILE)\n\
          \x20 --model <NAME>              model id (or AGENTD_MODEL)\n\
+         \x20 --model-swap <finish-on-old|restart-turn>  in-flight model-change policy (default finish-on-old; or AGENTD_MODEL_SWAP)\n\
          \n\
          TOOLS / MCP:\n\
          \x20 --mcp name=command          declare an MCP server (repeatable; stdio)\n\
          \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: unix:/path | vsock:CID:PORT (repeatable; needs --features a2a)\n\
-         \x20 --enable-exec               expose the gated exec tool\n\
+         \x20 --enable-exec <abs-path>    allow the gated exec tool to run this binary (repeatable; or AGENTD_ENABLE_EXEC as a ':'-list)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
          \x20 --allow-trifecta            permit all three capability legs in one agent\n\
          \n\
@@ -2870,13 +2998,30 @@ mod tests {
         assert_eq!(s["standby"], serde_json::json!(true));
     }
 
+    // An absolute binary that exists + is executable, for the exec-allowlist
+    // startup check (`validate_exec_allow_path`). `/bin/sh` is POSIX-guaranteed;
+    // fall back to `/usr/bin/env` if a stripped-down environment lacks it.
+    fn an_exec_binary() -> &'static str {
+        if std::path::Path::new("/bin/sh").exists() {
+            "/bin/sh"
+        } else {
+            "/usr/bin/env"
+        }
+    }
+
     #[test]
     fn trifecta_grant_tags_defaults_untagged_to_untrusted_and_exec_to_egress() {
-        let c = Config::load(&args(&["--mcp", "fs=cmd", "--enable-exec"]), &base_env()).unwrap();
+        let c = Config::load(
+            &args(&["--mcp", "fs=cmd", "--enable-exec", an_exec_binary()]),
+            &base_env(),
+        )
+        .unwrap();
         let tags = c.trifecta_grant_tags();
         assert!(tags.contains(&TrifectaTag::UntrustedInput)); // untagged server
         assert!(tags.contains(&TrifectaTag::Egress)); // --enable-exec
         assert!(!tags.contains(&TrifectaTag::Sensitive)); // two legs → not a trifecta
+        assert!(c.enable_exec); // derived from the non-empty allowlist
+        assert_eq!(c.exec_allow.len(), 1);
     }
 
     #[test]
@@ -2917,7 +3062,13 @@ mod tests {
     fn capabilities_reflects_present_config() {
         // With config present, the manifest reflects it (no validation needed).
         let c = Config::load(
-            &args(&["--capabilities", "--mcp", "fs=cmd", "--enable-exec"]),
+            &args(&[
+                "--capabilities",
+                "--mcp",
+                "fs=cmd",
+                "--enable-exec",
+                "/usr/bin/git",
+            ]),
             &base_env(),
         );
         let json = match c.unwrap_err() {
@@ -3183,6 +3334,107 @@ mod tests {
         assert!(dbg.contains("***"));
     }
 
+    #[test]
+    fn debug_redacts_credential_bearing_intelligence_uri() {
+        // The raw `--intelligence` URI can carry inline creds
+        // (`http://user:pass@host`). The Debug impl must show the SCHEME only, never
+        // the userinfo/host/path (RFC 0012 §3.7 — mirror effective_view).
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            (
+                "AGENTD_INTELLIGENCE".into(),
+                "http://alice:hunter2@internal.example/v1".into(),
+            ),
+        ];
+        let c = Config::load(&[], &env).unwrap();
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("hunter2"), "creds leaked: {dbg}");
+        assert!(!dbg.contains("internal.example"), "host leaked: {dbg}");
+        assert!(dbg.contains("http:<redacted>"), "scheme missing: {dbg}");
+    }
+
+    #[test]
+    fn help_text_lists_model_swap() {
+        // Fix 3: --model-swap is parsed+validated but was missing from --help.
+        let h = match Config::load(&args(&["--help"]), &[]).unwrap_err() {
+            ConfigError::Help(s) => s,
+            other => panic!("expected Help, got {other:?}"),
+        };
+        assert!(h.contains("--model-swap"), "help omits --model-swap");
+        assert!(h.contains("finish-on-old|restart-turn"));
+    }
+
+    #[test]
+    fn enable_exec_requires_a_binary_path() {
+        // Fix 2: a bare `--enable-exec` (no path) is a usage error (exit 2).
+        let e = Config::load(&args(&["--enable-exec"]), &base_env()).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+        // A following flag (not a path) is likewise rejected, not silently consumed.
+        let e = Config::load(&args(&["--enable-exec", "--log-content"]), &base_env()).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn enable_exec_missing_binary_is_exit2() {
+        // A named allowed binary that does not exist is a startup config error.
+        let e = Config::load(
+            &args(&["--enable-exec", "/nonexistent/agentd-xyz"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        match e {
+            ConfigError::Usage(m) => assert!(m.contains("does not exist"), "got: {m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        // --validate-config reports the SAME problem (one authority).
+        let v = validate_verdict(
+            &[
+                "--validate-config",
+                "--enable-exec",
+                "/nonexistent/agentd-xyz",
+            ],
+            &base_env(),
+        );
+        assert!(v.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn enable_exec_relative_path_is_exit2() {
+        let e = Config::load(&args(&["--enable-exec", "git"]), &base_env()).unwrap_err();
+        match e {
+            ConfigError::Usage(m) => assert!(m.contains("must be absolute"), "got: {m}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enable_exec_allowlist_loads_and_derives_flag() {
+        // A valid allowed binary loads; enable_exec is derived true and the path
+        // lands on exec_allow.
+        let bin = an_exec_binary();
+        let c = Config::load(&args(&["--enable-exec", bin]), &base_env()).unwrap();
+        assert!(c.enable_exec);
+        assert_eq!(c.exec_allow, vec![std::path::PathBuf::from(bin)]);
+    }
+
+    #[test]
+    fn enable_exec_env_is_a_path_list() {
+        // AGENTD_ENABLE_EXEC is now a ':'-separated allowlist, merged with flags.
+        let bin = an_exec_binary();
+        let mut env = base_env();
+        env.push(("AGENTD_ENABLE_EXEC".into(), bin.into()));
+        let c = Config::load(&[], &env).unwrap();
+        assert!(c.enable_exec);
+        assert_eq!(c.exec_allow, vec![std::path::PathBuf::from(bin)]);
+        // An empty env value is a usage error (operator footgun).
+        let mut env2 = base_env();
+        env2.push(("AGENTD_ENABLE_EXEC".into(), "".into()));
+        assert!(matches!(
+            Config::load(&[], &env2).unwrap_err(),
+            ConfigError::Usage(_)
+        ));
+    }
+
     // ───────────────────────── RFC 0017 — config file ─────────────────────────
 
     use std::io::Write as _;
@@ -3428,6 +3680,52 @@ mod tests {
         for line in lines.lines() {
             let _: serde_json::Value = serde_json::from_str(line).unwrap();
         }
+    }
+
+    #[test]
+    fn validate_config_refuses_a_trifecta_only_config_exit2() {
+        // RFC 0017 §7 / RFC 0012 §3.2: the trifecta gate lives in `validate()`, the
+        // ONE validation authority, so `--validate-config` must REFUSE a complete
+        // trifecta exactly as startup does (it used to pass valid while startup
+        // refused — the bug). One server tagged with all three legs, no override.
+        let v = validate_verdict(
+            &[
+                "--validate-config",
+                "--mcp",
+                "s=cmd",
+                "--mcp-tags",
+                "s=untrusted_input,sensitive,egress",
+            ],
+            &base_env(),
+        );
+        let lines = v.expect_err("a trifecta-only config must be invalid");
+        assert!(lines.contains("config.invalid"), "got: {lines}");
+        assert!(lines.contains("lethal-trifecta"), "got: {lines}");
+        for line in lines.lines() {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_config_and_startup_agree_on_trifecta() {
+        // The same trifecta config: startup `load()` errors (Usage, exit 2) and
+        // `--validate-config` returns an invalid verdict — they can never disagree.
+        let trifecta = [
+            "--mcp",
+            "s=cmd",
+            "--mcp-tags",
+            "s=untrusted_input,sensitive,egress",
+        ];
+        // Startup path (no --validate-config): a Usage error.
+        let startup = Config::load(&args(&trifecta), &base_env()).unwrap_err();
+        assert!(matches!(startup, ConfigError::Usage(_)));
+        // --allow-trifecta makes BOTH paths pass.
+        let mut allowed = vec!["--allow-trifecta"];
+        allowed.extend_from_slice(&trifecta);
+        assert!(Config::load(&args(&allowed), &base_env()).is_ok());
+        let mut allowed_vc = vec!["--validate-config", "--allow-trifecta"];
+        allowed_vc.extend_from_slice(&trifecta);
+        assert!(validate_verdict(&allowed_vc, &base_env()).is_ok());
     }
 
     #[test]

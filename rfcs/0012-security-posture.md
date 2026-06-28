@@ -287,17 +287,23 @@ dependency stance.
 `exec` (`sec/exec.rs`, RFC 0005 self-tool, RFC 0009 process regime) is the strongest egress
 leg and therefore the most dangerous trifecta member. Rules:
 
-- **Off by default.** Absent `--enable-exec`, the `exec` self-tool is **not registered** in the
-  self-MCP `tools/list` — the model never sees it. (Not "present but erroring": absent, so it
+- **Off by default.** Absent any `--enable-exec`, the `exec` self-tool is **not registered** in
+  the self-MCP `tools/list` — the model never sees it. (Not "present but erroring": absent, so it
   cannot be discovered or poisoned into existence.)
-- **Capability-checked at startup.** `--enable-exec` validates the allowed binary exists and is
-  executable; a missing binary is a **config error → exit 2** (RFC 0011), not a runtime
-  surprise mid-loop.
-- **No model-named binaries.** `exec` runs an operator-configured command form; arguments may
-  be model-supplied but the executable path is fixed by config (defense against §3.4 launch
-  injection). No shell interpretation by default (`execve`, not `/bin/sh -c`), so the model
-  cannot inject shell metacharacters; a `--exec-shell` opt-in for the cases that need it is
-  loudly documented as widening the surface.
+- **Operator allowlist of binaries.** `--enable-exec <abs-path>` (repeatable; or
+  `AGENTD_ENABLE_EXEC` as a `:`-separated path list) supplies the set of absolute binary paths
+  the tool may invoke. A bare `--enable-exec` with no path is a usage error (exit 2: "requires an
+  allowed binary path"). The allowlist is the operator's, never the model's.
+- **Capability-checked at startup.** Each allowed path is validated to exist and be executable;
+  a missing or non-executable allowed binary is a **config error → exit 2** (RFC 0011), not a
+  runtime surprise mid-loop. This check lives in `Config::validate()` — the one validation
+  authority — so `--validate-config` and startup agree (RFC 0017 §7).
+- **No model-named binaries.** A tool call whose resolved `argv[0]` is not an **exact-path
+  match** against the allowlist is rejected as a tool-domain `isError` observation (the model
+  adapts — never a crash/exit); arguments may be model-supplied but the executable is fixed by
+  config (defense against §3.4 launch injection). No shell interpretation by default (`execve`,
+  not `/bin/sh -c`), so the model cannot inject shell metacharacters; a `--exec-shell` opt-in for
+  the cases that need it is loudly documented as widening the surface.
 - **Same OS regime.** Each `exec` child is its own process group (`setpgid`), carries a
   **mandatory finite deadline**, is counted against the subtree token/breadth/rate budgets, and
   is torn down by the same bounded depth-first SIGTERM→SIGKILL kill ladder (RFC 0003). It has

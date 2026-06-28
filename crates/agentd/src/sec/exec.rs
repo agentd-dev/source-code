@@ -1,13 +1,18 @@
 //! The gated `exec` self-tool — the one non-MCP capability. RFC 0005 §exec,
 //! RFC 0012 §exec.
 //!
-//! Off by default; exposed only when `--enable-exec` is set. It runs a local
-//! command **argv-style** (no shell, no PATH lookup, no interpolation — so
-//! command injection is off the table by construction). The strongest leg of
-//! the lethal trifecta, so it is deliberately the most constrained tool:
+//! Off by default; exposed only when `--enable-exec <abs-path>` is set (the flag
+//! supplies an **operator allowlist** of the binaries the model may invoke —
+//! RFC 0012 §3.6, RFC 0005 §3.2). It runs a local command **argv-style** (no
+//! shell, no PATH lookup, no interpolation — so command injection is off the
+//! table by construction). The strongest leg of the lethal trifecta, so it is
+//! deliberately the most constrained tool:
 //!
 //! - `argv[0]` must be an **absolute path** to an existing, executable file
-//!   (otherwise the call fails as an observation — the model adapts).
+//!   AND must be on the operator's allowlist (exact-path match) — otherwise the
+//!   call fails as an observation (the model adapts, never a crash). The binary
+//!   is fixed by config; arguments may be model-supplied, but the executable is
+//!   not (RFC 0012 §3.6: "No model-named binaries").
 //! - The child runs with a **scrubbed environment** (curated PATH, no inherited
 //!   vars), `stdin` closed, output capped.
 //! - It is its **own process group**; on a timeout the whole group is
@@ -40,12 +45,13 @@ pub struct ExecResult {
     pub timed_out: bool,
 }
 
-/// Run `argv` (its first element is the absolute path) with a timeout. Returns `Err` for a
+/// Run `argv` (its first element is the absolute path) with a timeout against an
+/// operator `allow`list of permitted absolute binary paths. Returns `Err` for a
 /// validation/spawn failure (a recoverable observation); `Ok` for a command
 /// that *ran* — its exit code is data the model interprets.
-pub fn run(argv: &[String], timeout: Duration) -> Result<ExecResult, String> {
+pub fn run(argv: &[String], timeout: Duration, allow: &[String]) -> Result<ExecResult, String> {
     let prog = argv.first().ok_or_else(|| "exec: empty argv".to_string())?;
-    validate_program(prog)?;
+    validate_program(prog, allow)?;
 
     let mut cmd = Command::new(prog);
     cmd.args(&argv[1..])
@@ -123,10 +129,21 @@ pub fn run(argv: &[String], timeout: Duration) -> Result<ExecResult, String> {
     })
 }
 
-fn validate_program(prog: &str) -> Result<(), String> {
+fn validate_program(prog: &str, allow: &[String]) -> Result<(), String> {
     let path = Path::new(prog);
     if !path.is_absolute() {
         return Err(format!("exec: '{prog}' must be an absolute path"));
+    }
+    // Operator allowlist (RFC 0012 §3.6): the binary is fixed by config. A call
+    // whose argv[0] is not an exact-path match against an allowed binary is a
+    // tool-domain observation (the model adapts) — never a crash/exit. The
+    // allowlist is non-empty whenever the tool is advertised (startup refuses a
+    // bare `--enable-exec`), but guard for it explicitly so a stray empty list
+    // fails closed rather than open.
+    if !allow.iter().any(|a| a == prog) {
+        return Err(format!(
+            "exec: '{prog}' is not on the operator's allowed-binary list (--enable-exec)"
+        ));
     }
     let meta = std::fs::metadata(path).map_err(|_| format!("exec: '{prog}' does not exist"))?;
     if !meta.is_file() {
@@ -189,12 +206,14 @@ pub fn format_result(r: &ExecResult) -> String {
     s
 }
 
-/// The `exec` tool definition (advertised only when exec is enabled).
+/// The `exec` tool definition (advertised only when exec is enabled, i.e. the
+/// operator allowlist is non-empty).
 pub fn tool_def() -> ToolDef {
     ToolDef {
         name: "exec".into(),
         description: "Run a local command directly (no shell). 'argv' is an array of strings; \
-            argv[0] MUST be the absolute path to an existing executable and the rest are its \
+            argv[0] MUST be the absolute path to an allowed executable (the operator fixes the \
+            permitted binaries; a path not on that list is rejected) and the rest are its \
             arguments. The environment is scrubbed. Returns the exit code, stdout, and stderr."
             .into(),
         input_schema: json!({
@@ -211,10 +230,11 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-/// Parse + run an `exec` tool call. Returns `(observation, is_error)` for the
-/// loop. `is_error` is true only for a validation/spawn failure; a command that
-/// ran (any exit code) is a normal observation.
-pub fn handle_call(args: &Value, timeout: Duration) -> (String, bool) {
+/// Parse + run an `exec` tool call against the operator `allow`list. Returns
+/// `(observation, is_error)` for the loop. `is_error` is true only for a
+/// validation/spawn failure (including an `argv[0]` not on the allowlist); a
+/// command that ran (any exit code) is a normal observation.
+pub fn handle_call(args: &Value, timeout: Duration, allow: &[String]) -> (String, bool) {
     let argv: Vec<String> = match args.get("argv").and_then(Value::as_array) {
         Some(a) => a
             .iter()
@@ -230,7 +250,7 @@ pub fn handle_call(args: &Value, timeout: Duration) -> (String, bool) {
     if argv.is_empty() {
         return ("error: exec 'argv' must not be empty".into(), true);
     }
-    match run(&argv, timeout) {
+    match run(&argv, timeout, allow) {
         Ok(r) => (format_result(&r), false),
         Err(e) => (e, true),
     }
@@ -242,7 +262,13 @@ mod tests {
 
     #[test]
     fn runs_echo_and_captures_stdout() {
-        let r = run(&["/bin/echo".into(), "hello".into()], DEFAULT_TIMEOUT).unwrap();
+        let allow = vec!["/bin/echo".to_string()];
+        let r = run(
+            &["/bin/echo".into(), "hello".into()],
+            DEFAULT_TIMEOUT,
+            &allow,
+        )
+        .unwrap();
         assert_eq!(r.exit_code, 0);
         assert!(r.stdout.contains("hello"));
         assert!(!r.timed_out);
@@ -250,14 +276,40 @@ mod tests {
 
     #[test]
     fn relative_path_is_rejected() {
-        let err = run(&["echo".into()], DEFAULT_TIMEOUT).unwrap_err();
+        let err = run(&["echo".into()], DEFAULT_TIMEOUT, &["echo".to_string()]).unwrap_err();
         assert!(err.contains("absolute path"));
     }
 
     #[test]
     fn nonexistent_is_rejected() {
-        let err = run(&["/nonexistent/agentd-xyz".into()], DEFAULT_TIMEOUT).unwrap_err();
+        // On the allowlist but does not exist on disk → existence check fires.
+        let allow = vec!["/nonexistent/agentd-xyz".to_string()];
+        let err = run(&["/nonexistent/agentd-xyz".into()], DEFAULT_TIMEOUT, &allow).unwrap_err();
         assert!(err.contains("does not exist"));
+    }
+
+    #[test]
+    fn not_on_allowlist_is_rejected() {
+        // An absolute, existing, executable binary that is simply not allowed.
+        let err = run(
+            &["/bin/echo".into()],
+            DEFAULT_TIMEOUT,
+            &["/bin/true".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not on the operator's allowed-binary list"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_allowlist_fails_closed() {
+        let err = run(&["/bin/echo".into()], DEFAULT_TIMEOUT, &[]).unwrap_err();
+        assert!(
+            err.contains("not on the operator's allowed-binary list"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -268,14 +320,30 @@ mod tests {
         } else {
             "/usr/bin/sleep"
         };
-        let r = run(&[sleep.into(), "5".into()], Duration::from_millis(200)).unwrap();
+        let r = run(
+            &[sleep.into(), "5".into()],
+            Duration::from_millis(200),
+            &[sleep.to_string()],
+        )
+        .unwrap();
         assert!(r.timed_out, "expected timeout");
     }
 
     #[test]
     fn handle_call_missing_argv_is_error() {
-        let (_msg, err) = handle_call(&json!({}), DEFAULT_TIMEOUT);
+        let (_msg, err) = handle_call(&json!({}), DEFAULT_TIMEOUT, &["/bin/echo".to_string()]);
         assert!(err);
+    }
+
+    #[test]
+    fn handle_call_non_allowlisted_argv0_is_error() {
+        // argv[0] resolves but is not allowed → isError observation, not a crash.
+        let (msg, err) = handle_call(&json!({"argv": ["/bin/echo", "hi"]}), DEFAULT_TIMEOUT, &[]);
+        assert!(err);
+        assert!(
+            msg.contains("not on the operator's allowed-binary list"),
+            "{msg}"
+        );
     }
 
     #[test]

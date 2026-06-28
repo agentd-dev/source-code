@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Minimal, MCP-native, reactive agent runtime (rfcs/0001-mcp-native-agent-runtime.md)"

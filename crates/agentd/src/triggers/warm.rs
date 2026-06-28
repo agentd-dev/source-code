@@ -154,7 +154,16 @@ impl WarmRegistry {
                             log.info("intel.health", json!({"session": id, "all_down": all_down}));
                         }
                     }
-                    Ok(_) => {} // Ready / Pong / Event / Usage — progress, ignore here
+                    // Per-turn token usage rolled up from the warm child (RFC 0003
+                    // §hierarchical-accounting). A warm-only daemon has no
+                    // `supervise_once` reactor to consume this, so — like IntelHealth
+                    // above — it is recorded HERE into the frozen `agentd_tokens_total`
+                    // (+ legacy token counters). One `AgentMsg::Usage` per emitted turn
+                    // is a DELTA, and `record_tokens` fetch_adds, so no double-count.
+                    Ok((_, AgentMsg::Usage(usage))) => {
+                        crate::obs::metrics::record_tokens(usage.input_tokens, usage.output_tokens);
+                    }
+                    Ok(_) => {} // Ready / Pong / Event — progress, ignore here
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         log.warn("warm.died", json!({"session": id}));

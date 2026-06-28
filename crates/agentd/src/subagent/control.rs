@@ -131,7 +131,7 @@ pub fn run() -> i32 {
                 log.info("mcp.connect", serde_json::json!({"server": spec.name}));
                 // Stamp the run id (retry dedup, RFC 0011) + a W3C traceparent
                 // (distributed tracing, RFC 0010) on every tool call.
-                let mut meta = serde_json::json!({"agentd/run_id": payload.telemetry.run_id});
+                let mut meta = serde_json::json!({"agent/run_id": payload.telemetry.run_id});
                 if let Some(tid) = &payload.telemetry.trace_id {
                     meta["traceparent"] = crate::obs::trace::outbound_traceparent(tid).into();
                 }

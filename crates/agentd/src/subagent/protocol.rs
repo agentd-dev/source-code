@@ -21,7 +21,7 @@ use serde_json::Value;
 
 /// The environment variable the supervisor sets on the child so its `main`
 /// takes the subagent path instead of re-parsing CLI config.
-pub const SUBAGENT_ENV: &str = "AGENTD_SUBAGENT";
+pub const SUBAGENT_ENV: &str = "AGENT_SUBAGENT";
 
 // ---- downward: supervisor -> subagent ----
 

@@ -1,6 +1,6 @@
-# agentd — container image (multi-stage)
+# agent — container image (multi-stage)
 #
-# Stage 1 builds a statically-linked `agentd` against musl so the runtime
+# Stage 1 builds a statically-linked `agent` against musl so the runtime
 # stage can be a near-empty base. Stage 2 is a distroless nonroot image: no
 # shell, no package manager, runs as UID 65532.
 #
@@ -15,8 +15,8 @@
 #       --features tls           (rustls + ring + bundled webpki roots)
 # See the FEATURES build-arg below; pass e.g. --build-arg FEATURES=tls,vsock.
 #
-# MCP SERVERS ARE STDIO. agentd ships no tools of its own except a gated exec
-# (rfcs/0001, rfcs/0012). Every tool comes from an MCP server that agentd
+# MCP SERVERS ARE STDIO. agent ships no tools of its own except a gated exec
+# (rfcs/0001, rfcs/0012). Every tool comes from an MCP server that agent
 # spawns over **stdio** (`--mcp name=command ...`). Because the transport is
 # stdio (a child process, not a network call), each MCP server binary must be
 # reachable *inside this container's process namespace*. Two options:
@@ -55,7 +55,7 @@ RUN if [ -n "${FEATURES}" ]; then FEAT="--features ${FEATURES}"; else FEAT=""; f
         --target ${TARGET} \
         -p agentd \
         --no-default-features ${FEAT} \
-    && cp target/${TARGET}/release/agentd /agentd
+    && cp target/${TARGET}/release/agent /agent
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime (distroless, nonroot, no shell)
@@ -67,17 +67,17 @@ RUN if [ -n "${FEATURES}" ]; then FEAT="--features ${FEATURES}"; else FEAT=""; f
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 # OCI labels (optional, override at build time).
-LABEL org.opencontainers.image.title="agentd" \
+LABEL org.opencontainers.image.title="agent" \
       org.opencontainers.image.description="Minimal, MCP-native, reactive agent runtime" \
       org.opencontainers.image.source="https://github.com/agentd-dev/source-code"
 
-COPY --from=build /agentd /usr/local/bin/agentd
+COPY --from=build /agent /usr/local/bin/agent
 
 # Already nonroot via the base tag; stated explicitly for clarity.
 USER 65532:65532
 
 # No CMD instruction/intelligence baked in — those are the unit of work and
-# are supplied per-run via env (INSTRUCTION, AGENTD_INTELLIGENCE) or flags.
-# `agentd` with no args validates config and exits 2 (missing instruction),
+# are supplied per-run via env (INSTRUCTION, AGENT_INTELLIGENCE) or flags.
+# `agent` with no args validates config and exits 2 (missing instruction),
 # which is the correct, fail-fast default for a misconfigured pod.
-ENTRYPOINT ["/usr/local/bin/agentd"]
+ENTRYPOINT ["/usr/local/bin/agent"]

@@ -1,6 +1,6 @@
-# agentd architecture
+# agent architecture
 
-A readable overview for anyone who will **operate** or **extend** agentd. It
+A readable overview for anyone who will **operate** or **extend** agent. It
 explains the one idea everything else hangs off of — the **two-loop split** —
 then the concurrency model, the module map, and how a single run flows from
 arguments to result.
@@ -11,7 +11,7 @@ agentic loop, …) and the binding decisions in
 [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md).
 Where this overview simplifies, those win.
 
-> **Build status (2026-06):** the agentd runtime is implemented — config
+> **Build status (2026-06):** the agent runtime is implemented — config
 > validation, the agentic ReAct loop, the supervisor + subagent process tree
 > (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all four
 > run modes (once/loop/reactive/schedule), the reactive router, the
@@ -21,25 +21,25 @@ Where this overview simplifies, those win.
 
 ---
 
-## 1. What agentd is
+## 1. What agent is
 
-agentd is a small, dependency-light Rust binary that runs **one agent**. You
+agent is a small, dependency-light Rust binary that runs **one agent**. You
 give it an `INSTRUCTION` and a way to reach an LLM (the **intelligence**
 endpoint), and it runs an agentic loop — think, call a tool, observe, repeat —
 until the job is done or a new event wakes it.
 
 Three properties define it:
 
-- **MCP is the only tool source.** agentd ships **no built-in tool library**.
+- **MCP is the only tool source.** agent ships **no built-in tool library**.
   Every capability comes from an [MCP](https://modelcontextprotocol.io) server
   it connects to. The single exception, a gated `exec`, is itself surfaced *as*
-  an MCP tool on agentd's own self-MCP, off by default.
-- **It reacts.** agentd subscribes to MCP **resources** and treats their
+  an MCP tool on agent's own self-MCP, off by default.
+- **It reacts.** agent subscribes to MCP **resources** and treats their
   updates as triggers. A long-lived agent can sit idle at near-zero cost and
   wake when the world it watches changes. An agent can even subscribe *itself*
   to a resource mid-reasoning to schedule its own future wake-up.
-- **It composes.** agentd is an MCP **client** to the servers it uses *and* an
-  MCP **server** exposing itself, so one agentd can drive another with the same
+- **It composes.** agent is an MCP **client** to the servers it uses *and* an
+  MCP **server** exposing itself, so one agent can drive another with the same
   protocol it uses for everything else — no bespoke clustering layer.
 
 It runs standalone from a shell, as a long-lived daemon, or inside a minimal
@@ -50,7 +50,7 @@ of this project*) starts, stops, and replicates.
 
 ## 2. The two-loop split (the heart of the design)
 
-agentd is built around a deliberate separation of two loops:
+agent is built around a deliberate separation of two loops:
 
 | | **Supervisor loop** | **Agentic loop** |
 |---|---|---|
@@ -75,7 +75,7 @@ Three reasons, in priority order:
    lives in a child process with its own process group, the supervisor can
    `killpg` it instantly. This is the decisive argument and the main reason
    **tokio is rejected** — its central selling point (cooperative cancellation)
-   doesn't solve agentd's actual cancel problem.
+   doesn't solve agent's actual cancel problem.
 2. **Crash isolation.** Intelligence is the volatile part: it can panic, OOM, or
    run away. Isolating it in a child means a crashing or runaway agent never
    takes the supervisor down. The supervisor stays tiny and robust precisely
@@ -93,13 +93,13 @@ whole tree collapses from the leaves up rather than leaking orphans (RFC 0003).
 
 ```
                   ┌──────────────────────────────────────────────┐
-  INSTRUCTION ───▶│            agentd (main process)             │
+  INSTRUCTION ───▶│            agent (main process)             │
   intelligence ──▶│            = SUPERVISOR  (a REACTOR)         │
   MCP defs ──────▶│            no LLM dependency, never reasons  │
                   │                                              │
                   │  • parse + validate config (exit 2 on bad)   │
                   │  • connect MCP servers .................. as CLIENT ──┐
-                  │  • serve agentd's own MCP ............... as SERVER ◀─┘
+                  │  • serve agent's own MCP ............... as SERVER ◀─┘
                   │  • arm triggers: once│loop│reactive│schedule │
                   │  • subscribe MCP resources ◀──── notifications/resources/
                   │  • recv_timeout(merged mpsc): ONE blocking   │   updated {uri}
@@ -123,7 +123,7 @@ whole tree collapses from the leaves up rather than leaking orphans (RFC 0003).
              ▼
    ┌──────────────────────────────────────────────────────────┐
    │  MCP servers (external): filesystem, github, db, …        │
-   │  + agentd's own self-MCP (subagent.*, subscribe, exec)    │
+   │  + agent's own self-MCP (subagent.*, subscribe, exec)    │
    └──────────────────────────────────────────────────────────┘
 ```
 
@@ -214,12 +214,12 @@ The core supervision path stays thread-per-fd unconditionally.
 
 ## 4. Module map
 
-The single `agentd` binary plays three roles from one artifact: supervisor
+The single `agent` binary plays three roles from one artifact: supervisor
 (the normal path), subagent re-exec, and the early-exit `--help`/`--version`.
 The crate layout (from assessment §4.0):
 
 ```
-crates/agentd/src/
+crates/agent/src/
   main.rs            arg parse → mode dispatch (supervisor vs subagent re-exec)
   config.rs          precedence (default<file<env<flag), validate-at-startup, exit 2
   exit.rs            the public exit-code table + terminal-status→code mapping
@@ -305,7 +305,7 @@ A single `once` invocation, end to end:
               `initialize` handshake, negotiate the protocol version, and store
               its advertised capabilities. Every later call is gated on those
               caps; every */list follows pagination cursors.
-              (Optionally serve agentd's own MCP over --serve-mcp unix:… .)
+              (Optionally serve agent's own MCP over --serve-mcp unix:… .)
 
 3. SPAWN      the supervisor spawns the ROOT subagent (re-exec of argv[0]) with:
                 · instruction + output contract (objective, format, boundaries)
@@ -359,7 +359,7 @@ stalled · loop_detected · cancelled · crashed
   from the supervisor is the backstop for a child that won't wrap up.
 - **VERIFY is grounded in tool/exec results and resource state — never the model
   judging itself.** Self-critique without external ground truth reinforces blind
-  spots; agentd ships no LLM-as-judge in core. The VERIFY gate checks the
+  spots; agent ships no LLM-as-judge in core. The VERIFY gate checks the
   *machine-checkable* parts of the output contract (required fields present,
   declared artifacts written) and otherwise accepts the final.
 - **Errors split three ways.** Tool-domain errors and malformed model output
@@ -373,7 +373,7 @@ stalled · loop_detected · cancelled · crashed
 ### Example run
 
 ```console
-$ agentd \
+$ agent \
     --instruction "Summarize the open TODOs under /work and write SUMMARY.md" \
     --intelligence unix:/run/intel.sock \
     --mcp fs="mcp-server-fs --root /work" \
@@ -448,7 +448,7 @@ updates.
 >   (roadmap)**.
 > - **`subagent.spawn` defaults to synchronous** — it blocks the parent's turn
 >   and returns the distilled result. `{async}` / `{detach}` spawns and
->   completion-as-self-resource (`agentd://subagent/<handle>`) also ship.
+>   completion-as-self-resource (`agent://subagent/<handle>`) also ship.
 > - **MCP tasks, sampling, and roots are deferred** to v2 (RFC 0013). v1
 >   declares no client capabilities; it answers `roots/list` with `{"roots":[]}`
 >   and rejects an unsolicited `sampling/createMessage`.
@@ -457,10 +457,10 @@ updates.
 
 ## 7. The two external dependencies
 
-agentd reaches exactly two kinds of outside system, on **different wires**:
+agent reaches exactly two kinds of outside system, on **different wires**:
 
 - **Intelligence (the LLM).** One minimal abstraction, transport selected by a
-  URI in `AGENTD_INTELLIGENCE` / `--intelligence`: `unix:/path` (a sidecar
+  URI in `AGENT_INTELLIGENCE` / `--intelligence`: `unix:/path` (a sidecar
   gateway, the common same-pod case), `https://…` (behind the `tls` feature),
   or `vsock:<cid>:<port>` (an enclave/microVM, behind the `vsock` feature). The
   canonical in-binary wire is **OpenAI-compatible `/chat/completions` with
@@ -468,10 +468,10 @@ agentd reaches exactly two kinds of outside system, on **different wires**:
   (`openai-compatible` + `anthropic`), with other provider quirks pushed to the
   gateway. Credentials come from env/flags only, are never logged or persisted,
   and print as `***`.
-- **MCP servers (every tool).** agentd is a client to N servers over **stdio**
+- **MCP servers (every tool).** agent is a client to N servers over **stdio**
   (spawn the server as a child, NDJSON JSON-RPC over pipes). There is no
   built-in tool that isn't either an MCP tool from one of these servers or one
-  of agentd's own self-MCP tools (`subagent.*`, `subscribe`, `resource.read`,
+  of agent's own self-MCP tools (`subagent.*`, `subscribe`, `resource.read`,
   gated `exec`). That invariant is the whole point.
 
 ---
@@ -493,7 +493,7 @@ than persisting live state. The mechanisms an operator should know about
   kill-grace → `waitpid` until reaped. Each subagent is in its own process
   group. A second SIGTERM/SIGINT forces immediate SIGKILL of all groups.
 - **PID-1 / orphan discipline.** `PR_SET_CHILD_SUBREAPER` so orphaned
-  grandchildren reparent to agentd (not host init); a `waitpid(-1, WNOHANG)`
+  grandchildren reparent to agent (not host init); a `waitpid(-1, WNOHANG)`
   loop on `SIGCHLD` reaps any child including unknown PIDs; `PR_SET_PDEATHSIG` on
   every child so a supervisor crash collapses the tree.
 - **Nesting goes through one chokepoint.** A child creates children **only** by
@@ -506,13 +506,13 @@ than persisting live state. The mechanisms an operator should know about
 
 ### The cloud-native contract (RFC 0011)
 
-agentd's only obligation to an external scheduler is to be a clean citizen:
+agent's only obligation to an external scheduler is to be a clean citizen:
 
 - **Config precedence** is `built-in default < config file < env var < CLI
   flag`, **fully validated at startup** → exit 2 on bad config, before any side
   effect.
 - **A clean SIGTERM drain returns 0, not 143**, within a bounded budget.
-  `AGENTD_DRAIN_TIMEOUT` (default 25s) **MUST be less than the pod
+  `AGENT_DRAIN_TIMEOUT` (default 25s) **MUST be less than the pod
   `terminationGracePeriodSeconds`** (the top cloud-native footgun; validated at
   startup).
 - **The exit-code table is a public, machine-actionable API** (for
@@ -530,8 +530,8 @@ agentd's only obligation to an external scheduler is to be a clean citizen:
   the supervisor writes each tick.
 
 The actual CLI/env surface is in
-[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (run
-`agentd --help`). Only flags/env vars defined there exist.
+[`crates/agent/src/config.rs`](../crates/agent/src/config.rs) (run
+`agent --help`). Only flags/env vars defined there exist.
 
 ---
 
@@ -539,7 +539,7 @@ The actual CLI/env surface is in
 
 Minimalism plus **structural isolation** is the moat — no policy engine, no
 signing, no auth as core (RFC 0012). The outer boundary (container/VM/enclave)
-is the sandbox; agentd does not reimplement sandboxing. Capability scoping is
+is the sandbox; agent does not reimplement sandboxing. Capability scoping is
 the **granted MCP subset**, interpreted as a Rule-of-Two trust budget that
 narrows monotonically down the subagent tree — a grant handing one subagent all
 three legs of the lethal trifecta (untrusted-input + sensitive + egress) is

@@ -1,6 +1,6 @@
-# agentd container image
+# agent container image
 
-A multi-stage build that produces a tiny, nonroot `agentd` image: a musl
+A multi-stage build that produces a tiny, nonroot `agent` image: a musl
 static binary on `gcr.io/distroless/static-debian12:nonroot` (no shell, no
 package manager, UID 65532).
 
@@ -16,7 +16,7 @@ package manager, UID 65532).
 Default (minimalism) build — **no TLS**, no async runtime, no C toolchain:
 
 ```sh
-docker build -f examples/docker/Dockerfile -t agentd:latest .
+docker build -f examples/docker/Dockerfile -t agent:latest .
 ```
 
 Add features at build time with `--build-arg FEATURES=...`:
@@ -24,14 +24,14 @@ Add features at build time with `--build-arg FEATURES=...`:
 ```sh
 # direct https:// intelligence/MCP without a TLS-terminating sidecar
 docker build -f examples/docker/Dockerfile \
-  --build-arg FEATURES=tls -t agentd:tls .
+  --build-arg FEATURES=tls -t agent:tls .
 
 # multiple features
 docker build -f examples/docker/Dockerfile \
-  --build-arg FEATURES=tls,vsock,cron -t agentd:full .
+  --build-arg FEATURES=tls,vsock,cron -t agent:full .
 ```
 
-Feature flags map to the crate's `[features]` (see `crates/agentd/Cargo.toml`):
+Feature flags map to the crate's `[features]` (see `crates/agent/Cargo.toml`):
 `tls` (rustls+ring, bundled roots), `vsock`, `serve-mcp`, `cron`, `metrics`,
 `otel`. The default build has none of these on.
 
@@ -43,14 +43,14 @@ Intelligence and the instruction are supplied per run.
 ```sh
 docker run --rm \
   -e INSTRUCTION="Summarize /data/report.txt and write the summary via the fs MCP server." \
-  -e AGENTD_INTELLIGENCE="https://api.example/v1" \
-  -e AGENTD_INTELLIGENCE_TOKEN="$TOKEN" \
-  -e AGENTD_MODEL="claude-sonnet-4-5" \
-  agentd:tls
+  -e AGENT_INTELLIGENCE="https://api.example/v1" \
+  -e AGENT_INTELLIGENCE_TOKEN="$TOKEN" \
+  -e AGENT_MODEL="claude-sonnet-4-5" \
+  agent:tls
 ```
 
-`AGENTD_INTELLIGENCE_TOKEN` is a secret — it is **never** logged and is
-redacted in any debug output (see `crates/agentd/src/config.rs`). Pass it via
+`AGENT_INTELLIGENCE_TOKEN` is a secret — it is **never** logged and is
+redacted in any debug output (see `crates/agent/src/config.rs`). Pass it via
 env or `--intelligence-token`, never via a config file.
 
 With the default (no-TLS) image, point at a plaintext-terminating endpoint:
@@ -58,19 +58,19 @@ With the default (no-TLS) image, point at a plaintext-terminating endpoint:
 ```sh
 docker run --rm \
   -e INSTRUCTION="…" \
-  -e AGENTD_INTELLIGENCE="unix:/run/intel.sock" \
+  -e AGENT_INTELLIGENCE="unix:/run/intel.sock" \
   -v /run/intel.sock:/run/intel.sock \
-  agentd:latest
+  agent:latest
 ```
 
 ## MCP servers are stdio — bundle or co-locate
 
-agentd ships no tools of its own except a gated `exec` (off by default;
-`--enable-exec` / `AGENTD_ENABLE_EXEC`). **All** other tools come from MCP
-servers that agentd spawns over **stdio**:
+agent ships no tools of its own except a gated `exec` (off by default;
+`--enable-exec` / `AGENT_ENABLE_EXEC`). **All** other tools come from MCP
+servers that agent spawns over **stdio**:
 
 ```sh
-agentd \
+agent \
   --mcp fs=/usr/local/bin/mcp-server-fs --root /data \
   --mcp queue=/usr/local/bin/mcp-server-queue
 ```
@@ -86,25 +86,25 @@ be reachable **inside the container's process namespace**. So either:
    simpler v1 path.
 
 The example `Dockerfile` bundles nothing; add `COPY` lines for the servers you
-need, or build a downstream image `FROM agentd:latest`.
+need, or build a downstream image `FROM agent:latest`.
 
 ## v1 scope notes
 
 - **Reactivity is stdio-only in v1** (no reactive-over-HTTP). The
   `reactive`-mode subscriptions ride stdio MCP servers. *(roadmap: reactive
   over HTTP.)*
-- **Serving agentd's own MCP** (`--serve-mcp unix:/path`, requires the
+- **Serving agent's own MCP** (`--serve-mcp unix:/path`, requires the
   `serve-mcp` feature) is **stdio/unix only** in v1. *(roadmap: HTTP serving.)*
 - **Async subagents** land in M3; v1 spawn is synchronous. *(roadmap.)*
 - MCP **tasks / sampling / roots** are deferred (rfcs/0013). *(roadmap.)*
 
 ## Exit codes
 
-agentd's exit codes are a public, machine-actionable contract (rfcs/0011 §5)
+agent's exit codes are a public, machine-actionable contract (rfcs/0011 §5)
 that a Kubernetes `podFailurePolicy` can branch on — e.g. `2` (usage/config)
 is non-retriable, `4` (intelligence unreachable) and `6` (MCP down) are
 retriable. The k8s samples in [`examples/k8s/`](../k8s/) wire these up.
 
 The Kubernetes operator that schedules, replicates, and rolls these pods is
-**external and not part of this project** (rfcs/0011 §1). agentd only honors
+**external and not part of this project** (rfcs/0011 §1). agent only honors
 the contract; orchestration lives in your cluster.

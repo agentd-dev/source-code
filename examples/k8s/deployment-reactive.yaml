@@ -1,4 +1,4 @@
-# Long-lived reactive agentd as a Kubernetes Deployment (mode `reactive`).
+# Long-lived reactive agent as a Kubernetes Deployment (mode `reactive`).
 #
 # Same binary, same loop, same config as the one-shot Job — only the exit
 # predicate differs (rfcs/0011 §7). A reactive daemon idles cheaply and wakes
@@ -8,17 +8,17 @@
 # which is why the drain budget must fit inside the pod grace.
 #
 # SCOPE: reactivity is stdio-only — subscriptions ride stdio MCP servers spawned
-# by agentd. (Reactive-over-HTTP is a deferred v2 surface, RFC 0013.)
+# by agent. (Reactive-over-HTTP is a deferred v2 surface, RFC 0013.)
 #
 # NOTE: the operator that schedules/replicates/rolls this Deployment is
-# EXTERNAL and not part of agentd (rfcs/0011 §1). agentd only honors the
+# EXTERNAL and not part of agent (rfcs/0011 §1). agent only honors the
 # signal/drain/exit contract below.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: agentd-reactive
+  name: agent-reactive
   labels:
-    app.kubernetes.io/name: agentd
+    app.kubernetes.io/name: agent
 spec:
   # Reactive daemons are share-nothing and restart-safe (reconcile on start,
   # rfcs/0011 §7); replicas are independent. Keep at 1 unless your
@@ -26,13 +26,13 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: agentd
+      app.kubernetes.io/name: agent
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: agentd
+        app.kubernetes.io/name: agent
     spec:
-      # MUST be > AGENTD_DRAIN_TIMEOUT (default 25s) so agentd finishes its
+      # MUST be > AGENT_DRAIN_TIMEOUT (default 25s) so agent finishes its
       # bounded drain and exits 0 before the kubelet's own SIGKILL lands
       # (rfcs/0011 §3.3 / §4.2). 30s grace vs 25s drain leaves headroom for
       # the kill-ladder rungs + log flush. If you raise --drain-timeout, raise
@@ -45,11 +45,11 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: agentd
+        - name: agent
           # Multi-arch, cosign-signed, static-on-scratch; ships the dep-free
           # cloud-native features (the /healthz+/readyz surface the probes use).
           # Pin a version tag (or a digest) in production rather than :latest.
-          image: ghcr.io/agentd-dev/agentd:latest
+          image: ghcr.io/agentd-dev/agent:latest
           args:
             - --mode
             - reactive
@@ -75,16 +75,16 @@ spec:
                 For each new item under /data/inbox, classify it and route it
                 via the fs MCP server. Reconcile to desired state on each wake;
                 items already handled are a no-op.
-            - name: AGENTD_INTELLIGENCE
+            - name: AGENT_INTELLIGENCE
               value: unix:/run/intel/intel.sock
-            - name: AGENTD_INTELLIGENCE_TOKEN
+            - name: AGENT_INTELLIGENCE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: agentd-intelligence
+                  name: agent-intelligence
                   key: token
-            - name: AGENTD_MODEL
+            - name: AGENT_MODEL
               value: claude-sonnet-4-6
-            - name: AGENTD_LOG_LEVEL
+            - name: AGENT_LOG_LEVEL
               value: info
           ports:
             - name: probes
@@ -105,7 +105,7 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 3
           # Readiness = the daemon is up and serving. /readyz returns 200 while
-          # running; on drain agentd stops serving and the pod leaves rotation.
+          # running; on drain agent stops serving and the pod leaves rotation.
           readinessProbe:
             httpGet:
               path: /readyz

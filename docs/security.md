@@ -4,7 +4,7 @@
 > decisions: [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md).
 > Milestones: [`docs/design/PLAN.md`](design/PLAN.md).
 
-agentd connects an LLM-driven loop to *arbitrary, operator-declared* MCP servers and an
+agent connects an LLM-driven loop to *arbitrary, operator-declared* MCP servers and an
 optional `exec` capability. That is, by construction, the worst-case shape for the one
 unsolved problem in agent security: **prompt injection** — and its acute form, Willison's
 **lethal trifecta**, where a single agent simultaneously (1) reads untrusted content,
@@ -12,19 +12,19 @@ unsolved problem in agent security: **prompt injection** — and its acute form,
 three legs is a one-injected-prompt exfiltration tool.
 
 Prompt injection is **not patchable**. A 95%-effective guardrail is a failure in security
-terms. So agentd does not pretend to solve it with a classifier or a policy DSL. It contains
+terms. So agent does not pretend to solve it with a classifier or a policy DSL. It contains
 it structurally.
 
 ## The thesis: minimalism + structural isolation is the moat
 
-agentd ships **no policy engine, no request signing, no auth, no RBAC** in core — not behind a
+agent ships **no policy engine, no request signing, no auth, no RBAC** in core — not behind a
 feature gate, not anywhere. This is a conscious reversal of the retired "governance is the
 moat" design (a Rego-style DSL, ed25519 signing, JWT/x509). The reasoning:
 
 - A policy engine living *inside* an injectable model loop is theatre. The model can be steered
   to emit policy-compliant-but-malicious actions, and the engine itself is pure binary weight
   and new attack surface.
-- agentd's security is instead the **OS process tree**, the **granted MCP subset read as a
+- agent's security is instead the **OS process tree**, the **granted MCP subset read as a
   trust budget**, and **distilled structured returns as an injection firewall**. These cost
   near-zero binary weight, which keeps them consistent with the minimalism bar that *is* the
   product moat.
@@ -44,7 +44,7 @@ Concretely, the posture has eight load-bearing parts:
 
 ## 1. The outer boundary is the sandbox
 
-agentd is sandbox-*aware*, never sandbox-*providing*. It does **not** seccomp, chroot, or
+agent is sandbox-*aware*, never sandbox-*providing*. It does **not** seccomp, chroot, or
 namespace itself. Confinement, egress policy, filesystem scope, and aggregate resource limits
 are the deployment's job:
 
@@ -52,18 +52,18 @@ are the deployment's job:
 - **Egress network policy** — which hosts the whole pod may reach is a NetworkPolicy / firewall
   concern. The SSRF guards (§5) are a *second* line, not the only one. The recommended
   container shape terminates TLS at a sidecar, so most builds link no TLS at all.
-- **Aggregate memory** — cgroups v2 (`memory.max`, `pids.max`, `cgroup.kill`). agentd enforces
+- **Aggregate memory** — cgroups v2 (`memory.max`, `pids.max`, `cgroup.kill`). agent enforces
   only the *token* ceiling and per-child `RLIMIT_AS`/CPU in-binary; aggregate subtree memory is
-  a cgroup concern. agentd is cgroup-*aware*, never cgroup-*requiring*.
+  a cgroup concern. agent is cgroup-*aware*, never cgroup-*requiring*.
 
-Run agentd as if the process itself could be compromised, because under a successful injection
+Run agent as if the process itself could be compromised, because under a successful injection
 it effectively is. The blast radius is whatever the surrounding sandbox permits.
 
 ---
 
 ## 2. Capability scoping = the granted MCP subset, as a trust budget
 
-agentd ships **no tools of its own** except a gated `exec` and its self-MCP control tools
+agent ships **no tools of its own** except a gated `exec` and its self-MCP control tools
 (`subagent.*`, resource read/subscribe). Every other capability comes from operator-declared
 MCP servers. A subagent's capability set is exactly the MCP subset it was granted, and scope
 **narrows monotonically** down the subagent tree (RFC 0009) — a child can never hold more than
@@ -121,12 +121,12 @@ reload that would newly form a complete trifecta without `--allow-trifecta` is r
 (`config.reload_rejected{reason:"trifecta_required"}`) and the running config is kept verbatim —
 the live capability set can never be widened into a trifecta without a restart.
 
-- **Refuse** (default): a root grant that co-locates all three trifecta legs makes agentd
+- **Refuse** (default): a root grant that co-locates all three trifecta legs makes agent
   **refuse to start** — `validate()` rejects it as a config error, so it prints the reason and
   exits `2` (a config-usage refusal; the daemon never comes up):
 
   ```text
-  agentd: refused — this grant gives one agent all three lethal-trifecta legs
+  agent: refused — this grant gives one agent all three lethal-trifecta legs
   (untrusted input + sensitive data + egress). Split the capabilities across
   subagents, or relaunch with --allow-trifecta.
   ```
@@ -186,7 +186,7 @@ status + usage** up the length-framed control channel. The parent appends the *d
 
 **Defense-in-depth (recommended, not enforced in v1):** the parent specifies the child's
 *output contract* as a constrained shape (enum/struct fields, not free prose), so injected
-instructions in the child's input have no syntactic place to surface in the return. agentd does
+instructions in the child's input have no syntactic place to surface in the return. agent does
 not *enforce* schema-constrained returns in v1 (that needs provider strict-mode plumbing); the
 firewall holds on isolation alone, and the constrained shape is a recommendation on top.
 
@@ -206,28 +206,28 @@ Concrete rules:
   model as the tool catalogue, but are **never** used to make a security decision. Tags come
   from operator config (§2), never from `annotations`. The `readOnlyHint` / `destructiveHint`
   annotations are treated as untrusted hints — surfaced for audit, never load-bearing.
-- **Audit surface.** On `tools/list`, agentd logs each tool's
+- **Audit surface.** On `tools/list`, agent logs each tool's
   `{server, name, description_hash, description_len}` at `info`
   (`event:"mcp.tool.listed"`). A description whose hash changes between connections logs
   `event:"mcp.tool.description_changed"` at `warn` — rug-pull / TOCTOU detection.
 - **Launch commands are never model- or server-derived.** The set of MCP servers and their
   `argv` come *only* from operator config (`--mcp`), validated at startup (bad config → exit 2).
-  The model cannot add a server, edit an `argv`, or make agentd spawn a process from a string it
-  produced. `subagent.spawn` re-execs agentd's own `argv[0]`; `exec` runs an operator-allowed
+  The model cannot add a server, edit an `argv`, or make agent spawn a process from a string it
+  produced. `subagent.spawn` re-execs agent's own `argv[0]`; `exec` runs an operator-allowed
   binary, never a server-named one.
 
-> **Spawning a stdio MCP server means trusting that command as code at agentd's privilege.**
+> **Spawning a stdio MCP server means trusting that command as code at agent's privilege.**
 > Declaring `--mcp name=cmd` is an operator trust decision equivalent to running `cmd` yourself.
 > Vet your servers the way you vet any dependency you execute.
 
-- **stdio is the default transport.** A stdio MCP server can reach only agentd's pipes — not the
+- **stdio is the default transport.** A stdio MCP server can reach only agent's pipes — not the
   network, not other processes — which is itself a confinement win over an HTTP server.
 
 ---
 
 ## 5. SSRF defenses in the hand-rolled HTTP client
 
-agentd's single hand-rolled HTTP/1.1 + SSE client is the **only** outbound network primitive,
+agent's single hand-rolled HTTP/1.1 + SSE client is the **only** outbound network primitive,
 and therefore the only SSRF chokepoint. It carries the `https://` intelligence transport (and
 any future HTTP-MCP). Guards apply **after DNS resolution and on every redirect hop**:
 
@@ -265,7 +265,7 @@ no-ICU dependency stance.
   the self-MCP `tools/list` — the model never sees it, so it cannot be discovered or poisoned
   into existence. (Absent, not "present but erroring.")
 - **Operator allowlist of binaries.** `--enable-exec <abs-path>` (repeatable; or
-  `AGENTD_ENABLE_EXEC` as a `:`-separated path list) names the absolute binaries the tool may
+  `AGENT_ENABLE_EXEC` as a `:`-separated path list) names the absolute binaries the tool may
   invoke. A bare `--enable-exec` with no path is a usage error (exit 2).
 - **Capability-checked at startup.** Each allowed path is validated to exist and be executable;
   a missing/non-executable allowed binary is a **config error → exit 2** (in `Config::validate()`,
@@ -286,7 +286,7 @@ no-ICU dependency stance.
 Enable it explicitly:
 
 ```bash
-agentd \
+agent \
   --instruction "build and run the test suite, report failures" \
   --intelligence unix:/run/intel.sock \
   --enable-exec /usr/bin/cargo \
@@ -294,7 +294,7 @@ agentd \
 ```
 
 > **Status.** `--enable-exec <abs-path>` (repeatable) builds the operator allowlist of binaries
-> and defaults off (see `crates/agentd/src/config.rs` / `crates/agentd/src/sec/exec.rs`). The
+> and defaults off (see `crates/agent/src/config.rs` / `crates/agent/src/sec/exec.rs`). The
 > runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the MCP
 > client, and all four run modes — is implemented.
 
@@ -302,7 +302,7 @@ agentd \
 > turned on exec and let the model run **any** absolute-path binary. As of v2.8.0 it is an
 > **operator allowlist** (RFC 0012 §3.6) — it now **takes a path** and the bare form is rejected
 > at startup (exit 2 with an actionable error). To migrate, replace the bare flag with one
-> `--enable-exec <abs-path>` per binary you intend to allow (or set `AGENTD_ENABLE_EXEC` to a
+> `--enable-exec <abs-path>` per binary you intend to allow (or set `AGENT_ENABLE_EXEC` to a
 > `:`-separated path list):
 >
 > ```diff
@@ -318,10 +318,10 @@ agentd \
 
 ## 7. Secrets handling
 
-Secrets are config, never model/server data, and never durable agentd state.
+Secrets are config, never model/server data, and never durable agent state.
 
 - **Sources: env and flag only.** The intelligence credential comes from
-  `AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`). Secrets resolve through a single
+  `AGENT_INTELLIGENCE_TOKEN` (or `--intelligence-token`). Secrets resolve through a single
   `resolve(name)` front door. **The config file is never a secret source.** The retired
   `command` / `oauth2` resolvers are dropped.
 - **The carrier is `Config.intelligence_token`.** The `Config` `Debug` impl maps it to `***`,
@@ -339,8 +339,8 @@ This is already visible in the foundation today: the `Config` `Debug` impl redac
 debug string. Pass secrets via the environment:
 
 ```bash
-export AGENTD_INTELLIGENCE_TOKEN="$(cat /run/secrets/intel-token)"
-agentd --instruction "…" --intelligence https://api.example/v1 --model my-model
+export AGENT_INTELLIGENCE_TOKEN="$(cat /run/secrets/intel-token)"
+agent --instruction "…" --intelligence https://api.example/v1 --model my-model
 ```
 
 ---
@@ -348,20 +348,20 @@ agentd --instruction "…" --intelligence https://api.example/v1 --model my-mode
 ## 8. The actual v1 flag surface
 
 These security-relevant knobs exist in the binary today
-(`crates/agentd/src/config.rs`).
+(`crates/agent/src/config.rs`).
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|
-| `--enable-exec <abs-path>` | `AGENTD_ENABLE_EXEC` (`:`-list) | off | allow the gated `exec` self-tool to run this absolute binary (repeatable; the operator allowlist — argv[0] must match exactly) |
+| `--enable-exec <abs-path>` | `AGENT_ENABLE_EXEC` (`:`-list) | off | allow the gated `exec` self-tool to run this absolute binary (repeatable; the operator allowlist — argv[0] must match exactly) |
 | `--allow-trifecta` | — | off | permit all three capability legs in one subagent (audited override) |
 | `--mcp-tags name=tag,tag` | — | — | tag a server's tools `untrusted_input` / `sensitive` / `egress` for the Rule-of-Two |
-| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | — | bearer/key for the intelligence endpoint (redacted in logs) |
-| `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | — | `unix:/path`, `https://host/…`, or `vsock:cid:port` (validated; `http://` is dev-only and warns) |
-| `--serve-mcp <unix:/path>` | `AGENTD_SERVE_MCP` | off | serve agentd's own MCP over a unix socket (stdio always available) |
+| `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | — | bearer/key for the intelligence endpoint (redacted in logs) |
+| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `unix:/path`, `https://host/…`, or `vsock:cid:port` (validated; `http://` is dev-only and warns) |
+| `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | off | serve agent's own MCP over a unix socket (stdio always available) |
 | `--mcp name=cmd` | — | — | declare an MCP server (repeatable; stdio; operator-only, never model-derived) |
-| `--max-steps <N>` | `AGENTD_MAX_STEPS` | 50 | per-run step cap (a bound on a runaway/injected loop) |
-| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | 200000 | token budget |
-| `--deadline <dur>` | `AGENTD_DEADLINE` | 600s | wall-clock deadline |
+| `--max-steps <N>` | `AGENT_MAX_STEPS` | 50 | per-run step cap (a bound on a runaway/injected loop) |
+| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | 200000 | token budget |
+| `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
 | `--max-depth <N>` | — | 4 | subagent tree depth cap |
 
 The intelligence-URI validator rejects anything outside `unix:` / `https://` / `vsock:` /
@@ -388,11 +388,11 @@ Because v1 has **no auth model** (by the §thesis decision) and none of this har
 - A unix socket inherits **filesystem permissions** as its access control — the operator sets
   the socket mode/owner. That is structural, out-of-band auth, not an in-band token.
 - **Self-MCP-over-HTTP, an auth model, and `MCP-Session-Id` handling are deferred** (RFC 0013).
-  agentd ships no network-exposed control surface it cannot yet secure.
+  agent ships no network-exposed control surface it cannot yet secure.
 
 ---
 
-## 10. What agentd explicitly does NOT do
+## 10. What agent explicitly does NOT do
 
 Stated plainly so you size the surrounding environment correctly:
 
@@ -400,7 +400,7 @@ Stated plainly so you size the surrounding environment correctly:
   core, in any feature gate. The conscious reversal of "governance is the moat."
 - **No in-binary sandboxing** (seccomp / namespaces / chroot) — delegated to the outer boundary
   (§1).
-- **No content-based injection detection / classifier.** Prompt injection is unsolved; agentd
+- **No content-based injection detection / classifier.** Prompt injection is unsolved; agent
   defends *structurally* (isolation + scope budget + firewall) and is honest that this is
   **containment, not a guarantee**. There is no "is this prompt injection?" model call.
 - **No schema-enforced subagent returns in v1** — the firewall holds on process isolation;
@@ -412,9 +412,9 @@ Stated plainly so you size the surrounding environment correctly:
 
 ## TL;DR for operators
 
-1. Run agentd inside a real sandbox (container/VM) with an egress NetworkPolicy and cgroup
-   limits — that is the security boundary, not agentd.
-2. Treat every `--mcp` server as code you execute at agentd's privilege. Vet it.
+1. Run agent inside a real sandbox (container/VM) with an egress NetworkPolicy and cgroup
+   limits — that is the security boundary, not agent.
+2. Treat every `--mcp` server as code you execute at agent's privilege. Vet it.
 3. Keep `exec` off unless you need it; when you do, never co-locate it with an
    untrusted-content reader.
 4. Tag your tools and split trifecta tasks into reader/actor subagents

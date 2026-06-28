@@ -1021,7 +1021,7 @@ impl Config {
             match arg.as_str() {
                 "-h" | "--help" => return Err(ConfigError::Help(help_text())),
                 "-V" | "--version" => {
-                    return Err(ConfigError::Version(format!("agentd {}\n", crate::VERSION)));
+                    return Err(ConfigError::Version(format!("agent {}\n", crate::VERSION)));
                 }
                 "--capabilities" => capabilities = true,
                 // Already resolved into the FILE layer above; consume its value
@@ -2317,7 +2317,7 @@ fn apply_config_file(
 }
 
 fn usage(msg: String) -> ConfigError {
-    ConfigError::Usage(format!("agentd: {msg}"))
+    ConfigError::Usage(format!("agent: {msg}"))
 }
 
 fn truthy(v: &str) -> bool {
@@ -2359,10 +2359,10 @@ fn generate_run_id() -> String {
 
 fn help_text() -> String {
     format!(
-        "agentd {ver} — a minimal, MCP-native, reactive agent\n\
+        "agent {ver} — a minimal, MCP-native, reactive agent\n\
          \n\
          USAGE:\n\
-         \x20 agentd --instruction <TEXT> --intelligence <URI> [--mcp name=cmd ...] [options]\n\
+         \x20 agent --instruction <TEXT> --intelligence <URI> [--mcp name=cmd ...] [options]\n\
          \n\
          REQUIRED:\n\
          \x20 --instruction <TEXT>        the task (or INSTRUCTION env)\n\
@@ -2370,16 +2370,16 @@ fn help_text() -> String {
          \x20 --intelligence <URI>        unix:/path | https://host/... | vsock:cid:port\n\
          \n\
          INTELLIGENCE:\n\
-         \x20 --intelligence-token <T>    bearer/key (or AGENTD_INTELLIGENCE_TOKEN)\n\
-         \x20 --intelligence-token-file <PATH>  read the token from a mounted file (rotation; or AGENTD_INTELLIGENCE_TOKEN_FILE)\n\
-         \x20 --model <NAME>              model id (or AGENTD_MODEL)\n\
-         \x20 --model-swap <finish-on-old|restart-turn>  in-flight model-change policy (default finish-on-old; or AGENTD_MODEL_SWAP)\n\
+         \x20 --intelligence-token <T>    bearer/key (or AGENT_INTELLIGENCE_TOKEN)\n\
+         \x20 --intelligence-token-file <PATH>  read the token from a mounted file (rotation; or AGENT_INTELLIGENCE_TOKEN_FILE)\n\
+         \x20 --model <NAME>              model id (or AGENT_MODEL)\n\
+         \x20 --model-swap <finish-on-old|restart-turn>  in-flight model-change policy (default finish-on-old; or AGENT_MODEL_SWAP)\n\
          \n\
          TOOLS / MCP:\n\
          \x20 --mcp name=command          declare an MCP server (repeatable; stdio)\n\
-         \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
+         \x20 --serve-mcp <TARGET>        serve agent's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: unix:/path | vsock:CID:PORT (repeatable; needs --features a2a)\n\
-         \x20 --enable-exec <abs-path>    allow the gated exec tool to run this binary (repeatable; or AGENTD_ENABLE_EXEC as a ':'-list)\n\
+         \x20 --enable-exec <abs-path>    allow the gated exec tool to run this binary (repeatable; or AGENT_ENABLE_EXEC as a ':'-list)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
          \x20 --allow-trifecta            permit all three capability legs in one agent\n\
          \n\
@@ -2389,12 +2389,12 @@ fn help_text() -> String {
          \x20 --continue <uri>            subscribe, routed to one warm session (repeatable)\n\
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
          \x20 --cron <5-field>           schedule on a UTC cron expr (needs --features cron)\n\
-         \x20 --shard K/N                 partition the URI/key space across a fleet (needs --features cluster; or AGENTD_SHARD)\n\
+         \x20 --shard K/N                 partition the URI/key space across a fleet (needs --features cluster; or AGENT_SHARD)\n\
          \x20 --claim <uri>=<srv>[:style] claim an item before processing it (style tool|resource; needs --features cluster; repeatable)\n\
-         \x20 --claim-ttl <dur>           requested lease TTL (default 30s; or AGENTD_CLAIM_TTL)\n\
-         \x20 --claim-renew-fraction <F>  renew heartbeat at ttl*F, F in (0,1) (default 0.33; or AGENTD_CLAIM_RENEW_FRACTION)\n\
-         \x20 --standby                   warm, assignment-driven reactive worker (needs --features cluster; or AGENTD_STANDBY)\n\
-         \x20 --assign-from <srv>:<uri>   shared assignment resource the standby pool claim-pulls (needs --features cluster; or AGENTD_ASSIGN_FROM)\n\
+         \x20 --claim-ttl <dur>           requested lease TTL (default 30s; or AGENT_CLAIM_TTL)\n\
+         \x20 --claim-renew-fraction <F>  renew heartbeat at ttl*F, F in (0,1) (default 0.33; or AGENT_CLAIM_RENEW_FRACTION)\n\
+         \x20 --standby                   warm, assignment-driven reactive worker (needs --features cluster; or AGENT_STANDBY)\n\
+         \x20 --assign-from <srv>:<uri>   shared assignment resource the standby pool claim-pulls (needs --features cluster; or AGENT_ASSIGN_FROM)\n\
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
@@ -2403,7 +2403,7 @@ fn help_text() -> String {
          \x20 --max-depth <N>             subagent tree depth cap (default 4)\n\
          \n\
          RUNTIME:\n\
-         \x20 --run-id <ID>               idempotency key (or AGENTD_RUN_ID)\n\
+         \x20 --run-id <ID>               idempotency key (or AGENT_RUN_ID)\n\
          \x20 --log-level <L>             trace|debug|info|warn|error (default info)\n\
          \x20 --log-content               log tool args/results, not just lengths (opt-in)\n\
          \x20 --drain-timeout <dur>       graceful drain budget (default 25s; < pod grace)\n\
@@ -2412,17 +2412,17 @@ fn help_text() -> String {
          \x20 --cgroup <auto|PATH>        per-run cgroup for atomic cgroup.kill teardown (best-effort)\n\
          \x20 --cgroup-memory-max <SIZE>  per-run memory.max (max|512M|2G|bytes; needs --cgroup + delegation)\n\
          \x20 --cgroup-pids-max <N>       per-run pids.max (max|count of THREADS; needs --cgroup + delegation)\n\
-         \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
+         \x20 --traceparent <W3C>         continue an upstream trace (or AGENT_TRACEPARENT)\n\
          \x20 --report-file <PATH>        write the run-outcome report at terminal (atomic; inert for reactive)\n\
          \x20 --budget-exit-code <N>      remap the policy budget codes (3/7 only) to N at process exit (0..=255)\n\
-         \x20 --events-ring <N>           agentd://events ring size (default 1024; needs --serve-mcp + --features events)\n\
+         \x20 --events-ring <N>           agent://events ring size (default 1024; needs --serve-mcp + --features events)\n\
          \x20 --capabilities             print the capabilities manifest (JSON) and exit\n\
          \n\
          CONFIG FILE (RFC 0017):\n\
-         \x20 --config <PATH>             load a declarative JSON config file (or AGENTD_CONFIG)\n\
+         \x20 --config <PATH>             load a declarative JSON config file (or AGENT_CONFIG)\n\
          \x20 --validate-config          load+validate (file+env+flags), print the verdict, exit 0/2\n\
          \x20 --config-schema            print the config-file JSON Schema and exit\n\
-         \x20 --watch-config             reload on config-file change via inotify (needs --config + --features config-watch; or AGENTD_WATCH_CONFIG)\n\
+         \x20 --watch-config             reload on config-file change via inotify (needs --config + --features config-watch; or AGENT_WATCH_CONFIG)\n\
          \x20 -h, --help / -V, --version\n",
         ver = crate::VERSION
     )

@@ -1,6 +1,6 @@
 {
-  "//": "Illustrative MCP server config — the shape AGENTD_MCP_CONFIG points at.",
-  "//1": "Each server is launched over stdio (RFC 0004 §3.11): agentd spawns the",
+  "//": "Illustrative MCP server config — the shape AGENT_MCP_CONFIG points at.",
+  "//1": "Each server is launched over stdio (RFC 0004 §3.11): agent spawns the",
   "//2": "command, speaks JSON-RPC 2.0 / NDJSON on its stdin+stdout, and drains",
   "//3": "stderr into structured logs. The launch argv is TRUSTED config and is",
   "//4": "NEVER built from model- or server-controlled strings (RFC 0012).",

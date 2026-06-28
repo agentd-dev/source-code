@@ -473,7 +473,7 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
         Ok(p) => p,
         Err(e) => {
             log.error("proc.exit", json!({"err": format!("current_exe: {e}")}));
-            eprintln!("agentd: cannot locate own executable: {e}");
+            eprintln!("agent: cannot locate own executable: {e}");
             return exit::GENERIC;
         }
     };
@@ -520,17 +520,17 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
         }
         Ok(SuperviseResult::Failed(err)) => {
             log.error("proc.exit", json!({"err": err}));
-            eprintln!("agentd: {err}");
+            eprintln!("agent: {err}");
             proc_code
         }
         Ok(SuperviseResult::Killed(reason)) => {
             log.warn("proc.exit", json!({"killed": format!("{reason:?}")}));
-            eprintln!("agentd: run terminated ({reason:?})");
+            eprintln!("agent: run terminated ({reason:?})");
             proc_code
         }
         Err(e) => {
             log.error("proc.exit", json!({"err": format!("spawn: {e}")}));
-            eprintln!("agentd: failed to spawn root subagent: {e}");
+            eprintln!("agent: failed to spawn root subagent: {e}");
             proc_code
         }
     }

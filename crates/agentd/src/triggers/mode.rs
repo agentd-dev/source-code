@@ -61,7 +61,7 @@ struct HeldClaim {
     /// The opaque lease id `work.claim` granted (for renew/ack/release).
     lease_id: String,
     /// The item-derived claim key (== the spawned reaction's RUN_ID), carried on
-    /// `work.ack._meta.agentd/claim_key` so the server collapses the ack.
+    /// `work.ack._meta.agent/claim_key` so the server collapses the ack.
     claim_key: String,
     /// The requested lease TTL — the heartbeat renews at `ttl * renew_fraction`.
     ttl: Duration,
@@ -73,21 +73,21 @@ struct HeldClaim {
 }
 
 /// Build the frozen `work.*` `_meta` for a claim call (RFC 0015 §5.6). The ONLY
-/// keys are `agentd/claim_key`, `agentd/instance`, `agentd/shard` (omitted when
+/// keys are `agent/claim_key`, `agent/instance`, `agent/shard` (omitted when
 /// unsharded), and `traceparent` (omitted when absent). **No secret, no URL** —
 /// the item URI is a `work.claim` argument, never a `_meta` value.
 #[cfg(feature = "cluster")]
 fn claim_meta(cfg: &Config, claim_key: &str) -> Value {
     let mut m = serde_json::Map::new();
     m.insert(
-        "agentd/claim_key".into(),
+        "agent/claim_key".into(),
         Value::String(claim_key.to_string()),
     );
     if let Some(instance) = crate::identity::Identity::from_env(&cfg.run_id).instance {
-        m.insert("agentd/instance".into(), Value::String(instance));
+        m.insert("agent/instance".into(), Value::String(instance));
     }
     if let Some(shard) = cfg.shard.label() {
-        m.insert("agentd/shard".into(), Value::String(shard));
+        m.insert("agent/shard".into(), Value::String(shard));
     }
     if let Some(tp) = &cfg.traceparent {
         m.insert("traceparent".into(), Value::String(tp.clone()));
@@ -164,7 +164,7 @@ pub fn run_reactive(
                     "mcp.connect.fail",
                     json!({"server": spec.name, "err": e.to_string()}),
                 );
-                eprintln!("agentd: MCP server '{}' failed: {e}", spec.name);
+                eprintln!("agent: MCP server '{}' failed: {e}", spec.name);
                 return exit::MCP_REQUIRED_DOWN;
             }
         }
@@ -209,7 +209,7 @@ pub fn run_reactive(
                             json!({"server": route.server, "want": ["work.claim", "work.ack"]}),
                         );
                         eprintln!(
-                            "agentd: claim coordination server '{}' is up but does not advertise work.claim/work.ack",
+                            "agent: claim coordination server '{}' is up but does not advertise work.claim/work.ack",
                             route.server
                         );
                         return exit::USAGE;
@@ -220,7 +220,7 @@ pub fn run_reactive(
                             json!({"server": route.server, "err": e.to_string()}),
                         );
                         eprintln!(
-                            "agentd: claim coordination server '{}' is unreachable: {e}",
+                            "agent: claim coordination server '{}' is unreachable: {e}",
                             route.server
                         );
                         return exit::MCP_REQUIRED_DOWN;
@@ -695,7 +695,7 @@ pub fn run_reactive(
                                     },
                                 );
                                 // RUN_ID narrowing (RFC 0019 §3.5): the child
-                                // stamps `_meta.agentd/run_id` from this field
+                                // stamps `_meta.agent/run_id` from this field
                                 // (subagent/control.rs), so overriding it routes
                                 // every side-effect dedupe onto the claim key.
                                 payload.telemetry.run_id = claim_key;
@@ -813,7 +813,7 @@ pub fn run_reactive(
                                     },
                                 );
                                 // RUN_ID narrowing (RFC 0019 §3.5): the warm
-                                // session stamps every side-effect `_meta.agentd/
+                                // session stamps every side-effect `_meta.agent/
                                 // run_id` from this field, so a redelivered item
                                 // dedupes on the same item-derived claim key.
                                 payload.telemetry.run_id = claim_key;
@@ -1398,7 +1398,7 @@ fn apply_mcp_server_diff(
                 // (tracing, RFC 0010) tool `_meta`, exactly like the connect path.
                 // run_id is restart-only (stable for the process's life), so `new`
                 // carries the same id the supervisor started with.
-                let mut meta = json!({"agentd/run_id": new.run_id});
+                let mut meta = json!({"agent/run_id": new.run_id});
                 if let Some(tp) = &new.traceparent {
                     meta["traceparent"] = Value::String(tp.clone());
                 }
@@ -1848,7 +1848,7 @@ fn sleep_interruptible(dur: Duration) {
 }
 
 /// Settle a held claim after its reaction returns (RFC 0019 §3.4). A terminal
-/// `completed` outcome acks (`work.ack`, carrying `agentd/claim_key` so the server
+/// `completed` outcome acks (`work.ack`, carrying `agent/claim_key` so the server
 /// collapses a redelivered-but-already-acked item); any non-terminal / failed
 /// outcome releases (`work.release{reason:"wind-down"}`) so the item is immediately
 /// re-claimable. Best-effort: a failed ack/release is logged + counted, never
@@ -2372,9 +2372,9 @@ mod tests {
         };
         let m = claim_meta(&cfg, "deadbeef");
         // Exactly the frozen set (RFC 0015 §5.6).
-        assert_eq!(m["agentd/claim_key"], json!("deadbeef"));
-        assert_eq!(m["agentd/instance"], json!("pod-abc"));
-        assert_eq!(m["agentd/shard"], json!("3/8"));
+        assert_eq!(m["agent/claim_key"], json!("deadbeef"));
+        assert_eq!(m["agent/instance"], json!("pod-abc"));
+        assert_eq!(m["agent/shard"], json!("3/8"));
         assert_eq!(m["traceparent"], json!("00-trace-span-01"));
         let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys.len(), 4, "only the 4 frozen keys: {keys:?}");
@@ -2392,14 +2392,14 @@ mod tests {
         };
         let m2 = claim_meta(&cfg2, "k");
         assert!(
-            m2.get("agentd/shard").is_none(),
+            m2.get("agent/shard").is_none(),
             "shard must be omitted when unsharded"
         );
         assert!(
             m2.get("traceparent").is_none(),
             "traceparent omitted when absent"
         );
-        assert_eq!(m2["agentd/claim_key"], json!("k"));
+        assert_eq!(m2["agent/claim_key"], json!("k"));
     }
 
     #[test]

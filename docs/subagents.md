@@ -1,6 +1,6 @@
 # Subagents & the supervised process tree
 
-agentd is built from two kinds of process that never blur together:
+agent is built from two kinds of process that never blur together:
 
 - a **supervisor** — the long-lived root. It owns config, triggers, the MCP
   client connections, the process table, and every lifecycle decision. It does
@@ -45,7 +45,7 @@ fn main() -> ExitCode {
 // re-execs itself — never by argv[0] string-matching alone, which a
 // model-controlled instruction might try to influence.
 fn dispatch_mode() -> Mode {
-    if env::var_os("AGENTD_SUBAGENT").is_some() {
+    if env::var_os("AGENT_SUBAGENT").is_some() {
         Mode::Subagent
     } else {
         Mode::Supervisor(SupervisorConfig::load_and_validate()) // exit 2 on bad config
@@ -53,7 +53,7 @@ fn dispatch_mode() -> Mode {
 }
 ```
 
-When you run `agentd`, you start a **supervisor**. It re-execs itself
+When you run `agent`, you start a **supervisor**. It re-execs itself
 (`/proc/self/exe`) to create each subagent — never a bare instruction on the
 command line (argv is world-readable via `ps`/`/proc`, and instructions/seeds
 may carry untrusted or secrets-adjacent content). The spawn payload travels as
@@ -64,7 +64,7 @@ root subagent, blocks on its result, maps its terminal status to an exit code,
 and exits.
 
 ```console
-$ agentd \
+$ agent \
     --instruction "summarize the open PRs and post a digest" \
     --intelligence unix:/run/intel.sock \
     --mcp github=mcp-server-github \
@@ -79,7 +79,7 @@ The loop and supervisor process tree are implemented.
 
 The supervisor builds each child from `current_exe()` and, in order:
 
-1. sets `AGENTD_SUBAGENT=1` (the mode marker);
+1. sets `AGENT_SUBAGENT=1` (the mode marker);
 2. wires three pipes — control-in on the child's **stdin**, control-out on its
    **stdout**, and **stderr** for the child's own telemetry;
 3. applies `pre_exec` hooks (RFC 0003 §3.9): `setpgid(0,0)` (own process
@@ -104,7 +104,7 @@ if unsafe { libc::getppid() } != expected_ppid {
 ```
 
 The child then emits a `ctrl/ready` frame. A child that exits *before* `ready`
-within `AGENTD_SPAWN_READY` (2s) is a **crash-on-spawn** — the fork-bomb early
+within `AGENT_SPAWN_READY` (2s) is a **crash-on-spawn** — the fork-bomb early
 warning (see §7).
 
 ---
@@ -152,7 +152,7 @@ contract forces an objective and a required shape. A payload with an empty
 ```rust
 struct ContextSeed { slices: Vec<SeedSlice> }
 struct SeedSlice { label: String, content: SeedContent }
-enum SeedContent { Text(String), ResourceRef(String) } // agentd:// or a server uri
+enum SeedContent { Text(String), ResourceRef(String) } // agent:// or a server uri
 ```
 
 The parent passes **only the slices it chooses** — a `file_path` here, an `id`
@@ -261,7 +261,7 @@ adapt to**, never a JSON-RPC protocol error and never a crash:
 | tree-token ceiling | from budget | tree-wide | refuse new spawns + new model calls; drain |
 
 `max_depth` is the one you set directly on the CLI — `--max-depth N`
-(or `AGENTD_MAX_DEPTH`-style via the env layer), default **4** per `config.rs`.
+(or `AGENT_MAX_DEPTH`-style via the env layer), default **4** per `config.rs`.
 The others are RFC-level chokepoint defaults.
 
 ```rust
@@ -316,7 +316,7 @@ structural, not a convention: the control channel only ever carries a
 process. There is no protocol path for a raw transcript to flow up.
 
 **Store-and-reference.** When the result would blow the ~1–2k budget, the child
-writes the bulk to a resource (a scoped MCP tool, or an `agentd://`
+writes the bulk to a resource (a scoped MCP tool, or an `agent://`
 self-resource) and returns `Reference { uri, summary }`. The parent appends the
 `summary` and reads `uri` only if it actually needs the bulk — the coordinator's
 window stays lean.
@@ -348,8 +348,8 @@ enum Disposition { Sync, Async, Detach } // default = Sync
 
 - **`Async`.** Returns the `handle` immediately; the parent keeps reasoning and
   later calls `subagent.await` (waits for it) or peeks with `subagent.status` /
-  `resource.read agentd://subagent/{handle}` — the child's completion *is* an
-  update on that `agentd://subagent/{handle}` resource (the URI is derived from
+  `resource.read agent://subagent/{handle}` — the child's completion *is* an
+  update on that `agent://subagent/{handle}` resource (the URI is derived from
   the handle; there is no separate result resource). Bounded by `max_inflight`
   (default 4).
 
@@ -374,8 +374,8 @@ each catching a failure the others can't:
 ### Detector A — hard deadline (no child cooperation)
 
 Every child carries a mandatory, finite `deadline: Instant`, minted at spawn
-from its limits. Default `AGENTD_CHILD_DEADLINE = 600s` for subagents;
-`exec` children get `AGENTD_EXEC_DEADLINE = 120s`. The reactor arms its
+from its limits. Default `AGENT_CHILD_DEADLINE = 600s` for subagents;
+`exec` children get `AGENT_EXEC_DEADLINE = 120s`. The reactor arms its
 `recv_timeout` to the nearest deadline across all live children. On expiry: the
 verdict is `deadline`, the kill ladder runs on that child's subtree. This is the
 floor under everything else — it catches "runs forever" unconditionally.
@@ -383,7 +383,7 @@ floor under everything else — it catches "runs forever" unconditionally.
 ### Detector B — no-progress watchdog (liveness without cooperation)
 
 Every control frame stamps `last_event_at`. If a live child emits nothing for
-longer than `AGENTD_PROGRESS_TIMEOUT` (default 120s, ≈ 2× the model request
+longer than `AGENT_PROGRESS_TIMEOUT` (default 120s, ≈ 2× the model request
 timeout) it is declared stuck (`StuckReason::NoProgress`). It reuses the
 existing event stream — no new wire — and fires even if the child's control
 thread is *also* wedged.
@@ -394,7 +394,7 @@ The only detector that tells *busy-in-a-long-legitimate-tool-call* apart from
 *process wedged*. Inside each subagent the control reader runs on a **dedicated
 thread, decoupled from the agentic loop** — so it can answer pings while a
 model or tool call is in flight. The supervisor pings every
-`AGENTD_PING_INTERVAL` (5s):
+`AGENT_PING_INTERVAL` (5s):
 
 ```jsonc
 // downward, length-framed JSON-RPC (RFC 0005)
@@ -403,7 +403,7 @@ model or tool call is in flight. The supervisor pings every
 {"jsonrpc":"2.0","method":"ctrl/pong","params":{"seq": 42}}
 ```
 
-After `AGENTD_PING_MISS = 3` consecutive unanswered pings, the child is declared
+After `AGENT_PING_MISS = 3` consecutive unanswered pings, the child is declared
 stuck (`StuckReason::PongTimeout`) — its control thread is wedged or the process
 is in uninterruptible `D` state.
 
@@ -441,7 +441,7 @@ domain:
 - **`PR_SET_CHILD_SUBREAPER`** — the supervisor sets this at startup, so a
   grandchild orphaned by a dying subagent reparents to the supervisor, not to
   host PID 1. (If the supervisor is itself PID 1 — the recommended container
-  entrypoint — this is moot; agentd is a tini-class init for its own tree and
+  entrypoint — this is moot; agent is a tini-class init for its own tree and
   needs no external `tini`.)
 - **`PR_SET_PDEATHSIG = SIGKILL`** in every child's early `main` (§2). If the
   supervisor dies, the kernel collapses the tree from the leaves up
@@ -517,7 +517,7 @@ the **single tree-root counter**:
 Per-process `RLIMIT_AS` / `RLIMIT_CPU` (set in `pre_exec`) cap a single runaway
 cheaply. **Honest caveat:** `setrlimit` is per-process; it does **not** bound
 *aggregate subtree memory*. Only the **token** ceiling is enforced in-binary.
-Aggregate memory is a cgroups-v2 / deployment concern (agentd is cgroup-*aware*,
+Aggregate memory is a cgroups-v2 / deployment concern (agent is cgroup-*aware*,
 not cgroup-*requiring*) — size your pod's `resources.limits` for the whole tree,
 not per child.
 
@@ -543,7 +543,7 @@ This read-after-subscribe converts edge-triggering into level-triggering across
 the restart boundary: any change that happened while the supervisor was down is
 recovered, because the agent acts on *current state*, not a missed delta. Warm
 sessions and dynamic self-subscriptions are **lost** in v1 — recovered by
-idempotent re-trigger (`--run-id` / `AGENTD_RUN_ID`), not by resurrection.
+idempotent re-trigger (`--run-id` / `AGENT_RUN_ID`), not by resurrection.
 Durable warm-session checkpointing is deferred to v2 (RFC 0013).
 
 ---
@@ -555,18 +555,18 @@ Knobs that exist on the CLI/env surface today (`config.rs`):
 | Flag | Env | Default | Effect |
 |---|---|---|---|
 | `--max-depth N` | (env layer) | 4 | subagent tree depth cap |
-| `--max-steps N` | `AGENTD_MAX_STEPS` | 50 | per-run step cap |
-| `--max-tokens N` | `AGENTD_MAX_TOKENS` | 200000 | token budget |
-| `--deadline <dur>` | `AGENTD_DEADLINE` | 600s | wall-clock deadline |
-| `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | 25s | whole-tree drain budget (`< pod grace`) |
-| `--mode <m>` | `AGENTD_MODE` | once | `once` / `loop` / `reactive` / `schedule` |
-| `--run-id <id>` | `AGENTD_RUN_ID` | generated | idempotency key for re-trigger |
+| `--max-steps N` | `AGENT_MAX_STEPS` | 50 | per-run step cap |
+| `--max-tokens N` | `AGENT_MAX_TOKENS` | 200000 | token budget |
+| `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
+| `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | 25s | whole-tree drain budget (`< pod grace`) |
+| `--mode <m>` | `AGENT_MODE` | once | `once` / `loop` / `reactive` / `schedule` |
+| `--run-id <id>` | `AGENT_RUN_ID` | generated | idempotency key for re-trigger |
 
 RFC-level chokepoint and detector defaults (not CLI flags in v1):
 `max_children` 8, `max_total_subagents` 64, `tree_token_ceiling` 2,000,000,
-`AGENTD_CHILD_DEADLINE` 600s, `AGENTD_EXEC_DEADLINE` 120s,
-`AGENTD_PROGRESS_TIMEOUT` 120s, `AGENTD_PING_INTERVAL` 5s, `AGENTD_PING_MISS` 3,
-`AGENTD_SPAWN_READY` 2s, `DRAIN_GRACE` 5s, `KILL_GRACE` 2s.
+`AGENT_CHILD_DEADLINE` 600s, `AGENT_EXEC_DEADLINE` 120s,
+`AGENT_PROGRESS_TIMEOUT` 120s, `AGENT_PING_INTERVAL` 5s, `AGENT_PING_MISS` 3,
+`AGENT_SPAWN_READY` 2s, `DRAIN_GRACE` 5s, `KILL_GRACE` 2s.
 
 See RFC 0009 and RFC 0003 for the binding specifications, and
 `docs/design/PLAN.md` for what ships in which milestone.

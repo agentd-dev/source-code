@@ -32,7 +32,7 @@ fn sigterm(pid: u32) {
 /// Spawn a reactive agentd reading `config_path`, run it, SIGHUP after rewriting
 /// the file to `new_file`, then SIGTERM and return (exit_code, stderr).
 fn run_reload(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
 
     // Write the initial config file (a reloadable-only file: model + log_level).
@@ -118,7 +118,7 @@ fn sighup_applies_a_reloadable_change_then_drains_to_exit_0() {
 /// (not a flag), so a reload can repoint it — the RFC 0018 §5 hot-swap path. No
 /// `--intelligence` flag is passed (a flag would override the file + pin it).
 fn run_reload_intel_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg_path = dir.path().join("agentd.json");
@@ -231,7 +231,7 @@ fn sighup_rejects_an_invalid_config_as_a_no_op() {
 /// the file, then SIGTERM. Returns (exit_code, stderr). No `--mcp`/`--subscribe`
 /// flags — those would compose with the file and pin the flag-declared server.
 fn run_reload_mcp_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg_path = dir.path().join("agentd.json");
     std::fs::write(&cfg_path, initial_file).expect("write initial config");
@@ -284,7 +284,7 @@ fn sighup_re_handshakes_mcp_servers_on_reload_add_and_remove() {
     // config.reloaded names mcp_servers, a reload-kind mcp.connect fires for the
     // added server, a reload-kind subscribe + read-after-subscribe arms the new
     // URI — and the daemon stays up and drains to exit 0.
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let initial = format!(
         r#"{{ "model": "m", "log_level": "info",
             "mcp_servers": [
@@ -336,7 +336,7 @@ fn sighup_contained_failure_when_an_added_mcp_server_cannot_spawn() {
     // mcp.connect.fail (the server is simply absent, a tool-domain absence, RFC
     // 0007), the reload still APPLIES (config.reloaded), and the daemon stays up +
     // drains to exit 0. It is NOT a rollback and NOT a daemon abort.
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let initial = format!(
         r#"{{ "model": "m", "log_level": "info",
             "mcp_servers": [

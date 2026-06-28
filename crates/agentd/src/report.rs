@@ -12,7 +12,7 @@
 //!   * `exit_code` is the **RFC 0011 §5** coarse projection of `status` — see
 //!     [`crate::exit`]; both are present so a reader sees the precise status and
 //!     can still author exit-code policy (§6.2);
-//!   * `distillate_ref` POINTS at the result body (`agentd://subagent/0/result`,
+//!   * `distillate_ref` POINTS at the result body (`agent://subagent/0/result`,
 //!     RFC 0005 §3.3); it never embeds it — the report stays small and bounded;
 //!   * `trace_id` is the RFC 0010 §3.6 trace, for cross-pod stitching.
 //!
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(v["duration_ms"], 84_213u64);
         assert_eq!(v["started_at"], "2023-11-14T22:13:20.000Z");
         // distillate_ref points; it does not embed.
-        assert_eq!(v["distillate_ref"], "agentd://subagent/0/result");
+        assert_eq!(v["distillate_ref"], "agent://subagent/0/result");
         assert_eq!(v["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(v["refusals"]["depth"], 1);
         assert_eq!(v["refusals"]["trifecta"], 0);

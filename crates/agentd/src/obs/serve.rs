@@ -179,7 +179,7 @@ mod tests {
         let (s, ct, body) = route("/metrics");
         assert!(s.starts_with("200"));
         assert!(ct.contains("version=0.0.4"));
-        assert!(body.contains("agentd_runs_started_total"));
+        assert!(body.contains("agent_runs_started_total"));
 
         let (s, _, _) = route("/nope");
         assert!(s.starts_with("404"));

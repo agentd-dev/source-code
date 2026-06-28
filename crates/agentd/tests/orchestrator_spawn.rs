@@ -64,7 +64,7 @@ fn parent_payload() -> SpawnPayload {
 }
 
 fn start_mock_llm(socket: &Path) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_agent"))
         .args(["--internal-mock-llm", socket.to_str().unwrap(), "final"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -87,7 +87,7 @@ fn async_spawn_returns_a_handle_then_await_collects_the_result() {
     let mut payload = parent_payload();
     payload.intelligence.uri = format!("unix:{}", sock.display());
 
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
 
     // The collection tools ride alongside spawn at a depth-budgeted node.
@@ -147,7 +147,7 @@ fn a_detached_child_is_not_collectable() {
     let mut payload = parent_payload();
     payload.intelligence.uri = format!("unix:{}", sock.display());
 
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
 
     // detach=true: fire-and-forget. The ack must NOT promise a collectable result.
@@ -159,7 +159,7 @@ fn a_detached_child_is_not_collectable() {
         .expect("spawn");
     assert!(!err, "detached spawn should succeed: {ack}");
     assert!(
-        ack.contains("fire-and-forget") && !ack.contains("agentd://"),
+        ack.contains("fire-and-forget") && !ack.contains("agent://"),
         "detach ack omits the resource uri: {ack}"
     );
 
@@ -194,7 +194,7 @@ fn async_completion_is_readable_as_an_agentd_resource() {
     let mut payload = parent_payload();
     payload.intelligence.uri = format!("unix:{}", sock.display());
 
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
 
     // The handler serves agentd:// resources (so the loop offers resource.read).
@@ -212,7 +212,7 @@ fn async_completion_is_readable_as_an_agentd_resource() {
         .expect("spawn");
     assert!(!err, "async spawn should succeed: {ack}");
     assert!(
-        ack.contains("agentd://subagent/0.0"),
+        ack.contains("agent://subagent/0.0"),
         "ack should mention the resource uri: {ack}"
     );
 
@@ -251,7 +251,7 @@ fn async_completion_is_readable_as_an_agentd_resource() {
 
 #[test]
 fn subagent_spawn_runs_a_real_child() {
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
     let mut orch =
         Orchestrator::from_payload(exe, &parent_payload(), Duration::from_secs(15), logger());
 

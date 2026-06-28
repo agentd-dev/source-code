@@ -76,7 +76,7 @@ fn binaries() -> &'static Bins {
         build(&["build", "-p", "agentd-conformance", "--bin", "confmcp"]);
         build(&["build", "-p", "agentd-conformance", "--bin", "workmcp"]);
         let dir = target_dir();
-        let agentd = dir.join("agentd");
+        let agentd = dir.join("agent");
         let confmcp = dir.join("confmcp");
         let workmcp = dir.join("workmcp");
         // The `cluster`-featured agentd. The `--claim` path (RFC 0019 §3) is
@@ -97,7 +97,7 @@ fn binaries() -> &'static Bins {
             ],
             &cluster_target,
         );
-        let agentd_cluster = cluster_target.join("debug").join("agentd");
+        let agentd_cluster = cluster_target.join("debug").join("agent");
         for (p, what) in [
             (&agentd, "agentd"),
             (&agentd_cluster, "agentd (cluster)"),

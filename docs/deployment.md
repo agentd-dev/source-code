@@ -1,6 +1,6 @@
-# Deploying agentd
+# Deploying agent
 
-`agentd` is one binary that runs **one agent**. An external scheduler starts,
+`agent` is one binary that runs **one agent**. An external scheduler starts,
 stops, replicates, and watches it; the binary itself owns no control plane
 (RFC 0011 §1). This page is a set of deployment recipes for the v1 target:
 
@@ -22,7 +22,7 @@ class.
 > below describe real behaviour.
 
 Every flag and env var on this page is taken verbatim from
-[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agentd --help`).
+[`crates/agent/src/config.rs`](../crates/agent/src/config.rs) (`agent --help`).
 If a flag is not in `--help`, it does not exist. See
 [`configuration.md`](configuration.md) for the **complete** flag/env reference,
 the config-file schema, and the reloadable-vs-restart-only partition.
@@ -32,7 +32,7 @@ the config-file schema, and the reloadable-vs-restart-only partition.
 ## The config surface you will actually use
 
 Precedence, top wins: **built-in default < config file < env var < CLI flag**.
-The config file (`--config`/`AGENTD_CONFIG`) is **live** (RFC 0017) — a local JSON
+The config file (`--config`/`AGENT_CONFIG`) is **live** (RFC 0017) — a local JSON
 document for structural config (MCP inventory, subscriptions, limits, the
 intelligence endpoint list + headers). Everything else is env-settable;
 **secrets are env/flag/mounted-file only, never inline in the config file**
@@ -42,33 +42,33 @@ intelligence endpoint list + headers). Everything else is env-settable;
 | Concern | Env | Flag |
 |---|---|---|
 | Instruction | `INSTRUCTION` | `--instruction <TEXT>` / `--instruction-file <PATH>` |
-| Config file | `AGENTD_CONFIG` | `--config <PATH>` |
-| Intelligence list | `AGENTD_INTELLIGENCE` | `--intelligence unix:/… │ https://… │ vsock:cid:port` (comma-list = failover) |
-| Intelligence creds | `AGENTD_INTELLIGENCE_TOKEN` / `…_FILE`, `…_<N>` / `…_<N>_FILE` | `--intelligence-token <T>` / `--intelligence-token-file <PATH>` |
-| Model / swap policy | `AGENTD_MODEL` / `AGENTD_MODEL_SWAP` | `--model <NAME>` / `--model-swap finish-on-old│restart-turn` |
+| Config file | `AGENT_CONFIG` | `--config <PATH>` |
+| Intelligence list | `AGENT_INTELLIGENCE` | `--intelligence unix:/… │ https://… │ vsock:cid:port` (comma-list = failover) |
+| Intelligence creds | `AGENT_INTELLIGENCE_TOKEN` / `…_FILE`, `…_<N>` / `…_<N>_FILE` | `--intelligence-token <T>` / `--intelligence-token-file <PATH>` |
+| Model / swap policy | `AGENT_MODEL` / `AGENT_MODEL_SWAP` | `--model <NAME>` / `--model-swap finish-on-old│restart-turn` |
 | MCP server | — | `--mcp name=command …` (repeatable, stdio) |
-| Serve self-MCP | `AGENTD_SERVE_MCP` | `--serve-mcp unix:/… │ vsock:PORT │ vsock:CID:PORT` (`serve-mcp` feat.) |
-| A2A peer | `AGENTD_A2A_PEER` | `--a2a-peer name=endpoint` (repeatable; `a2a` feat.) |
-| Enable exec tool | `AGENTD_ENABLE_EXEC` (`:`-list) | `--enable-exec <abs-path>` (repeatable allowlist) |
-| Mode | `AGENTD_MODE` | `--mode once│loop│reactive│schedule` |
+| Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp unix:/… │ vsock:PORT │ vsock:CID:PORT` (`serve-mcp` feat.) |
+| A2A peer | `AGENT_A2A_PEER` | `--a2a-peer name=endpoint` (repeatable; `a2a` feat.) |
+| Enable exec tool | `AGENT_ENABLE_EXEC` (`:`-list) | `--enable-exec <abs-path>` (repeatable allowlist) |
+| Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule` |
 | Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
-| Interval / cron | `AGENTD_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
-| **Sharding** | `AGENTD_SHARD`, `AGENTD_SHARD_TIMER` | `--shard K/N` (`cluster` feat.) |
-| **Work-claim** | `AGENTD_CLAIM_TTL`, `AGENTD_CLAIM_RENEW_FRACTION` | `--claim <uri>=<srv>[:tool]`, `--claim-ttl`, `--claim-renew-fraction` (`cluster` feat.) |
-| **Standby** | `AGENTD_STANDBY`, `AGENTD_ASSIGN_FROM`, `AGENTD_WARM_INTEL` | `--standby`, `--assign-from <srv>:<uri>` (`cluster` feat.) |
-| Max steps | `AGENTD_MAX_STEPS` | `--max-steps <N>` (default 50) |
-| Max tokens | `AGENTD_MAX_TOKENS` | `--max-tokens <N>` (default 200000) |
-| Deadline | `AGENTD_DEADLINE` | `--deadline <dur>` (default 600s) |
+| Interval / cron | `AGENT_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
+| **Sharding** | `AGENT_SHARD`, `AGENT_SHARD_TIMER` | `--shard K/N` (`cluster` feat.) |
+| **Work-claim** | `AGENT_CLAIM_TTL`, `AGENT_CLAIM_RENEW_FRACTION` | `--claim <uri>=<srv>[:tool]`, `--claim-ttl`, `--claim-renew-fraction` (`cluster` feat.) |
+| **Standby** | `AGENT_STANDBY`, `AGENT_ASSIGN_FROM`, `AGENT_WARM_INTEL` | `--standby`, `--assign-from <srv>:<uri>` (`cluster` feat.) |
+| Max steps | `AGENT_MAX_STEPS` | `--max-steps <N>` (default 50) |
+| Max tokens | `AGENT_MAX_TOKENS` | `--max-tokens <N>` (default 200000) |
+| Deadline | `AGENT_DEADLINE` | `--deadline <dur>` (default 600s) |
 | Max depth | — | `--max-depth <N>` (default 4) |
-| **Run ID** | `AGENTD_RUN_ID` | `--run-id <ID>` (idempotency key) |
-| Log level | `AGENTD_LOG_LEVEL` | `--log-level trace│debug│info│warn│error` |
-| Log content | `AGENTD_LOG_CONTENT` | `--log-content` |
-| **Drain timeout** | `AGENTD_DRAIN_TIMEOUT` | `--drain-timeout <dur>` (default 25s) |
+| **Run ID** | `AGENT_RUN_ID` | `--run-id <ID>` (idempotency key) |
+| Log level | `AGENT_LOG_LEVEL` | `--log-level trace│debug│info│warn│error` |
+| Log content | `AGENT_LOG_CONTENT` | `--log-content` |
+| **Drain timeout** | `AGENT_DRAIN_TIMEOUT` | `--drain-timeout <dur>` (default 25s) |
 | Health file | — | `--health-file <PATH>` |
-| Metrics/probes | `AGENTD_METRICS_ADDR` | `--metrics-addr host:port` (`metrics` feat.) |
-| Per-run cgroup | `AGENTD_CGROUP` / `…_MEMORY_MAX` / `…_PIDS_MAX` | `--cgroup auto│PATH`, `--cgroup-memory-max`, `--cgroup-pids-max` |
-| Report / events | `AGENTD_REPORT_FILE`, `AGENTD_EVENTS_RING` | `--report-file <PATH>`, `--events-ring <N>` |
-| **Hot reload** | `AGENTD_WATCH_CONFIG` | `--watch-config` (`config-watch` feat.) + SIGHUP (`hot-reload` feat.) |
+| Metrics/probes | `AGENT_METRICS_ADDR` | `--metrics-addr host:port` (`metrics` feat.) |
+| Per-run cgroup | `AGENT_CGROUP` / `…_MEMORY_MAX` / `…_PIDS_MAX` | `--cgroup auto│PATH`, `--cgroup-memory-max`, `--cgroup-pids-max` |
+| Report / events | `AGENT_REPORT_FILE`, `AGENT_EVENTS_RING` | `--report-file <PATH>`, `--events-ring <N>` |
+| **Hot reload** | `AGENT_WATCH_CONFIG` | `--watch-config` (`config-watch` feat.) + SIGHUP (`hot-reload` feat.) |
 
 Durations accept `ms`/`s`/`m`/`h` or a bare integer (seconds): `600s`, `5m`,
 `2h`, `250ms`, `30`. Each intelligence list element must be `unix:/path`,
@@ -81,7 +81,7 @@ reference exits `2` in milliseconds, not after an LLM round-trip.
 > MCP server children); self-MCP serving is **unix/vsock** (no HTTP serving of
 > the self-MCP); MCP tasks/sampling/roots are deferred (RFC 0013). The
 > `cluster` work-claim `:resource` style is a stub (`:tool` is the working
-> style), and `AGENTD_WARM_INTEL` is forward-compat only — see
+> style), and `AGENT_WARM_INTEL` is forward-compat only — see
 > [`configuration.md`](configuration.md) §13. Items below are tagged where they
 > do not ship.
 
@@ -94,7 +94,7 @@ status, emit the result on **stdout**, write telemetry to **stderr**, exit with
 a code from the [exit-code table](#the-exit-code-contract).
 
 ```bash
-agentd \
+agent \
   --instruction "Summarise today's open incidents and post a digest." \
   --intelligence unix:/run/intelligence.sock \
   --model my-model \
@@ -116,14 +116,14 @@ Because stdout is the result and stderr is telemetry, you compose with ordinary
 shell tooling:
 
 ```bash
-agentd --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock \
+agent --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock \
   2> >(jq -c 'select(.level=="error")') \
   | tee result.txt
 ```
 
 Read the instruction from a file (handy for ConfigMap/Secret projection) with
 `--instruction-file`, or set `INSTRUCTION` in the environment. The intelligence
-token is **never** logged — pass it via `AGENTD_INTELLIGENCE_TOKEN` or
+token is **never** logged — pass it via `AGENT_INTELLIGENCE_TOKEN` or
 `--intelligence-token`, not on a shared command line where it lands in `ps`.
 
 **Idempotent retries.** A bare run mints a random `run_id` per process. For a
@@ -131,12 +131,12 @@ unit of work that a scheduler may retry, pin a **stable** key so backing MCP
 services can dedupe the side effect (RFC 0011 §6):
 
 ```bash
-agentd --run-id "nightly-digest-2026-06-25" \
+agent --run-id "nightly-digest-2026-06-25" \
   --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock --mcp …
 ```
 
 The key rides in the `_meta` of every outbound MCP `tools/call`; a backing
-service that honours idempotency keys collapses a retried effect to one. agentd
+service that honours idempotency keys collapses a retried effect to one. agent
 itself writes nothing durable except its log streams, so a re-run is safe by
 construction.
 
@@ -149,7 +149,7 @@ updates (RFC 0008). It exits only on a signal or a fatal class — never on an
 individual reaction failing.
 
 ```bash
-agentd \
+agent \
   --mode reactive \
   --instruction "When a ticket is filed, triage it and assign an owner." \
   --intelligence unix:/run/intelligence.sock \
@@ -157,7 +157,7 @@ agentd \
   --mcp tickets="mcp-server-tickets --watch" \
   --subscribe "tickets://queue/inbound" \
   --drain-timeout 25s \
-  --health-file /run/agentd/health
+  --health-file /run/agent/health
 ```
 
 `--mode reactive` **requires at least one `--subscribe <uri>`** (validated;
@@ -185,29 +185,29 @@ A **clean drain exits `0`, not `143`** — a rolled `Deployment` looks like a
 clean shutdown in dashboards, not a failure. A **second** `SIGTERM`/`SIGINT`
 forces immediate `SIGKILL` of all process groups.
 
-The whole drain is bounded by `AGENTD_DRAIN_TIMEOUT` (default 25s). **This MUST
+The whole drain is bounded by `AGENT_DRAIN_TIMEOUT` (default 25s). **This MUST
 be smaller than the orchestrator's shutdown grace** — see the
 [footgun below](#the-top-footgun-drain-timeout--grace).
 
 ### As a systemd unit
 
 ```ini
-# /etc/systemd/system/agentd-triage.service
+# /etc/systemd/system/agent-triage.service
 [Unit]
-Description=agentd ticket triage (reactive)
+Description=agent ticket triage (reactive)
 After=network.target
 
 [Service]
-Environment=AGENTD_INTELLIGENCE=unix:/run/intelligence.sock
-Environment=AGENTD_INTELLIGENCE_TOKEN=
-EnvironmentFile=/etc/agentd/triage.env
-ExecStart=/usr/local/bin/agentd \
+Environment=AGENT_INTELLIGENCE=unix:/run/intelligence.sock
+Environment=AGENT_INTELLIGENCE_TOKEN=
+EnvironmentFile=/etc/agent/triage.env
+ExecStart=/usr/local/bin/agent \
   --mode reactive \
-  --instruction-file /etc/agentd/triage.txt \
+  --instruction-file /etc/agent/triage.txt \
   --mcp tickets=mcp-server-tickets \
   --subscribe tickets://queue/inbound \
   --drain-timeout 25s
-# Give the drain room: must exceed AGENTD_DRAIN_TIMEOUT.
+# Give the drain room: must exceed AGENT_DRAIN_TIMEOUT.
 TimeoutStopSec=30
 KillSignal=SIGTERM
 Restart=on-failure
@@ -223,9 +223,9 @@ it **larger** than `--drain-timeout`.
 
 ## 3. Container — minimal scratch/distroless image
 
-agentd is `std` + `libc`, statically linkable, with no async runtime, no C
+agent is `std` + `libc`, statically linkable, with no async runtime, no C
 toolchain, and **no built-in tools** — so the image is tiny (~1.3 MB on
-`scratch`). The recommended entrypoint is `agentd` itself: it sets
+`scratch`). The recommended entrypoint is `agent` itself: it sets
 `PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
 own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
 
@@ -239,10 +239,10 @@ minimalism target. What each adds:
 | Feature | Adds |
 |---|---|
 | `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`--metrics-addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
-| `serve-mcp` | agentd serving its own MCP (`--serve-mcp`) so other agents compose with it; also the substrate for `events`/`a2a`/the capacity surface. |
+| `serve-mcp` | agent serving its own MCP (`--serve-mcp`) so other agents compose with it; also the substrate for `events`/`a2a`/the capacity surface. |
 | `cron` | UTC 5-field cron scheduling for `--mode schedule` (`--cron`). |
 | `otel` | OTLP-over-HTTP/JSON span export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
-| `cluster` | Horizontal scaling: `--shard K/N` partitioning, work-claim leases (`--claim`), standby pools (`--standby`/`--assign-from`), the autoscaling signal set, and the `agentd://capacity` read surface. |
+| `cluster` | Horizontal scaling: `--shard K/N` partitioning, work-claim leases (`--claim`), standby pools (`--standby`/`--assign-from`), the autoscaling signal set, and the `agent://capacity` read surface. |
 | `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a reactive quiesce boundary. |
 | `config-watch` | The `inotify` file-watch reload trigger (`--watch-config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
 
@@ -270,12 +270,12 @@ RUN if [ -n "$FEATURES" ]; then \
 # scratch: nothing but the binary. (Swap for gcr.io/distroless/static if you
 # want a CA bundle + /etc/passwd without managing them yourself.)
 FROM scratch
-COPY --from=build /src/target/release/agentd /agentd
+COPY --from=build /src/target/release/agent /agent
 # Non-root by uid (scratch has no /etc/passwd; the kernel uses the number).
 USER 65532:65532
 # MCP server binaries are part of the agent's toolset — add them alongside:
 # COPY --from=build /path/to/mcp-server-tickets /usr/local/bin/
-ENTRYPOINT ["/agentd"]
+ENTRYPOINT ["/agent"]
 ```
 
 > **Build-arg, not flag.** `FEATURES` selects what the **binary** can do; it is a
@@ -295,8 +295,8 @@ inside the pod, TLS at the boundary**:
   roots; adds the one heavier dependency).
 
 ```bash
-# In-pod: agentd talks plaintext over a unix socket to a TLS-terminating sidecar.
-agentd --intelligence unix:/run/intel/intel.sock --instruction-file /etc/task.txt --mcp …
+# In-pod: agent talks plaintext over a unix socket to a TLS-terminating sidecar.
+agent --intelligence unix:/run/intel/intel.sock --instruction-file /etc/task.txt --mcp …
 ```
 
 This keeps the default image at scratch-size with no certificate management in
@@ -312,7 +312,7 @@ Two options, both live:
   liveness probe at `/healthz` and readiness at `/readyz`. The bare `:port` form
   binds all IPv4 interfaces so the kubelet reaches it at the pod IP. (See the K8s
   probes below.)
-- **`--health-file <PATH>`** — agentd heartbeats it while the reactor is live, so
+- **`--health-file <PATH>`** — agent heartbeats it while the reactor is live, so
   an exec-style probe can `test` its freshness. Useful where you do not want an
   HTTP listener at all.
 
@@ -333,7 +333,7 @@ is flowing.
 ## 4. Scheduled by an external orchestrator (Kubernetes)
 
 The orchestrator (a K8s operator, Knative, Nomad, a bare-metal supervisor) is
-**not part of this project** (RFC 0011 §1). agentd just honours a contract:
+**not part of this project** (RFC 0011 §1). agent just honours a contract:
 config from env/flags, signal-driven drain, and a public exit-code table a
 `podFailurePolicy` can branch on. Below are the three shapes; runnable manifests
 live in [`examples/`](../examples/).
@@ -342,7 +342,7 @@ live in [`examples/`](../examples/).
 
 This table is a **stable, machine-actionable API** — author `podFailurePolicy`
 against it (RFC 0011 §5; constants in
-[`crates/agentd/src/exit.rs`](../crates/agentd/src/exit.rs)):
+[`crates/agent/src/exit.rs`](../crates/agent/src/exit.rs)):
 
 | Code | Meaning | Scheduler hint |
 |---|---|---|
@@ -358,22 +358,22 @@ against it (RFC 0011 §5; constants in
 | `137` | killed by `SIGKILL` (OOM / kubelet) — OS-set | raise memory limit |
 | `143` | killed by `SIGTERM` **without** clean drain — OS-set | distinguishes ungraceful from `0` |
 
-agentd never `exit(137)`/`exit(143)` itself — the kernel sets those when it
+agent never `exit(137)`/`exit(143)` itself — the kernel sets those when it
 kills the process. A clean drain returns `0`.
 
 ### The top footgun: drain timeout < grace
 
-> **`AGENTD_DRAIN_TIMEOUT` (default 25s) MUST be `<`
+> **`AGENT_DRAIN_TIMEOUT` (default 25s) MUST be `<`
 > `terminationGracePeriodSeconds` (default 30s).**
 
 If your drain budget is `>=` the pod's grace period, the kubelet sends
-`SIGKILL` **before** agentd finishes draining — you lose the clean exit (it
+`SIGKILL` **before** agent finishes draining — you lose the clean exit (it
 becomes `137`/`143`), in-flight subagents are not wound down at turn boundaries,
 and a rolled `Deployment` shows failures instead of clean `0`s. Always keep the
 internal budget the **smaller** number, with headroom for the kill-ladder rung
 plus the log flush.
 
-agentd validates this where it can: a `drain_timeout >= 30s` (the K8s default
+agent validates this where it can: a `drain_timeout >= 30s` (the K8s default
 grace) emits a loud warning at startup (RFC 0011 §3.3). Set both explicitly and
 keep the gap:
 
@@ -381,7 +381,7 @@ keep the gap:
 spec:
   terminationGracePeriodSeconds: 30   # kubelet grace
   containers:
-    - name: agentd
+    - name: agent
       args: ["--drain-timeout", "25s", …]   # < 30s, with headroom
 ```
 
@@ -394,7 +394,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agentd-digest
+  name: agent-digest
 spec:
   backoffLimit: 3
   podFailurePolicy:
@@ -408,33 +408,33 @@ spec:
       restartPolicy: Never
       terminationGracePeriodSeconds: 30
       containers:
-        - name: agentd
-          image: ghcr.io/example/agentd:2.0.0
+        - name: agent
+          image: ghcr.io/example/agent:2.0.0
           args:
             - --mode=once
-            - --instruction-file=/etc/agentd/task.txt
+            - --instruction-file=/etc/agent/task.txt
             - --intelligence=unix:/run/intel/intel.sock
             - --drain-timeout=25s
           env:
-            - { name: AGENTD_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
-            - { name: AGENTD_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
+            - { name: AGENT_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
+            - { name: AGENT_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
 ```
 
-Pin `AGENTD_RUN_ID` to a stable per-unit-of-work value (e.g. derived from the
+Pin `AGENT_RUN_ID` to a stable per-unit-of-work value (e.g. derived from the
 Job name) so retries dedupe through your MCP backing services.
 
 ### 4b. CronJob — on a schedule
 
 Prefer an **external** `CronJob` firing `--mode once` per tick over the internal
 `--mode schedule`/`--interval` — it is more robust, observable, and 12-factor
-(RFC 0011 §9). agentd's internal scheduler is a standalone convenience, not a
+(RFC 0011 §9). agent's internal scheduler is a standalone convenience, not a
 calendar (no DST/missed-tick catch-up; UTC).
 
 ```yaml
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: agentd-nightly
+  name: agent-nightly
 spec:
   schedule: "0 2 * * *"
   jobTemplate:
@@ -445,11 +445,11 @@ spec:
           restartPolicy: Never
           terminationGracePeriodSeconds: 30
           containers:
-            - name: agentd
-              image: ghcr.io/example/agentd:2.0.0
+            - name: agent
+              image: ghcr.io/example/agent:2.0.0
               args:
                 - --mode=once
-                - --instruction-file=/etc/agentd/nightly.txt
+                - --instruction-file=/etc/agent/nightly.txt
                 - --intelligence=unix:/run/intel/intel.sock
                 - --drain-timeout=25s
 ```
@@ -463,27 +463,27 @@ rolls cleanly because a clean drain exits `0`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: agentd-triage
+  name: agent-triage
 spec:
   replicas: 1
-  selector: { matchLabels: { app: agentd-triage } }
+  selector: { matchLabels: { app: agent-triage } }
   template:
-    metadata: { labels: { app: agentd-triage } }
+    metadata: { labels: { app: agent-triage } }
     spec:
       terminationGracePeriodSeconds: 30   # > --drain-timeout
       containers:
-        - name: agentd
-          image: ghcr.io/example/agentd:2.0.0
+        - name: agent
+          image: ghcr.io/example/agent:2.0.0
           args:
             - --mode=reactive
-            - --instruction-file=/etc/agentd/triage.txt
+            - --instruction-file=/etc/agent/triage.txt
             - --intelligence=unix:/run/intel/intel.sock
             - --subscribe=tickets://queue/inbound
             - --drain-timeout=25s
-            - --health-file=/run/agentd/health
+            - --health-file=/run/agent/health
           livenessProbe:
             # The reactor heartbeats the health file; a wedged reactor goes stale.
-            exec: { command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/agentd/health) )) -lt 30"] }
+            exec: { command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/agent/health) )) -lt 30"] }
             periodSeconds: 10
           # If built/served with the HTTP health surface (RFC 0010), use instead:
           #   httpGet: { path: /healthz, port: 8080 }
@@ -501,45 +501,45 @@ OOM surfaces as `137` and means "raise the limit" (RFC 0003 §3.8).
 
 To process a shared workload across N replicas without duplicating it, run a
 **sharded fleet** (RFC 0019; needs an image built with `--features cluster`). The
-idiom maps a **StatefulSet pod ordinal → `AGENTD_SHARD=K/N`**: each pod owns shard
+idiom maps a **StatefulSet pod ordinal → `AGENT_SHARD=K/N`**: each pod owns shard
 `K` of `N`, and `replicas` is `N`. The ordinal is in the pod's hostname
-(`agentd-shard-0`, `-1`, …), so the container derives `K` from it; agentctl
-injects `AGENTD_SHARD` the same way. Shard identity is **restart-only** — a
+(`agent-shard-0`, `-1`, …), so the container derives `K` from it; agentctl
+injects `AGENT_SHARD` the same way. Shard identity is **restart-only** — a
 reload never changes it (a re-shard is a rolling restart).
 
 ```yaml
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: agentd-shard
+  name: agent-shard
 spec:
-  serviceName: agentd-shard
+  serviceName: agent-shard
   replicas: 8                       # == N (the shard count)
-  selector: { matchLabels: { app: agentd-shard } }
+  selector: { matchLabels: { app: agent-shard } }
   template:
-    metadata: { labels: { app: agentd-shard } }
+    metadata: { labels: { app: agent-shard } }
     spec:
       terminationGracePeriodSeconds: 30   # > --drain-timeout
       containers:
-        - name: agentd
-          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with `cluster`
+        - name: agent
+          image: ghcr.io/agentd-dev/agent:2.7.0   # built with `cluster`
           # Derive K from the StatefulSet ordinal (the trailing -N of the hostname)
-          # and export AGENTD_SHARD=K/8 before exec'ing agentd.
+          # and export AGENT_SHARD=K/8 before exec'ing agent.
           command: ["/bin/sh", "-c"]   # use a shell image, or bake this into an entrypoint
           args:
             - |
               K="${HOSTNAME##*-}"
-              exec /agentd --mode reactive \
-                --instruction-file /etc/agentd/task.txt \
+              exec /agent --mode reactive \
+                --instruction-file /etc/agent/task.txt \
                 --intelligence unix:/run/intel/intel.sock \
                 --subscribe tickets://queue/inbound \
                 --metrics-addr :9090 --drain-timeout 25s
           env:
-            - name: AGENTD_SHARD
+            - name: AGENT_SHARD
               value: "0/8"            # overwritten below from the ordinal…
-          # …or, on the scratch image (no shell), set AGENTD_SHARD directly per
+          # …or, on the scratch image (no shell), set AGENT_SHARD directly per
           # pod via a small admission/operator that reads the ordinal. The shard
-          # gate is the only sharding wiring agentd needs.
+          # gate is the only sharding wiring agent needs.
 ```
 
 Because shard ownership is a pure FNV-1a gate over the resource URI/key, the
@@ -547,7 +547,7 @@ replicas are share-nothing: each independently subscribes to the full set and
 **processes only the items hashing to its shard**. For at-most-once processing of
 an item that more than one replica could see, layer **work-claim** on top
 (`--claim <uri>=<coord-server>`, [`configuration.md`](configuration.md) §13) so a
-lease — not just the hash — decides ownership. `AGENTD_SHARD_TIMER` (`shard0` |
+lease — not just the hash — decides ownership. `AGENT_SHARD_TIMER` (`shard0` |
 `keyed`) controls timer firing for a sharded `schedule`/`loop` fleet.
 
 ### 4e. Hot reload via a ConfigMap (`hot-reload` / `config-watch` features)
@@ -559,7 +559,7 @@ either send `SIGHUP` or run `--watch-config`:
 
 - **`--watch-config`** (`config-watch` feature) arms an `inotify` watch on the
   config file's directory. A `kubectl apply` of the ConfigMap is an atomic
-  volume-symlink swap, which the watch sees — agentd re-reads, **validates**, and
+  volume-symlink swap, which the watch sees — agent re-reads, **validates**, and
   applies the reloadable subset (model, the intelligence endpoint list, limits,
   `subscribe`, `log_level`, `mcp_servers` re-handshake) in place. An invalid
   candidate keeps the running config — nothing is half-applied. A diff that
@@ -575,20 +575,20 @@ spec:
   template:
     spec:
       containers:
-        - name: agentd
-          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with config-watch
+        - name: agent
+          image: ghcr.io/agentd-dev/agent:2.7.0   # built with config-watch
           args:
             - --mode=reactive
-            - --config=/etc/agentd/config.json      # mounted from the ConfigMap
+            - --config=/etc/agent/config.json      # mounted from the ConfigMap
             - --watch-config                        # reload on a ConfigMap update
-            - --instruction-file=/etc/agentd/task.txt
+            - --instruction-file=/etc/agent/task.txt
             - --metrics-addr=:9090
             - --drain-timeout=25s
           volumeMounts:
-            - { name: config, mountPath: /etc/agentd, readOnly: true }
+            - { name: config, mountPath: /etc/agent, readOnly: true }
       volumes:
         - name: config
-          configMap: { name: agentd-config }        # holds config.json (+ task.txt)
+          configMap: { name: agent-config }        # holds config.json (+ task.txt)
 ```
 
 Secrets never live in the ConfigMap: the file carries only structural config and
@@ -601,11 +601,11 @@ The same `--serve-mcp` listener that exposes the self-MCP also carries the
 **management transport** — status, subagent introspection, and (with
 `--features a2a`) the A2A method surface — over a **unix socket or AF_VSOCK port**
 (`--serve-mcp vsock:PORT`, `--features vsock`). vsock is the right transport when
-a host/enclave **node-agent** drives a guest agentd across a VM boundary
+a host/enclave **node-agent** drives a guest agent across a VM boundary
 (Firecracker/Kata): no shared filesystem, no TCP port to firewall. There is **no
 HTTP** management surface — keep this off any TCP port. The node-agent (the thing
-that issues management RPCs, signals reloads, and reads `agentd://` resources) is
-**external** and not part of agentd; agentd only honours the transport contract.
+that issues management RPCs, signals reloads, and reads `agent://` resources) is
+**external** and not part of agent; agent only honours the transport contract.
 
 ---
 
@@ -618,7 +618,7 @@ files:
 - `examples/k8s/cronjob-schedule.yaml` — scheduled `CronJob`
 - `examples/k8s/deployment-reactive.yaml` — reactive `Deployment` with HTTP probes
 - `examples/docker/Dockerfile` — the static-on-scratch image
-- `examples/systemd-agentd.service` — reactive systemd unit
+- `examples/systemd-agent.service` — reactive systemd unit
 
 ---
 

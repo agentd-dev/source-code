@@ -1,9 +1,9 @@
-# Getting started with agentd
+# Getting started with agent
 
-`agentd` is a small, dependency-light Rust binary that runs **one agent**. You
+`agent` is a small, dependency-light Rust binary that runs **one agent**. You
 give it an instruction and a way to reach an LLM, and it runs an agentic loop —
 think, call tools, observe, repeat — until the job is done or a new event wakes
-it. Every tool it can call comes from an **MCP server**; agentd ships none of its
+it. Every tool it can call comes from an **MCP server**; agent ships none of its
 own (except a gated `exec`). It reaches exactly **one** LLM endpoint, the
 *intelligence*. And it reacts to the world through **MCP resource
 subscriptions** — a resource changing upstream is what triggers a run.
@@ -14,7 +14,7 @@ instruction in `loop` and `reactive` modes. For the full knob list see
 see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 [RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md).
 
-> **Build status.** The agentd runtime is fully implemented — config
+> **Build status.** The agent runtime is fully implemented — config
 > validation, the agentic loop, the supervisor + subagent process tree, the
 > MCP client, the intelligence client, and all four run modes. The examples on
 > this page run as written.
@@ -23,16 +23,16 @@ see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 
 ## Install / build
 
-agentd is a single Cargo crate in a workspace. The default build is
+agent is a single Cargo crate in a workspace. The default build is
 dependency-light: no async runtime, no TLS, no C/C++ toolchain.
 
 ```console
-$ git clone <repo> agentd && cd agentd
+$ git clone <repo> agent && cd agent
 $ cargo build -p agentd --release
-   Compiling agentd v2.0.0
+   Compiling agent v2.0.0
     Finished `release` profile [optimized] target(s)
-$ ./target/release/agentd --version
-agentd 2.0.0
+$ ./target/release/agent --version
+agent 2.0.0
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops
@@ -52,7 +52,7 @@ $ cargo build -p agentd --release --features tls,vsock,serve-mcp,cron
 ```
 
 The common container pattern terminates TLS at a sidecar and links **no** TLS in
-the binary — agentd talks to the sidecar over a unix socket.
+the binary — agent talks to the sidecar over a unix socket.
 
 ### Minimal container
 
@@ -66,10 +66,10 @@ COPY . .
 RUN cargo build -p agentd --release
 
 FROM debian:bookworm-slim
-COPY --from=build /src/target/release/agentd /usr/local/bin/agentd
+COPY --from=build /src/target/release/agent /usr/local/bin/agent
 # bundle any stdio MCP servers you want available as children, e.g.:
 # COPY --from=build /usr/local/bin/mcp-server-fs /usr/local/bin/
-ENTRYPOINT ["agentd"]
+ENTRYPOINT ["agent"]
 ```
 
 All configuration is env-settable (12-factor), so the container takes its
@@ -83,7 +83,7 @@ environment — see [configuration.md](configuration.md).
 Two loops, deliberately separated:
 
 ```
-  agentd (main process) = SUPERVISOR        ── never talks to the LLM
+  agent (main process) = SUPERVISOR        ── never talks to the LLM
     • parse + validate config (exits 2 on bad config, before any side effect)
     • connect declared MCP servers (as a CLIENT) ── this is where ALL tools come from
     • arm the trigger: once | loop | reactive | schedule
@@ -102,9 +102,9 @@ Three facts are the whole design:
    tree, and limits. It has no LLM dependency, so it stays tiny and robust; a
    runaway or crashing model is always isolated in a child the supervisor can
    `SIGKILL`.
-2. **MCP is the only tool source.** agentd ships no `fs`/`http`/`shell` tool
+2. **MCP is the only tool source.** agent ships no `fs`/`http`/`shell` tool
    library. Want a capability? Connect an MCP server with `--mcp`. (The one
-   exception, `exec`, is itself surfaced as an MCP tool from agentd's own
+   exception, `exec`, is itself surfaced as an MCP tool from agent's own
    self-MCP, and is off by default.)
 3. **One intelligence endpoint.** A single LLM endpoint named by a URI in
    `--intelligence` — `unix:`, `https://`, or `vsock:`. This is the LLM wire,
@@ -123,7 +123,7 @@ result on stdout, exit. Here we give the agent a filesystem MCP server and ask i
 to do something with a file.
 
 ```console
-$ agentd \
+$ agent \
     --instruction "Read /data/report.md and write a 3-bullet summary to /data/summary.md" \
     --intelligence unix:/run/intel.sock \
     --mcp "fs=mcp-server-fs --root /data"
@@ -139,10 +139,10 @@ Three things are wired here:
   (requires the `tls` feature). The endpoint must be `unix:`, `https://`, or
   `vsock:` — anything else is rejected at startup with exit 2.
 - **`--mcp "fs=mcp-server-fs --root /data"`** — declare an MCP server named `fs`.
-  The value is `name=command args…`; agentd spawns `mcp-server-fs --root /data`
+  The value is `name=command args…`; agent spawns `mcp-server-fs --root /data`
   as a stdio child and discovers its tools via `tools/list`. **Quote the whole
   `name=command args` as one shell argument** so the server's own flags
-  (`--root /data`) aren't parsed by agentd. Repeat `--mcp` for more servers.
+  (`--root /data`) aren't parsed by agent. Repeat `--mcp` for more servers.
 
 ### Read the telemetry (stderr) and the result (stdout)
 
@@ -193,7 +193,7 @@ or runaway loop can never burn unbounded cost. See
 
 The runtime is fully implemented and runs the command above end to end:
 `--help` and `--version` exit 0; invalid config exits **2** in milliseconds with
-an `agentd: …` message on stderr; valid config parses, logs `proc.start`, runs
+an `agent: …` message on stderr; valid config parses, logs `proc.start`, runs
 the agentic loop, and exits on the agent's terminal status (see the exit-code
 table above).
 
@@ -207,7 +207,7 @@ inner loop as `once`; only the exit predicate differs. It stops on a bound (max
 iterations / wall-clock deadline / tree-wide token ceiling) or a `SIGTERM`.
 
 ```console
-$ agentd \
+$ agent \
     --instruction "Check /data/inbox for new files; process each into /data/done" \
     --intelligence unix:/run/intel.sock \
     --mcp "fs=mcp-server-fs --root /data" \
@@ -234,7 +234,7 @@ when an MCP resource it subscribed to changes**. Instead of polling on a timer,
 you subscribe to concrete resource URIs; an upstream change is the trigger.
 
 ```console
-$ agentd \
+$ agent \
     --instruction "When a file appears in the inbox, process it into /data/done" \
     --intelligence unix:/run/intel.sock \
     --mcp "fs=mcp-server-fs --root /data" \
@@ -267,7 +267,7 @@ runtime is built around.
 
 > **v1 scope (roadmap notes).** Reactivity is **stdio-only** in v1 — only stdio
 > MCP servers deliver notifications; reactive-over-HTTP is deferred (roadmap).
-> Serving agentd's own MCP (`--serve-mcp`) is **stdio/unix-socket only**;
+> Serving agent's own MCP (`--serve-mcp`) is **stdio/unix-socket only**;
 > HTTP serving is deferred (roadmap). Subagent spawning defaults to
 > **synchronous**; `{async}`/`{detach}` dispositions also ship. MCP
 > tasks/sampling/roots are deferred ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).

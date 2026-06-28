@@ -1,6 +1,6 @@
 # Operations
 
-`agentd` is one process running one agent, but a fleet of them is a *control
+`agent` is one process running one agent, but a fleet of them is a *control
 plane*. This page is for the operator (and the `agentctl` it drives): how to
 talk to a running instance, the tools that steer it without restarting it, how a
 controller discovers what an instance can do, and how to push a config change
@@ -28,25 +28,25 @@ config-reload notifications come with it.
 Two MCP surfaces speak the *same* dialect but live in different trust domains:
 
 - **Stdio** — the process's own stdin/stdout. This is the driving harness (the
-  parent that spawned this agentd, or the `subagent.*` control path). Every
-  agentd serves the self-MCP over stdio always.
+  parent that spawned this agent, or the `subagent.*` control path). Every
+  agent serves the self-MCP over stdio always.
 - **Management** — a peer that connected to a `--serve-mcp` listener. This is
   the operator / `agentctl` channel.
 
-You arm the management transport with `--serve-mcp` (env `AGENTD_SERVE_MCP`):
+You arm the management transport with `--serve-mcp` (env `AGENT_SERVE_MCP`):
 
 | Form | Meaning | Needs |
 |---|---|---|
-| `--serve-mcp unix:/run/agentd.sock` | a unix-domain socket | `--features serve-mcp` |
+| `--serve-mcp unix:/run/agent.sock` | a unix-domain socket | `--features serve-mcp` |
 | `--serve-mcp vsock:PORT` | vsock, wildcard CID (`VMADDR_CID_ANY`) | `--features serve-mcp,vsock` |
 | `--serve-mcp vsock:CID:PORT` | vsock, explicit CID:port (a Firecracker/Kata guest) | `--features serve-mcp,vsock` |
 
 ```console
-$ agentd \
+$ agent \
     --instruction 'reconcile on change' \
     --intelligence unix:/run/intel.sock \
     --mode reactive --subscribe file:///data/desired.json \
-    --serve-mcp unix:/run/agentd.sock
+    --serve-mcp unix:/run/agent.sock
 ```
 
 Both unix and vsock are served by the same blocking, thread-per-connection
@@ -63,14 +63,14 @@ The trust split is enforced by *transport origin*, not an in-band flag:
   subagent driving its own loop) cannot even *see* them in `tools/list`, and a
   `tools/call` for one falls through to an unknown-tool error. So a subagent can
   never drain or pause its own supervisor.
-- The **operator-facing resources** (`agentd://inventory`,
-  `agentd://intelligence`, `agentd://config/effective`, `agentd://capacity`,
-  `agentd://events`) are likewise Management-only — listed, readable, and
+- The **operator-facing resources** (`agent://inventory`,
+  `agent://intelligence`, `agent://config/effective`, `agent://capacity`,
+  `agent://events`) are likewise Management-only — listed, readable, and
   subscribable only from the management transport. A Stdio read of one 404s like
   any unknown URI.
 - The **base** self-MCP surface (the `subagent.*` tools, `status`,
-  `agentd://status`, `agentd://capabilities`, `agentd://run/<id>`,
-  `agentd://subagent/<handle>`) is readable on *every* origin.
+  `agent://status`, `agent://capabilities`, `agent://run/<id>`,
+  `agent://subagent/<handle>`) is readable on *every* origin.
 
 The capabilities manifest reports the management address at
 `surfaces.management` (its address string when configured, `false` otherwise),
@@ -165,8 +165,8 @@ still while you swap the model service underneath it.
 `affected` counts only the live subtrees that took the message. `pause` sets an
 instance-wide flag, so:
 
-- `agentd://inventory` reports `paused:true` (and each live node mirrors it);
-- the `agentd_paused` gauge reads `1` (see [observability](observability.md));
+- `agent://inventory` reports `paused:true` (and each live node mirrors it);
+- the `agent_paused` gauge reads `1` (see [observability](observability.md));
 - a run launched *while paused* starts paused.
 
 Pause is explicitly **not** readiness — a paused instance can still be ready (the
@@ -187,7 +187,7 @@ running (unlike `drain`, which also exits).
 
 An **unknown handle** is reported as an `isError:true` result (a racing reap may
 have already removed it), *not* a JSON-RPC protocol error — the same observation
--vs-fault distinction agentd honours everywhere ([mcp §1.4](mcp.md)). A handle
+-vs-fault distinction agent honours everywhere ([mcp §1.4](mcp.md)). A handle
 that is already terminal returns `cancelled:false, reason:"already finished"`.
 `reason` is surfaced into the `ctrl/cancel` frame and the logs.
 
@@ -202,23 +202,23 @@ run shape, and the `surfaces{}` block (the graceful-degradation contract).
 
 It is exposed two ways, from **one** builder so they never drift:
 
-- **`agentd --capabilities`** — a one-shot that prints the manifest to stdout and
+- **`agent --capabilities`** — a one-shot that prints the manifest to stdout and
   exits `0`. It is **side-effect-free and network-free**: no socket bind, no MCP
   connect, no LLM call, no discovery probe. This is the admission probe a
   controller runs against the *image* before it schedules anything.
-- **`agentd://capabilities`** — the live resource on the management transport,
+- **`agent://capabilities`** — the live resource on the management transport,
   built from the running daemon (it overlays a lazily-probed, cached model
   discovery onto `intelligence.models`).
 
 ```console
-$ agentd --instruction x --intelligence unix:/run/intel.sock --capabilities
-{ "contract_version":"1.0", "agentd_version":"…", "build_features":[…],
+$ agent --instruction x --intelligence unix:/run/intel.sock --capabilities
+{ "contract_version":"1.0", "agent_version":"…", "build_features":[…],
   "identity":{…}, "mode":"once", "model":null,
   "intelligence":{ "transport":"unix", "endpoints":1, "healthy":"unknown", … },
   "mcp_servers":[…], "limits":{…}, "surfaces":{…} }
 ```
 
-`contract_version` is `1.0` — the agentctl↔agentd contract version. A controller
+`contract_version` is `1.0` — the agentctl↔agent contract version. A controller
 refuses an instance whose *major* it does not understand.
 
 **No secrets, ever.** The manifest carries no token, no resolved `{{secret:NAME}}`
@@ -239,14 +239,14 @@ degrades gracefully: it drives only what is declared.
 | `a2a` | object \| `false` | the A2A surface (`a2a` feature) — version, streaming, method set |
 | `metrics` | address string \| `false` | the `--metrics-addr` for `/metrics`+`/healthz`+`/readyz` |
 | `metrics_schema` | `"1.0"` | the frozen metrics-schema version |
-| `events` | bool | `agentd://events` served (needs `events` + a management transport) |
+| `events` | bool | `agent://events` served (needs `events` + a management transport) |
 | `report_schema` | `"1.0"` | the run-outcome report schema this binary writes |
 | `exit_codes` | `"1.0"` | the frozen exit-code contract version |
-| `intelligence` | bool | `agentd://intelligence` health resource served (needs `serve-mcp`) |
+| `intelligence` | bool | `agent://intelligence` health resource served (needs `serve-mcp`) |
 | `config_validate` | `true` | `--validate-config` available (always, default build) |
 | `config_schema` | `true` | `--config-schema` available (always, default build) |
 | `hot_reload` | bool | hot reload served (needs the `hot-reload` feature) |
-| `config_effective` | bool | `agentd://config/effective` served (needs `serve-mcp`) |
+| `config_effective` | bool | `agent://config/effective` served (needs `serve-mcp`) |
 | `cluster` | bool | sharding + the capacity resource present (`cluster` feature) |
 | `shard` | `"K/N"` \| `null` | this instance's shard identity, or null when unsharded |
 | `standby` | bool | reflects `--standby` (a directed-assignment target) |
@@ -278,7 +278,7 @@ Both funnel into one identical reload routine:
   config file's directory, so a Kubernetes ConfigMap volume swap reloads the file
   in place. It sets the *same* latch SIGHUP does, plus a watch-attribution flag,
   so the reload is labelled `trigger:"watch"`. `--watch-config` **requires** a
-  config file (`--config` / `AGENTD_CONFIG`); watching nothing is a usage error
+  config file (`--config` / `AGENT_CONFIG`); watching nothing is a usage error
   (exit `2`).
 
 ### 4.2 What is reloadable vs restart-only
@@ -326,35 +326,35 @@ The routine is, in order:
    added MCP server that won't connect) is logged and the server is simply absent
    — it never rolls back the already-applied steps or kills the daemon.
 5. **Refresh the served surface** — `notifications/tools/list_changed` if the
-   server set changed; swap the live `agentd://config/effective` view and fire
+   server set changed; swap the live `agent://config/effective` view and fire
    `resources/updated` to its subscribers.
 
-`agentd --validate-config` runs the **same** coherence check as an admission
+`agent --validate-config` runs the **same** coherence check as an admission
 gate before you ship the file — a bad file fails fast (exit `2`) instead of at
-reload time. `agentd --config-schema` prints the file schema. Both are default-
+reload time. `agent --config-schema` prints the file schema. Both are default-
 build flags (always available).
 
 ### 4.4 Observing a reload
 
 A successful reload emits `config.reloaded{changed,applied_ms}` (the `changed`
 list uses the reloadable group labels: `model`, `limits`, `log_level`,
-`subscribe`, `mcp_servers`, `intelligence`), bumps `agentd_config_generation`,
-records `agentd_config_reload_total{result:"applied"}`, and fires
-`resources/updated` for `agentd://config/effective`. An intelligence hot-swap
+`subscribe`, `mcp_servers`, `intelligence`), bumps `agent_config_generation`,
+records `agent_config_reload_total{result:"applied"}`, and fires
+`resources/updated` for `agent://config/effective`. An intelligence hot-swap
 additionally emits `intel.swap{kind,model_from,model_to,endpoint_change,policy}`
-and notifies `agentd://intelligence`. A rejected reload emits
+and notifies `agent://intelligence`. A rejected reload emits
 `config.reload_rejected{reason,field}` and `…{result:"rejected"}` and leaves the
 generation unchanged. (Metric/event names are detailed in
 [observability §3](observability.md).)
 
-> **To reload a ConfigMap:** run with `--watch-config --config /etc/agentd/config.json`
+> **To reload a ConfigMap:** run with `--watch-config --config /etc/agent/config.json`
 > over a ConfigMap volume mount; the kubelet's atomic symlink swap fires the
 > inotify watch and the reloadable subset applies in place. A controller can poll
-> `agentd_config_generation` (or subscribe `agentd://config/effective`) to confirm
+> `agent_config_generation` (or subscribe `agent://config/effective`) to confirm
 > generation N landed. If the change touches a restart-only field, the reload is
 > rejected and you roll a restart.
 
-### 4.5 `agentd://config/effective`
+### 4.5 `agent://config/effective`
 
 The live, **redacted** view of the running daemon's reloadable config —
 Management-only and subscribable. It carries `model`, `swap_policy`, `max_tokens`,
@@ -375,11 +375,11 @@ after a reload, without ever exposing a credential.
   `--serve-mcp`, `--drain-timeout`, `--config`, the validate-at-startup contract.
 - [Observability & health](observability.md) — the metrics, events, and
   resources this page emits/exposes, plus `/healthz`+`/readyz`+`/metrics`.
-- [Deploying agentd](deployment.md) — the pod/scheduler model the drain,
+- [Deploying agent](deployment.md) — the pod/scheduler model the drain,
   lame-duck, and reload primitives plug into.
 - [Intelligence](intelligence.md) — the endpoint list + the runtime hot-swap that
   an `intelligence` reload drives.
 - [MCP: the universal interface](mcp.md) — the self-MCP dialect, the served
-  `subagent.*` tools, and the `agentd://` resource scheme these tools extend.
+  `subagent.*` tools, and the `agent://` resource scheme these tools extend.
 - [Horizontal scaling](scaling.md) — sharding, work-claim leases, standby, and the
   autoscaling signals; `drain` releasing held claims is the scale-down-safety seam.

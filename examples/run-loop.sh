@@ -5,7 +5,7 @@
 #
 # Targets v1 behavior (see docs/design/PLAN.md). The binary today validates
 # config + scaffold-notices run modes; the supervisor driver lands across
-# M1-M3. All flags below exist in crates/agentd/src/config.rs.
+# M1-M3. All flags below exist in crates/agent/src/config.rs.
 #
 # --interval D selects the re-entry cadence: D>0 polls every D; D=0 re-enters
 # immediately on completion (work-until-done). Here we poll every 5 minutes.
@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-AGENTD="${AGENTD:-agentd}"
+AGENTD="${AGENTD:-agent}"
 
-export AGENTD_INTELLIGENCE="${AGENTD_INTELLIGENCE:-unix:/run/intel.sock}"
-# export AGENTD_INTELLIGENCE_TOKEN=...   # set in your environment, not here
+export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-unix:/run/intel.sock}"
+# export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
 exec "$AGENTD" \
   --mode loop \

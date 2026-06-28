@@ -71,7 +71,7 @@ pub struct McpClient {
     caps: ServerCapabilities,
     timeout: Duration,
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
-    /// `{"agentd/run_id": …}`) so backing services can dedupe retries
+    /// `{"agent/run_id": …}`) so backing services can dedupe retries
     /// (RFC 0011 §idempotency).
     tool_meta: Option<Value>,
     _reader: JoinHandle<()>,
@@ -227,7 +227,7 @@ impl McpClient {
     /// `tools/call` with **per-call** `_meta` merged on top of the persistent
     /// [`Self::set_tool_meta`] for this one call only — without mutating the
     /// stored meta. Used by the work-claim client (RFC 0019 §3 / RFC 0015 §5.6),
-    /// where `agentd/claim_key` is per-item and must ride the individual call,
+    /// where `agent/claim_key` is per-item and must ride the individual call,
     /// never the persistent stamp. `extra_meta` (an object) wins key-by-key over
     /// the persistent meta; a non-object `extra_meta` replaces it. The persistent
     /// meta is left untouched.
@@ -557,11 +557,11 @@ mod tests {
 
     #[test]
     fn call_params_inject_meta_for_idempotency() {
-        let meta = json!({"agentd/run_id": "r1"});
+        let meta = json!({"agent/run_id": "r1"});
         let p = build_call_params("send_email", Some(json!({"to": "x"})), Some(&meta));
         assert_eq!(p["name"], "send_email");
         assert_eq!(p["arguments"]["to"], "x");
-        assert_eq!(p["_meta"]["agentd/run_id"], "r1");
+        assert_eq!(p["_meta"]["agent/run_id"], "r1");
 
         // no meta / no args → those keys are absent
         let p2 = build_call_params("noop", None, None);
@@ -573,19 +573,19 @@ mod tests {
     #[test]
     fn merge_meta_overlays_extra_without_mutating_base() {
         // Per-call claim_key rides on top of the persistent run_id stamp.
-        let base = json!({"agentd/run_id": "r1", "traceparent": "tp"});
+        let base = json!({"agent/run_id": "r1", "traceparent": "tp"});
         let merged = merge_meta(
             Some(&base),
-            json!({"agentd/claim_key": "ck", "traceparent": "tp2"}),
+            json!({"agent/claim_key": "ck", "traceparent": "tp2"}),
         );
-        assert_eq!(merged["agentd/run_id"], "r1"); // persistent key preserved
-        assert_eq!(merged["agentd/claim_key"], "ck"); // per-call key added
+        assert_eq!(merged["agent/run_id"], "r1"); // persistent key preserved
+        assert_eq!(merged["agent/claim_key"], "ck"); // per-call key added
         assert_eq!(merged["traceparent"], "tp2"); // extra wins on conflict
         // The base is untouched.
         assert_eq!(base["traceparent"], "tp");
         // No persistent base → the extra is the meta.
-        let only = merge_meta(None, json!({"agentd/claim_key": "ck"}));
-        assert_eq!(only["agentd/claim_key"], "ck");
+        let only = merge_meta(None, json!({"agent/claim_key": "ck"}));
+        assert_eq!(only["agent/claim_key"], "ck");
     }
 
     #[test]

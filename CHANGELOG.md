@@ -6,6 +6,17 @@ versions are the released git tags (`vX.Y.Z`) and the published image
 remains `1.0` and surfaces evolve additively, but **breaking changes are called
 out explicitly** below.
 
+## v2.8.1 — graceful `--enable-exec` migration
+
+A docs/UX patch over v2.8.0's breaking exec change (no behavior change beyond the
+error text; allowlist semantics + exit codes unchanged).
+
+- A bare `--enable-exec` (and `--enable-exec --someflag`) now fails with an
+  actionable migration error naming the new syntax and the v2.8.0 change, instead
+  of a generic "requires a value". `AGENTD_ENABLE_EXEC` empty gets the same.
+- A prominent migration callout in `docs/security.md §6` (before/after) + a pointer
+  in `docs/configuration.md`; this CHANGELOG.
+
 ## v2.8.0 — audit hardening
 
 A multi-dimension audit (security, robustness, observability, consistency,

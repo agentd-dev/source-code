@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-AGENTD="${AGENTD:-agentd}"
+AGENTD="${AGENTD:-agent}"
 
-export AGENTD_INTELLIGENCE="${AGENTD_INTELLIGENCE:-unix:/run/intel.sock}"
-# export AGENTD_INTELLIGENCE_TOKEN=...   # set in your environment, not here
+export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-unix:/run/intel.sock}"
+# export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
 # A reactive daemon should bound its cumulative cost: --max-tokens / --deadline
 # here are tree-wide and lifetime-scoped (the budget is the ultimate
@@ -31,6 +31,6 @@ exec "$AGENTD" \
   --subscribe "inbox:///items/new" \
   --max-steps 25 \
   --max-tokens 2000000 \
-  --health-file /run/agentd/health \
+  --health-file /run/agent/health \
   --drain-timeout 25s \
   --log-level info

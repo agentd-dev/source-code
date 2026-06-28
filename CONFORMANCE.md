@@ -1,18 +1,26 @@
-# agentd — Agent Control Contract (ACC) v1 conformance
+# agent — Agent Control Contract (ACC) v1 conformance
 
-`agentd` is the **reference implementation** of an agent driven by the **agentctl**
+`agent` is the **reference implementation** of an agent driven by the **agentctl**
 Kubernetes control plane. agentctl depends only on the published **Agent Control
-Contract (ACC)** — never on agentd's code (principle P0). This document records
-agentd's conformance to **ACC v1** (`contract_version` `1.0`), surface by surface:
+Contract (ACC)** — never on the binary's code (principle P0). This document records
+`agent`'s conformance to **ACC v1** (`contract_version` `1.0`), surface by surface:
 what passes, the gaps closed to get there, and the P-series items deliberately
 deferred.
 
-- Contract (consumed, **never edited by agentd**):
+> **v3.0.0 neutral cutover.** The runtime was renamed `agentd` → **`agent`** and now
+> **emits the neutral ACC tokens only** — `agent://` resources, `agent_` metrics,
+> `agent_version`, `agent/*` `_meta`, and `AGENT_*` env (documented). The legacy
+> `agentd*` spellings are **still accepted on input** (graceful) but never emitted.
+> The image is `ghcr.io/agentd-dev/agent`. The golden fixtures were re-captured from
+> the `agent 3.0.0` binary; the agentctl fixture tests moved in lockstep. Where this
+> document still cites a branded form below, read it as the legacy input alias.
+
+- Contract (consumed, **never edited by `agent`**):
   `/root/agentctl-dev/source-code/contract/` — `README.md`, `SPEC.md`,
   `schemas/*.json`, `fixtures/capabilities/*`.
 - Conformance is judged by **behavior** against those artifacts (ACC SPEC §8), not
-  by sharing code. The branded spellings stay accepted **and emitted**; neutral
-  acceptance was *added*, never substituted (L4).
+  by sharing code. The neutral spellings are emitted; the branded spellings remain
+  accepted on **input** to GA (L4).
 
 ## Verdict — conformant to ACC v1
 
@@ -36,7 +44,7 @@ no credential reaches the manifest / config file / identity path.
 
 | Surface | ACC schema | Status | Notes |
 |---|---|---|---|
-| **Capabilities manifest** | `manifest.schema.json` | ✅ PASS | `json!`→`Value` (secret-safe); all required root keys + `agentd_version`; now also emits neutral `agent_version` + `surfaces.events_schema` (when served). Sum types correct. Live `agent://capabilities` is parsed-equal to the one-shot. |
+| **Capabilities manifest** | `manifest.schema.json` | ✅ PASS | `json!`→`Value` (secret-safe); all required root keys; emits the neutral `agent_version` (the legacy `agentd_version` was dropped at v3.0.0) + `surfaces.events_schema` (when served). Sum types correct. Live `agent://capabilities` is parsed-equal to the one-shot. |
 | **Management profile** | `management-profile.json` | ✅ PASS | Frozen order `[drain, lame-duck, pause, resume, cancel]`; Management-gated; a non-Management caller of an operator **tool or resource** (read **and** subscribe) → `-32601`. `attach` not a tool; no `force`. `drain ≡ SIGTERM ≡ exit 0`; `lame-duck` readiness-only; `cancel{handle:"0"\|omitted}` = whole run. |
 | **Exit codes** | `exit-codes.table.json` | ✅ PASS | Table + `pod_failure_intent` exact; unknown → `retriable`; `EXIT_CODES="1.0"`. Clean drain = **0, not 143**. Only **3 & 7** remappable, via the new `--budget-exit-code`. |
 | **Run-outcome report** | `report.schema.json` | ✅ PASS | 12 required keys; `report_schema="1.0"`; `mode ∈ {once,loop,schedule}` (never `reactive`); 9-value closed `status`; `distillate_ref` `^(agent\|agentd)://`; `instance`/`trace_id` omitted-not-null; tokens never currency. A real once-run report validates. |
@@ -44,7 +52,7 @@ no credential reaches the manifest / config file / identity path.
 | **Events** | `events.schema.json` | ✅ PASS | `agent://events` read body = `{events_schema:"1.0", oldest_seq, newest_seq, dropped, events[]}`; each line carries monotonic `seq` + the required tuple; `level`/`comp` closed, `event` open; lossy ring; `?after/level/event` parsing. Accepts the neutral `agent://` scheme. Validates live. |
 | **Config file** | `config.schema.json` | ✅ PASS | The one **closed** surface — typo → exit 2. `--validate-config` 0/2 (good→0, typo→2, inline secret-shaped header→2). `--config-schema` emits a valid draft-2020-12 closed doc, `x-agentd-contract-version="1.0"`. Restart-only keys rejected on a live reload. |
 | **A2A** | `a2a.methods.json` | ✅ PASS | 6 live methods served, 5 gateway-owned → `-32601`; closed error set `-32001/-32601/-32602/-32603`; Management-gated; COMPLETED task = exactly one `<taskId>.distillate` artifact; framed streaming until `final`; `TASK_STATE_*` mapping; `surfaces.a2a` emitted. Live drive confirms the error codes. |
-| **Env convention** | `env-convention.json` | ✅ PASS | Downward-API identity; **neutral `AGENT_*` now accepted** alongside branded `AGENTD_*` (env, identity, per-endpoint tokens). Empty → unset; `run_id` always present; `AGENT_SHARD "K/N"` rejects `N==0`/`K>=N` → exit 2; credentials only on the `*_TOKEN[_FILE]` path. |
+| **Env convention** | `env-convention.json` | ✅ PASS | Downward-API identity; **neutral `AGENT_*` is the documented form**, the legacy `AGENTD_*` still accepted on input (env, identity, per-endpoint tokens). Empty → unset; `run_id` always present; `AGENT_SHARD "K/N"` rejects `N==0`/`K>=N` → exit 2; credentials only on the `*_TOKEN[_FILE]` path. |
 
 ## Validation report (live harness — drives the real binary)
 
@@ -136,7 +144,7 @@ record stays truthful and `report.schema`-valid. New: `exit::apply_budget_remap`
 Branded forms stay accepted **and emitted** (none dropped); neutral spellings are
 now **also accepted on input** (cutover to neutral-primary is a GA decision):
 - **Env** (`config.rs::debrand_env`) — one normalization pass: any `AGENT_<X>`
-  synthesizes the branded `AGENTD_<X>` iff absent (**branded wins on conflict**, so
+  synthesizes the branded `AGENT_<X>` iff absent (**branded wins on conflict**, so
   every fielded deployment is byte-for-byte unchanged); every config env var is
   covered with no per-read change.
 - **Identity** (`identity.rs`) — `AGENT_POD_NAME/UID/NAMESPACE/NODE_NAME`
@@ -144,7 +152,7 @@ now **also accepted on input** (cutover to neutral-primary is a GA decision):
 - **Per-endpoint tokens** (`intel/endpoints.rs`) —
   `AGENT_INTELLIGENCE_TOKEN[_N][_FILE]` accepted; value stays opaque (L5).
 - **Resource URIs** (`agentd_uri.rs`) — `agent://…` accepted on read alongside
-  `agentd://…` for every resource; still emits branded `agentd://`.
+  `agent://…` for every resource; still emits branded `agent://`.
 - **Manifest** (`capabilities.rs`) — emits neutral `agent_version` next to
   `agentd_version`, plus additive `surfaces.events_schema` when the stream is served.
 
@@ -189,7 +197,7 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
 3. **`run_id` is an opaque stable string, not a Crockford ULID** — no schema
    enforces a ULID pattern (`manifest`/`report` require only a non-empty string);
    agentd mints `format!("{millis:x}{pid:x}")`, stable across a retried Job when
-   `AGENT_RUN_ID`/`AGENTD_RUN_ID` is set. Switching the format is unnecessary for
+   `AGENT_RUN_ID`/`AGENT_RUN_ID` is set. Switching the format is unnecessary for
    conformance and risk-bearing, so it is left as-is.
 4. **`--config-schema` is the strict serde mirror** (reloadable keys only, closed);
    the contract's `config.schema.json` is the broader VIEW that also declares

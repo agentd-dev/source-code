@@ -1,6 +1,6 @@
-# agentd examples
+# agent examples
 
-Runnable samples for the three operational shapes of **agentd** — a one-shot
+Runnable samples for the three operational shapes of **agent** — a one-shot
 run, an event-reactive daemon, and a polling/work-until-done loop — plus the
 instruction files and MCP server config they use.
 
@@ -8,7 +8,7 @@ instruction files and MCP server config they use.
 > supervisor + subagent process tree, the MCP client, served self-MCP, and all
 > four run modes ship; the commands below run real agent runs (given an
 > intelligence endpoint + MCP servers). Every flag and env var used here exists
-> in `crates/agentd/src/config.rs` (the authoritative surface).
+> in `crates/agent/src/config.rs` (the authoritative surface).
 
 ---
 
@@ -23,18 +23,18 @@ instruction files and MCP server config they use.
 | `run-reactive.sh` | `--mode reactive`: idle, wake on MCP resource changes, never exit on its own. Deployment shape. |
 | `run-loop.sh` | `--mode loop`: re-enter on a cadence until a bound or a drain signal. Job-with-deadline / Deployment shape. |
 
-All three scripts assume `agentd` is on `$PATH` (override with `AGENTD=/path/to/agentd`)
+All three scripts assume `agent` is on `$PATH` (override with `AGENTD=/path/to/agent`)
 and that an intelligence endpoint is reachable. Build the binary with
-`cargo build --release`; the binary is at `target/release/agentd`.
+`cargo build --release`; the binary is at `target/release/agent`.
 
 ---
 
 ## Prerequisites
 
-agentd ships **no tools of its own** (except a gated `exec`, off by default) and
+agent ships **no tools of its own** (except a gated `exec`, off by default) and
 talks to **one** intelligence endpoint. So every sample needs two things wired:
 
-1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENTD_INTELLIGENCE`.
+1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENT_INTELLIGENCE`.
    One of:
    - `unix:/run/intel.sock` — a gateway/sidecar over a unix socket (core build).
    - `https://host/v1/...` — a direct HTTPS endpoint (`tls` feature).
@@ -43,11 +43,11 @@ talks to **one** intelligence endpoint. So every sample needs two things wired:
 
    The wire is OpenAI-compatible `/chat/completions` with native tool-calling
    (RFC 0006). The credential is passed by **env/flag only**, never read from a
-   config file, and is redacted everywhere agentd logs:
+   config file, and is redacted everywhere agent logs:
 
    ```bash
-   export AGENTD_INTELLIGENCE=unix:/run/intel.sock
-   export AGENTD_INTELLIGENCE_TOKEN=...        # or --intelligence-token
+   export AGENT_INTELLIGENCE=unix:/run/intel.sock
+   export AGENT_INTELLIGENCE_TOKEN=...        # or --intelligence-token
    ```
 
 2. **MCP servers for the tools/resources the instruction needs** — declared with
@@ -56,7 +56,7 @@ talks to **one** intelligence endpoint. So every sample needs two things wired:
    **trusted config** and is never built from model- or server-controlled
    strings.
 
-A bad config exits `2` in milliseconds, before any LLM round-trip — agentd
+A bad config exits `2` in milliseconds, before any LLM round-trip — agent
 validates everything up front (e.g. `--mode reactive` with no `--subscribe`, or
 an intelligence URI with an unsupported scheme, both fail fast).
 
@@ -93,7 +93,7 @@ secrets never go here (env/flag only).
 
 > **v1 vs roadmap.** In v1 the stable, wired surface for declaring servers is the
 > repeatable **`--mcp name=command arg arg`** flag (see `config.rs`). The
-> JSON config file (loaded via a config-file layer / `AGENTD_MCP_CONFIG`) and the
+> JSON config file (loaded via a config-file layer / `AGENT_MCP_CONFIG`) and the
 > per-server allowlist fields are **(roadmap)** — the file layer slots between
 > built-in defaults and env in a later milestone (`docs/design/PLAN.md`). The
 > sample scripts therefore use `--mcp` flags directly so they match what v1
@@ -116,15 +116,15 @@ Run an instruction to a terminal status, then exit. This is the Job / CLI shape:
 result on stdout, telemetry on stderr, no daemon, no socket.
 
 ```bash
-export AGENTD_INTELLIGENCE=unix:/run/intel.sock
-export AGENTD_INTELLIGENCE_TOKEN=...
+export AGENT_INTELLIGENCE=unix:/run/intel.sock
+export AGENT_INTELLIGENCE_TOKEN=...
 ./run-once.sh
 ```
 
 The script runs (abbreviated):
 
 ```bash
-agentd \
+agent \
   --mode once \
   --instruction-file instructions/research.md \
   --model claude-opus-4 \
@@ -150,15 +150,15 @@ drain signal (`SIGTERM`) or a fatal/limit class stops it. Deploy it as a
 long-lived Deployment.
 
 ```bash
-export AGENTD_INTELLIGENCE=unix:/run/intel.sock
-export AGENTD_INTELLIGENCE_TOKEN=...
+export AGENT_INTELLIGENCE=unix:/run/intel.sock
+export AGENT_INTELLIGENCE_TOKEN=...
 ./run-reactive.sh
 ```
 
 Abbreviated:
 
 ```bash
-agentd \
+agent \
   --mode reactive \
   --instruction-file instructions/triage.md \
   --model claude-opus-4 \
@@ -166,7 +166,7 @@ agentd \
   --mcp "tickets=mcp-server-tickets --project OPS" \
   --subscribe "inbox:///items/new" \
   --max-steps 25 --max-tokens 2000000 \
-  --health-file /run/agentd/health --drain-timeout 25s
+  --health-file /run/agent/health --drain-timeout 25s
 ```
 
 `--mode reactive` **requires** at least one `--subscribe <uri>`; without it the
@@ -188,15 +188,15 @@ step cap), the wall-clock `--deadline`, or the tree-wide token ceiling — or a
 drain signal. The Job-with-deadline / Deployment shape.
 
 ```bash
-export AGENTD_INTELLIGENCE=unix:/run/intel.sock
-export AGENTD_INTELLIGENCE_TOKEN=...
+export AGENT_INTELLIGENCE=unix:/run/intel.sock
+export AGENT_INTELLIGENCE_TOKEN=...
 ./run-loop.sh
 ```
 
 Abbreviated:
 
 ```bash
-agentd \
+agent \
   --mode loop \
   --interval 5m \
   --instruction-file instructions/triage.md \
@@ -213,8 +213,8 @@ loop into a bounded run; omit it (and let the orchestrator own lifecycle) for a
 kept-alive Deployment.
 
 > **Scheduling note.** For production cron, the **recommended** path is an
-> external scheduler (e.g. a k8s CronJob) invoking `agentd --mode once …` — robust
-> to clock skew and restart. agentd also has a `--mode schedule` (per-fire
+> external scheduler (e.g. a k8s CronJob) invoking `agent --mode once …` — robust
+> to clock skew and restart. agent also has a `--mode schedule` (per-fire
 > identical to `once`, requires `--interval <dur>` or `--cron <expr>`) for
 > non-orchestrated deployments (RFC 0008).
 
@@ -222,7 +222,7 @@ kept-alive Deployment.
 
 ## What a run logs
 
-agentd emits structured JSON lines on stderr (one event per line). The intended
+agent emits structured JSON lines on stderr (one event per line). The intended
 v1 shape, illustrative:
 
 ```json
@@ -233,36 +233,36 @@ v1 shape, illustrative:
 ```
 
 Credentials never appear in any log line — the `--intelligence-token` value is
-redacted (`***`) in all agentd output, including panic messages.
+redacted (`***`) in all agent output, including panic messages.
 
 ---
 
 ## Flag reference (used by these samples)
 
-Every flag below is in `crates/agentd/src/config.rs`; run `agentd --help` for the
+Every flag below is in `crates/agent/src/config.rs`; run `agent --help` for the
 full list. Anything env-settable (12-factor) is shown with its env var.
 
 | Flag | Env | Meaning |
 |---|---|---|
 | `--instruction <TEXT>` | `INSTRUCTION` | the task |
 | `--instruction-file <PATH>` | — | read the instruction from a file |
-| `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | `unix:/path` \| `https://host/…` \| `vsock:cid:port` |
-| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
-| `--model <NAME>` | `AGENTD_MODEL` | model id |
+| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | `unix:/path` \| `https://host/…` \| `vsock:cid:port` |
+| `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
+| `--model <NAME>` | `AGENT_MODEL` | model id |
 | `--mcp name=command` | — | declare an MCP server (repeatable; stdio) |
-| `--mode once\|loop\|reactive\|schedule` | `AGENTD_MODE` | the driver (default `once`) |
+| `--mode once\|loop\|reactive\|schedule` | `AGENT_MODE` | the driver (default `once`) |
 | `--subscribe <uri>` | — | subscribe to an MCP resource (repeatable; required for `reactive`) |
 | `--interval <dur>` | — | loop/schedule cadence (e.g. `5m`, `0`=immediate) |
-| `--max-steps <N>` | `AGENTD_MAX_STEPS` | per-run step cap (default 50) |
-| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | token budget (default 200000) |
-| `--deadline <dur>` | `AGENTD_DEADLINE` | wall-clock deadline (default `600s`) |
+| `--max-steps <N>` | `AGENT_MAX_STEPS` | per-run step cap (default 50) |
+| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget (default 200000) |
+| `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline (default `600s`) |
 | `--max-depth <N>` | — | subagent tree depth cap (default 4) |
-| `--run-id <ID>` | `AGENTD_RUN_ID` | idempotency key (auto-generated if unset) |
-| `--log-level <L>` | `AGENTD_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
-| `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
+| `--run-id <ID>` | `AGENT_RUN_ID` | idempotency key (auto-generated if unset) |
+| `--log-level <L>` | `AGENT_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
+| `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
 | `--health-file <PATH>` | — | liveness heartbeat file |
-| `--serve-mcp <unix:/path>` | `AGENTD_SERVE_MCP` | serve agentd's own MCP (stdio/unix; HTTP serving is roadmap) |
-| `--enable-exec` | `AGENTD_ENABLE_EXEC` | expose the gated `exec` tool (off by default) |
+| `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | serve agent's own MCP (stdio/unix; HTTP serving is roadmap) |
+| `--enable-exec` | `AGENT_ENABLE_EXEC` | expose the gated `exec` tool (off by default) |
 
 Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 `30`, `5m`, `2h`.
@@ -275,5 +275,5 @@ Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 - **Self-MCP serving is stdio/unix only** (`--serve-mcp unix:/path`). HTTP
   serving — **(roadmap)**.
 - **MCP `tasks` / `sampling` / `roots`** are not used as a client — **(roadmap)**, RFC 0013.
-- **Config file / `AGENTD_MCP_CONFIG`** layer and per-server allowlists —
+- **Config file / `AGENT_MCP_CONFIG`** layer and per-server allowlists —
   **(roadmap)**; v1 uses `--mcp` flags. See `docs/design/PLAN.md`.

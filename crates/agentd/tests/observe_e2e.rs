@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn exe() -> &'static str {
-    env!("CARGO_BIN_EXE_agentd")
+    env!("CARGO_BIN_EXE_agent")
 }
 
 fn sigterm(pid: u32) {
@@ -289,10 +289,10 @@ fn scrape_metrics(port: u16) -> String {
     buf
 }
 
-/// Extract the integer value of a `agentd_tokens_total{type="..."} N` sample.
+/// Extract the integer value of a `agent_tokens_total{type="..."} N` sample.
 #[cfg(feature = "metrics")]
 fn token_total(body: &str, ty: &str) -> u64 {
-    let needle = format!("agentd_tokens_total{{type=\"{ty}\"}} ");
+    let needle = format!("agent_tokens_total{{type=\"{ty}\"}} ");
     for line in body.lines() {
         if let Some(v) = line.strip_prefix(&needle) {
             return v.trim().parse().unwrap_or(0);
@@ -304,12 +304,12 @@ fn token_total(body: &str, ty: &str) -> u64 {
 /// The producer→consumer→counter chain (metrics-honesty): a real reactive run
 /// drives a real subagent against the mock LLM; the child now PRODUCES
 /// `AgentMsg::Usage`, the supervisor reactor CONSUMES it via `record_tokens`, and
-/// the frozen `agentd_tokens_total{type}` counter is non-zero on the `/metrics`
+/// the frozen `agent_tokens_total{type}` counter is non-zero on the `/metrics`
 /// scrape. Before this fix the child never emitted `Usage`, so the counter was
 /// silently 0 despite the wired consumer. [feature: metrics]
 #[cfg(feature = "metrics")]
 #[test]
-fn reactive_run_rolls_token_usage_up_to_agentd_tokens_total() {
+fn reactive_run_rolls_token_usage_up_to_agent_tokens_total() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(&sock, "final");
@@ -351,7 +351,7 @@ fn reactive_run_rolls_token_usage_up_to_agentd_tokens_total() {
 
     // Poll /metrics while the daemon is LIVE: the reaction fires ~200ms after
     // subscribe; once the child rolls its Usage up, the supervisor's
-    // `agentd_tokens_total` goes non-zero. The mock `final` answer reports
+    // `agent_tokens_total` goes non-zero. The mock `final` answer reports
     // {prompt_tokens:11, completion_tokens:5}, so `out` reaches ≥ 5.
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut out_tokens = 0u64;
@@ -379,11 +379,11 @@ fn reactive_run_rolls_token_usage_up_to_agentd_tokens_total() {
         "no reaction fired (no real run to produce Usage):\n{out}"
     );
     // The chain: child PRODUCES AgentMsg::Usage → supervisor reactor CONSUMES it via
-    // record_tokens → the frozen agentd_tokens_total counter is non-zero. Before
+    // record_tokens → the frozen agent_tokens_total counter is non-zero. Before
     // this fix the producer was missing, so this would read 0.
     assert!(
         in_tokens > 0 && out_tokens > 0,
-        "agentd_tokens_total stayed zero — the child→supervisor→counter token \
+        "agent_tokens_total stayed zero — the child→supervisor→counter token \
          roll-up is broken (in={in_tokens}, out={out_tokens})\n{out}"
     );
 }

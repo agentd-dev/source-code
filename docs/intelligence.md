@@ -1,10 +1,10 @@
 # Intelligence: the LLM wire
 
-agentd reaches the model over **one logical wire**. The agentic ReAct loop —
+agent reaches the model over **one logical wire**. The agentic ReAct loop —
 which runs only inside a subagent process — sends it messages plus a scoped tool
 catalogue and gets back text *and* structured tool calls. That wire is named in
-`AGENTD_INTELLIGENCE` (or `--intelligence`) and authenticated with
-`AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`). For resilience the wire
+`AGENT_INTELLIGENCE` (or `--intelligence`) and authenticated with
+`AGENT_INTELLIGENCE_TOKEN` (or `--intelligence-token`). For resilience the wire
 can list **several endpoints** (failover priority by order), each with its own
 credential, and the list + model are **hot-swappable without a restart** — but it
 stays one model-facing channel. That is the whole surface.
@@ -24,17 +24,17 @@ only carries the LLM request/response. Do not conflate the two.
 ---
 
 > **One wire, many endpoints.** The model-facing channel is still a single
-> logical wire, but `AGENTD_INTELLIGENCE` now accepts an **ordered list** of
+> logical wire, but `AGENT_INTELLIGENCE` now accepts an **ordered list** of
 > endpoints for failover (see [Resilience](#resilience-multi-endpoint-failover--the-circuit-breaker)),
 > the endpoint list and model are **hot-swappable** without a restart (see
-> [Runtime hot-swap](#runtime-hot-swap-model-swap)), and agentd can **discover**
+> [Runtime hot-swap](#runtime-hot-swap-model-swap)), and agent can **discover**
 > what an endpoint serves (see [Model discovery](#model-discovery)). The
 > single-endpoint behaviour described first is exactly the one-element-list case.
 
 ## The one URI, three transports
 
-The scheme of `AGENTD_INTELLIGENCE` selects the transport. All three drive the
-*same* hand-rolled HTTP/1.1 client over a `Read + Write` byte stream — agentd
+The scheme of `AGENT_INTELLIGENCE` selects the transport. All three drive the
+*same* hand-rolled HTTP/1.1 client over a `Read + Write` byte stream — agent
 ships no async runtime and no `url`/ICU stack.
 
 | URI form | Transport | Use case | Build |
@@ -47,8 +47,8 @@ The URI is validated **at startup**, before any side effect. A scheme that
 isn't `unix:`, `https://`, or `vsock:` exits `2` in milliseconds:
 
 ```
-$ agentd --instruction 'hi' --intelligence ftp://x
-agentd: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://x)
+$ agent --instruction 'hi' --intelligence ftp://x
+agent: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://x)
 $ echo $?
 2
 ```
@@ -60,11 +60,11 @@ the client warns). Use `unix:` or `https://` in production.
 ### `unix:` — sidecar gateway (canonical for clusters)
 
 A gateway sidecar (LiteLLM, a local vLLM, your own proxy) terminates TLS and
-provider auth; agentd talks plaintext HTTP over the socket. No TLS feature, no
+provider auth; agent talks plaintext HTTP over the socket. No TLS feature, no
 key in the agent process.
 
 ```bash
-agentd \
+agent \
   --instruction-file ./task.md \
   --intelligence unix:/run/intel.sock \
   --model gpt-4o \
@@ -74,8 +74,8 @@ agentd \
 ### `https://` — direct or remote gateway (feature `tls`)
 
 ```bash
-export AGENTD_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
-agentd \
+export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
+agent \
   --instruction 'summarize the open incidents' \
   --intelligence https://api.openai.com/v1/chat/completions \
   --model gpt-4o \
@@ -88,7 +88,7 @@ cmake. SNI is the parsed host.
 ### `vsock:` — enclave / microVM (feature `vsock`)
 
 ```bash
-agentd \
+agent \
   --instruction-file /task.md \
   --intelligence vsock:2:8080 \
   --model claude-opus-4
@@ -103,7 +103,7 @@ even in default builds, which return a clear "requires --features vsock" error.
 
 ## The wire: OpenAI-compatible by default, Anthropic in-binary
 
-agentd ships **exactly two** in-binary adapters. The bias is deliberate: fewer
+agent ships **exactly two** in-binary adapters. The bias is deliberate: fewer
 adapters, thinner binary, push provider quirks to a gateway.
 
 ### Canonical: `openai-compatible` `POST /v1/chat/completions`
@@ -155,13 +155,13 @@ reason, usage from `usage.{input_tokens,output_tokens}`.
 
 Gemini, Bedrock, Cohere, and other providers are **not** in the binary. Run a
 gateway that exposes an OpenAI-compatible `/chat/completions`, point
-`AGENTD_INTELLIGENCE` at it (`unix:` or `https://`), and the canonical adapter
+`AGENT_INTELLIGENCE` at it (`unix:` or `https://`), and the canonical adapter
 handles the rest. This keeps the binary thin and the provider matrix out of
-agentd's release cadence.
+agent's release cadence.
 
 > **Roadmap.** Selecting the Anthropic adapter (vs. the default
 > openai-compatible) and the legacy framed-`complete` gateway wire are specified
-> in RFC 0006 (`AGENTD_INTELLIGENCE_DIALECT`, `AGENTD_INTELLIGENCE_WIRE`) but are
+> in RFC 0006 (`AGENT_INTELLIGENCE_DIALECT`, `AGENT_INTELLIGENCE_WIRE`) but are
 > **not yet on the CLI surface** in `config.rs`. Until they land, the binary
 > drives the canonical openai-compatible HTTP wire. Track in
 > [`design/PLAN.md`](design/PLAN.md).
@@ -188,7 +188,7 @@ synthesized into a normal tool call and routed identically to a native one; an
 step-consuming observation fed back to the model — never a hard abort.
 
 This is a **demoted fallback**: native is always tried first. The toolmode knob
-(`AGENTD_INTELLIGENCE_TOOLMODE = native | json | auto`) is specified in RFC 0006
+(`AGENT_INTELLIGENCE_TOOLMODE = native | json | auto`) is specified in RFC 0006
 but is **roadmap** — not yet on the `config.rs` surface. Prefer an
 openai-compatible endpoint with native tool-calling for v1.
 
@@ -201,13 +201,13 @@ logged**:
 
 ```bash
 # flag (sets endpoint 1's credential)
-agentd … --intelligence-token "$OPENAI_API_KEY"
+agent … --intelligence-token "$OPENAI_API_KEY"
 # or env (preferred for 12-factor / secret mounts)
-export AGENTD_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
-agentd …
+export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
+agent …
 # or read from a mounted file (rotation-friendly)
-export AGENTD_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/llm/token
-agentd …
+export AGENT_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/llm/token
+agent …
 ```
 
 ### Per-endpoint credentials
@@ -217,9 +217,9 @@ position (1-indexed):
 
 | Endpoint | Inline env | File env |
 |---|---|---|
-| 1 (primary) | `AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`) | `AGENTD_INTELLIGENCE_TOKEN_FILE` (or `--intelligence-token-file`) |
-| 2 | `AGENTD_INTELLIGENCE_TOKEN_2` | `AGENTD_INTELLIGENCE_TOKEN_2_FILE` |
-| *N* | `AGENTD_INTELLIGENCE_TOKEN_<N>` | `AGENTD_INTELLIGENCE_TOKEN_<N>_FILE` |
+| 1 (primary) | `AGENT_INTELLIGENCE_TOKEN` (or `--intelligence-token`) | `AGENT_INTELLIGENCE_TOKEN_FILE` (or `--intelligence-token-file`) |
+| 2 | `AGENT_INTELLIGENCE_TOKEN_2` | `AGENT_INTELLIGENCE_TOKEN_2_FILE` |
+| *N* | `AGENT_INTELLIGENCE_TOKEN_<N>` | `AGENT_INTELLIGENCE_TOKEN_<N>_FILE` |
 
 Precedence per endpoint: an explicit inline env override wins, then the `…_FILE`
 variant, then (endpoint 1 only) the resolved `--intelligence-token`. An endpoint
@@ -233,7 +233,7 @@ Rules:
   never persisted, never put in the transcript fed back to the model.
 - **Redacted everywhere.** The `Config` `Debug` impl prints the token as `***`;
   the secret-header allowlist keeps `authorization` / `x-api-key` out of the
-  JSON-lines logs and any span; `agentd://intelligence` shows transport + index
+  JSON-lines logs and any span; `agent://intelligence` shows transport + index
   only. There is a test asserting the raw value never appears.
 - **Optional for keyless endpoints.** A local vLLM/Ollama behind a `unix:` socket
   needs no token at all.
@@ -271,7 +271,7 @@ Example of the redaction (the token is set but never echoed):
 
 ## Resilience: multi-endpoint failover & the circuit breaker
 
-`AGENTD_INTELLIGENCE` (or `--intelligence`) accepts an **ordered,
+`AGENT_INTELLIGENCE` (or `--intelligence`) accepts an **ordered,
 comma-separated list** of endpoints. List order *is* failover priority — the
 first element is the primary. A single-element list is exactly the
 single-endpoint behaviour above; the failover/breaker machinery is inert with one
@@ -279,7 +279,7 @@ endpoint.
 
 ```bash
 # two enclave-host endpoints, then a sidecar gateway as the last resort
-agentd \
+agent \
   --intelligence 'vsock:3:8080,vsock:3:8081,unix:/run/intel.sock' \
   --model claude-opus-4 \
   …
@@ -325,14 +325,14 @@ open-and-cooling, the list is "all down": on a `once` run that surfaces as
 **exit 4**; a long-lived daemon backs off and keeps serving (it does not crash on
 a transient roll).
 
-These transitions feed the metrics (`agentd_intel_up`,
-`agentd_intel_errors_total{reason}`) and the `intel.*` events — see
+These transitions feed the metrics (`agent_intel_up`,
+`agent_intel_errors_total{reason}`) and the `intel.*` events — see
 [Observability](observability.md).
 
-### `agentd://intelligence` — the live endpoint health view
+### `agent://intelligence` — the live endpoint health view
 
-When serving its self-MCP (`--serve-mcp`), agentd exposes a **management-only**,
-subscribable resource: **`agentd://intelligence`**. It is the ordered endpoint
+When serving its self-MCP (`--serve-mcp`), agent exposes a **management-only**,
+subscribable resource: **`agent://intelligence`**. It is the ordered endpoint
 list with **transport + index only — never the URL, host, cid, or credential**
 (RFC 0012 §3.7):
 
@@ -383,7 +383,7 @@ invisible — the run rebuilds its client with **fresh breaker state** (so no st
 breaker carries to a new endpoint) and continues. The endpoint URL and credential
 travel on the control frame like the spawn payload and are **never logged**.
 
-`--model-swap` (env `AGENTD_MODEL_SWAP`) controls only what happens when a reload
+`--model-swap` (env `AGENT_MODEL_SWAP`) controls only what happens when a reload
 changes the **model** under an in-flight turn:
 
 | Policy | Behaviour |
@@ -406,14 +406,14 @@ and is never read from the config file.
 
 ## Model discovery
 
-agentd can learn what an OpenAI-compatible endpoint serves via a tiny,
+agent can learn what an OpenAI-compatible endpoint serves via a tiny,
 best-effort probe: one hand-rolled `GET /v1/models` over the **same** transport
 and bearer auth the chat call uses (no new client, no streaming, zero new deps).
 It is **lazy, cached, and silent-degrade**:
 
-- It runs **only** when the served `agentd://intelligence` (or the live
-  `agentd://capabilities`) surface is actually read — never on the hot path, and
-  **never at startup** (the one-shot `agentd --capabilities` probe stays
+- It runs **only** when the served `agent://intelligence` (or the live
+  `agent://capabilities`) surface is actually read — never on the hot path, and
+  **never at startup** (the one-shot `agent --capabilities` probe stays
   network-free). The result is cached supervisor-side with a short TTL.
 - **Any** failure — a `404` (discovery unsupported), a connection failure, a
   non-JSON body — yields no models and never flips `discovery` to true. It is
@@ -422,7 +422,7 @@ It is **lazy, cached, and silent-degrade**:
 - The `anthropic` dialect has **no list endpoint**, so it contributes nothing —
   just the configured model.
 
-It surfaces two fields on `agentd://intelligence` and the capabilities manifest's
+It surfaces two fields on `agent://intelligence` and the capabilities manifest's
 `intelligence` block:
 
 - `discovery` — `true` if at least one endpoint answered `/v1/models`.
@@ -444,14 +444,14 @@ in parentheses; the flag wins over env, which wins over the default.)
 
 | Flag | Env | Meaning |
 |---|---|---|
-| `--intelligence <URI[,URI…]>` | `AGENTD_INTELLIGENCE` | the endpoint **list**: comma-separated `unix:` \| `https://` \| `vsock:`, order = failover priority (required) |
-| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | endpoint-1 bearer / `x-api-key` value (never logged) |
-| `--intelligence-token-file <PATH>` | `AGENTD_INTELLIGENCE_TOKEN_FILE` | read endpoint-1's token from a mounted file (rotation) |
-| *(per-endpoint, env-only)* | `AGENTD_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | endpoint *N*'s token / token-file (1-indexed, N ≥ 2) |
-| `--model <NAME>` | `AGENTD_MODEL` | model id sent in the request body (reloadable) |
-| `--model-swap <POLICY>` | `AGENTD_MODEL_SWAP` | in-flight model-swap policy: `finish-on-old` (default) \| `restart-turn` |
-| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | token budget for the run (default 200000) |
-| `--deadline <dur>` | `AGENTD_DEADLINE` | wall-clock deadline, e.g. `600s`, `5m` (default 600s) |
+| `--intelligence <URI[,URI…]>` | `AGENT_INTELLIGENCE` | the endpoint **list**: comma-separated `unix:` \| `https://` \| `vsock:`, order = failover priority (required) |
+| `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | endpoint-1 bearer / `x-api-key` value (never logged) |
+| `--intelligence-token-file <PATH>` | `AGENT_INTELLIGENCE_TOKEN_FILE` | read endpoint-1's token from a mounted file (rotation) |
+| *(per-endpoint, env-only)* | `AGENT_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | endpoint *N*'s token / token-file (1-indexed, N ≥ 2) |
+| `--model <NAME>` | `AGENT_MODEL` | model id sent in the request body (reloadable) |
+| `--model-swap <POLICY>` | `AGENT_MODEL_SWAP` | in-flight model-swap policy: `finish-on-old` (default) \| `restart-turn` |
+| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget for the run (default 200000) |
+| `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline, e.g. `600s`, `5m` (default 600s) |
 
 Durations accept `ms`, `s`, `m`, `h`, or a bare integer (seconds). The
 `intelligence` endpoint list, `model`, and `model_swap` are also settable from the
@@ -460,9 +460,9 @@ config file and are **reloadable** (see [Configuration](configuration.md) and th
 only.
 
 > The dialect/toolmode/legacy-wire selectors from RFC 0006
-> (`AGENTD_INTELLIGENCE_DIALECT`, `AGENTD_INTELLIGENCE_TOOLMODE`,
-> `AGENTD_INTELLIGENCE_WIRE`) are **not yet** in `config.rs`; do not rely on
-> them until they appear in `agentd --help`. They are tracked in
+> (`AGENT_INTELLIGENCE_DIALECT`, `AGENT_INTELLIGENCE_TOOLMODE`,
+> `AGENT_INTELLIGENCE_WIRE`) are **not yet** in `config.rs`; do not rely on
+> them until they appear in `agent --help`. They are tracked in
 > [`design/PLAN.md`](design/PLAN.md).
 
 ---
@@ -470,8 +470,8 @@ only.
 ## See also
 
 - [Configuration reference](configuration.md) (the full flag/env surface + the reloadable config file)
-- [Observability](observability.md) (the `intel.*` events, `agentd_intel_*` metrics, the breaker signals)
-- [Horizontal scaling](scaling.md) (where `intelligence.warm`/`healthy` feeds `agentd://capacity`)
+- [Observability](observability.md) (the `intel.*` events, `agent_intel_*` metrics, the breaker signals)
+- [Horizontal scaling](scaling.md) (where `intelligence.warm`/`healthy` feeds `agent://capacity`)
 - [RFC 0006 — Intelligence transport & wire](../rfcs/0006-intelligence-transport-and-wire.md) (this channel, in full)
 - [RFC 0018 — Intelligence transport resilience](../rfcs/0018-intelligence-transport-resilience.md) (failover, the breaker, swap, discovery)
 - [RFC 0004 — MCP client subset & codec](../rfcs/0004-mcp-client-subset-and-codec.md) (where tools come from)

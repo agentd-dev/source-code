@@ -1,6 +1,6 @@
 # Modes & triggers
 
-agentd has **one loop**. The "four modes" are not four programs — they are one
+agent has **one loop**. The "four modes" are not four programs — they are one
 supervisor loop with four different **exit predicates**. A `once` run and a
 long-lived `reactive` daemon share the same inner agentic loop, the same spawn
 chokepoint, the same router; they differ only in *when the supervisor decides to
@@ -33,7 +33,7 @@ what to do next.
 | `reactive` | arm subscriptions + routes; idle (no root at start) | **never on its own** — only a drain signal or a fatal/limit class | Deployment |
 | `schedule` | arm a timer event source; no root at start | per-fire identical to `once`; the daemon form exits only on signal/limit | external CronJob (recommended) or internal `--interval` |
 
-Default mode is `once`. Select with `--mode` (or `AGENTD_MODE`):
+Default mode is `once`. Select with `--mode` (or `AGENT_MODE`):
 
 ```
 --mode once|loop|reactive|schedule
@@ -62,7 +62,7 @@ budget/exhausted (steps / tokens / the run's own `deadline`)→7, … (exit code
 self-terminate, not a terminal-status mapping)
 
 ```
-agentd \
+agent \
   --instruction "Summarize today's open PRs and post to #eng." \
   --intelligence unix:/run/intelligence.sock \
   --model claude-opus-4-8 \
@@ -99,7 +99,7 @@ Keep working across "shifts" until a bound is hit or a drain signal arrives.
 
 ```
 # Poll a queue every 30s, react, exit on deadline or token budget.
-agentd \
+agent \
   --mode loop \
   --interval 30s \
   --instruction "Drain the review queue: triage each new item." \
@@ -119,7 +119,7 @@ child won't self-terminate.)
 > continuation of the prior session is a planned `--session fresh|warm` knob
 > (RFC 0008 §3.1.2; default fresh for `--interval D>0`, warm for `--interval 0`).
 > **(roadmap)** — not yet on the CLI surface in
-> [`config.rs`](../crates/agentd/src/config.rs); v1 re-enters fresh.
+> [`config.rs`](../crates/agent/src/config.rs); v1 re-enters fresh.
 
 ---
 
@@ -137,7 +137,7 @@ server failed → `6`; tree token ceiling spent → `7`).
 a missing subscription is a usage error → exit 2):
 
 ```
-agentd \
+agent \
   --mode reactive \
   --subscribe "file:///inbox/*.json" \
   --instruction "When an inbox file appears, validate it and file an issue." \
@@ -166,7 +166,7 @@ notification is **payload-less** — it carries only `{uri}` (optionally `title`
 ```
 
 So the reactive loop is intrinsically **notify-then-read**: the notification only
-says *"this URI changed"*; agentd (the agent, on its own terms) must follow up
+says *"this URI changed"*; agent (the agent, on its own terms) must follow up
 with `resources/read` to learn *what* it now is. Two round-trips, raceable. The
 supervisor never reads the changed body itself — it delivers the URI(s) into the
 agent, and the agent decides whether to `resource.read`. This keeps large diffs
@@ -252,7 +252,7 @@ starting new work," never melts down.
 
 ### Delivery semantics: at-least-once + re-read-current-state
 
-agentd promises **convergence on current state, not exactly-once** (RFC 0008
+agent promises **convergence on current state, not exactly-once** (RFC 0008
 §3.5). Notifications can be redelivered (reconnect, restart, a coalesce edge).
 Because the agent `resource.read`s on wake and acts on what the resource *is*
 now, reprocessing converges — coalesce is lossless and redelivery is safe.
@@ -266,7 +266,7 @@ Ordering guarantees:
 - **Across different routes/sessions:** concurrent, unordered. Exactly-one-owner
   means there is no cross-route race on a single event.
 
-**Reconnect recovery.** On MCP server reconnect or supervisor restart, agentd
+**Reconnect recovery.** On MCP server reconnect or supervisor restart, agent
 re-subscribes every *declared* subscription and synthesizes one coalesced
 "possibly changed" event per watched URI (read-after-subscribe converts
 edge-triggering to level-triggering across the boundary). This recovers any
@@ -327,9 +327,9 @@ clock fire is an internal event delivered to the *same* router, routed to a
 ### Recommended: external CronJob → `once`
 
 For production, prefer an **external** scheduler (a k8s CronJob, systemd timer,
-cron) invoking `agentd --mode once …`. This is robust to clock skew, restarts,
+cron) invoking `agent --mode once …`. This is robust to clock skew, restarts,
 and is 12-factor clean — the schedule lives in the orchestrator, not in the
-process. agentd has no calendars, DST handling, timezone job-store, or per-fire
+process. agent has no calendars, DST handling, timezone job-store, or per-fire
 persistence in core (UTC only).
 
 ```yaml
@@ -345,8 +345,8 @@ spec:
         spec:
           restartPolicy: Never
           containers:
-            - name: agentd
-              image: agentd:1.x
+            - name: agent
+              image: agent:1.x
               args:
                 - --mode=once
                 - --instruction=Compile the nightly digest and email it.
@@ -362,7 +362,7 @@ convenience: the timer source fires every `D` and routes a fresh root per fire.
 2). UTC only.
 
 ```
-agentd \
+agent \
   --mode schedule \
   --interval 15m \
   --instruction "Check the status page; alert on any red." \
@@ -377,7 +377,7 @@ limit class.
 > **Internal cron.** A 5-field cron expression (`--mode schedule --cron
 > "<min hour dom mon dow>"`, UTC, RFC 0008 §3.6) ships behind the `cron` build
 > feature. The `--cron` flag is on the CLI surface today
-> ([`config.rs`](../crates/agentd/src/config.rs)); build with `--features cron`
+> ([`config.rs`](../crates/agent/src/config.rs)); build with `--features cron`
 > to enable it. For production, prefer an external CronJob → `once`, or
 > `--interval`.
 
@@ -386,40 +386,40 @@ limit class.
 ## CLI / env surface for modes & triggers
 
 These are the flags that actually exist today
-([`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs)). Precedence is
+([`crates/agent/src/config.rs`](../crates/agent/src/config.rs)). Precedence is
 built-in default < (config file, later) < env var < flag, validated **before any
 side effect** (a bad config exits `2` in milliseconds, RFC 0011).
 
 | Knob | Flag | Env | Default | Notes |
 |---|---|---|---|---|
-| Mode | `--mode once\|loop\|reactive\|schedule` | `AGENTD_MODE` | `once` | the driver |
+| Mode | `--mode once\|loop\|reactive\|schedule` | `AGENT_MODE` | `once` | the driver |
 | Subscribe | `--subscribe <uri>` (repeatable) | — | none | required for `reactive` |
 | Continue | `--continue <uri>` (repeatable) | — | none | subscribe an MCP resource, routed to one warm `continue` session |
 | Interval | `--interval <dur>` | — | unset | `loop`/`schedule`; required for `schedule` |
 | Instruction | `--instruction <TEXT>` / `--instruction-file <PATH>` | `INSTRUCTION` | — | required |
-| Intelligence | `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | — | `unix:` / `https://` / `vsock:` |
-| Model | `--model <NAME>` | `AGENTD_MODEL` | — | model id |
+| Intelligence | `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `unix:` / `https://` / `vsock:` |
+| Model | `--model <NAME>` | `AGENT_MODEL` | — | model id |
 | MCP server | `--mcp name=command` (repeatable) | — | none | stdio transport |
-| Max steps | `--max-steps <N>` | `AGENTD_MAX_STEPS` | 50 | per-run step cap |
-| Max tokens | `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | 200000 | token budget |
-| Deadline | `--deadline <dur>` | `AGENTD_DEADLINE` | 600s | wall-clock deadline |
+| Max steps | `--max-steps <N>` | `AGENT_MAX_STEPS` | 50 | per-run step cap |
+| Max tokens | `--max-tokens <N>` | `AGENT_MAX_TOKENS` | 200000 | token budget |
+| Deadline | `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
 | Max depth | `--max-depth <N>` | — | 4 | subagent tree depth cap |
-| Run id | `--run-id <ID>` | `AGENTD_RUN_ID` | generated | idempotency key |
-| Drain | `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | 25s | graceful drain budget |
-| Serve MCP | `--serve-mcp <unix:/path>` | `AGENTD_SERVE_MCP` | off | stdio/unix only in v1 |
+| Run id | `--run-id <ID>` | `AGENT_RUN_ID` | generated | idempotency key |
+| Drain | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | 25s | graceful drain budget |
+| Serve MCP | `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | off | stdio/unix only in v1 |
 | Health file | `--health-file <PATH>` | — | off | liveness heartbeat |
-| Log level | `--log-level <L>` | `AGENTD_LOG_LEVEL` | info | trace…error |
+| Log level | `--log-level <L>` | `AGENT_LOG_LEVEL` | info | trace…error |
 
 **Validation rules that touch modes (config.rs):**
 
 - `--mode reactive` requires at least one `--subscribe <uri>`, else exit 2.
 - `--mode schedule` requires `--interval <dur>`, else exit 2.
-- An invalid `--mode`/`AGENTD_MODE` value is a usage error → exit 2.
+- An invalid `--mode`/`AGENT_MODE` value is a usage error → exit 2.
 
 Durations accept `ms`/`s`/`m`/`h` suffixes or a bare integer (seconds):
 `250ms`, `30s`, `5m`, `2h`, `600`.
 
-See `agentd --help` for the full flag list.
+See `agent --help` for the full flag list.
 
 ---
 
@@ -431,7 +431,7 @@ See `agentd --help` for the full flag list.
 - **Poll something / work-until-done with a bound** → `loop` (`--interval D` to
   poll, `--interval 0` to drain-then-done).
 - **React to resource changes / be event-driven / let the agent schedule its own
-  wakes** → `reactive` with `--subscribe`. This is agentd's signature mode and
+  wakes** → `reactive` with `--subscribe`. This is agent's signature mode and
   the part of the ecosystem nothing else builds.
 
 ---
@@ -445,7 +445,7 @@ See `agentd --help` for the full flag list.
 - RFC 0011 — cloud-native contract (exit codes, config precedence, drain)
 - Binding decisions — `docs/design/00-architecture-assessment.md`
 - Build progress — `docs/design/PLAN.md`
-- The live CLI/env surface — `crates/agentd/src/config.rs`
+- The live CLI/env surface — `crates/agent/src/config.rs`
 - [Horizontal scaling](scaling.md) — running the reactive worker as a *fleet*:
   `--shard K/N` partitioning + work-claim leases extend the exactly-one-owner rule
   from intra- to **inter**-instance (RFC 0019).

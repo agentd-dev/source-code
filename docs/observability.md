@@ -1,6 +1,6 @@
 # Observability
 
-agentd is a *process tree*, not a thread pool, and it is reactive — it spends
+agent is a *process tree*, not a thread pool, and it is reactive — it spends
 most of its life asleep. That shapes everything below. The contract has three
 jobs:
 
@@ -42,7 +42,7 @@ so telemetry still goes to **stderr** — never mixed into the channel.
 
 ```sh
 # result on stdout, telemetry on stderr — cleanly separable
-agentd --instruction "summarise /data/report.md" \
+agent --instruction "summarise /data/report.md" \
        --intelligence unix:/run/intel.sock \
        --mcp fs="mcp-server-fs --root /data" \
   > result.json 2> telemetry.ndjson
@@ -81,7 +81,7 @@ Example — one supervisor line and one agent line:
 ```
 
 Set verbosity with `--log-level trace|debug|info|warn|error` (default `info`;
-env `AGENTD_LOG_LEVEL`). The level filter is a cheap integer compare *before* any
+env `AGENT_LOG_LEVEL`). The level filter is a cheap integer compare *before* any
 allocation — below-level calls cost essentially nothing.
 
 ---
@@ -176,7 +176,7 @@ plane framing for each lives in [`docs/operations.md`](operations.md).
 > The intelligence-swap line carries the model *names* (non-secret identifiers),
 > the swap kind, and whether the endpoint list changed — **never** the endpoint
 > URL or credential. Endpoint identity is transport+index only, surfaced by the
-> `agentd://intelligence` resource (§The served control resources), never inline.
+> `agent://intelligence` resource (§The served control resources), never inline.
 
 ---
 
@@ -227,7 +227,7 @@ discovery, no join-key negotiation.
 ### Getting telemetry off-box — two wirings
 
 - **(A) default — each process writes its own stderr.** The container
-  runtime/collector captures it; agentd does no aggregation and never becomes a
+  runtime/collector captures it; agent does no aggregation and never becomes a
   logging bottleneck. Cleanest for Kubernetes. Reassemble by `run_id` +
   `agent_path` prefix.
 - **(B) `--aggregate-logs` (roadmap)** — child telemetry is framed up the
@@ -249,7 +249,7 @@ The default logs **hashes and lengths only** — never raw content:
 - `*_hash` is the first 8 hex chars of a fast non-cryptographic digest — a
   stable correlation aid, **not** a security primitive.
 
-`--log-content` (env `AGENTD_LOG_CONTENT`) opts in to capturing
+`--log-content` (env `AGENT_LOG_CONTENT`) opts in to capturing
 prompt / tool-arg / result bodies. It is loud, gated, and redaction-aware. It is
 a debug/non-prod switch.
 
@@ -272,8 +272,8 @@ backend.
 
 **Ingest (mint-or-adopt):**
 
-- If an inbound `traceparent` arrives — on an inbound MCP request to agentd's
-  self-MCP server, or via the **`AGENTD_TRACEPARENT`** env var when an
+- If an inbound `traceparent` arrives — on an inbound MCP request to agent's
+  self-MCP server, or via the **`AGENT_TRACEPARENT`** env var when an
   orchestrator starts the pod — adopt its `trace_id` and use its `span_id` as the
   root `parent_span_id`.
 - Otherwise **mint one `trace_id` per `run_id`** (16 random bytes) so the run is
@@ -336,7 +336,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
    | 143 | killed by SIGTERM (128+15, OS-set) — ungraceful | — |
 
    A clean SIGTERM drain returns **0, not 143**. 137/143 are set by the OS when
-   the kernel kills us; agentd never exits those itself.
+   the kernel kills us; agent never exits those itself.
 
 2. **`--health-file PATH` (default daemon surface).** The supervisor writes the
    file every heartbeat — **no socket, no port** — via an atomic
@@ -353,7 +353,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
    ```yaml
    livenessProbe:
      exec:
-       command: ["sh","-c","test $(( $(date +%s) - $(date -d \"$(jq -r .ts /run/agentd/health)\" +%s) )) -lt 15"]
+       command: ["sh","-c","test $(( $(date +%s) - $(date -d \"$(jq -r .ts /run/agent/health)\" +%s) )) -lt 15"]
      periodSeconds: 5
    ```
 
@@ -371,9 +371,9 @@ the pod is not "ready", so an orchestrator won't route work to it.
 run — a pure CLI invocation carries zero health machinery. HTTP and socket
 surfaces are opt-in and never on for a one-shot.
 
-> `--health-file`, `--log-level` (plus `AGENTD_LOG_LEVEL`), `--log-content`,
+> `--health-file`, `--log-level` (plus `AGENT_LOG_LEVEL`), `--log-content`,
 > `--serve-mcp`, and `--metrics-addr` (behind `metrics`) are all live; see
-> [`config.rs`](../crates/agentd/src/config.rs) for the authoritative flag/env
+> [`config.rs`](../crates/agent/src/config.rs) for the authoritative flag/env
 > list. `--aggregate-logs` and `--health-http` remain roadmap items tracked in
 > [`docs/design/PLAN.md`](design/PLAN.md).
 
@@ -382,7 +382,7 @@ surfaces are opt-in and never on for a one-shot.
 ## The served control resources
 
 When the management transport is on (`--serve-mcp`, [`operations.md`](operations.md)),
-a control plane reads live state as `agentd://` MCP resources rather than scraping
+a control plane reads live state as `agent://` MCP resources rather than scraping
 metrics — each is a structured JSON read, most are **subscribable** (notify-then-
 read: a payload-free `notifications/resources/updated`, then a `resources/read`).
 Most are **Management-only** (a Stdio peer 404s on them). These complement the
@@ -391,23 +391,23 @@ operator reads and event-driven control.
 
 | Resource | Origin | Subscribable | Body |
 |---|---|---|---|
-| `agentd://status` | any | no | run id, mode, version, pid, uptime, spawn counts |
-| `agentd://capabilities` | any | no | the live capabilities manifest (identity, `surfaces{}`, limits) |
-| `agentd://run/{id}` | any | yes (each spawn / terminal change) | the served run aggregate; folds in the run-outcome report once terminal |
-| `agentd://subagent/{handle}` | any | yes (terminal only) | an async child's status / distilled result |
-| `agentd://session/{handle}` | any | yes (each warm-turn boundary) | a warm session's turn state |
-| `agentd://inventory` | Management | yes (spawn / exit / status change) | the live subagent-tree projection: lifecycle flags (`draining`/`paused`/`ready`), totals, per-node status/usage |
-| `agentd://intelligence` | Management | yes (breaker / active / all-down transitions) | endpoint health: the ordered endpoint list (transport + index, **never** the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, the all-down flag, swap policy, discovery |
-| `agentd://config/effective` | Management | yes (each applied hot reload) | the live, **redacted** reloadable-config view (no token/URL/secret) |
-| `agentd://capacity` | Management *(cluster build)* | no | the placement view: identity, shard `K/N`, standby, free slots, active subagents, intelligence warmth, saturation |
-| `agentd://events` | Management *(`events` feature)* | yes (each new event) | the bounded live-event ring — see below |
+| `agent://status` | any | no | run id, mode, version, pid, uptime, spawn counts |
+| `agent://capabilities` | any | no | the live capabilities manifest (identity, `surfaces{}`, limits) |
+| `agent://run/{id}` | any | yes (each spawn / terminal change) | the served run aggregate; folds in the run-outcome report once terminal |
+| `agent://subagent/{handle}` | any | yes (terminal only) | an async child's status / distilled result |
+| `agent://session/{handle}` | any | yes (each warm-turn boundary) | a warm session's turn state |
+| `agent://inventory` | Management | yes (spawn / exit / status change) | the live subagent-tree projection: lifecycle flags (`draining`/`paused`/`ready`), totals, per-node status/usage |
+| `agent://intelligence` | Management | yes (breaker / active / all-down transitions) | endpoint health: the ordered endpoint list (transport + index, **never** the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, the all-down flag, swap policy, discovery |
+| `agent://config/effective` | Management | yes (each applied hot reload) | the live, **redacted** reloadable-config view (no token/URL/secret) |
+| `agent://capacity` | Management *(cluster build)* | no | the placement view: identity, shard `K/N`, standby, free slots, active subagents, intelligence warmth, saturation |
+| `agent://events` | Management *(`events` feature)* | yes (each new event) | the bounded live-event ring — see below |
 
 > The redaction discipline is the same as the capabilities manifest and the
-> intel-swap log line: `agentd://intelligence` and `agentd://config/effective`
+> intel-swap log line: `agent://intelligence` and `agent://config/effective`
 > carry transport schemes, structural names, and header *names* only — never a
 > token, an endpoint URL, or a resolved `{{secret:…}}` value.
 
-### `agentd://events` — the live log ring
+### `agent://events` — the live log ring
 
 With the `events` feature (and a management transport to serve it on), the same
 JSON log lines are mirrored into a bounded in-memory ring you can tail over MCP —
@@ -417,7 +417,7 @@ reports the window bounds and a **`dropped`** count so a subscriber knows when t
 lossy-by-design ring outran it:
 
 ```jsonc
-// resources/read agentd://events?after=4821&level=warn&event=subagent.,limit.
+// resources/read agent://events?after=4821&level=warn&event=subagent.,limit.
 { "events_schema":"1.0", "oldest_seq":4700, "newest_seq":4990, "dropped":0,
   "events":[ /* the RFC 0010 JSON log lines, filtered */ ] }
 ```
@@ -452,33 +452,33 @@ jq '[ select(.event=="intel.result") | .tokens_out ] | add' telemetry.ndjson
 The metrics that matter (derivable from logs by default; emitted directly under
 the features below):
 
-- **Gauges:** `agentd_active_subagents`, `agentd_tree_depth`,
-  `agentd_tree_breadth`, `agentd_subscriptions_active`, `agentd_ready` (0/1),
-  `agentd_up`.
-- **Counters:** `agentd_loop_steps_total`, `agentd_intel_calls_total`,
-  `agentd_tokens_total{type=in|out}`, `agentd_reactions_total`,
-  `agentd_subagents_spawned_total`, `agentd_subagents_exited_total{status}`,
-  `agentd_subagent_restarts_total{reason}`,
-  `agentd_subagent_stuck_kills_total{signal}` (the reliability headline),
-  `agentd_limit_exceeded_total{limit}`,
-  `agentd_mcp_connect_failures_total{server}`.
+- **Gauges:** `agent_active_subagents`, `agent_tree_depth`,
+  `agent_tree_breadth`, `agent_subscriptions_active`, `agent_ready` (0/1),
+  `agent_up`.
+- **Counters:** `agent_loop_steps_total`, `agent_intel_calls_total`,
+  `agent_tokens_total{type=in|out}`, `agent_reactions_total`,
+  `agent_subagents_spawned_total`, `agent_subagents_exited_total{status}`,
+  `agent_subagent_restarts_total{reason}`,
+  `agent_subagent_stuck_kills_total{signal}` (the reliability headline),
+  `agent_limit_exceeded_total{limit}`,
+  `agent_mcp_connect_failures_total{server}`.
 
 > **What the `metrics` build actually renders.** The list above is what an
 > agentctl dashboard counts; under `--features metrics` the **emitted** series are
-> exactly those in [`obs/metrics.rs::render`](../crates/agentd/src/obs/metrics.rs)
+> exactly those in [`obs/metrics.rs::render`](../crates/agent/src/obs/metrics.rs)
 > and the frozen RFC 0016 §4.3 set below. Three §4.3 names are **reserved**, not
 > emitted in this build (rendered as a `# HELP`/`# TYPE` marker with no sample, the
-> same honest-absence shape as `agentd_mcp_up`):
-> `agentd_tool_calls_total{server,tool,ok}` (the tool-call boundary runs in the
+> same honest-absence shape as `agent_mcp_up`):
+> `agent_tool_calls_total{server,tool,ok}` (the tool-call boundary runs in the
 > child loop, so a supervisor scrape can't reflect it — derive from `tool.result`
-> log lines), and the three latency **histograms** `agentd_run_duration_ms`,
-> `agentd_intel_call_duration_ms`, `agentd_tool_call_duration_ms` (no histogram
+> log lines), and the three latency **histograms** `agent_run_duration_ms`,
+> `agent_intel_call_duration_ms`, `agent_tool_call_duration_ms` (no histogram
 > exposition machinery in this build — use the `dur_ms` log field). The frozen
-> `model` label on `agentd_tokens_total` / `agentd_intel_calls_total` is likewise
+> `model` label on `agent_tokens_total` / `agent_intel_calls_total` is likewise
 > **deferred**: the call sites carry no model identifier, so the label is reserved
 > and intentionally absent (never faked) — per-model splits come from
-> `intel.result.usage` log lines. `agentd_loop_steps_total`, `agentd_refusals_total`,
-> and the steps/tokens/deadline/depth legs of `agentd_limit_exceeded_total` are
+> `intel.result.usage` log lines. `agent_loop_steps_total`, `agent_refusals_total`,
+> and the steps/tokens/deadline/depth legs of `agent_limit_exceeded_total` are
 > **process-local** — emitted in the re-exec'd child loop, so the supervisor scrape
 > reflects only its own process (cross-process rollup is a v1 non-goal); the
 > `tree_tokens` leg is the supervisor's own bound and is live.
@@ -509,44 +509,44 @@ array). The same cardinality discipline as the default story applies: **never**
 
 The management/hot-reload surfaces add these to the frozen set:
 
-- **`agentd_paused`** *(gauge, 0/1)* — `1` while the `pause` operator tool has
+- **`agent_paused`** *(gauge, 0/1)* — `1` while the `pause` operator tool has
   frozen the agentic tree at turn boundaries; `0` after `resume`. **Pause is not
-  readiness** — `agentd_ready` ignores it (it tracks only drain / lame-duck), so
-  a paused instance can still read `agentd_ready 1`.
-- **`agentd_config_reload_total{result}`** *(counter)* — hot reloads by result.
+  readiness** — `agent_ready` ignores it (it tracks only drain / lame-duck), so
+  a paused instance can still read `agent_ready 1`.
+- **`agent_config_reload_total{result}`** *(counter)* — hot reloads by result.
   The closed domain is `applied` | `rejected` | `other`. A `rejected` reload is a
   clean no-op (the running config is unchanged).
-- **`agentd_config_generation`** *(gauge)* — the count of successfully-applied
+- **`agent_config_generation`** *(gauge)* — the count of successfully-applied
   reloads, monotonic in practice. A scraper detects "this instance has picked up
   generation N" against the controller's desired generation.
-- **`agentd_drains_total{phase}`** *(counter)* — drain phase transitions; the
+- **`agent_drains_total{phase}`** *(counter)* — drain phase transitions; the
   closed domain is `started` | `completed` | `forced` | `other` (so `completed`
   vs `forced` distinguishes a clean drain from one that overran its budget).
-- **`agentd_runs_total{status}`** *(counter)* — runs by the RFC 0007 §3.4
+- **`agent_runs_total{status}`** *(counter)* — runs by the RFC 0007 §3.4
   terminal-status vocabulary (`completed`, `refused`, `exhausted_steps`,
   `exhausted_tokens`, `deadline`, `stalled`, `loop_detected`, `cancelled`,
   `crashed`, `other`).
-- **`agentd_refusals_total{reason}`** *(counter; **process-local**)* — guard trips
+- **`agent_refusals_total{reason}`** *(counter; **process-local**)* — guard trips
   by reason (`trifecta` | `rate` | `budget` | `depth` | `mcp` | `other`). Refusals
   trip in the re-exec'd child loop, so this reflects only the scraped process — the
   headline safety signal is the refusal / `scope.trifecta_refused` log line.
-- **`agentd_intel_up`** *(gauge, 0/1)* and **`agentd_intel_errors_total{reason}`**
+- **`agent_intel_up`** *(gauge, 0/1)* and **`agent_intel_errors_total{reason}`**
   *(counter; `unreachable`|`auth`|`timeout`|`5xx`|`other`)* — intelligence-endpoint
   reachability + error breakdown.
-- **`agentd_intel_all_down`** *(gauge, 0/1)* — `1` while **every** model endpoint
+- **`agent_intel_all_down`** *(gauge, 0/1)* — `1` while **every** model endpoint
   is down (the latched last-child-experience truth that also flips `/readyz`
-  NotReady, RFC 0018 §6); distinct from `agentd_intel_up` (the active endpoint's
+  NotReady, RFC 0018 §6); distinct from `agent_intel_up` (the active endpoint's
   reachability).
-- **`agentd_restarts_total`**, **`agentd_reactor_stalls_total`** *(counters;
+- **`agent_restarts_total`**, **`agent_reactor_stalls_total`** *(counters;
   **reserved** in `metrics_schema 1.0`)* — supervisor process restarts observed
   (rebuild+reconcile), and wedged-reactor liveness trips. Both are rendered but
   **not emitted** in this build: there is no in-process rebuild+reconcile path for
   the former (a pod restart is a fresh zeroed process the orchestrator counts), and
   a wedged reactor surfaces as a `/healthz` 503 (a per-scrape heartbeat-age read),
   not a one-shot in-process event, for the latter.
-- **`agentd_tree_breadth`** *(gauge)* — current max siblings at any tree node
-  (alongside the existing `agentd_active_subagents` / `agentd_tree_depth`).
-- **`agentd_memory_max_bytes`** / **`agentd_memory_current_bytes`** *(gauges)* —
+- **`agent_tree_breadth`** *(gauge)* — current max siblings at any tree node
+  (alongside the existing `agent_active_subagents` / `agent_tree_depth`).
+- **`agent_memory_max_bytes`** / **`agent_memory_current_bytes`** *(gauges)* —
   cgroup-v2 `memory.max` / `memory.current`, emitted only for the fields the
   kernel exposes (absent off-cgroup, keeping `/metrics` clean).
 
@@ -554,11 +554,11 @@ The management/hot-reload surfaces add these to the frozen set:
 
 Point-in-time gauges a horizontal scaler reads:
 
-- **`agentd_pending_events`** — reactive events received but not yet routed.
-- **`agentd_inflight_reactions`** — reactions currently executing.
-- **`agentd_subscriptions_active`** — reconciled declared subscriptions.
-- **`agentd_reaction_lag_ms`** — age of the oldest un-routed pending event.
-- **`agentd_saturation`** *(float gauge in `[0,1]`)* — in-flight / capacity
+- **`agent_pending_events`** — reactive events received but not yet routed.
+- **`agent_inflight_reactions`** — reactions currently executing.
+- **`agent_subscriptions_active`** — reconciled declared subscriptions.
+- **`agent_reaction_lag_ms`** — age of the oldest un-routed pending event.
+- **`agent_saturation`** *(float gauge in `[0,1]`)* — in-flight / capacity
   utilization — the HPA "utilization" target. A zero capacity reads `0.0` and an
   over-cap in-flight clamps to `1.0` (never a div-by-zero, never `> 1`).
 
@@ -566,17 +566,17 @@ Point-in-time gauges a horizontal scaler reads:
 
 Wired by the `cluster` build's shard gate and claim gate:
 
-- **`agentd_shard_skipped_total`** *(counter)* — items dropped as out-of-shard by
+- **`agent_shard_skipped_total`** *(counter)* — items dropped as out-of-shard by
   the routing pre-filter.
-- **`agentd_claims_lost_total`** *(counter)* — work claims lost to another replica
+- **`agent_claims_lost_total`** *(counter)* — work claims lost to another replica
   — the over-provision signal (high & rising under low backlog ⇒ scale down).
-- **`agentd_claims_granted_total`** / **`agentd_claims_released_total`**
+- **`agent_claims_granted_total`** / **`agent_claims_released_total`**
   *(counters)* — claims this replica won, and held claims handed back on a non-
   terminal wind-down or drain.
 
-(The legacy bare series — `agentd_runs_started_total`, `agentd_tokens_input_total`,
-`agentd_reactions_total`, etc. — are retained alongside the frozen set, additive
-within the major. `agentd_mcp_up{server}` is **not** emitted in this build — only
+(The legacy bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
+`agent_reactions_total`, etc. — are retained alongside the frozen set, additive
+within the major. `agent_mcp_up{server}` is **not** emitted in this build — only
 the connect-failure counter is.)
 
 ### `otel` feature — OTLP export + GenAI semconv (`--features otel`)
@@ -587,20 +587,20 @@ trace ids (no `opentelemetry`/`tracing` crates, no protobuf). It POSTs one batch
 per finished run to `OTEL_EXPORTER_OTLP_ENDPOINT`, mapping the event taxonomy
 onto the OTel GenAI semantic conventions:
 
-| agentd event/span | `gen_ai.operation.name` | Key attributes |
+| agent event/span | `gen_ai.operation.name` | Key attributes |
 |---|---|---|
 | `subagent.spawn` → `loop.final` | `invoke_agent` | `gen_ai.agent.id`, `gen_ai.agent.name`, `gen_ai.conversation.id` |
 | `intel.call` / `intel.result` | `chat` | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons` |
 | `tool.call` / `tool.result` | `execute_tool` | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `mcp.method.name`, `server.address` |
 
-agentd instruments the **client side** of each tool call and *propagates*
+agent instruments the **client side** of each tool call and *propagates*
 context so the MCP server's spans nest underneath — one span tree, no duplicate
 spans. Export is OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`, pushed to a local
-collector / sidecar so agentd stays thin (no batching/retry sophistication).
+collector / sidecar so agent stays thin (no batching/retry sophistication).
 
 **Token-accounting honesty:** tokens come from the intelligence response
-`usage`. When absent, agentd logs `0` / `null` — never a guess — so
-`agentd_tokens_total` stays trustworthy.
+`usage`. When absent, agent logs `0` / `null` — never a guess — so
+`agent_tokens_total` stays trustworthy.
 
 ---
 
@@ -610,7 +610,7 @@ collector / sidecar so agentd stays thin (no batching/retry sophistication).
 - **No metrics client library, ever** — Prometheus text is hand-written; OTLP
   metrics ride `otel`.
 - **No span export in the default build** — propagation is on, export is gated.
-- **No MCP `logging` capability** — agentd does not implement or advertise it
+- **No MCP `logging` capability** — agent does not implement or advertise it
   (the spec deprecates it in favour of stderr + OpenTelemetry).
 - **No log file management / rotation / shipping in-binary** — stderr only; the
   container runtime / collector owns capture and rotation.

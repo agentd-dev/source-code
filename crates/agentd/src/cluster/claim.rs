@@ -12,7 +12,7 @@
 //! the `_meta` convention below are the frozen contract.
 //!
 //! **No secret / URL in `_meta` ever** (RFC 0015 §5.6 / RFC 0012 §3.7): the only
-//! keys emitted are `agentd/claim_key`, `agentd/instance`, `agentd/shard` (omitted
+//! keys emitted are `agent/claim_key`, `agent/instance`, `agent/shard` (omitted
 //! if unsharded), and `traceparent` (if present). The item URI is a `work.claim`
 //! *argument*, never a `_meta` value, and is never logged at info beyond the
 //! claim-event lines the reactor already emits for routing.
@@ -156,12 +156,12 @@ pub fn renew(client: &McpClient, lease_id: &str, ttl: Duration) -> Result<(), St
 }
 
 /// Ack a completed item (RFC 0019 §3.3 / §3.5): the durable side effect, keyed on
-/// `agentd/claim_key`, is committed; a redelivered-but-already-acked item is a
-/// server-side no-op. Carries `_meta.agentd/claim_key` so the server can collapse
+/// `agent/claim_key`, is committed; a redelivered-but-already-acked item is a
+/// server-side no-op. Carries `_meta.agent/claim_key` so the server can collapse
 /// the ack on the SAME item-derived key (RFC 0015 §5.6).
 pub fn ack(client: &McpClient, lease_id: &str, claim_key: &str) -> Result<(), String> {
     let args = json!({ "lease_id": lease_id });
-    let meta = json!({ "agentd/claim_key": claim_key });
+    let meta = json!({ "agent/claim_key": claim_key });
     call_lease_tool(client, TOOL_ACK, args, meta)
 }
 

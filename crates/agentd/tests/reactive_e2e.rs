@@ -14,7 +14,7 @@ use std::time::Duration;
 /// Run reactive agentd for `run_ms` against the mock MCP server (extra mock
 /// args appended via `mock_args`), then return the captured stderr telemetry.
 fn run_reactive_capture(mock_args: &str, run_ms: u64) -> String {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     // The mock MCP server is the agentd binary itself in its hidden mock mode.
     let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json{mock_args}");
 
@@ -81,7 +81,7 @@ fn trace_context_propagates_across_the_agent_tree() {
     // Run with an upstream traceparent; its trace id must appear on BOTH the
     // supervisor's and the spawned subagent's log lines — one auditable trace
     // for the whole run (RFC 0010 §context-propagation).
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json");
     let trace_id = "1234567890abcdef1234567890abcdef";
     let traceparent = format!("00-{trace_id}-1111111111111111-01");

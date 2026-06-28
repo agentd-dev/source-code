@@ -46,10 +46,9 @@ pub const OPERATOR_TOOLS: &[&str] = &["drain", "lame-duck", "pause", "resume", "
 pub fn manifest(cfg: &Config, identity: &Identity, live: bool) -> Value {
     json!({
         "contract_version": CONTRACT_VERSION,
-        "agentd_version": crate::VERSION,
-        // De-branding (ACC SPEC L4): emit the neutral `agent_version` ALONGSIDE the
-        // branded `agentd_version` (never dropped) — the manifest root anyOf-requires
-        // one of the two, so this lets a neutral-only consumer read it pre-GA.
+        // Neutral de-branded version key (ACC SPEC L4). The runtime is fully
+        // de-branded to neutral spellings; the legacy `agentd_version` is no longer
+        // emitted (the manifest root anyOf is satisfied by `agent_version` alone).
         "agent_version": crate::VERSION,
         "build_features": build_features(),
         "identity": identity_block(identity),
@@ -423,7 +422,6 @@ mod tests {
         let m = manifest(&cfg, &id, false);
         for key in [
             "contract_version",
-            "agentd_version",
             "agent_version",
             "build_features",
             "identity",
@@ -440,10 +438,14 @@ mod tests {
             assert!(m.get(key).is_some(), "manifest missing top-level key {key}");
         }
         assert_eq!(m["contract_version"], json!("1.0"));
-        assert_eq!(m["agentd_version"], json!(crate::VERSION));
-        // De-branding (ACC SPEC L4): the neutral `agent_version` is emitted next to
-        // the branded `agentd_version` (both present, same value; neither dropped).
+        // De-branded (ACC SPEC L4): only the neutral `agent_version` is emitted;
+        // the legacy `agentd_version` key is gone (the root anyOf is satisfied by
+        // `agent_version` alone).
         assert_eq!(m["agent_version"], json!(crate::VERSION));
+        assert!(
+            m.get("agentd_version").is_none(),
+            "legacy agentd_version dropped"
+        );
         // run_id is always present in identity.
         assert_eq!(m["identity"]["run_id"], json!(cfg.run_id));
     }

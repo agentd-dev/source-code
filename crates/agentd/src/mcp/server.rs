@@ -1289,7 +1289,7 @@ pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHan
     let listener = UnixListener::bind(path)?;
     log.info(
         "mcp.serving",
-        json!({"transport": "unix", "path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status", "agentd://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
+        json!({"transport": "unix", "path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
     );
     let handle = ServeHandle {
         sessions: Arc::clone(&ctx.sessions),
@@ -1343,7 +1343,7 @@ pub fn serve_vsock(
     let listener = vsock::VsockListener::bind_with_cid_port(cid, port)?;
     log.info(
         "mcp.serving",
-        json!({"transport": "vsock", "cid": cid, "port": port, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agentd://status", "agentd://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
+        json!({"transport": "vsock", "cid": cid, "port": port, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
     );
     let handle = ServeHandle {
         sessions: Arc::clone(&ctx.sessions),
@@ -1774,7 +1774,7 @@ fn spawn_events_notifier(subscriptions: SubRegistry) {
 fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
     let mut list = vec![
         json!({
-            "uri": "agentd://status",
+            "uri": "agent://status",
             "name": "status",
             "description": "This agentd's run id, mode, version, pid, uptime, and spawn counts.",
             "mimeType": "application/json"
@@ -1782,7 +1782,7 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
         json!({
             // Stable + listable (RFC 0015 §3.4): a self-description manifest, readable
             // on every origin. The run id is fixed at startup, so the uri never 404s.
-            "uri": "agentd://capabilities",
+            "uri": "agent://capabilities",
             "name": "capabilities",
             "description": "This agentd's self-description: identity, the declared capability surface (intelligence transport, MCP servers, exec, limits, isolation), and live daemon counters.",
             "mimeType": "application/json"
@@ -2078,7 +2078,7 @@ fn events_read(
             None => Response::err(
                 req.id,
                 json::RESOURCE_NOT_FOUND,
-                "agentd://events not served (no event ring installed)".to_string(),
+                "agent://events not served (no event ring installed)".to_string(),
             ),
         }
     }
@@ -3369,18 +3369,18 @@ mod tests {
             .filter_map(|x| x["uri"].as_str())
             .collect();
         assert!(
-            uris.contains(&"agentd://status"),
-            "agentd://status listed: {uris:?}"
+            uris.contains(&"agent://status"),
+            "agent://status listed: {uris:?}"
         );
         // the run aggregate is stable (daemon-lifetime uri) → safe to list.
         assert!(
-            uris.contains(&"agentd://run/r1"),
-            "agentd://run/r1 listed: {uris:?}"
+            uris.contains(&"agent://run/r1"),
+            "agent://run/r1 listed: {uris:?}"
         );
         // capabilities is a stable, listable self-description (RFC 0015 §3.4).
         assert!(
-            uris.contains(&"agentd://capabilities"),
-            "agentd://capabilities listed: {uris:?}"
+            uris.contains(&"agent://capabilities"),
+            "agent://capabilities listed: {uris:?}"
         );
     }
 
@@ -3389,7 +3389,7 @@ mod tests {
         let r = dispatch(
             req(
                 "resources/read",
-                Some(json!({"uri": "agentd://capabilities"})),
+                Some(json!({"uri": "agent://capabilities"})),
             ),
             &ctx(),
             PeerOrigin::Management,
@@ -3399,7 +3399,7 @@ mod tests {
         );
         let v = r.result.expect("ok");
         let entry = &v["contents"][0];
-        assert_eq!(entry["uri"], "agentd://capabilities");
+        assert_eq!(entry["uri"], "agent://capabilities");
         assert_eq!(entry["mimeType"], "application/json");
         let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
         // The served manifest is the canonical RFC 0015 §5.2 schema (the same
@@ -3416,7 +3416,7 @@ mod tests {
         let r = dispatch(
             req(
                 "resources/read",
-                Some(json!({"uri": "agentd://capabilities"})),
+                Some(json!({"uri": "agent://capabilities"})),
             ),
             &ctx(),
             PeerOrigin::Stdio,
@@ -3430,7 +3430,7 @@ mod tests {
     #[test]
     fn resources_read_status_returns_a_contents_body() {
         let r = dispatch(
-            req("resources/read", Some(json!({"uri": "agentd://status"}))),
+            req("resources/read", Some(json!({"uri": "agent://status"}))),
             &ctx(),
             PeerOrigin::Management,
             &writer(),
@@ -3439,7 +3439,7 @@ mod tests {
         );
         let v = r.result.expect("ok");
         let entry = &v["contents"][0];
-        assert_eq!(entry["uri"], "agentd://status");
+        assert_eq!(entry["uri"], "agent://status");
         assert_eq!(entry["mimeType"], "application/json");
         // the text is the JSON status body
         let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
@@ -4629,7 +4629,7 @@ mod tests {
             .iter()
             .filter_map(|x| x["uri"].as_str().map(str::to_string))
             .collect();
-        assert!(mgmt_uris.contains(&"agentd://inventory".to_string()));
+        assert!(mgmt_uris.contains(&"agent://inventory".to_string()));
 
         let stdio = dispatch(
             req("resources/list", None),
@@ -4646,11 +4646,11 @@ mod tests {
             .filter_map(|x| x["uri"].as_str().map(str::to_string))
             .collect();
         assert!(
-            !stdio_uris.contains(&"agentd://inventory".to_string()),
+            !stdio_uris.contains(&"agent://inventory".to_string()),
             "inventory not listed to stdio: {stdio_uris:?}"
         );
         // capabilities stays visible on stdio (it's harmless self-description).
-        assert!(stdio_uris.contains(&"agentd://capabilities".to_string()));
+        assert!(stdio_uris.contains(&"agent://capabilities".to_string()));
     }
 
     #[test]
@@ -4893,7 +4893,7 @@ mod tests {
             .iter()
             .filter_map(|x| x["uri"].as_str().map(str::to_string))
             .collect();
-        assert!(uris.contains(&"agentd://intelligence".to_string()));
+        assert!(uris.contains(&"agent://intelligence".to_string()));
 
         let stdio = dispatch(
             req("resources/list", None),
@@ -4909,7 +4909,7 @@ mod tests {
             .iter()
             .filter_map(|x| x["uri"].as_str().map(str::to_string))
             .collect();
-        assert!(!stdio_uris.contains(&"agentd://intelligence".to_string()));
+        assert!(!stdio_uris.contains(&"agent://intelligence".to_string()));
 
         // subscribable for management, refused for stdio
         assert!(
@@ -5048,7 +5048,7 @@ mod tests {
             .iter()
             .filter_map(|x| x["uri"].as_str().map(str::to_string))
             .collect();
-        assert!(uris.contains(&"agentd://config/effective".to_string()));
+        assert!(uris.contains(&"agent://config/effective".to_string()));
 
         let stdio = dispatch(
             req("resources/list", None),
@@ -5064,7 +5064,7 @@ mod tests {
             .iter()
             .filter_map(|x| x["uri"].as_str().map(str::to_string))
             .collect();
-        assert!(!stdio_uris.contains(&"agentd://config/effective".to_string()));
+        assert!(!stdio_uris.contains(&"agent://config/effective".to_string()));
 
         // subscribable for management, refused for stdio
         assert!(

@@ -13,22 +13,23 @@
 //!     self-MCP — the run/session resources are also subscribable and fire
 //!     `notifications/resources/updated` repeatedly (RFC 0005 §3.3/§3.4).
 
-/// The scheme prefix agentd EMITS (the branded alias, kept until the GA cutover).
-pub const SCHEME: &str = "agentd://";
+/// The neutral (canonical) scheme prefix the agent EMITS (`agent://`). The whole
+/// runtime is de-branded to the neutral spelling; the legacy `agentd://` form is
+/// still ACCEPTED on input ([`LEGACY_SCHEME`]) but never emitted.
+pub const SCHEME: &str = "agent://";
 
-/// The neutral (canonical, de-branded) scheme prefix ACCEPTED as an input alias
-/// (ACC SPEC L4 / management-profile.json `x-debranding`). agentd still emits the
-/// branded `agentd://`, but a consumer addressing `agent://…` is honoured too —
-/// the branded spelling is never dropped, neutral is merely also accepted.
-pub const NEUTRAL_SCHEME: &str = "agent://";
+/// The legacy branded scheme prefix (`agentd://`) ACCEPTED as an input alias but
+/// no longer emitted (ACC SPEC L4 — neutral is canonical). A consumer addressing
+/// the old `agentd://…` spelling is still honoured on reads.
+pub const LEGACY_SCHEME: &str = "agentd://";
 
-/// Whether `uri` is one of agentd's own resources — so it routes to agentd's own
-/// resource backends rather than an MCP server. Accepts EITHER the branded
-/// `agentd://` or the neutral `agent://` prefix (ACC SPEC L4; the two prefixes are
-/// mutually exclusive — `agentd://x` does not start with `agent://`).
+/// Whether `uri` is one of the agent's own resources — so it routes to the agent's
+/// own resource backends rather than an MCP server. Accepts EITHER the neutral
+/// `agent://` (emitted) or the legacy `agentd://` prefix (ACC SPEC L4; the two
+/// prefixes are mutually exclusive — `agentd://x` does not start with `agent://`).
 pub fn is_agentd(uri: &str) -> bool {
     let uri = uri.trim();
-    uri.starts_with(SCHEME) || uri.starts_with(NEUTRAL_SCHEME)
+    uri.starts_with(SCHEME) || uri.starts_with(LEGACY_SCHEME)
 }
 
 /// A parsed `agentd://` resource address.
@@ -131,7 +132,7 @@ impl AgentdResource {
         let trimmed = uri.trim();
         let rest = trimmed
             .strip_prefix(SCHEME)
-            .or_else(|| trimmed.strip_prefix(NEUTRAL_SCHEME))?;
+            .or_else(|| trimmed.strip_prefix(LEGACY_SCHEME))?;
         // Split the optional `?query` off the path (only `agentd://events` uses
         // one today — the cursor/filters, RFC 0016 §7). Path-only resources see
         // identical behaviour: their `rest` has no `?`, so `path == rest`.
@@ -205,25 +206,25 @@ pub fn session_uri(handle: &str) -> String {
 }
 
 /// The `agentd://inventory` URI — the live subagent-tree projection (RFC 0015 §5.3).
-pub const INVENTORY_URI: &str = "agentd://inventory";
+pub const INVENTORY_URI: &str = "agent://inventory";
 
 /// The `agentd://intelligence` URI — the live intelligence-endpoint health view
 /// (RFC 0018 §4.4). Management-only; subscribable.
-pub const INTELLIGENCE_URI: &str = "agentd://intelligence";
+pub const INTELLIGENCE_URI: &str = "agent://intelligence";
 
 /// The `agentd://capacity` URI — the live capacity/placement view (RFC 0019
 /// §7.2/§9). Management-only; present only in `cluster` builds.
-pub const CAPACITY_URI: &str = "agentd://capacity";
+pub const CAPACITY_URI: &str = "agent://capacity";
 
 /// The `agentd://config/effective` URI — the live, redacted reloadable-config
 /// view (RFC 0017 §4.2 / §5.6). Management-only; subscribable; fires
 /// `resources/updated` on each applied hot reload. Served only with `serve-mcp`.
-pub const CONFIG_EFFECTIVE_URI: &str = "agentd://config/effective";
+pub const CONFIG_EFFECTIVE_URI: &str = "agent://config/effective";
 
 /// The `agentd://events` URI — the bounded live-event ring (RFC 0016 §7). The
 /// bare base URI (subscribe/list/notify use it); a read appends `?after=<seq>`
 /// and the optional `?level=`/`?event=` filters.
-pub const EVENTS_URI: &str = "agentd://events";
+pub const EVENTS_URI: &str = "agent://events";
 
 #[cfg(test)]
 mod tests {
@@ -251,7 +252,7 @@ mod tests {
             AgentdResource::parse("agentd://subagent/0.1"),
             Some(AgentdResource::Subagent("0.1".into()))
         );
-        assert_eq!(subagent_uri("0.2"), "agentd://subagent/0.2");
+        assert_eq!(subagent_uri("0.2"), "agent://subagent/0.2");
     }
 
     #[test]
@@ -270,8 +271,8 @@ mod tests {
             Some(AgentdResource::Session("served.3".into()))
         );
         // builders round-trip back through parse
-        assert_eq!(run_uri("r-7"), "agentd://run/r-7");
-        assert_eq!(session_uri("served.3"), "agentd://session/served.3");
+        assert_eq!(run_uri("r-7"), "agent://run/r-7");
+        assert_eq!(session_uri("served.3"), "agent://session/served.3");
         assert_eq!(
             AgentdResource::parse(&run_uri("r-7")),
             Some(AgentdResource::Run("r-7".into()))

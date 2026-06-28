@@ -58,7 +58,7 @@ pub fn record_run_started() {
 
 /// A supervised run reached a terminal disposition.
 ///
-/// Also increments the frozen `agentd_runs_total{status}` (RFC 0016 §4.3) under a
+/// Also increments the frozen `agent_runs_total{status}` (RFC 0016 §4.3) under a
 /// **coarse** status projection of the three `RunOutcome` variants this call site
 /// carries (`completed` / `crashed` / `cancelled`). The precise RFC 0007 §3.4
 /// terminal-status string is available at the loop boundary but not at this
@@ -77,7 +77,7 @@ pub fn record_run(outcome: RunOutcome) {
 /// `status` MUST be an RFC 0007 §3.4 closed-vocabulary string
 /// ([`crate::agentloop::stop::TerminalStatus::as_str`]); an out-of-vocabulary
 /// value is bucketed under `other` so the label domain stays closed (§4.2). This
-/// is the precise driver for `agentd_runs_total{status}`; it is *not* wired from a
+/// is the precise driver for `agent_runs_total{status}`; it is *not* wired from a
 /// supervisor hook in this chunk (the supervisor only has the coarse `RunOutcome`)
 /// — the integrator/loop chunk calls it where the `TerminalStatus` is known.
 pub fn record_run_status(status: &str) {
@@ -95,8 +95,8 @@ pub fn record_reaction() {
 
 /// Tokens reported up by a direct child (`AgentMsg::Usage`).
 ///
-/// Feeds both the legacy bare `agentd_tokens_{input,output}_total` and the frozen
-/// `agentd_tokens_total{type}` (RFC 0016 §4.3). The §4.3 schema also carries a
+/// Feeds both the legacy bare `agent_tokens_{input,output}_total` and the frozen
+/// `agent_tokens_total{type}` (RFC 0016 §4.3). The §4.3 schema also carries a
 /// `model` label; the `AgentMsg::Usage` control-channel message this call site
 /// rides does not carry the model, so the `model` label is absent here — wiring
 /// the `model` label needs a new call site at the intelligence boundary (see the
@@ -117,7 +117,7 @@ pub fn record_restart_tripped() {
 }
 
 /// One loop step executed (`loop.step`, RFC 0010 §3.3). Drives
-/// `agentd_loop_steps_total` (RFC 0016 §4.3).
+/// `agent_loop_steps_total` (RFC 0016 §4.3).
 ///
 /// **Process-local / unwired:** `loop.step` is emitted inside the re-exec'd child
 /// agentic loop, a different process from the supervisor that `/metrics` scrapes,
@@ -130,7 +130,7 @@ pub fn record_loop_step() {
     imp::REGISTRY.loop_steps.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A refusal / guard trip by reason (RFC 0016 §4.3 `agentd_refusals_total`).
+/// A refusal / guard trip by reason (RFC 0016 §4.3 `agent_refusals_total`).
 ///
 /// `reason` is the §4.3 closed domain (`trifecta`/`rate`/`budget`/`depth`/`mcp`);
 /// an unknown value buckets under `other`.
@@ -174,7 +174,7 @@ pub fn record_subagent_spawned() {
 }
 
 /// A subagent exited with a terminal `status` (`subagent.exit`, RFC 0007 §3.4).
-/// Drives `agentd_subagents_exited_total{status}` (RFC 0016 §4.3).
+/// Drives `agent_subagents_exited_total{status}` (RFC 0016 §4.3).
 pub fn record_subagent_exited(status: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_subagent_exited(status);
@@ -183,7 +183,7 @@ pub fn record_subagent_exited(status: &str) {
 }
 
 /// A subagent was restarted by the governor (`subagent.restart`, RFC 0003 §3.7).
-/// Drives `agentd_subagent_restarts_total{reason}` (RFC 0016 §4.3).
+/// Drives `agent_subagent_restarts_total{reason}` (RFC 0016 §4.3).
 pub fn record_subagent_restart(reason: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_subagent_restart(reason);
@@ -192,7 +192,7 @@ pub fn record_subagent_restart(reason: &str) {
 }
 
 /// A wedged/stuck subagent was killed (`subagent.stuck`, RFC 0003 — the
-/// reliability headline). Drives `agentd_subagent_stuck_kills_total{signal}`
+/// reliability headline). Drives `agent_subagent_stuck_kills_total{signal}`
 /// (RFC 0016 §4.3); `signal` ∈ `term`\|`kill` (an unknown value buckets `other`).
 pub fn record_subagent_stuck_kill(signal: &str) {
     #[cfg(feature = "metrics")]
@@ -202,14 +202,14 @@ pub fn record_subagent_stuck_kill(signal: &str) {
 }
 
 /// An intelligence call was made (`intel.call`, RFC 0016 §4.3
-/// `agentd_intel_calls_total`).
+/// `agent_intel_calls_total`).
 pub fn record_intel_call() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.intel_calls.fetch_add(1, Ordering::Relaxed);
 }
 
 /// An intelligence-endpoint error by reason (RFC 0016 §4.3
-/// `agentd_intel_errors_total`). `reason` ∈ `unreachable`\|`auth`\|`timeout`\|
+/// `agent_intel_errors_total`). `reason` ∈ `unreachable`\|`auth`\|`timeout`\|
 /// `5xx` (an unknown value buckets `other`).
 pub fn record_intel_error(reason: &str) {
     #[cfg(feature = "metrics")]
@@ -219,7 +219,7 @@ pub fn record_intel_error(reason: &str) {
 }
 
 /// An MCP connect attempt failed for a declared `server` (`mcp.connect.fail`,
-/// RFC 0016 §4.3 `agentd_mcp_connect_failures_total`). `server` is the declared
+/// RFC 0016 §4.3 `agent_mcp_connect_failures_total`). `server` is the declared
 /// server name (bounded — there is a fixed, small declared set, RFC 0004); an
 /// over-capacity name buckets under `other` so the series stays bounded.
 pub fn record_mcp_connect_failure(server: &str) {
@@ -229,7 +229,7 @@ pub fn record_mcp_connect_failure(server: &str) {
     let _ = server;
 }
 
-/// A drain phase transition (RFC 0011 §4 / RFC 0016 §4.3 `agentd_drains_total`).
+/// A drain phase transition (RFC 0011 §4 / RFC 0016 §4.3 `agent_drains_total`).
 /// `phase` ∈ `started`\|`completed`\|`forced` (an unknown value buckets `other`).
 pub fn record_drain(phase: &str) {
     #[cfg(feature = "metrics")]
@@ -239,7 +239,7 @@ pub fn record_drain(phase: &str) {
 }
 
 /// A supervisor process restart was observed (rebuild+reconcile, RFC 0003 §3.11).
-/// Drives `agentd_restarts_total` (RFC 0016 §4.3) — distinct from the breaker-trip
+/// Drives `agent_restarts_total` (RFC 0016 §4.3) — distinct from the breaker-trip
 /// counter [`record_restart_tripped`].
 ///
 /// **Reserved / unwired in metrics_schema 1.0:** this build has no in-process
@@ -255,7 +255,7 @@ pub fn record_supervisor_restart() {
 }
 
 /// A wedged-reactor liveness trip (RFC 0003 / RFC 0016 §5 / §4.3
-/// `agentd_reactor_stalls_total`).
+/// `agent_reactor_stalls_total`).
 ///
 /// **Reserved / unwired in metrics_schema 1.0:** a wedged reactor is surfaced as a
 /// `/healthz` 503 (a per-scrape read of the heartbeat age in `obs::serve`), not as
@@ -268,7 +268,7 @@ pub fn record_reactor_stall() {
 }
 
 /// Point-in-time set of the intelligence-endpoint reachability gauge
-/// (`agentd_intel_up`, RFC 0016 §4.3 — RFC 0006/0018).
+/// (`agent_intel_up`, RFC 0016 §4.3 — RFC 0006/0018).
 pub fn set_intel_up(up: bool) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY
@@ -278,7 +278,7 @@ pub fn set_intel_up(up: bool) {
     let _ = up;
 }
 
-/// Point-in-time set of the tree-pause gauge (`agentd_paused`, RFC 0015 §5.5 /
+/// Point-in-time set of the tree-pause gauge (`agent_paused`, RFC 0015 §5.5 /
 /// RFC 0016 §4.3) — 1 while the `pause` operator tool has frozen the agentic
 /// loops, 0 after `resume`. No-op-safe / metrics-gated, mirroring `set_intel_up`.
 pub fn set_paused(on: bool) {
@@ -289,11 +289,11 @@ pub fn set_paused(on: bool) {
 }
 
 /// Point-in-time set of the intelligence all-endpoints-down gauge
-/// (`agentd_intel_all_down`, RFC 0018 §6 / RFC 0016 §4.3) — 1 while every model
+/// (`agent_intel_all_down`, RFC 0018 §6 / RFC 0016 §4.3) — 1 while every model
 /// endpoint is down (the latched, eventually-consistent last-child-experience
 /// truth a subagent reports up via `AgentMsg::IntelHealth`; the same flag flips
 /// `/readyz` NotReady). 0 once any endpoint is usable again. Distinct from
-/// `agentd_intel_up` (the active endpoint's reachability): all-down is the
+/// `agent_intel_up` (the active endpoint's reachability): all-down is the
 /// fleet-routing signal (no endpoint usable at all). No-op-safe / metrics-gated.
 pub fn set_intel_all_down(on: bool) {
     #[cfg(feature = "metrics")]
@@ -305,7 +305,7 @@ pub fn set_intel_all_down(on: bool) {
 }
 
 /// Point-in-time set of the subagent-tree shape gauges (RFC 0016 §4.3:
-/// `agentd_active_subagents` / `agentd_tree_depth` / `agentd_tree_breadth`).
+/// `agent_active_subagents` / `agent_tree_depth` / `agent_tree_breadth`).
 pub fn set_tree_shape(active: u64, depth: u64, breadth: u64) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.set_tree_shape(active, depth, breadth);
@@ -314,8 +314,8 @@ pub fn set_tree_shape(active: u64, depth: u64, breadth: u64) {
 }
 
 /// Point-in-time set of the reactive backlog gauges — the RFC 0019 scaling signal
-/// set (RFC 0016 §4.3: `agentd_pending_events` / `agentd_inflight_reactions` /
-/// `agentd_subscriptions_active` / `agentd_reaction_lag_ms`).
+/// set (RFC 0016 §4.3: `agent_pending_events` / `agent_inflight_reactions` /
+/// `agent_subscriptions_active` / `agent_reaction_lag_ms`).
 pub fn set_reactive_backlog(pending: u64, inflight: u64, subscriptions: u64, lag_ms: u64) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.set_reactive_backlog(pending, inflight, subscriptions, lag_ms);
@@ -324,14 +324,14 @@ pub fn set_reactive_backlog(pending: u64, inflight: u64, subscriptions: u64, lag
 }
 
 /// An item was dropped as out-of-shard (RFC 0019 §4.1 / §5.1
-/// `agentd_shard_skipped_total`). The shard gate is the cheap pre-filter applied
+/// `agent_shard_skipped_total`). The shard gate is the cheap pre-filter applied
 /// at routing intake before any spawn; this counts the items this replica rejects.
 pub fn record_shard_skipped() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.shard_skipped.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A claim was lost to another replica (RFC 0019 §5.1 `agentd_claims_lost_total`).
+/// A claim was lost to another replica (RFC 0019 §5.1 `agent_claims_lost_total`).
 /// Wired by the claim gate (`cluster` build): a `work.claim{granted:false}` drops
 /// the delivery and increments this — the over-provisioning signal a scaler reads
 /// (high & rising under low backlog ⇒ scale down).
@@ -340,7 +340,7 @@ pub fn record_claim_lost() {
     imp::REGISTRY.claims_lost.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A claim was granted (RFC 0019 §3.2 / §5.1 `agentd_claims_granted_total`): this
+/// A claim was granted (RFC 0019 §3.2 / §5.1 `agent_claims_granted_total`): this
 /// replica won `work.claim` and proceeds to process the item. Wired by the claim
 /// gate in the `cluster` build.
 pub fn record_claim_granted() {
@@ -348,7 +348,7 @@ pub fn record_claim_granted() {
     imp::REGISTRY.claims_granted.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A held claim was released (RFC 0019 §3.3 / §6 `agentd_claims_released_total`):
+/// A held claim was released (RFC 0019 §3.3 / §6 `agent_claims_released_total`):
 /// a non-terminal wind-down or a drain handed the item back to the fleet. Wired by
 /// the claim gate + the drain step-1.5 in the `cluster` build.
 pub fn record_claim_released() {
@@ -371,7 +371,7 @@ pub fn set_saturation(numerator: u64, denominator: u64) {
 }
 
 /// A config hot reload reached a terminal disposition (RFC 0017 §5.6). Drives
-/// `agentd_config_reload_total{result}` with the closed domain
+/// `agent_config_reload_total{result}` with the closed domain
 /// `applied`\|`rejected` (an unknown value buckets `other`). A `rejected` reload
 /// is a clean no-op (the running config is unchanged); `applied` bumps the
 /// generation gauge via [`set_config_generation`].
@@ -382,7 +382,7 @@ pub fn record_config_reload(result: &str) {
     let _ = result;
 }
 
-/// Point-in-time set of the config-generation gauge (`agentd_config_generation`,
+/// Point-in-time set of the config-generation gauge (`agent_config_generation`,
 /// RFC 0017 §5.6): the count of successfully-applied reloads, so a scraper can
 /// detect "this instance has picked up generation N" against agentctl's desired
 /// generation. Monotonic in practice (the reload loop only ever increments it).
@@ -420,7 +420,7 @@ mod imp {
     // arrays ARE the cardinality bound — there is no map, no allocation, no
     // unbounded label key path.
 
-    /// `agentd_runs_total{status}` / `agentd_subagents_exited_total{status}`
+    /// `agent_runs_total{status}` / `agent_subagents_exited_total{status}`
     /// label domain: the RFC 0007 §3.4 closed terminal-status vocabulary
     /// (verbatim from `TerminalStatus::as_str`), plus `other`.
     const STATUS_LABELS: &[&str] = &[
@@ -436,10 +436,10 @@ mod imp {
         "other",
     ];
 
-    /// `agentd_refusals_total{reason}` label domain (RFC 0016 §4.3).
+    /// `agent_refusals_total{reason}` label domain (RFC 0016 §4.3).
     const REFUSAL_REASONS: &[&str] = &["trifecta", "rate", "budget", "depth", "mcp", "other"];
 
-    /// `agentd_limit_exceeded_total{limit}` label domain (mirrors the
+    /// `agent_limit_exceeded_total{limit}` label domain (mirrors the
     /// `limit.exceeded` event's `limit` field, RFC 0016 §4.3).
     const LIMIT_LABELS: &[&str] = &[
         "steps",
@@ -452,22 +452,22 @@ mod imp {
         "other",
     ];
 
-    /// `agentd_subagent_restarts_total{reason}` label domain (RFC 0003 §3.7).
+    /// `agent_subagent_restarts_total{reason}` label domain (RFC 0003 §3.7).
     const RESTART_REASONS: &[&str] = &["crashed", "stuck", "rate", "other"];
 
-    /// `agentd_subagent_stuck_kills_total{signal}` label domain (RFC 0016 §4.3).
+    /// `agent_subagent_stuck_kills_total{signal}` label domain (RFC 0016 §4.3).
     const SIGNAL_LABELS: &[&str] = &["term", "kill", "other"];
 
-    /// `agentd_intel_errors_total{reason}` label domain (RFC 0016 §4.3).
+    /// `agent_intel_errors_total{reason}` label domain (RFC 0016 §4.3).
     const INTEL_ERROR_REASONS: &[&str] = &["unreachable", "auth", "timeout", "5xx", "other"];
 
-    /// `agentd_drains_total{phase}` label domain (RFC 0011 §4 / RFC 0016 §4.3).
+    /// `agent_drains_total{phase}` label domain (RFC 0011 §4 / RFC 0016 §4.3).
     const DRAIN_PHASES: &[&str] = &["started", "completed", "forced", "other"];
 
-    /// `agentd_tokens_total{type}` direction label domain (RFC 0016 §4.3).
+    /// `agent_tokens_total{type}` direction label domain (RFC 0016 §4.3).
     const TOKEN_TYPES: &[&str] = &["in", "out"];
 
-    /// `agentd_config_reload_total{result}` label domain (RFC 0017 §5.6). A hot
+    /// `agent_config_reload_total{result}` label domain (RFC 0017 §5.6). A hot
     /// reload either `applied` (the reloadable diff took effect) or was `rejected`
     /// (invalid / restart-only / inconsistent → a clean no-op); `other` is the
     /// catch-all that keeps the series bounded (RFC 0016 §4.2).
@@ -554,9 +554,9 @@ mod imp {
         reaction_lag_ms: AtomicU64,
 
         // --- RFC 0019 §5.1: horizontal-scaling signals ----------------------
-        // `agentd_saturation` is stored as basis points (0..=10000) and rendered
-        // as a float in [0,1]. `agentd_shard_skipped_total` counts out-of-shard
-        // drops; `agentd_claims_lost_total` is fed by the claim gate (work-claim
+        // `agent_saturation` is stored as basis points (0..=10000) and rendered
+        // as a float in [0,1]. `agent_shard_skipped_total` counts out-of-shard
+        // drops; `agent_claims_lost_total` is fed by the claim gate (work-claim
         // ships) alongside the granted/released counters.
         saturation_bp: AtomicU64,
         pub(super) shard_skipped: AtomicU64,
@@ -623,7 +623,7 @@ mod imp {
                 RunOutcome::Killed => &self.runs_killed,
             };
             c.fetch_add(1, Ordering::Relaxed);
-            // Frozen §4.3 `agentd_runs_total{status}` — a COARSE projection of the
+            // Frozen §4.3 `agent_runs_total{status}` — a COARSE projection of the
             // three `RunOutcome` variants this hook carries onto the RFC 0007 §3.4
             // domain (a precise status needs `record_run_status`, see the caveat).
             let status = match outcome {
@@ -641,7 +641,7 @@ mod imp {
         pub(super) fn record_tokens(&self, input: u64, output: u64) {
             self.tokens_input.fetch_add(input, Ordering::Relaxed);
             self.tokens_output.fetch_add(output, Ordering::Relaxed);
-            // Frozen §4.3 `agentd_tokens_total{type}` (the `model` label is not
+            // Frozen §4.3 `agent_tokens_total{type}` (the `model` label is not
             // available at the `AgentMsg::Usage` hook — see the caveat).
             self.tokens_typed.slots[0].fetch_add(input, Ordering::Relaxed);
             self.tokens_typed.slots[1].fetch_add(output, Ordering::Relaxed);
@@ -721,11 +721,11 @@ mod imp {
             let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
 
             // --- liveness / readiness gauges (RFC 0016 §4.3) -----------------
-            // `agentd_up` is always 1 while we can render. `agentd_ready` is
+            // `agent_up` is always 1 while we can render. `agent_ready` is
             // derived from the same process-wide drain/lame-duck state `/readyz`
             // reports (RFC 0010 §3.7) — read-only, no extra call site.
-            gauge(&mut s, "agentd_up", "1 while the process is alive", 1);
-            // `agentd_ready` mirrors `/readyz` exactly (RFC 0010 §3.7 / RFC 0018 §6):
+            gauge(&mut s, "agent_up", "1 while the process is alive", 1);
+            // `agent_ready` mirrors `/readyz` exactly (RFC 0010 §3.7 / RFC 0018 §6):
             // NotReady when draining, lame-ducked, OR all intelligence endpoints are
             // down — the same three conditions the readiness probe consults.
             let ready = u64::from(
@@ -735,16 +735,16 @@ mod imp {
             );
             gauge(
                 &mut s,
-                "agentd_ready",
+                "agent_ready",
                 "1 when ready to accept work (not draining / lame-ducked / intel-all-down)",
                 ready,
             );
-            // `agentd_paused` (RFC 0015 §5.5): 1 while the tree is paused at turn
+            // `agent_paused` (RFC 0015 §5.5): 1 while the tree is paused at turn
             // boundaries. Pause is NOT readiness — a paused instance can still be
             // ready (the `ready` gauge above ignores pause, only drain/lame-duck).
             gauge(
                 &mut s,
-                "agentd_paused",
+                "agent_paused",
                 "1 while the agentic tree is paused at turn boundaries (RFC 0015 §4.3)",
                 g(&self.paused),
             );
@@ -752,13 +752,13 @@ mod imp {
             // --- run lifecycle & terminal-status (RFC 0016 §4.3) -------------
             labelled_counter(
                 &mut s,
-                "agentd_runs_total",
+                "agent_runs_total",
                 "Runs by terminal status (RFC 0007 §3.4).",
                 "status",
                 STATUS_LABELS,
                 &self.runs_total,
             );
-            // `agentd_loop_steps_total` is driven by `loop.step`, which is emitted
+            // `agent_loop_steps_total` is driven by `loop.step`, which is emitted
             // INSIDE the re-exec'd child agentic loop — a different process from the
             // supervisor this scrape reflects. `record_loop_step` is intentionally
             // left unwired here: bumping it would only touch the child's own
@@ -769,13 +769,13 @@ mod imp {
             // log lines (the default story), not from this counter.
             counter(
                 &mut s,
-                "agentd_loop_steps_total",
+                "agent_loop_steps_total",
                 "Agentic loop steps (process-local; emitted in the child loop, so the supervisor scrape reflects its own process only — cross-process rollup is a v1 non-goal).",
                 g(&self.loop_steps),
             );
 
             // --- token / cost accounting (RFC 0016 §4.3) ---------------------
-            // `agentd_tokens_total{type}`: the `model` label RFC 0016 §4.3 freezes
+            // `agent_tokens_total{type}`: the `model` label RFC 0016 §4.3 freezes
             // is DEFERRED in metrics_schema 1.0 — the only call site
             // (`record_tokens`, fed by `AgentMsg::Usage` up the control channel)
             // does not carry the model identifier, and adding it needs a new emit
@@ -784,26 +784,26 @@ mod imp {
             // gets per-model token splits from `intel.result.usage` log lines.
             labelled_counter(
                 &mut s,
-                "agentd_tokens_total",
+                "agent_tokens_total",
                 "Model tokens by direction (the frozen `model` label is deferred in metrics_schema 1.0 — the AgentMsg::Usage hook carries no model id; never faked).",
                 "type",
                 TOKEN_TYPES,
                 &self.tokens_typed,
             );
-            // `agentd_intel_calls_total`: same `model`-label deferral as tokens
+            // `agent_intel_calls_total`: same `model`-label deferral as tokens
             // (the `record_intel_call` site carries no model id). Additionally
             // process-local — `IntelClient::complete` runs in the re-exec'd child
             // (the supervisor makes no LLM calls), so this reflects only the
             // scraped process. Derive per-model call counts from `intel.call` logs.
             counter(
                 &mut s,
-                "agentd_intel_calls_total",
+                "agent_intel_calls_total",
                 "Intelligence calls made (process-local — the LLM client runs in the child; the frozen `model` label is deferred in metrics_schema 1.0, never faked).",
                 g(&self.intel_calls),
             );
 
             // --- refusal / bound counters (RFC 0016 §4.3) --------------------
-            // `agentd_refusals_total` is driven by the model/loop refusing or a
+            // `agent_refusals_total` is driven by the model/loop refusing or a
             // guard tripping — all INSIDE the re-exec'd child loop (orchestrator
             // self-tool / scope checks), so `record_refusal` is left unwired: it
             // would only bump the child's process-local registry. Rendered for
@@ -813,13 +813,13 @@ mod imp {
             // log lines.
             labelled_counter(
                 &mut s,
-                "agentd_refusals_total",
+                "agent_refusals_total",
                 "Refusals/guard trips by reason (process-local; tripped in the child loop, so the supervisor scrape reflects its own process only).",
                 "reason",
                 REFUSAL_REASONS,
                 &self.refusals,
             );
-            // `agentd_limit_exceeded_total{limit}` is PARTIALLY wired: the
+            // `agent_limit_exceeded_total{limit}` is PARTIALLY wired: the
             // `tree_tokens` leg is the supervisor's own tree-ceiling trip
             // (`supervisor::reactor`, this process → reaches the scrape), so it is
             // live. The `steps`/`tokens`/`deadline`/`depth` legs trip inside the
@@ -828,7 +828,7 @@ mod imp {
             // as the rest of this module.
             labelled_counter(
                 &mut s,
-                "agentd_limit_exceeded_total",
+                "agent_limit_exceeded_total",
                 "Hard-bound trips by limit (the `tree_tokens` leg is supervisor-live; the steps/tokens/deadline/depth legs trip in the child loop and are process-local).",
                 "limit",
                 LIMIT_LABELS,
@@ -838,31 +838,31 @@ mod imp {
             // --- subagent-tree gauges + counters (RFC 0016 §4.3) -------------
             gauge(
                 &mut s,
-                "agentd_active_subagents",
+                "agent_active_subagents",
                 "Subagents currently alive in the tree.",
                 g(&self.active_subagents),
             );
             gauge(
                 &mut s,
-                "agentd_tree_depth",
+                "agent_tree_depth",
                 "Current max subagent-tree depth.",
                 g(&self.tree_depth),
             );
             gauge(
                 &mut s,
-                "agentd_tree_breadth",
+                "agent_tree_breadth",
                 "Current max siblings at any tree node.",
                 g(&self.tree_breadth),
             );
             counter(
                 &mut s,
-                "agentd_subagents_spawned_total",
+                "agent_subagents_spawned_total",
                 "Subagents spawned.",
                 g(&self.subagents_spawned),
             );
             labelled_counter(
                 &mut s,
-                "agentd_subagents_exited_total",
+                "agent_subagents_exited_total",
                 "Subagents exited by terminal status (RFC 0007 §3.4).",
                 "status",
                 STATUS_LABELS,
@@ -870,7 +870,7 @@ mod imp {
             );
             labelled_counter(
                 &mut s,
-                "agentd_subagent_restarts_total",
+                "agent_subagent_restarts_total",
                 "Subagent restarts by reason (RFC 0003 §3.7).",
                 "reason",
                 RESTART_REASONS,
@@ -878,7 +878,7 @@ mod imp {
             );
             labelled_counter(
                 &mut s,
-                "agentd_subagent_stuck_kills_total",
+                "agent_subagent_stuck_kills_total",
                 "Wedged-subagent kills by signal (RFC 0003).",
                 "signal",
                 SIGNAL_LABELS,
@@ -888,21 +888,21 @@ mod imp {
             // --- intelligence health (RFC 0016 §4.3) -------------------------
             gauge(
                 &mut s,
-                "agentd_intel_up",
+                "agent_intel_up",
                 "1 when the intelligence endpoint is reachable.",
                 g(&self.intel_up),
             );
-            // `agentd_intel_all_down` (RFC 0018 §6): 1 while EVERY model endpoint is
+            // `agent_intel_all_down` (RFC 0018 §6): 1 while EVERY model endpoint is
             // down — the fleet-routing signal (the same latch that flips /readyz).
             gauge(
                 &mut s,
-                "agentd_intel_all_down",
+                "agent_intel_all_down",
                 "1 while all intelligence endpoints are down (RFC 0018 §6).",
                 g(&self.intel_all_down),
             );
             labelled_counter(
                 &mut s,
-                "agentd_intel_errors_total",
+                "agent_intel_errors_total",
                 "Intelligence-endpoint errors by reason.",
                 "reason",
                 INTEL_ERROR_REASONS,
@@ -910,7 +910,7 @@ mod imp {
             );
 
             // --- MCP server health (RFC 0016 §4.3) ---------------------------
-            // `agentd_mcp_up{server}` is gauge-per-declared-server; this chunk
+            // `agent_mcp_up{server}` is gauge-per-declared-server; this chunk
             // has no declared-server registration hook, so it is RESERVED/not
             // emitted in this build (the honest-absence precedent the rest of this
             // module follows). The connect-failure counter below IS wired — the
@@ -922,7 +922,7 @@ mod imp {
             mcp_servers().render_connect_failures(&mut s, &self.mcp_connect_failures);
 
             // --- tool-call accounting (RFC 0016 §4.3) — RESERVED -------------
-            // `agentd_tool_calls_total{server,tool,ok}` is keyed off `tool.result`,
+            // `agent_tool_calls_total{server,tool,ok}` is keyed off `tool.result`,
             // whose boundary (`McpClient::call_tool`) runs predominantly INSIDE the
             // re-exec'd child loop (the subagent's tool use); the only supervisor-
             // process call sites are the reactor's own management/lease calls
@@ -931,15 +931,15 @@ mod imp {
             // (it would NOT reflect the children's tool calls), so the series is
             // RESERVED here — rendered as a HELP/TYPE marker, no fabricated 0 — and
             // agentctl reads tool calls from `tool.result` log lines (the default
-            // story). This mirrors the `agentd_mcp_up` honest-absence precedent.
+            // story). This mirrors the `agent_mcp_up` honest-absence precedent.
             reserved(
                 &mut s,
-                "agentd_tool_calls_total",
+                "agent_tool_calls_total",
                 "counter",
                 "Tool calls by server/tool/ok (RFC 0016 §4.3) — reserved in metrics_schema 1.0; the tool-call boundary runs in the child loop, so a supervisor scrape can't reflect it (derive from tool.result log lines).",
             );
-            // `agentd_tool_call_duration_ms` / `agentd_intel_call_duration_ms` /
-            // `agentd_run_duration_ms` are frozen HISTOGRAMS. This crate has no
+            // `agent_tool_call_duration_ms` / `agent_intel_call_duration_ms` /
+            // `agent_run_duration_ms` are frozen HISTOGRAMS. This crate has no
             // histogram exposition machinery (no bucket/sum/count emission, by
             // design — RFC 0010 §3.8 keeps the surface a hand-written counter/gauge
             // text), so they are RESERVED: rendered as HELP/TYPE markers only, no
@@ -948,37 +948,37 @@ mod imp {
             // marker. Latency lives in the `dur_ms` field of the matching log lines.
             reserved(
                 &mut s,
-                "agentd_tool_call_duration_ms",
+                "agent_tool_call_duration_ms",
                 "histogram",
                 "Tool-call latency (RFC 0016 §4.3) — reserved in metrics_schema 1.0; histogram exposition not implemented (use the tool.result dur_ms field).",
             );
             reserved(
                 &mut s,
-                "agentd_intel_call_duration_ms",
+                "agent_intel_call_duration_ms",
                 "histogram",
                 "Intelligence-call latency (RFC 0016 §4.3) — reserved in metrics_schema 1.0; histogram exposition not implemented (use the intel.result dur_ms field).",
             );
             reserved(
                 &mut s,
-                "agentd_run_duration_ms",
+                "agent_run_duration_ms",
                 "histogram",
                 "Run latency by terminal status (RFC 0016 §4.3) — reserved in metrics_schema 1.0; histogram exposition not implemented (derive from run start→terminal log lines).",
             );
 
             // --- lifecycle events (RFC 0016 §4.3) ----------------------------
-            // `agentd_drains_total{phase}` is wired: the reactor's per-run teardown
+            // `agent_drains_total{phase}` is wired: the reactor's per-run teardown
             // (`supervisor::reactor`) and the daemon's graceful wind-down
             // (`triggers::mode`) both run in this (supervisor) process and bump
             // `started`/`completed`/`forced`.
             labelled_counter(
                 &mut s,
-                "agentd_drains_total",
+                "agent_drains_total",
                 "Drain phase transitions (RFC 0011 §4).",
                 "phase",
                 DRAIN_PHASES,
                 &self.drains,
             );
-            // `agentd_restarts_total` is RESERVED in metrics_schema 1.0: it counts
+            // `agent_restarts_total` is RESERVED in metrics_schema 1.0: it counts
             // a supervisor process *restart* (rebuild+reconcile, RFC 0003 §3.11),
             // and this build has no such in-process restart path to emit it from
             // (a pod restart is a fresh process with a zeroed registry — an
@@ -987,11 +987,11 @@ mod imp {
             // exists for the future reconcile path but is intentionally unwired.
             counter(
                 &mut s,
-                "agentd_restarts_total",
+                "agent_restarts_total",
                 "Supervisor process restarts observed (RFC 0003 §3.11) — reserved in metrics_schema 1.0; no in-process restart/reconcile emit site in this build.",
                 g(&self.supervisor_restarts),
             );
-            // `agentd_reactor_stalls_total` is RESERVED in metrics_schema 1.0: a
+            // `agent_reactor_stalls_total` is RESERVED in metrics_schema 1.0: a
             // wedged reactor is surfaced as a `/healthz` 503 (a derived read of the
             // heartbeat age in `obs::serve`, evaluated per scrape — RFC 0010 §3.7),
             // not as a one-shot in-process event, so there is no clean emit site to
@@ -1001,18 +1001,18 @@ mod imp {
             // 503 itself, not this counter.
             counter(
                 &mut s,
-                "agentd_reactor_stalls_total",
+                "agent_reactor_stalls_total",
                 "Wedged-reactor liveness trips (RFC 0003) — reserved in metrics_schema 1.0; the live signal is the /healthz 503, no one-shot in-process emit site yet.",
                 g(&self.reactor_stalls),
             );
 
             // --- hot reload (RFC 0017 §5.6) ----------------------------------
-            // `agentd_config_reload_total{result}` over the closed applied/rejected
-            // domain, plus `agentd_config_generation` (applied-reload count) so a
+            // `agent_config_reload_total{result}` over the closed applied/rejected
+            // domain, plus `agent_config_generation` (applied-reload count) so a
             // scraper detects "generation N is effective" against the desired one.
             labelled_counter(
                 &mut s,
-                "agentd_config_reload_total",
+                "agent_config_reload_total",
                 "Hot reloads by result (RFC 0017 §5.6).",
                 "result",
                 RELOAD_RESULTS,
@@ -1020,7 +1020,7 @@ mod imp {
             );
             gauge(
                 &mut s,
-                "agentd_config_generation",
+                "agent_config_generation",
                 "Successfully-applied config reloads (the live generation).",
                 g(&self.config_generation),
             );
@@ -1028,42 +1028,42 @@ mod imp {
             // --- reactive backlog — the RFC 0019 scaling signal set (§4.3) ---
             gauge(
                 &mut s,
-                "agentd_pending_events",
+                "agent_pending_events",
                 "Reactive events received but not yet routed.",
                 g(&self.pending_events),
             );
             gauge(
                 &mut s,
-                "agentd_inflight_reactions",
+                "agent_inflight_reactions",
                 "Reactions currently executing.",
                 g(&self.inflight_reactions),
             );
             gauge(
                 &mut s,
-                "agentd_subscriptions_active",
+                "agent_subscriptions_active",
                 "Reconciled declared subscriptions.",
                 g(&self.subscriptions_active),
             );
             gauge(
                 &mut s,
-                "agentd_reaction_lag_ms",
+                "agent_reaction_lag_ms",
                 "Age of the oldest un-routed pending event (ms).",
                 g(&self.reaction_lag_ms),
             );
 
             // --- horizontal-scaling signals (RFC 0019 §5.1) ------------------
-            // `agentd_saturation` is in_flight/capacity in [0,1] — the HPA target.
+            // `agent_saturation` is in_flight/capacity in [0,1] — the HPA target.
             // Stored as basis points; rendered as the float.
             let sat = g(&self.saturation_bp) as f64 / 10_000.0;
             gauge_f64(
                 &mut s,
-                "agentd_saturation",
+                "agent_saturation",
                 "In-flight / capacity utilization in [0,1] (RFC 0019 §5.1).",
                 sat,
             );
             counter(
                 &mut s,
-                "agentd_shard_skipped_total",
+                "agent_shard_skipped_total",
                 "Items dropped as out-of-shard (RFC 0019 §4.1).",
                 g(&self.shard_skipped),
             );
@@ -1072,19 +1072,19 @@ mod imp {
             // out the claim outcome set. Wired by the `cluster` claim gate.
             counter(
                 &mut s,
-                "agentd_claims_lost_total",
+                "agent_claims_lost_total",
                 "Work claims lost to another replica (RFC 0019 §5.1).",
                 g(&self.claims_lost),
             );
             counter(
                 &mut s,
-                "agentd_claims_granted_total",
+                "agent_claims_granted_total",
                 "Work claims granted to this replica (RFC 0019 §3.2).",
                 g(&self.claims_granted),
             );
             counter(
                 &mut s,
-                "agentd_claims_released_total",
+                "agent_claims_released_total",
                 "Held claims released back to the fleet (RFC 0019 §3.3/§6).",
                 g(&self.claims_released),
             );
@@ -1092,49 +1092,49 @@ mod imp {
             // --- legacy bare series (RFC 0010 §3.8; retained, additive) ------
             counter(
                 &mut s,
-                "agentd_runs_started_total",
+                "agent_runs_started_total",
                 "Supervised runs started",
                 g(&self.runs_started),
             );
             counter(
                 &mut s,
-                "agentd_runs_completed_total",
+                "agent_runs_completed_total",
                 "Supervised runs that completed",
                 g(&self.runs_completed),
             );
             counter(
                 &mut s,
-                "agentd_runs_failed_total",
+                "agent_runs_failed_total",
                 "Supervised runs that failed on infra",
                 g(&self.runs_failed),
             );
             counter(
                 &mut s,
-                "agentd_runs_killed_total",
+                "agent_runs_killed_total",
                 "Supervised runs torn down by the supervisor",
                 g(&self.runs_killed),
             );
             counter(
                 &mut s,
-                "agentd_reactions_total",
+                "agent_reactions_total",
                 "Reactive triggers fired",
                 g(&self.reactions),
             );
             counter(
                 &mut s,
-                "agentd_tokens_input_total",
+                "agent_tokens_input_total",
                 "Input tokens reported by direct children",
                 g(&self.tokens_input),
             );
             counter(
                 &mut s,
-                "agentd_tokens_output_total",
+                "agent_tokens_output_total",
                 "Output tokens reported by direct children",
                 g(&self.tokens_output),
             );
             counter(
                 &mut s,
-                "agentd_restarts_tripped_total",
+                "agent_restarts_tripped_total",
                 "Restart-governor breaker trips",
                 g(&self.restarts_tripped),
             );
@@ -1142,7 +1142,7 @@ mod imp {
         }
     }
 
-    // --- `agentd_mcp_connect_failures_total{server}` -------------------------
+    // --- `agent_mcp_connect_failures_total{server}` -------------------------
     // The `server` label is bounded (RFC 0004: a small, fixed declared set) but
     // its *values* are config-time strings, not a compile-time enum. We bound it
     // structurally with a fixed slot table that interns server names on first use;
@@ -1188,14 +1188,14 @@ mod imp {
             ctr.slots[idx].fetch_add(1, Ordering::Relaxed);
         }
 
-        /// Emit one `agentd_mcp_connect_failures_total{server="…"}` line per
+        /// Emit one `agent_mcp_connect_failures_total{server="…"}` line per
         /// interned server with a non-zero count, plus the `other` overflow slot.
         fn render_connect_failures(&self, s: &mut String, ctr: &LabelCounter<MCP_SERVER_SLOTS>) {
             let names = match self.names.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let name = "agentd_mcp_connect_failures_total";
+            let name = "agent_mcp_connect_failures_total";
             let _ = writeln!(s, "# HELP {name} MCP connect failures by server.");
             let _ = writeln!(s, "# TYPE {name} counter");
             for (i, server) in names.iter().enumerate() {
@@ -1225,7 +1225,7 @@ mod imp {
     /// this build: render the `# HELP`/`# TYPE` headers (so the contract stays
     /// discoverable from the scrape and a future silent-drop is catchable) WITHOUT
     /// a fabricated always-0 sample line. This is the same honest-absence shape as
-    /// `agentd_mcp_up` — a marker, not a value. `kind` is the Prometheus type the
+    /// `agent_mcp_up` — a marker, not a value. `kind` is the Prometheus type the
     /// series will eventually carry (`counter`/`histogram`); `help` MUST say it is
     /// reserved and why (cross-process boundary / no histogram exposition yet).
     fn reserved(s: &mut String, name: &str, kind: &str, help: &str) {
@@ -1273,7 +1273,7 @@ mod imp {
         if let Some(v) = mem.max {
             gauge(
                 &mut s,
-                "agentd_memory_max_bytes",
+                "agent_memory_max_bytes",
                 "cgroup v2 memory.max hard limit (bytes)",
                 v,
             );
@@ -1281,7 +1281,7 @@ mod imp {
         if let Some(v) = mem.current {
             gauge(
                 &mut s,
-                "agentd_memory_current_bytes",
+                "agent_memory_current_bytes",
                 "cgroup v2 memory.current usage (bytes)",
                 v,
             );
@@ -1301,12 +1301,12 @@ mod imp {
             r.record_run(RunOutcome::Failed);
             r.record_tokens(100, 50);
             let out = r.render();
-            assert!(out.contains("# TYPE agentd_runs_started_total counter"));
-            assert!(out.contains("agentd_runs_started_total 3"));
-            assert!(out.contains("agentd_runs_completed_total 1"));
-            assert!(out.contains("agentd_runs_failed_total 1"));
-            assert!(out.contains("agentd_tokens_input_total 100"));
-            assert!(out.contains("agentd_tokens_output_total 50"));
+            assert!(out.contains("# TYPE agent_runs_started_total counter"));
+            assert!(out.contains("agent_runs_started_total 3"));
+            assert!(out.contains("agent_runs_completed_total 1"));
+            assert!(out.contains("agent_runs_failed_total 1"));
+            assert!(out.contains("agent_tokens_input_total 100"));
+            assert!(out.contains("agent_tokens_output_total 50"));
         }
 
         #[test]
@@ -1314,36 +1314,36 @@ mod imp {
             let r = Registry::new();
             let out = r.render();
             // RFC 0016 §4.3 liveness/readiness gauges, label-free.
-            assert!(out.contains("# TYPE agentd_up gauge"));
-            assert!(out.contains("agentd_up 1"));
-            assert!(out.contains("# TYPE agentd_ready gauge"));
+            assert!(out.contains("# TYPE agent_up gauge"));
+            assert!(out.contains("agent_up 1"));
+            assert!(out.contains("# TYPE agent_ready gauge"));
             // ready is 0/1; in a bare test process (no drain) it is 1.
-            assert!(out.contains("agentd_ready "));
+            assert!(out.contains("agent_ready "));
         }
 
         #[test]
         fn paused_gauge_renders_zero_then_one() {
-            // RFC 0015 §5.5: `agentd_paused` is a 0/1 gauge, default 0.
+            // RFC 0015 §5.5: `agent_paused` is a 0/1 gauge, default 0.
             let r = Registry::new();
             let out = r.render();
-            assert!(out.contains("# TYPE agentd_paused gauge"));
-            assert!(out.contains("agentd_paused 0"));
+            assert!(out.contains("# TYPE agent_paused gauge"));
+            assert!(out.contains("agent_paused 0"));
             // Set via the same atomic `set_paused` writes; renders 1.
             r.paused.store(1, Ordering::Relaxed);
-            assert!(r.render().contains("agentd_paused 1"));
+            assert!(r.render().contains("agent_paused 1"));
         }
 
         #[test]
         fn intel_all_down_gauge_renders_zero_then_one() {
-            // RFC 0018 §6: `agentd_intel_all_down` is a 0/1 gauge, default 0, set
+            // RFC 0018 §6: `agent_intel_all_down` is a 0/1 gauge, default 0, set
             // from the latched all-down flag (the same one /readyz reads).
             let r = Registry::new();
             let out = r.render();
-            assert!(out.contains("# TYPE agentd_intel_all_down gauge"));
-            assert!(out.contains("agentd_intel_all_down 0"));
+            assert!(out.contains("# TYPE agent_intel_all_down gauge"));
+            assert!(out.contains("agent_intel_all_down 0"));
             // Set via the same atomic `set_intel_all_down` writes; renders 1.
             r.intel_all_down.store(1, Ordering::Relaxed);
-            assert!(r.render().contains("agentd_intel_all_down 1"));
+            assert!(r.render().contains("agent_intel_all_down 1"));
         }
 
         #[test]
@@ -1355,13 +1355,13 @@ mod imp {
             // an out-of-vocabulary status buckets under `other`, never a new label
             r.record_run_status("totally_made_up");
             let out = r.render();
-            assert!(out.contains("agentd_runs_total{status=\"completed\"} 1"));
-            assert!(out.contains("agentd_runs_total{status=\"refused\"} 2"));
-            assert!(out.contains("agentd_runs_total{status=\"other\"} 1"));
+            assert!(out.contains("agent_runs_total{status=\"completed\"} 1"));
+            assert!(out.contains("agent_runs_total{status=\"refused\"} 2"));
+            assert!(out.contains("agent_runs_total{status=\"other\"} 1"));
             // every closed-domain value is present (zero-valued series included)
-            assert!(out.contains("agentd_runs_total{status=\"loop_detected\"} 0"));
+            assert!(out.contains("agent_runs_total{status=\"loop_detected\"} 0"));
             // exactly one HELP/TYPE header for the family
-            assert_eq!(out.matches("# TYPE agentd_runs_total counter").count(), 1);
+            assert_eq!(out.matches("# TYPE agent_runs_total counter").count(), 1);
         }
 
         #[test]
@@ -1370,8 +1370,8 @@ mod imp {
             r.record_tokens(880, 40);
             r.record_tokens(120, 10);
             let out = r.render();
-            assert!(out.contains("agentd_tokens_total{type=\"in\"} 1000"));
-            assert!(out.contains("agentd_tokens_total{type=\"out\"} 50"));
+            assert!(out.contains("agent_tokens_total{type=\"in\"} 1000"));
+            assert!(out.contains("agent_tokens_total{type=\"out\"} 50"));
         }
 
         #[test]
@@ -1382,14 +1382,14 @@ mod imp {
             r.record_refusal("depth");
             r.record_limit_exceeded("spawn_rate");
             let out = r.render();
-            assert!(out.contains("agentd_refusals_total{reason=\"trifecta\"} 1"));
-            assert!(out.contains("agentd_refusals_total{reason=\"depth\"} 2"));
-            assert!(out.contains("agentd_limit_exceeded_total{limit=\"spawn_rate\"} 1"));
+            assert!(out.contains("agent_refusals_total{reason=\"trifecta\"} 1"));
+            assert!(out.contains("agent_refusals_total{reason=\"depth\"} 2"));
+            assert!(out.contains("agent_limit_exceeded_total{limit=\"spawn_rate\"} 1"));
             // closed domains: a stray reason never widens the label set
             r.record_refusal("nope");
             assert!(
                 r.render()
-                    .contains("agentd_refusals_total{reason=\"other\"} 1")
+                    .contains("agent_refusals_total{reason=\"other\"} 1")
             );
         }
 
@@ -1399,13 +1399,13 @@ mod imp {
             r.set_tree_shape(4, 2, 3);
             r.set_reactive_backlog(7, 1, 9, 250);
             let out = r.render();
-            assert!(out.contains("agentd_active_subagents 4"));
-            assert!(out.contains("agentd_tree_depth 2"));
-            assert!(out.contains("agentd_tree_breadth 3"));
-            assert!(out.contains("agentd_pending_events 7"));
-            assert!(out.contains("agentd_inflight_reactions 1"));
-            assert!(out.contains("agentd_subscriptions_active 9"));
-            assert!(out.contains("agentd_reaction_lag_ms 250"));
+            assert!(out.contains("agent_active_subagents 4"));
+            assert!(out.contains("agent_tree_depth 2"));
+            assert!(out.contains("agent_tree_breadth 3"));
+            assert!(out.contains("agent_pending_events 7"));
+            assert!(out.contains("agent_inflight_reactions 1"));
+            assert!(out.contains("agent_subscriptions_active 9"));
+            assert!(out.contains("agent_reaction_lag_ms 250"));
         }
 
         #[test]
@@ -1417,23 +1417,23 @@ mod imp {
             r.set_saturation(35, 64);
             r.shard_skipped.fetch_add(3, Ordering::Relaxed);
             let out = r.render();
-            assert!(out.contains("# TYPE agentd_saturation gauge"));
-            assert!(out.contains("agentd_saturation 0.5468"));
-            assert!(out.contains("# TYPE agentd_shard_skipped_total counter"));
-            assert!(out.contains("agentd_shard_skipped_total 3"));
+            assert!(out.contains("# TYPE agent_saturation gauge"));
+            assert!(out.contains("agent_saturation 0.5468"));
+            assert!(out.contains("# TYPE agent_shard_skipped_total counter"));
+            assert!(out.contains("agent_shard_skipped_total 3"));
             // The claim lifecycle counters render (default 0 in a bare registry).
-            assert!(out.contains("# TYPE agentd_claims_lost_total counter"));
-            assert!(out.contains("agentd_claims_lost_total 0"));
-            assert!(out.contains("# TYPE agentd_claims_granted_total counter"));
-            assert!(out.contains("# TYPE agentd_claims_released_total counter"));
+            assert!(out.contains("# TYPE agent_claims_lost_total counter"));
+            assert!(out.contains("agent_claims_lost_total 0"));
+            assert!(out.contains("# TYPE agent_claims_granted_total counter"));
+            assert!(out.contains("# TYPE agent_claims_released_total counter"));
             // And they increment.
             r.claims_lost.fetch_add(2, Ordering::Relaxed);
             r.claims_granted.fetch_add(5, Ordering::Relaxed);
             r.claims_released.fetch_add(1, Ordering::Relaxed);
             let out = r.render();
-            assert!(out.contains("agentd_claims_lost_total 2"));
-            assert!(out.contains("agentd_claims_granted_total 5"));
-            assert!(out.contains("agentd_claims_released_total 1"));
+            assert!(out.contains("agent_claims_lost_total 2"));
+            assert!(out.contains("agent_claims_granted_total 5"));
+            assert!(out.contains("agent_claims_released_total 1"));
         }
 
         #[test]
@@ -1441,10 +1441,10 @@ mod imp {
             let r = Registry::new();
             // over-cap in-flight clamps to 1.0
             r.set_saturation(100, 64);
-            assert!(r.render().contains("agentd_saturation 1"));
+            assert!(r.render().contains("agent_saturation 1"));
             // zero capacity → 0.0 (never a div-by-zero)
             r.set_saturation(5, 0);
-            assert!(r.render().contains("agentd_saturation 0"));
+            assert!(r.render().contains("agent_saturation 0"));
         }
 
         #[test]
@@ -1454,8 +1454,8 @@ mod imp {
             r.record_mcp_connect_failure("github");
             r.record_mcp_connect_failure("filesystem");
             let out = r.render();
-            assert!(out.contains("agentd_mcp_connect_failures_total{server=\"github\"} 2"));
-            assert!(out.contains("agentd_mcp_connect_failures_total{server=\"filesystem\"} 1"));
+            assert!(out.contains("agent_mcp_connect_failures_total{server=\"github\"} 2"));
+            assert!(out.contains("agent_mcp_connect_failures_total{server=\"filesystem\"} 1"));
         }
 
         #[test]
@@ -1465,8 +1465,8 @@ mod imp {
             r.record_drain("completed");
             r.record_drain("forced");
             let out = r.render();
-            assert!(out.contains("agentd_drains_total{phase=\"completed\"} 1"));
-            assert!(out.contains("agentd_drains_total{phase=\"forced\"} 1"));
+            assert!(out.contains("agent_drains_total{phase=\"completed\"} 1"));
+            assert!(out.contains("agent_drains_total{phase=\"forced\"} 1"));
         }
 
         #[test]
@@ -1477,11 +1477,11 @@ mod imp {
             let r = Registry::new();
             let out = r.render();
             // Both closed-domain series are present even at zero.
-            assert!(out.contains("# TYPE agentd_config_reload_total counter"));
-            assert!(out.contains("agentd_config_reload_total{result=\"applied\"} 0"));
-            assert!(out.contains("agentd_config_reload_total{result=\"rejected\"} 0"));
-            assert!(out.contains("# TYPE agentd_config_generation gauge"));
-            assert!(out.contains("agentd_config_generation 0"));
+            assert!(out.contains("# TYPE agent_config_reload_total counter"));
+            assert!(out.contains("agent_config_reload_total{result=\"applied\"} 0"));
+            assert!(out.contains("agent_config_reload_total{result=\"rejected\"} 0"));
+            assert!(out.contains("# TYPE agent_config_generation gauge"));
+            assert!(out.contains("agent_config_generation 0"));
             // They increment over the closed domain; an unknown buckets `other`.
             r.record_config_reload("applied");
             r.record_config_reload("rejected");
@@ -1489,13 +1489,13 @@ mod imp {
             r.record_config_reload("totally_made_up");
             r.config_generation.store(1, Ordering::Relaxed);
             let out = r.render();
-            assert!(out.contains("agentd_config_reload_total{result=\"applied\"} 1"));
-            assert!(out.contains("agentd_config_reload_total{result=\"rejected\"} 2"));
-            assert!(out.contains("agentd_config_reload_total{result=\"other\"} 1"));
-            assert!(out.contains("agentd_config_generation 1"));
+            assert!(out.contains("agent_config_reload_total{result=\"applied\"} 1"));
+            assert!(out.contains("agent_config_reload_total{result=\"rejected\"} 2"));
+            assert!(out.contains("agent_config_reload_total{result=\"other\"} 1"));
+            assert!(out.contains("agent_config_generation 1"));
             // Exactly one HELP/TYPE header for the counter family.
             assert_eq!(
-                out.matches("# TYPE agentd_config_reload_total counter")
+                out.matches("# TYPE agent_config_reload_total counter")
                     .count(),
                 1
             );
@@ -1535,9 +1535,9 @@ mod imp {
                 current: Some(512),
                 high: None,
             });
-            assert!(g.contains("# TYPE agentd_memory_max_bytes gauge"));
-            assert!(g.contains("agentd_memory_max_bytes 1024"));
-            assert!(g.contains("agentd_memory_current_bytes 512"));
+            assert!(g.contains("# TYPE agent_memory_max_bytes gauge"));
+            assert!(g.contains("agent_memory_max_bytes 1024"));
+            assert!(g.contains("agent_memory_current_bytes 512"));
             assert_eq!(g.matches(" gauge\n").count(), 2);
             // no cgroup → no gauge lines (keeps /metrics clean off-cgroup)
             assert!(memory_gauges(MemorySnapshot::default()).is_empty());
@@ -1554,43 +1554,43 @@ mod imp {
             // The full §4.3 metric-name set (the names are the frozen contract).
             for name in [
                 // liveness/readiness gauges
-                "agentd_up",
-                "agentd_ready",
+                "agent_up",
+                "agent_ready",
                 // run lifecycle + tokens + intel
-                "agentd_runs_total",
-                "agentd_run_duration_ms", // reserved (histogram)
-                "agentd_loop_steps_total",
-                "agentd_tokens_total",
-                "agentd_intel_calls_total",
-                "agentd_intel_call_duration_ms", // reserved (histogram)
+                "agent_runs_total",
+                "agent_run_duration_ms", // reserved (histogram)
+                "agent_loop_steps_total",
+                "agent_tokens_total",
+                "agent_intel_calls_total",
+                "agent_intel_call_duration_ms", // reserved (histogram)
                 // refusal / bound
-                "agentd_refusals_total",
-                "agentd_limit_exceeded_total",
+                "agent_refusals_total",
+                "agent_limit_exceeded_total",
                 // subagent tree
-                "agentd_active_subagents",
-                "agentd_tree_depth",
-                "agentd_tree_breadth",
-                "agentd_subagents_spawned_total",
-                "agentd_subagents_exited_total",
-                "agentd_subagent_restarts_total",
-                "agentd_subagent_stuck_kills_total",
+                "agent_active_subagents",
+                "agent_tree_depth",
+                "agent_tree_breadth",
+                "agent_subagents_spawned_total",
+                "agent_subagents_exited_total",
+                "agent_subagent_restarts_total",
+                "agent_subagent_stuck_kills_total",
                 // intelligence health
-                "agentd_intel_up",
-                "agentd_intel_errors_total",
+                "agent_intel_up",
+                "agent_intel_errors_total",
                 // MCP server health
-                "agentd_mcp_connect_failures_total",
+                "agent_mcp_connect_failures_total",
                 // tool-call accounting (reserved)
-                "agentd_tool_calls_total",
-                "agentd_tool_call_duration_ms", // reserved (histogram)
+                "agent_tool_calls_total",
+                "agent_tool_call_duration_ms", // reserved (histogram)
                 // lifecycle events
-                "agentd_drains_total",
-                "agentd_restarts_total",       // reserved (no emit site)
-                "agentd_reactor_stalls_total", // reserved (no emit site)
+                "agent_drains_total",
+                "agent_restarts_total",       // reserved (no emit site)
+                "agent_reactor_stalls_total", // reserved (no emit site)
                 // reactive backlog
-                "agentd_pending_events",
-                "agentd_inflight_reactions",
-                "agentd_subscriptions_active",
-                "agentd_reaction_lag_ms",
+                "agent_pending_events",
+                "agent_inflight_reactions",
+                "agent_subscriptions_active",
+                "agent_reaction_lag_ms",
             ] {
                 assert!(
                     out.contains(&format!("# TYPE {name} ")),
@@ -1601,10 +1601,10 @@ mod imp {
             // a HELP/TYPE marker, NO fabricated sample line (the honest-absence
             // shape — no `name <value>` and no `name{...} <value>`).
             for reserved in [
-                "agentd_run_duration_ms",
-                "agentd_intel_call_duration_ms",
-                "agentd_tool_call_duration_ms",
-                "agentd_tool_calls_total",
+                "agent_run_duration_ms",
+                "agent_intel_call_duration_ms",
+                "agent_tool_call_duration_ms",
+                "agent_tool_calls_total",
             ] {
                 assert!(
                     out.contains(&format!("# TYPE {reserved} ")),
@@ -1650,31 +1650,31 @@ mod imp {
             // tree-token bound trip (reactor.rs Usage handler).
             r.record_limit_exceeded("tree_tokens");
             let out = r.render();
-            assert!(out.contains("agentd_subagents_spawned_total 1"));
-            assert!(out.contains("agentd_subagents_exited_total{status=\"completed\"} 1"));
-            assert!(out.contains("agentd_subagents_exited_total{status=\"cancelled\"} 1"));
-            assert!(out.contains("agentd_subagent_stuck_kills_total{signal=\"term\"} 1"));
-            assert!(out.contains("agentd_subagent_stuck_kills_total{signal=\"kill\"} 1"));
-            assert!(out.contains("agentd_drains_total{phase=\"started\"} 1"));
-            assert!(out.contains("agentd_drains_total{phase=\"completed\"} 1"));
-            assert!(out.contains("agentd_drains_total{phase=\"forced\"} 1"));
-            assert!(out.contains("agentd_subagent_restarts_total{reason=\"crashed\"} 1"));
-            assert!(out.contains("agentd_mcp_connect_failures_total{server=\"github\"} 1"));
-            assert!(out.contains("agentd_limit_exceeded_total{limit=\"tree_tokens\"} 1"));
+            assert!(out.contains("agent_subagents_spawned_total 1"));
+            assert!(out.contains("agent_subagents_exited_total{status=\"completed\"} 1"));
+            assert!(out.contains("agent_subagents_exited_total{status=\"cancelled\"} 1"));
+            assert!(out.contains("agent_subagent_stuck_kills_total{signal=\"term\"} 1"));
+            assert!(out.contains("agent_subagent_stuck_kills_total{signal=\"kill\"} 1"));
+            assert!(out.contains("agent_drains_total{phase=\"started\"} 1"));
+            assert!(out.contains("agent_drains_total{phase=\"completed\"} 1"));
+            assert!(out.contains("agent_drains_total{phase=\"forced\"} 1"));
+            assert!(out.contains("agent_subagent_restarts_total{reason=\"crashed\"} 1"));
+            assert!(out.contains("agent_mcp_connect_failures_total{server=\"github\"} 1"));
+            assert!(out.contains("agent_limit_exceeded_total{limit=\"tree_tokens\"} 1"));
         }
 
         #[test]
         fn reserved_no_emit_counters_render_zero() {
-            // `agentd_restarts_total` (supervisor restart) and
-            // `agentd_reactor_stalls_total` have no in-process emit site in this
+            // `agent_restarts_total` (supervisor restart) and
+            // `agent_reactor_stalls_total` have no in-process emit site in this
             // build; they render reserved-but-present at 0 so the contract stays
             // discoverable without falsely claiming a non-zero value.
             let r = Registry::new();
             let out = r.render();
-            assert!(out.contains("# TYPE agentd_restarts_total counter"));
-            assert!(out.contains("agentd_restarts_total 0"));
-            assert!(out.contains("# TYPE agentd_reactor_stalls_total counter"));
-            assert!(out.contains("agentd_reactor_stalls_total 0"));
+            assert!(out.contains("# TYPE agent_restarts_total counter"));
+            assert!(out.contains("agent_restarts_total 0"));
+            assert!(out.contains("# TYPE agent_reactor_stalls_total counter"));
+            assert!(out.contains("agent_reactor_stalls_total 0"));
             // Their HELP marks them reserved (not silently permanent-0). Both
             // reserved-counter HELP lines carry the marker phrase.
             assert!(out.matches("reserved in metrics_schema 1.0").count() >= 2);

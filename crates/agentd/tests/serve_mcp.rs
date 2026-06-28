@@ -109,7 +109,7 @@ fn rpc(
 
 #[test]
 fn a_peer_initializes_lists_and_calls_status() {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("agentd.sock");
 
@@ -218,7 +218,7 @@ fn a_peer_initializes_lists_and_calls_status() {
         r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#,
     );
     assert_eq!(
-        res_list["result"]["resources"][0]["uri"], "agentd://status",
+        res_list["result"]["resources"][0]["uri"], "agent://status",
         "resources/list: {res_list}"
     );
 
@@ -258,7 +258,7 @@ fn a_peer_initializes_lists_and_calls_status() {
 
 #[test]
 fn async_spawn_returns_a_handle_and_tracks_the_run() {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("agentd.sock");
     // intel unreachable → the served async run fails fast; we observe the
@@ -351,7 +351,7 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
     // The reactive loop closed: a peer subscribes to agentd://subagent/<handle>
     // and is PUSHED notifications/resources/updated when that run terminates —
     // no polling. (We cancel a hanging run to make it terminate on cue.)
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(exe, &llm_sock, "hang");
@@ -380,7 +380,7 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
         .as_str()
         .expect("handle")
         .to_string();
-    let uri = format!("agentd://subagent/{handle}");
+    let uri = format!("agent://subagent/{handle}");
 
     // subscribe to the run's resource, then cancel it so it terminates.
     let sub = rpc(
@@ -442,7 +442,7 @@ fn poll_warm_turns(
 fn a_warm_session_runs_a_turn_per_send() {
     // Bidirectional composability: subagent.spawn warm=true keeps the agent alive;
     // each subagent.send runs another turn over the SAME conversation.
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(exe, &llm_sock, "final"); // each turn completes at once
@@ -555,7 +555,7 @@ fn concurrent_async_runs_do_not_serialize() {
     // observe the cancel until run 1 finished — by which point run 1 would be done
     // too. Run 2 finishing cancelled while run 1 is still running proves the two
     // supervisors run concurrently.
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(exe, &llm_sock, "hang");
@@ -631,7 +631,7 @@ fn concurrent_async_runs_do_not_serialize() {
 
 #[test]
 fn cancel_drains_a_live_async_run() {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.sock");
     // `hang`: the run's child blocks ~30s in the model call, so reaching a
@@ -698,7 +698,7 @@ fn cancel_drains_a_live_async_run() {
 /// tools (drain / lame-duck / cancel) and read `agentd://inventory`.
 #[test]
 fn management_peer_drives_the_operator_surface() {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("agentd.sock");
     // An idle reactive daemon that just serves the socket (intel unreachable; it
@@ -854,7 +854,7 @@ fn management_peer_drives_the_operator_surface() {
 #[cfg(feature = "a2a")]
 #[test]
 fn one_agentd_delegates_to_another_over_a2a() {
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let exe = env!("CARGO_BIN_EXE_agent");
     let dir = tempfile::tempdir().expect("tempdir");
 
     // The server agentd: a mock LLM it can reach, and its A2A surface served on a

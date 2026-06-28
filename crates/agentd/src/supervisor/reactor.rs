@@ -217,6 +217,10 @@ impl Supervisor {
             "subagent.spawn",
             json!({"node": node.0, "depth": payload.depth}),
         );
+        // Frozen §4.3 `agentd_subagents_spawned_total` — wired here because the
+        // spawn happens in THIS (supervisor) process, so the bump reaches the
+        // supervisor's `/metrics` scrape (cross-process rollup is a v1 non-goal).
+        crate::obs::metrics::record_subagent_spawned();
         Ok(())
     }
 
@@ -305,6 +309,12 @@ impl Supervisor {
                 if self.tree.charge_tokens(node, u.total()) && self.drain.is_none() {
                     self.log
                         .warn("limit.exceeded", json!({"limit": "tree_tokens"}));
+                    // Frozen §4.3 `agentd_limit_exceeded_total{limit}` — the
+                    // `tree_tokens` leg is the SUPERVISOR's own bound (the tree
+                    // ceiling is charged here), so it reaches the scrape. The other
+                    // legs (steps/tokens/deadline/depth) trip inside the re-exec'd
+                    // child loop; those are process-local (see metrics.rs caveat).
+                    crate::obs::metrics::record_limit_exceeded("tree_tokens");
                     self.begin_drain(KillReason::TreeBudget);
                 }
             }
@@ -476,6 +486,15 @@ impl Supervisor {
                         "subagent.exit",
                         json!({"node": node.0, "outcome": format!("{:?}", r.outcome)}),
                     );
+                    // Frozen §4.3 `agentd_subagents_exited_total{status}` — wired
+                    // here (supervisor process → reaches the scrape). The reap site
+                    // carries only the OS `WaitOutcome`, not the RFC 0007 §3.4
+                    // terminal status the child reported, so this is a COARSE
+                    // projection onto the closed status domain (clean exit →
+                    // `completed`, any signal → `cancelled` [torn down], a non-zero
+                    // exit → `crashed`); the precise per-status breakdown lives in
+                    // the child's `subagent.result`/`subagent.failed` log frames.
+                    crate::obs::metrics::record_subagent_exited(exit_status_label(r.outcome));
                     // The root exited without reporting a result. Only treat that
                     // as an unexpected failure when we are NOT tearing the tree
                     // down: during a drain/stuck/deadline/budget teardown the root
@@ -588,6 +607,11 @@ impl Supervisor {
             "subagent.drain",
             json!({"reason": format!("{reason:?}"), "live": self.live.len()}),
         );
+        // Frozen §4.3 `agentd_drains_total{phase="started"}` — the reactor's own
+        // teardown begins in THIS (supervisor) process, so it reaches the scrape.
+        // `completed` is bumped when the ladder finishes (`LadderAction::Done`),
+        // `forced` when the drain budget is blown (`drain.timeout`).
+        crate::obs::metrics::record_drain("started");
         self.drain = Some(Drain {
             reason,
             ladder: Ladder::with_defaults(now),
@@ -614,6 +638,10 @@ impl Supervisor {
                 "drain.timeout",
                 json!({"live": self.live.len(), "drain_ms": self.drain_timeout.as_millis() as u64}),
             );
+            // Frozen §4.3 `agentd_drains_total{phase="forced"}` — the budget was
+            // exceeded, so the kill ladder is being forced (distinguishes a clean
+            // drain from one that overran). Latched once via the `forced` flag.
+            crate::obs::metrics::record_drain("forced");
         }
         // Hard escape: completion is otherwise gated solely on `live` emptying,
         // which depends on every child's exit being reaped + dispatched. If the
@@ -664,6 +692,9 @@ impl Supervisor {
                 }
                 self.log
                     .warn("subagent.sigterm", json!({"live": self.live.len()}));
+                // Frozen §4.3 `agentd_subagent_stuck_kills_total{signal="term"}` —
+                // the wedged-subtree kill ladder runs in THIS (supervisor) process.
+                crate::obs::metrics::record_subagent_stuck_kill("term");
                 None
             }
             LadderAction::Kill => {
@@ -678,6 +709,8 @@ impl Supervisor {
                 }
                 self.log
                     .warn("subagent.sigkill", json!({"live": self.live.len()}));
+                // Frozen §4.3 `agentd_subagent_stuck_kills_total{signal="kill"}`.
+                crate::obs::metrics::record_subagent_stuck_kill("kill");
                 None
             }
             LadderAction::Done => {
@@ -686,6 +719,9 @@ impl Supervisor {
                     .as_ref()
                     .map(|d| d.reason)
                     .unwrap_or(KillReason::Drain);
+                // Frozen §4.3 `agentd_drains_total{phase="completed"}` — the ladder
+                // finished and the whole subtree is reaped (supervisor process).
+                crate::obs::metrics::record_drain("completed");
                 // Prefer a real terminal the root produced; else the teardown reason.
                 Some(
                     self.root_terminal
@@ -694,6 +730,20 @@ impl Supervisor {
                 )
             }
         }
+    }
+}
+
+/// Coarse projection of an OS `WaitOutcome` onto the frozen RFC 0007 §3.4
+/// terminal-status label domain for `agentd_subagents_exited_total{status}`. The
+/// reap site only sees how the process *ended* (exit code / signal), not the
+/// child's reported terminal status, so this maps clean→`completed`, signalled→
+/// `cancelled` (the subtree was torn down), and a non-zero exit→`crashed`. The
+/// exact per-status counts come from the child's own `subagent.result` frames.
+fn exit_status_label(outcome: WaitOutcome) -> &'static str {
+    match outcome {
+        WaitOutcome::Exited(0) => "completed",
+        WaitOutcome::Exited(_) => "crashed",
+        WaitOutcome::Signaled(_) => "cancelled",
     }
 }
 
@@ -780,4 +830,34 @@ pub fn supervise_swappable(
         SuperviseResult::Killed(_) => crate::obs::metrics::RunOutcome::Killed,
     });
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_status_label_projects_wait_outcome_onto_closed_domain() {
+        // The coarse OS-outcome → frozen RFC 0007 §3.4 status projection used to
+        // drive `agentd_subagents_exited_total{status}` from the reap site.
+        assert_eq!(exit_status_label(WaitOutcome::Exited(0)), "completed");
+        // a non-zero exit (e.g. exit 7 budget / exit 1 generic) → crashed bucket
+        assert_eq!(exit_status_label(WaitOutcome::Exited(1)), "crashed");
+        assert_eq!(exit_status_label(WaitOutcome::Exited(7)), "crashed");
+        // any signal death (SIGTERM/SIGKILL from the teardown ladder) → cancelled
+        assert_eq!(exit_status_label(WaitOutcome::Signaled(15)), "cancelled");
+        assert_eq!(exit_status_label(WaitOutcome::Signaled(9)), "cancelled");
+        // every projected label is in the frozen subagents-exited status domain.
+        for o in [
+            WaitOutcome::Exited(0),
+            WaitOutcome::Exited(1),
+            WaitOutcome::Signaled(9),
+        ] {
+            let label = exit_status_label(o);
+            assert!(
+                ["completed", "crashed", "cancelled"].contains(&label),
+                "projected status {label} is outside the closed domain"
+            );
+        }
+    }
 }

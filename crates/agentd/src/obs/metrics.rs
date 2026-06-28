@@ -117,6 +117,13 @@ pub fn record_restart_tripped() {
 
 /// One loop step executed (`loop.step`, RFC 0010 §3.3). Drives
 /// `agentd_loop_steps_total` (RFC 0016 §4.3).
+///
+/// **Process-local / unwired:** `loop.step` is emitted inside the re-exec'd child
+/// agentic loop, a different process from the supervisor that `/metrics` scrapes,
+/// so calling this would only bump the child's own registry (cross-process rollup
+/// is a v1 non-goal — module header). It is therefore intentionally NOT called
+/// from the loop; the series renders the supervisor's own process only and
+/// agentctl derives step counts from `loop.step` log lines.
 pub fn record_loop_step() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.loop_steps.fetch_add(1, Ordering::Relaxed);
@@ -126,6 +133,12 @@ pub fn record_loop_step() {
 ///
 /// `reason` is the §4.3 closed domain (`trifecta`/`rate`/`budget`/`depth`/`mcp`);
 /// an unknown value buckets under `other`.
+///
+/// **Process-local / unwired:** refusals trip inside the re-exec'd child loop
+/// (the orchestrator self-tool / scope checks), so a bump here would only reach
+/// the child's process-local registry, never the supervisor scrape (cross-process
+/// rollup is a v1 non-goal). Intentionally not called; the headline safety signal
+/// is the refusal / `scope.trifecta_refused` log line.
 pub fn record_refusal(reason: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_refusal(reason);
@@ -138,6 +151,12 @@ pub fn record_refusal(reason: &str) {
 /// `limit` is the §4.3 closed domain (`steps`/`tokens`/`deadline`/`depth`/
 /// `tree_tokens`/`restart_storm`/`spawn_rate`); an unknown value buckets under
 /// `other`.
+///
+/// **Partially wired:** the `tree_tokens` leg is the supervisor's own tree-ceiling
+/// trip (`supervisor::reactor`, this process), so it is live and reaches the
+/// scrape. The `steps`/`tokens`/`deadline`/`depth` legs trip inside the re-exec'd
+/// child loop and are therefore process-local (not called from the child for the
+/// scrape — derive those from `limit.exceeded` log lines).
 pub fn record_limit_exceeded(limit: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_limit_exceeded(limit);
@@ -221,6 +240,12 @@ pub fn record_drain(phase: &str) {
 /// A supervisor process restart was observed (rebuild+reconcile, RFC 0003 §3.11).
 /// Drives `agentd_restarts_total` (RFC 0016 §4.3) — distinct from the breaker-trip
 /// counter [`record_restart_tripped`].
+///
+/// **Reserved / unwired in metrics_schema 1.0:** this build has no in-process
+/// rebuild+reconcile restart path to call it from (a pod restart is a fresh
+/// process with a zeroed registry — an orchestrator counts those, not the
+/// binary). The series renders (always 0) so the frozen contract stays
+/// discoverable; this fn exists for the future reconcile path.
 pub fn record_supervisor_restart() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY
@@ -230,6 +255,12 @@ pub fn record_supervisor_restart() {
 
 /// A wedged-reactor liveness trip (RFC 0003 / RFC 0016 §5 / §4.3
 /// `agentd_reactor_stalls_total`).
+///
+/// **Reserved / unwired in metrics_schema 1.0:** a wedged reactor is surfaced as a
+/// `/healthz` 503 (a per-scrape read of the heartbeat age in `obs::serve`), not as
+/// a one-shot in-process event, so there is no clean site to bump this exactly
+/// once. The series renders (always 0) for discoverability; the live alerting
+/// signal is the 503 itself.
 pub fn record_reactor_stall() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.reactor_stalls.fetch_add(1, Ordering::Relaxed);
@@ -726,43 +757,78 @@ mod imp {
                 STATUS_LABELS,
                 &self.runs_total,
             );
+            // `agentd_loop_steps_total` is driven by `loop.step`, which is emitted
+            // INSIDE the re-exec'd child agentic loop — a different process from the
+            // supervisor this scrape reflects. `record_loop_step` is intentionally
+            // left unwired here: bumping it would only touch the child's own
+            // process-local registry, never this supervisor's. The series is
+            // rendered (so the frozen contract stays discoverable) but reads the
+            // supervisor's own process only; cross-process rollup is a v1 non-goal
+            // (module header). agentctl derives per-run step counts from `loop.step`
+            // log lines (the default story), not from this counter.
             counter(
                 &mut s,
                 "agentd_loop_steps_total",
-                "Agentic loop steps executed.",
+                "Agentic loop steps (process-local; emitted in the child loop, so the supervisor scrape reflects its own process only — cross-process rollup is a v1 non-goal).",
                 g(&self.loop_steps),
             );
 
             // --- token / cost accounting (RFC 0016 §4.3) ---------------------
-            // `agentd_tokens_total{type}` — `model` label deferred (see caveat).
+            // `agentd_tokens_total{type}`: the `model` label RFC 0016 §4.3 freezes
+            // is DEFERRED in metrics_schema 1.0 — the only call site
+            // (`record_tokens`, fed by `AgentMsg::Usage` up the control channel)
+            // does not carry the model identifier, and adding it needs a new emit
+            // site at the intelligence boundary. The label key is reserved; it is
+            // intentionally absent (never faked) until that site lands. agentctl
+            // gets per-model token splits from `intel.result.usage` log lines.
             labelled_counter(
                 &mut s,
                 "agentd_tokens_total",
-                "Model tokens by direction.",
+                "Model tokens by direction (the frozen `model` label is deferred in metrics_schema 1.0 — the AgentMsg::Usage hook carries no model id; never faked).",
                 "type",
                 TOKEN_TYPES,
                 &self.tokens_typed,
             );
+            // `agentd_intel_calls_total`: same `model`-label deferral as tokens
+            // (the `record_intel_call` site carries no model id). Additionally
+            // process-local — `IntelClient::complete` runs in the re-exec'd child
+            // (the supervisor makes no LLM calls), so this reflects only the
+            // scraped process. Derive per-model call counts from `intel.call` logs.
             counter(
                 &mut s,
                 "agentd_intel_calls_total",
-                "Intelligence calls made.",
+                "Intelligence calls made (process-local — the LLM client runs in the child; the frozen `model` label is deferred in metrics_schema 1.0, never faked).",
                 g(&self.intel_calls),
             );
 
             // --- refusal / bound counters (RFC 0016 §4.3) --------------------
+            // `agentd_refusals_total` is driven by the model/loop refusing or a
+            // guard tripping — all INSIDE the re-exec'd child loop (orchestrator
+            // self-tool / scope checks), so `record_refusal` is left unwired: it
+            // would only bump the child's process-local registry. Rendered for
+            // contract discoverability but process-local (the supervisor scrape
+            // reflects its own process; cross-process rollup is a v1 non-goal).
+            // agentctl derives refusals from the refusal/`scope.trifecta_refused`
+            // log lines.
             labelled_counter(
                 &mut s,
                 "agentd_refusals_total",
-                "Refusals/guard trips by reason.",
+                "Refusals/guard trips by reason (process-local; tripped in the child loop, so the supervisor scrape reflects its own process only).",
                 "reason",
                 REFUSAL_REASONS,
                 &self.refusals,
             );
+            // `agentd_limit_exceeded_total{limit}` is PARTIALLY wired: the
+            // `tree_tokens` leg is the supervisor's own tree-ceiling trip
+            // (`supervisor::reactor`, this process → reaches the scrape), so it is
+            // live. The `steps`/`tokens`/`deadline`/`depth` legs trip inside the
+            // re-exec'd child loop and are therefore process-local (unwired here;
+            // derived from `limit.exceeded` log lines). Same cross-process boundary
+            // as the rest of this module.
             labelled_counter(
                 &mut s,
                 "agentd_limit_exceeded_total",
-                "Hard-bound trips by limit.",
+                "Hard-bound trips by limit (the `tree_tokens` leg is supervisor-live; the steps/tokens/deadline/depth legs trip in the child loop and are process-local).",
                 "limit",
                 LIMIT_LABELS,
                 &self.limit_exceeded,
@@ -844,11 +910,65 @@ mod imp {
 
             // --- MCP server health (RFC 0016 §4.3) ---------------------------
             // `agentd_mcp_up{server}` is gauge-per-declared-server; this chunk
-            // has no declared-server registration hook, so it is deferred (see
-            // caveat). The connect-failure counter is wired by `server`.
+            // has no declared-server registration hook, so it is RESERVED/not
+            // emitted in this build (the honest-absence precedent the rest of this
+            // module follows). The connect-failure counter below IS wired — the
+            // daemon's supervisor-process connect path (initial + hot-reload add,
+            // `triggers::mode`) calls `record_mcp_connect_failure(server)`, so a
+            // failing declared server shows up here labelled by `server`. (A
+            // child-side connect failure is process-local and does not reach this
+            // supervisor scrape — the cross-process boundary in the module header.)
             mcp_servers().render_connect_failures(&mut s, &self.mcp_connect_failures);
 
+            // --- tool-call accounting (RFC 0016 §4.3) — RESERVED -------------
+            // `agentd_tool_calls_total{server,tool,ok}` is keyed off `tool.result`,
+            // whose boundary (`McpClient::call_tool`) runs predominantly INSIDE the
+            // re-exec'd child loop (the subagent's tool use); the only supervisor-
+            // process call sites are the reactor's own management/lease calls
+            // (`cluster` claim gate), not the agent's tool use the dashboard wants.
+            // A scrape-side counter would therefore be process-local and misleading
+            // (it would NOT reflect the children's tool calls), so the series is
+            // RESERVED here — rendered as a HELP/TYPE marker, no fabricated 0 — and
+            // agentctl reads tool calls from `tool.result` log lines (the default
+            // story). This mirrors the `agentd_mcp_up` honest-absence precedent.
+            reserved(
+                &mut s,
+                "agentd_tool_calls_total",
+                "counter",
+                "Tool calls by server/tool/ok (RFC 0016 §4.3) — reserved in metrics_schema 1.0; the tool-call boundary runs in the child loop, so a supervisor scrape can't reflect it (derive from tool.result log lines).",
+            );
+            // `agentd_tool_call_duration_ms` / `agentd_intel_call_duration_ms` /
+            // `agentd_run_duration_ms` are frozen HISTOGRAMS. This crate has no
+            // histogram exposition machinery (no bucket/sum/count emission, by
+            // design — RFC 0010 §3.8 keeps the surface a hand-written counter/gauge
+            // text), so they are RESERVED: rendered as HELP/TYPE markers only, no
+            // fabricated buckets. Implementing them is a real feature beyond this
+            // honesty pass; a half-built histogram would be worse than an honest
+            // marker. Latency lives in the `dur_ms` field of the matching log lines.
+            reserved(
+                &mut s,
+                "agentd_tool_call_duration_ms",
+                "histogram",
+                "Tool-call latency (RFC 0016 §4.3) — reserved in metrics_schema 1.0; histogram exposition not implemented (use the tool.result dur_ms field).",
+            );
+            reserved(
+                &mut s,
+                "agentd_intel_call_duration_ms",
+                "histogram",
+                "Intelligence-call latency (RFC 0016 §4.3) — reserved in metrics_schema 1.0; histogram exposition not implemented (use the intel.result dur_ms field).",
+            );
+            reserved(
+                &mut s,
+                "agentd_run_duration_ms",
+                "histogram",
+                "Run latency by terminal status (RFC 0016 §4.3) — reserved in metrics_schema 1.0; histogram exposition not implemented (derive from run start→terminal log lines).",
+            );
+
             // --- lifecycle events (RFC 0016 §4.3) ----------------------------
+            // `agentd_drains_total{phase}` is wired: the reactor's per-run teardown
+            // (`supervisor::reactor`) and the daemon's graceful wind-down
+            // (`triggers::mode`) both run in this (supervisor) process and bump
+            // `started`/`completed`/`forced`.
             labelled_counter(
                 &mut s,
                 "agentd_drains_total",
@@ -857,16 +977,31 @@ mod imp {
                 DRAIN_PHASES,
                 &self.drains,
             );
+            // `agentd_restarts_total` is RESERVED in metrics_schema 1.0: it counts
+            // a supervisor process *restart* (rebuild+reconcile, RFC 0003 §3.11),
+            // and this build has no such in-process restart path to emit it from
+            // (a pod restart is a fresh process with a zeroed registry — an
+            // orchestrator counts those, not the binary). Rendered (always 0) so
+            // the frozen series stays discoverable; `record_supervisor_restart`
+            // exists for the future reconcile path but is intentionally unwired.
             counter(
                 &mut s,
                 "agentd_restarts_total",
-                "Supervisor process restarts observed (RFC 0003 §3.11).",
+                "Supervisor process restarts observed (RFC 0003 §3.11) — reserved in metrics_schema 1.0; no in-process restart/reconcile emit site in this build.",
                 g(&self.supervisor_restarts),
             );
+            // `agentd_reactor_stalls_total` is RESERVED in metrics_schema 1.0: a
+            // wedged reactor is surfaced as a `/healthz` 503 (a derived read of the
+            // heartbeat age in `obs::serve`, evaluated per scrape — RFC 0010 §3.7),
+            // not as a one-shot in-process event, so there is no clean emit site to
+            // bump a counter exactly once. Rendered (always 0) for discoverability;
+            // `record_reactor_stall` is intentionally unwired pending a dedicated
+            // stall-detection edge. The liveness signal an operator alerts on is the
+            // 503 itself, not this counter.
             counter(
                 &mut s,
                 "agentd_reactor_stalls_total",
-                "Wedged-reactor liveness trips (RFC 0003).",
+                "Wedged-reactor liveness trips (RFC 0003) — reserved in metrics_schema 1.0; the live signal is the /healthz 503, no one-shot in-process emit site yet.",
                 g(&self.reactor_stalls),
             );
 
@@ -1083,6 +1218,18 @@ mod imp {
         let _ = writeln!(s, "# HELP {name} {help}");
         let _ = writeln!(s, "# TYPE {name} counter");
         let _ = writeln!(s, "{name} {value}");
+    }
+
+    /// A frozen `metrics_schema 1.0` series whose machinery is not implemented in
+    /// this build: render the `# HELP`/`# TYPE` headers (so the contract stays
+    /// discoverable from the scrape and a future silent-drop is catchable) WITHOUT
+    /// a fabricated always-0 sample line. This is the same honest-absence shape as
+    /// `agentd_mcp_up` — a marker, not a value. `kind` is the Prometheus type the
+    /// series will eventually carry (`counter`/`histogram`); `help` MUST say it is
+    /// reserved and why (cross-process boundary / no histogram exposition yet).
+    fn reserved(s: &mut String, name: &str, kind: &str, help: &str) {
+        let _ = writeln!(s, "# HELP {name} {help}");
+        let _ = writeln!(s, "# TYPE {name} {kind}");
     }
 
     /// One gauge family (point-in-time value) in Prometheus text format.
@@ -1393,6 +1540,143 @@ mod imp {
             assert_eq!(g.matches(" gauge\n").count(), 2);
             // no cgroup → no gauge lines (keeps /metrics clean off-cgroup)
             assert!(memory_gauges(MemorySnapshot::default()).is_empty());
+        }
+
+        #[test]
+        fn frozen_schema_4_3_series_all_present_emitted_or_reserved() {
+            // Honesty gate: every frozen RFC 0016 §4.3 series MUST be discoverable
+            // from the render — either as a live counter/gauge or as a reserved
+            // HELP/TYPE marker. This catches a future silent drop of a frozen
+            // series (a major-bump-only change) at test time.
+            let r = Registry::new();
+            let out = r.render();
+            // The full §4.3 metric-name set (the names are the frozen contract).
+            for name in [
+                // liveness/readiness gauges
+                "agentd_up",
+                "agentd_ready",
+                // run lifecycle + tokens + intel
+                "agentd_runs_total",
+                "agentd_run_duration_ms", // reserved (histogram)
+                "agentd_loop_steps_total",
+                "agentd_tokens_total",
+                "agentd_intel_calls_total",
+                "agentd_intel_call_duration_ms", // reserved (histogram)
+                // refusal / bound
+                "agentd_refusals_total",
+                "agentd_limit_exceeded_total",
+                // subagent tree
+                "agentd_active_subagents",
+                "agentd_tree_depth",
+                "agentd_tree_breadth",
+                "agentd_subagents_spawned_total",
+                "agentd_subagents_exited_total",
+                "agentd_subagent_restarts_total",
+                "agentd_subagent_stuck_kills_total",
+                // intelligence health
+                "agentd_intel_up",
+                "agentd_intel_errors_total",
+                // MCP server health
+                "agentd_mcp_connect_failures_total",
+                // tool-call accounting (reserved)
+                "agentd_tool_calls_total",
+                "agentd_tool_call_duration_ms", // reserved (histogram)
+                // lifecycle events
+                "agentd_drains_total",
+                "agentd_restarts_total",       // reserved (no emit site)
+                "agentd_reactor_stalls_total", // reserved (no emit site)
+                // reactive backlog
+                "agentd_pending_events",
+                "agentd_inflight_reactions",
+                "agentd_subscriptions_active",
+                "agentd_reaction_lag_ms",
+            ] {
+                assert!(
+                    out.contains(&format!("# TYPE {name} ")),
+                    "frozen §4.3 series missing from render: {name}"
+                );
+            }
+            // The three histograms + the deferred tool-call counter are RESERVED:
+            // a HELP/TYPE marker, NO fabricated sample line (the honest-absence
+            // shape — no `name <value>` and no `name{...} <value>`).
+            for reserved in [
+                "agentd_run_duration_ms",
+                "agentd_intel_call_duration_ms",
+                "agentd_tool_call_duration_ms",
+                "agentd_tool_calls_total",
+            ] {
+                assert!(
+                    out.contains(&format!("# TYPE {reserved} ")),
+                    "reserved series marker missing: {reserved}"
+                );
+                // No sample line for the reserved series (only the two `#` headers).
+                for line in out.lines() {
+                    if line.starts_with('#') {
+                        continue;
+                    }
+                    assert!(
+                        !line.starts_with(reserved),
+                        "reserved series {reserved} must not emit a sample line: {line:?}"
+                    );
+                }
+            }
+            // The reserved markers say so (honest HELP text).
+            assert!(out.contains("reserved in metrics_schema 1.0"));
+        }
+
+        #[test]
+        fn wired_supervisor_counters_increment() {
+            // The supervisor-process counters wired in this pass increment via the
+            // same registry methods the emit sites call. (The emit sites live in
+            // `supervisor::reactor` / `triggers::mode`; here we exercise the
+            // registry contract those call sites depend on.)
+            let r = Registry::new();
+            // subagent spawn/exit (reactor.rs).
+            r.subagents_spawned.fetch_add(1, Ordering::Relaxed);
+            r.record_subagent_exited("completed");
+            r.record_subagent_exited("cancelled");
+            // stuck-kill ladder (reactor.rs drive_drain Term/Kill).
+            r.record_subagent_stuck_kill("term");
+            r.record_subagent_stuck_kill("kill");
+            // drain phases (reactor.rs begin_drain/Done/timeout + mode.rs daemon).
+            r.record_drain("started");
+            r.record_drain("completed");
+            r.record_drain("forced");
+            // restart governor respawn (mode.rs Backoff branch).
+            r.record_subagent_restart("crashed");
+            // mcp connect failure (mode.rs connect + hot-reload add).
+            r.record_mcp_connect_failure("github");
+            // tree-token bound trip (reactor.rs Usage handler).
+            r.record_limit_exceeded("tree_tokens");
+            let out = r.render();
+            assert!(out.contains("agentd_subagents_spawned_total 1"));
+            assert!(out.contains("agentd_subagents_exited_total{status=\"completed\"} 1"));
+            assert!(out.contains("agentd_subagents_exited_total{status=\"cancelled\"} 1"));
+            assert!(out.contains("agentd_subagent_stuck_kills_total{signal=\"term\"} 1"));
+            assert!(out.contains("agentd_subagent_stuck_kills_total{signal=\"kill\"} 1"));
+            assert!(out.contains("agentd_drains_total{phase=\"started\"} 1"));
+            assert!(out.contains("agentd_drains_total{phase=\"completed\"} 1"));
+            assert!(out.contains("agentd_drains_total{phase=\"forced\"} 1"));
+            assert!(out.contains("agentd_subagent_restarts_total{reason=\"crashed\"} 1"));
+            assert!(out.contains("agentd_mcp_connect_failures_total{server=\"github\"} 1"));
+            assert!(out.contains("agentd_limit_exceeded_total{limit=\"tree_tokens\"} 1"));
+        }
+
+        #[test]
+        fn reserved_no_emit_counters_render_zero() {
+            // `agentd_restarts_total` (supervisor restart) and
+            // `agentd_reactor_stalls_total` have no in-process emit site in this
+            // build; they render reserved-but-present at 0 so the contract stays
+            // discoverable without falsely claiming a non-zero value.
+            let r = Registry::new();
+            let out = r.render();
+            assert!(out.contains("# TYPE agentd_restarts_total counter"));
+            assert!(out.contains("agentd_restarts_total 0"));
+            assert!(out.contains("# TYPE agentd_reactor_stalls_total counter"));
+            assert!(out.contains("agentd_reactor_stalls_total 0"));
+            // Their HELP marks them reserved (not silently permanent-0). Both
+            // reserved-counter HELP lines carry the marker phrase.
+            assert!(out.matches("reserved in metrics_schema 1.0").count() >= 2);
         }
     }
 }

@@ -49,7 +49,7 @@ intelligence endpoint list + headers). Everything else is env-settable;
 | MCP server | — | `--mcp name=command …` (repeatable, stdio) |
 | Serve self-MCP | `AGENTD_SERVE_MCP` | `--serve-mcp unix:/… │ vsock:PORT │ vsock:CID:PORT` (`serve-mcp` feat.) |
 | A2A peer | `AGENTD_A2A_PEER` | `--a2a-peer name=endpoint` (repeatable; `a2a` feat.) |
-| Enable exec tool | `AGENTD_ENABLE_EXEC` | `--enable-exec` |
+| Enable exec tool | `AGENTD_ENABLE_EXEC` (`:`-list) | `--enable-exec <abs-path>` (repeatable allowlist) |
 | Mode | `AGENTD_MODE` | `--mode once│loop│reactive│schedule` |
 | Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
 | Interval / cron | `AGENTD_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |

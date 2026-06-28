@@ -920,10 +920,22 @@ fn apply_reload(
     // STEP 1 — re-load + re-validate (pure-CPU, no side effect). Re-read ONLY the
     // FILE, re-merge built-in<file<env<flag. `Config::reload` runs the FULL
     // `validate()` pipeline, so a now-invalid file is a `Usage` error here.
+    //
+    // The lethal-trifecta gate now lives in `validate()` (RFC 0012 §3.2 / RFC 0017
+    // §7 — the one validation authority), so a reload whose NEW config forms a
+    // complete trifecta WITHOUT `--allow-trifecta` is refused right here. Because
+    // `--allow-trifecta` is process-global (flag/env, never file-settable) the
+    // running daemon could NOT have started with an un-allowed trifecta, so any
+    // such refusal on reload is, by construction, a NEWLY-formed trifecta (e.g. a
+    // reload that adds an egress/sensitive-tagged `mcp_servers` entry). Relabel it
+    // from the generic "invalid" to `reason="trifecta_required"` — mirroring the
+    // `restart_required` path — so agentctl can route it (the live widening of a
+    // security-critical capability is refused without a restart + the override).
     let mut new_cfg = match Config::reload(args, env) {
         Ok(c) => c,
         Err(e) => {
-            reject(log, generation, "invalid", None, &e.to_string());
+            let msg = e.to_string();
+            reject(log, generation, reload_reject_reason(&msg), None, &msg);
             return None; // no-op — running config kept verbatim
         }
     };
@@ -955,6 +967,33 @@ fn apply_reload(
         };
         reject(log, generation, reason, field, &msg);
         return None; // no-op
+    }
+
+    // Trifecta widening audit (RFC 0012 §3.2): with `--allow-trifecta` set, a
+    // reload CAN legitimately land a complete trifecta that the running config did
+    // not hold (e.g. it adds the egress leg via a tagged `mcp_servers` entry).
+    // `validate()` (run inside `Config::reload` above) already PERMITTED it
+    // (downgraded the refusal to a warning), so it reaches here — but the live
+    // widening must still be recorded, mirroring the startup `scope.trifecta_grant`
+    // event the supervisor emits for an allowed root trifecta. Emit it only on the
+    // running→new TRANSITION into a complete trifecta, so a steady-state reload of
+    // an already-allowed trifecta config does not re-log.
+    {
+        use crate::sec::scope::{TrifectaVerdict, check_trifecta};
+        let now = check_trifecta(new_cfg.trifecta_grant_tags(), new_cfg.allow_trifecta);
+        let before = check_trifecta(running.trifecta_grant_tags(), running.allow_trifecta);
+        if now == TrifectaVerdict::AllowedWithWarning
+            && before != TrifectaVerdict::AllowedWithWarning
+        {
+            log.warn(
+                "scope.trifecta_grant",
+                json!({
+                    "allowed": true,
+                    "legs": ["untrusted_input", "sensitive", "egress"],
+                    "via": "reload",
+                }),
+            );
+        }
     }
 
     // Both pure-CPU gates passed. Compute the reloadable diff (what changed) for
@@ -1021,6 +1060,21 @@ fn apply_reload(
     crate::obs::metrics::record_config_reload("applied");
     crate::obs::metrics::set_config_generation(*generation);
     Some(new_cfg)
+}
+
+/// Classify a candidate-config `validate()` failure into a reload-reject
+/// `reason` (RFC 0017 §5.6). A newly-formed lethal trifecta (refused by the gate
+/// now living in `validate()`, RFC 0012 §3.2) gets the dedicated
+/// `trifecta_required` reason — mirroring `restart_required` — so agentctl can
+/// route it (a security widening needs a restart + `--allow-trifecta`, not a
+/// file fix). Everything else is the generic `invalid`. Pure.
+#[cfg(feature = "hot-reload")]
+fn reload_reject_reason(msg: &str) -> &'static str {
+    if msg.contains("lethal-trifecta") {
+        "trifecta_required"
+    } else {
+        "invalid"
+    }
 }
 
 /// Emit the `config.reload_rejected` event + the `rejected` metric (RFC 0017
@@ -2090,6 +2144,53 @@ mod tests {
         assert!(reloadable_changes(&running, &tagged).contains(&"mcp_servers"));
     }
 
+    /// A reload whose NEW config forms a complete lethal trifecta (no
+    /// `--allow-trifecta`) is refused by the trifecta gate now in `validate()`
+    /// (RFC 0012 §3.2 / RFC 0017 §7), and that refusal is classified as
+    /// `reason="trifecta_required"` so a SIGHUP/ConfigMap swap can never widen the
+    /// trifecta live. The candidate is rebuilt from a config file, so we drive the
+    /// real `Config::reload` path (file<env<flag).
+    #[cfg(feature = "hot-reload")]
+    #[test]
+    fn reload_forming_a_trifecta_is_refused_as_trifecta_required() {
+        use std::io::Write as _;
+        // A config file that grants all three legs on one server (no override).
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            r#"{{"mcp_servers":[{{"name":"s","command":"cmd","tags":{{"*":["untrusted_input","sensitive","egress"]}}}}]}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let args = vec![
+            "--config".to_string(),
+            f.path().display().to_string(),
+            "--mode".to_string(),
+            "reactive".to_string(),
+            "--subscribe".to_string(),
+            "x:res".to_string(),
+        ];
+        let env = vec![
+            ("INSTRUCTION".to_string(), "x".to_string()),
+            ("AGENTD_INTELLIGENCE".to_string(), "unix:/x".to_string()),
+        ];
+        // The candidate fails to load (the trifecta gate in validate() refuses it).
+        let err = Config::reload(&args, &env).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("lethal-trifecta"), "got: {msg}");
+        // …and the reload reason classifier maps that to trifecta_required.
+        assert_eq!(reload_reject_reason(&msg), "trifecta_required");
+        // A generic validation failure is still plain "invalid".
+        assert_eq!(
+            reload_reject_reason("mcp server 's' has empty name"),
+            "invalid"
+        );
+        // With --allow-trifecta the SAME file loads cleanly (the override permits it).
+        let mut allowed = args.clone();
+        allowed.push("--allow-trifecta".to_string());
+        assert!(Config::reload(&allowed, &env).is_ok());
+    }
+
     fn base() -> SpawnPayload {
         SpawnPayload {
             instruction: "triage the change".into(),
@@ -2117,7 +2218,7 @@ mod tests {
                 log_content: false,
             },
             depth: 0,
-            enable_exec: false,
+            exec_allow: Vec::new(),
             warm: false,
         }
     }

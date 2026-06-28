@@ -45,7 +45,14 @@ fn trifecta_refused(h: &Harness) -> Outcome {
     let r = h.run(&args);
     // The refusal is a startup config-validation rejection (the agent never runs)
     // → exit 2 (config/usage). Exit 5 is reserved for a *runtime* refusal after
-    // the agent ran. The scope.trifecta_refused event names the policy cause.
+    // the agent ran.
+    //
+    // The trifecta gate now lives in `Config::validate()` — the single validation
+    // authority (RFC 0017 §7), so `--validate-config` and startup agree. That means
+    // the refusal happens during config load, BEFORE the logger is constructed, so
+    // it surfaces as the usage-refusal MESSAGE on stderr (exactly like every other
+    // `validate()` failure) rather than a structured `scope.trifecta_refused` log
+    // event. We assert that human-readable refusal text instead of the event.
     Outcome::require(
         r.code == Some(2),
         format!(
@@ -55,8 +62,8 @@ fn trifecta_refused(h: &Harness) -> Outcome {
     )
     .and(|| {
         Outcome::require(
-            r.saw_event("scope.trifecta_refused"),
-            "no scope.trifecta_refused event".to_string(),
+            r.stderr.contains("lethal-trifecta"),
+            format!("no lethal-trifecta refusal on stderr:\n{}", r.stderr),
         )
     })
 }

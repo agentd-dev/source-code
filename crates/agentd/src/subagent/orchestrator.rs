@@ -103,7 +103,10 @@ pub struct Orchestrator {
     trace_id: Option<String>,
     log_level: String,
     child_limits: Limits,
-    enable_exec: bool,
+    /// The operator allowlist of absolute binary paths the `exec` tool may invoke
+    /// (RFC 0012 §3.6). Empty ⇒ exec is off (the tool is not advertised). Inherited
+    /// from the payload and fanned to children unchanged (scope only narrows).
+    exec_allow: Vec<String>,
     drain_timeout: Duration,
     /// Future wake-ups the root agent requested via `schedule` this run; drained
     /// into the run's `Outcome` for a daemon supervisor to arm (RFC 0008).
@@ -140,9 +143,10 @@ impl Orchestrator {
             log_level: payload.telemetry.log_level.clone(),
             // Children inherit the parent's per-run bounds (v1).
             child_limits: payload.limits.clone(),
-            // exec is inherited by children (scope only narrows; the Rule-of-Two
-            // tag check is a later refinement).
-            enable_exec: payload.enable_exec,
+            // exec's allowlist is inherited by children (scope only narrows; the
+            // Rule-of-Two tag check is a later refinement). The binary set is fixed
+            // by the operator (RFC 0012 §3.6), never widened by a child.
+            exec_allow: payload.exec_allow.clone(),
             drain_timeout,
             scheduled: Vec::new(),
             subscriptions: Vec::new(),
@@ -324,7 +328,7 @@ impl Orchestrator {
                 log_content: self.log.content_capture(),
             },
             depth: self.parent_depth + 1,
-            enable_exec: self.enable_exec,
+            exec_allow: self.exec_allow.clone(),
             warm: false, // a delegated subagent is a one-shot distilled subtask
         };
         let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
@@ -654,8 +658,9 @@ impl SelfHandler for Orchestrator {
             t.push(subscribe_tool_def());
             t.push(unsubscribe_tool_def());
         }
-        // The gated exec tool — only when --enable-exec was set (RFC 0012).
-        if self.enable_exec {
+        // The gated exec tool — only when the operator allowlist is non-empty
+        // (i.e. --enable-exec named at least one binary; RFC 0012 §3.6).
+        if !self.exec_allow.is_empty() {
             t.push(crate::sec::exec::tool_def());
         }
         t
@@ -680,9 +685,10 @@ impl SelfHandler for Orchestrator {
             "unsubscribe" if self.parent_depth == 0 => {
                 Some(self.subscription(SubscriptionAction::Unsubscribe, args))
             }
-            "exec" if self.enable_exec => Some(crate::sec::exec::handle_call(
+            "exec" if !self.exec_allow.is_empty() => Some(crate::sec::exec::handle_call(
                 args,
                 crate::sec::exec::DEFAULT_TIMEOUT,
+                &self.exec_allow,
             )),
             _ => None,
         }
@@ -958,31 +964,45 @@ mod tests {
                 log_content: false,
             },
             depth,
-            enable_exec: false,
+            exec_allow: Vec::new(),
             warm: false,
         }
     }
 
     #[test]
-    fn exec_tool_is_gated_by_enable_exec() {
+    fn exec_tool_is_gated_by_allowlist() {
         let mut p = payload(0, 4);
-        p.enable_exec = false;
+        p.exec_allow = Vec::new();
         let mut o =
             Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
         assert!(
             !o.tools().iter().any(|t| t.name == "exec"),
-            "exec must be off by default"
+            "exec must be off when the allowlist is empty"
         );
         assert!(
             o.handle("exec", &json!({"argv": ["/bin/true"]})).is_none(),
-            "exec must not run when disabled"
+            "exec must not run when the allowlist is empty"
         );
 
-        p.enable_exec = true;
-        let o = Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
+        // A non-empty allowlist advertises the tool; a call whose argv[0] is NOT
+        // on it is a tool-domain isError observation, not a missing tool.
+        p.exec_allow = vec!["/bin/true".into()];
+        let mut o =
+            Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
         assert!(
             o.tools().iter().any(|t| t.name == "exec"),
-            "exec advertised when enabled"
+            "exec advertised when the allowlist is non-empty"
+        );
+        let (msg, is_err) = o
+            .handle("exec", &json!({"argv": ["/bin/echo", "hi"]}))
+            .expect("exec dispatches when advertised");
+        assert!(
+            is_err,
+            "a non-allowlisted argv[0] is an isError observation"
+        );
+        assert!(
+            msg.contains("not on the operator's allowed-binary list"),
+            "{msg}"
         );
     }
 

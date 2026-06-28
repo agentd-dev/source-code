@@ -72,7 +72,7 @@ fn payload(sock: &Path) -> SpawnPayload {
             log_content: false,
         },
         depth: 0,
-        enable_exec: false,
+        exec_allow: Vec::new(),
         warm: false, // the registry forces warm = true
     }
 }

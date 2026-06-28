@@ -140,31 +140,21 @@ fn run() -> i32 {
         }),
     );
 
-    // Rule of Two (RFC 0012 §3.2): refuse a grant that co-locates all three
-    // lethal capability legs (untrusted input + sensitive data + egress) in one
-    // agent, unless --allow-trifecta. Scope narrows monotonically (RFC 0009), so
-    // enforcing on the root grant bounds the entire subagent tree.
+    // Rule of Two (RFC 0012 §3.2): the lethal-trifecta REFUSAL is now enforced
+    // inside `Config::validate()` — the single validation authority (RFC 0017 §7)
+    // that `--validate-config` and startup both run — so a refused grant already
+    // exited 2 during `Config::load` above and never reaches here. What remains is
+    // the auditable WIDENING: when `--allow-trifecta` downgrades the refusal to a
+    // warning, emit the `scope.trifecta_grant` event so the override is recorded.
+    // Scope narrows monotonically (RFC 0009), so the root union bounds the tree.
     use agentd::sec::scope::{TrifectaVerdict, check_trifecta};
-    match check_trifecta(cfg.trifecta_grant_tags(), cfg.allow_trifecta) {
-        TrifectaVerdict::Ok => {}
-        TrifectaVerdict::AllowedWithWarning => {
-            log.warn(
-                "scope.trifecta_grant",
-                json!({"allowed": true, "legs": ["untrusted_input", "sensitive", "egress"]}),
-            );
-        }
-        TrifectaVerdict::RefusedTrifecta => {
-            log.error(
-                "scope.trifecta_refused",
-                json!({"legs": ["untrusted_input", "sensitive", "egress"]}),
-            );
-            eprintln!(
-                "agentd: refused — this grant gives one agent all three lethal-trifecta legs \
-                 (untrusted input + sensitive data + egress). Split the capabilities across \
-                 subagents, or relaunch with --allow-trifecta."
-            );
-            return exit::USAGE;
-        }
+    if check_trifecta(cfg.trifecta_grant_tags(), cfg.allow_trifecta)
+        == TrifectaVerdict::AllowedWithWarning
+    {
+        log.warn(
+            "scope.trifecta_grant",
+            json!({"allowed": true, "legs": ["untrusted_input", "sensitive", "egress"]}),
+        );
     }
 
     // cgroup v2 memory awareness (best-effort): report the scheduler-imposed
@@ -630,7 +620,11 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             log_content: cfg.log_content,
         },
         depth: 0,
-        enable_exec: cfg.enable_exec,
+        exec_allow: cfg
+            .exec_allow
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         warm: false, // root runs are one-shot; warm continue-sessions are daemon-minted
     }
 }

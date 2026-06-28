@@ -57,7 +57,7 @@ fn parent_payload() -> SpawnPayload {
             log_content: false,
         },
         depth: 0,
-        enable_exec: false,
+        exec_allow: Vec::new(),
         warm: false,
     }
 }

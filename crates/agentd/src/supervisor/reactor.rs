@@ -337,6 +337,26 @@ impl Supervisor {
                     self.root_terminal = Some(SuperviseResult::Failed(error));
                 }
             }
+            AgentMsg::IntelHealth { all_down, active } => {
+                // RFC 0018 §6: the child reports its intel reachability (the
+                // supervisor has no LLM of its own). Latch it into the process-global
+                // `/readyz`, `agentd_intel_all_down`, and `agentd://intelligence`/
+                // `capacity` read — the ONE eventually-consistent truth. Just
+                // progress for liveness; never terminal. The notify-then-read on a
+                // transition is fired by the served drain path (which holds the subs
+                // registry); the blocking `supervise_once` reactor only latches.
+                self.on_event(node, now);
+                let transitioned = signals::set_intel_all_down(all_down);
+                crate::obs::metrics::set_intel_all_down(all_down);
+                if transitioned {
+                    let mut f = json!({"node": node.0, "all_down": all_down});
+                    if let Some(a) = &active {
+                        f["active_index"] = json!(a.index);
+                        f["active_transport"] = json!(a.transport);
+                    }
+                    self.log.info("intel.health", f);
+                }
+            }
         }
     }
 

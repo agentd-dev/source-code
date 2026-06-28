@@ -97,6 +97,28 @@ pub struct IntelClient {
     /// recovers without the daemon crashing — it resumes the instant any endpoint
     /// half-opens healthy.
     alldown: Option<AllDownPolicy>,
+    /// Edge-triggered all-down reachability reporter (RFC 0018 §6). The model loop
+    /// runs in a CHILD process that owns this breaker state; the supervisor has no
+    /// LLM and no live view of it. When set, `complete()` invokes this ONCE on each
+    /// transition of the list's all-down state — on **entering** all-down (every
+    /// breaker open / sweep exhausted) and on **recovering** (any endpoint usable)
+    /// — so the child can report `AgentMsg::IntelHealth` upward. Edge-triggered (a
+    /// cheap `Cell<bool>` compare), so the no-transition steady state pays nothing
+    /// past one bool check. `IntelHealthReport` carries transport+index ONLY (no
+    /// URL/secret). The data path (selection/failover/wire) is UNCHANGED — this is
+    /// a pure additive upward report. Default `None` (one-shot / no supervisor).
+    health_reporter: Option<Box<dyn Fn(IntelHealthReport)>>,
+    /// Last all-down state observed by the reporter, so we only fire on a change.
+    last_all_down: std::cell::Cell<bool>,
+}
+
+/// The edge-triggered intelligence-reachability report a child emits upward (RFC
+/// 0018 §6). `active` is the bounded `(index, transport-scheme)` of the serving
+/// endpoint — transport + index ONLY, NEVER a URL/cid/host or credential (RFC 0012
+/// §3.7). `None` on entering all-down (nothing is serving).
+pub struct IntelHealthReport {
+    pub all_down: bool,
+    pub active: Option<(usize, &'static str)>,
 }
 
 /// Bounded, jittered all-down backoff (RFC 0018 §6 / §4.2). A daemon re-arms the
@@ -140,7 +162,18 @@ impl IntelClient {
             timeout: Duration::from_secs(120),
             trace_id: None,
             alldown: None,
+            health_reporter: None,
+            last_all_down: std::cell::Cell::new(false),
         })
+    }
+
+    /// Install the edge-triggered all-down reachability reporter (RFC 0018 §6): the
+    /// child wires this to send an `AgentMsg::IntelHealth` up to the supervisor on
+    /// each all-down ENTER/EXIT transition. Idempotent on the steady state — the
+    /// callback fires only on a change of the list's all-down state, never per call.
+    /// Adds NOTHING to the data path; a client without it behaves exactly as before.
+    pub fn set_health_reporter(&mut self, reporter: Box<dyn Fn(IntelHealthReport)>) {
+        self.health_reporter = Some(reporter);
     }
 
     /// Stamp the run's trace id so each completion carries a `traceparent`
@@ -200,8 +233,19 @@ impl IntelClient {
             // `set_intel_up` reflects the active endpoint's reachability (in rotation).
             {
                 let list = self.list.borrow();
+                let all_down = list.all_down();
                 let active_up = list.ep(list.active()).health.is_up();
-                crate::obs::metrics::set_intel_up(active_up && !list.all_down());
+                crate::obs::metrics::set_intel_up(active_up && !all_down);
+                // RFC 0018 §6 upward report: fire ONLY on an all-down transition so
+                // the supervisor latches the child's reachability (edge-triggered —
+                // the steady state pays just this bool compare). transport+index
+                // only; no URL/secret. The data path above is untouched.
+                if let Some(report) = &self.health_reporter
+                    && self.last_all_down.replace(all_down) != all_down
+                {
+                    let active = (!all_down).then(|| list.active_identity());
+                    report(IntelHealthReport { all_down, active });
+                }
             }
 
             match sweep.outcome {

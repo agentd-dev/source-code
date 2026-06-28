@@ -150,15 +150,26 @@ struct WarmServed {
 /// Handle → live warm session.
 type WarmRegistry = Arc<Mutex<HashMap<String, WarmServed>>>;
 
-/// Drain a warm session's channel: record completed turns + detect end. Returns
-/// `true` if the session's observable state advanced (a turn completed or it
-/// ended) — the caller pushes a `agentd://session/<handle>` update on `true`.
-/// Idempotent: a no-op drain on an already-`done` session returns `false`.
-fn drain_warm(w: &mut WarmServed) -> bool {
+/// What one [`drain_warm`] pass observed: whether the session's resource state
+/// advanced (pushes a `agentd://session/<handle>` update), and whether the latched
+/// intel all-down state TRANSITIONED on this pass (pushes an `agentd://intelligence`
+/// update — RFC 0018 §6). The two are independent surfaces.
+#[derive(Default)]
+struct WarmDrainOutcome {
+    advanced: bool,
+    intel_transition: bool,
+}
+
+/// Drain a warm session's channel: record completed turns + detect end, and latch
+/// any `AgentMsg::IntelHealth` reachability report into the process-global truth
+/// (RFC 0018 §6). `advanced` is `true` if the session's observable state advanced
+/// (a turn completed or it ended) — the caller pushes a `agentd://session/<handle>`
+/// update then. Idempotent: a no-op drain on an already-`done` session is empty.
+fn drain_warm(w: &mut WarmServed) -> WarmDrainOutcome {
+    let mut out = WarmDrainOutcome::default();
     if w.done {
-        return false;
+        return out;
     }
-    let mut changed = false;
     loop {
         match w.rx.try_recv() {
             Ok((_, AgentMsg::Turn { outcome })) => {
@@ -171,17 +182,29 @@ fn drain_warm(w: &mut WarmServed) -> bool {
                         crate::agentloop::stop::TerminalStatus::Completed
                     ),
                 ));
-                changed = true; // a turn boundary — the session resource changed
+                out.advanced = true; // a turn boundary — the session resource changed
             }
             Ok((_, AgentMsg::Result { .. })) | Ok((_, AgentMsg::Failed { .. })) => {
                 w.done = true;
-                return true;
+                out.advanced = true;
+                return out;
+            }
+            // RFC 0018 §6: latch the served warm session's intel reachability into
+            // the ONE eventually-consistent truth `/readyz`, `agentd_intel_all_down`,
+            // and `agentd://intelligence`/`capacity` read. The caller fires the
+            // notify-then-read on a transition (it holds the subs registry).
+            Ok((_, AgentMsg::IntelHealth { all_down, .. })) => {
+                if crate::signals::set_intel_all_down(all_down) {
+                    crate::obs::metrics::set_intel_all_down(all_down);
+                    out.intel_transition = true;
+                }
             }
             Ok(_) => {} // Ready / Pong / Event / Usage
-            Err(TryRecvError::Empty) => return changed,
+            Err(TryRecvError::Empty) => return out,
             Err(TryRecvError::Disconnected) => {
                 w.done = true;
-                return true;
+                out.advanced = true;
+                return out;
             }
         }
     }
@@ -193,8 +216,15 @@ fn drain_warm(w: &mut WarmServed) -> bool {
 /// so the subscription must survive each emission). Used on every path that drains
 /// a still-tracked session by handle.
 fn drain_warm_notify(handle: &str, w: &mut WarmServed, subs: &SubRegistry) {
-    if drain_warm(w) {
+    let out = drain_warm(w);
+    if out.advanced {
         notify_resource_updated_keep(subs, &crate::agentd_uri::session_uri(handle));
+    }
+    // RFC 0018 §6: an all-down ENTER/EXIT transition is a breaker change — fire the
+    // `agentd://intelligence` notify-then-read so a subscriber re-reads the live
+    // `all_down` (making the §4.4 "fires on … all-down transitions" contract true).
+    if out.intel_transition {
+        notify_resource_updated_keep(subs, crate::agentd_uri::INTELLIGENCE_URI);
     }
 }
 
@@ -340,6 +370,12 @@ impl LiveConfig {
     /// policy. Notify-then-read: NO payload in the notification (the body is read
     /// on demand, carrying transport+index only — never the URL/creds). KEPT
     /// (fires on every swap), exactly like the config/effective notify.
+    ///
+    /// The SAME notify is also fired on an all-down breaker ENTER/EXIT transition
+    /// (RFC 0018 §6) — not from here but from the served warm drain
+    /// (`drain_warm_notify`), which latches a child's `AgentMsg::IntelHealth` and
+    /// re-pushes `agentd://intelligence` on a transition so a subscriber re-reads
+    /// the live `all_down`.
     pub fn notify_intelligence_updated(&self) {
         notify_resource_updated_keep(&self.subs, crate::agentd_uri::INTELLIGENCE_URI);
     }
@@ -681,21 +717,27 @@ impl ServeCtx {
         })
     }
 
-    /// The `agentd://intelligence` body (RFC 0018 §4.4): the endpoint list
-    /// (transport + index, NEVER the URL/creds), which is active, and each one's
-    /// health (state/latency/error-rate). Built from the daemon config's endpoint
-    /// list — a pure structural+health read, no secret, no URL (RFC 0012 §3.7).
+    /// The `agentd://intelligence` body (RFC 0018 §4.4 / §6): the endpoint list
+    /// (transport + index, NEVER the URL/creds), which is active, the swap policy,
+    /// the discovery surface, and the LIVE all-down reachability. Built from the
+    /// daemon config's endpoint topology — a pure structural read, no secret, no URL
+    /// (RFC 0012 §3.7).
     ///
-    /// Note: in served mode the model loop runs in a child subagent process, so
-    /// the live breaker counters are per-run; this supervisor-side view reflects
-    /// the configured endpoint topology with the supervisor's own (fresh) health
-    /// records. The per-endpoint creds resolve from env at build time and are
-    /// never surfaced (the parse drops them into the dialer only).
+    /// HONESTY (RFC 0018 §6): in served mode the model loop runs in a CHILD subagent
+    /// process that owns the live breaker/failover state — the supervisor has no LLM
+    /// and cannot re-derive per-endpoint breaker state. So:
+    /// - the top-level `all_down` is the LATCHED, eventually-consistent truth a child
+    ///   reports up via `AgentMsg::IntelHealth` (NOT a fresh-parse fiction that was
+    ///   structurally always-false), the same flag that flips `/readyz`; and
+    /// - the per-endpoint `state`/`error_rate`/`latency` that genuinely is NOT bridged
+    ///   is reported as `"unknown"` / `aggregated:false` rather than fabricating a
+    ///   freshly-parsed `closed`/0. The endpoint TOPOLOGY (index/transport/addr) is
+    ///   real; only the per-endpoint live health is not aggregated supervisor-side.
     fn intelligence_body(&self) -> Value {
         // Read the LIVE (post-reload) config: `intelligence`/`model` are reloadable
-        // via RFC 0018 §5, so a hot-swap must be reflected here. A swap fans
-        // `notifications/resources/updated{agentd://intelligence}` so a subscriber
-        // re-reads this and sees the new endpoint topology / model (§4.4).
+        // via RFC 0018 §5, so a hot-swap must be reflected here. A swap (and an
+        // all-down breaker transition, §6) fans `notifications/resources/updated{
+        // agentd://intelligence}` so a subscriber re-reads this.
         let cfg = self.live_config.current();
         let uri = cfg.intelligence.as_deref().unwrap_or_default();
         match crate::intel::endpoints::EndpointList::parse(uri, cfg.intelligence_token.clone()) {
@@ -703,6 +745,32 @@ impl ServeCtx {
                 let mut body = list.body(cfg.model.as_deref());
                 // The active swap policy (§4.4 / §5) — non-secret, read on demand.
                 if let Value::Object(m) = &mut body {
+                    // RFC 0018 §6: replace the fresh-parse `all_down` (structurally
+                    // always-false here — the supervisor's parse has fresh breakers)
+                    // with the LATCHED last-child-experience truth. This is the same
+                    // flag /readyz + `agentd_intel_all_down` read.
+                    let all_down = crate::signals::intel_all_down();
+                    m.insert("all_down".into(), json!(all_down));
+                    // Be honest that the per-endpoint breaker detail is NOT bridged
+                    // from the child loop to this supervisor-side view: the topology
+                    // is real, but the live per-endpoint `state`/`error_rate`/latency
+                    // are not aggregated here. A reader keys off `all_down` (latched)
+                    // + `agentd_intel_*` metrics for live health, not these fields.
+                    m.insert("health_aggregated".into(), json!(false));
+                    m.insert("all_down_source".into(), json!("latched_child_report"));
+                    if let Some(Value::Array(eps)) = m.get_mut("endpoints") {
+                        for ep in eps.iter_mut() {
+                            if let Value::Object(epm) = ep {
+                                // The fresh-parse health fields are not real — null
+                                // them out and mark the breaker state unknown rather
+                                // than fabricating closed/0 (RFC 0018 §6 honesty).
+                                epm.insert("state".into(), json!("unknown"));
+                                epm.remove("ewma_latency_ms");
+                                epm.remove("error_rate");
+                                epm.remove("consec_fail");
+                            }
+                        }
+                    }
                     m.insert("swap_policy".into(), json!(cfg.model_swap.as_str()));
                     // RFC 0018 §5.4: the discovery surface — `discovery` (did any
                     // endpoint answer /v1/models) + `models` (union of discovered +
@@ -779,17 +847,24 @@ impl ServeCtx {
         } else {
             (active as f64 / max_total as f64).min(1.0)
         };
-        // Intelligence warmth/health from the configured endpoint topology: at
-        // least one endpoint not all-down ⇒ warm + healthy. A misconfigured list
-        // (should not reach a running daemon — startup validated it) reads not-warm.
+        // Intelligence warmth/health (RFC 0018 §6): the supervisor has no LLM and
+        // cannot probe the endpoints itself, so warmth/health derive from the
+        // LATCHED, eventually-consistent all-down truth a child reports up via
+        // `AgentMsg::IntelHealth` (the same flag /readyz + `agentd_intel_all_down`
+        // read) — NOT a fresh config-parse whose breakers are structurally always
+        // closed (which made `healthy` always true regardless of a down endpoint).
+        // A misconfigured list (should not reach a running daemon — startup
+        // validated it) reads not-warm. `warm` == `healthy` here: both mean "the
+        // fleet should route model work to this pod", and that is exactly what the
+        // latched all-down flag answers.
         let uri = self.config.intelligence.as_deref().unwrap_or_default();
-        let (warm, healthy) = match crate::intel::endpoints::EndpointList::parse(
+        let configured_ok = crate::intel::endpoints::EndpointList::parse(
             uri,
             self.config.intelligence_token.clone(),
-        ) {
-            Ok(list) => (!list.all_down(), !list.all_down()),
-            Err(_) => (false, false),
-        };
+        )
+        .is_ok();
+        let reachable = configured_ok && !crate::signals::intel_all_down();
+        let (warm, healthy) = (reachable, reachable);
         json!({
             "instance": identity.instance,
             // The shard identity string "K/N", or null when unsharded (N==1).
@@ -1465,9 +1540,13 @@ fn subscribe_resource(
                 );
             }
         }
-        // agentd://intelligence fires on breaker / active / all-down transitions
-        // (RFC 0018 §4.4) and is Management-only — reject a non-Management
-        // subscribe as not-found, matching the read gate.
+        // agentd://intelligence fires its `resources/updated` on a hot-swap
+        // (RFC 0018 §5, via `notify_intelligence_updated`) AND on an all-down breaker
+        // ENTER/EXIT transition (RFC 0018 §6 — the served warm drain fires the notify
+        // when a child's `AgentMsg::IntelHealth` flips the latched `all_down`). It is
+        // Management-only — reject a non-Management subscribe as not-found, matching
+        // the read gate. (Per-endpoint breaker/active transitions are NOT bridged to
+        // this supervisor-side view — see `intelligence_body`'s honesty note.)
         Some(crate::agentd_uri::AgentdResource::Intelligence) => {
             if origin != PeerOrigin::Management {
                 return Response::err(
@@ -4442,6 +4521,7 @@ mod tests {
 
     #[test]
     fn intelligence_read_is_management_gated_and_carries_no_url_or_token() {
+        let _g = crate::signals::test_guard(); // `all_down` reads the process-global latch
         let ctx = ctx_multi_endpoint();
         // Management read → endpoints + health, schema per RFC 0018 §4.4.
         let r = dispatch(
@@ -4459,14 +4539,22 @@ mod tests {
         let text = v["contents"][0]["text"].as_str().unwrap();
         let body: Value = serde_json::from_str(text).unwrap();
         assert_eq!(body["active"], 0);
+        // RFC 0018 §6: `all_down` is the LATCHED truth (false by default here); the
+        // per-endpoint live health is NOT bridged supervisor-side → honest markers.
         assert_eq!(body["all_down"], false);
+        assert_eq!(body["health_aggregated"], false);
+        assert_eq!(body["all_down_source"], "latched_child_report");
         assert_eq!(body["model"], "claude-opus-4");
         let eps = body["endpoints"].as_array().unwrap();
         assert_eq!(eps.len(), 2);
         assert_eq!(eps[0]["index"], 0);
         assert_eq!(eps[0]["transport"], "vsock");
         assert_eq!(eps[0]["addr"], "3:8080");
-        assert_eq!(eps[0]["state"], "closed");
+        // The per-endpoint breaker state is reported `unknown` (not a fabricated
+        // `closed`/0) because it genuinely isn't aggregated here (RFC 0018 §6).
+        assert_eq!(eps[0]["state"], "unknown");
+        assert!(eps[0].get("ewma_latency_ms").is_none());
+        assert!(eps[0].get("error_rate").is_none());
         assert_eq!(eps[1]["transport"], "unix");
         // RFC 0012 §3.7: NEVER the token, NEVER a full URL with its scheme.
         assert!(!text.contains("super-secret-tok"), "token leaked: {text}");
@@ -4507,6 +4595,50 @@ mod tests {
         // The rest of the §4.4 body is intact alongside the additive fields.
         assert_eq!(body["active"], 0);
         assert_eq!(body["model"], "claude-opus-4");
+    }
+
+    #[test]
+    fn intelligence_body_reflects_the_latched_all_down_not_a_fresh_parse_fiction() {
+        // RFC 0018 §6: the body's `all_down` must track the latched last-child
+        // report, NOT a fresh `EndpointList::parse` (whose breakers are always
+        // CLOSED, so `all_down` would be structurally always-false). Latch true →
+        // the body reports true; clear → false.
+        let _g = crate::signals::test_guard();
+        let ctx = ctx_multi_endpoint();
+        assert_eq!(
+            ctx.intelligence_body()["all_down"],
+            json!(false),
+            "default latch is not-all-down"
+        );
+        crate::signals::set_intel_all_down(true);
+        assert_eq!(
+            ctx.intelligence_body()["all_down"],
+            json!(true),
+            "a latched child all-down report surfaces (not the fresh-parse false)"
+        );
+        crate::signals::set_intel_all_down(false);
+        assert_eq!(ctx.intelligence_body()["all_down"], json!(false));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn capacity_body_intelligence_warmth_reflects_the_latched_all_down() {
+        // RFC 0018 §6: `intelligence.warm`/`healthy` derive from the latched truth,
+        // not a fresh parse (which made `healthy` always true regardless of a down
+        // endpoint). A valid config + not-all-down ⇒ warm/healthy; all-down ⇒ cold.
+        let _g = crate::signals::test_guard();
+        let ctx = ctx_multi_endpoint();
+        let body = ctx.capacity_body();
+        assert_eq!(body["intelligence"]["warm"], json!(true));
+        assert_eq!(body["intelligence"]["healthy"], json!(true));
+        crate::signals::set_intel_all_down(true);
+        let body = ctx.capacity_body();
+        assert_eq!(
+            body["intelligence"]["warm"],
+            json!(false),
+            "a latched all-down makes the pod cold (don't route model work here)"
+        );
+        assert_eq!(body["intelligence"]["healthy"], json!(false));
     }
 
     #[test]

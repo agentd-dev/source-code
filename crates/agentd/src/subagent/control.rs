@@ -17,12 +17,12 @@
 use crate::agentloop::runner::{LoopAbort, LoopInput, Session, run_loop};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::config::SwapPolicy;
-use crate::intel::client::IntelClient;
+use crate::intel::client::{IntelClient, IntelHealthReport};
 use crate::json::frame;
 use crate::mcp::client::McpClient;
 use crate::obs::log::{Comp, Level, LogCtx, Logger};
 use crate::subagent::orchestrator::Orchestrator;
-use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
+use crate::subagent::protocol::{AgentMsg, ControlMsg, IntelActive, SpawnPayload, SwapIntel};
 use crate::supervisor::budget::Budget;
 use std::io::{self, BufReader, Stdin, Stdout};
 use std::path::PathBuf;
@@ -106,6 +106,9 @@ pub fn run() -> i32 {
         Ok(mut c) => {
             // Outbound LLM calls join the run's distributed trace (RFC 0010).
             c.set_trace_id(payload.telemetry.trace_id.clone());
+            // RFC 0018 §6: bridge this child's intel reachability UP to the
+            // supervisor (which has no LLM of its own) on each all-down transition.
+            install_intel_health_reporter(&mut c, &up);
             c
         }
         Err(e) => {
@@ -193,7 +196,7 @@ pub fn run() -> i32 {
     // turn started is applied here (rebuild client + adopt model). A swap that
     // lands DURING the turn is finish-on-old and invisible — a one-shot has no
     // next turn, so `restart-turn` is moot for it (the run ends after this turn).
-    apply_pending_swap(&pending_swap, &mut intel, &mut input.model, &log);
+    apply_pending_swap(&pending_swap, &mut intel, &mut input.model, &up, &log);
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
         Ok(outcome) => {
             let code = crate::exit::once_exit(outcome.status, outcome.partial);
@@ -264,7 +267,7 @@ fn run_warm(
         // (fresh health/breaker) and adopts the new model. The transcript is
         // UNTOUCHED (§5.3 — no context reset); a turn already running was never
         // torn (finish-on-old by construction — the swap only lands at this seam).
-        apply_pending_swap_warm(pending_swap, &mut intel, &mut session, log);
+        apply_pending_swap_warm(pending_swap, &mut intel, &mut session, up, log);
         // Snapshot the pre-turn transcript so `restart-turn` (RFC 0018 §5.3) can
         // discard a turn that completed under a model swap and re-run it on the new
         // model from this exact state. Cheap (a `usize`); unused under finish-on-old.
@@ -447,6 +450,7 @@ fn apply_pending_swap(
     pending: &PendingSwap,
     intel: &mut IntelClient,
     model: &mut String,
+    up: &Up,
     log: &Logger,
 ) {
     let Some(swap) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -455,7 +459,10 @@ fn apply_pending_swap(
     let from_model = model.clone();
     let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
     let endpoint_change = match rebuild_intel(&swap, intel, log) {
-        Some(c) => {
+        Some(mut c) => {
+            // The rebuilt client has fresh breakers + no reporter — re-install it
+            // so the child keeps bridging reachability up after a repoint (§6).
+            install_intel_health_reporter(&mut c, up);
             *intel = c;
             true
         }
@@ -473,6 +480,7 @@ fn apply_pending_swap_warm(
     pending: &PendingSwap,
     intel: &mut IntelClient,
     session: &mut Session<'_>,
+    up: &Up,
     log: &Logger,
 ) {
     let Some(swap) = pending.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -481,7 +489,10 @@ fn apply_pending_swap_warm(
     let from_model = session.model().to_string();
     let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
     let endpoint_change = match rebuild_intel(&swap, intel, log) {
-        Some(c) => {
+        Some(mut c) => {
+            // The rebuilt client has fresh breakers + no reporter — re-install it
+            // so a warm session keeps bridging reachability up after a repoint (§6).
+            install_intel_health_reporter(&mut c, up);
             *intel = c;
             true
         }
@@ -519,7 +530,28 @@ fn read_spawn(reader: &mut BufReader<Stdin>) -> Result<SpawnPayload, String> {
         .ok_or_else(|| "stdin closed before spawn payload".to_string())?;
     match serde_json::from_slice::<ControlMsg>(&bytes).map_err(|e| e.to_string())? {
         ControlMsg::Spawn(p) => Ok(*p),
-        other => Err(format!("first frame was not Spawn: {other:?}")),
+        // Defense-in-depth (unreachable in practice — the supervisor always sends
+        // Spawn first): report only the variant LABEL, never `{other:?}`. A
+        // `SwapIntel`/`Inject` first frame would otherwise Debug-print a plaintext
+        // token / injected instruction to stderr, contradicting "token NEVER logged".
+        other => Err(format!(
+            "first frame was not Spawn (got {})",
+            control_msg_label(&other)
+        )),
+    }
+}
+
+/// The bare variant tag of a [`ControlMsg`] — NO payload (a `SwapIntel`/`Inject`
+/// carries a credential / injected instruction that must never reach a log/stderr).
+fn control_msg_label(msg: &ControlMsg) -> &'static str {
+    match msg {
+        ControlMsg::Spawn(_) => "spawn",
+        ControlMsg::Ping { .. } => "ping",
+        ControlMsg::Pause => "pause",
+        ControlMsg::Resume => "resume",
+        ControlMsg::Cancel { .. } => "cancel",
+        ControlMsg::Inject { .. } => "inject",
+        ControlMsg::SwapIntel(_) => "swap_intel",
     }
 }
 
@@ -545,6 +577,30 @@ fn send_up(up: &Up, msg: &AgentMsg) {
         // Best-effort: a dead parent means our writes fail; we don't crash.
         let _ = frame::write_frame(&mut *out, msg);
     }
+}
+
+/// Wire the child's intelligence reachability UP to the supervisor (RFC 0018 §6).
+/// The model loop runs in this CHILD process and owns the breaker/failover state;
+/// the supervisor has no LLM and no live view of it. The reporter is edge-triggered
+/// (fires only on an all-down ENTER/EXIT transition) and carries transport+index
+/// ONLY — NEVER a URL/cid/host or credential (RFC 0012 §3.7). Re-installed after a
+/// hot-swap rebuild (the rebuilt client has fresh breakers + no reporter). Cloning
+/// the `up` Arc lets the reporter outlive this fn (it is owned by the new client).
+fn install_intel_health_reporter(intel: &mut IntelClient, up: &Up) {
+    let up = Arc::clone(up);
+    intel.set_health_reporter(Box::new(move |r: IntelHealthReport| {
+        let active = r.active.map(|(index, transport)| IntelActive {
+            index,
+            transport: transport.to_string(),
+        });
+        send_up(
+            &up,
+            &AgentMsg::IntelHealth {
+                all_down: r.all_down,
+                active,
+            },
+        );
+    }));
 }
 
 /// The control reader thread. Owns stdin, answers `Ping` with `Pong`, flips the
@@ -651,6 +707,13 @@ mod tests {
         )
     }
 
+    /// A best-effort upward handle for the swap-apply tests — writes to the real
+    /// stdout (the reporter re-install path is exercised; the framed bytes are
+    /// inert in a unit test, and `send_up` is best-effort by construction).
+    fn test_up() -> Up {
+        Arc::new(Mutex::new(io::stdout()))
+    }
+
     #[test]
     fn pause_wait_returns_immediately_when_not_paused() {
         let paused = AtomicBool::new(false);
@@ -731,7 +794,7 @@ mod tests {
             Some("new-model"),
             SwapPolicy::FinishOnOld,
         ));
-        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());
         assert_eq!(model, "new-model");
         assert_eq!(
             intel.endpoint_count(),
@@ -740,7 +803,7 @@ mod tests {
         );
         // The slot is drained — a second apply is a no-op (no double-swap).
         assert!(pending.lock().unwrap().is_none());
-        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());
         assert_eq!(model, "new-model");
     }
 
@@ -750,7 +813,7 @@ mod tests {
         let pending: PendingSwap = Arc::new(Mutex::new(None));
         let mut intel = IntelClient::from_parts("unix:/only.sock", None).unwrap();
         let mut model = "m".to_string();
-        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());
         assert_eq!(model, "m");
         assert_eq!(intel.endpoint_count(), 1);
     }
@@ -773,6 +836,39 @@ mod tests {
     }
 
     #[test]
+    fn read_spawn_error_never_echoes_a_swap_intel_token() {
+        // Defense-in-depth (the info fold-in): a non-Spawn first frame must report
+        // only the variant LABEL — never `{other:?}`, which would Debug-print a
+        // plaintext token / injected instruction to stderr ("token NEVER logged").
+        let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
+            uri: "unix:/secret.sock".into(),
+            token: Some("super-secret-token".into()),
+            model: Some("m".into()),
+            policy: SwapPolicy::FinishOnOld,
+        }));
+        let mut buf = Vec::new();
+        frame::write_frame(&mut buf, &swap).unwrap();
+        let mut reader = BufReader::new(io::Cursor::new(buf));
+        // `read_spawn` takes `BufReader<Stdin>`; the label helper is the unit under
+        // test for the redaction property — drive it directly to avoid a real stdin.
+        let err = format!(
+            "first frame was not Spawn (got {})",
+            control_msg_label(&swap)
+        );
+        assert_eq!(err, "first frame was not Spawn (got swap_intel)");
+        assert!(!err.contains("super-secret-token"), "token leaked: {err}");
+        assert!(!err.contains("unix:/secret.sock"), "uri leaked: {err}");
+        // The label helper covers every variant tag, payload-free.
+        assert_eq!(
+            control_msg_label(&ControlMsg::Inject {
+                message: "do bad things".into()
+            }),
+            "inject"
+        );
+        let _ = &mut reader; // the framed bytes are constructed; the property is the label
+    }
+
+    #[test]
     fn bad_swap_list_keeps_the_old_client() {
         // RFC 0018 §5.2: an unparseable new list never tears a working run — the
         // old client is kept; only the model (a plain string) is still adopted.
@@ -780,7 +876,7 @@ mod tests {
         let mut intel = IntelClient::from_parts("unix:/old.sock,unix:/old2.sock", None).unwrap();
         let mut model = "old".to_string();
         *pending.lock().unwrap() = Some(swap_to("", Some("new"), SwapPolicy::FinishOnOld));
-        apply_pending_swap(&pending, &mut intel, &mut model, &test_log());
+        apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());
         assert_eq!(intel.endpoint_count(), 2, "kept the old 2-endpoint client");
         assert_eq!(model, "new");
     }

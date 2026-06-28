@@ -105,21 +105,31 @@ fn route(path: &str) -> (&'static str, &'static str, String) {
     }
 }
 
-/// Readiness (RFC 0010 §3.7 / RFC 0015 §4.2). The surface is bound only after
-/// the daemon has initialized, so reaching it means the process is up. Readiness
-/// is then overridden NotReady when the operator has lame-ducked the instance
-/// (`lame-duck{ready:false}`) or a drain is in progress — both advertise "don't
-/// route new work here" without the process necessarily exiting. The override is
-/// toward NotReady only: clearing lame-duck restores Ready iff nothing else
-/// (drain) holds it down.
+/// Readiness (RFC 0010 §3.7 / RFC 0015 §4.2 / RFC 0018 §6). The surface is bound
+/// only after the daemon has initialized, so reaching it means the process is up.
+/// Readiness is then overridden NotReady when the operator has lame-ducked the
+/// instance (`lame-duck{ready:false}`), a drain is in progress, OR the intelligence
+/// channel is all-endpoints-down (RFC 0018 §6) — all three advertise "don't route
+/// new work here" without the process necessarily exiting. The override is toward
+/// NotReady only: clearing the held condition restores Ready iff nothing else holds
+/// it down.
+///
+/// `intel_all_down` is the EVENTUALLY-CONSISTENT, last-child-experience latch a
+/// subagent reports up via `AgentMsg::IntelHealth` (the supervisor has no LLM of
+/// its own to probe with). A pod whose only model endpoint is down stops
+/// advertising Ready, so the fleet stops routing work to it — and recovers Ready
+/// the moment a child reports an endpoint usable again.
 fn readiness_response() -> (&'static str, &'static str, String) {
     let lame_duck = crate::signals::lame_duck();
     let draining = crate::signals::draining();
-    if lame_duck || draining {
+    let intel_all_down = crate::signals::intel_all_down();
+    if lame_duck || draining || intel_all_down {
         (
             "503 Service Unavailable",
             "text/plain",
-            format!("not ready lame_duck={lame_duck} draining={draining}\n"),
+            format!(
+                "not ready lame_duck={lame_duck} draining={draining} intel_all_down={intel_all_down}\n"
+            ),
         )
     } else {
         ("200 OK", "text/plain", "ready\n".into())
@@ -196,6 +206,30 @@ mod tests {
             let (s, _, _) = route("/readyz");
             assert_eq!(s, "200 OK", "clearing lame-duck restores Ready");
         }
+    }
+
+    #[test]
+    fn readyz_flips_503_under_intel_all_down_then_clears() {
+        // RFC 0018 §6: a pod whose only model endpoint is down stops advertising
+        // Ready (the readiness flip the §6 promise requires), and recovers when a
+        // child reports an endpoint usable again. The latch is the same one a child's
+        // `AgentMsg::IntelHealth` sets through the supervisor.
+        let _g = crate::signals::test_guard();
+        if crate::signals::draining() {
+            return; // a SIGTERM in the test process would dominate the verdict
+        }
+        // Baseline: nothing held down → ready.
+        let (s, _, _) = route("/readyz");
+        assert_eq!(s, "200 OK", "baseline /readyz is ready");
+        // All-endpoints-down → /readyz 503 (the body names the held condition).
+        crate::signals::set_intel_all_down(true);
+        let (s, _, body) = route("/readyz");
+        assert_eq!(s, "503 Service Unavailable", "intel all-down → NotReady");
+        assert!(body.contains("intel_all_down=true"), "body: {body}");
+        // Recovery → Ready again (nothing else holds it down).
+        crate::signals::set_intel_all_down(false);
+        let (s, _, _) = route("/readyz");
+        assert_eq!(s, "200 OK", "intel recovery restores Ready");
     }
 
     #[test]

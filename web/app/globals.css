@@ -240,7 +240,7 @@ a {
 }
 
 /* ───────────────────────── docs prose ───────────────────────── */
-.prose-agentd {
+.prose-agent {
   --tw-prose-body: var(--fg);
   --tw-prose-headings: var(--fg-strong);
   --tw-prose-links: var(--green);
@@ -253,23 +253,23 @@ a {
   --tw-prose-td-borders: var(--line);
   font-size: 0.92rem;
 }
-.prose-agentd :where(code):not(:where(pre code)) {
+.prose-agent :where(code):not(:where(pre code)) {
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 0.08rem 0.35rem;
   font-weight: 400;
 }
-.prose-agentd :where(code):not(:where(pre code))::before,
-.prose-agentd :where(code):not(:where(pre code))::after {
+.prose-agent :where(code):not(:where(pre code))::before,
+.prose-agent :where(code):not(:where(pre code))::after {
   content: "";
 }
-.prose-agentd :where(pre) {
+.prose-agent :where(pre) {
   background: #0c0c0e;
   border: 1px solid var(--line);
   border-radius: 8px;
 }
-.prose-agentd :where(a):hover {
+.prose-agent :where(a):hover {
   text-decoration: underline;
 }
 

@@ -446,3 +446,6 @@ See `agentd --help` for the full flag list.
 - Binding decisions — `docs/design/00-architecture-assessment.md`
 - Build progress — `docs/design/PLAN.md`
 - The live CLI/env surface — `crates/agentd/src/config.rs`
+- [Horizontal scaling](scaling.md) — running the reactive worker as a *fleet*:
+  `--shard K/N` partitioning + work-claim leases extend the exactly-one-owner rule
+  from intra- to **inter**-instance (RFC 0019).

@@ -11,9 +11,10 @@
 //!
 //! agentd does **not** discover its own shard — agentctl assigns `K/N` from the
 //! StatefulSet ordinal (RFC 0019 §4.2); this module only reads, validates, and
-//! applies it. Claim/lease (§3) and standby (§7) are DEFERRED (RFC 0019 §12), so
-//! sharding here is the whole cross-instance-ownership story for this build: a
-//! `K/N` fleet with no claim deterministically owns each item by one shard.
+//! applies it. Sharding is the cheap pre-filter; the work-claim convention (§3,
+//! see [`super::claim`]) is the correctness backstop — both ship. A `K/N` fleet
+//! with no claim still deterministically owns each item by one shard (the §4.1
+//! shard-only row), which is correct for level-triggered work.
 
 /// FNV-1a/64, hand-rolled exactly per RFC 0019 §4.1: offset basis
 /// `0xcbf29ce484222325`, prime `0x00000100000001B3`, xor-then-multiply with

@@ -152,6 +152,32 @@ introduces **no** new `event` strings.
 > `kind:"self_subscribe"`. Build-gated surfaces also emit `metrics.*` /
 > `cron.unavailable` / `mcp.serve_unavailable` when a flag needs a feature.
 
+### Operability: management, hot reload, intelligence swap
+
+These events come from the operability surfaces (the management transport, hot
+reload, the intelligence hot-swap). They are emitted only by the builds that
+serve them (`serve-mcp` / `hot-reload` / `config-watch`). The operator/control-
+plane framing for each lives in [`docs/operations.md`](operations.md).
+
+| Event | `comp` | Fields beyond canonical |
+|---|---|---|
+| `mcp.connect` / `mcp.disconnect` | `supervisor` | `origin` (`stdio`/`management`), `conn` — a peer joined/left the served transport |
+| `mcp.drain` | `supervisor` | `in_flight`, `eta_ms` — the `drain` operator tool tripped the drain latch |
+| `mcp.lame_duck` | `supervisor` | `ready` — the `lame-duck` tool flipped the readiness override |
+| `mcp.pause` / `mcp.resume` | `supervisor` | `affected` — the `pause`/`resume` tools suspended/continued N live subtrees |
+| `config.reload_requested` | `supervisor` | `trigger` (`sighup`/`watch`) — a reload was requested |
+| `config.reloaded` | `supervisor` | `changed` (the reloadable group labels), `applied_ms` — a reload was **applied** (a clean no-op with no material change still reports `changed:[]`) |
+| `config.reload_rejected` | `supervisor` | `reason` (`invalid`/`restart_required`), `field`, `diagnostics` — a reload was a clean no-op |
+| `config.reload.values` | `supervisor` | `model`, `max_tokens`, `max_steps`, `max_depth`, `log_level` — the value-swap step's new template (no secret) |
+| `config.watch.armed` / `config.watch.fired` / `config.watch.error` | `supervisor` | `file`/`err` — the `--watch-config` inotify watcher armed, fired on a ConfigMap swap, or hit an I/O error |
+| `intel.swap` | `intel` | `kind` (`model`/`endpoint`), `model_from`, `model_to`, `endpoint_change`, `policy` — a hot-swap was applied at a turn boundary (no URL, no secret) |
+| `intel.swap.reject` | `intel` | a parked swap was refused at the turn boundary |
+
+> The intelligence-swap line carries the model *names* (non-secret identifiers),
+> the swap kind, and whether the endpoint list changed — **never** the endpoint
+> URL or credential. Endpoint identity is transport+index only, surfaced by the
+> `agentd://intelligence` resource (§The served control resources), never inline.
+
 ---
 
 ## Tree correlation
@@ -353,6 +379,57 @@ surfaces are opt-in and never on for a one-shot.
 
 ---
 
+## The served control resources
+
+When the management transport is on (`--serve-mcp`, [`operations.md`](operations.md)),
+a control plane reads live state as `agentd://` MCP resources rather than scraping
+metrics — each is a structured JSON read, most are **subscribable** (notify-then-
+read: a payload-free `notifications/resources/updated`, then a `resources/read`).
+Most are **Management-only** (a Stdio peer 404s on them). These complement the
+metrics above: metrics are for time-series/alerting, resources for point-in-time
+operator reads and event-driven control.
+
+| Resource | Origin | Subscribable | Body |
+|---|---|---|---|
+| `agentd://status` | any | no | run id, mode, version, pid, uptime, spawn counts |
+| `agentd://capabilities` | any | no | the live capabilities manifest (identity, `surfaces{}`, limits) |
+| `agentd://run/{id}` | any | yes (each spawn / terminal change) | the served run aggregate; folds in the run-outcome report once terminal |
+| `agentd://subagent/{handle}` | any | yes (terminal only) | an async child's status / distilled result |
+| `agentd://session/{handle}` | any | yes (each warm-turn boundary) | a warm session's turn state |
+| `agentd://inventory` | Management | yes (spawn / exit / status change) | the live subagent-tree projection: lifecycle flags (`draining`/`paused`/`ready`), totals, per-node status/usage |
+| `agentd://intelligence` | Management | yes (breaker / active / all-down transitions) | endpoint health: the ordered endpoint list (transport + index, **never** the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, the all-down flag, swap policy, discovery |
+| `agentd://config/effective` | Management | yes (each applied hot reload) | the live, **redacted** reloadable-config view (no token/URL/secret) |
+| `agentd://capacity` | Management *(cluster build)* | no | the placement view: identity, shard `K/N`, standby, free slots, active subagents, intelligence warmth, saturation |
+| `agentd://events` | Management *(`events` feature)* | yes (each new event) | the bounded live-event ring — see below |
+
+> The redaction discipline is the same as the capabilities manifest and the
+> intel-swap log line: `agentd://intelligence` and `agentd://config/effective`
+> carry transport schemes, structural names, and header *names* only — never a
+> token, an endpoint URL, or a resolved `{{secret:…}}` value.
+
+### `agentd://events` — the live log ring
+
+With the `events` feature (and a management transport to serve it on), the same
+JSON log lines are mirrored into a bounded in-memory ring you can tail over MCP —
+the operator live-tail, without a collector round-trip. A read drains a bounded
+window with the standard MCP cursor; the envelope (`events_schema` = `1.0`)
+reports the window bounds and a **`dropped`** count so a subscriber knows when the
+lossy-by-design ring outran it:
+
+```jsonc
+// resources/read agentd://events?after=4821&level=warn&event=subagent.,limit.
+{ "events_schema":"1.0", "oldest_seq":4700, "newest_seq":4990, "dropped":0,
+  "events":[ /* the RFC 0010 JSON log lines, filtered */ ] }
+```
+
+The cursor + filters ride the query string: `?after=<seq>` (advance to the last
+`seq` you saw; a malformed value safely falls back to the whole window),
+`?level=<lvl>` (exact level match), `?event=<prefix,prefix>` (a comma-list of
+dotted event prefixes). The ring never blocks the supervisor — a slow reader
+loses old lines (reflected in `dropped`), never stalls the daemon.
+
+---
+
 ## Metrics & traces
 
 ### Default: derive metrics from logs
@@ -399,6 +476,78 @@ A tiny in-process table of atomic counters/gauges feeds a hand-written
 **Prometheus 0.0.4 text exposition** (`# HELP` / `# TYPE` + `name{labels} value`)
 served on the already-opt-in surface (`/metrics`). **No `prometheus` or `metrics`
 crate** — it is plain text, no async, no SDK.
+
+The metric **names** and label **keys** are a **frozen, versioned contract**
+(`metrics_schema` = `1.0`, surfaced at `surfaces.metrics_schema` in the
+capabilities manifest). The set is additive within the major; a rename/removal
+bumps the major. A control plane authors scalers/alerts against it. Labels carry
+**bounded** values only — out-of-vocabulary values fold into an `other` slot so
+the cardinality is structurally bounded (the closed label set is a compile-time
+array). The same cardinality discipline as the default story applies: **never**
+`run_id` / `agent_id` / `agent_path` / `call_id` / a URI in a label.
+
+#### Operability metrics (control plane)
+
+The management/hot-reload surfaces add these to the frozen set:
+
+- **`agentd_paused`** *(gauge, 0/1)* — `1` while the `pause` operator tool has
+  frozen the agentic tree at turn boundaries; `0` after `resume`. **Pause is not
+  readiness** — `agentd_ready` ignores it (it tracks only drain / lame-duck), so
+  a paused instance can still read `agentd_ready 1`.
+- **`agentd_config_reload_total{result}`** *(counter)* — hot reloads by result.
+  The closed domain is `applied` | `rejected` | `other`. A `rejected` reload is a
+  clean no-op (the running config is unchanged).
+- **`agentd_config_generation`** *(gauge)* — the count of successfully-applied
+  reloads, monotonic in practice. A scraper detects "this instance has picked up
+  generation N" against the controller's desired generation.
+- **`agentd_drains_total{phase}`** *(counter)* — drain phase transitions; the
+  closed domain is `started` | `completed` | `forced` | `other` (so `completed`
+  vs `forced` distinguishes a clean drain from one that overran its budget).
+- **`agentd_runs_total{status}`** *(counter)* — runs by the RFC 0007 §3.4
+  terminal-status vocabulary (`completed`, `refused`, `exhausted_steps`,
+  `exhausted_tokens`, `deadline`, `stalled`, `loop_detected`, `cancelled`,
+  `crashed`, `other`).
+- **`agentd_refusals_total{reason}`** *(counter)* — guard trips by reason
+  (`trifecta` | `rate` | `budget` | `depth` | `mcp` | `other`).
+- **`agentd_intel_up`** *(gauge, 0/1)* and **`agentd_intel_errors_total{reason}`**
+  *(counter; `unreachable`|`auth`|`timeout`|`5xx`|`other`)* — intelligence-endpoint
+  reachability + error breakdown.
+- **`agentd_restarts_total`**, **`agentd_reactor_stalls_total`** *(counters)* —
+  supervisor process restarts observed, and wedged-reactor liveness trips.
+- **`agentd_tree_breadth`** *(gauge)* — current max siblings at any tree node
+  (alongside the existing `agentd_active_subagents` / `agentd_tree_depth`).
+- **`agentd_memory_max_bytes`** / **`agentd_memory_current_bytes`** *(gauges)* —
+  cgroup-v2 `memory.max` / `memory.current`, emitted only for the fields the
+  kernel exposes (absent off-cgroup, keeping `/metrics` clean).
+
+#### Reactive-backlog gauges (the scaling-signal set)
+
+Point-in-time gauges a horizontal scaler reads:
+
+- **`agentd_pending_events`** — reactive events received but not yet routed.
+- **`agentd_inflight_reactions`** — reactions currently executing.
+- **`agentd_subscriptions_active`** — reconciled declared subscriptions.
+- **`agentd_reaction_lag_ms`** — age of the oldest un-routed pending event.
+- **`agentd_saturation`** *(float gauge in `[0,1]`)* — in-flight / capacity
+  utilization — the HPA "utilization" target. A zero capacity reads `0.0` and an
+  over-cap in-flight clamps to `1.0` (never a div-by-zero, never `> 1`).
+
+#### Horizontal-scaling counters (`cluster` build)
+
+Wired by the `cluster` build's shard gate and claim gate:
+
+- **`agentd_shard_skipped_total`** *(counter)* — items dropped as out-of-shard by
+  the routing pre-filter.
+- **`agentd_claims_lost_total`** *(counter)* — work claims lost to another replica
+  — the over-provision signal (high & rising under low backlog ⇒ scale down).
+- **`agentd_claims_granted_total`** / **`agentd_claims_released_total`**
+  *(counters)* — claims this replica won, and held claims handed back on a non-
+  terminal wind-down or drain.
+
+(The legacy bare series — `agentd_runs_started_total`, `agentd_tokens_input_total`,
+`agentd_reactions_total`, etc. — are retained alongside the frozen set, additive
+within the major. `agentd_mcp_up{server}` is **not** emitted in this build — only
+the connect-failure counter is.)
 
 ### `otel` feature — OTLP export + GenAI semconv (`--features otel`)
 

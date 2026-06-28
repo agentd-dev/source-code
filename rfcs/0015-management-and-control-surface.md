@@ -675,12 +675,24 @@ result schema.
 | `agentd/shard` | `"K/N"` or absent (RFC 0019 §4) | server-side observability only |
 | `traceparent` | W3C trace-context (RFC 0010) | span propagation |
 
-**Two styles (frozen, per-route `claim.style`).** `tool` (default): the server
+**Two styles (per-route `claim.style`).** `tool` (default): the server
 advertises the four `work.*` tools above. `resource`: the server models items as
 resources carrying a `lease` field; `work.claim` degenerates to a conditional
 (compare-and-set) `tools/call` the server exposes, observed after a
 `resources/read`. The lifecycle (CLAIMED → ack/release/expire) is identical; only
 the wire shape differs.
+
+> **Implementation status (resource style).** The `tool` style is **implemented +
+> frozen** (the four `work.*` names + `_meta` above). The `resource` style is
+> **deliberately deferred — its CAS wire shape is NOT yet frozen.** Unlike `tool`,
+> where the names are pinned, the resource variant's compare-and-set call (the
+> exact tool name + `expect_lease`/`new_lease` argument shape) is left unfrozen
+> **until a concrete resource-lease coordination server exists to validate it
+> against** — freezing a CAS contract speculatively risks a wrong shape that could
+> double-grant, the one thing the convention must never do. agentd's claim client
+> therefore dispatches a `claim.style=resource` route to a loud error (and startup
+> validation rejects it), never a silent misbehaviour; the path slots in behind the
+> existing `ClaimOutcome` once the CAS shape is frozen against a real consumer.
 
 **The claim key narrows RUN_ID for `claim` routes (extension to RFC 0011 §6).**
 RFC 0011 §6.1 mints RUN_ID as a per-process value. For a `claim` route this would

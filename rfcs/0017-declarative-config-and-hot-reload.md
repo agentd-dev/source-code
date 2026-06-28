@@ -489,6 +489,10 @@ validated, and it **never** half-applies.
    ├─ MCP servers:   stop+reap removed servers via the stdio shutdown ladder
    │                 (close-stdin→SIGTERM→SIGKILL, RFC 0004/0003 §3.5);
    │                 spawn+handshake added servers (RFC 0004); leave unchanged ones.
+   │                 (changed = same name, different command/argv/tags = remove-
+   │                 then-add.) The supervisor keys servers/owner/claim wiring BY
+   │                 NAME, not by Vec position, so a remove/add never shifts another
+   │                 server's identity — the live re-handshake stays coherent.
    ├─ subscriptions: unsubscribe removed URIs; for ADDED URIs, subscribe AND
    │                 read-after-subscribe (MANDATORY — RFC 0003 §3.11) to convert
    │                 edge→level across the reload boundary; leave unchanged ones.

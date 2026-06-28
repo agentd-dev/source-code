@@ -292,6 +292,18 @@ impl McpClient {
     }
 
     fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
+        // Fail FAST if the reader thread has already exited (the server's stdout
+        // hit EOF / a read error). Without this, a request after the reader is gone
+        // registers a pending sender nothing will ever resolve, so `recv_timeout`
+        // blocks for the FULL per-request timeout (up to 60s) — which can wedge a
+        // best-effort drain/reload unsubscribe. A dead reader means the connection
+        // is gone; surface it immediately as a transport error (RFC 0004).
+        if self._reader.is_finished() {
+            return Err(McpError::Transport(format!(
+                "server '{}' connection is closed (reader exited)",
+                self.name
+            )));
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);

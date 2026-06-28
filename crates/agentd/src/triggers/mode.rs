@@ -29,7 +29,7 @@ use crate::triggers::router::{Disposition, Route, Router};
 use crate::triggers::warm::WarmRegistry;
 use crate::wire::mcp::method;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -53,8 +53,10 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 ///     keeps the lease (`last_renew`), and they settle when the session ENDS.
 #[cfg(feature = "cluster")]
 struct HeldClaim {
-    /// Index of the coordination server in the connected `servers` vec.
-    server_idx: usize,
+    /// NAME of the coordination server in the name-keyed `servers` map. A name is
+    /// stable across a hot reload (RFC 0017 §5.3); a positional index would shift
+    /// when an earlier server is removed, silently mis-routing the ack/release.
+    server: String,
     /// The opaque lease id `work.claim` granted (for renew/ack/release).
     lease_id: String,
     /// The item-derived claim key (== the spawned reaction's RUN_ID), carried on
@@ -125,7 +127,20 @@ pub fn run_reactive(
 ) -> i32 {
     // The supervisor owns the MCP connections used for subscriptions + reads.
     // (Each spawned reaction connects its own MCP for tool use, via the payload.)
-    let mut servers = Vec::new();
+    //
+    // NAME-KEYED (RFC 0017 §5.3): `servers` maps a server's NAME → its connected
+    // `McpClient`, and `owner` maps a subscription URI → the owning server's NAME.
+    // A name is stable across an add/remove/edit hot reload, where a positional
+    // `Vec` index would shift the moment an earlier server is removed — silently
+    // corrupting `owner` and the claim wiring. Lookups are by-name throughout.
+    // `server_order` preserves the config declaration order so the "first server
+    // that supports subscribe" choice (subscription arming) is byte-for-byte the
+    // pre-refactor insertion-order choice, not the BTreeMap's name-sorted order.
+    let mut servers: BTreeMap<String, McpClient> = BTreeMap::new();
+    // Mutable so a hot reload can append an added server / drop a removed one
+    // while keeping the declaration-order "first supporting server" choice stable.
+    #[cfg_attr(not(feature = "hot-reload"), allow(unused_mut))]
+    let mut server_order: Vec<String> = Vec::new();
     for spec in &cfg.mcp_servers {
         match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60))
             .and_then(|mut c| c.initialize().map(|()| c))
@@ -135,7 +150,8 @@ pub fn run_reactive(
                     "mcp.connect",
                     json!({"server": spec.name, "subscribe": c.capabilities().supports_subscribe()}),
                 );
-                servers.push(c);
+                servers.insert(spec.name.clone(), c);
+                server_order.push(spec.name.clone());
             }
             Err(e) => {
                 log.error(
@@ -156,12 +172,13 @@ pub fn run_reactive(
     // guaranteed the server is a declared `--mcp` server (exit 2) and the URI is
     // in the subscribe set (routed as a Spawn).
     #[cfg(feature = "cluster")]
-    let claim_by_uri: HashMap<String, crate::cluster::ClaimSpec> = {
+    #[cfg_attr(not(feature = "hot-reload"), allow(unused_mut))]
+    let mut claim_by_uri: HashMap<String, crate::cluster::ClaimSpec> = {
         use std::collections::HashSet;
         let mut map: HashMap<String, crate::cluster::ClaimSpec> = HashMap::new();
-        let mut validated: HashSet<usize> = HashSet::new();
+        let mut validated: HashSet<String> = HashSet::new();
         for route in &cfg.claim_routes {
-            let Some(idx) = servers.iter().position(|s| s.name() == route.server) else {
+            let Some(coord) = servers.get(&route.server) else {
                 // Unreachable in practice (config validated it), but never panic.
                 log.error(
                     "claim.server_missing",
@@ -169,11 +186,11 @@ pub fn run_reactive(
                 );
                 return exit::USAGE;
             };
-            if validated.insert(idx) {
+            if validated.insert(route.server.clone()) {
                 // Live, post-handshake predicate (one list_tools per distinct
                 // coordination server). A transport failure here is a down server
                 // → exit 6 (retriable); up-but-missing-the-tools → exit 2.
-                match servers[idx].list_tools() {
+                match coord.list_tools() {
                     Ok(tools) if crate::cluster::advertises_work_tools(&tools) => {
                         log.info(
                             "claim.coord_ready",
@@ -207,7 +224,7 @@ pub fn run_reactive(
             map.insert(
                 route.uri.clone(),
                 crate::cluster::ClaimSpec {
-                    server_idx: idx,
+                    server: route.server.clone(),
                     ttl: cfg.claim_ttl,
                     renew_fraction: cfg.claim_renew_fraction,
                     style: route.style,
@@ -283,16 +300,18 @@ pub fn run_reactive(
     };
 
     // Subscribe each URI (spawn + continue alike) on the first connected server
-    // that supports it; track which server owns each URI so we read it back from
-    // the same place.
-    let mut owner: HashMap<String, usize> = HashMap::new();
+    // (in config declaration order) that supports it; track which server NAME
+    // owns each URI so we read it back from the same place. Name-keyed `owner`
+    // (URI → server name) is stable across a reload (RFC 0017 §5.3).
+    let mut owner: HashMap<String, String> = HashMap::new();
     for uri in cfg.subscribe.iter().chain(&cfg.continue_subscribe) {
         let mut armed = false;
-        for (i, s) in servers.iter().enumerate() {
+        for name in &server_order {
+            let s = &servers[name];
             if s.capabilities().supports_subscribe() {
                 match s.subscribe(uri) {
                     Ok(()) => {
-                        owner.insert(uri.clone(), i);
+                        owner.insert(uri.clone(), name.clone());
                         log.info("subscribe", json!({"uri": uri, "server": s.name()}));
                         armed = true;
                         break;
@@ -380,7 +399,10 @@ pub fn run_reactive(
                 &mut base,
                 &mut router,
                 &mut owner,
-                &servers,
+                &mut servers,
+                &mut server_order,
+                #[cfg(feature = "cluster")]
+                &mut claim_by_uri,
                 &mut generation,
                 log,
             ) {
@@ -432,6 +454,12 @@ pub fn run_reactive(
                         }),
                     );
                 }
+                // RFC 0017 §5.3 step 5: an `mcp_servers` change DEFINITELY changes
+                // the available tool set, so the self-MCP must emit
+                // `notifications/tools/list_changed` so the model / agentctl re-reads
+                // the tool catalogue. Computed BEFORE `running` is reassigned.
+                #[cfg(feature = "serve-mcp")]
+                let tools_changed = running.mcp_servers != new_cfg.mcp_servers;
                 // APPLIED reload (RFC 0017 §5.6): publish the new config onto the
                 // served `agentd://config/effective` view and push
                 // `resources/updated` so a subscribed agentctl learns push-style.
@@ -448,6 +476,11 @@ pub fn run_reactive(
                     // swap policy (notify-then-read; no payload, no secret/URL).
                     if swap_needed {
                         lc.notify_intelligence_updated();
+                    }
+                    // RFC 0017 §5.3 step 5: the tool catalogue changed → fan
+                    // `notifications/tools/list_changed` so peers re-list.
+                    if tools_changed {
+                        lc.notify_tools_list_changed();
                     }
                 }
                 running = new_cfg;
@@ -485,11 +518,17 @@ pub fn run_reactive(
                         break;
                     }
                     crate::obs::metrics::record_claim_released();
-                    match crate::cluster::claim::release(
-                        &servers[held.server_idx],
-                        &held.lease_id,
-                        "draining",
-                    ) {
+                    let Some(coord) = servers.get(&held.server) else {
+                        // The coordination server was removed by a prior reload —
+                        // its lease is already gone with the process; nothing to
+                        // release. Count it as handled and move on (never panic).
+                        log.warn(
+                            "drain.claim_release_skipped",
+                            json!({"key": key, "server": held.server, "reason": "server_removed"}),
+                        );
+                        continue;
+                    };
+                    match crate::cluster::claim::release(coord, &held.lease_id, "draining") {
                         Ok(()) => {
                             released += 1;
                             log.info("claim.released", json!({"key": key, "reason": "draining"}));
@@ -512,8 +551,10 @@ pub fn run_reactive(
                 std::thread::sleep(Duration::from_millis(50));
             }
             warm.clear();
-            for (uri, &i) in &owner {
-                let _ = servers[i].unsubscribe(uri); // best-effort
+            for (uri, name) in &owner {
+                if let Some(s) = servers.get(name) {
+                    let _ = s.unsubscribe(uri); // best-effort
+                }
             }
             log.info("proc.exit", json!({"reason": "drain", "mode": "reactive"}));
             return exit::SUCCESS;
@@ -522,7 +563,7 @@ pub fn run_reactive(
 
         // Drain inbound notifications → feed the router. (list_changed
         // re-enumeration for templated subscriptions lands later.)
-        for s in &servers {
+        for s in servers.values() {
             for n in s.drain_notifications() {
                 if n.method == method::NOTIFY_RESOURCES_UPDATED
                     && let Some(uri) = updated_uri(&n.params)
@@ -561,7 +602,16 @@ pub fn run_reactive(
                         let claim_key =
                             crate::cluster::derive_claim_key(&delivery.uri, &spec.route_id);
                         let meta = claim_meta(cfg, &claim_key);
-                        let coord = &servers[spec.server_idx];
+                        // Resolve the coordination server by NAME (stable across a
+                        // reload). Absent ⇒ a reload removed it; skip the delivery
+                        // (the claim route is unsatisfiable), never panic.
+                        let Some(coord) = servers.get(&spec.server) else {
+                            log.error(
+                                "claim.server_missing",
+                                json!({"uri": delivery.uri, "server": spec.server}),
+                            );
+                            continue;
+                        };
                         match crate::cluster::claim_styled(
                             coord,
                             spec.style,
@@ -595,7 +645,7 @@ pub fn run_reactive(
                                 held_claims.insert(
                                     delivery.uri.clone(),
                                     HeldClaim {
-                                        server_idx: spec.server_idx,
+                                        server: spec.server.clone(),
                                         lease_id,
                                         claim_key: claim_key.clone(),
                                         ttl: spec.ttl,
@@ -629,7 +679,15 @@ pub fn run_reactive(
                     }
 
                     if let Some(o) = outcome {
-                        apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
+                        apply_effects(
+                            o,
+                            &mut wakes,
+                            &mut router,
+                            &mut owner,
+                            &servers,
+                            &server_order,
+                            log,
+                        );
                     }
                 }
                 Disposition::Continue(session_id) => {
@@ -657,7 +715,15 @@ pub fn run_reactive(
                         let claim_key =
                             crate::cluster::derive_claim_key(&delivery.uri, &spec.route_id);
                         let meta = claim_meta(cfg, &claim_key);
-                        let coord = &servers[spec.server_idx];
+                        // Resolve the coordination server by NAME (stable across a
+                        // reload). Absent ⇒ a reload removed it; skip the delivery.
+                        let Some(coord) = servers.get(&spec.server) else {
+                            log.error(
+                                "claim.server_missing",
+                                json!({"uri": delivery.uri, "server": spec.server, "session": session_id}),
+                            );
+                            continue;
+                        };
                         match crate::cluster::claim_styled(
                             coord,
                             spec.style,
@@ -697,7 +763,7 @@ pub fn run_reactive(
                                 held_claims.insert(
                                     session_id.clone(),
                                     HeldClaim {
-                                        server_idx: spec.server_idx,
+                                        server: spec.server.clone(),
                                         lease_id,
                                         claim_key: claim_key.clone(),
                                         ttl: spec.ttl,
@@ -734,7 +800,15 @@ pub fn run_reactive(
         // §3.4): a terminal `completed` acks, anything else releases.
         let warm_drained = warm.drain(log);
         for (_session, outcome) in warm_drained.turns {
-            apply_effects(outcome, &mut wakes, &mut router, &mut owner, &servers, log);
+            apply_effects(
+                outcome,
+                &mut wakes,
+                &mut router,
+                &mut owner,
+                &servers,
+                &server_order,
+                log,
+            );
         }
         #[cfg(feature = "cluster")]
         for (session_id, terminal) in warm_drained.ended {
@@ -766,7 +840,15 @@ pub fn run_reactive(
             );
             crate::obs::metrics::record_reaction();
             if let Some(o) = react(&exe, &payload, cfg.drain_timeout, log) {
-                apply_effects(o, &mut wakes, &mut router, &mut owner, &servers, log);
+                apply_effects(
+                    o,
+                    &mut wakes,
+                    &mut router,
+                    &mut owner,
+                    &servers,
+                    &server_order,
+                    log,
+                );
             }
         }
 
@@ -798,12 +880,16 @@ pub fn run_reactive(
 /// was rejected — a clean, byte-for-byte no-op (RFC 0017 §7): the running config,
 /// `base`, `router`, `owner`, and `servers` are all left exactly as they were.
 ///
-/// `mcp_servers` is treated as **restart-only** in this build (it is in
-/// [`RESTART_ONLY_FIELDS`]): the positional `owner`/claim index map makes a fully
-/// correct live re-handshake + remap too invasive to do safely in this chunk
-/// (RFC 0017 §5.3 "scope it out cleanly"). An `mcp_servers` change is therefore
-/// rejected in step 2 with `reason="restart_required"` — a conservative reject is
-/// correct; a half-correct live swap is not. A live re-handshake is the follow-up.
+/// `mcp_servers` is now **reloadable** (RFC 0017 §5.1 / §5.3 step 4): a validated
+/// reload re-handshakes the MCP server set at this quiesce boundary — removed
+/// servers are stopped+reaped (their `McpClient` Drop runs the stdio shutdown
+/// ladder), added servers are spawned+handshaked+subscribed (with the MANDATORY
+/// read-after-subscribe), changed servers are remove-then-add. The name-keyed
+/// `servers`/`owner` map (and name-keyed `claim_by_uri`) makes this safe: a
+/// remove/add never shifts another server's key, so `owner` and the claim wiring
+/// stay coherent. A failed *add* is contained (logged `mcp.connect.fail`, the
+/// server is simply absent — RFC 0007 tool-domain absence) and never aborts the
+/// daemon or rolls back already-applied sub-steps (§5.3 contained-failure).
 #[cfg(feature = "hot-reload")]
 #[allow(clippy::too_many_arguments)]
 fn apply_reload(
@@ -812,8 +898,10 @@ fn apply_reload(
     running: &Config,
     base: &mut SpawnPayload,
     router: &mut Router,
-    owner: &mut HashMap<String, usize>,
-    servers: &[McpClient],
+    owner: &mut HashMap<String, String>,
+    servers: &mut BTreeMap<String, McpClient>,
+    server_order: &mut Vec<String>,
+    #[cfg(feature = "cluster")] claim_by_uri: &mut HashMap<String, crate::cluster::ClaimSpec>,
     generation: &mut u64,
     log: &Logger,
 ) -> Option<Config> {
@@ -896,19 +984,32 @@ fn apply_reload(
     signals::set_reloading(true);
 
     // STEP 4 — APPLY the reloadable diff (idempotent, ordered, all-or-nothing on
-    // what validated). value-swaps first (lowest risk), then the subscription
-    // reconcile (read-after-subscribe on adds, RFC 0017 §5.3).
+    // what validated; contained runtime failure). value-swaps first (lowest
+    // risk), then the MCP server re-handshake (so an added server is connected
+    // BEFORE the subscription reconcile can bind a new URI to it / before a claim
+    // route re-resolves to it), then the subscription reconcile (read-after-
+    // subscribe on adds, RFC 0017 §5.3), then (cluster) the claim re-resolution.
     apply_value_swaps(base, &new_cfg, log);
-    apply_subscription_diff(running, &new_cfg, router, owner, servers, log);
+    apply_mcp_server_diff(running, &new_cfg, servers, server_order, owner, router, log);
+    apply_subscription_diff(running, &new_cfg, router, owner, servers, server_order, log);
+    // Under `cluster`, the claim wiring (`claim_by_uri`) binds a route URI →
+    // coordination server NAME → its live client. After the server set changed,
+    // re-resolve it against the post-reload `servers` and re-validate each claim
+    // coordination server still advertises `work.*` (RFC 0019 §3). A now-absent or
+    // no-longer-advertising claim server does NOT exit the daemon on a reload (a
+    // reload never kills the daemon, RFC 0017 §5.3); the route is dropped from the
+    // wiring and logged, so its deliveries fall through unclaimed (the gentlest
+    // correct degradation — the work simply isn't claimed by this replica).
+    #[cfg(feature = "cluster")]
+    reresolve_claim_routes(&new_cfg, servers, claim_by_uri, log);
 
-    // STEP 5 — self-MCP surface refresh. The tool set is `mcp_servers`-derived
-    // and `mcp_servers` is restart-only here, so it never changes on a reload —
-    // no `tools/list_changed` is warranted. The SUBSCRIBABLE served resource
-    // `agentd://config/effective` (RFC 0017 §4.2 / §5.6) IS now refreshed: the
-    // caller (`run_reactive`) swaps the live config + fires `resources/updated`
-    // on this applied return (and on the no-change applied return above), so a
-    // subscribed agentctl re-reads the post-reload view. Done in the caller (not
-    // here) because the served `LiveConfig` handle lives on the reactor side.
+    // STEP 5 — self-MCP surface refresh. An `mcp_servers` change DEFINITELY
+    // changes the available tool set, so the caller (`run_reactive`) emits
+    // `notifications/tools/list_changed` when the server set differs (it holds the
+    // served self-MCP handle). The SUBSCRIBABLE served resource
+    // `agentd://config/effective` (RFC 0017 §4.2 / §5.6) is likewise refreshed
+    // there: the caller swaps the live config + fires `resources/updated` on this
+    // applied return, so a subscribed agentctl re-reads the post-reload view.
 
     // STEP 6 — clear the guard, emit success, bump the generation + metric.
     signals::set_reloading(false);
@@ -957,6 +1058,11 @@ fn reloadable_changes(running: &Config, new: &Config) -> Vec<&'static str> {
     }
     if running.subscribe != new.subscribe {
         changed.push("subscribe");
+    }
+    // RFC 0017 §5.1: the MCP server inventory is reloadable — a re-handshake at
+    // the quiesce boundary (add/remove/edit a server). Diffed by name+command+tags.
+    if running.mcp_servers != new.mcp_servers {
+        changed.push("mcp_servers");
     }
     // RFC 0018 §5.1: the intelligence endpoint list + swap policy are reloadable.
     // A change repoints NEW spawns (via `apply_value_swaps`) and is fanned to
@@ -1027,8 +1133,9 @@ fn apply_subscription_diff(
     running: &Config,
     new: &Config,
     router: &mut Router,
-    owner: &mut HashMap<String, usize>,
-    servers: &[McpClient],
+    owner: &mut HashMap<String, String>,
+    servers: &BTreeMap<String, McpClient>,
+    server_order: &[String],
     log: &Logger,
 ) {
     use std::collections::HashSet;
@@ -1038,49 +1145,276 @@ fn apply_subscription_diff(
     // REMOVED: unsubscribe + drop the route + owner (and any pending delivery).
     for uri in running.subscribe.iter() {
         if !new_set.contains(uri.as_str()) {
-            if let Some(i) = owner.remove(uri) {
-                let _ = servers[i].unsubscribe(uri); // best-effort
+            if let Some(name) = owner.remove(uri)
+                && let Some(s) = servers.get(&name)
+            {
+                let _ = s.unsubscribe(uri); // best-effort
             }
             router.remove_exact(uri);
             log.info("unsubscribe", json!({"uri": uri, "kind": "reload"}));
         }
     }
 
-    // ADDED: subscribe on the first supporting server, add the route, then
-    // read-after-subscribe so a change that predates the subscribe isn't missed.
+    // ADDED: subscribe on the first supporting server (config declaration order),
+    // add the route, then read-after-subscribe so a change that predates the
+    // subscribe isn't missed.
     let now = Instant::now();
     for uri in new.subscribe.iter() {
         if old_set.contains(uri.as_str()) || router.has_exact(uri) {
             continue; // unchanged (or already routed) — leave it
         }
-        let mut armed = false;
-        for (i, s) in servers.iter().enumerate() {
-            if s.capabilities().supports_subscribe() && s.subscribe(uri).is_ok() {
-                owner.insert(uri.clone(), i);
+        arm_added_subscription(uri, servers, server_order, owner, router, now, log);
+    }
+}
+
+/// Arm one newly-added subscription URI: subscribe on the first supporting server
+/// (declaration order), add its Spawn route, and do the MANDATORY read-after-
+/// subscribe (RFC 0017 §5.3 — convert edge→level across the reload boundary,
+/// exactly like startup). Shared by `apply_subscription_diff` (new declared subs)
+/// and the orphan re-home path in `apply_mcp_server_diff` (a sub whose owning
+/// server was removed but the URI is still wanted). Logs `subscribe.unsupported`
+/// when no connected server can serve it.
+#[cfg(feature = "hot-reload")]
+fn arm_added_subscription(
+    uri: &str,
+    servers: &BTreeMap<String, McpClient>,
+    server_order: &[String],
+    owner: &mut HashMap<String, String>,
+    router: &mut Router,
+    now: Instant,
+    log: &Logger,
+) {
+    match arm_uri_on_first_supporting(servers, server_order, owner, uri) {
+        Some(server) => {
+            if !router.has_exact(uri) {
                 router.add_route(Route::new(uri, Disposition::Spawn, DEBOUNCE));
+            }
+            log.info(
+                "subscribe",
+                json!({"uri": uri, "server": server, "kind": "reload"}),
+            );
+            if router.on_updated(uri, now) {
                 log.info(
-                    "subscribe",
-                    json!({"uri": uri, "server": s.name(), "kind": "reload"}),
+                    "reactive.initial_read",
+                    json!({"uri": uri, "kind": "reload"}),
                 );
-                // MANDATORY read-after-subscribe (RFC 0017 §5.3): convert the
-                // edge-triggered `updated` into level-triggered "act on current
-                // state" across the reload boundary, exactly like startup.
-                if router.on_updated(uri, now) {
-                    log.info(
-                        "reactive.initial_read",
-                        json!({"uri": uri, "kind": "reload"}),
-                    );
-                }
-                armed = true;
-                break;
             }
         }
-        if !armed {
-            log.warn(
-                "subscribe.unsupported",
-                json!({"uri": uri, "kind": "reload"}),
+        None => log.warn(
+            "subscribe.unsupported",
+            json!({"uri": uri, "kind": "reload"}),
+        ),
+    }
+}
+
+/// Re-handshake the MCP server set across the reload boundary (RFC 0017 §5.3
+/// step 4). Diffs `running.mcp_servers` vs `new.mcp_servers` BY NAME (+ command/
+/// argv/tags), then applies, ordered, with contained runtime failure:
+///
+///  * **removed** (in running, not in new): unsubscribe its owned URIs (best-
+///    effort), drop the `McpClient` (its Drop runs the stdio shutdown ladder /
+///    kill+reap), remove from `servers`/`server_order`. Any URI it owned that is
+///    STILL a wanted subscription is RE-HOMED onto a surviving server below.
+///  * **changed** (same name, different command/argv/tags): remove-then-add — a
+///    command/argv change is a new process.
+///  * **added** (in new, not in running): `McpClient::spawn` + `initialize` +
+///    re-stamp the run-id/traceparent tool `_meta` (matching the connect path);
+///    append to `servers`/`server_order`. A failed add is CONTAINED — logged
+///    `mcp.connect.fail`, the server simply absent (RFC 0007 tool-domain absence)
+///    — it never rolls back applied sub-steps and never aborts the daemon.
+///
+/// After the set changed, orphaned subscriptions (a still-wanted URI whose owning
+/// server was removed) are re-subscribed on a surviving server WITH the mandatory
+/// read-after-subscribe, so edge→level holds across the reload. The added
+/// servers' OWN subscriptions are armed by the subsequent `apply_subscription_diff`
+/// (a newly-declared URI) or by this re-home (an existing URI moving servers).
+/// `servers`/`owner` are never left in a state that did not validate (§5.3).
+#[cfg(feature = "hot-reload")]
+fn apply_mcp_server_diff(
+    running: &Config,
+    new: &Config,
+    servers: &mut BTreeMap<String, McpClient>,
+    server_order: &mut Vec<String>,
+    owner: &mut HashMap<String, String>,
+    router: &mut Router,
+    log: &Logger,
+) {
+    use crate::config::McpServerSpec;
+    let by_name = |specs: &[McpServerSpec], name: &str| -> Option<McpServerSpec> {
+        specs.iter().find(|s| s.name == name).cloned()
+    };
+    // REMOVED + CHANGED: a server in `running` that is gone, or whose command/argv/
+    // tags differ in `new`, is stopped+reaped (drop runs the shutdown ladder). A
+    // changed server is removed here and re-added in the ADD pass below.
+    let mut removed_uris: Vec<String> = Vec::new();
+    for spec in &running.mcp_servers {
+        let want = by_name(&new.mcp_servers, &spec.name);
+        let drop_it = match &want {
+            None => true,         // removed outright
+            Some(n) => n != spec, // changed (command/argv/tags differ)
+        };
+        if drop_it {
+            // Unsubscribe + collect every URI this server owned, so we can re-home
+            // the ones still wanted after the set settles. Best-effort unsubscribe.
+            let owned: Vec<String> = owner
+                .iter()
+                .filter(|(_, n)| n.as_str() == spec.name)
+                .map(|(u, _)| u.clone())
+                .collect();
+            for uri in &owned {
+                if let Some(s) = servers.get(&spec.name) {
+                    let _ = s.unsubscribe(uri); // best-effort
+                }
+                owner.remove(uri);
+                removed_uris.push(uri.clone());
+            }
+            // Drop the client (Drop = stdio shutdown ladder / kill+reap, RFC 0004).
+            servers.remove(&spec.name);
+            server_order.retain(|n| n != &spec.name);
+            log.info(
+                "mcp.disconnect",
+                json!({"server": spec.name, "kind": "reload", "reason": if want.is_none() {"removed"} else {"changed"}}),
             );
         }
+    }
+
+    // ADDED + CHANGED(re-add): a server in `new` not currently connected is
+    // spawned + handshaked. A failed add is contained (logged + absent), never
+    // fatal and never a rollback (RFC 0017 §5.3 contained-failure).
+    for spec in &new.mcp_servers {
+        if servers.contains_key(&spec.name) {
+            continue; // unchanged — leave the live connection untouched
+        }
+        match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60))
+            .and_then(|mut c| c.initialize().map(|()| c))
+        {
+            Ok(mut c) => {
+                // Re-stamp the run-id (retry dedup, RFC 0011) + traceparent
+                // (tracing, RFC 0010) tool `_meta`, exactly like the connect path.
+                // run_id is restart-only (stable for the process's life), so `new`
+                // carries the same id the supervisor started with.
+                let mut meta = json!({"agentd/run_id": new.run_id});
+                if let Some(tp) = &new.traceparent {
+                    meta["traceparent"] = Value::String(tp.clone());
+                }
+                c.set_tool_meta(meta);
+                log.info(
+                    "mcp.connect",
+                    json!({"server": spec.name, "kind": "reload", "subscribe": c.capabilities().supports_subscribe()}),
+                );
+                servers.insert(spec.name.clone(), c);
+                server_order.push(spec.name.clone());
+            }
+            Err(e) => {
+                // CONTAINED FAILURE: a failed add is a tool-domain absence (RFC
+                // 0007), logged, NOT a rollback, NOT a daemon abort (RFC 0017 §5.3).
+                log.error(
+                    "mcp.connect.fail",
+                    json!({"server": spec.name, "kind": "reload", "err": e.to_string()}),
+                );
+            }
+        }
+    }
+
+    // RE-HOME orphaned subscriptions: a URI whose owning server was removed but
+    // that is STILL declared (or routed) gets re-subscribed on a surviving server
+    // WITH read-after-subscribe. A URI that was only on the removed server and is
+    // no longer wanted is left dropped (apply_subscription_diff handles declared
+    // removals; this covers the unchanged-URI-but-removed-server case).
+    let now = Instant::now();
+    for uri in removed_uris {
+        let still_wanted = new.subscribe.iter().any(|u| u == &uri)
+            || new.continue_subscribe.iter().any(|u| u == &uri);
+        if !still_wanted {
+            // Not declared anymore AND its server is gone — drop its route too, so
+            // a stale Spawn route can't fire against a vanished owner.
+            router.remove_exact(&uri);
+            continue;
+        }
+        if owner.contains_key(&uri) {
+            continue; // already re-homed (e.g. a still-present server also owns it)
+        }
+        arm_added_subscription(&uri, servers, server_order, owner, router, now, log);
+    }
+}
+
+/// Re-resolve the claim wiring after an `mcp_servers` reload (RFC 0019 §3, RFC
+/// 0017 §5.3): each claim route's coordination server is resolved BY NAME against
+/// the post-reload `servers`. A route whose coordination server is now absent — or
+/// is present but no longer advertises `work.*` — is DROPPED from `claim_by_uri`
+/// and logged. A reload never exits the daemon (unlike startup, where a missing
+/// claim server is a hard exit); the gentlest correct degradation is to leave the
+/// route unsatisfiable (its deliveries fall through unclaimed by THIS replica —
+/// at-least-once + another replica's claim still cover the work). Best-effort.
+#[cfg(all(feature = "hot-reload", feature = "cluster"))]
+fn reresolve_claim_routes(
+    new: &Config,
+    servers: &BTreeMap<String, McpClient>,
+    claim_by_uri: &mut HashMap<String, crate::cluster::ClaimSpec>,
+    log: &Logger,
+) {
+    use std::collections::HashSet;
+    claim_by_uri.clear();
+    let mut validated: HashSet<String> = HashSet::new();
+    let mut unsatisfiable: HashSet<String> = HashSet::new();
+    for route in &new.claim_routes {
+        if unsatisfiable.contains(&route.server) {
+            continue; // already found gone/incoherent this pass
+        }
+        let Some(coord) = servers.get(&route.server) else {
+            log.warn(
+                "claim.coord_missing",
+                json!({"uri": route.uri, "server": route.server, "kind": "reload", "degradation": "route_unsatisfiable"}),
+            );
+            unsatisfiable.insert(route.server.clone());
+            continue;
+        };
+        // Re-validate the coordination predicate once per distinct server. A
+        // transport failure or a missing `work.*` advert drops the route (logged),
+        // never exits — a reload must not kill the daemon (RFC 0017 §5.3).
+        if validated.insert(route.server.clone()) {
+            match coord.list_tools() {
+                Ok(tools) if crate::cluster::advertises_work_tools(&tools) => {
+                    log.info(
+                        "claim.coord_ready",
+                        json!({"server": route.server, "kind": "reload", "tools": tools.len()}),
+                    );
+                }
+                Ok(_) => {
+                    log.warn(
+                        "claim.coord_missing_tools",
+                        json!({"server": route.server, "kind": "reload", "degradation": "route_unsatisfiable"}),
+                    );
+                    unsatisfiable.insert(route.server.clone());
+                    continue;
+                }
+                Err(e) => {
+                    log.warn(
+                        "claim.coord_unreachable",
+                        json!({"server": route.server, "kind": "reload", "err": e.to_string(), "degradation": "route_unsatisfiable"}),
+                    );
+                    unsatisfiable.insert(route.server.clone());
+                    continue;
+                }
+            }
+        }
+        claim_by_uri.insert(
+            route.uri.clone(),
+            crate::cluster::ClaimSpec {
+                server: route.server.clone(),
+                ttl: new.claim_ttl,
+                renew_fraction: new.claim_renew_fraction,
+                style: route.style,
+                route_id: route.uri.clone(),
+                continue_session: route.continue_session,
+            },
+        );
+    }
+    if !claim_by_uri.is_empty() {
+        log.info(
+            "claim.rearmed",
+            json!({"routes": claim_by_uri.len(), "kind": "reload"}),
+        );
     }
 }
 
@@ -1390,8 +1724,21 @@ fn sleep_interruptible(dur: Duration) {
 /// re-claimable. Best-effort: a failed ack/release is logged + counted, never
 /// fatal — the lease TTL is the backstop.
 #[cfg(feature = "cluster")]
-fn settle_claim(servers: &[McpClient], held: &HeldClaim, outcome: Option<&Outcome>, log: &Logger) {
-    let coord = &servers[held.server_idx];
+fn settle_claim(
+    servers: &BTreeMap<String, McpClient>,
+    held: &HeldClaim,
+    outcome: Option<&Outcome>,
+    log: &Logger,
+) {
+    let Some(coord) = servers.get(&held.server) else {
+        // The coordination server was removed by a reload — its lease died with
+        // the process; nothing to ack/release. Never panic (RFC 0019 §8 row 6).
+        log.warn(
+            "claim.settle_skipped",
+            json!({"lease": held.lease_id, "server": held.server, "reason": "server_removed"}),
+        );
+        return;
+    };
     let completed = outcome.is_some_and(|o| o.status == TerminalStatus::Completed);
     if completed {
         match crate::cluster::claim::ack(coord, &held.lease_id, &held.claim_key) {
@@ -1424,13 +1771,19 @@ fn settle_claim(servers: &[McpClient], held: &HeldClaim, outcome: Option<&Outcom
 /// ack/release is logged + counted, never fatal (the lease TTL is the backstop).
 #[cfg(feature = "cluster")]
 fn settle_session_claim(
-    servers: &[McpClient],
+    servers: &BTreeMap<String, McpClient>,
     held: &HeldClaim,
     terminal: Option<TerminalStatus>,
     session_id: &str,
     log: &Logger,
 ) {
-    let coord = &servers[held.server_idx];
+    let Some(coord) = servers.get(&held.server) else {
+        log.warn(
+            "claim.settle_skipped",
+            json!({"lease": held.lease_id, "session": session_id, "server": held.server, "reason": "server_removed"}),
+        );
+        return;
+    };
     if terminal == Some(TerminalStatus::Completed) {
         match crate::cluster::claim::ack(coord, &held.lease_id, &held.claim_key) {
             Ok(()) => log.info(
@@ -1468,7 +1821,7 @@ fn settle_session_claim(
 /// tick, before this pass).
 #[cfg(feature = "cluster")]
 fn renew_held_claims(
-    servers: &[McpClient],
+    servers: &BTreeMap<String, McpClient>,
     held_claims: &mut HashMap<String, HeldClaim>,
     log: &Logger,
 ) {
@@ -1478,7 +1831,18 @@ fn renew_held_claims(
         if now.duration_since(held.last_renew) < cadence {
             continue; // not yet due — the cheap path most ticks take.
         }
-        match crate::cluster::claim::renew(&servers[held.server_idx], &held.lease_id, held.ttl) {
+        let Some(coord) = servers.get(&held.server) else {
+            // The coordination server was removed by a reload — stop renewing a
+            // lease whose server is gone (the lease died with the process). Skip;
+            // the TTL backstop + at-least-once redelivery hold (RFC 0019 §3.5).
+            held.last_renew = now;
+            log.warn(
+                "claim.renew_skipped",
+                json!({"lease": held.lease_id, "key": key, "server": held.server, "reason": "server_removed"}),
+            );
+            continue;
+        };
+        match crate::cluster::claim::renew(coord, &held.lease_id, held.ttl) {
             Ok(()) => {
                 held.last_renew = now;
                 log.info("claim.renewed", json!({"lease": held.lease_id, "key": key}));
@@ -1524,14 +1888,37 @@ fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) -> O
     }
 }
 
+/// Subscribe `uri` on the first connected server (in config declaration order
+/// `server_order`) that supports `resources/subscribe` and accepts it, recording
+/// the owning server NAME in `owner`. Returns the owning server name on success,
+/// `None` if no server armed it. The declaration-order walk reproduces the
+/// pre-refactor positional "first supporting server" choice exactly (now keyed by
+/// name, not index — RFC 0017 §5.3). Pure routing helper.
+fn arm_uri_on_first_supporting(
+    servers: &BTreeMap<String, McpClient>,
+    server_order: &[String],
+    owner: &mut HashMap<String, String>,
+    uri: &str,
+) -> Option<String> {
+    for name in server_order {
+        let Some(s) = servers.get(name) else { continue };
+        if s.capabilities().supports_subscribe() && s.subscribe(uri).is_ok() {
+            owner.insert(uri.to_string(), name.clone());
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 /// Apply a completed reaction's self-requests: arm its scheduled wake-ups and
 /// add/remove its resource subscriptions on the live router + servers (RFC 0008).
 fn apply_effects(
     o: Outcome,
     wakes: &mut Vec<(Instant, String)>,
     router: &mut Router,
-    owner: &mut HashMap<String, usize>,
-    servers: &[McpClient],
+    owner: &mut HashMap<String, String>,
+    servers: &BTreeMap<String, McpClient>,
+    server_order: &[String],
     log: &Logger,
 ) {
     arm_wakes(wakes, o.scheduled, Instant::now(), log);
@@ -1541,30 +1928,30 @@ fn apply_effects(
                 if router.has_exact(&req.uri) {
                     continue; // already watched
                 }
-                let armed = servers.iter().enumerate().any(|(i, s)| {
-                    if s.capabilities().supports_subscribe() && s.subscribe(&req.uri).is_ok() {
-                        owner.insert(req.uri.clone(), i);
+                match arm_uri_on_first_supporting(servers, server_order, owner, &req.uri) {
+                    Some(server) => {
                         // Self-subscribe = self-scheduling into a WARM session
                         // (RFC 0008 §self-subscribe): the agent re-enters one live
                         // continue-session per event (session keyed by the URI),
                         // rather than a fresh spawn each time.
-                        router.add_route(Route::new(&req.uri, Disposition::Continue(req.uri.clone()), DEBOUNCE));
-                        log.info("trigger.armed", json!({"kind": "self_subscribe", "uri": req.uri, "server": s.name(), "disposition": "continue"}));
-                        true
-                    } else {
-                        false
+                        router.add_route(Route::new(
+                            &req.uri,
+                            Disposition::Continue(req.uri.clone()),
+                            DEBOUNCE,
+                        ));
+                        log.info("trigger.armed", json!({"kind": "self_subscribe", "uri": req.uri, "server": server, "disposition": "continue"}));
                     }
-                });
-                if !armed {
-                    log.warn(
+                    None => log.warn(
                         "subscribe.unsupported",
                         json!({"uri": req.uri, "kind": "self_subscribe"}),
-                    );
+                    ),
                 }
             }
             SubscriptionAction::Unsubscribe => {
-                if let Some(i) = owner.remove(&req.uri) {
-                    let _ = servers[i].unsubscribe(&req.uri);
+                if let Some(name) = owner.remove(&req.uri)
+                    && let Some(s) = servers.get(&name)
+                {
+                    let _ = s.unsubscribe(&req.uri);
                 }
                 if router.remove_exact(&req.uri) > 0 {
                     log.info(
@@ -1641,18 +2028,67 @@ fn updated_uri(params: &Option<Value>) -> Option<String> {
 }
 
 fn read_current(
-    servers: &[McpClient],
-    owner: &HashMap<String, usize>,
+    servers: &BTreeMap<String, McpClient>,
+    owner: &HashMap<String, String>,
     uri: &str,
 ) -> Option<String> {
-    let idx = *owner.get(uri)?;
-    servers.get(idx)?.read_resource(uri).ok().map(|r| r.text())
+    let name = owner.get(uri)?;
+    servers.get(name)?.read_resource(uri).ok().map(|r| r.text())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::subagent::protocol::{IntelConfig, Limits, Telemetry};
+
+    /// The mcp_servers reload diff/apply DECISION logic (RFC 0017 §5.3 step 4),
+    /// unit-tested in isolation from the spawn I/O (the live re-handshake itself is
+    /// proven by the reload_e2e suite). A server is classified by NAME, then by
+    /// whether its command/argv/tags differ: removed / added / changed / unchanged.
+    #[cfg(feature = "hot-reload")]
+    #[test]
+    fn mcp_server_reload_is_diffed_by_name_and_command_and_tags() {
+        use crate::config::{Config, McpServerSpec, Mode};
+        let srv = |name: &str, cmd: &[&str]| McpServerSpec {
+            name: name.into(),
+            command: cmd.iter().map(|s| s.to_string()).collect(),
+            tags: vec![],
+        };
+        let running = Config {
+            mode: Mode::Reactive,
+            mcp_servers: vec![srv("a", &["a-cmd"]), srv("b", &["b-cmd"])],
+            ..Config::default()
+        };
+        // ADD c, REMOVE b, CHANGE a's command, KEEP nothing identical to a.
+        let mut new = running.clone();
+        new.mcp_servers = vec![
+            srv("a", &["a-cmd-v2"]), // changed (command differs)
+            srv("c", &["c-cmd"]),    // added
+                                     // b removed
+        ];
+        // reloadable_changes must flag mcp_servers as changed.
+        assert!(reloadable_changes(&running, &new).contains(&"mcp_servers"));
+
+        // The per-server classification the apply step uses: by name, then equality.
+        let by_name =
+            |specs: &[McpServerSpec], n: &str| specs.iter().find(|s| s.name == n).cloned();
+        // a: present in both, but specs differ → CHANGED (remove-then-add).
+        let a_old = by_name(&running.mcp_servers, "a").unwrap();
+        let a_new = by_name(&new.mcp_servers, "a").unwrap();
+        assert_ne!(a_old, a_new, "a is changed");
+        // b: in running, gone in new → REMOVED.
+        assert!(by_name(&new.mcp_servers, "b").is_none(), "b is removed");
+        // c: in new, not running → ADDED.
+        assert!(by_name(&running.mcp_servers, "c").is_none(), "c is added");
+
+        // An identical server set (same name+command+tags) is NO change.
+        assert!(!reloadable_changes(&running, &running).contains(&"mcp_servers"));
+
+        // A tag-only change still counts (the apply remove-then-adds it).
+        let mut tagged = running.clone();
+        tagged.mcp_servers[0].tags = vec![crate::sec::scope::TrifectaTag::Sensitive];
+        assert!(reloadable_changes(&running, &tagged).contains(&"mcp_servers"));
+    }
 
     fn base() -> SpawnPayload {
         SpawnPayload {

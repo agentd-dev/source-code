@@ -31,12 +31,16 @@ pub const TOOL_RELEASE: &str = "work.release";
 
 /// A live, server-bound claim route. Built in `run_reactive` from a
 /// [`crate::config::ClaimRoute`] once the coordination server is connected and
-/// validated (`server_idx` is its index in the connected-server vec). `route_id`
-/// is the stable per-route string folded into the claim-key derivation (the URI
-/// in v1), so a redelivered item maps to the SAME key (RFC 0019 §3.5).
+/// validated (`server` is the coordination server's NAME — stable across a hot
+/// reload, unlike a positional index, RFC 0017 §5.3). `route_id` is the stable
+/// per-route string folded into the claim-key derivation (the URI in v1), so a
+/// redelivered item maps to the SAME key (RFC 0019 §3.5).
 #[derive(Debug, Clone)]
 pub struct ClaimSpec {
-    pub server_idx: usize,
+    /// The coordination server's NAME. Resolved to the live `McpClient` by name
+    /// at use (the name-keyed `servers` map) — a name is stable across an
+    /// add/remove reload, where a positional index would silently shift.
+    pub server: String,
     pub ttl: Duration,
     pub renew_fraction: f64,
     pub style: ClaimStyle,

@@ -48,12 +48,26 @@ jobs:
           - "--features otel"
           - "--features tls"
           - "--features vsock"
+          - "--features a2a"
+          - "--features events"
+          - "--features cluster"
+          - "--features hot-reload"
+          - "--features config-watch"
+          - "--features serve-mcp,hot-reload" # the combo that latently broke once
+          - "--features cluster,metrics" # the scaling-signal cross combo
+          - "--release --features internal-mocks" # debug auto-enables it; --release exercises the opt-in path
           - "--features metrics,serve-mcp,cron,otel" # the image's cloud-native set
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Per-feature lint: --all-features unification hides a solo-build clippy
+      # error (a dead test helper, a duplicated cfg_attr) — each combo must lint
+      # clean on its own, not just compile.
+      - run: cargo clippy -p agentd --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo test -p agentd ${{ matrix.features }}
 
   # Minimalism is the moat: the DEFAULT build must stay at exactly three direct

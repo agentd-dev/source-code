@@ -1349,8 +1349,10 @@ fn handle_conn(stream: ServeStream, origin: PeerOrigin, ctx: &ServeCtx, log: &Lo
 /// Test-only `dispatch` seam: routes one request at the given origin with a
 /// throwaway connection writer (its peer end is dropped). Lets sibling-module tests
 /// ([`crate::mcp::a2a`]) exercise the origin gate (e.g. a `Stdio`-origin `a2a.*`
-/// falling through to `-32601`) without re-plumbing a full connection.
-#[cfg(test)]
+/// falling through to `-32601`) without re-plumbing a full connection. Only the
+/// `a2a` tests use this seam, so it's gated on that feature to stay dead-code-free
+/// in test builds that don't (e.g. `--features serve-mcp,hot-reload`).
+#[cfg(all(test, feature = "a2a"))]
 pub(crate) fn dispatch_for_test(
     req: Request,
     ctx: &ServeCtx,

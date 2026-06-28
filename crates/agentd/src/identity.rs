@@ -101,7 +101,12 @@ mod tests {
 
         // Neutral present, branded cleared (ACC SPEC L4): the `AGENT_*` spelling is
         // accepted on its own.
-        for k in ["AGENTD_POD_NAME", "AGENTD_POD_UID", "AGENTD_POD_NAMESPACE", "AGENTD_NODE_NAME"] {
+        for k in [
+            "AGENTD_POD_NAME",
+            "AGENTD_POD_UID",
+            "AGENTD_POD_NAMESPACE",
+            "AGENTD_NODE_NAME",
+        ] {
             unsafe { std::env::remove_var(k) };
         }
         unsafe {

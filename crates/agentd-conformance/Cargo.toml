@@ -15,7 +15,7 @@ version = "2.9.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Black-box conformance suite for the agentd runtime (MCP client/server + supervisor + agent loop)"
-license = "MIT"
+license = "Apache-2.0"
 publish = false
 # `cargo run -p agentd-conformance` → the report runner (not the confmcp helper).
 default-run = "agentd-conformance"

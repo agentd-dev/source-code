@@ -80,7 +80,17 @@ pub enum ClaimOutcome {
 /// persistent run-id stamp by [`McpClient::call_tool_with_meta`].
 pub fn claim(client: &McpClient, item: &str, ttl: Duration, meta: Value) -> ClaimOutcome {
     let args = json!({ "item": item, "ttl_ms": ttl.as_millis() as u64 });
-    match client.call_tool_with_meta(TOOL_CLAIM, Some(args), meta) {
+    // SHORT management timeout (RFC 0016 §10): every `work.*` call runs on the
+    // single reactor thread, so a slow-but-alive coordination server must not block
+    // it past the liveness staleness window. A timeout surfaces here as
+    // `ClaimOutcome::Error` (the daemon skips the delivery, keeps serving) — never
+    // a silent proceed, and never a heartbeat starvation that SIGKILLs the pod.
+    match client.call_tool_with_meta_within(
+        TOOL_CLAIM,
+        Some(args),
+        meta,
+        crate::obs::health::management_timeout(),
+    ) {
         Ok(res) => {
             if res.is_error() {
                 return ClaimOutcome::Error(format!("work.claim isError: {}", res.text()));
@@ -158,8 +168,27 @@ pub fn ack(client: &McpClient, lease_id: &str, claim_key: &str) -> Result<(), St
 /// 0019 §3.3 / §6): the item is immediately re-claimable. `reason` is surfaced to
 /// the server (`"draining"` / `"wind-down"`).
 pub fn release(client: &McpClient, lease_id: &str, reason: &str) -> Result<(), String> {
+    release_within(
+        client,
+        lease_id,
+        reason,
+        crate::obs::health::management_timeout(),
+    )
+}
+
+/// [`release`] with a caller-supplied per-call timeout. Drain step 1.5 derives it
+/// from the REMAINING drain budget (`min(management_timeout, deadline - now)`) so
+/// the budget bounds WALL TIME, not the iteration count: a hung coordination
+/// server can no longer block a single release for the full per-request timeout
+/// (RFC 0019 §6 / audit Finding 2). A timeout is the usual best-effort `Err`.
+pub fn release_within(
+    client: &McpClient,
+    lease_id: &str,
+    reason: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let args = json!({ "lease_id": lease_id, "reason": reason });
-    call_lease_tool(client, TOOL_RELEASE, args, Value::Null)
+    call_lease_tool_within(client, TOOL_RELEASE, args, Value::Null, timeout)
 }
 
 /// A deterministic, item-derived claim key (RFC 0019 §3.5 / RFC 0015 §5.6). Stable
@@ -204,7 +233,33 @@ fn call_lease_tool(
     args: Value,
     extra_meta: Value,
 ) -> Result<(), String> {
-    match client.call_tool_with_meta(tool, Some(args), extra_meta) {
+    // SHORT management timeout (RFC 0016 §10): renew/ack/release all run on the
+    // single reactor thread (the renew heartbeat + the inline settle). Bounding
+    // each at the management timeout — well under the liveness staleness window —
+    // keeps a slow/hung coordination server from starving the heartbeat (Finding
+    // 1). The drain step-1.5 release passes a budget-derived timeout instead (see
+    // `release_within`). The lease TTL is the backstop for any timed-out call.
+    call_lease_tool_within(
+        client,
+        tool,
+        args,
+        extra_meta,
+        crate::obs::health::management_timeout(),
+    )
+}
+
+/// [`call_lease_tool`] with an explicit per-call timeout (the SHORT management
+/// bound, or a budget-derived value for the drain release). A timeout or a
+/// tool-domain `isError:true` both map to `Err(message)` — these are best-effort
+/// lifecycle calls the caller logs/counts; the lease TTL is the backstop.
+fn call_lease_tool_within(
+    client: &McpClient,
+    tool: &str,
+    args: Value,
+    extra_meta: Value,
+    timeout: Duration,
+) -> Result<(), String> {
+    match client.call_tool_with_meta_within(tool, Some(args), extra_meta, timeout) {
         Ok(res) if res.is_error() => Err(format!("{tool} isError: {}", res.text())),
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -380,5 +435,73 @@ mod tests {
             structured_content: None,
         };
         assert_eq!(result_value(&res2)["lease_id"], json!("L2"));
+    }
+
+    /// A `work.release` against a coordination server that handshakes (so tools are
+    /// advertised) but then NEVER replies to the lease call must return within the
+    /// caller-supplied bound — proving the short/budget-derived timeout is plumbed
+    /// all the way through `release_within` → `call_lease_tool_within` →
+    /// `call_tool_with_meta_within`, not the default ~60s (audit Finding 2). The
+    /// `sh` server replies only to the FIRST request (initialize, id=1, advertising
+    /// `tools`) then hangs, so the reader thread stays alive (no fast-fail) and the
+    /// `work.release` (id=2) blocks until the supplied timeout fires.
+    #[test]
+    fn release_within_honours_its_bound_against_a_hung_server() {
+        use crate::mcp::client::McpClient;
+        // Reply to the first line (initialize) with a tools-advertising result,
+        // then read+discard forever (alive but silent on every later request).
+        let script = r#"IFS= read -r _first; printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"hung","version":"0"}}}\n'; while IFS= read -r _l; do :; done; sleep 3600"#;
+        let mut client = McpClient::spawn(
+            "coord-hung",
+            &["sh".to_string(), "-c".to_string(), script.to_string()],
+            Duration::from_secs(60), // DEFAULT 60s — the per-call bound must win.
+        )
+        .expect("spawn the hung coordination server");
+        client
+            .initialize()
+            .expect("handshake completes (id=1 answered)");
+        assert!(
+            client.capabilities().supports_tools(),
+            "server advertises tools so the release reaches the request layer"
+        );
+
+        // Release with a SHORT explicit bound: it must time out fast, not at 60s.
+        let bound = Duration::from_millis(250);
+        let started = std::time::Instant::now();
+        let r = release_within(&client, "lease-xyz", "draining", bound);
+        let elapsed = started.elapsed();
+        assert!(r.is_err(), "a hung release must surface a best-effort Err");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "release_within must honour its short bound, not the 60s default (took {elapsed:?})"
+        );
+    }
+
+    /// The drain step-1.5 per-call budget arithmetic (audit Finding 2): each
+    /// release is capped at `min(management_timeout, deadline - now)`, so the budget
+    /// bounds WALL TIME, not the iteration count. Pure arithmetic — the live
+    /// hung-release behaviour is covered above + by the work_claim conformance suite.
+    #[test]
+    fn drain_release_per_call_timeout_is_min_of_management_and_remaining_budget() {
+        use crate::obs::health::management_timeout;
+        let mgmt = management_timeout();
+
+        // Plenty of budget left → the management timeout caps it (the common case).
+        let remaining = mgmt + Duration::from_secs(10);
+        assert_eq!(std::cmp::min(mgmt, remaining), mgmt);
+
+        // Nearly exhausted budget → the REMAINING budget caps it, so the last
+        // release cannot run the full management timeout and overrun the deadline.
+        let remaining = Duration::from_millis(40);
+        assert_eq!(std::cmp::min(mgmt, remaining), remaining);
+        assert!(std::cmp::min(mgmt, remaining) < mgmt);
+
+        // The total budget itself is `min(2s, drain_timeout/4)` — a small drain
+        // timeout shrinks the budget, and the per-call cap shrinks with it.
+        let drain_timeout = Duration::from_millis(800);
+        let budget = std::cmp::min(Duration::from_secs(2), drain_timeout / 4);
+        assert_eq!(budget, Duration::from_millis(200));
+        // The first per-call cap can never exceed the whole budget.
+        assert!(std::cmp::min(mgmt, budget) <= budget);
     }
 }

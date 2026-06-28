@@ -230,7 +230,7 @@ fn run() -> i32 {
                     path.into(),
                     cfg.run_id.clone(),
                     cfg.mode.as_str().into(),
-                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_millis(agentd::obs::health::LIVENESS_STALE_AFTER_MS),
                 );
                 log.info("health.armed", json!({"file": path}));
             }

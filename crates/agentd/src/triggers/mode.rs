@@ -392,6 +392,13 @@ pub fn run_reactive(
         // no-reload path is identical to before.
         #[cfg(feature = "hot-reload")]
         if signals::reload_requested() && !signals::draining() {
+            // Belt-and-suspenders for liveness (RFC 0016 §10): the reload apply is a
+            // multi-call reactor-thread section (re-handshake list_tools, connect,
+            // subscribe, claim re-validate). Each call is now SHORT-bounded, but a
+            // run of several back-to-back could still approach the staleness window —
+            // so refresh the heartbeat immediately before entering it. Cheap (one
+            // relaxed store); the short per-call timeout is the real fix.
+            crate::obs::health::tick();
             if let Some(new_cfg) = apply_reload(
                 args,
                 env,
@@ -497,11 +504,21 @@ pub fn run_reactive(
         if signals::draining() {
             // Drain step 1.5 (RFC 0019 §6): release every held claim BEFORE
             // winding down, so a surviving replica re-claims immediately rather
-            // than waiting out the lease TTL. Best-effort under a hard sub-budget
-            // (`min(2s, drain_timeout/4)` total) — never blocks drain past it; a
-            // failed release is logged + counted, never fatal (the TTL backstops).
+            // than waiting out the lease TTL. Best-effort under a hard WALL-TIME
+            // budget (`min(2s, drain_timeout/4)` total): each release is given the
+            // REMAINING budget as its per-call timeout, so the budget bounds wall
+            // time — not iteration count — even against a hung coordination server
+            // (a single release can no longer block the full ~60s per-request
+            // timeout; audit Finding 2). A failed/timed-out release is logged +
+            // counted, never fatal (the lease TTL is the backstop).
             #[cfg(feature = "cluster")]
             if !held_claims.is_empty() {
+                // Belt-and-suspenders for liveness (RFC 0016 §10): the release loop
+                // below is a multi-call reactor-thread section; refresh the heartbeat
+                // before entering it so a run of short-bounded releases still keeps
+                // the daemon live while it drains (the writer thread runs until the
+                // final `draining` record). The per-call budget cap is the real fix.
+                crate::obs::health::tick();
                 let budget = std::cmp::min(Duration::from_secs(2), cfg.drain_timeout / 4);
                 let deadline = Instant::now() + budget;
                 let total = held_claims.len();
@@ -510,7 +527,8 @@ pub fn run_reactive(
                 // continue-claim by session id — but a `HeldClaim` carries the
                 // lease id + server regardless, so the release is identical.
                 for (key, held) in held_claims.drain() {
-                    if Instant::now() >= deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
                         log.warn(
                             "drain.claim_release_budget",
                             json!({"released": released, "total": total}),
@@ -528,7 +546,17 @@ pub fn run_reactive(
                         );
                         continue;
                     };
-                    match crate::cluster::claim::release(coord, &held.lease_id, "draining") {
+                    // Cap this release at the REMAINING budget (never longer than
+                    // the management timeout), so one hung release cannot blow the
+                    // whole drain budget — the deadline now bounds WALL TIME.
+                    let per_call =
+                        std::cmp::min(crate::obs::health::management_timeout(), deadline - now);
+                    match crate::cluster::claim::release_within(
+                        coord,
+                        &held.lease_id,
+                        "draining",
+                        per_call,
+                    ) {
                         Ok(()) => {
                             released += 1;
                             log.info("claim.released", json!({"key": key, "reason": "draining"}));
@@ -553,7 +581,9 @@ pub fn run_reactive(
             warm.clear();
             for (uri, name) in &owner {
                 if let Some(s) = servers.get(name) {
-                    let _ = s.unsubscribe(uri); // best-effort
+                    // Best-effort, SHORT-bounded (RFC 0016 §10): a slow server must
+                    // not stall the drain (the unsubscribe is on the reactor thread).
+                    let _ = s.unsubscribe_within(uri, crate::obs::health::management_timeout());
                 }
             }
             log.info("proc.exit", json!({"reason": "drain", "mode": "reactive"}));
@@ -1202,7 +1232,8 @@ fn apply_subscription_diff(
             if let Some(name) = owner.remove(uri)
                 && let Some(s) = servers.get(&name)
             {
-                let _ = s.unsubscribe(uri); // best-effort
+                // Best-effort, SHORT-bounded (RFC 0016 §10) — on the reactor thread.
+                let _ = s.unsubscribe_within(uri, crate::obs::health::management_timeout());
             }
             router.remove_exact(uri);
             log.info("unsubscribe", json!({"uri": uri, "kind": "reload"}));
@@ -1317,7 +1348,8 @@ fn apply_mcp_server_diff(
                 .collect();
             for uri in &owned {
                 if let Some(s) = servers.get(&spec.name) {
-                    let _ = s.unsubscribe(uri); // best-effort
+                    // Best-effort, SHORT-bounded (RFC 0016 §10) — on the reactor thread.
+                    let _ = s.unsubscribe_within(uri, crate::obs::health::management_timeout());
                 }
                 owner.remove(uri);
                 removed_uris.push(uri.clone());
@@ -1339,9 +1371,17 @@ fn apply_mcp_server_diff(
         if servers.contains_key(&spec.name) {
             continue; // unchanged — leave the live connection untouched
         }
-        match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60))
-            .and_then(|mut c| c.initialize().map(|()| c))
-        {
+        // The handshake runs on the REACTOR thread mid-reload, so it uses the
+        // SHORT management timeout (RFC 0016 §10): a slow-but-alive added server
+        // must not block the reactor (and starve the liveness heartbeat) for the
+        // full ~60s. A timeout is a contained `mcp.connect.fail` — the server is
+        // simply absent (RFC 0007 / RFC 0017 §5.3 contained-failure), never fatal.
+        match McpClient::spawn(&spec.name, &spec.command, Duration::from_secs(60)).and_then(
+            |mut c| {
+                c.initialize_within(crate::obs::health::management_timeout())
+                    .map(|()| c)
+            },
+        ) {
             Ok(mut c) => {
                 // Re-stamp the run-id (retry dedup, RFC 0011) + traceparent
                 // (tracing, RFC 0010) tool `_meta`, exactly like the connect path.
@@ -1425,9 +1465,14 @@ fn reresolve_claim_routes(
         };
         // Re-validate the coordination predicate once per distinct server. A
         // transport failure or a missing `work.*` advert drops the route (logged),
-        // never exits — a reload must not kill the daemon (RFC 0017 §5.3).
+        // never exits — a reload must not kill the daemon (RFC 0017 §5.3). This
+        // runs on the REACTOR thread mid-loop, so it uses the SHORT management
+        // timeout (RFC 0016 §10): a slow-but-alive coordination server here must
+        // not block the reactor past the liveness window — a timeout just drops the
+        // route as unsatisfiable (the gentlest degradation), exactly like an
+        // unreachable server.
         if validated.insert(route.server.clone()) {
-            match coord.list_tools() {
+            match coord.list_tools_within(crate::obs::health::management_timeout()) {
                 Ok(tools) if crate::cluster::advertises_work_tools(&tools) => {
                     log.info(
                         "claim.coord_ready",
@@ -1956,7 +2001,15 @@ fn arm_uri_on_first_supporting(
 ) -> Option<String> {
     for name in server_order {
         let Some(s) = servers.get(name) else { continue };
-        if s.capabilities().supports_subscribe() && s.subscribe(uri).is_ok() {
+        // SHORT management timeout (RFC 0016 §10): this is only ever called on the
+        // reactor thread (the reload re-handshake / orphan re-home / a completed
+        // reaction's self-subscribe), so a slow-but-alive server arming the
+        // subscription must not block the reactor past the liveness window. The
+        // startup subscription sweep arms directly with the default timeout.
+        if s.capabilities().supports_subscribe()
+            && s.subscribe_within(uri, crate::obs::health::management_timeout())
+                .is_ok()
+        {
             owner.insert(uri.to_string(), name.clone());
             return Some(name.clone());
         }
@@ -2005,7 +2058,9 @@ fn apply_effects(
                 if let Some(name) = owner.remove(&req.uri)
                     && let Some(s) = servers.get(&name)
                 {
-                    let _ = s.unsubscribe(&req.uri);
+                    // Best-effort, SHORT-bounded (RFC 0016 §10) — on the reactor thread.
+                    let _ =
+                        s.unsubscribe_within(&req.uri, crate::obs::health::management_timeout());
                 }
                 if router.remove_exact(&req.uri) > 0 {
                     log.info(
@@ -2087,7 +2142,17 @@ fn read_current(
     uri: &str,
 ) -> Option<String> {
     let name = owner.get(uri)?;
-    servers.get(name)?.read_resource(uri).ok().map(|r| r.text())
+    // SHORT management timeout (RFC 0016 §10): the notify-then-read runs on the
+    // single reactor thread, so a slow-but-alive resource server must not block it
+    // past the liveness staleness window (Finding 1). A timed-out read is treated
+    // exactly like any read failure — the caller `unwrap_or_default()`s to empty
+    // and the level-triggered model re-reads on the next `updated`, so the
+    // edge→level recovery semantics are unchanged from today's read-failure path.
+    servers
+        .get(name)?
+        .read_resource_within(uri, crate::obs::health::management_timeout())
+        .ok()
+        .map(|r| r.text())
 }
 
 #[cfg(test)]

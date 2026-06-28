@@ -52,12 +52,15 @@ cluster = []
 metrics = []
 # Restart-free reconfiguration (RFC 0017 §5): a SIGHUP-triggered, validate-first,
 # quiesce-and-reapply hot reload of the reloadable config subset (model/limits/
-# log_level/subscribe), gated at a reactive quiesce boundary. Dependency-free —
-# raw `libc::sigaction` + the existing self-pipe (no signal-hook), reusing the
-# one `Config::load` validation pipeline. SIGHUP keeps its default disposition
-# when this feature is OFF. mcp_servers is treated as restart-only here (the
-# positional owner/claim map makes a live re-handshake too invasive to do safely
-# — RFC 0017 §5.3 "scope it out cleanly").
+# log_level/subscribe/mcp_servers), gated at a reactive quiesce boundary.
+# Dependency-free — raw `libc::sigaction` + the existing self-pipe (no
+# signal-hook), reusing the one `Config::load` validation pipeline. SIGHUP keeps
+# its default disposition when this feature is OFF. `mcp_servers` is RELOADABLE
+# (RFC 0017 §5.1/§5.3 step 4): a validated reload re-handshakes the MCP server set
+# live — removed servers stop+reap via the stdio shutdown ladder, added servers
+# spawn+handshake+subscribe (read-after-subscribe), changed servers remove-then-
+# add. The supervisor's name-keyed `servers`/`owner`/claim wiring makes the live
+# re-handshake safe (a remove/add never shifts another server's identity).
 hot-reload = []
 # The inotify file-watch reload trigger (RFC 0017 §5.2): a `--watch-config`-armed
 # raw `inotify` watch on the config file's PARENT DIRECTORY that sets the SAME

@@ -344,6 +344,38 @@ impl LiveConfig {
         notify_resource_updated_keep(&self.subs, crate::agentd_uri::INTELLIGENCE_URI);
     }
 
+    /// Fire `notifications/tools/list_changed` after an `mcp_servers` hot reload
+    /// changed the available tool set (RFC 0005 §3.1 / RFC 0017 §5.3 step 5). The
+    /// served self-MCP has no global connection registry, so this broadcasts to
+    /// every DISTINCT writer currently in the subscription registry — a connected
+    /// agentctl that subscribed to any agentd:// resource (e.g.
+    /// `agentd://config/effective`, the config watcher) is exactly the peer that
+    /// must re-read the tool catalogue. Best-effort; a dead writer is pruned by its
+    /// own reader loop. No payload (the peer re-lists on receipt).
+    pub fn notify_tools_list_changed(&self) {
+        let writers: Vec<SharedWriter> = {
+            let g = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen: Vec<*const Mutex<ServeStream>> = Vec::new();
+            let mut out: Vec<SharedWriter> = Vec::new();
+            for list in g.values() {
+                for s in list {
+                    let ptr = Arc::as_ptr(&s.writer);
+                    if !seen.contains(&ptr) {
+                        seen.push(ptr);
+                        out.push(Arc::clone(&s.writer));
+                    }
+                }
+            }
+            out
+        };
+        let note = Notification::new(method::NOTIFY_TOOLS_LIST_CHANGED, None);
+        for w in writers {
+            if let Ok(mut wl) = w.lock() {
+                let _ = frame::write_line(&mut *wl, &note);
+            }
+        }
+    }
+
     /// Fan an intelligence hot-swap (RFC 0018 §5.2) into every live SERVED run —
     /// the supervisor-side reach of a reload that repoints the endpoint list /
     /// changes the model. Mirrors `fan_pause`'s dual fan-out EXACTLY:

@@ -1542,6 +1542,14 @@ pub enum DiagLevel {
 }
 
 impl Diag {
+    // The warn-vs-reject distinction is part of the RFC 0017 §5.4 coherence-check
+    // contract: a restart-only field merely *present in the file* is a Warn (it
+    // works, it just pins restart-to-change), distinct from a differing-on-reload
+    // Error. No restart-only field is file-settable in today's schema (mcp_servers,
+    // the one that was, is now reloadable), so the Warn path has no live caller —
+    // but the constructor stays so a future widened file schema (§5.4 check 1) is
+    // covered without re-introducing the API.
+    #[allow(dead_code)]
     fn warn(field: &str, msg: impl Into<String>) -> Diag {
         Diag {
             field: field.to_string(),
@@ -1572,16 +1580,21 @@ impl Diag {
 /// `reason="restart_required"` (agentctl rolls a pod restart — its policy). They
 /// also drive the "restart-only field set in the file" warning (§5.4 check 1).
 /// Sharding (`--shard`) and claim routes are restart-only (RFC 0019 §4.3 — shard
-/// identity is immutable); `mcp_servers` is restart-only in THIS chunk (the
-/// positional owner/claim map makes a live re-handshake too invasive to do
-/// safely — see the apply step in `triggers::mode`).
+/// identity is immutable).
+///
+/// NB: `mcp_servers` is **reloadable** (RFC 0017 §5.1 / §5.3 step 4): a validated
+/// reload re-handshakes the MCP server set at the quiesce boundary. The name-keyed
+/// `servers`/`owner`/claim wiring (`triggers::mode`) makes the live re-handshake
+/// safe — a remove/add never shifts another server's identity — so it is
+/// deliberately ABSENT from this list (it used to be scoped restart-only).
 pub const RESTART_ONLY_FIELDS: &[&str] = &[
     "mode",
     // NB: `intelligence` (the endpoint list) and `model`/`model_swap` are
     // RELOADABLE via RFC 0018 §5 — the runtime hot-swap primitive. A reload whose
     // diff repoints the endpoint list or changes the model is APPLIED at a turn
     // boundary (the supervisor fans `ctrl/swap_intel` to in-flight children), not
-    // rejected. They are deliberately absent from this list.
+    // rejected. They are deliberately absent from this list. `mcp_servers` is
+    // likewise reloadable (RFC 0017 §5.1) — re-handshaked, not rejected.
     "run_id",             // instance identity / idempotency key
     "serve_mcp",          // a live control socket must not rebind mid-flight
     "enable_exec",        // a security-capability toggle — never widen live
@@ -1591,7 +1604,6 @@ pub const RESTART_ONLY_FIELDS: &[&str] = &[
     "standby",            // standby pool membership is restart-only
     "assign_from",        // the assignment channel is restart-only
     "continue_subscribe", // warm-session routing topology is restart-only
-    "mcp_servers",        // SCOPED OUT in this chunk (see the module note)
 ];
 
 impl Config {
@@ -1609,40 +1621,17 @@ impl Config {
         Config::load(args, env)
     }
 
-    /// Whether a restart-only field was set by the config FILE (§5.4 check 1).
-    /// Used to emit the advisory "this field belongs in env/flag" warning. We do
-    /// not track per-key provenance, so this is a conservative approximation: a
-    /// field is "file-set" if a config file is present AND the field differs from
-    /// its built-in default (env/flag also set it, but env/flag for a restart-only
-    /// scalar is the *intended* home, so over-warning there is avoided by only
-    /// checking when a `--config`/`AGENTD_CONFIG` file is in play — the caller
-    /// passes `file_present`).
-    fn restart_only_file_warnings(&self, file_present: bool, diags: &mut Vec<Diag>) {
-        if !file_present {
-            return;
-        }
-        let def = Config::default();
-        // Only the fields a config FILE can structurally carry are worth warning
-        // about (the file schema, RFC 0017 §3.3, has no key for mode/run_id/etc.,
-        // so they can't be file-set — `intelligence`/`serve_mcp`/`enable_exec`/
-        // `mode`/`shard`/`claim` are env/flag-only). The reachable case is none:
-        // the file schema deliberately excludes every restart-only field. We keep
-        // the hook (and the loop) so a future widened file schema is covered.
-        for &f in RESTART_ONLY_FIELDS {
-            let differs = match f {
-                "mcp_servers" => self.mcp_servers != def.mcp_servers,
-                _ => false,
-            };
-            // mcp_servers CAN be file-set and is restart-only in this chunk, so
-            // warn the operator it pins them to a restart to change it live.
-            if differs && f == "mcp_servers" {
-                diags.push(Diag::warn(
-                    f,
-                    "mcp_servers is restart-only in this build; changing it requires a \
-                     pod restart (a live MCP re-handshake is a documented follow-up)",
-                ));
-            }
-        }
+    /// Advisory: a restart-only field set in the config FILE (§5.4 check 1) —
+    /// "this field belongs in env/flag" — pushed as a `Warn`. Today the file
+    /// schema (RFC 0017 §3.3) exposes NO restart-only key: `mode`/`run_id`/
+    /// `serve_mcp`/`enable_exec`/`shard`/`claim` are env/flag-only, and the one
+    /// structural field that USED to be restart-only — `mcp_servers` — is now
+    /// RELOADABLE (RFC 0017 §5.1: live re-handshake at the quiesce boundary). So
+    /// there is nothing file-settable to warn about; the hook stays (consulting
+    /// `file_present`, the gate a future widened schema would use) so re-arming a
+    /// warning needs no plumbing change.
+    fn restart_only_file_warnings(&self, file_present: bool, _diags: &mut Vec<Diag>) {
+        let _ = file_present; // gate retained for a future widened file schema (§5.4)
     }
 
     /// The reload-coherence check (RFC 0017 §5.4), run by BOTH `--validate-config`
@@ -1710,7 +1699,6 @@ impl Config {
             "standby" => self.standby != running.standby,
             "assign_from" => self.assign_from != running.assign_from,
             "continue_subscribe" => self.continue_subscribe != running.continue_subscribe,
-            "mcp_servers" => self.mcp_servers != running.mcp_servers,
             _ => false,
         }
     }
@@ -3661,9 +3649,9 @@ mod tests {
 
     #[test]
     fn coherence_accepts_a_reloadable_diff() {
-        // RFC 0017 §5.1 + RFC 0018 §5.1: log_level / model / subscribe and now the
-        // intelligence endpoint list + model-swap policy are reloadable — a diff in
-        // them passes the coherence check (no restart-only field touched).
+        // RFC 0017 §5.1 + RFC 0018 §5.1: log_level / model / subscribe / mcp_servers
+        // and the intelligence endpoint list + model-swap policy are reloadable — a
+        // diff in them passes the coherence check (no restart-only field touched).
         let running = reactive_base();
         for mutate in [
             (|c: &mut Config| c.log_level = Level::Debug) as fn(&mut Config),
@@ -3671,6 +3659,14 @@ mod tests {
             |c: &mut Config| c.max_tokens = 999_999,
             |c: &mut Config| c.max_steps = 123,
             |c: &mut Config| c.subscribe = vec!["file:///in.json".into(), "file:///b.json".into()],
+            // RFC 0017 §5.1: the MCP server inventory is reloadable (re-handshake).
+            |c: &mut Config| {
+                c.mcp_servers = vec![McpServerSpec {
+                    name: "added".into(),
+                    command: vec!["mcp-new".into()],
+                    tags: vec![],
+                }]
+            },
             // RFC 0018 §5.1: an endpoint repoint is a reloadable hot-swap.
             |c: &mut Config| c.intelligence = Some("unix:/other.sock".into()),
             |c: &mut Config| c.model_swap = SwapPolicy::RestartTurn,
@@ -3682,6 +3678,42 @@ mod tests {
                 "a reloadable diff must be accepted",
             );
         }
+    }
+
+    #[test]
+    fn mcp_servers_is_reloadable_not_restart_only() {
+        // RFC 0017 §5.1: `mcp_servers` was lifted out of the restart-only set — a
+        // live re-handshake is now implemented (`triggers::mode`), so an add/remove/
+        // edit of a server is APPLIED at the quiesce boundary, not rejected.
+        assert!(
+            !RESTART_ONLY_FIELDS.contains(&"mcp_servers"),
+            "mcp_servers must NOT be restart-only (RFC 0017 §5.1)"
+        );
+        let running = reactive_base();
+        // ADD a server.
+        let mut added = running.clone();
+        added.mcp_servers.push(McpServerSpec {
+            name: "extra".into(),
+            command: vec!["mcp-extra".into()],
+            tags: vec![],
+        });
+        assert!(
+            Config::reload_coherence_check(&added, Some(&running), true).is_ok(),
+            "adding an MCP server must pass the coherence check (it is reloadable)"
+        );
+        // EDIT a server's command (a changed server = remove-then-add at apply).
+        let mut with_server = running.clone();
+        with_server.mcp_servers = vec![McpServerSpec {
+            name: "s".into(),
+            command: vec!["mcp-orig".into()],
+            tags: vec![],
+        }];
+        let mut edited = with_server.clone();
+        edited.mcp_servers[0].command = vec!["mcp-edited".into()];
+        assert!(
+            Config::reload_coherence_check(&edited, Some(&with_server), true).is_ok(),
+            "editing an MCP server must pass the coherence check (it is reloadable)"
+        );
     }
 
     #[test]
@@ -3804,13 +3836,6 @@ mod tests {
                     })
                 }
                 "continue_subscribe" => a.continue_subscribe = vec!["u".into()],
-                "mcp_servers" => {
-                    a.mcp_servers = vec![McpServerSpec {
-                        name: "n".into(),
-                        command: vec!["c".into()],
-                        tags: vec![],
-                    }]
-                }
                 other => panic!("RESTART_ONLY_FIELDS has an unmapped field '{other}'"),
             }
             assert!(

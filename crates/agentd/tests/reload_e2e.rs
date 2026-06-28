@@ -203,35 +203,171 @@ fn sighup_applies_an_intelligence_repoint_as_a_hot_swap() {
 }
 
 #[test]
-fn sighup_rejects_a_restart_only_change_as_a_no_op() {
-    // Changing a RESTART-ONLY field (mcp_servers — scoped restart-only in this
-    // build) is rejected: the reload is a clean no-op (config.reload_rejected),
-    // the daemon stays healthy and drains to exit 0. The file declares a working
-    // mock server (so startup reaches the loop); the reload edits its argv, an
-    // mcp_servers diff → restart_required.
-    let exe = env!("CARGO_BIN_EXE_agentd");
-    let initial = format!(
-        r#"{{ "model": "m", "mcp_servers": [
-            {{ "name": "filemock", "command": "{exe}",
-               "argv": ["--internal-mock-mcp", "file:///other-a.json", "--no-emit"] }}
-        ] }}"#
-    );
-    let changed = format!(
-        r#"{{ "model": "m", "mcp_servers": [
-            {{ "name": "filemock", "command": "{exe}",
-               "argv": ["--internal-mock-mcp", "file:///other-b.json", "--no-emit"] }}
-        ] }}"#
-    );
-    let (code, out) = run_reload(&initial, &changed);
+fn sighup_rejects_an_invalid_config_as_a_no_op() {
+    // An INVALID new config (a typo'd key — `deny_unknown_fields` rejects it) is a
+    // clean no-op: the reload emits config.reload_rejected{reason:"invalid"}, the
+    // daemon stays healthy and drains to exit 0. (mcp_servers is now RELOADABLE, so
+    // the restart-required-reject is exercised at the unit level — config.rs's
+    // coherence_rejects_a_differing_restart_only_field — not here.)
+    let initial = r#"{ "model": "model-a", "log_level": "info" }"#;
+    let bad = r#"{ "model": "model-a", "max_token": 5, "log_level": "info" }"#; // typo: max_token
+    let (code, out) = run_reload(initial, bad);
 
     assert!(
         out.contains(r#""event":"config.reload_rejected""#),
-        "a restart-only change should be rejected:\n{out}"
+        "an invalid reload should be rejected:\n{out}"
     );
     assert!(
-        out.contains("restart_required"),
-        "the rejection reason should be restart_required:\n{out}"
+        out.contains(r#""reason":"invalid""#),
+        "the rejection reason should be invalid:\n{out}"
     );
     // A rejected reload is a no-op — the daemon is unharmed and drains to exit 0.
     assert_eq!(code, Some(0), "expected graceful exit 0; stderr:\n{out}");
+}
+
+/// Spawn a reactive agentd whose MCP servers + subscriptions are declared in the
+/// config FILE (so a reload can add/remove one), run it, SIGHUP after rewriting
+/// the file, then SIGTERM. Returns (exit_code, stderr). No `--mcp`/`--subscribe`
+/// flags — those would compose with the file and pin the flag-declared server.
+fn run_reload_mcp_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("agentd.json");
+    std::fs::write(&cfg_path, initial_file).expect("write initial config");
+
+    let mut child = Command::new(exe)
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--mode",
+            "reactive",
+            "--instruction",
+            "react",
+            "--intelligence",
+            "unix:/nonexistent-reload.sock",
+            "--log-level",
+            "info",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd reactive");
+
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        stderr.read_to_string(&mut s).ok();
+        s
+    });
+
+    std::thread::sleep(Duration::from_millis(700));
+    {
+        let mut f = std::fs::File::create(&cfg_path).expect("rewrite config");
+        f.write_all(new_file.as_bytes()).expect("write new config");
+        f.flush().ok();
+    }
+    sighup(child.id());
+    std::thread::sleep(Duration::from_millis(900));
+    sigterm(child.id());
+    let status = child.wait().expect("wait for agentd");
+    let out = reader.join().unwrap_or_default();
+    (status.code(), out)
+}
+
+#[test]
+fn sighup_re_handshakes_mcp_servers_on_reload_add_and_remove() {
+    // RFC 0017 §5.1/§5.3 step 4: `mcp_servers` is now RELOADABLE — a live
+    // re-handshake at the quiesce boundary. The reload here REMOVES `mockA` (its
+    // McpClient Drop runs the stdio shutdown ladder) and ADDS `mockB` + a new
+    // subscription on its URI. We observe the re-handshake in the event stream:
+    // config.reloaded names mcp_servers, a reload-kind mcp.connect fires for the
+    // added server, a reload-kind subscribe + read-after-subscribe arms the new
+    // URI — and the daemon stays up and drains to exit 0.
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let initial = format!(
+        r#"{{ "model": "m", "log_level": "info",
+            "mcp_servers": [
+              {{ "name": "mockA", "command": "{exe}",
+                 "argv": ["--internal-mock-mcp", "file:///a.json", "--no-emit"] }}
+            ],
+            "subscribe": ["file:///a.json"] }}"#
+    );
+    let changed = format!(
+        r#"{{ "model": "m", "log_level": "info",
+            "mcp_servers": [
+              {{ "name": "mockB", "command": "{exe}",
+                 "argv": ["--internal-mock-mcp", "file:///b.json", "--no-emit"] }}
+            ],
+            "subscribe": ["file:///b.json"] }}"#
+    );
+    let (code, out) = run_reload_mcp_in_file(&initial, &changed);
+
+    assert!(
+        out.contains(r#""event":"proc.ready""#),
+        "reactive never became ready:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"config.reloaded""#),
+        "an mcp_servers re-handshake must be APPLIED, not rejected:\n{out}"
+    );
+    assert!(
+        out.contains(r#""mcp_servers""#),
+        "the changed list should name mcp_servers:\n{out}"
+    );
+    // The ADDED server is connected with reload provenance.
+    assert!(
+        out.contains(r#""event":"mcp.connect""#) && out.contains(r#""kind":"reload""#),
+        "the added MCP server should re-handshake on reload:\n{out}"
+    );
+    // The REMOVED server's URI is unsubscribed and the NEW URI armed + read.
+    assert!(
+        out.contains(r#""event":"subscribe""#) && out.contains("file:///b.json"),
+        "the added server's subscription should arm on reload:\n{out}"
+    );
+    // The tool set changed → never trips the daemon; it drains to exit 0.
+    assert_eq!(code, Some(0), "expected graceful exit 0; stderr:\n{out}");
+}
+
+#[test]
+fn sighup_contained_failure_when_an_added_mcp_server_cannot_spawn() {
+    // RFC 0017 §5.3 contained-failure: a reload that ADDS a server which cannot
+    // spawn (a nonexistent command) is CONTAINED — the failed add logs
+    // mcp.connect.fail (the server is simply absent, a tool-domain absence, RFC
+    // 0007), the reload still APPLIES (config.reloaded), and the daemon stays up +
+    // drains to exit 0. It is NOT a rollback and NOT a daemon abort.
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let initial = format!(
+        r#"{{ "model": "m", "log_level": "info",
+            "mcp_servers": [
+              {{ "name": "mockA", "command": "{exe}",
+                 "argv": ["--internal-mock-mcp", "file:///a.json", "--no-emit"] }}
+            ],
+            "subscribe": ["file:///a.json"] }}"#
+    );
+    // Keep mockA, ADD a server whose command does not exist → contained add-fail.
+    let changed = format!(
+        r#"{{ "model": "m", "log_level": "info",
+            "mcp_servers": [
+              {{ "name": "mockA", "command": "{exe}",
+                 "argv": ["--internal-mock-mcp", "file:///a.json", "--no-emit"] }},
+              {{ "name": "broken", "command": "/nonexistent/agentd-mcp-xyz", "argv": [] }}
+            ],
+            "subscribe": ["file:///a.json"] }}"#
+    );
+    let (code, out) = run_reload_mcp_in_file(&initial, &changed);
+
+    assert!(
+        out.contains(r#""event":"config.reloaded""#),
+        "a reload with a contained add-failure must still APPLY:\n{out}"
+    );
+    assert!(
+        out.contains(r#""event":"mcp.connect.fail""#) && out.contains("broken"),
+        "the failed add should log mcp.connect.fail for the broken server:\n{out}"
+    );
+    // Contained: the daemon is unharmed and drains to exit 0 (no abort, no rollback).
+    assert_eq!(
+        code,
+        Some(0),
+        "a failed add must NOT abort the daemon; stderr:\n{out}"
+    );
 }

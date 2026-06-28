@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-agent connects an LLM-driven loop to *arbitrary, operator-declared MCP servers* and an
+agentd connects an LLM-driven loop to *arbitrary, operator-declared MCP servers* and an
 `exec` capability. That is, by construction, the worst-case shape for the single unsolved
 agent-security problem: **prompt injection / the lethal trifecta** (Willison) — an agent
 that simultaneously (1) reads untrusted content, (2) holds sensitive data/tools, and
@@ -22,7 +22,7 @@ The retired design answered this with "governance is the moat" — a policy DSL 
 signing (ed25519), JWT auth, x509. **This RFC is the conscious reversal of that
 (assessment §2.11).** A policy engine inside an injectable model loop is theatre: the model
 can be steered to produce policy-compliant-but-malicious actions, and the engine is pure
-binary weight and attack surface. agent's security is **minimalism + structural isolation**:
+binary weight and attack surface. agentd's security is **minimalism + structural isolation**:
 the OS process tree, the granted-MCP-subset interpreted as a trust budget, and distilled
 structured returns as an injection firewall. That is honest about what is and is not solvable,
 and it costs near-zero binary weight — consistent with the minimalism bar that is the moat.
@@ -37,7 +37,7 @@ the deployment boundary (sandboxing, network policy, cgroups, TLS termination).
 **No policy engine, no signing, no auth as core.** Security is structural:
 
 1. **The outer boundary is the sandbox.** Container / VM / microVM / enclave provides
-   confinement, egress policy, filesystem scope, and resource limits. agent does **not**
+   confinement, egress policy, filesystem scope, and resource limits. agentd does **not**
    reimplement any of these. It is sandbox-*aware* (cgroup-v2, §2.8 of the assessment) but
    never sandbox-*providing*.
 2. **Capability scoping = the granted MCP subset, read as a Rule-of-Two trust budget.** Scope
@@ -50,7 +50,7 @@ the deployment boundary (sandboxing, network policy, cgroups, TLS termination).
    tools but **never sees the raw untrusted content**.
 4. **All MCP server content is untrusted — including tool descriptions, schemas, and
    annotations** (tool poisoning / ASI01). Never build a launch command from a
-   model- or server-controlled string. stdio default limits a server's reach to agent.
+   model- or server-controlled string. stdio default limits a server's reach to agentd.
 5. **SSRF defenses live in the hand-rolled HTTP client** (RFC 0006 / `net/http.rs`):
    HTTPS-in-prod, block RFC-1918 / loopback / link-local by default, validate redirects, pin
    DNS where feasible, CR/LF-rejecting header construction, localhost opt-out for dev.
@@ -58,7 +58,7 @@ the deployment boundary (sandboxing, network policy, cgroups, TLS termination).
    limits + kill ladder (RFC 0003), and is the leg that should be *least* exposed to untrusted
    content.
 7. **Self-MCP serving prefers stdio / unix-socket; HTTP serving is deferred** (RFC 0013)
-   precisely because Streamable HTTP serving needs real hardening agent does not yet do.
+   precisely because Streamable HTTP serving needs real hardening agentd does not yet do.
 8. **Secrets are env/flag only**, behind a `resolve()` front door, never logged / persisted /
    put in a transcript; their `Debug` prints `***`.
 
@@ -149,7 +149,7 @@ pub fn check_trifecta(grant: &Scope, allow_trifecta: bool) -> TrifectaVerdict {
    "content":[{"type":"text",
      "text":"refused: this grant gives one subagent all three lethal-trifecta legs
              (untrusted_input + sensitive + egress). Split into reader/actor subagents,
-             or relaunch agent with --allow-trifecta to override."}]}
+             or relaunch agentd with --allow-trifecta to override."}]}
   ```
 
 - **`Warn`**: with `--allow-trifecta`, the spawn proceeds and the supervisor emits a
@@ -190,7 +190,7 @@ never the child's raw transcript. Two security properties follow with no extra m
 Hardening of the firewall (recommended, encoded in tool descriptions, not enforced in core):
 the parent specifies the child's **output contract** (RFC 0009) as a constrained shape
 (enum/struct fields, not free prose) so injected instructions in the child's input have no
-syntactic place to surface in the return. agent does not *enforce* schema-constrained returns
+syntactic place to surface in the return. agentd does not *enforce* schema-constrained returns
 in v1 (it would need provider strict-mode plumbing); the firewall holds on isolation alone, and
 the constrained shape is a defense-in-depth recommendation.
 
@@ -213,12 +213,12 @@ the protocol presents as trusted metadata**: tool `name`/`description`/`inputSch
 - **Launch commands are never model- or server-derived.** The set of MCP servers and their
   `argv` come *only* from operator config (`--mcp`, `--mcp-config`), validated at startup
   (RFC 0011, exit 2 on bad config). The model cannot add a server, edit an `argv`, or cause
-  agent to spawn a process from a string it produced. `subagent.spawn` re-execs **agent's own
+  agentd to spawn a process from a string it produced. `subagent.spawn` re-execs **agentd's own
   `argv[0]`** (RFC 0009), never a model-supplied path; `exec` (§3.6) runs an operator-allowed
   binary, never a server-named one. **Spawning a stdio MCP server = trusting that command as
-  code at agent's privilege** — documented as an operator trust decision equivalent to running
+  code at agentd's privilege** — documented as an operator trust decision equivalent to running
   the binary.
-- **stdio is the default transport** (RFC 0004): a stdio server can reach only agent's pipes,
+- **stdio is the default transport** (RFC 0004): a stdio server can reach only agentd's pipes,
   not the network or other processes, which is itself a confinement win over an HTTP server.
 
 ### 3.5 SSRF defenses in the hand-rolled HTTP client
@@ -318,7 +318,7 @@ leg and therefore the most dangerous trifecta member. Rules:
 
 ### 3.7 Secrets handling
 
-Secrets are config, never model/server data, and never durable agent state.
+Secrets are config, never model/server data, and never durable agentd state.
 
 - **Sources: env and file only** via the `secrets::resolve(name)` front door
   (`sec/secrets.rs`); `command`/`oauth2` resolvers from the retired design are **dropped**. The
@@ -357,40 +357,40 @@ Secrets are config, never model/server data, and never durable agent state.
 
 ### 3.8 Self-MCP-over-HTTP hardening — why v1 defers it
 
-Serving the self-MCP (RFC 0005) over Streamable HTTP would expose agent's `subagent.*`,
+Serving the self-MCP (RFC 0005) over Streamable HTTP would expose agentd's `subagent.*`,
 `exec`, and state resources to network peers — a materially larger attack surface than stdio.
 A conformant, *safe* Streamable HTTP server requires all of:
 
 - **Non-deterministic session IDs** (high-entropy, e.g. 128-bit CSPRNG) in `MCP-Session-Id`;
 - **Sessions are not authentication.** A session id identifies a connection, never authorizes a
   caller; an unknown id ⇒ 404 → client restarts, never an implicit grant.
-- **No token passthrough** (MCP MUST NOT): agent must not accept or forward a bearer token that
+- **No token passthrough** (MCP MUST NOT): agentd must not accept or forward a bearer token that
   was not issued to it; the self-MCP performs no OAuth proxying.
 - **`Origin` validated → HTTP 403** on mismatch (DNS-rebinding defense), **bind to loopback**
   when local.
 - POST+GET endpoint, SSE upgrade, `MCP-Protocol-Version` header, resumability — none of which
-  agent implements in v1.
+  agentd implements in v1.
 
 Because v1 has **no auth model** (by §2 decision — no auth as core) and none of this hardening
 built, **v1 serves the self-MCP over stdio (always) and unix-socket (`--serve-mcp unix:…`, NDJSON
 framing) only** (RFC 0005). A unix socket inherits filesystem permissions as its access control
 (operator sets the socket mode/owner) — structural, not in-band, auth. Streamable HTTP serving,
 together with the hardening above and an auth story, is **deferred to RFC 0013**. This is honest
-minimalism: agent does not ship a network-exposed control surface it cannot yet secure.
+minimalism: agentd does not ship a network-exposed control surface it cannot yet secure.
 
 ### 3.9 What is delegated to the deployment boundary
 
 Stated explicitly so operators size their environment correctly (the assessment is binding that
 these are *not* in-binary):
 
-- **Sandboxing / confinement** — container/VM/microVM/enclave. agent does not seccomp, chroot,
+- **Sandboxing / confinement** — container/VM/microVM/enclave. agentd does not seccomp, chroot,
   or namespace itself.
 - **Egress network policy** — beyond the SSRF guards (§3.5), coarse egress control (which hosts
   the whole pod may reach) is a NetworkPolicy / firewall concern. The recommended container
   shape terminates TLS at a sidecar (assessment §2.2), so most builds link no TLS at all.
 - **Aggregate memory limits** — cgroups v2 (`memory.max`/`pids.max`/`cgroup.kill`), per the
   honest caveat in assessment §2.8: only the *token* ceiling and per-child `RLIMIT_AS`/`CPU` are
-  in-binary; aggregate subtree memory is a deployment concern. agent is cgroup-aware, never
+  in-binary; aggregate subtree memory is a deployment concern. agentd is cgroup-aware, never
   cgroup-requiring.
 - **Authn/z of inbound callers** — filesystem perms on the unix socket (v1); a real auth model
   is deferred with HTTP serving (RFC 0013).
@@ -434,7 +434,7 @@ these are *not* in-binary):
   moat" (assessment §2.11). None of these are in core, in any feature gate.
 - **No in-binary sandboxing** (seccomp/namespaces/chroot) — delegated to the outer boundary
   (§3.9).
-- **No content-based injection detection / classifier.** Prompt injection is unsolved; agent
+- **No content-based injection detection / classifier.** Prompt injection is unsolved; agentd
   defends *structurally* (isolation + scope budget + firewall), and is honest that this is
   containment, not a guarantee (assessment §5 risk 7). No "is this prompt injection?" model call.
 - **No schema-enforced subagent returns in v1** (§3.3) — the firewall holds on process isolation;
@@ -443,7 +443,7 @@ these are *not* in-binary):
   (§3.8). v1 has no network-exposed control surface.
 - **MCP `roots` as a filesystem-scope signal** — acknowledged as idiomatic but deferred with the
   rest of the v1 client-capability deferrals (assessment §2.5); v1 declares no client capabilities.
-- **cgroup write enforcement** — agent never *requires* cgroup write access; aggregate-memory
+- **cgroup write enforcement** — agentd never *requires* cgroup write access; aggregate-memory
   enforcement is the deployment's job (§3.9, assessment §2.8 caveat).
 - **DNS-over-the-network config / dynamic server registration** — config is never read from the
   network (RFC 0011); the model can never register an MCP server or an `exec` binary.

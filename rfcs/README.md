@@ -1,12 +1,12 @@
-# agent RFCs — index
+# agentd RFCs — index
 
-This directory holds the agent RFC set. **0001–0013** are the rewrite core
+This directory holds the agentd RFC set. **0001–0013** are the rewrite core
 (Accepted, shipped v1): RFC **0001** is the readable narrative front door, and
 **0002–0013** specify each mechanism area in depth. **0014–0020** are the
-**agentctl control-plane track** (Proposed) — the contract surface agent exposes
+**agentctl control-plane track** (Proposed) — the contract surface agentd exposes
 so an external control plane (the `agentctl` CLI + `kubectl agent[s]` plugin +
 Kubernetes operator) can provision, supply intelligence over vsock, scale,
-observe, and manage a *fleet* of agent instances; RFC **0014** is the umbrella
+observe, and manage a *fleet* of agentd instances; RFC **0014** is the umbrella
 and **0015–0020** the concrete contracts (**0020** adds A2A-over-vsock agent-mesh
 interop). All cross-reference one another by number rather than restating detail.
 
@@ -35,13 +35,13 @@ these rather than redefining them.
 | [0011](0011-cloud-native-contract.md) | Cloud-native contract: config, signals, exit codes, idempotency | Accepted (shipped v1) | Config precedence + validate-at-startup, drain choreography + `AGENT_DRAIN_TIMEOUT` < grace, the exit-code table (authority), RUN_ID idempotency, statelessness, cgroup friendliness. |
 | [0012](0012-security-posture.md) | Security posture | Accepted (shipped v1) | Granted-MCP-subset as Rule-of-Two trust budget, untrusted-server-content stance, SSRF defenses, gated `exec`, self-MCP hardening, secrets handling. |
 | [0013](0013-deferred-v2-surface.md) | Deferred v2 surface | Accepted (v2 surface, deferred) | The explicit defer list: MCP tasks, sampling (as client), roots, Streamable HTTP serving + SSE, MCP-backed session checkpointing — each with its named v1 fallback. |
-| [0014](0014-control-plane-contract.md) | agent as a managed workload — the control-plane (agentctl) contract | Proposed (control-plane track) | Umbrella: data/control-plane split, vsock-as-management, the capabilities-manifest spine, ratified cross-cutting conventions (ownership map, `surfaces{}`, versioning, the k8s env convention), the sub-RFC index. |
+| [0014](0014-control-plane-contract.md) | agentd as a managed workload — the control-plane (agentctl) contract | Proposed (control-plane track) | Umbrella: data/control-plane split, vsock-as-management, the capabilities-manifest spine, ratified cross-cutting conventions (ownership map, `surfaces{}`, versioning, the k8s env convention), the sub-RFC index. |
 | [0015](0015-management-and-control-surface.md) | Management & control surface | Proposed (control-plane track) | `--serve-mcp vsock:PORT`; the operator MCP profile (`agent://capabilities`/`inventory` + `drain`/`lame-duck`/`pause`/`resume`/`cancel`, `attach`=`subagent.send`); the frozen capabilities manifest; downward-API instance identity (env-only). |
 | [0016](0016-telemetry-and-lifecycle-contract.md) | Telemetry & lifecycle contract | Proposed (control-plane track) | The frozen Prometheus metrics schema (`metrics_schema`); the exit-code *contract* around RFC 0011 §5; machine-readable run-outcome reports; `agent://events`; stuck-detector liveness; fleet trace correlation. |
-| [0017](0017-declarative-config-and-hot-reload.md) | Declarative configuration & hot reload | Proposed (control-plane track) | The config-file layer + JSON schema; `agent --validate-config`/`--config-schema`; `SIGHUP`/file-watch hot reload of the reloadable subset (servers/subscriptions/model/limits); file-based secret refs. |
+| [0017](0017-declarative-config-and-hot-reload.md) | Declarative configuration & hot reload | Proposed (control-plane track) | The config-file layer + JSON schema; `agentd --validate-config`/`--config-schema`; `SIGHUP`/file-watch hot reload of the reloadable subset (servers/subscriptions/model/limits); file-based secret refs. |
 | [0018](0018-intelligence-transport-resilience.md) | Intelligence transport resilience | Proposed (control-plane track) | Ordered multi-endpoint intelligence with health-aware failover + circuit-break; per-endpoint health surface; runtime model/endpoint hot-swap (no restart); optional model-discovery handshake. |
 | [0019](0019-horizontal-scaling.md) | Horizontal scaling | Proposed (control-plane track) | Cross-replica work-claim/lease (reuses MCP, no bespoke queue); `--shard K/N` static partitioning (FNV-1a/64); the autoscaling signal set (KEDA/HPA inputs); warm-pool/standby. |
-| [0020](0020-a2a-interop-over-vsock.md) | A2A interoperability over vsock | Proposed (control-plane track) | Serve **A2A** over vsock (manifest = Agent Card, a run = a Task); the node-agent is a dumb HTTP↔vsock gateway + PEP (TLS/auth/SSE/webhooks/history). The subagent decision: local supervised subagents unchanged; A2A is the external surface + a delegation backend; MCP-self-serving → compat. Likely obviates HTTP serving in agent. |
+| [0020](0020-a2a-interop-over-vsock.md) | A2A interoperability over vsock | Proposed (control-plane track) | Serve **A2A** over vsock (manifest = Agent Card, a run = a Task); the node-agent is a dumb HTTP↔vsock gateway + PEP (TLS/auth/SSE/webhooks/history). The subagent decision: local supervised subagents unchanged; A2A is the external surface + a delegation backend; MCP-self-serving → compat. Likely obviates HTTP serving in agentd. |
 
 ## Supporting research (non-normative)
 

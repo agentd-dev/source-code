@@ -3,7 +3,7 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agent rewrite — control-plane track (RFC 0014); extends the intelligence transport & wire (RFC 0006)
+**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the intelligence transport & wire (RFC 0006)
 
 ---
 
@@ -12,7 +12,7 @@
 RFC 0006 nails the intelligence wire to **exactly one endpoint** named by a
 single URI in `AGENT_INTELLIGENCE`, dialed fresh per call with `Connection:
 close`. That is the right primitive for the data plane, but it is brittle under
-the deployment shape RFC 0014 introduces: a fleet of agent pods whose
+the deployment shape RFC 0014 introduces: a fleet of agentd pods whose
 intelligence is supplied by a **host-side model service over vsock** (the
 node-agent's job, RFC 0014 §2). In that world the single endpoint is a moving,
 fallible thing:
@@ -30,7 +30,7 @@ RFC 0006 today turns each of these into an `EXIT_INTELLIGENCE` (4) and a pod
 restart. For a `once`-mode `Job` that is acceptable (the scheduler retries). For
 a long-lived **reactive `Deployment`** it is not: a host-side model roll should
 not look like a fleet of crashing pods, and a CID move should not require a
-rolling restart of every agent.
+rolling restart of every agentd.
 
 This RFC makes the intelligence channel **resilient** without breaking RFC 0006's
 moat: it stays the same hand-rolled HTTP/1.1 client over the same `Transport:
@@ -47,7 +47,7 @@ node-agent's job).
 This RFC slots under RFC 0014 as sub-RFC **0018** and couples to four contracts it
 does **not** redefine: the metrics schema and the `agent://` resource surface
 that agentctl scrapes (RFC 0016 / RFC 0015), the hot-reload mechanism (RFC 0017),
-and the capabilities manifest (RFC 0015). It owns one thing: **how agent survives
+and the capabilities manifest (RFC 0015). It owns one thing: **how agentd survives
 its model endpoint moving, flapping, or being swapped.**
 
 This RFC owns: the `--intelligence` endpoint *list* and its failover policy; the
@@ -104,7 +104,7 @@ metric exposition format (RFC 0010 §3.8 / RFC 0016).
    CID/host) is always finish-on-old: it is invisible to the run.
 
 5. **Model discovery is optional and capability-negotiated.** If an endpoint
-   advertises it, agent performs a tiny handshake (`GET /v1/models`, the
+   advertises it, agentd performs a tiny handshake (`GET /v1/models`, the
    OpenAI-compatible shape RFC 0006 already speaks) to learn which models it
    serves, and surfaces the result into the RFC 0015 capabilities manifest
    (`intelligence.models`) so agentctl can do **model-aware placement**. An endpoint
@@ -270,8 +270,8 @@ pub struct HealthRecord {
 Error rate is derived (`total_fail / total_calls` over the process, plus the cheap
 `consec_fail` for the breaker decision); a windowed rate is **not** kept in-binary
 — agentctl computes rates from the scraped counters over its own window (RFC 0016),
-keeping cardinality and state out of agent (the same discipline as RFC 0010 §3.8:
-agent emits counters, the collector computes rates).
+keeping cardinality and state out of agentd (the same discipline as RFC 0010 §3.8:
+agentd emits counters, the collector computes rates).
 
 ### 4.2 The circuit breaker
 
@@ -456,7 +456,7 @@ Choreography on a validated reload whose diff includes `intelligence`/`model`:
 ### 5.3 What a model swap means for an in-flight run
 
 A model swap mid-run is the subtle case (an endpoint repoint is invisible). The
-**transcript is continuous** across the swap — agent does not reset context — but
+**transcript is continuous** across the swap — agentd does not reset context — but
 the next turn is served by a *different model*. Two policies, `--model-swap` /
 `AGENT_MODEL_SWAP`:
 
@@ -481,14 +481,14 @@ warm-session checkpointing stays deferred, RFC 0013).
 
 **Out of scope (stays in agentctl / RFC 0014 §6):** *deciding* to swap (small↔large
 policy, cost/latency triggers, rolling a fleet's model) is policy — agentctl writes
-the new ConfigMap and signals the reload (RFC 0017). agent only executes the
+the new ConfigMap and signals the reload (RFC 0017). agentd only executes the
 quiesce-switch-resume primitive.
 
 > **Resolved / implemented (§5.1–§5.3).** Shipped. RFC 0017 §5.1 now lists
 > `intelligence`/`model`/`model_swap` as **reloadable via this RFC's swap
 > primitive** (no longer restart-only). **Process-boundary adaptation:** the §5.2
 > sketch models `LIVE` as a single supervisor-held `RwLock<Arc<IntelConfig>>` that
-> "subagents read per turn" — but agent re-execs each subagent as its own
+> "subagents read per turn" — but agentd re-execs each subagent as its own
 > **process**, so a supervisor-side `RwLock` cannot reach a child's loop. The
 > faithful implementation makes `LIVE` **child-local**: a new
 > `ControlMsg::SwapIntel` (the same fan-out shape as `pause`/`resume`, with a
@@ -515,7 +515,7 @@ quiesce-switch-resume primitive.
 
 ### 5.4 Optional model discovery (capability-negotiated)
 
-agent may learn what an endpoint serves via a tiny handshake — **off unless an
+agentd may learn what an endpoint serves via a tiny handshake — **off unless an
 endpoint looks discovery-capable, and silent on failure** (decision 5):
 
 - **Probe.** `GET /v1/models` (OpenAI-compatible, the dialect RFC 0006 already
@@ -616,7 +616,7 @@ error — that would mask a misconfiguration as a transient outage.
   breaker is checked synchronously against a clock on the existing reactor wake; no
   timer thread). **No connection pool** (still one dial per call). **No
   service-discovery / k8s / DNS-SRV client** — agentctl supplies the endpoint list
-  and moves it via RFC 0017 reload; agent only *uses* the list it is given (RFC
+  and moves it via RFC 0017 reload; agentd only *uses* the list it is given (RFC
   0014 §6). **No new TLS/gRPC stack** — TLS stays the existing feature-gated rustls
   path (RFC 0006 §2). A resilience feature that would pull any of those is wrong by
   construction and belongs in agentctl.
@@ -678,7 +678,7 @@ existing `chat` span, not a new span).
   a restart (§5.3).
 - **RFC 0014 (control-plane umbrella).** This is sub-RFC 0018; the
   primitives-not-policy split (§3) governs the agentctl boundary (§5.3, §7);
-  agentctl supplies/moves endpoints and decides swaps, agent executes the
+  agentctl supplies/moves endpoints and decides swaps, agentd executes the
   primitives.
 - **RFC 0015 (management & control surface).** Owns the capabilities manifest this
   extends (`intelligence` block, §5.4) and the operator MCP profile that lists
@@ -696,7 +696,7 @@ existing `chat` span, not a new span).
 
 - **No load-balancing across healthy endpoints.** The list is **priority-ordered
   failover**, not round-robin/weighted balancing. Spreading load across replicas is
-  agentctl's job (place pods on different endpoints); agent prefers the
+  agentctl's job (place pods on different endpoints); agentd prefers the
   lowest-index healthy endpoint (sticky-primary). Weighted/least-latency selection
   is a possible later flag, not v1.
 - **No connection pooling or keep-alive.** One dial per call stays (RFC 0006);
@@ -705,7 +705,7 @@ existing `chat` span, not a new span).
   clock on the existing call path / reactor wake; we do not actively poll endpoints
   on a timer (discovery is lazy, §5.4). An always-on active health-prober is
   rejected as it would add a thread and constant traffic for an idle daemon.
-- **No service discovery.** agent does not resolve DNS-SRV, watch a registry, or
+- **No service discovery.** agentd does not resolve DNS-SRV, watch a registry, or
   learn endpoints from the network — it uses the list it is given and is repointed
   by reload (RFC 0017). "Where is the model service" is agentctl's (RFC 0014 §6).
 - **No mid-request repoint / no streaming-aware swap.** A swap seam is a turn
@@ -713,7 +713,7 @@ existing `chat` span, not a new span).
   so a request is short). If streaming `/chat/completions` is ever adopted (RFC 0006
   open item), swap-mid-stream is a follow-up, not v1.
 - **No per-endpoint distinct dialect *negotiation*.** A per-endpoint dialect
-  override is allowed in config (§3.1), but agent does not *probe* an endpoint's
+  override is allowed in config (§3.1), but agentd does not *probe* an endpoint's
   dialect; misconfigured dialect is a non-failover request error (§3.3).
 - **No durable health state across restart.** Health/breaker records are in-memory;
   a restarted pod starts every endpoint CLOSED and re-learns (cheap, and correct —

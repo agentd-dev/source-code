@@ -1,40 +1,40 @@
-# A one-shot agent run as a Kubernetes Job (mode `once`).
+# A one-shot agentd run as a Kubernetes Job (mode `once`).
 #
-# The instruction IS the unit of work: agent runs it to a terminal status
+# The instruction IS the unit of work: agentd runs it to a terminal status
 # and exits with a code from the rfcs/0011 §5 table. `podFailurePolicy` maps
 # those codes to retriable vs terminal so the Job does the right thing.
 #
-# NOTE: the operator/scheduler is EXTERNAL and not part of agent. This is a
+# NOTE: the operator/scheduler is EXTERNAL and not part of agentd. This is a
 # plain Job — your cluster (or a higher-level operator that is NOT in this
-# project) owns scheduling, retries, and rollout. agent only honors the
+# project) owns scheduling, retries, and rollout. agentd only honors the
 # exit-code/signal contract (rfcs/0011 §1).
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: agent-digest-once
+  name: agentd-digest-once
   labels:
-    app.kubernetes.io/name: agent
+    app.kubernetes.io/name: agentd
 spec:
   # backoffLimit governs how many retries the retriable exit codes get.
   backoffLimit: 3
-  # Give the whole Job a hard ceiling independent of agent's own --deadline.
+  # Give the whole Job a hard ceiling independent of agentd's own --deadline.
   activeDeadlineSeconds: 1800
 
-  # podFailurePolicy turns agent's exit codes (rfcs/0011 §5) into Job actions.
+  # podFailurePolicy turns agentd's exit codes (rfcs/0011 §5) into Job actions.
   # Requires the JobPodFailurePolicy feature (GA in modern clusters).
   podFailurePolicy:
     rules:
       # Config/usage error — deterministic operator mistake. Don't retry.
       - action: FailJob
         onExitCodes:
-          containerName: agent
+          containerName: agentd
           operator: In
           values: [2]
       # Agent ran correctly but concluded the task cannot be done / refused.
       # Deterministic — retrying will reach the same conclusion.
       - action: FailJob
         onExitCodes:
-          containerName: agent
+          containerName: agentd
           operator: In
           values: [5]
       # Transient/upstream classes — let backoffLimit retry them.
@@ -42,7 +42,7 @@ spec:
       #   6 = required MCP server failed to connect/handshake or died
       - action: Count
         onExitCodes:
-          containerName: agent
+          containerName: agentd
           operator: In
           values: [4, 6]
       # Budget/partial — default retriable; flip to FailJob if your policy is
@@ -50,7 +50,7 @@ spec:
       #   3 = usable partial result   7 = hit max-steps/tokens/deadline budget
       - action: Count
         onExitCodes:
-          containerName: agent
+          containerName: agentd
           operator: In
           values: [3, 7]
       # SIGTERM-without-clean-drain (143) — count as a normal retriable failure
@@ -63,7 +63,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: agent
+        app.kubernetes.io/name: agentd
     spec:
       restartPolicy: Never
       securityContext:
@@ -73,10 +73,10 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: agent
+        - name: agentd
           # Multi-arch, cosign-signed, static-on-scratch. Pin a version tag (or a
           # digest) in production rather than :latest.
-          image: ghcr.io/agentd-dev/agent:latest
+          image: ghcr.io/agentd-dev/agentd:latest
           args:
             # MCP servers are stdio child processes — bundled in the image.
             - --mcp
@@ -96,7 +96,7 @@ spec:
             - name: AGENT_INTELLIGENCE_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: agent-intelligence
+                  name: agentd-intelligence
                   key: token
             - name: AGENT_MODEL
               value: claude-sonnet-4-6

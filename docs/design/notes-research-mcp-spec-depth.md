@@ -1,4 +1,4 @@
-# MCP Wire Protocol — Implementation Reference for agent
+# MCP Wire Protocol — Implementation Reference for agentd
 
 **Status:** Research note / durable design artifact.
 **For:** RFC 0001 (minimal, MCP-native, reactive agent runtime).
@@ -88,8 +88,8 @@ Before the server receives `initialized`, the server SHOULD send nothing but
                                      "sampling":   { "createMessage": {} } } }
     },
     "clientInfo": {
-      "name": "agent",
-      "title": "agent",
+      "name": "agentd",
+      "title": "agentd",
       "version": "1.x",
       "description": "…",      // optional
       "websiteUrl": "…",       // optional
@@ -236,7 +236,7 @@ All blocks may carry optional `annotations` (`audience`, `priority`,
 }}
 ```
 
-**agent handling:** map a JSON-RPC `error` from `tools/call` to a loop-level
+**agentd handling:** map a JSON-RPC `error` from `tools/call` to a loop-level
 failure (retry/abort policy); map `isError:true` to an *observation* fed back to
 the model. This distinction is load-bearing for the agentic loop.
 
@@ -297,7 +297,7 @@ Error: resource not found ⇒ `-32002` with `data.uri`.
 }}
 ```
 Note: `resourceTemplates` has **no** pagination cursor in the spec example.
-agent can treat templates as informational for v1 (we read concrete URIs).
+agentd can treat templates as informational for v1 (we read concrete URIs).
 
 ### 3.4 Subscriptions (the trigger mechanism)
 
@@ -321,7 +321,7 @@ agent can treat templates as informational for v1 (we read concrete URIs).
 { "jsonrpc":"2.0","method":"notifications/resources/list_changed" }
 ```
 
-**This is the single most important inbound signal for agent.** The supervisor
+**This is the single most important inbound signal for agentd.** The supervisor
 loop maps `notifications/resources/updated{uri}` → spawn-vs-continue routing
 (RFC §5.3). Note the update notification carries **only the URI**; to see *what*
 changed the supervisor (or the woken subagent) must call `resources/read`.
@@ -342,7 +342,7 @@ changed the supervisor (or the woken subagent) must call `resources/read`.
 }}
 ```
 
-**Verdict for agent v1: SKIP as both client and server.** Prompts are
+**Verdict for agentd v1: SKIP as both client and server.** Prompts are
 user-controlled slash-command templates — irrelevant to a headless agent. We do
 not declare the `prompts` capability on our server, and as a client we simply
 never call `prompts/*`. (A server that offers prompts is harmless; we ignore
@@ -354,8 +354,8 @@ for tools.
 ## 5. Sampling — `sampling/createMessage` (server → client)
 
 This is a **reverse** call: the MCP *server* asks the *client* to run an LLM
-generation. For agent-as-client this is **optional**; for agent-as-server it
-is a powerful primitive (a peer agent, or a tool server, can borrow *our*
+generation. For agentd-as-client this is **optional**; for agentd-as-server it
+is a powerful primitive (a peer agentd, or a tool server, can borrow *our*
 intelligence endpoint).
 
 ### 5.1 Request (server → client)
@@ -397,7 +397,7 @@ intelligence endpoint).
 `modelPreferences` decouples request from concrete model: three normalized
 priorities (`costPriority`, `speedPriority`, `intelligencePriority`, each 0–1)
 plus `hints[]` (ordered substrings matched flexibly against model names; advisory
-— the *client* picks). This maps cleanly onto agent's single intelligence
+— the *client* picks). This maps cleanly onto agentd's single intelligence
 endpoint: we translate `hints`/priorities into our `--model` / gateway routing.
 
 ### 5.4 Tool-use sampling (multi-turn)
@@ -410,7 +410,7 @@ is `role:"user"` containing **only** `{"type":"tool_result","toolUseId","content
 blocks (one per tool_use id; tool-result messages MUST NOT mix other content).
 Errors: user-rejected `-1`; missing/mixed tool results `-32602`.
 
-**agent verdict:** As **client**, **DEFER** sampling for v1 (don't declare
+**agentd verdict:** As **client**, **DEFER** sampling for v1 (don't declare
 `sampling`) — our agentic loop already owns the LLM directly; servicing
 server-initiated sampling is extra surface. As **server**, **DEFER** issuing
 `sampling/createMessage` to v1 too; it's a strong v2 feature for agent-to-agent
@@ -434,7 +434,7 @@ Client declares `roots:{listChanged}`. Server asks for filesystem boundaries.
 ```
 `uri` **MUST** be a `file://` URI. Not-supported ⇒ `-32601`.
 
-**agent verdict:** **DEFER** both directions for v1. As a client we may answer
+**agentd verdict:** **DEFER** both directions for v1. As a client we may answer
 `roots/list` with an **empty list** `{"roots":[]}` if a server insists, but we
 need not declare the capability. As a server we don't request roots in v1.
 
@@ -453,11 +453,11 @@ need not declare the capability. As a server we don't request roots in v1.
 Levels = RFC 5424 syslog severities, lowest→highest:
 `debug, info, notice, warning, error, critical, alert, emergency`.
 
-**agent verdict:** As **client**, **consume** `notifications/message` and fold
+**agentd verdict:** As **client**, **consume** `notifications/message` and fold
 it into our structured logs/tracing (cheap, high observability value — RFC
 requirement #6). Sending `logging/setLevel` is optional but trivial. As
 **server**, declaring `logging` and emitting `notifications/message` is a clean
-way to surface agent internals to a driving client — **nice-to-have v1, can
+way to surface agentd internals to a driving client — **nice-to-have v1, can
 defer to early v2.**
 
 ---
@@ -471,9 +471,9 @@ defer to early v2.**
 { "jsonrpc":"2.0","id":"123","result":{} }          // empty
 ```
 Receiver MUST answer promptly with `{}`. Timeout ⇒ sender MAY treat the
-connection as stale and tear down / restart the child. **agent MUST implement
+connection as stale and tear down / restart the child. **agentd MUST implement
 ping both ways** — it is our liveness probe for stdio MCP subprocesses and for
-peer agent connections (RFC requirement #8: detect dead/stuck subprocesses).
+peer agentd connections (RFC requirement #8: detect dead/stuck subprocesses).
 
 ### 8.2 Progress
 
@@ -486,7 +486,7 @@ in a request. Receiver MAY then emit:
 ```
 `progress` MUST strictly increase; `total`/`message` optional; both may be float.
 Progress MAY reset the request timeout clock, but an absolute max timeout MUST
-still apply. **agent verdict:** consume progress to keep long tool calls from
+still apply. **agentd verdict:** consume progress to keep long tool calls from
 tripping timeouts and to stream status up the control channel; emitting it from
 our server is optional v1.
 
@@ -499,14 +499,14 @@ our server is optional v1.
 Rules: may only reference an in-flight request issued *in the same direction*;
 `initialize` MUST NOT be cancelled; receiver SHOULD stop work and **send no
 response**; sender SHOULD ignore a late response; both sides handle the race
-where the response already left. **agent MUST send cancellation** when a
+where the response already left. **agentd MUST send cancellation** when a
 deadline/step-budget trips or a subagent is killed, so we don't leak in-flight
 tool calls on a server we keep using.
 
 ### 8.4 Pagination
 
 `*/list` methods: pass optional `cursor`, read optional `nextCursor`; loop until
-absent. Cursors are opaque. agent implements a tiny "drain all pages" helper.
+absent. Cursors are opaque. agentd implements a tiny "drain all pages" helper.
 
 ---
 
@@ -531,7 +531,7 @@ Rules (all MUST unless noted):
   exit → `SIGTERM` if it lingers → `SIGKILL` if it still lingers. Server MAY
   self-initiate by closing stdout and exiting.
 
-This is a near-perfect match for agent's process model. Our codec is: a
+This is a near-perfect match for agentd's process model. Our codec is: a
 buffered line reader on stdout (split on `\n`), `serde`-free hand-rollable if we
 want, writing `compact_json + "\n"` to stdin. The same line-protocol discipline
 (JSON object per line, no embedded newlines) is what RFC §6.2 proposes for the
@@ -587,7 +587,7 @@ old transport.
 
 ---
 
-## 10. The MINIMAL subset agent implements in v1
+## 10. The MINIMAL subset agentd implements in v1
 
 Guiding principle (RFC §12): smallest surface that makes the three execution
 modes and the supervised tree work. Everything below is justified against a
@@ -612,7 +612,7 @@ need **not** declare `roots`, `sampling`, `elicitation`, or `tasks` to use a
 server's tools/resources. We only declare a client capability when we intend to
 service it. v1 declares **none** of them.
 
-### 10.2 As an MCP **server** (agent's self-MCP, RFC §8) — v1 MUST
+### 10.2 As an MCP **server** (agentd's self-MCP, RFC §8) — v1 MUST
 
 | Area | Methods / notifications | Why |
 |---|---|---|

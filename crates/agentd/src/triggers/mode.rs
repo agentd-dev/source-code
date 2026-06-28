@@ -164,7 +164,7 @@ pub fn run_reactive(
                     "mcp.connect.fail",
                     json!({"server": spec.name, "err": e.to_string()}),
                 );
-                eprintln!("agent: MCP server '{}' failed: {e}", spec.name);
+                eprintln!("agentd: MCP server '{}' failed: {e}", spec.name);
                 return exit::MCP_REQUIRED_DOWN;
             }
         }
@@ -209,7 +209,7 @@ pub fn run_reactive(
                             json!({"server": route.server, "want": ["work.claim", "work.ack"]}),
                         );
                         eprintln!(
-                            "agent: claim coordination server '{}' is up but does not advertise work.claim/work.ack",
+                            "agentd: claim coordination server '{}' is up but does not advertise work.claim/work.ack",
                             route.server
                         );
                         return exit::USAGE;
@@ -220,7 +220,7 @@ pub fn run_reactive(
                             json!({"server": route.server, "err": e.to_string()}),
                         );
                         eprintln!(
-                            "agent: claim coordination server '{}' is unreachable: {e}",
+                            "agentd: claim coordination server '{}' is unreachable: {e}",
                             route.server
                         );
                         return exit::MCP_REQUIRED_DOWN;

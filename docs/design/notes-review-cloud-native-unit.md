@@ -1,8 +1,8 @@
-# Design Note — agent as a Schedulable Cloud-Native Unit of Work
+# Design Note — agentd as a Schedulable Cloud-Native Unit of Work
 
-**Lens:** behavior of `agent` as a unit of work an external scheduler/operator
+**Lens:** behavior of `agentd` as a unit of work an external scheduler/operator
 starts, stops, replicates, and reacts to. The orchestrator/operator is **out of
-scope** (RFC §2). The deliverable here is the **contract** `agent` must honour to
+scope** (RFC §2). The deliverable here is the **contract** `agentd` must honour to
 be a perfect citizen for one: config, process lifecycle, signals, exit codes,
 state, idempotency, health, and resource friendliness.
 
@@ -256,7 +256,7 @@ help." Extend the existing `runtime.rs` convention:
 output is written *through MCP tools* to backing services (a filesystem MCP, a db
 MCP, a queue MCP) — never to supervisor-local memory or local disk as the source
 of truth. This is exactly 12-factor "stateless processes; persist to a backing
-service," and it falls out naturally because `agent` has **no built-in tools** —
+service," and it falls out naturally because `agentd` has **no built-in tools** —
 the only way it can persist anything is by calling an MCP server, which is by
 construction an external backing service.
 
@@ -306,29 +306,29 @@ external backing service reached over MCP. (12-factor VI again.)
 
 A scheduler retries (research: `backoffLimit`, exponential backoff, at-least-once
 semantics). Therefore **a one-shot run must be safe to execute more than once.**
-`agent` cannot *make* an arbitrary instruction idempotent — but it must provide
+`agentd` cannot *make* an arbitrary instruction idempotent — but it must provide
 the **mechanism** for the deployment to achieve it:
 
 - **`RUN_ID` (idempotency key).** Accept `AGENT_RUN_ID` / `--run-id`. Propagate
-  it into the agent's context and, crucially, **into every MCP tool call's
+  it into the agentd's context and, crucially, **into every MCP tool call's
   metadata** so an MCP backing service that supports idempotency keys
   (e.g. a queue with dedupe, an HTTP API with `Idempotency-Key`) can dedupe
   retried side effects. Default: a per-process random ULID (so logs/traces
   correlate), but for retry-dedupe the operator should set a *stable* key per
   logical unit of work (K8s can inject the Job name / a hash).
 - **Read-modify-write through MCP, not blind append.** Encourage (in docs and the
-  default system prompt) the pattern: the agent checks current state via
+  default system prompt) the pattern: the agentd checks current state via
   `resources/read` before mutating, so a re-run that finds work already done is a
   no-op. This is the level-triggered reconcile pattern again, applied to one-shot.
 - **Deterministic terminal classification.** A re-run of an already-complete unit
   should detect "already done" (via the backing service) and exit `0`
   immediately, cheaply — not redo LLM work. This makes retries cheap and safe.
-- **No hidden local side effects.** `agent` itself writes nothing durable
+- **No hidden local side effects.** `agentd` itself writes nothing durable
   locally except logs (stdout/stderr, which are append-only and harmless to
   duplicate). All side effects go through MCP, where the idempotency key can act.
 
 **Honest scope statement:** true idempotency is a property of the *instruction +
-the MCP tools it uses*, which `agent` does not own. Our contract is: (1) provide
+the MCP tools it uses*, which `agentd` does not own. Our contract is: (1) provide
 and propagate a stable idempotency key, (2) never introduce *our own*
 non-idempotent local side effects, (3) make "already done" cheap to detect and
 exit on. Beyond that, idempotency is the operator's composition responsibility —
@@ -392,7 +392,7 @@ must not let one runaway branch OOM-kill the pod or exhaust PIDs.
   - **`pids.max`** caps total processes so a recursive `subagent.spawn` storm
     can't fork-bomb the node (defense-in-depth alongside `--max-depth` and
     tree budget from RFC §13).
-  - **`memory.max`** on the subtree contains a memory-hungry agent to a fraction
+  - **`memory.max`** on the subtree contains a memory-hungry agentd to a fraction
     of the pod, so the OOM killer hits the offending subtree, not the supervisor.
     The supervisor survives, observes the child's `137`, and reacts cleanly.
 - **Respect, don't reimplement.** We do not build a sandbox (RFC §13). If cgroup
@@ -443,11 +443,11 @@ Maps the brief's reliability requirement onto the lifecycle contract:
 ## 9. The same binary, three deploy shapes — concrete config recipes
 
 Demonstrating §0: identical binary, different env. (Operator manifests are out of
-scope; these are the `agent`-side knobs each shape sets.)
+scope; these are the `agentd`-side knobs each shape sets.)
 
 **A. Standalone CLI one-shot**
 ```
-agent --mode once \
+agentd --mode once \
   --instruction "summarize the open PRs and write a digest" \
   --intelligence https://gateway.local/v1 --intelligence-token $TOK \
   --mcp github=github-mcp --mcp fs=fs-mcp
@@ -458,7 +458,7 @@ agent --mode once \
 ```
 AGENT_MODE=reactive
 AGENT_SUBSCRIBE=db://query/inbound_tasks,file:///work/inbox
-AGENT_MCP_CONFIG=/etc/agent/mcp.json
+AGENT_MCP_CONFIG=/etc/agentd/mcp.json
 AGENT_INTELLIGENCE=unix:/var/run/intel.sock     # sidecar gateway, no TLS in-binary
 AGENT_HEALTH_ADDR=:8080                          # liveness/readiness/startup
 AGENT_SERVE_MCP=unix:/var/run/agent.sock        # composable by peers

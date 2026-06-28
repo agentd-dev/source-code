@@ -1,8 +1,8 @@
 # agentd-conformance
 
-A **black-box** conformance suite for the agent runtime. It knows agent only as
+A **black-box** conformance suite for the agent runtime. It knows agentd only as
 a binary plus the MCP / JSON-RPC 2.0 spec and the documented exit-code table — it
-never links the agent library, so it catches real protocol/behaviour
+never links the agentd library, so it catches real protocol/behaviour
 regressions instead of agreeing with the implementation's own types.
 
 Each check drives the real binary (built on demand with `--features serve-mcp`)
@@ -17,7 +17,7 @@ cargo run  -p agentd-conformance          # the same checks → a PASS/FAIL repo
 cargo run  -p agentd-conformance -- --json   # machine-readable conformance record
 ```
 
-The suite builds the agent binary itself, so no prior `cargo build` is needed.
+The suite builds the agentd binary itself, so no prior `cargo build` is needed.
 Every check is host-independent — conformance is judged against the spec, never
 the environment — so there are no capability-gated checks to skip.
 
@@ -25,8 +25,8 @@ the environment — so there are no capability-gated checks to skip.
 
 | Family        | What it proves                                                          |
 |---------------|-------------------------------------------------------------------------|
-| `mcp-server`  | agent's served self-MCP: initialize, tools/list, tools/call, resources, ping, error codes (-32601 / -32602 / -32002), notification + malformed-input handling. |
-| `mcp-client`  | agent as a client to a backing server (a recording `confmcp` reference server): initialize w/ protocolVersion + clientInfo, `notifications/initialized`, tools/list discovery, resource subscribe. |
+| `mcp-server`  | agentd's served self-MCP: initialize, tools/list, tools/call, resources, ping, error codes (-32601 / -32602 / -32002), notification + malformed-input handling. |
+| `mcp-client`  | agentd as a client to a backing server (a recording `confmcp` reference server): initialize w/ protocolVersion + clientInfo, `notifications/initialized`, tools/list discovery, resource subscribe. |
 | `supervisor`  | the exit-code table (0 / 2 / 4 / 6) and the SIGTERM graceful-drain → exit 0. |
 | `agent-loop`  | the ReAct loop end-to-end: a direct answer, a tool call executed + fed back, multi-step convergence, and `--max-steps` bounding a non-converging loop. |
 | `security`    | the Rule-of-Two lethal-trifecta refusal + its `--allow-trifecta` override, and that the intelligence token never leaks into telemetry. |

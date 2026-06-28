@@ -1,6 +1,6 @@
-# Deploying agent
+# Deploying agentd
 
-`agent` is one binary that runs **one agent**. An external scheduler starts,
+`agentd` is one binary that runs **one agent**. An external scheduler starts,
 stops, replicates, and watches it; the binary itself owns no control plane
 (RFC 0011 §1). This page is a set of deployment recipes for the v1 target:
 
@@ -22,7 +22,7 @@ class.
 > below describe real behaviour.
 
 Every flag and env var on this page is taken verbatim from
-[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agent --help`).
+[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agentd --help`).
 If a flag is not in `--help`, it does not exist. See
 [`configuration.md`](configuration.md) for the **complete** flag/env reference,
 the config-file schema, and the reloadable-vs-restart-only partition.
@@ -94,7 +94,7 @@ status, emit the result on **stdout**, write telemetry to **stderr**, exit with
 a code from the [exit-code table](#the-exit-code-contract).
 
 ```bash
-agent \
+agentd \
   --instruction "Summarise today's open incidents and post a digest." \
   --intelligence unix:/run/intelligence.sock \
   --model my-model \
@@ -116,7 +116,7 @@ Because stdout is the result and stderr is telemetry, you compose with ordinary
 shell tooling:
 
 ```bash
-agent --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock \
+agentd --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock \
   2> >(jq -c 'select(.level=="error")') \
   | tee result.txt
 ```
@@ -131,12 +131,12 @@ unit of work that a scheduler may retry, pin a **stable** key so backing MCP
 services can dedupe the side effect (RFC 0011 §6):
 
 ```bash
-agent --run-id "nightly-digest-2026-06-25" \
+agentd --run-id "nightly-digest-2026-06-25" \
   --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock --mcp …
 ```
 
 The key rides in the `_meta` of every outbound MCP `tools/call`; a backing
-service that honours idempotency keys collapses a retried effect to one. agent
+service that honours idempotency keys collapses a retried effect to one. agentd
 itself writes nothing durable except its log streams, so a re-run is safe by
 construction.
 
@@ -149,7 +149,7 @@ updates (RFC 0008). It exits only on a signal or a fatal class — never on an
 individual reaction failing.
 
 ```bash
-agent \
+agentd \
   --mode reactive \
   --instruction "When a ticket is filed, triage it and assign an owner." \
   --intelligence unix:/run/intelligence.sock \
@@ -200,10 +200,10 @@ After=network.target
 [Service]
 Environment=AGENT_INTELLIGENCE=unix:/run/intelligence.sock
 Environment=AGENT_INTELLIGENCE_TOKEN=
-EnvironmentFile=/etc/agent/triage.env
-ExecStart=/usr/local/bin/agent \
+EnvironmentFile=/etc/agentd/triage.env
+ExecStart=/usr/local/bin/agentd \
   --mode reactive \
-  --instruction-file /etc/agent/triage.txt \
+  --instruction-file /etc/agentd/triage.txt \
   --mcp tickets=mcp-server-tickets \
   --subscribe tickets://queue/inbound \
   --drain-timeout 25s
@@ -223,9 +223,9 @@ it **larger** than `--drain-timeout`.
 
 ## 3. Container — minimal scratch/distroless image
 
-agent is `std` + `libc`, statically linkable, with no async runtime, no C
+agentd is `std` + `libc`, statically linkable, with no async runtime, no C
 toolchain, and **no built-in tools** — so the image is tiny (~1.3 MB on
-`scratch`). The recommended entrypoint is `agent` itself: it sets
+`scratch`). The recommended entrypoint is `agentd` itself: it sets
 `PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
 own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
 
@@ -239,7 +239,7 @@ minimalism target. What each adds:
 | Feature | Adds |
 |---|---|
 | `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`--metrics-addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
-| `serve-mcp` | agent serving its own MCP (`--serve-mcp`) so other agents compose with it; also the substrate for `events`/`a2a`/the capacity surface. |
+| `serve-mcp` | agentd serving its own MCP (`--serve-mcp`) so other agents compose with it; also the substrate for `events`/`a2a`/the capacity surface. |
 | `cron` | UTC 5-field cron scheduling for `--mode schedule` (`--cron`). |
 | `otel` | OTLP-over-HTTP/JSON span export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
 | `cluster` | Horizontal scaling: `--shard K/N` partitioning, work-claim leases (`--claim`), standby pools (`--standby`/`--assign-from`), the autoscaling signal set, and the `agent://capacity` read surface. |
@@ -270,12 +270,12 @@ RUN if [ -n "$FEATURES" ]; then \
 # scratch: nothing but the binary. (Swap for gcr.io/distroless/static if you
 # want a CA bundle + /etc/passwd without managing them yourself.)
 FROM scratch
-COPY --from=build /src/target/release/agent /agent
+COPY --from=build /src/target/release/agentd /agent
 # Non-root by uid (scratch has no /etc/passwd; the kernel uses the number).
 USER 65532:65532
-# MCP server binaries are part of the agent's toolset — add them alongside:
+# MCP server binaries are part of the agentd's toolset — add them alongside:
 # COPY --from=build /path/to/mcp-server-tickets /usr/local/bin/
-ENTRYPOINT ["/agent"]
+ENTRYPOINT ["/agentd"]
 ```
 
 > **Build-arg, not flag.** `FEATURES` selects what the **binary** can do; it is a
@@ -295,12 +295,12 @@ inside the pod, TLS at the boundary**:
   roots; adds the one heavier dependency).
 
 ```bash
-# In-pod: agent talks plaintext over a unix socket to a TLS-terminating sidecar.
-agent --intelligence unix:/run/intel/intel.sock --instruction-file /etc/task.txt --mcp …
+# In-pod: agentd talks plaintext over a unix socket to a TLS-terminating sidecar.
+agentd --intelligence unix:/run/intel/intel.sock --instruction-file /etc/task.txt --mcp …
 ```
 
 This keeps the default image at scratch-size with no certificate management in
-the agent process.
+the agentd process.
 
 ### Health surface
 
@@ -312,13 +312,13 @@ Two options, both live:
   liveness probe at `/healthz` and readiness at `/readyz`. The bare `:port` form
   binds all IPv4 interfaces so the kubelet reaches it at the pod IP. (See the K8s
   probes below.)
-- **`--health-file <PATH>`** — agent heartbeats it while the reactor is live, so
+- **`--health-file <PATH>`** — agentd heartbeats it while the reactor is live, so
   an exec-style probe can `test` its freshness. Useful where you do not want an
   HTTP listener at all.
 
 `/healthz` returns 200 while the **supervisor** tick is fresh and 503 once it
 goes stale; `/readyz` flips to not-ready on drain so the pod leaves rotation. An
-idle reactive agent is healthy — liveness tracks the supervisor, not whether work
+idle reactive agentd is healthy — liveness tracks the supervisor, not whether work
 is flowing.
 
 > **Self-MCP scope.** `--serve-mcp` lets other agents compose with this one over
@@ -333,7 +333,7 @@ is flowing.
 ## 4. Scheduled by an external orchestrator (Kubernetes)
 
 The orchestrator (a K8s operator, Knative, Nomad, a bare-metal supervisor) is
-**not part of this project** (RFC 0011 §1). agent just honours a contract:
+**not part of this project** (RFC 0011 §1). agentd just honours a contract:
 config from env/flags, signal-driven drain, and a public exit-code table a
 `podFailurePolicy` can branch on. Below are the three shapes; runnable manifests
 live in [`examples/`](../examples/).
@@ -351,14 +351,14 @@ against it (RFC 0011 §5; constants in
 | `2` | config / usage error (validation failed) | **non-retriable** → `FailJob` |
 | `3` | partial result (useful output, some sub-tasks failed) | policy |
 | `4` | intelligence endpoint unreachable / auth after retries | retriable |
-| `5` | agent ran correctly but the task **cannot** be done / refused | **non-retriable** |
+| `5` | agentd ran correctly but the task **cannot** be done / refused | **non-retriable** |
 | `6` | a required MCP server failed to connect / handshake / died | retriable |
 | `7` | budget exceeded (steps / tokens / deadline / tree) | policy |
 | `124` | hard wall-clock deadline (`--deadline`) tripped | — |
 | `137` | killed by `SIGKILL` (OOM / kubelet) — OS-set | raise memory limit |
 | `143` | killed by `SIGTERM` **without** clean drain — OS-set | distinguishes ungraceful from `0` |
 
-agent never `exit(137)`/`exit(143)` itself — the kernel sets those when it
+agentd never `exit(137)`/`exit(143)` itself — the kernel sets those when it
 kills the process. A clean drain returns `0`.
 
 ### The top footgun: drain timeout < grace
@@ -367,13 +367,13 @@ kills the process. A clean drain returns `0`.
 > `terminationGracePeriodSeconds` (default 30s).**
 
 If your drain budget is `>=` the pod's grace period, the kubelet sends
-`SIGKILL` **before** agent finishes draining — you lose the clean exit (it
+`SIGKILL` **before** agentd finishes draining — you lose the clean exit (it
 becomes `137`/`143`), in-flight subagents are not wound down at turn boundaries,
 and a rolled `Deployment` shows failures instead of clean `0`s. Always keep the
 internal budget the **smaller** number, with headroom for the kill-ladder rung
 plus the log flush.
 
-agent validates this where it can: a `drain_timeout >= 30s` (the K8s default
+agentd validates this where it can: a `drain_timeout >= 30s` (the K8s default
 grace) emits a loud warning at startup (RFC 0011 §3.3). Set both explicitly and
 keep the gap:
 
@@ -412,7 +412,7 @@ spec:
           image: ghcr.io/example/agent:2.0.0
           args:
             - --mode=once
-            - --instruction-file=/etc/agent/task.txt
+            - --instruction-file=/etc/agentd/task.txt
             - --intelligence=unix:/run/intel/intel.sock
             - --drain-timeout=25s
           env:
@@ -427,7 +427,7 @@ Job name) so retries dedupe through your MCP backing services.
 
 Prefer an **external** `CronJob` firing `--mode once` per tick over the internal
 `--mode schedule`/`--interval` — it is more robust, observable, and 12-factor
-(RFC 0011 §9). agent's internal scheduler is a standalone convenience, not a
+(RFC 0011 §9). agentd's internal scheduler is a standalone convenience, not a
 calendar (no DST/missed-tick catch-up; UTC).
 
 ```yaml
@@ -449,7 +449,7 @@ spec:
               image: ghcr.io/example/agent:2.0.0
               args:
                 - --mode=once
-                - --instruction-file=/etc/agent/nightly.txt
+                - --instruction-file=/etc/agentd/nightly.txt
                 - --intelligence=unix:/run/intel/intel.sock
                 - --drain-timeout=25s
 ```
@@ -476,7 +476,7 @@ spec:
           image: ghcr.io/example/agent:2.0.0
           args:
             - --mode=reactive
-            - --instruction-file=/etc/agent/triage.txt
+            - --instruction-file=/etc/agentd/triage.txt
             - --intelligence=unix:/run/intel/intel.sock
             - --subscribe=tickets://queue/inbound
             - --drain-timeout=25s
@@ -522,15 +522,15 @@ spec:
       terminationGracePeriodSeconds: 30   # > --drain-timeout
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agent:2.7.0   # built with `cluster`
+          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with `cluster`
           # Derive K from the StatefulSet ordinal (the trailing -N of the hostname)
           # and export AGENT_SHARD=K/8 before exec'ing agent.
           command: ["/bin/sh", "-c"]   # use a shell image, or bake this into an entrypoint
           args:
             - |
               K="${HOSTNAME##*-}"
-              exec /agent --mode reactive \
-                --instruction-file /etc/agent/task.txt \
+              exec /agentd --mode reactive \
+                --instruction-file /etc/agentd/task.txt \
                 --intelligence unix:/run/intel/intel.sock \
                 --subscribe tickets://queue/inbound \
                 --metrics-addr :9090 --drain-timeout 25s
@@ -539,7 +539,7 @@ spec:
               value: "0/8"            # overwritten below from the ordinal…
           # …or, on the scratch image (no shell), set AGENT_SHARD directly per
           # pod via a small admission/operator that reads the ordinal. The shard
-          # gate is the only sharding wiring agent needs.
+          # gate is the only sharding wiring agentd needs.
 ```
 
 Because shard ownership is a pure FNV-1a gate over the resource URI/key, the
@@ -559,7 +559,7 @@ either send `SIGHUP` or run `--watch-config`:
 
 - **`--watch-config`** (`config-watch` feature) arms an `inotify` watch on the
   config file's directory. A `kubectl apply` of the ConfigMap is an atomic
-  volume-symlink swap, which the watch sees — agent re-reads, **validates**, and
+  volume-symlink swap, which the watch sees — agentd re-reads, **validates**, and
   applies the reloadable subset (model, the intelligence endpoint list, limits,
   `subscribe`, `log_level`, `mcp_servers` re-handshake) in place. An invalid
   candidate keeps the running config — nothing is half-applied. A diff that
@@ -576,16 +576,16 @@ spec:
     spec:
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agent:2.7.0   # built with config-watch
+          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with config-watch
           args:
             - --mode=reactive
-            - --config=/etc/agent/config.json      # mounted from the ConfigMap
+            - --config=/etc/agentd/config.json      # mounted from the ConfigMap
             - --watch-config                        # reload on a ConfigMap update
-            - --instruction-file=/etc/agent/task.txt
+            - --instruction-file=/etc/agentd/task.txt
             - --metrics-addr=:9090
             - --drain-timeout=25s
           volumeMounts:
-            - { name: config, mountPath: /etc/agent, readOnly: true }
+            - { name: config, mountPath: /etc/agentd, readOnly: true }
       volumes:
         - name: config
           configMap: { name: agent-config }        # holds config.json (+ task.txt)
@@ -605,7 +605,7 @@ a host/enclave **node-agent** drives a guest agent across a VM boundary
 (Firecracker/Kata): no shared filesystem, no TCP port to firewall. There is **no
 HTTP** management surface — keep this off any TCP port. The node-agent (the thing
 that issues management RPCs, signals reloads, and reads `agent://` resources) is
-**external** and not part of agent; agent only honours the transport contract.
+**external** and not part of agentd; agentd only honours the transport contract.
 
 ---
 
@@ -618,7 +618,7 @@ files:
 - `examples/k8s/cronjob-schedule.yaml` — scheduled `CronJob`
 - `examples/k8s/deployment-reactive.yaml` — reactive `Deployment` with HTTP probes
 - `examples/docker/Dockerfile` — the static-on-scratch image
-- `examples/systemd-agent.service` — reactive systemd unit
+- `examples/systemd-agentd.service` — reactive systemd unit
 
 ---
 

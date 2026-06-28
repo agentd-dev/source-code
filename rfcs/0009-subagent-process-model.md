@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 > **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) records two forward
 > alignments on this model. (1) **A2A-Task-mappable** (RFC 0020 §5): a run /

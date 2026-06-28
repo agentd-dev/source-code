@@ -1,8 +1,8 @@
 # MCP: the universal interface
 
-agent has no opinions about *what* it can do — it ships almost no tools of its
+agentd has no opinions about *what* it can do — it ships almost no tools of its
 own. Everything an agent can touch arrives over the **Model Context Protocol**
-(MCP, target spec **2025-11-25**). agent plays both halves of that protocol:
+(MCP, target spec **2025-11-25**). agentd plays both halves of that protocol:
 
 - as a **client**, it connects to external MCP servers and the tools/resources
   they expose become the agent's entire action space;
@@ -21,27 +21,27 @@ no special-case protocol.
 
 ---
 
-## 1. agent as MCP client
+## 1. agentd as MCP client
 
 ### 1.1 There are no built-in tools
 
-agent ships **no** tools of its own except a single, off-by-default gated
+agentd ships **no** tools of its own except a single, off-by-default gated
 `exec` (see §2.4). Every other capability — read a file, query an API, run a
-search — is a tool on some MCP server you declare. The agent discovers them with
+search — is a tool on some MCP server you declare. agentd discovers them with
 `tools/list` and invokes them with `tools/call`. If you declare zero servers and
-don't pass `--enable-exec`, the agent has an empty toolbox.
+don't pass `--enable-exec`, agentd has an empty toolbox.
 
 This is deliberate: the action space is configuration, not code. Swapping what
-an agent can do never means rebuilding agent.
+an agent can do never means rebuilding agentd.
 
 ### 1.2 Declaring servers — `--mcp name=command`
 
 You declare each MCP server with `--mcp name=command`, repeatable. The transport
-is **stdio**: agent launches the command as a subprocess and speaks JSON-RPC
+is **stdio**: agentd launches the command as a subprocess and speaks JSON-RPC
 over its stdin/stdout.
 
 ```bash
-agent \
+agentd \
   --instruction "Summarize the open TODOs under /work and write a digest" \
   --intelligence unix:/run/intel.sock \
   --mcp fs=mcp-server-fs --root /work \
@@ -59,19 +59,19 @@ the executable and the rest are its arguments:
 
 > The launch command is **trusted config** — it is never built from
 > model-controlled or server-controlled strings. Declare servers from your
-> deployment config, not from agent output.
+> deployment config, not from agentd output.
 
 Multiple servers coexist; tool names are **server-qualified** internally so two
 servers can both expose a `search` tool without colliding. A `--mcp` with an
 empty name or empty command is rejected at startup (exit `2`) before any
 side effect.
 
-The exact flag surface (from `agent --help`):
+The exact flag surface (from `agentd --help`):
 
 ```
 TOOLS / MCP:
   --mcp name=command          declare an MCP server (repeatable; stdio)
-  --serve-mcp <unix:/path>    serve agent's own MCP
+  --serve-mcp <unix:/path>    serve agentd's own MCP
   --enable-exec               expose the gated exec tool
 ```
 
@@ -81,17 +81,17 @@ surface.)
 
 ### 1.3 The handshake and capability negotiation
 
-On connect, before anything else, agent runs the MCP lifecycle. It pins
+On connect, before anything else, agentd runs the MCP lifecycle. It pins
 `protocolVersion: "2025-11-25"` and declares **no client capabilities at all**:
 
 ```jsonc
-// agent → server
+// agentd → server
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agent","version":"2.0.1"}              // title omitted
+    "clientInfo":{"name":"agentd","version":"2.0.1"}             // title omitted
 }}
-// server → agent
+// server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
     "protocolVersion":"2025-11-25",
     "capabilities":{
@@ -101,12 +101,12 @@ On connect, before anything else, agent runs the MCP lifecycle. It pins
     "serverInfo":{"name":"mcp-server-fs","version":"…"},
     "instructions":"…"                                   // optional; folded into the prompt
 }}
-// agent → server
+// agentd → server
 { "jsonrpc":"2.0","method":"notifications/initialized" }
 ```
 
 Why `capabilities:{}`? You only declare a *client* capability when you intend to
-*service* it, and agent services none. It does not offer `roots`, `sampling`,
+*service* it, and agentd services none. It does not offer `roots`, `sampling`,
 `elicitation`, or `tasks`. This is the minimal interop posture and the smallest
 injection surface. If a server nonetheless asks:
 
@@ -115,12 +115,12 @@ injection surface. If a server nonetheless asks:
 - `sampling/createMessage`, `elicitation/create`, anything else → rejected with
   `-32601` *method not found*.
 
-**Version negotiation.** agent offers `2025-11-25` and accepts a downgrade to
+**Version negotiation.** agentd offers `2025-11-25` and accepts a downgrade to
 `2025-06-18`, `2025-03-26`, or `2024-11-05` where the feature use overlaps
 (e.g. structured tool output requires ≥ `2025-06-18`). A version it cannot speak,
 or a handshake that doesn't complete within the init timeout (default **10s**),
 is a connect failure. The negotiated capability set is then **frozen** and gates
-every subsequent call: agent never sends `resources/subscribe` to a server that
+every subsequent call: agentd never sends `resources/subscribe` to a server that
 didn't advertise `resources.subscribe`; it degrades instead.
 
 A **required** server that fails its handshake aborts the run with exit `6`. An
@@ -128,16 +128,16 @@ optional one is logged and simply omitted from the catalogue.
 
 ### 1.4 Tools: list and call
 
-`tools/list` is drained across all pages — agent follows `nextCursor` to
+`tools/list` is drained across all pages — agentd follows `nextCursor` to
 exhaustion (cursors are opaque; the page loop is capped at 1024 iterations to
 defend against a broken server that returns the same cursor forever).
 
 ```jsonc
-// agent → server
+// agentd → server
 { "jsonrpc":"2.0","id":2,"method":"tools/call",
   "params":{ "name":"get_weather", "arguments":{"location":"NYC"},
              "_meta":{ "io.modelcontextprotocol/run-id":"<run_id>" } } }
-// server → agent  (success — note isError lives INSIDE result)
+// server → agentd  (success — note isError lives INSIDE result)
 { "jsonrpc":"2.0","id":2,"result":{
     "content":[ { "type":"text","text":"22.5°C" } ],
     "isError":false,
@@ -149,22 +149,22 @@ The run id flows into every call's `_meta` for end-to-end correlation.
 
 **The load-bearing distinction — `isError` vs JSON-RPC `error`:**
 
-| Wire shape | Meaning | What agent does |
+| Wire shape | Meaning | What agentd does |
 |---|---|---|
 | `result.isError == true` | tool *ran* and reported a failure (a **successful** JSON-RPC response) | feed `content[]` back to the model as an observation; it self-corrects; **consumes a step** |
 | top-level JSON-RPC `error` | protocol/transport fault (unknown tool, bad params, server crash) | classify per the retry/abort policy — not handed to the model as a normal observation |
 
 A tool saying "file not found" is an observation the model reasons about. A
 server saying "I have no such tool" is a protocol error. Conflating them is a
-classic agent bug; agent keeps them strictly separate.
+classic agent bug; agentd keeps them strictly separate.
 
 > **Tool descriptions and annotations are untrusted.** They are
-> server-controlled text (the "tool poisoning" surface). agent surfaces and
+> server-controlled text (the "tool poisoning" surface). agentd surfaces and
 > logs them for operator audit but never auto-trusts them. See the security
 > notes in [RFC 0012](../rfcs/0012-security-posture.md).
 
 On `notifications/tools/list_changed` (only if the server advertised
-`tools.listChanged`) agent re-issues `tools/list` and refreshes the catalogue.
+`tools.listChanged`) agentd re-issues `tools/list` and refreshes the catalogue.
 
 ### 1.5 Resources: list vs read
 
@@ -188,24 +188,24 @@ items, e.g. a directory listing), text in `text`, binary base64 in `blob`:
 
 A missing resource returns `-32002` with `data.uri` — surfaced as an observation,
 not a transport abort. `resources/templates/list` is read but **informational
-only**: templates are not subscribable; agent reacts to concrete URIs only.
+only**: templates are not subscribable; agentd reacts to concrete URIs only.
 
 ### 1.6 Reactivity: the notify-then-read subscription model
 
-This is how agent *wakes* on external change. The model has one non-obvious but
+This is how agentd *wakes* on external change. The model has one non-obvious but
 load-bearing property: **the update notification carries no payload.**
 
 ```jsonc
-// agent → server  (only if caps.resources.subscribe; one CONCRETE uri, never a template)
+// agentd → server  (only if caps.resources.subscribe; one CONCRETE uri, never a template)
 { "jsonrpc":"2.0","id":4,"method":"resources/subscribe","params":{"uri":"file:///work/inbox"} }
 { "jsonrpc":"2.0","id":4,"result":{} }
 
-// later — server → agent
+// later — server → agentd
 { "jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///work/inbox"} }
 ```
 
 The notification says only *"`file:///work/inbox` changed"* — no diff, no new
-content. So agent does **notify-then-read**: on wake it issues a fresh
+content. So agentd does **notify-then-read**: on wake it issues a fresh
 `resources/read` to learn the current state. Two consequences fall out of this:
 
 1. It's two round-trips, and the read can race a subsequent update. agent's
@@ -214,7 +214,7 @@ content. So agent does **notify-then-read**: on wake it issues a fresh
    *is now*, not on a stale diff. (Debounce/coalesce/routing of these wakes is
    the reactive router's job;
    [RFC 0008](../rfcs/0008-execution-modes-and-reactive-routing.md).)
-2. On reconnect, agent re-issues every subscription and then synthesizes one
+2. On reconnect, agentd re-issues every subscription and then synthesizes one
    coalesced "updated" per watched URI, so a change missed while disconnected is
    not lost (edge-triggered events promoted to level across the restart).
 
@@ -229,7 +229,7 @@ content. So agent does **notify-then-read**: on wake it issues a fresh
 You wire a subscription to a run with `--subscribe` plus `--mode reactive`:
 
 ```bash
-agent \
+agentd \
   --instruction "When the inbox changes, triage new items" \
   --intelligence unix:/run/intel.sock \
   --mcp fs=mcp-server-fs --root /work \
@@ -247,14 +247,14 @@ config is rejected at startup (exit `2`).
 
 ### 1.7 Liveness and lifecycle
 
-agent pings idle connections outbound (default every **30s**, **10s** per-ping
+agentd pings idle connections outbound (default every **30s**, **10s** per-ping
 timeout); three consecutive missed pongs marks the server stale and runs the
 shutdown ladder. It answers inbound `ping` unconditionally. When it abandons an
 in-flight call (deadline trip, step-budget exhaustion, cancel) it sends
 `notifications/cancelled{requestId,reason}` so it doesn't leak work on a server
 it keeps using — but it **never** cancels `initialize`.
 
-stderr from each server is free-form per spec, so agent **never** treats stderr
+stderr from each server is free-form per spec, so agentd **never** treats stderr
 as an error signal; a dedicated thread drains it into the structured log stream
 (event `mcp.stderr`, tagged by server). The shutdown ladder is ordered and
 bounded: close stdin (EOF) → wait → `SIGTERM` → wait → `SIGKILL` → reap. The
@@ -262,9 +262,9 @@ whole drain counts inside `--drain-timeout` (default `25s`).
 
 ---
 
-## 2. agent as MCP server (self-MCP)
+## 2. agentd as MCP server (self-MCP)
 
-agent is *also* an MCP server. A parent agent, a peer, or any MCP-aware harness
+agentd is *also* an MCP server. A parent agent, a peer, or any MCP-aware harness
 can `initialize` against it and get a real, capability-negotiated catalogue: five
 tools to spawn and steer subagents (`subagent.spawn` / `.send` / `.status` /
 `.cancel`) plus a `status` tool, and the subscribable `agent://` state resources
@@ -274,7 +274,7 @@ It serves this over **stdio always**, and over a **unix socket** when you pass
 `--serve-mcp unix:PATH`:
 
 ```bash
-agent \
+agentd \
   --instruction "Be a reusable code-review worker" \
   --intelligence unix:/run/intel.sock \
   --mcp fs=mcp-server-fs --root /src \
@@ -305,7 +305,7 @@ nothing else. Note `tools` is an **empty object** (no `listChanged`) and
       "tools":     { },
       "resources": { "subscribe": true }
     },
-    "serverInfo":{ "name":"agent","version":"2.0.1" }   // version = the binary's CARGO_PKG_VERSION
+    "serverInfo":{ "name":"agentd","version":"2.0.1" }   // version = the binary's CARGO_PKG_VERSION
 }}
 ```
 
@@ -384,7 +384,7 @@ a crash:
 
 Note the pattern: a cap/scope **refusal** is `isError:true` (so the calling
 model adapts), while a malformed `tools/call` (unknown tool, bad params) is a
-JSON-RPC `error` (`-32601`/`-32602`) — the same distinction agent honors as a
+JSON-RPC `error` (`-32601`/`-32602`) — the same distinction agentd honors as a
 client (§1.4).
 
 > **Async & warm spawn ship.** `subagent.spawn` defaults to sync. An `{async}`
@@ -426,7 +426,7 @@ URI that could 404 on read. A served async handle is `served.{n}`.
 ```
 
 **The emission rule — the reactive substrate.** When a served async run reaches a
-terminal status, agent emits `notifications/resources/updated{uri}` for its
+terminal status, agentd emits `notifications/resources/updated{uri}` for its
 `agent://subagent/{handle}` to every peer subscribed to that URI — **URI only, no
 payload, no diff**, exactly like the client side (§1.6) — then consumes the
 subscription. The peer `resources/read`s to learn the result. Same notify-then-read,
@@ -443,12 +443,12 @@ didn't subscribe to.
 
 The word "subscribe" appears in two different roles here:
 
-- **MCP `resources/subscribe`** — a *method a peer calls on agent's server* to
+- **MCP `resources/subscribe`** — a *method a peer calls on agentd's server* to
   get an `updated` notification for one of agent's own `agent://subagent/<handle>`
   URIs (§2.3).
-- **The `subscribe` *self-tool*** — a *running agent calls this on its own loop*
+- **The `subscribe` *self-tool*** — a *running agentd calls this on its own loop*
   (via `tools/call`) to subscribe **itself** to an *external* MCP resource
-  reachable through agent's client side. Self-subscribe = **self-scheduling**,
+  reachable through agentd's client side. Self-subscribe = **self-scheduling**,
   the signature reactive capability. (It is a self-tool of the agent's loop, not
   part of the served peer-facing `tools/list`.)
 
@@ -480,15 +480,15 @@ This keeps the public surface a single, clean MCP dialect.
 
 ## 3. Composition: one agent driving another
 
-Because agent is symmetric, composition needs no new protocol. A parent agent
+Because agentd is symmetric, composition needs no new protocol. A parent agent
 declares a child agent as just another MCP server:
 
 ```bash
 # the parent — the child agent is "just an MCP server" on a unix socket
-agent \
+agentd \
   --instruction "Orchestrate the nightly review across the repo" \
   --intelligence unix:/run/intel.sock \
-  --mcp reviewer="agent --instruction worker --intelligence unix:/run/intel.sock --serve-mcp unix:/run/rev.sock"
+  --mcp reviewer="agentd --instruction worker --intelligence unix:/run/intel.sock --serve-mcp unix:/run/rev.sock"
 ```
 
 From the parent's point of view the child is a normal MCP server: it
@@ -523,7 +523,7 @@ parent agent                              child agent (self-MCP, unix:/run/rev.s
 Because every notification is payload-free and the parent always re-reads current
 state, redelivery is safe and the parent converges on the child's actual
 terminal result. No exactly-once gymnastics, no diff bookkeeping — the same
-discipline agent applies to every MCP resource, applied to agents themselves.
+discipline agentd applies to every MCP resource, applied to agents themselves.
 
 ---
 

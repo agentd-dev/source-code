@@ -1,11 +1,11 @@
-# Contributing to agent
+# Contributing to agentd
 
-Thanks for contributing! agent is the **reference agent** for the Agent Control
+Thanks for contributing! agentd is the **reference agent** for the Agent Control
 Contract (ACC) that the agentctl control plane consumes.
 
 ## Licensing & DCO sign-off
 
-agent is **Apache-2.0** (see [`LICENSE`](LICENSE)) — contributions are accepted
+agentd is **Apache-2.0** (see [`LICENSE`](LICENSE)) — contributions are accepted
 **inbound = outbound** under Apache-2.0 (Apache-2.0 §5); no CLA is required.
 Instead, sign off every commit with the **Developer Certificate of Origin**
 (certifying you wrote it / may submit it):
@@ -26,7 +26,7 @@ New source files carry an SPDX header on line 1:
 
 ## ACC conformance — keep the contract honest
 
-agent is conformant to the ACC **by behaviour**, not by sharing code with the
+agentd is conformant to the ACC **by behaviour**, not by sharing code with the
 control plane ([`CONFORMANCE.md`](CONFORMANCE.md)). If you change a served
 surface (manifest, management profile, metrics, exit codes, events, config, A2A,
 env, report):

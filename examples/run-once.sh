@@ -11,11 +11,11 @@
 
 set -euo pipefail
 
-AGENTD="${AGENTD:-agent}"
+AGENTD="${AGENTD:-agentd}"
 
 # Intelligence endpoint: unix:/path | https://host/... | vsock:cid:port.
 # The token is passed by ENV ONLY (never a flag in CI logs) — it is redacted in
-# all agent output. Here we read it from the environment if present.
+# all agentd output. Here we read it from the environment if present.
 export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-unix:/run/intel.sock}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 

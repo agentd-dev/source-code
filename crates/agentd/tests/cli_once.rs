@@ -8,7 +8,7 @@ use std::process::Command;
 
 #[test]
 fn supervised_once_exits_4_on_unreachable_intel() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
         .args([
             "--instruction",
@@ -33,7 +33,7 @@ fn supervised_once_exits_4_on_unreachable_intel() {
 
 #[test]
 fn bad_flag_exits_2() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
         .arg("--no-such-flag")
         .output()
@@ -43,7 +43,7 @@ fn bad_flag_exits_2() {
 
 #[test]
 fn reactive_requires_a_subscription() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
         .args([
             "--mode",
@@ -60,7 +60,7 @@ fn reactive_requires_a_subscription() {
 
 #[test]
 fn reactive_exits_6_when_required_mcp_server_is_down() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
         .args([
             "--mode",

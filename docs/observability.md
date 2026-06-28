@@ -1,6 +1,6 @@
 # Observability
 
-agent is a *process tree*, not a thread pool, and it is reactive — it spends
+agentd is a *process tree*, not a thread pool, and it is reactive — it spends
 most of its life asleep. That shapes everything below. The contract has three
 jobs:
 
@@ -12,7 +12,7 @@ jobs:
    conversation state — its telemetry is lifecycle/control. The subagent's
    telemetry is reasoning (steps, tool calls, tokens). Same line schema, two
    `comp` labels.
-3. **Distinguish "healthy and idle" from "hung."** A reactive agent subscribed
+3. **Distinguish "healthy and idle" from "hung."** A reactive agentd subscribed
    to MCP resources idles for hours by design, so **health is never inferred
    from traffic** — it is measured at the supervisor's own event loop.
 
@@ -42,7 +42,7 @@ so telemetry still goes to **stderr** — never mixed into the channel.
 
 ```sh
 # result on stdout, telemetry on stderr — cleanly separable
-agent --instruction "summarise /data/report.md" \
+agentd --instruction "summarise /data/report.md" \
        --intelligence unix:/run/intel.sock \
        --mcp fs="mcp-server-fs --root /data" \
   > result.json 2> telemetry.ndjson
@@ -136,8 +136,8 @@ the v1 set (build-gated surfaces add a few more, noted inline).
 | `intel.result` | `model`, `tokens_in`, `tokens_out`, `finish_reason`, `dur_ms` |
 | `tool.call` | `tool`, `id`, (`args` only with content capture on) |
 | `tool.result` | `tool`, `is_error`, `bytes` (`content` only with content capture on) |
-| `self.schedule` | `after_s`, `queued` — the agent scheduled a future self-wake-up (RFC 0008) |
-| `self.subscribe` | `action` (`subscribe`/`unsubscribe`), `uri` — the agent changed its own subscriptions |
+| `self.schedule` | `after_s`, `queued` — the agentd scheduled a future self-wake-up (RFC 0008) |
+| `self.subscribe` | `action` (`subscribe`/`unsubscribe`), `uri` — the agentd changed its own subscriptions |
 
 `comp:"mcp"` is used for transport-level lines folded from MCP
 `notifications/message`; it reuses these event names (e.g. `mcp.disconnect`) and
@@ -227,7 +227,7 @@ discovery, no join-key negotiation.
 ### Getting telemetry off-box — two wirings
 
 - **(A) default — each process writes its own stderr.** The container
-  runtime/collector captures it; agent does no aggregation and never becomes a
+  runtime/collector captures it; agentd does no aggregation and never becomes a
   logging bottleneck. Cleanest for Kubernetes. Reassemble by `run_id` +
   `agent_path` prefix.
 - **(B) `--aggregate-logs` (roadmap)** — child telemetry is framed up the
@@ -272,7 +272,7 @@ backend.
 
 **Ingest (mint-or-adopt):**
 
-- If an inbound `traceparent` arrives — on an inbound MCP request to agent's
+- If an inbound `traceparent` arrives — on an inbound MCP request to agentd's
   self-MCP server, or via the **`AGENT_TRACEPARENT`** env var when an
   orchestrator starts the pod — adopt its `trace_id` and use its `span_id` as the
   root `parent_span_id`.
@@ -296,7 +296,7 @@ backend.
 
 ## Health (mode-aware)
 
-A reactive agent is *supposed* to be idle, so **liveness is measured at the
+A reactive agentd is *supposed* to be idle, so **liveness is measured at the
 supervisor's event loop, not at the agent**.
 
 | Mode | Readiness | Liveness | Terminal health |
@@ -336,7 +336,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
    | 143 | killed by SIGTERM (128+15, OS-set) — ungraceful | — |
 
    A clean SIGTERM drain returns **0, not 143**. 137/143 are set by the OS when
-   the kernel kills us; agent never exits those itself.
+   the kernel kills us; agentd never exits those itself.
 
 2. **`--health-file PATH` (default daemon surface).** The supervisor writes the
    file every heartbeat — **no socket, no port** — via an atomic
@@ -593,13 +593,13 @@ onto the OTel GenAI semantic conventions:
 | `intel.call` / `intel.result` | `chat` | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons` |
 | `tool.call` / `tool.result` | `execute_tool` | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `mcp.method.name`, `server.address` |
 
-agent instruments the **client side** of each tool call and *propagates*
+agentd instruments the **client side** of each tool call and *propagates*
 context so the MCP server's spans nest underneath — one span tree, no duplicate
 spans. Export is OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`, pushed to a local
-collector / sidecar so agent stays thin (no batching/retry sophistication).
+collector / sidecar so agentd stays thin (no batching/retry sophistication).
 
 **Token-accounting honesty:** tokens come from the intelligence response
-`usage`. When absent, agent logs `0` / `null` — never a guess — so
+`usage`. When absent, agentd logs `0` / `null` — never a guess — so
 `agent_tokens_total` stays trustworthy.
 
 ---
@@ -610,7 +610,7 @@ collector / sidecar so agent stays thin (no batching/retry sophistication).
 - **No metrics client library, ever** — Prometheus text is hand-written; OTLP
   metrics ride `otel`.
 - **No span export in the default build** — propagation is on, export is gated.
-- **No MCP `logging` capability** — agent does not implement or advertise it
+- **No MCP `logging` capability** — agentd does not implement or advertise it
   (the spec deprecates it in favour of stderr + OpenTelemetry).
 - **No log file management / rotation / shipping in-binary** — stderr only; the
   container runtime / collector owns capture and rotation.

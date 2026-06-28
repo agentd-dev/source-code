@@ -1,6 +1,6 @@
 # Modes & triggers
 
-agent has **one loop**. The "four modes" are not four programs — they are one
+agentd has **one loop**. The "four modes" are not four programs — they are one
 supervisor loop with four different **exit predicates**. A `once` run and a
 long-lived `reactive` daemon share the same inner agentic loop, the same spawn
 chokepoint, the same router; they differ only in *when the supervisor decides to
@@ -62,7 +62,7 @@ budget/exhausted (steps / tokens / the run's own `deadline`)→7, … (exit code
 self-terminate, not a terminal-status mapping)
 
 ```
-agent \
+agentd \
   --instruction "Summarize today's open PRs and post to #eng." \
   --intelligence unix:/run/intelligence.sock \
   --model claude-opus-4-8 \
@@ -99,7 +99,7 @@ Keep working across "shifts" until a bound is hit or a drain signal arrives.
 
 ```
 # Poll a queue every 30s, react, exit on deadline or token budget.
-agent \
+agentd \
   --mode loop \
   --interval 30s \
   --instruction "Drain the review queue: triage each new item." \
@@ -137,7 +137,7 @@ server failed → `6`; tree token ceiling spent → `7`).
 a missing subscription is a usage error → exit 2):
 
 ```
-agent \
+agentd \
   --mode reactive \
   --subscribe "file:///inbox/*.json" \
   --instruction "When an inbox file appears, validate it and file an issue." \
@@ -252,7 +252,7 @@ starting new work," never melts down.
 
 ### Delivery semantics: at-least-once + re-read-current-state
 
-agent promises **convergence on current state, not exactly-once** (RFC 0008
+agentd promises **convergence on current state, not exactly-once** (RFC 0008
 §3.5). Notifications can be redelivered (reconnect, restart, a coalesce edge).
 Because the agent `resource.read`s on wake and acts on what the resource *is*
 now, reprocessing converges — coalesce is lossless and redelivery is safe.
@@ -266,7 +266,7 @@ Ordering guarantees:
 - **Across different routes/sessions:** concurrent, unordered. Exactly-one-owner
   means there is no cross-route race on a single event.
 
-**Reconnect recovery.** On MCP server reconnect or supervisor restart, agent
+**Reconnect recovery.** On MCP server reconnect or supervisor restart, agentd
 re-subscribes every *declared* subscription and synthesizes one coalesced
 "possibly changed" event per watched URI (read-after-subscribe converts
 edge-triggering to level-triggering across the boundary). This recovers any
@@ -293,17 +293,17 @@ reactor.recv_timeout(min(child_deadlines, route.debounce_timers, clock.next_fire
 
 ### Self-subscribe = self-scheduling
 
-This is the capability that closes the loop. When a *running* agent calls the
+This is the capability that closes the loop. When a *running* agentd calls the
 `subscribe(uri)` self-tool mid-reasoning (RFC 0005), the supervisor (RFC 0008
 §3.6):
 
 1. issues `resources/subscribe` upstream (capability-gated);
 2. **auto-creates a `continue(this_session)` route** at the front of the declared
    order (most specific, owned by the caller);
-3. returns success. The agent ends its turn; the session goes **warm**
+3. returns success. The agentd ends its turn; the session goes **warm**
    (suspended). The next `updated{uri}` re-enters *this* session.
 
-The agent has just scheduled its own future wake — "wake me when X changes." A
+The agentd has just scheduled its own future wake — "wake me when X changes." A
 child subagent's completion-as-self-resource is just an `updated` that the
 parent's self-subscribe route delivers, which is how async subagents (RFC 0009)
 report back. `unsubscribe(uri)` removes the route and subscription.
@@ -327,9 +327,9 @@ clock fire is an internal event delivered to the *same* router, routed to a
 ### Recommended: external CronJob → `once`
 
 For production, prefer an **external** scheduler (a k8s CronJob, systemd timer,
-cron) invoking `agent --mode once …`. This is robust to clock skew, restarts,
+cron) invoking `agentd --mode once …`. This is robust to clock skew, restarts,
 and is 12-factor clean — the schedule lives in the orchestrator, not in the
-process. agent has no calendars, DST handling, timezone job-store, or per-fire
+process. agentd has no calendars, DST handling, timezone job-store, or per-fire
 persistence in core (UTC only).
 
 ```yaml
@@ -362,7 +362,7 @@ convenience: the timer source fires every `D` and routes a fresh root per fire.
 2). UTC only.
 
 ```
-agent \
+agentd \
   --mode schedule \
   --interval 15m \
   --instruction "Check the status page; alert on any red." \
@@ -419,7 +419,7 @@ side effect** (a bad config exits `2` in milliseconds, RFC 0011).
 Durations accept `ms`/`s`/`m`/`h` suffixes or a bare integer (seconds):
 `250ms`, `30s`, `5m`, `2h`, `600`.
 
-See `agent --help` for the full flag list.
+See `agentd --help` for the full flag list.
 
 ---
 
@@ -431,7 +431,7 @@ See `agent --help` for the full flag list.
 - **Poll something / work-until-done with a bound** → `loop` (`--interval D` to
   poll, `--interval 0` to drain-then-done).
 - **React to resource changes / be event-driven / let the agent schedule its own
-  wakes** → `reactive` with `--subscribe`. This is agent's signature mode and
+  wakes** → `reactive` with `--subscribe`. This is agentd's signature mode and
   the part of the ecosystem nothing else builds.
 
 ---

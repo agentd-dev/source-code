@@ -1,13 +1,13 @@
 # Horizontal scaling
 
-A single `agent` is one process running one agent. To handle more load you run
+A single `agentd` is one process running one agent. To handle more load you run
 **more replicas of the same binary** — a fleet. But a reactive fleet has a
 correctness problem the moment it has more than one member: every replica is
 subscribed to the same MCP resources, so a single `file:///inbox/42.json`
 `updated` notification fans out to **all** of them and each one spawns a
 reaction. That is duplicate processing — N replicas doing the same work N times.
 
-agent solves this with two composable mechanisms, both behind the `cluster`
+agentd solves this with two composable mechanisms, both behind the `cluster`
 build feature:
 
 1. **Sharding** (`--shard K/N`) — a cheap, deterministic pre-filter: each
@@ -16,7 +16,7 @@ build feature:
    an item a replica claims it against a coordination server and proceeds only on
    a granted lease.
 
-agent itself does **not** scale the fleet — it only partitions work and emits
+agentd itself does **not** scale the fleet — it only partitions work and emits
 the signals a control plane (agentctl / KEDA / an HPA) scales on. Everything
 below is verified against the shipped binary; features that are forward-compat
 stubs are called out explicitly.
@@ -37,7 +37,7 @@ Two `reactive` replicas, each `--subscribe file:///inbox/`. A new file lands. Th
 MCP server notifies both. Both read it, both spawn an agent, both write the
 result. Without coordination, work is duplicated and side effects double up.
 
-The fix is to make exactly one replica own each item. agent gives you two layers
+The fix is to make exactly one replica own each item. agentd gives you two layers
 that compose; you can run either alone or both together (§5).
 
 ```
@@ -67,7 +67,7 @@ fnv1a64(uri) % N == K
 The hash is a **hand-rolled FNV-1a/64** (offset basis `0xcbf29ce484222325`,
 prime `0x00000100000001B3`) — deterministic fleet-wide, stable across versions,
 languages, and architectures. The default hasher is randomized and the obvious
-crates are dependencies, so agent rolls its own; there is exactly one FNV in the
+crates are dependencies, so agentd rolls its own; there is exactly one FNV in the
 tree and the work-claim key derivation reuses it.
 
 The gate runs at **reactive routing intake, before any debounce or spawn**, so
@@ -77,7 +77,7 @@ no gap.
 
 ```bash
 # replica 2 of a 4-shard fleet
-agent --instruction-file /etc/agent/task.md \
+agentd --instruction-file /etc/agentd/task.md \
        --intelligence unix:/run/intel.sock \
        --mode reactive \
        --subscribe 'file:///inbox/' \
@@ -93,7 +93,7 @@ items).
 
 ### 2.1 Who assigns K/N
 
-agent does **not** discover its own shard. The standard pattern is a Kubernetes
+agentd does **not** discover its own shard. The standard pattern is a Kubernetes
 **StatefulSet**: each replica gets a stable ordinal (`agent-0`, `agent-1`, …),
 and agentctl injects `AGENT_SHARD=<ordinal>/<replicas>` from it. The binary only
 reads, validates, and applies the value. See §7 for the sketch.
@@ -121,13 +121,13 @@ Sharding alone is enough when the partition is clean and stable. But if you want
 **cross-instance ownership** that survives a replica dying mid-item — at-least-once
 delivery with redelivery — you add a work-claim lease.
 
-agent does **not** run a queue. It is the *participant* half of a coordination
+agentd does **not** run a queue. It is the *participant* half of a coordination
 convention: before processing an item, it calls `work.claim` on a **coordination
 MCP server** (a declared `--mcp` server that advertises the `work.*` tools) and
 proceeds only on a granted lease.
 
 ```bash
-agent --instruction-file /etc/agent/task.md \
+agentd --instruction-file /etc/agentd/task.md \
        --intelligence unix:/run/intel.sock \
        --mode reactive \
        --mcp coord='mcp-server-workqueue --addr /run/coord.sock' \
@@ -137,14 +137,14 @@ agent --instruction-file /etc/agent/task.md \
 `--claim <uri>=<server>[:tool|resource]` is repeatable. The route's `uri` is
 automatically added to the subscribe set (subscribed and routed as a spawn). The
 `<server>` must be a declared `--mcp` server, validated at startup (exit `2`
-otherwise). agent *calls* the `work.*` tools — it never serves them.
+otherwise). agentd *calls* the `work.*` tools — it never serves them.
 
 ### 3.1 The `work.*` convention
 
 The four tool names are a **frozen contract**; the tools' *schemas* are the
 coordination server's own (discovered via `tools/list`):
 
-| Tool | When agent calls it |
+| Tool | When agentd calls it |
 |---|---|
 | `work.claim` | Before processing a routed item. Args `{item, ttl_ms}`. Returns `{granted:true, lease_id, expires_in_ms}` or `{granted:false, held_by}`. |
 | `work.ack` | On a terminal `completed` run — the durable side effect is committed. |
@@ -155,7 +155,7 @@ A coordination server is valid only if its `tools/list` advertises **both**
 `work.claim` and `work.ack`. A server that is *up but missing* them is a wiring
 mistake → exit `2`; a server that is *down* fails the MCP connect → exit `6`.
 
-**No secret or URL ever rides in `_meta`.** The only `_meta` keys agent emits on
+**No secret or URL ever rides in `_meta`.** The only `_meta` keys agentd emits on
 a claim are `agent/claim_key`, `agent/instance`, `agent/shard` (omitted when
 unsharded), and `traceparent` (when present). The item URI is a `work.claim`
 *argument*, never a `_meta` value.
@@ -199,7 +199,7 @@ route whose URI is also a `--continue` URI".
 
 ```bash
 # continue-claim: one warm session per claimed channel, lease held for its life
-agent … --mode reactive \
+agentd … --mode reactive \
          --mcp coord='mcp-server-workqueue --addr /run/coord.sock' \
          --continue 'file:///stream/in.json' \
          --claim 'file:///stream/in.json'=coord
@@ -209,7 +209,7 @@ agent … --mode reactive \
 
 The claim convention is **at-least-once**, not exactly-once. A claimer can die
 after committing a side effect but before `work.ack`; the lease expires and the
-item is redelivered to another replica. agent makes this safe with a
+item is redelivered to another replica. agentd makes this safe with a
 **deterministic, item-derived claim key**:
 
 - The key is `derive_claim_key(item_uri, route_id)` — two FNV passes over
@@ -220,7 +220,7 @@ item is redelivered to another replica. agent makes this safe with a
   side-effect `tools/call` carries it in `_meta.agent/run_id` — the dedupe key a
   backing service uses to collapse a retry (see [Configuration §8](configuration.md)).
 
-So redelivery is correct *if your backing tools dedupe on the run-id key*. agent
+So redelivery is correct *if your backing tools dedupe on the run-id key*. agentd
 guarantees the stable key; the durable store must honour it.
 
 ### 3.6 `claim.style=resource` is a stub
@@ -255,7 +255,7 @@ network round-trip only happens for items this replica might own).
 
 ## 5. Autoscaling signals
 
-agent emits the signals; a control plane scales on them. With `--features
+agentd emits the signals; a control plane scales on them. With `--features
 metrics` these are Prometheus gauges/counters on `/metrics` (served on
 `--metrics-addr`); without it they are derivable from the JSON-lines event stream
 (see [Observability](observability.md)). The names are part of the frozen metrics
@@ -277,12 +277,12 @@ schema:
 A typical scaler scales **out** on rising backlog (`agent_pending_events` /
 `agent_reaction_lag_ms`) or high `agent_saturation`, and scales **in** when
 `agent_claims_lost_total` rises under low backlog (replicas fighting over too
-little work). agent never changes its own replica count — scaling is the control
+little work). agentd never changes its own replica count — scaling is the control
 plane's job.
 
 ### 5.1 `agent://capacity` — the placement view
 
-When serving its self-MCP (`--serve-mcp`) in a `cluster` build, agent exposes
+When serving its self-MCP (`--serve-mcp`) in a `cluster` build, agentd exposes
 **`agent://capacity`** — a management-only read surface agentctl uses to place
 work onto the right replica:
 
@@ -317,7 +317,7 @@ route** on `(uri, server)` whose URI is folded into the subscribe set — it reu
 the existing claim machinery with no new code path.
 
 ```bash
-agent --instruction-file /etc/agent/task.md \
+agentd --instruction-file /etc/agentd/task.md \
        --intelligence unix:/run/intel.sock \
        --mode reactive --standby \
        --mcp coord='mcp-server-workqueue --addr /run/coord.sock' \
@@ -329,7 +329,7 @@ agent --instruction-file /etc/agent/task.md \
 `standby:true` on `agent://capacity` so agentctl can direct an assignment only to
 warm members.
 
-> **What standby is NOT (yet).** There is **no warm-child pool**. agent's
+> **What standby is NOT (yet).** There is **no warm-child pool**. agentd's
 > supervisor runs no LLM loop — every reaction re-execs and connects its own
 > intelligence — so today "standby" means *a reactive worker that claim-pulls an
 > assignment channel and reports `standby:true`*. It does **not** eliminate
@@ -369,7 +369,7 @@ spec:
             - name: AGENT_MODE
               value: "reactive"
           args:
-            - --instruction-file=/etc/agent/task.md
+            - --instruction-file=/etc/agentd/task.md
             - --subscribe=file:///inbox/
             # Optional claim backstop for death recovery within the shard:
             - --mcp=coord=mcp-server-workqueue --addr /run/coord.sock
@@ -389,7 +389,7 @@ emits the signals.
 
 ## See also
 
-- [Deploying agent](deployment.md) — pod recipes, StatefulSets, drain timing,
+- [Deploying agentd](deployment.md) — pod recipes, StatefulSets, drain timing,
   `terminationGracePeriodSeconds`.
 - [Observability](observability.md) — the full metrics schema, the JSON-lines
   event stream, and deriving metrics from logs.

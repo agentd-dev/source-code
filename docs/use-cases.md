@@ -1,6 +1,6 @@
 # Use cases
 
-agent is a **runtime, not an application**. You don't configure features — you
+agentd is a **runtime, not an application**. You don't configure features — you
 hand it three things and it runs the agentic loop:
 
 1. an **instruction** (what to do, ending in an explicit output contract),
@@ -41,7 +41,7 @@ and [`mcp.md`](mcp.md). Runnable skeletons live in [`examples/`](../examples/SAM
 
 ---
 
-# Part A — agent as a single agent
+# Part A — agentd as a single agent
 
 ## 1. One-shot research / report job
 
@@ -54,7 +54,7 @@ plan. The run produces its result on **stdout**, structured telemetry on
 scheduler can branch on it.
 
 ```bash
-agent \
+agentd \
   --mode once \
   --instruction-file instructions/research.md \
   --intelligence unix:/run/intel.sock \
@@ -74,7 +74,7 @@ child won't self-terminate, kills with `124`
 ([RFC 0007](../rfcs/0007-agentic-loop-and-terminal-status.md),
 [RFC 0011](../rfcs/0011-cloud-native-contract.md)).
 
-**Why agent.** A bad config exits `2` in milliseconds, before any token is
+**Why agentd.** A bad config exits `2` in milliseconds, before any token is
 spent. Setting `--run-id` makes a retried Job idempotent. The whole thing is one
 ~1 MB static binary on `scratch` — nothing to install, nothing to patch.
 
@@ -89,7 +89,7 @@ alert queue, a support inbox, a "new object" bucket notification, a CI webhook
 landed as a resource — and it triages each item as it arrives.
 
 ```bash
-agent \
+agentd \
   --mode reactive \
   --instruction-file instructions/triage.md \
   --intelligence unix:/run/intel.sock \
@@ -102,14 +102,14 @@ agent \
 
 **The contract.** `--mode reactive` **requires** at least one `--subscribe`
 (without it, config validation fails `2`). The wake notification carries **only
-a URI** — the agent `resources/read`s the item's *current* state, so a change
+a URI** — the agentd `resources/read`s the item's *current* state, so a change
 missed during a restart is still recovered (level-, not edge-, triggered). The
 [triage instruction](../examples/instructions/triage.md) emits one JSON decision
 object per item, and — importantly — treats the item's text as **untrusted
 data, not instructions** (the right posture for anything reacting to the
 outside world).
 
-**Why agent.** The tree-wide `--max-tokens` ceiling is the ultimate
+**Why agentd.** The tree-wide `--max-tokens` ceiling is the ultimate
 backpressure under a flood. `--metrics-addr` adds `/healthz`+`/readyz`+`/metrics`
 for k8s probes; `--drain-timeout` (kept under the pod's
 `terminationGracePeriodSeconds`) bounds graceful shutdown so in-flight triage
@@ -129,9 +129,9 @@ data lake for schema violations every 15 minutes.
 
 ```bash
 # k8s CronJob spec runs, on each fire:
-agent \
+agentd \
   --mode once \
-  --instruction-file /etc/agent/audit.md \
+  --instruction-file /etc/agentd/audit.md \
   --intelligence unix:/run/intel.sock \
   --mcp "fs=mcp-server-fs --root /data --read-only" \
   --mcp "tickets=mcp-server-tickets --project SEC" \
@@ -142,11 +142,11 @@ agent \
 In-process polling instead:
 
 ```bash
-agent --mode loop --interval 15m  --instruction-file /etc/agent/audit.md  …
-agent --mode loop --interval 0    …   # work-until-done: re-enter immediately on completion
+agentd --mode loop --interval 15m  --instruction-file /etc/agentd/audit.md  …
+agentd --mode loop --interval 0    …   # work-until-done: re-enter immediately on completion
 ```
 
-**Why agent.** A `CronJob` owns lifecycle, retries, and history; agent owns the
+**Why agentd.** A `CronJob` owns lifecycle, retries, and history; agentd owns the
 *reasoning* of one fire and an honest exit code. `--interval 0` turns `loop` into
 a drain-a-backlog worker that re-enters the instant it finishes, until a bound
 (`--deadline` / token ceiling) or `SIGTERM`.
@@ -182,9 +182,9 @@ evaluate several candidate designs against the same rubric; shard a large
 backfill and reconcile the shard reports.
 
 ```bash
-agent \
+agentd \
   --mode once \
-  --instruction-file /etc/agent/repo-audit.md \
+  --instruction-file /etc/agentd/repo-audit.md \
   --intelligence unix:/run/intel.sock \
   --mcp "fs=mcp-server-fs --root /src --read-only" \
   --mcp "tickets=mcp-server-tickets --project ENG" \
@@ -215,7 +215,7 @@ that are **sensitive** or **egress**-capable. The untrusted reader returns a
 distilled, structured summary; only that distillate crosses back — raw,
 possibly-injected bytes never enter a context that can act on them.
 
-This is the agentic answer to prompt injection, and agent enforces it
+This is the agentic answer to prompt injection, and agentd enforces it
 structurally. You tag each MCP server's capabilities, and at **startup** the
 supervisor refuses any root grant that gives one agent all three of
 `untrusted_input` + `sensitive` + `egress` — the
@@ -227,9 +227,9 @@ Within one tree you partition the (≤2-leg) work with subagents — read the
 untrusted ticket in a child scoped to `tickets` only, then act in the parent:
 
 ```bash
-agent \
+agentd \
   --mode reactive \
-  --instruction-file /etc/agent/handle-ticket.md \
+  --instruction-file /etc/agentd/handle-ticket.md \
   --intelligence unix:/run/intel.sock \
   --subscribe "tickets:///incoming" \
   --mcp "tickets=mcp-server-tickets --project SUP" --mcp-tags "tickets=untrusted_input" \
@@ -251,26 +251,26 @@ right shape: run the **actor** as a *separate* agent holding `crm` + `email`
 distillate over MCP — the cross-process composition of **use case 6** below. Each
 process stays within the Rule-of-Two; no single agent ever holds all three.
 
-**Why agent.** The trust boundary is the **process boundary** plus the
+**Why agentd.** The trust boundary is the **process boundary** plus the
 spawn-time scope intersection — not a convention you hope the model follows. An
 untagged server is treated conservatively as `untrusted_input`, and
 `--enable-exec` counts as `egress`, so the check fails *closed*.
 
 ## 6. A served worker an orchestrator drives and steers
 
-**Pattern:** run agent as a long-lived **MCP server** (`--serve-mcp unix:/path`)
+**Pattern:** run agentd as a long-lived **MCP server** (`--serve-mcp unix:/path`)
 that exposes `subagent.spawn` / `subagent.send` / `subagent.status` /
 `subagent.cancel` and the subscribable `agent://` state resources. Any MCP
 client — a control plane, a workflow engine, **or another agent** — drives it.
-Because agent is symmetric, composition needs no new protocol: the parent just
+Because agentd is symmetric, composition needs no new protocol: the parent just
 declares the worker as one more `--mcp` server.
 
 ```bash
 # An orchestrator agent driving a worker agent, both on one node:
-agent \
+agentd \
   --instruction "Run the nightly review; delegate each PR to the reviewer service." \
   --intelligence unix:/run/intel.sock \
-  --mcp reviewer="agent --instruction worker --intelligence unix:/run/intel.sock --serve-mcp unix:/run/rev.sock"
+  --mcp reviewer="agentd --instruction worker --intelligence unix:/run/intel.sock --serve-mcp unix:/run/rev.sock"
 ```
 
 Two patterns fall out ([`mcp.md`](mcp.md) §3):
@@ -281,7 +281,7 @@ Two patterns fall out ([`mcp.md`](mcp.md) §3):
   `agent://subagent/{handle}`, and is woken by `notifications/resources/updated`
   when the worker reaches a terminal status; it then `resources/read`s that URI to
   collect the status and distilled result — the same notify-then-read discipline
-  agent uses for every resource, applied to agents themselves.
+  agentd uses for every resource, applied to agents themselves.
 
 **Warm sessions.** `subagent.send` injects a follow-up turn into a still-warm
 worker session — an iterative reviewer that keeps context across rounds ("address
@@ -289,7 +289,7 @@ that feedback and re-check"), a chat-shaped assistant fronted by a thin gateway,
 a multi-step workflow where each step refines the last. `subagent.cancel` walks
 the kill ladder on a subtree when the orchestrator changes its mind.
 
-**Why agent.** The orchestrator gets supervision for free: every served run is a
+**Why agentd.** The orchestrator gets supervision for free: every served run is a
 real, reaped process with a hard deadline, a no-progress watchdog, and active
 ping/pong liveness; `agent://subagent/{handle}` gives the driver an honest,
 subscribable view of each child, and the read-only `agent://status` a view of
@@ -299,7 +299,7 @@ the worker itself — without parsing logs.
 
 ## Compose them
 
-These aren't exclusive. A realistic production agent is often several at once: a
+These aren't exclusive. A realistic production agentd is often several at once: a
 **reactive** front (use case 2) that, per event, **fans out** to workers (4),
 **partitions trust** so the untrusted reader can't exfiltrate (5), and is itself a
 **served** worker (6) that a higher-level orchestrator drives and can drain on
@@ -310,6 +310,6 @@ instruction, the `--mcp` wiring, and the mode.
 
 - [`modes-and-triggers.md`](modes-and-triggers.md) — `once` / `loop` / `reactive` / `schedule` in depth, and the reactive router.
 - [`subagents.md`](subagents.md) — the spawn payload, scope intersection, dispositions, caps, and supervision.
-- [`mcp.md`](mcp.md) — agent as MCP client *and* server, the `agent://` resources, and composition.
+- [`mcp.md`](mcp.md) — agentd as MCP client *and* server, the `agent://` resources, and composition.
 - [`security.md`](security.md) — the Rule-of-Two trifecta, secret redaction, and tool scoping.
 - [`deployment.md`](deployment.md) and [`examples/`](../examples/SAMPLES.md) — k8s `Job` / `CronJob` / `Deployment` manifests and runnable skeletons.

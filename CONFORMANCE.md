@@ -1,21 +1,21 @@
-# agent — Agent Control Contract (ACC) v1 conformance
+# agentd — Agent Control Contract (ACC) v1 conformance
 
-`agent` is the **reference implementation** of an agent driven by the **agentctl**
+`agentd` is the **reference implementation** of an agent driven by the **agentctl**
 Kubernetes control plane. agentctl depends only on the published **Agent Control
 Contract (ACC)** — never on the binary's code (principle P0). This document records
-`agent`'s conformance to **ACC v1** (`contract_version` `1.0`), surface by surface:
+`agentd`'s conformance to **ACC v1** (`contract_version` `1.0`), surface by surface:
 what passes, the gaps closed to get there, and the P-series items deliberately
 deferred.
 
-> **v3.0.0 neutral cutover.** The runtime was renamed `agentd` → **`agent`** and now
+> **Naming model.** The product/binary/image is **`agentd`**, and it now
 > **emits the neutral ACC tokens only** — `agent://` resources, `agent_` metrics,
 > `agent_version`, `agent/*` `_meta`, and `AGENT_*` env (documented). The legacy
-> `agentd*` spellings are **still accepted on input** (graceful) but never emitted.
-> The image is `ghcr.io/agentd-dev/agent`. The golden fixtures were re-captured from
-> the `agent 3.0.0` binary; the agentctl fixture tests moved in lockstep. Where this
+> branded spellings are **still accepted on input** (graceful) but never emitted.
+> The image is `ghcr.io/agentd-dev/agentd`. The golden fixtures were re-captured from
+> the `agentd 1.0.0` binary (`agent_version: "1.0.0"`); the agentctl fixture tests moved in lockstep. Where this
 > document still cites a branded form below, read it as the legacy input alias.
 
-- Contract (consumed, **never edited by `agent`**):
+- Contract (consumed, **never edited by `agentd`**):
   `/root/agentctl-dev/source-code/contract/` — `README.md`, `SPEC.md`,
   `schemas/*.json`, `fixtures/capabilities/*`.
 - Conformance is judged by **behavior** against those artifacts (ACC SPEC §8), not
@@ -44,7 +44,7 @@ no credential reaches the manifest / config file / identity path.
 
 | Surface | ACC schema | Status | Notes |
 |---|---|---|---|
-| **Capabilities manifest** | `manifest.schema.json` | ✅ PASS | `json!`→`Value` (secret-safe); all required root keys; emits the neutral `agent_version` (the legacy `agentd_version` was dropped at v3.0.0) + `surfaces.events_schema` (when served). Sum types correct. Live `agent://capabilities` is parsed-equal to the one-shot. |
+| **Capabilities manifest** | `manifest.schema.json` | ✅ PASS | `json!`→`Value` (secret-safe); all required root keys; emits the neutral `agent_version` (the legacy branded `agentd_version` is not emitted) + `surfaces.events_schema` (when served). Sum types correct. Live `agent://capabilities` is parsed-equal to the one-shot. |
 | **Management profile** | `management-profile.json` | ✅ PASS | Frozen order `[drain, lame-duck, pause, resume, cancel]`; Management-gated; a non-Management caller of an operator **tool or resource** (read **and** subscribe) → `-32601`. `attach` not a tool; no `force`. `drain ≡ SIGTERM ≡ exit 0`; `lame-duck` readiness-only; `cancel{handle:"0"\|omitted}` = whole run. |
 | **Exit codes** | `exit-codes.table.json` | ✅ PASS | Table + `pod_failure_intent` exact; unknown → `retriable`; `EXIT_CODES="1.0"`. Clean drain = **0, not 143**. Only **3 & 7** remappable, via the new `--budget-exit-code`. |
 | **Run-outcome report** | `report.schema.json` | ✅ PASS | 12 required keys; `report_schema="1.0"`; `mode ∈ {once,loop,schedule}` (never `reactive`); 9-value closed `status`; `distillate_ref` `^(agent\|agentd)://`; `instance`/`trace_id` omitted-not-null; tokens never currency. A real once-run report validates. |
@@ -87,7 +87,7 @@ under induced failures: `exit-0-on-success`, `exit-2-on-bad-flag`,
 ```sh
 cargo run -p agentd-conformance                 # 38 behavioral checks
 cargo build -p agentd --features "serve-mcp,a2a,events,metrics,cluster,internal-mocks"
-python3 acc_validate.py ./target/debug/agent   # 22 live schema+behavior checks
+python3 acc_validate.py ./target/debug/agentd   # 22 live schema+behavior checks
 # fixtures vs schema:
 for f in /root/agentctl-dev/source-code/contract/fixtures/capabilities/*.json; do
   python3 - "$f" <<'PY'
@@ -104,7 +104,7 @@ The golden corpus in `contract/fixtures/capabilities/` is **owned by the agentct
 contract repo** and pinned by its `agent-contract-client` fixture tests
 (`tests/fixtures.rs`), which assert exact content — `default.json` `version ==
 "2.5.0"` and `surfaces.claim` as an object, plus the `full-features.json` surface
-values. They remain the **real `--capabilities` captures from agent 2.5.0** and
+values. They remain the **real `--capabilities` captures from agentd 2.5.0** and
 all four validate against the *current* `manifest.schema.json`.
 
 The current binary's `--capabilities` is a **superset** of the 2.5.0 capture
@@ -122,7 +122,7 @@ every capturable key are covered: the off/null branches by `default` +
 > to *omitted* (a bare release build has no `cluster` feature), breaking the pinned
 > `fixtures.rs` assertions. Since the agentctl repo owns the fixtures **and** their
 > tests, re-capturing must move both in lockstep there; the regenerated v2.8.1
-> captures are available for adoption. Forcing them from agent would make the two
+> captures are available for adoption. Forcing them from agentd would make the two
 > repos inconsistent (a failing agentctl test), so they are deliberately left to
 > the owner. `intelligence.healthy` stays `"unknown"` in any one-shot capture (the
 > probe is network-free admission, ACC SPEC §3) — its boolean branch is reachable
@@ -177,10 +177,10 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
 | **P2** — freeze A2A wire strings + `surfaces.a2a` | **RESOLVED (reference binding).** `surfaces.a2a` emitted; reference PascalCase `a2a.*` served. Normative spelling stays open per the contract; a gateway translates. |
 | **P10** — reconcile autoscaling metric names | **RESOLVED (source wins).** Only `agent_pending_events` emitted; `agent_reactive_backlog` an alias-only, never on the scrape; `agent_tokens_per_sec`/`agent_intelligence_latency_ms` stay provisional/not-emitted. |
 | **P-pause** — pause/resume served | **RESOLVED.** Both ship (frozen order), Management-gated, reflected in `agent_paused`. |
-| **P4** — `agent://metrics` text body + `agent://capacity` schema | **DEFERRED (contract: OUT OF SCOPE / downstream).** `surfaces.metrics` carries the scrape address; the byte-identical Prom-text resource + capacity schema are undefined upstream. `agent://capacity` is served (cluster builds) but its frozen schema is not pinned. No agent change for v1. |
+| **P4** — `agent://metrics` text body + `agent://capacity` schema | **DEFERRED (contract: OUT OF SCOPE / downstream).** `surfaces.metrics` carries the scrape address; the byte-identical Prom-text resource + capacity schema are undefined upstream. `agent://capacity` is served (cluster builds) but its frozen schema is not pinned. No agentd change for v1. |
 | **P5** — re-readable distillate after exit | **DEFERRED (contract-open).** `distillate_ref` points; the durable copy is the report file + stdout. |
 | **P-trace** — traceparent ingest on the A2A surface | **DEFERRED (contract-open).** `trace_id` uses the existing env/`_meta` ingest path. |
-| **P3 (shard)** — `--shard auto/N` derive K from the pod ordinal | **DEFERRED (owner = agentctl).** agent parses explicit `K/N` and rejects `N==0`/`K>=N` (exit 2); deriving `K` is the control plane's job. |
+| **P3 (shard)** — `--shard auto/N` derive K from the pod ordinal | **DEFERRED (owner = agentctl).** agentd parses explicit `K/N` and rejects `N==0`/`K>=N` (exit 2); deriving `K` is the control plane's job. |
 | **P-grace** — `AGENT_POD_GRACE_SECONDS` | **DEFERRED (contract-flagged provisional).** Not read in source (drain budget = `--drain-timeout`/`AGENT_DRAIN_TIMEOUT`); the neutral alias would nonetheless be honored by `debrand_env`. |
 
 ## Notes & honest absences (not gaps)
@@ -189,14 +189,14 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
    one-shot probe is network-free admission, always pre-connect `"unknown"`. The
    boolean branch is unit-tested on the live `agent://intelligence`/`capabilities`
    read.
-2. **`_meta` input de-branding is N/A for v1** — agent's served `tools/call`
+2. **`_meta` input de-branding is N/A for v1** — agentd's served `tools/call`
    handler consumes **no** incoming `_meta` keys (only `name`/`arguments`); its
    `agentd/*` keys are all **outbound** stamps onto downstream MCP servers (kept
    branded, the accepted current form). There is no incoming `_meta` read site to
    alias.
 3. **`run_id` is an opaque stable string, not a Crockford ULID** — no schema
    enforces a ULID pattern (`manifest`/`report` require only a non-empty string);
-   agent mints `format!("{millis:x}{pid:x}")`, stable across a retried Job when
+   agentd mints `format!("{millis:x}{pid:x}")`, stable across a retried Job when
    `AGENT_RUN_ID`/`AGENT_RUN_ID` is set. Switching the format is unnecessary for
    conformance and risk-bearing, so it is left as-is.
 4. **`--config-schema` is the strict serde mirror** (reloadable keys only, closed);
@@ -207,18 +207,18 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
    subtree — consistent with `x-mode-reachability` (intent `policy`). The
    "unreachable via `once_exit()`" note is about that internal fn only.
 
-## Contract reconciliation & asks (no schema edited by agent)
+## Contract reconciliation & asks (no schema edited by agentd)
 
 The contract's `config.schema.json`, `metrics.registry.json`, and
 `exit-codes.table.json` were reconciled upstream to match the reference (agentctl
 commit `68a61b8`, "source-wins" per L8 — `intelligence`/`model_swap` config keys,
-the `agent_intel_all_down` stable gauge, code 124 `returned_by_agent:true`). agent
+the `agent_intel_all_down` stable gauge, code 124 `returned_by_agent:true`). agentd
 made **no** edit to any ACC schema in this pass; remaining disagreements are
 recorded here as asks rather than schema edits:
 
 - **C1 — `SPEC.md` §4.4 metric count is stale.** The prose says "46 records — 29
   stable, 8 legacy, 9 provisional"; the registry JSON now has **51 records — 36
-  stable, 8 legacy, 7 provisional**. agent emits a superset of the stable set; the
+  stable, 8 legacy, 7 provisional**. agentd emits a superset of the stable set; the
   registry JSON, not the prose, is authoritative. Suggest updating the prose.
 - **C2 — "ULID" wording for `run_id`** (note 3) is not schema-enforced and not met
   literally by the reference; suggest softening to "opaque stable id (ULID

@@ -39,7 +39,7 @@ multiplexes many I/O sources while staying minimal and dependency-light.
 
 4. **TLS: `rustls` with the `ring` provider, behind a feature flag, default
    OFF.** The recommended container topology terminates TLS at a
-   sidecar/gateway and keeps `agent` plaintext-to-localhost — so most
+   sidecar/gateway and keeps `agentd` plaintext-to-localhost — so most
    builds carry **no TLS at all**. When compiled in, prefer **`ring`** over
    `aws-lc-rs` to avoid the C toolchain / `aws-lc-sys` build dependency.
 
@@ -63,7 +63,7 @@ of first-party crates**, with TLS/vsock/streaming-HTTP each opt-in.
 
 ## 1. What the runtime actually has to multiplex
 
-From RFC §§3–8, a single `agent` process (the supervisor) must concurrently
+From RFC §§3–8, a single `agentd` process (the supervisor) must concurrently
 service:
 
 | Source | Count (expected) | Shape | Liveness concern |
@@ -366,7 +366,7 @@ is "small enough to audit by reading it," shipping ICU is absurd.
   `read_line` SSE loop) and a hand-rolled HTTP/1.1 *server*
   (`triggers/http.rs`). This is *proven prior art in this exact repo*, not
   speculation.
-- `agent`'s HTTP needs are narrow and known: `POST /chat/completions`
+- `agentd`'s HTTP needs are narrow and known: `POST /chat/completions`
   (and MCP-over-HTTP), a couple of headers, chunked **or** SSE response
   bodies, one well-behaved gateway endpoint. It does **not** need redirects
   (the old code deliberately refuses them on policy grounds), cookies,
@@ -398,7 +398,7 @@ pull it behind a feature and accept the ICU cost knowingly.
 
 - **Default container topology terminates TLS at a sidecar/gateway** (RFC
   §7.2 "common same-pod sidecar," §12 "recommended container pattern
-  terminates TLS at the sidecar and keeps `agent` plaintext-to-localhost").
+  terminates TLS at the sidecar and keeps `agentd` plaintext-to-localhost").
   So the *common* build links **no TLS** — the biggest TLS dependency win is
   *not compiling it at all*.
 - When `https://` is used directly (standalone CLI), compile `rustls` behind

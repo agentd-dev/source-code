@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
@@ -20,13 +20,13 @@
 
 ## 1. Problem / Context
 
-agent carries two JSON-RPC surfaces that are easy to conflate and must not be:
+agentd carries two JSON-RPC surfaces that are easy to conflate and must not be:
 
-1. **The public self-MCP server** (assessment §2.5 SERVER half, §2.3). agent
+1. **The public self-MCP server** (assessment §2.5 SERVER half, §2.3). agentd
    is symmetric: as well as being an MCP *client* to external servers (RFC
-   0004), it *is* an MCP server. This is what makes agent composable — a
+   0004), it *is* an MCP server. This is what makes agentd composable — a
    parent agent, a peer agent, or a driving harness `initialize`s against
-   agent and gets a real MCP catalogue: tools to spawn/steer subagents, tools
+   agentd and gets a real MCP catalogue: tools to spawn/steer subagents, tools
    to read and subscribe to state, an optional gated `exec`, and a set of
    **subscribable `agent://` state resources** whose `notifications/resources/updated`
    emissions are the substrate for agent-to-agent reactivity and for
@@ -228,7 +228,7 @@ listed (capability absence, not a runtime error).
 
 The server exposes session/run/subagent state as readable **and subscribable**
 resources under the custom `agent://` scheme (legal per RFC 3986; semantics
-understood only by other agent instances — review §4 caveat 2). This is the
+understood only by other agentd instances — review §4 caveat 2). This is the
 mechanism for agent-to-agent reactivity: a peer or parent subscribes to one of
 our state URIs, and on each state transition we emit
 `notifications/resources/updated{uri}` — the peer then `resources/read`s to
@@ -343,9 +343,9 @@ Two distinct subscribe surfaces meet here and must not be confused:
 - **MCP `resources/subscribe`** (a *method* a peer calls on our server) — the
   peer wants `updated` notifications for one of *our* `agent://` URIs (§3.3).
 - **The `subscribe` *tool*** (in `tools/list`) — a *running subagent* calls this
-  via `tools/call` to ask the supervisor to subscribe **the agent itself** to an
-  *external* MCP resource `(server, uri)` reachable through agent's client side
-  (RFC 0004). When a running agent subscribes, the supervisor auto-creates a
+  via `tools/call` to ask the supervisor to subscribe **the agentd itself** to an
+  *external* MCP resource `(server, uri)` reachable through agentd's client side
+  (RFC 0004). When a running agentd subscribes, the supervisor auto-creates a
   `continue(this_session)` route — **self-subscribe = self-scheduling**, the
   signature capability (assessment §2.6; routing in RFC 0008).
 
@@ -355,7 +355,7 @@ Two distinct subscribe surfaces meet here and must not be confused:
 { "name":"subscribe","title":"Subscribe to a resource",
   "inputSchema":{ "type":"object",
     "properties":{
-      "server":{"type":"string"},     // MCP server name from agent's client registry
+      "server":{"type":"string"},     // MCP server name from agentd's client registry
       "uri":{"type":"string"}         // concrete URI (not a template)
     },
     "required":["server","uri"],
@@ -367,8 +367,8 @@ Returns `{}` on success; `isError:true` if the named server didn't advertise
 
 ### 3.6 Transports — stdio always; unix when `--serve-mcp unix:…`
 
-- **stdio (always on).** When a parent/peer spawns agent as a subprocess, the
-  self-MCP is served on agent's own stdin/stdout using **NDJSON** (`read_line`/
+- **stdio (always on).** When a parent/peer spawns agentd as a subprocess, the
+  self-MCP is served on agentd's own stdin/stdout using **NDJSON** (`read_line`/
   `write_line`): one compact JSON object per line, `\n`-terminated, no embedded
   newlines, UTF-8 (MCP stdio rules — RFC 0004). **stdout is sacred for MCP
   messages only**; all telemetry goes to stderr (assessment §2.9). Note: a
@@ -402,7 +402,7 @@ struct PeerConn { id: ConnId, stream: FramedNdjson, caps: PeerCaps }
 ### 3.7 Liveness and cancellation on the served side
 
 The server answers `ping` with `{}` promptly (it is a good citizen, and ping is
-a driver's liveness probe of agent — RFC 0004). It accepts
+a driver's liveness probe of agentd — RFC 0004). It accepts
 `notifications/cancelled{requestId,reason?}` for an in-flight served request
 (e.g. a long sync `subagent.spawn`): on receipt it requests graceful cancel of
 the spawned subtree via the kill ladder (RFC 0003) and sends no response for the
@@ -621,7 +621,7 @@ where the control protocol must agree.)
 
 ## 5. Interactions with other RFCs
 
-- **RFC 0001 (core).** This RFC realizes the "agent is both MCP client and its
+- **RFC 0001 (core).** This RFC realizes the "agentd is both MCP client and its
   own MCP server" thesis (server half) and the private supervision wire.
 - **RFC 0002 (reactor & concurrency).** The supervisor's per-child control-out
   reader thread and each unix peer-conn reader thread forward onto the merged
@@ -633,7 +633,7 @@ where the control protocol must agree.)
   accounting fed by `ev/usage`.
 - **RFC 0004 (MCP client subset & codec).** Shares `json/` + `frame.rs`
   (`read_line`/`write_line` here too); the `subscribe`/`resource.read` self-tools
-  drive agent's *client*-side subscriptions and reads; capability-gating and
+  drive agentd's *client*-side subscriptions and reads; capability-gating and
   notify-then-read are defined there.
 - **RFC 0007 (agentic loop).** The child loop consumes forwarded `DownMsg`,
   emits `UpMsg`; terminal-status enum and VERIFY-grounded `ev/result` come from
@@ -668,7 +668,7 @@ where the control protocol must agree.)
   task-augmented requests. `subagent.spawn` does **not** declare
   `execution.taskSupport`.
 - **`sampling/createMessage` in either direction** — deferred (assessment §1.3
-  item 5; review §5). agent declares no `sampling` client capability and serves
+  item 5; review §5). agentd declares no `sampling` client capability and serves
   no sampling; intelligence-sharing is a v2 feature wired as a client capability,
   not a server one.
 - **`prompts/*`, `roots/*`, `elicitation/*`, `completion/*`, `logging` server

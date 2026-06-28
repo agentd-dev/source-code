@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { DOCS } from "../../lib/docs";
 
-export const metadata = { title: "agent docs" };
+export const metadata = { title: "agentd docs" };
 
 export default function DocsIndex() {
   const guides = DOCS.filter((d) => !d.slug.startsWith("rfc-"));

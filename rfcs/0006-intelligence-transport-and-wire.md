@@ -3,12 +3,12 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 > **A2A alignment (RFC 0020).** Note the transport symmetry RFC 0020 exploits:
-> here agent dials intelligence **out** over vsock behind a TLS-terminating
+> here agentd dials intelligence **out** over vsock behind a TLS-terminating
 > sidecar; RFC 0020 serves A2A **in** over vsock behind an HTTP-terminating
-> gateway. Same posture — agent network-isolated, the gateway/sidecar owns
+> gateway. Same posture — agentd network-isolated, the gateway/sidecar owns
 > TLS/auth/HTTP — inverted direction. The vsock transport this RFC defines for
 > the client is mirrored on the serving side (RFC 0015 §3, RFC 0020).
 

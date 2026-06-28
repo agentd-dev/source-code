@@ -8,7 +8,7 @@ reactive) + time-scheduled runs + subagent spawn semantics.
 This is a durable design artifact. It makes concrete, opinionated
 recommendations — not a survey. Where the RFC left an open question (§14), I
 take a position and justify it. Where the 2024–2026 production literature has a
-clear answer, I cite it and adapt it to agent's minimalism bar.
+clear answer, I cite it and adapt it to agentd's minimalism bar.
 
 ---
 
@@ -28,7 +28,7 @@ clear answer, I cite it and adapt it to agent's minimalism bar.
    says final · step cap · token budget · deadline · **no-progress (idle)** ·
    per-tool repeat cap · cancel. Each has a *distinct* terminal status so the
    parent and an external scheduler can tell *why* it stopped.
-4. **Resources reach the agent two ways at once:** the resource *list*
+4. **Resources reach the agentd two ways at once:** the resource *list*
    (names + descriptions + URIs, not bodies) is injected into context as a
    compact catalogue; resource *bodies* are pulled on demand via a
    `resource.read` tool. List = awareness; read = attention.
@@ -37,7 +37,7 @@ clear answer, I cite it and adapt it to agent's minimalism bar.
    `spawn`-per-event or bound to one warm session; bursts are coalesced by a
    per-resource debounce window; events are a bounded per-route queue with an
    explicit overflow policy. This is the part the ecosystem has *not* solved —
-   it is agent's opportunity, so it must be specified precisely.
+   it is agentd's opportunity, so it must be specified precisely.
 6. **Context management is minimal and lever-ordered:** (a) drop stale tool
    results first, (b) then summarize-and-restart (compaction) at a high-water
    mark. No vector DB, no memory service in core — a `note.write`/`note.read`
@@ -98,12 +98,12 @@ Each request is assembled fresh from a small set of parts, in this order:
 5. **Running transcript** — prior turns: assistant messages, tool calls, and
    tool results, *as managed by §5 compaction*.
 
-The tool catalogue (scoped MCP tools + agent self-tools) is passed in the
+The tool catalogue (scoped MCP tools + agentd self-tools) is passed in the
 provider's `tools` field (native tool-calling), not stuffed into the system
 text, *when the gateway supports it*. Tool definitions must be unambiguous and
 non-overlapping — Anthropic's test: "if a human engineer can't say which tool to
-use, neither can the agent." Since agent ships **no** tools of its own beyond
-the self-MCP, tool quality is the MCP server author's responsibility; agent's
+use, neither can the agent." Since agentd ships **no** tools of its own beyond
+the self-MCP, tool quality is the MCP server author's responsibility; agentd's
 job is to pass them through faithfully and cheaply (token-efficiently).
 
 ### 1.3 Stopping conditions (the heart of "when does it stop")
@@ -125,11 +125,11 @@ This is the question the brief asks most pointedly. The answer is the same for
 | Crash | `crashed` | process exit / panic | supervisor observes via exit code |
 
 Two of these are routinely forgotten and *are* the production-failure stories
-of 2024–2026, so they are mandatory in agent:
+of 2024–2026, so they are mandatory in agentd:
 
 - **The global step/token/deadline cap is non-negotiable.** The literature's
   cautionary tale: four agents ran 11 days and billed \$47K on a missing
-  `max_steps`. agent already has the bones for this in the retired
+  `max_steps`. agentd already has the bones for this in the retired
   `BudgetTracker` (`crates/agentd/src/budget.rs`: cumulative token cap with a
   `check_*_budget()` BEFORE the call, `add_*` AFTER) — reuse that exact
   check-before / record-after discipline.
@@ -152,7 +152,7 @@ consecutive turns (default 3), stop with `stalled`. This catches the
 model call. It is intentionally simple — a content hash, not semantic judgment.
 
 For the **loop mode** specifically (§2.2), "idle" *also* has an outer meaning:
-the agent completed and there is genuinely nothing to do. That is handled by the
+the agentd completed and there is genuinely nothing to do. That is handled by the
 *supervisor's* re-entry policy (idle backoff), not the inner loop.
 
 ### 1.4 Tool-call execution + result feedback
@@ -163,8 +163,8 @@ For each tool call in an assistant turn:
    RFC)? If not, return a tool *result* saying so (recoverable), do not abort.
    The retired loop_node does exactly this ("not in this loop's allowed set")
    and it is the right behavior — keep it.
-2. **Route** — resolve the owning MCP server (or the agent self-MCP) and call
-   `tools/call`. agent self-tools (`subagent.*`, `subscribe`, `exec`) route
+2. **Route** — resolve the owning MCP server (or the agentd self-MCP) and call
+   `tools/call`. agentd self-tools (`subagent.*`, `subscribe`, `exec`) route
    internally.
 3. **Result back as an observation** — append the result (or the error) to the
    transcript as a tool-result message. **Tool errors are observations, not
@@ -299,27 +299,27 @@ both implemented as **internal time events fed into the same reactive router**:
 
 Do **not** build calendars, timezones-with-DST gymnastics, or a job store in
 core. An external scheduler (the K8s operator, *not in this repo*) is the real
-cron for production; agent's in-process cron is for standalone/daemon
-convenience. If timezones matter, the operator passes them; agent computes in a
+cron for production; agentd's in-process cron is for standalone/daemon
+convenience. If timezones matter, the operator passes them; agentd computes in a
 single configured TZ (default UTC) and stops there.
 
 ---
 
 ## 3. "Pay attention to available resources" — list vs read (both)
 
-The brief asks pointedly: does the agent get the resource *list* in context, or
+The brief asks pointedly: does the agentd get the resource *list* in context, or
 read resources via tools, or both? **Both — and they play different roles.**
 
 - **Awareness (the list, in context).** At loop start and after any
   `list_changed`, the supervisor calls `resources/list` on each scoped server
   and injects a **compact catalogue** into the system/awareness block: for each
   resource, `{uri, name, one-line description, mtime/etag/size if available}`.
-  **Never the bodies.** This is what makes the agent *aware* of what it can look
+  **Never the bodies.** This is what makes the agentd *aware* of what it can look
   at without paying for the content. Cap the catalogue (e.g. top-N by relevance
   or a size budget); if a server exposes thousands of resources, summarize by
   prefix/type rather than listing every URI.
 - **Attention (the body, via a tool).** Provide a `resource.read(uri)` self-tool
-  (thin wrapper over `resources/read`). The agent pulls a body only when it
+  (thin wrapper over `resources/read`). The agentd pulls a body only when it
   decides it needs it. This is ordinary "retrieve on demand," and it keeps
   context lean: bodies enter context only when load-bearing, and §5 can evict
   them once consulted.
@@ -327,9 +327,9 @@ read resources via tools, or both? **Both — and they play different roles.**
 This mirrors Anthropic's "smallest set of high-signal tokens" principle: the
 list is cheap awareness; reads are deliberate, model-chosen attention. For the
 **reactive** case, the event payload should include the *changed URI* (and
-etag/version if the server provides one) so the agent knows *what* changed; the
-agent then `resource.read`s it if the change is relevant. Re-reading on the
-agent's terms (not auto-inlining the new body) avoids dumping large diffs into
+etag/version if the server provides one) so the agentd knows *what* changed; the
+agentd then `resource.read`s it if the change is relevant. Re-reading on the
+agentd's terms (not auto-inlining the new body) avoids dumping large diffs into
 context on every notification.
 
 ---
@@ -369,14 +369,14 @@ deterministic:
   knob for spawn routes.
 - **`continue(session_id)`** (stateful reaction): the event is delivered **into
   one specific warm session** and re-enters its loop where it left off. Use when
-  the agent is doing one ongoing job and updates are new information for it (the
-  RFC's "agent wakes up, reads what changed, keeps working in the same
+  the agentd is doing one ongoing job and updates are new information for it (the
+  RFC's "agentd wakes up, reads what changed, keeps working in the same
   context"). A session processes its events **one at a time, in order** (§4.6);
   it is a single consumer of its own queue.
 
-**Self-subscription (the novel capability).** When a running agent calls the
+**Self-subscription (the novel capability).** When a running agentd calls the
 `subscribe(uri)` self-tool mid-reasoning, the supervisor creates a route with
-`disposition: continue(this_session)` automatically — i.e. the agent has just
+`disposition: continue(this_session)` automatically — i.e. the agentd has just
 **scheduled its own future continuation**. It then ends its turn; the session
 goes warm; the next update on `uri` re-enters *this* session. `unsubscribe`
 removes the route and, if the session has no other subscriptions and no pending
@@ -406,7 +406,7 @@ route:
   collapses a burst of writes into one wake-up.
 - **Coalesce semantics:** multiple events on the *same uri* within the window
   collapse to **one** delivery carrying the **latest** etag/version (we don't
-  need the intermediate states — the agent will `resource.read` the current
+  need the intermediate states — the agentd will `resource.read` the current
   value anyway, §3). Events on *different* uris owned by the same `continue`
   session are delivered as a **set** ("these N resources changed") in one
   wake-up, not N separate re-entries. This is the single most important
@@ -446,7 +446,7 @@ process never melts down; it degrades to "not starting new work."
   exactly-one-owner invariant means there's no cross-route race on a single
   event.
 - **At-least-once, idempotency expected.** A notification can be redelivered
-  (reconnect, restart). Because the agent re-reads current state on wake
+  (reconnect, restart). Because the agentd re-reads current state on wake
   (it acts on *what the resource is now*, not on a delta), processing is
   naturally idempotent for state-changed semantics. We do **not** promise
   exactly-once; we promise "you'll always converge on current state."
@@ -473,8 +473,8 @@ the order Anthropic recommends applying levers:
 1. **Lever 1 — clear stale tool results (cheapest, safest).** Once a tool result
    is deep in history and has been superseded, replace its body with a tiny
    stub (`[tool result for read_file(x) elided; re-read if needed]`). "Why would
-   the agent need to see the raw result again?" This alone reclaims most of the
-   bloat in tool-heavy loops and is *lossless in practice* because the agent can
+   the agentd need to see the raw result again?" This alone reclaims most of the
+   bloat in tool-heavy loops and is *lossless in practice* because the agentd can
    re-fetch. Implement as: keep the **last M** tool results verbatim
    (default M≈5, matching Claude Code's "5 most recent files"), stub older ones.
 2. **Lever 2 — compaction (summarize-and-restart) at a high-water mark.** When
@@ -484,11 +484,11 @@ the order Anthropic recommends applying levers:
    plan; drop redundant chatter." Start a fresh transcript = `[system] +
    [summary] + [last M verbatim tool results/files]`. Tune by *recall first*
    (capture everything relevant), then precision. This is exactly Claude Code's
-   compaction and Anthropic now ships a compaction API — but agent does it with
+   compaction and Anthropic now ships a compaction API — but agentd does it with
    one ordinary model call and a prompt, **no new dependency**.
 3. **Lever 3 — externalize to notes (optional, opt-in).** For long-horizon work,
    a `note.write(text)` / `note.read()` self-tool pair backed by a single file
-   lets the agent persist durable state *outside* the window and pull it back
+   lets the agentd persist durable state *outside* the window and pull it back
    when needed (the Pokémon-agent pattern: tallies + strategy notes surviving
    thousands of steps). This is the *only* "memory" in core, and it is just an
    MCP tool over a file — no vector store, no embedding model, no memory service.
@@ -603,7 +603,7 @@ labeled stop*, never a silent hang and never an uncontrolled overrun:
 | per-tool repeat cap K | per subagent | refuse the repeated call (tool result) | may lead to `stalled` |
 | RLIMIT_AS / RLIMIT_CPU | per process | kernel kills the process | observed as `crashed` |
 
-Key principle: **at every budget the agent gets a chance to wrap up gracefully**
+Key principle: **at every budget the agentd gets a chance to wrap up gracefully**
 (return what it has) rather than being guillotined — *except* the OS-level
 RLIMIT/SIGKILL backstops, which exist precisely for the case where graceful stop
 failed (a wedged or runaway child). The supervisor's hard `SIGKILL` of a subtree
@@ -650,7 +650,7 @@ recover, stay stable.
 ## 9. Determinism / replay
 
 Full determinism is impossible (the model is non-deterministic, tools touch the
-world). What agent *can* and *should* guarantee is **replayable observability**,
+world). What agentd *can* and *should* guarantee is **replayable observability**,
 not bit-identical re-execution:
 
 - **Append-only event log per run.** Every turn emits structured JSON-line
@@ -673,7 +673,7 @@ not bit-identical re-execution:
   +`engine/checkpoint.rs` are harvestable starting points.
 - **Session durability (RFC §14.3): in-memory for v1, checkpoint later.** Warm
   reactive sessions live in memory; a pod restart loses them — acceptable for v1
-  because the re-read-current-state model means a restarted agent re-subscribes
+  because the re-read-current-state model means a restarted agentd re-subscribes
   and converges. Optional checkpointing (serialize a session's transcript +
   subscriptions to disk) is a clean later extension that lets an external
   scheduler move/restart the pod without losing long-lived context.

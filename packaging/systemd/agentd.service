@@ -1,17 +1,17 @@
 [Unit]
-Description=MCP-native agent runtime (agent)
+Description=MCP-native agent runtime (agentd)
 Documentation=https://github.com/agentd-dev/source-code/tree/main/docs
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-EnvironmentFile=-/etc/default/agent
-ExecStart=/usr/bin/agent $AGENT_ARGS
+EnvironmentFile=-/etc/default/agentd
+ExecStart=/usr/bin/agentd $AGENT_ARGS
 Restart=on-failure
 RestartSec=5s
 
-# Graceful shutdown. TimeoutStopSec MUST exceed agent's --drain-timeout
+# Graceful shutdown. TimeoutStopSec MUST exceed agentd's --drain-timeout
 # (default 25s) or systemd will SIGKILL mid-drain and in-flight work errors;
 # a clean drain exits 0, an overrun is the OS-set 143 (rfcs/0011 §5).
 KillSignal=SIGTERM
@@ -22,21 +22,21 @@ TimeoutStopSec=60s
 # StateDirectory / LogsDirectory below for write-access paths.
 DynamicUser=yes
 
-# StateDirectory → /var/lib/agent ; LogsDirectory → /var/log/agent.
+# StateDirectory → /var/lib/agentd ; LogsDirectory → /var/log/agentd.
 # Both are created with the correct dynamic-user perms on first
 # start and kept across restarts.
-StateDirectory=agent
+StateDirectory=agentd
 StateDirectoryMode=0750
-LogsDirectory=agent
+LogsDirectory=agentd
 LogsDirectoryMode=0750
 
-# Filesystem namespace: the process can only write to /var/lib/agent,
-# /var/log/agent, and /tmp (PrivateTmp).
+# Filesystem namespace: the process can only write to /var/lib/agentd,
+# /var/log/agentd, and /tmp (PrivateTmp).
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ReadOnlyPaths=/etc/agent
+ReadOnlyPaths=/etc/agentd
 
 # Kernel + namespace isolation.
 ProtectKernelTunables=yes
@@ -48,7 +48,7 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 
-# Note: agent forks + supervises subagent processes (PR_SET_CHILD_SUBREAPER,
+# Note: agentd forks + supervises subagent processes (PR_SET_CHILD_SUBREAPER,
 # PR_SET_PDEATHSIG, process-group kills). The @system-service set + the
 # restrictions below permit that. Do NOT add ProtectControlGroups=yes if you use
 # --cgroup (active enforcement needs cgroup-fs writes).
@@ -70,7 +70,7 @@ AmbientCapabilities=
 NoNewPrivileges=yes
 
 # If the /metrics+/healthz surface must bind a port <1024, enable via drop-in:
-#   systemctl edit agent
+#   systemctl edit agentd
 # and add: CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # + AmbientCapabilities=CAP_NET_BIND_SERVICE under [Service].
 

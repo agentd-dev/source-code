@@ -3,13 +3,13 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agent rewrite — control-plane track (RFC 0014); extends execution modes & reactive routing (RFC 0008)
+**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends execution modes & reactive routing (RFC 0008)
 
 ---
 
 ## 1. Problem / Context
 
-RFC 0008 made one agent instance a correct reactive worker: every inbound
+RFC 0008 made one agentd instance a correct reactive worker: every inbound
 `notifications/resources/updated{uri}` matches **exactly one** route, in-order,
 no fan-out, at-least-once with convergence on current state. That guarantee is
 **intra-instance**. It says nothing about a *second* replica subscribed to the
@@ -35,7 +35,7 @@ four mechanisms, in dependency order:
    fleet need not contend on every item; an instance ignores items outside its
    shard before the claim even happens.
 3. **Autoscaling signals** — the metric set agentctl/KEDA scales the fleet on.
-   agent *exposes* the signals; the scaler logic is agentctl's.
+   agentd *exposes* the signals; the scaler logic is agentctl's.
 4. **Warm pool / standby** — an optional mode where an instance holds
    intelligence + MCP connections open, idle, ready to be *assigned* work,
    cutting cold-start.
@@ -44,7 +44,7 @@ It also pins **scale-down safety**: a held claim and in-flight work must survive
 an HPA scale-down, which means the drain choreography (RFC 0011) must release
 claims, and statelessness (RFC 0011 §7) must make any replica fungible.
 
-**This RFC owns** the claim/lease convention agent participates in, the shard
+**This RFC owns** the claim/lease convention agentd participates in, the shard
 hash + assignment contract, the autoscaling-signal *surface* (names, semantics,
 where they live), and the standby mode. It does **not** own: the queue/lease
 *server* (that is an external MCP backing service or the source server itself);
@@ -56,15 +56,15 @@ extends (RFC 0008); the exit-code/signal/idempotency contract it leans on
 **Minimalism moat (non-negotiable, RFC 0014 §3.3).** Every surface here is
 feature-gated and **dependency-free**. The default build stays `serde` +
 `serde_json` + `libc`; the cloud-native image set stays dep-free. Claim/lease is
-**MCP tool-calls over the transport agent already speaks** (RFC 0004) — no
+**MCP tool-calls over the transport agentd already speaks** (RFC 0004) — no
 queue client, no Redis, no Raft, no consensus library, no async runtime. Shard
 hashing is a hand-rolled FNV-1a, no `hashbrown`/`siphash`/`sha2` crate.
 Autoscaling signals are the **already-existing** metric surface (RFC 0010 /
-RFC 0016) read by an *external* scraper — agent grows no KEDA client. A feature
+RFC 0016) read by an *external* scraper — agentd grows no KEDA client. A feature
 that would pull a Kubernetes client, a TLS/gRPC stack, or an async executor is
 wrong by construction and belongs in agentctl.
 
-**Primitives, not policy (RFC 0014 §3).** agent exposes: a claim convention it
+**Primitives, not policy (RFC 0014 §3).** agentd exposes: a claim convention it
 honours, a shard predicate it applies, signals it emits, an assignment endpoint
 it serves. agentctl owns: *which* shard each pod gets, *when* to scale, *how* to
 rebalance, *which* warm pod gets the next job. We reuse MCP; we invent no new
@@ -75,7 +75,7 @@ protocol.
 ## 2. Decision
 
 1. **Cross-instance ownership is achieved by a work-claim lease, reusing MCP —
-   never a bespoke queue agent runs.** Before a reactive worker processes a
+   never a bespoke queue agentd runs.** Before a reactive worker processes a
    routed item, it **claims** it by calling a `work.claim` tool (or a conventional
    `_meta` lease) on the source/coordination MCP server; it processes only on a
    *granted* claim, then **acks** (`work.ack`) on success or **releases**
@@ -87,7 +87,7 @@ protocol.
 2. **Claiming is opt-in per route via `disposition: claim`** (an extension of the
    RFC 0008 spawn/continue axis), gated by the `cluster` feature. A route with no
    claim convention behaves exactly as RFC 0008 (single-instance ownership). The
-   coordination server's claim tools are discovered from its MCP catalogue; agent
+   coordination server's claim tools are discovered from its MCP catalogue; agentd
    participates, it does not provide them. The dedupe of record lives in the
    backing service (RFC 0011 §6.4), keyed by the **claim key**, which is by
    default the **`AGENT_RUN_ID`** (RFC 0011 §6) the worker would have used anyway.
@@ -103,7 +103,7 @@ protocol.
    that share a shard (N=1, or transient overlap during rebalance).
 
 4. **Rebalancing on an `N` change is drain-and-reassign, never live-migrate.**
-   agent holds shard identity as immutable config (RFC 0011 §4.1, no live
+   agentd holds shard identity as immutable config (RFC 0011 §4.1, no live
    reload). agentctl changes the fleet by **rolling the StatefulSet**: each pod's
    `--shard K/N` comes from its stable ordinal identity; an `N` change is a
    rolling restart where every pod drains (releasing held claims, decrementing
@@ -111,14 +111,14 @@ protocol.
    owned by two live shards at once because the old pod *released* before the new
    pod *claimed*; the lease TTL covers the seam.
 
-5. **agent exposes autoscaling signals; agentctl/KEDA owns the scaler.** The
+5. **agentd exposes autoscaling signals; agentctl/KEDA owns the scaler.** The
    signal set — `agent_reactive_backlog`, `agent_active_subagents`,
    `agent_saturation`, `agent_tokens_per_sec`, `agent_intelligence_latency_ms`
    — is part of the **frozen metrics schema (RFC 0016)**, surfaced on the existing
    metrics endpoint (RFC 0010) and mirrored as `agent://metrics` /
    `agent://capacity` resources (RFC 0005). The intended scaler behaviour (scale
    on backlog, respect drain on scale-down, avoid thrash) is **documented here as
-   intent** but **implemented in agentctl** — agent ships no HPA logic.
+   intent** but **implemented in agentctl** — agentd ships no HPA logic.
 
 6. **Standby (`--standby`) is a reactive worker that holds connections warm and
    waits to be *assigned*, distinct from reactive-idle.** A reactive-idle worker
@@ -156,9 +156,9 @@ process this," so exactly one replica wins.
 
 We do **not** invent a queue. We reuse MCP `tools/call` (RFC 0004 codec) against
 whichever server owns the work items (the source server itself, or a thin
-coordination MCP server the operator runs). agent is a *participant* in a claim
+coordination MCP server the operator runs). agentd is a *participant* in a claim
 protocol, identically to how RFC 0011 §6 makes it a participant in an idempotency
-protocol — the mechanism is in the backing service; agent supplies the key and
+protocol — the mechanism is in the backing service; agentd supplies the key and
 honours the lifecycle.
 
 ### 3.2 The claim lifecycle
@@ -195,12 +195,12 @@ local state, RFC 0011 §7):
 | `DONE` | `work.ack` accepted | — |
 | `RELEASED` | `work.release` (drain or wind-down) | re-claimable by fleet |
 
-### 3.3 The claim tools (discovered, not defined by agent)
+### 3.3 The claim tools (discovered, not defined by agentd)
 
-agent calls these on the coordination server; their *schemas* are the server's,
+agentd calls these on the coordination server; their *schemas* are the server's,
 discovered via `tools/list` (RFC 0004). The **names and argument convention**
 below are what agentctl freezes (RFC 0014 §3.4) so a fleet and its claim server
-agree. agent uses them if present; a route declaring `claim` against a server
+agree. agentd uses them if present; a route declaring `claim` against a server
 that does not advertise them fails validation at startup (exit 2, RFC 0011 §3.3).
 
 ```jsonc
@@ -229,7 +229,7 @@ that does not advertise them fails validation at startup (exit 2, RFC 0011 §3.3
 ```
 
 If the source server itself models items as **resources with a lease field**
-(rather than offering claim *tools*), agent supports the **resource-lease
+(rather than offering claim *tools*), agentd supports the **resource-lease
 variant**: `resource.read` the item, observe a `lease` field, attempt a
 compare-and-set write (`work.claim` degenerates to a conditional `tools/call`
 the server exposes). The lifecycle is identical; only the wire shape differs.
@@ -267,7 +267,7 @@ the side effect but before `work.ack` will have its item **redelivered**, and a
 second replica will re-process it. Correctness therefore rests on the **same
 idempotency mechanism RFC 0011 §6 already mandates**:
 
-- The **claim key is the `RUN_ID`** (RFC 0011 §6.1). agent injects
+- The **claim key is the `RUN_ID`** (RFC 0011 §6.1). agentd injects
   `agent/run_id` (== `agent/claim_key`) into the `_meta` of *every* downstream
   `tools/call` the worker makes while processing the item (RFC 0011 §6.2). So the
   durable side effect is deduped on the **same key** whether the work is done by
@@ -287,11 +287,11 @@ idempotency mechanism RFC 0011 §6 already mandates**:
   `resource.read` finds the work done and the loop exits `completed`→`0` without
   burning an LLM turn.
 
-> The honest scope statement (mirroring RFC 0011 §6.4): agent guarantees (1) a
+> The honest scope statement (mirroring RFC 0011 §6.4): agentd guarantees (1) a
 > single serializing claim before processing, (2) a stable, item-derived key
 > propagated into every side effect, (3) lease release on clean wind-down and
 > lease expiry on death, and (4) no local non-idempotent side effect. End-to-end
-> exactly-once is the **backing service's** dedupe on the key — agent supplies
+> exactly-once is the **backing service's** dedupe on the key — agentd supplies
 > the key and the lifecycle, never the storage.
 
 ### 3.6 Config surface (claim slice)
@@ -373,17 +373,17 @@ progress despite a node loss.
 
 ### 4.2 Assignment: agentctl owns K, the StatefulSet owns identity
 
-agent does **not** discover its own shard. agentctl assigns it, leveraging
+agentd does **not** discover its own shard. agentctl assigns it, leveraging
 **StatefulSet stable ordinal identity** (`pod-0 … pod-(N-1)`): the pod's ordinal
 *is* `K`, the replica count *is* `N`, both injected as config (downward API or
 env) the same way `terminationGracePeriodSeconds` is (RFC 0011 §3.3).
 
 ```jsonc
-// what agentctl injects (env, resolved by RFC 0011 §3.1 precedence); agent only reads it
+// what agentctl injects (env, resolved by RFC 0011 §3.1 precedence); agentd only reads it
 { "AGENT_SHARD": "3/8" }   // from: K = ordinal(pod-3), N = .spec.replicas
 ```
 
-agent's role is to **read `K/N`, validate `0 <= K < N`, apply `owns()`**, and
+agentd's role is to **read `K/N`, validate `0 <= K < N`, apply `owns()`**, and
 report `"shard":"3/8"` in its capabilities manifest (RFC 0014 §5) and on every
 claim `_meta` (§3.3) for server-side observability. The mapping ordinal→K and the
 StatefulSet are entirely agentctl's (RFC 0014 §6 non-goals).
@@ -391,7 +391,7 @@ StatefulSet are entirely agentctl's (RFC 0014 §6 non-goals).
 ### 4.3 Rebalancing on N change — drain + reassign (Decision 4)
 
 A shard count change (`N: 8 → 12`) re-partitions the key space: items that hashed
-to shard 3-of-8 may now belong to shard 5-of-12. agent holds shard identity as
+to shard 3-of-8 may now belong to shard 5-of-12. agentd holds shard identity as
 **immutable config** (RFC 0011 §4.1 — no live reload, restart-to-reconfigure), so
 a rebalance is a **rolling restart driven by agentctl**, not an in-process
 migration:
@@ -441,7 +441,7 @@ rather than a stable entity key when the session must aggregate multiple URIs
 
 ### 5.1 The signal set (names frozen in RFC 0016; surfaced here)
 
-agent **exposes** these; the scaler **consumes** them. They are part of the
+agentd **exposes** these; the scaler **consumes** them. They are part of the
 **frozen metrics schema (RFC 0016)** — this RFC names them and pins their
 *semantics for scaling*, but RFC 0016 owns the schema, `# HELP`/`# TYPE`, and the
 `metrics_schema` version in the capabilities manifest (RFC 0014 §5). They are
@@ -456,7 +456,7 @@ vsock-only fleets with no cluster network (RFC 0014 §2).
 | `agent_active_subagents` | gauge | live subagents (= RFC 0010 `agent_active_subagents`) | concurrency headroom; near `max` ⇒ saturated |
 | `agent_saturation` | gauge `[0.0,1.0]` | `in_flight / capacity` where capacity = `min(max_inflight·routes, max_total_subagents)` | scale up as it approaches 1.0; the HPA "utilization" target |
 | `agent_tokens_per_sec` | gauge | rolling tokens/s across the tree (derived from RFC 0010 `agent_tokens_total`) | intelligence-bound load; informs *model-aware* placement & cost ceilings |
-| `agent_intelligence_latency_ms` | gauge | p50/p95 intel call latency (from RFC 0010 `gen_ai.client.operation.duration`) | rising latency ⇒ upstream saturation; **scale the model service, not necessarily agent** |
+| `agent_intelligence_latency_ms` | gauge | p50/p95 intel call latency (from RFC 0010 `gen_ai.client.operation.duration`) | rising latency ⇒ upstream saturation; **scale the model service, not necessarily agentd** |
 | `agent_claims_lost_total` | counter | claims lost to another replica (contention) | high & rising under low backlog ⇒ **over-provisioned**, scale *down* |
 | `agent_shard_skipped_total` | counter | items dropped as out-of-shard | sanity: confirms shard partitioning is live |
 
@@ -470,7 +470,7 @@ fleet does not explode label cardinality.
 ### 5.2 Intended scaler behaviour (intent — implemented in agentctl)
 
 Documented so agentctl/KEDA authors target the right thing; **none of this is
-agent code**.
+agentd code**.
 
 - **Scale up on backlog, not on CPU.** A reactive worker is intelligence-bound
   and idles at near-zero CPU between events (RFC 0008 §3.1.3) — CPU-based HPA is
@@ -484,15 +484,15 @@ agent code**.
   drain completes leaks a held claim until its TTL expires — correct but slow).
 - **Avoid thrash.** Backlog is bursty (RFC 0008 debounce/coalesce). agentctl
   configures KEDA `cooldownPeriod` / HPA `stabilizationWindowSeconds` so a
-  coalesced burst does not scale 1→20→1. agent's debounce already smooths the
+  coalesced burst does not scale 1→20→1. agentd's debounce already smooths the
   *signal*; the hysteresis lives in the scaler.
 - **Scale-down preference: lame-duck the least-loaded.** agentctl picks the
   victim (lowest `agent_active_subagents`, drained via the `lame-duck` /
-  `drain` management tools, RFC 0014 §4 / RFC 0015). agent exposes per-pod load;
+  `drain` management tools, RFC 0014 §4 / RFC 0015). agentd exposes per-pod load;
   the *choice* is agentctl's. `agent_claims_lost_total` rising under low backlog
   is the over-provisioning signal that should trigger scale-*down*.
 
-agent's whole contribution to autoscaling is **emitting honest signals and
+agentd's whole contribution to autoscaling is **emitting honest signals and
 draining cleanly**. The control loop is agentctl's (RFC 0014 §6 non-goals: "HPA/KEDA
 scalers" are explicitly agentctl's).
 
@@ -528,7 +528,7 @@ RUNNING ──SIGTERM──► DRAINING:
 ```
 
 **Statelessness makes any replica fungible (RFC 0011 §7).** A released claim
-carries no agent-local state — the item lives on the coordination server, the
+carries no agentd-local state — the item lives on the coordination server, the
 side-effect dedupe key is item-derived (§3.5), and the supervisor holds nothing
 durable a SIGKILL could corrupt (RFC 0011 §4.4). So a re-claimed item runs
 *identically* on any replica; there is no "sticky" worker. This is what lets the
@@ -579,7 +579,7 @@ Two mechanisms, both reusing the existing surface; an operator picks one:
    subscribe*: agentctl issues, on the member, the equivalent of RFC 0008's
    self-subscribe (§3.6) bound to the assigned item, so the member re-enters a
    warm session on it. The choice of *which* member is **agentctl's policy** (RFC
-   0014 §3); agent only exposes the spawn/assign primitive and `agent://capacity`
+   0014 §3); agentd only exposes the spawn/assign primitive and `agent://capacity`
    so agentctl can see who is free.
 
 ```jsonc
@@ -610,7 +610,7 @@ fungible as any other (§6).
 
 | # | Situation | Behaviour |
 |---|---|---|
-| 1 | **Two replicas claim the same item simultaneously** | The coordination server's `work.claim` is the single serializing point; it grants to exactly one (`granted:true`), the other gets `granted:false` → `claims_lost_total++`, drops. agent assumes the server makes claim atomic; if it cannot, two-owner is possible and only idempotency (§3.5) saves correctness. |
+| 1 | **Two replicas claim the same item simultaneously** | The coordination server's `work.claim` is the single serializing point; it grants to exactly one (`granted:true`), the other gets `granted:false` → `claims_lost_total++`, drops. agentd assumes the server makes claim atomic; if it cannot, two-owner is possible and only idempotency (§3.5) saves correctness. |
 | 2 | **Claimer dies after side effect, before `work.ack`** | Lease not renewed → TTL expires → item redelivered → second claimer re-processes → side effect deduped on the **item-derived key** (§3.5) → "already done" → `completed`→exit 0 cheaply. At-least-once + idempotent. |
 | 3 | **Claimer dies after `work.claim`, before any side effect** | Lease expires → redelivered → clean reprocess. No duplication. |
 | 4 | **Coordination server is down at startup** | `tools/list` handshake fails → exit **6 EXIT_MCP** (RFC 0011 §5, retriable — sidecar may be racing up). A `claim` route requires its server like any required MCP server. |
@@ -619,11 +619,11 @@ fungible as any other (§6).
 | 7 | **Lease expires while work is still in-flight** (slow LLM, missed renew) | The item is redelivered to the fleet; **two replicas may now process concurrently** (the original + the re-claimer). Both write under the **same item-derived key** → the backing service dedupes → one effect. The straggler's eventual `work.ack` is a no-op (already-acked). Set `--claim-ttl` > realistic processing time; the renew heartbeat (`ttl/3`) is the primary guard. |
 | 8 | **`N` change mid-burst (rebalance)** | Rolling restart (§4.3): each pod drains+releases before its replacement starts. Brief neither-owner window per pod is recovered by read-after-subscribe (RFC 0008 §3.5). Claim (if enabled) resolves any transient two-owner overlap. |
 | 9 | **Item hashes to a shard whose pod is down (shard-only, no claim)** | The item waits until the StatefulSet reschedules that ordinal (same `K`). On restart, read-after-subscribe re-synthesizes the event (RFC 0008 §3.5). Acceptable for level-triggered work; for progress-under-node-loss, enable claim (§4.1 bottom row). |
-| 10 | **Scale-down SIGKILLs before drain (grace < drain_timeout)** | Held leases are **not** released → they expire by TTL → items redeliver after one TTL. Correct but delayed. The RFC 0011 §3.3 grace > drain_timeout invariant prevents this; agent warns at startup if it can prove the coupling is wrong. |
+| 10 | **Scale-down SIGKILLs before drain (grace < drain_timeout)** | Held leases are **not** released → they expire by TTL → items redeliver after one TTL. Correct but delayed. The RFC 0011 §3.3 grace > drain_timeout invariant prevents this; agentd warns at startup if it can prove the coupling is wrong. |
 | 11 | **Standby member assigned work, then dies before claiming** | Claim-pull: nothing was claimed → no loss, another member wins. Directed-assign: the directed subscribe produced no claim → the assigner observes no `agent://capacity` change / no ack and re-assigns (agentctl policy). |
 | 12 | **All replicas in a shard are over budget (tree token ceiling)** | Each stops spawning and drains warm sessions (RFC 0008 §3.1, the ultimate backpressure), releasing claims (§6). Backlog rises → `agent_reactive_backlog` climbs → the scaler adds replicas (which have fresh tree budgets). Budget exhaustion becomes a *scale signal*, not a meltdown. |
 | 13 | **`work.release` itself fails during drain** | Best-effort, sub-budgeted (§6); logged `drain.claim_release_failed`; never blocks drain; lease TTL is the backstop. Drain still exits 0. |
-| 14 | **Two replicas with the same `--shard K/N` (mis-assignment)** | Both `owns()` the same items → duplicate processing unless claim is enabled. This is an agentctl mis-assignment (two pods, same ordinal — should be impossible with a StatefulSet); claim makes it merely wasteful, not incorrect. agent surfaces `shard` in `_meta`/manifest so agentctl can detect the collision. |
+| 14 | **Two replicas with the same `--shard K/N` (mis-assignment)** | Both `owns()` the same items → duplicate processing unless claim is enabled. This is an agentctl mis-assignment (two pods, same ordinal — should be impossible with a StatefulSet); claim makes it merely wasteful, not incorrect. agentd surfaces `shard` in `_meta`/manifest so agentctl can detect the collision. |
 
 **Invariant preserved across all rows:** correctness never depends on
 exactly-once delivery. It depends on (a) a single serializing claim *or* a single
@@ -662,19 +662,19 @@ degrades to RFC 0008 single-instance behaviour and agentctl runs it as a singlet
 
 ## 10. Non-goals / Deferred
 
-- **No queue, no broker, no consensus in agent.** Claim/lease is a *convention*
+- **No queue, no broker, no consensus in agentd.** Claim/lease is a *convention*
   over MCP `tools/call`; the atomic claim and the lease store live in an external
   coordination MCP server (the source server or a thin one the operator runs).
-  agent ships no Redis/Raft/etcd client and no leader election (those are
+  agentd ships no Redis/Raft/etcd client and no leader election (those are
   agentctl/operator concerns, RFC 0014 §6).
 - **No exactly-once.** At-least-once + item-derived idempotency only (§3.5,
   RFC 0008 §2.6). A use case needing true exactly-once needs a transactional
-  backing service; agent supplies the key, not the transaction.
+  backing service; agentd supplies the key, not the transaction.
 - **No live shard migration / consistent-hashing ring.** Rebalance is a rolling
-  restart driven by agentctl (§4.3); agent's shard identity is immutable config
+  restart driven by agentctl (§4.3); agentd's shard identity is immutable config
   (RFC 0011 §4.1). A minimal-disruption consistent-hash assignment is an
-  *agentctl* placement choice, not an agent mechanism.
-- **No in-process autoscaler.** agent emits signals; HPA/KEDA logic, scale
+  *agentctl* placement choice, not an agentd mechanism.
+- **No in-process autoscaler.** agentd emits signals; HPA/KEDA logic, scale
   decisions, cooldowns, and victim selection are agentctl's (RFC 0014 §6, §5.2).
 - **No KEDA/Kubernetes client, no gRPC/TLS stack, no async runtime.** All four
   mechanisms are `cluster`-feature-gated and built from the existing dep-free
@@ -725,7 +725,7 @@ degrades to RFC 0008 single-instance behaviour and agentctl runs it as a singlet
   frozen in RFC 0015 §5.6.** §3.3 defines `work.claim`/`work.renew`/`work.ack`/
   `work.release` and the `agent/claim_key` `_meta` convention; the umbrella ratified
   RFC 0015 §5.6 as the single authority for the names + `_meta` keys + style variants
-  (RFC 0015 serves the management surface agentctl negotiates on, even though agent
+  (RFC 0015 serves the management surface agentctl negotiates on, even though agentd
   *calls* `work.*` rather than serving them). The schemas remain the server's,
   discovered via `tools/list`.
 - **RUN_ID default narrowing for `claim` routes.** ✅ **Resolved: recorded in

@@ -1,6 +1,6 @@
 # Intelligence: the LLM wire
 
-agent reaches the model over **one logical wire**. The agentic ReAct loop —
+agentd reaches the model over **one logical wire**. The agentic ReAct loop —
 which runs only inside a subagent process — sends it messages plus a scoped tool
 catalogue and gets back text *and* structured tool calls. That wire is named in
 `AGENT_INTELLIGENCE` (or `--intelligence`) and authenticated with
@@ -27,14 +27,14 @@ only carries the LLM request/response. Do not conflate the two.
 > logical wire, but `AGENT_INTELLIGENCE` now accepts an **ordered list** of
 > endpoints for failover (see [Resilience](#resilience-multi-endpoint-failover--the-circuit-breaker)),
 > the endpoint list and model are **hot-swappable** without a restart (see
-> [Runtime hot-swap](#runtime-hot-swap-model-swap)), and agent can **discover**
+> [Runtime hot-swap](#runtime-hot-swap-model-swap)), and agentd can **discover**
 > what an endpoint serves (see [Model discovery](#model-discovery)). The
 > single-endpoint behaviour described first is exactly the one-element-list case.
 
 ## The one URI, three transports
 
 The scheme of `AGENT_INTELLIGENCE` selects the transport. All three drive the
-*same* hand-rolled HTTP/1.1 client over a `Read + Write` byte stream — agent
+*same* hand-rolled HTTP/1.1 client over a `Read + Write` byte stream — agentd
 ships no async runtime and no `url`/ICU stack.
 
 | URI form | Transport | Use case | Build |
@@ -47,8 +47,8 @@ The URI is validated **at startup**, before any side effect. A scheme that
 isn't `unix:`, `https://`, or `vsock:` exits `2` in milliseconds:
 
 ```
-$ agent --instruction 'hi' --intelligence ftp://x
-agent: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://x)
+$ agentd --instruction 'hi' --intelligence ftp://x
+agentd: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://x)
 $ echo $?
 2
 ```
@@ -60,11 +60,11 @@ the client warns). Use `unix:` or `https://` in production.
 ### `unix:` — sidecar gateway (canonical for clusters)
 
 A gateway sidecar (LiteLLM, a local vLLM, your own proxy) terminates TLS and
-provider auth; agent talks plaintext HTTP over the socket. No TLS feature, no
-key in the agent process.
+provider auth; agentd talks plaintext HTTP over the socket. No TLS feature, no
+key in the agentd process.
 
 ```bash
-agent \
+agentd \
   --instruction-file ./task.md \
   --intelligence unix:/run/intel.sock \
   --model gpt-4o \
@@ -75,7 +75,7 @@ agent \
 
 ```bash
 export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
-agent \
+agentd \
   --instruction 'summarize the open incidents' \
   --intelligence https://api.openai.com/v1/chat/completions \
   --model gpt-4o \
@@ -88,7 +88,7 @@ cmake. SNI is the parsed host.
 ### `vsock:` — enclave / microVM (feature `vsock`)
 
 ```bash
-agent \
+agentd \
   --instruction-file /task.md \
   --intelligence vsock:2:8080 \
   --model claude-opus-4
@@ -103,7 +103,7 @@ even in default builds, which return a clear "requires --features vsock" error.
 
 ## The wire: OpenAI-compatible by default, Anthropic in-binary
 
-agent ships **exactly two** in-binary adapters. The bias is deliberate: fewer
+agentd ships **exactly two** in-binary adapters. The bias is deliberate: fewer
 adapters, thinner binary, push provider quirks to a gateway.
 
 ### Canonical: `openai-compatible` `POST /v1/chat/completions`
@@ -157,7 +157,7 @@ Gemini, Bedrock, Cohere, and other providers are **not** in the binary. Run a
 gateway that exposes an OpenAI-compatible `/chat/completions`, point
 `AGENT_INTELLIGENCE` at it (`unix:` or `https://`), and the canonical adapter
 handles the rest. This keeps the binary thin and the provider matrix out of
-agent's release cadence.
+agentd's release cadence.
 
 > **Roadmap.** Selecting the Anthropic adapter (vs. the default
 > openai-compatible) and the legacy framed-`complete` gateway wire are specified
@@ -201,13 +201,13 @@ logged**:
 
 ```bash
 # flag (sets endpoint 1's credential)
-agent … --intelligence-token "$OPENAI_API_KEY"
+agentd … --intelligence-token "$OPENAI_API_KEY"
 # or env (preferred for 12-factor / secret mounts)
 export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
-agent …
+agentd …
 # or read from a mounted file (rotation-friendly)
 export AGENT_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/llm/token
-agent …
+agentd …
 ```
 
 ### Per-endpoint credentials
@@ -279,7 +279,7 @@ endpoint.
 
 ```bash
 # two enclave-host endpoints, then a sidecar gateway as the last resort
-agent \
+agentd \
   --intelligence 'vsock:3:8080,vsock:3:8081,unix:/run/intel.sock' \
   --model claude-opus-4 \
   …
@@ -331,7 +331,7 @@ These transitions feed the metrics (`agent_intel_up`,
 
 ### `agent://intelligence` — the live endpoint health view
 
-When serving its self-MCP (`--serve-mcp`), agent exposes a **management-only**,
+When serving its self-MCP (`--serve-mcp`), agentd exposes a **management-only**,
 subscribable resource: **`agent://intelligence`**. It is the ordered endpoint
 list with **transport + index only — never the URL, host, cid, or credential**
 (RFC 0012 §3.7):
@@ -406,14 +406,14 @@ and is never read from the config file.
 
 ## Model discovery
 
-agent can learn what an OpenAI-compatible endpoint serves via a tiny,
+agentd can learn what an OpenAI-compatible endpoint serves via a tiny,
 best-effort probe: one hand-rolled `GET /v1/models` over the **same** transport
 and bearer auth the chat call uses (no new client, no streaming, zero new deps).
 It is **lazy, cached, and silent-degrade**:
 
 - It runs **only** when the served `agent://intelligence` (or the live
   `agent://capabilities`) surface is actually read — never on the hot path, and
-  **never at startup** (the one-shot `agent --capabilities` probe stays
+  **never at startup** (the one-shot `agentd --capabilities` probe stays
   network-free). The result is cached supervisor-side with a short TTL.
 - **Any** failure — a `404` (discovery unsupported), a connection failure, a
   non-JSON body — yields no models and never flips `discovery` to true. It is
@@ -462,7 +462,7 @@ only.
 > The dialect/toolmode/legacy-wire selectors from RFC 0006
 > (`AGENT_INTELLIGENCE_DIALECT`, `AGENT_INTELLIGENCE_TOOLMODE`,
 > `AGENT_INTELLIGENCE_WIRE`) are **not yet** in `config.rs`; do not rely on
-> them until they appear in `agent --help`. They are tracked in
+> them until they appear in `agentd --help`. They are tracked in
 > [`design/PLAN.md`](design/PLAN.md).
 
 ---

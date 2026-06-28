@@ -105,8 +105,8 @@ jobs:
         with:
           context: .
           load: true
-          tags: agent:ci
+          tags: agentd:ci
       - name: Smoke-test the image
         run: |
-          docker run --rm agent:ci --version
-          docker run --rm agent:ci --help | grep -q -- '--metrics-addr'
+          docker run --rm agentd:ci --version
+          docker run --rm agentd:ci --help | grep -q -- '--metrics-addr'

@@ -3,13 +3,13 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agent rewrite — control-plane track (RFC 0014); extends observability (RFC 0010) and the exit-code contract (RFC 0011 §5)
+**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends observability (RFC 0010) and the exit-code contract (RFC 0011 §5)
 
 ---
 
 ## 1. Problem / Context
 
-RFC 0010 gave agent a complete *self-contained* observability story: a closed
+RFC 0010 gave agentd a complete *self-contained* observability story: a closed
 JSON-lines log schema, a closed `event` vocabulary, mode-aware health, W3C
 trace-context propagation, and a default "metrics-from-logs" posture with an
 optional hand-rolled Prometheus exposition behind the `metrics` feature. RFC
@@ -17,13 +17,13 @@ optional hand-rolled Prometheus exposition behind the `metrics` feature. RFC
 Both were written for an operator reading *one* instance.
 
 A **control plane** (RFC 0014: `agentctl`, its operator, and the `kubectl
-agent[s]` plugin) reads a *fleet*. It builds dashboards, alert rules, and
+agentd[s]` plugin) reads a *fleet*. It builds dashboards, alert rules, and
 autoscalers; it authors `podFailurePolicy` rules; it renders `kubectl agents
 results` and `kubectl agents top`; it tails live activity across pods. Every one
 of those couples *tightly* to the exact spelling of a metric name, a label set,
 an exit code, a report field, an event name. The moment any of those is a
 "documented default" rather than a **frozen, versioned contract**, the control
-plane breaks silently on an agent upgrade — the exact failure RFC 0014 §3.4
+plane breaks silently on an agentd upgrade — the exact failure RFC 0014 §3.4
 ("freeze and version what agentctl builds against") exists to prevent.
 
 This RFC does **not** add a new telemetry mechanism. RFC 0010 already owns the
@@ -42,7 +42,7 @@ a contract surface agentctl can build against:
    agentctl tails activity over the self-MCP without scraping stderr;
 5. **stuck-liveness** — surfacing RFC 0003's internal stuck-detector through
    `/healthz` so k8s restarts a *wedged* instance (a live PID is not a live
-   agent); and
+   agentd); and
 6. **correlation** — restating that W3C `traceparent` in/out (RFC 0010 §3.6)
    stitches a multi-pod agent flow into one trace, so agentctl need invent
    nothing.
@@ -55,7 +55,7 @@ report reuse the existing `serde_json` serializer and the existing self-MCP
 transports. **Nothing here pulls an async runtime, a Kubernetes client, or a
 TLS/gRPC stack.** The Kubernetes-facing translation — the dashboards, the
 alert-rule YAML, the HPA/KEDA scaler objects, the `podFailurePolicy` documents,
-the `kubectl` rendering — lives entirely in agentctl. agent exposes the
+the `kubectl` rendering — lives entirely in agentctl. agentd exposes the
 primitives; agentctl owns the policy (RFC 0014 §3).
 
 ---
@@ -104,13 +104,13 @@ primitives; agentctl owns the policy (RFC 0014 §3).
    RFC 0010 §3.7).** A *wedged supervisor reactor* fails liveness so k8s restarts
    the pod; a *stuck subagent* must **not** fail pod liveness (RFC 0003 detects
    and kills it; the tree stays live). This RFC only states the control-plane
-   *intent* — "a live PID is not a live agent, probe the reactor heartbeat" — and
+   *intent* — "a live PID is not a live agentd, probe the reactor heartbeat" — and
    defers the surface entirely to RFC 0010 §3.7. No new health mechanism.
 
 6. **Correlation is RFC 0010 §3.6, restated for the fleet (§9).** W3C
    `traceparent` adopted-or-minted on ingest, propagated on every MCP call, LLM
    call, and spawn payload, means a multi-pod agentctl-driven flow stitches into
-   one trace with no new agent work. This RFC adds nothing; it points agentctl
+   one trace with no new agentd work. This RFC adds nothing; it points agentctl
    at the existing fields.
 
 7. **Hold the moat and version everything agentctl couples to (§8).** Every
@@ -212,8 +212,8 @@ only if it changes the closed label domain (it does — see §8).
 Token accounting honesty (RFC 0010 §3.9): tokens come from the intelligence
 `usage` (RFC 0006); when a gateway omits it, the counter is **not incremented
 with a guess** — absence is `0`, never an estimate, so `agent_tokens_total`
-stays trustworthy for cost aggregation. agent emits *tokens*, not currency;
-**cost = tokens × a price table agentctl owns** — agent never learns a price
+stays trustworthy for cost aggregation. agentd emits *tokens*, not currency;
+**cost = tokens × a price table agentctl owns** — agentd never learns a price
 (no pricing in the data plane).
 
 **Refusal / bound counters by reason (the safety + alert inputs):**
@@ -298,8 +298,8 @@ distinction in §5.
 These four are the **scaling signal set** RFC 0019 builds a KEDA/HPA scaler on
 (scale on `agent_pending_events` / `agent_reaction_lag_ms`). They are frozen
 *here* so RFC 0019's scaler is authored against a stable name at `metrics_schema`
-`1.0`. agent exposes the gauge; **the scaler object, the target value, and the
-scale-up/down policy are agentctl's** (RFC 0019). agent never learns it is being
+`1.0`. agentd exposes the gauge; **the scaler object, the target value, and the
+scale-up/down policy are agentctl's** (RFC 0019). agentd never learns it is being
 scaled.
 
 ### 4.4 Example exposition
@@ -348,7 +348,7 @@ a major it does not understand.
 
 Each RFC 0011 §5 code carries a **control-plane intent** — what a
 `podFailurePolicy` *should* do — so agentctl can mechanically emit `onExitCodes`
-rules. agent emits the code; agentctl owns the actual `FailJob`/`Ignore`/`Count`
+rules. agentd emits the code; agentctl owns the actual `FailJob`/`Ignore`/`Count`
 choice and any operator override.
 
 | Code (RFC 0011 §5) | Name | Intent | agentctl `podFailurePolicy` hint |
@@ -373,7 +373,7 @@ when present. `infra` codes are never authored as a retry rule — they signal a
 
 ### 5.3 OS-set 137/143 semantics (the clean-drain distinction)
 
-`137` and `143` are **kernel-set** (`128 + signo`); agent never returns them
+`137` and `143` are **kernel-set** (`128 + signo`); agentd never returns them
 (RFC 0011 §5.1 — `ExitCode` enum tops out at `124`). The control-plane-critical
 invariant, owned by RFC 0011 §4: **a clean SIGTERM drain returns `0`, not `143`**.
 Therefore:
@@ -454,7 +454,7 @@ Field rules:
 - **`distillate_ref` points; it does not embed.** The result *body* is the
   distilled return (RFC 0007 §3.9 / RFC 0005 §3.3 `agent://subagent/{handle}/result`).
   The report stays small and bounded; the body is read on demand. For a one-shot
-  CLI run the body is also on **stdout** (RFC 0010 §2: stdout = the agent's
+  CLI run the body is also on **stdout** (RFC 0010 §2: stdout = the agentd's
   result); `distillate_ref` is the structured handle for fleet readers.
 - **`refusals` is a per-run roll-up** of the §4.3 reasons (the metric counters
   are fleet-cumulative; the report is this-run), so `kubectl agents results`
@@ -515,7 +515,7 @@ of truth and the durable record; `agent://events` is the live-tail convenience.
 
 `agent://events` is a read-only `agent://` resource (RFC 0005 §3.3 scheme)
 added to the served resource list, gated behind `serve-mcp` + a new `events`
-feature. agent's reactive substrate is **notify-then-read** (RFC 0005 §3.3: the
+feature. agentd's reactive substrate is **notify-then-read** (RFC 0005 §3.3: the
 notification carries *no payload*; the peer `resources/read`s to learn new
 state). Because a live event stream is a *sequence* (not a single current-state
 value), the read returns a **bounded window from an in-memory ring**, and the
@@ -571,9 +571,9 @@ job (cheap, additive). The `events_schema` versions only the *envelope*
   prefixes) so a subscriber tailing only security/lifecycle events does not pull
   every `loop.step`. The filter is a cheap prefix match over the ring; no query
   engine.
-- **Fan-out is the subscriber's job.** agent serves *one instance's* ring.
+- **Fan-out is the subscriber's job.** agentd serves *one instance's* ring.
   Cross-instance aggregation, a fleet event bus, long-term storage, and replay
-  beyond the ring are **agentctl's** (RFC 0014 §6 non-goals). agent never
+  beyond the ring are **agentctl's** (RFC 0014 §6 non-goals). agentd never
   buffers beyond N lines and never ships events anywhere — it serves a read.
 - **No new transport.** The resource rides the existing self-MCP over unix/vsock
   (and future HTTP, RFC 0013); a vsock-only pod's node-agent (RFC 0014 §2) tails
@@ -637,7 +637,7 @@ each surface it compares the major it understands against the advertised major:
   ⇒ the binary did not build that feature; agentctl manages what remains
   (liveness + exit code + logs), exactly as RFC 0014 §7 specifies.
 
-### 8.4 Telemetry-path failure semantics (agent never dies for telemetry)
+### 8.4 Telemetry-path failure semantics (agentd never dies for telemetry)
 
 Inherited from RFC 0010 §3.1 and made explicit for the new surfaces:
 
@@ -666,7 +666,7 @@ MCP) to a `Job` pod another agentctl reconcile created. **RFC 0010 §3.6 already
 makes these one trace** — this RFC adds nothing, it points agentctl at the
 existing fields:
 
-- **Ingest (mint-or-adopt).** agent adopts an inbound `traceparent` — on an
+- **Ingest (mint-or-adopt).** agentd adopts an inbound `traceparent` — on an
   inbound self-MCP request (RFC 0005, the surface agentctl drives) or via
   `AGENT_TRACEPARENT` when agentctl starts the pod — else mints one per `run_id`
   (RFC 0010 §3.6). So agentctl sets `AGENT_TRACEPARENT` (or the inbound `_meta`)
@@ -689,7 +689,7 @@ default build, with no OTLP collector required (it can correlate logs/reports by
 
 ## 10. Liveness for the fleet (RFC 0010 §3.7, restated as intent)
 
-The control-plane requirement: **a live PID is not a live agent.** A reactive
+The control-plane requirement: **a live PID is not a live agentd.** A reactive
 daemon idles for hours by design (RFC 0010 §1); k8s must restart a *wedged*
 instance but must **not** restart a healthy-idle one or a healthy tree with one
 stuck child. RFC 0010 §3.7 already owns the surface; this RFC states only the
@@ -743,17 +743,17 @@ is **already** an RFC 0011 §5.2 row.
 
 ## 12. Non-goals (these stay in agentctl)
 
-- **Dashboards, alert-rule YAML, recording rules.** agent freezes the metric
+- **Dashboards, alert-rule YAML, recording rules.** agentd freezes the metric
   names; the Grafana/Prometheus rule objects are agentctl's (RFC 0014 §6).
-- **HPA/KEDA scaler objects, target values, scale policies.** agent exposes
+- **HPA/KEDA scaler objects, target values, scale policies.** agentd exposes
   `agent_pending_events`/`agent_reaction_lag_ms` (§4.3); the scaler that reads
   them is RFC 0019 / agentctl.
-- **`podFailurePolicy` documents.** agent freezes the exit-code intent (§5.2);
+- **`podFailurePolicy` documents.** agentd freezes the exit-code intent (§5.2);
   the compiled `onExitCodes` rules and any operator override are agentctl's.
-- **A cost/price table.** agent emits `agent_tokens_total`; tokens × price =
+- **A cost/price table.** agentd emits `agent_tokens_total`; tokens × price =
   cost is agentctl's table (no pricing in the data plane, §4.3).
 - **Cross-instance aggregation, a fleet event bus, long-term metric/trace/event
-  storage, replay beyond the ring.** RFC 0014 §6 non-goals; agent serves one
+  storage, replay beyond the ring.** RFC 0014 §6 non-goals; agentd serves one
   instance's metrics/ring/report.
 - **An OTLP collector / metrics backend.** Span/metric *export* is the `otel`
   feature pushing to a sidecar (RFC 0010 §3.9); the collector is infra agentctl

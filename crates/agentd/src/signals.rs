@@ -58,6 +58,25 @@ mod imp {
     // DRAINING/LAME_DUCK: pause freezes the agentic loops only — never exits, never
     // touches readiness (the supervisor reactor and liveness heartbeat run on).
     static PAUSED: AtomicBool = AtomicBool::new(false);
+    // Intelligence all-endpoints-down latch (RFC 0018 §6). The model loop runs in
+    // a re-exec'd CHILD process that owns its own intel client + circuit-breaker /
+    // failover state; the supervisor has NO LLM and no live view of that breaker
+    // state. The child therefore reports its reachability UPWARD (an edge-triggered
+    // `AgentMsg::IntelHealth` at the breaker/failover seam — on entering all-down
+    // and on recovering); the supervisor latches it HERE so the readiness probe,
+    // the `agentd_intel_all_down` gauge, and the `agentd://intelligence`/`capacity`
+    // bodies all read ONE truth without a feature dependency (it rides here, not in
+    // a feature-gated module, exactly like LAME_DUCK/PAUSED).
+    //
+    // SEMANTICS (be honest): this is EVENTUALLY-CONSISTENT, last-child-experience.
+    // A fresh subagent spawn starts with FRESH breakers (all CLOSED), so the latched
+    // flag reflects the MOST RECENT child's intel reachability and persists between
+    // reactions — it is the right "should the fleet route work to this pod" signal,
+    // but it is NOT a continuous supervisor-side probe of the endpoints. There is no
+    // model loop in the supervisor to probe with; the truth comes from whichever
+    // child last exercised the endpoints. Distinct from DRAINING/LAME_DUCK (which an
+    // operator/SIGTERM set): this is set by the data path (a child's failover).
+    static INTEL_ALL_DOWN: AtomicBool = AtomicBool::new(false);
     // Self-pipe fds (-1 until install()). The write end is touched from signal
     // handlers; the read end is what the reactor waits on.
     static WAKE_R: AtomicI32 = AtomicI32::new(-1);
@@ -189,6 +208,19 @@ mod imp {
         PAUSED.store(on, Ordering::SeqCst);
     }
 
+    pub fn intel_all_down() -> bool {
+        INTEL_ALL_DOWN.load(Ordering::SeqCst)
+    }
+
+    /// Latch the intelligence all-endpoints-down state from a child's upward
+    /// `AgentMsg::IntelHealth` report (RFC 0018 §6). Returns `true` iff the value
+    /// TRANSITIONED (so the supervisor fires the `agentd://intelligence`
+    /// notify-then-read exactly on a breaker enter/exit, not on every report).
+    /// Eventually-consistent / last-child-experience — see the static's doc above.
+    pub fn set_intel_all_down(on: bool) -> bool {
+        INTEL_ALL_DOWN.swap(on, Ordering::SeqCst) != on
+    }
+
     /// Take and clear the SIGCHLD flag — the reactor then runs the waitpid loop.
     pub fn take_child_exit() -> bool {
         CHILD_EXIT.swap(false, Ordering::SeqCst)
@@ -299,6 +331,12 @@ mod imp {
         false
     }
     pub fn set_paused(_on: bool) {}
+    pub fn intel_all_down() -> bool {
+        false
+    }
+    pub fn set_intel_all_down(_on: bool) -> bool {
+        false
+    }
     pub fn take_child_exit() -> bool {
         false
     }
@@ -370,6 +408,27 @@ pub fn set_paused(on: bool) {
     imp::set_paused(on)
 }
 
+/// Is the intelligence channel all-endpoints-down (RFC 0018 §6)? The latched,
+/// EVENTUALLY-CONSISTENT last-child-experience truth a child reports up via
+/// `AgentMsg::IntelHealth` — read by `/readyz` (flips NotReady), the
+/// `agentd_intel_all_down` gauge, and the `agentd://intelligence`/`capacity`
+/// bodies. NOT a live supervisor-side probe (there is no model loop in the
+/// supervisor): it reflects whichever child last exercised the endpoints.
+pub fn intel_all_down() -> bool {
+    imp::intel_all_down()
+}
+
+/// Latch the intelligence all-endpoints-down state from a child's `AgentMsg::
+/// IntelHealth` report (RFC 0018 §6). Returns `true` iff the value TRANSITIONED,
+/// so the supervisor can fire the `agentd://intelligence` notify exactly on a
+/// breaker enter/exit. Eventually-consistent / last-child-experience: a fresh
+/// spawn has fresh breakers, so this reflects the most recent child's reachability
+/// and persists between reactions — the right "route work here?" signal, not a
+/// continuous probe.
+pub fn set_intel_all_down(on: bool) -> bool {
+    imp::set_intel_all_down(on)
+}
+
 /// Take-and-clear the SIGCHLD flag — true if a child exited since last checked.
 pub fn take_child_exit() -> bool {
     imp::take_child_exit()
@@ -438,8 +497,9 @@ pub fn drain_wakeup() {
 }
 
 // ── Test isolation for the process-global signal state ──────────────────────
-// `DRAINING` is a one-way latch and `PAUSED`/`LAME_DUCK`/`RELOADING` are
-// process-global, so tests that touch them race + poison each other when cargo
+// `DRAINING` is a one-way latch and `PAUSED`/`LAME_DUCK`/`RELOADING`/
+// `INTEL_ALL_DOWN` are process-global, so tests that touch them race + poison
+// each other when cargo
 // runs them in parallel within one test binary (e.g. a drain test leaves
 // `DRAINING` set, breaking every later readiness assertion). Every test that
 // reads OR writes this state takes `test_guard()`: it serializes them on one
@@ -456,6 +516,10 @@ pub fn reset_for_test() {
     set_paused(false);
     set_reloading(false);
     clear_reload();
+    // The intel all-down latch is process-global too (set by a child's IntelHealth
+    // report); clear it so an all-down readiness/gauge test cannot poison a later
+    // readiness test sharing this process.
+    let _ = set_intel_all_down(false);
     // Clear the watch-attribution latch too (set by `request_reload_from_watch`),
     // so a watcher test cannot leak `trigger:"watch"` into a later reload test.
     let _ = take_reload_was_watch();

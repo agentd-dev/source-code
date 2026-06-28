@@ -183,6 +183,14 @@ impl EndpointList {
         self.attempt_order().is_empty()
     }
 
+    /// The active endpoint's bounded structural identity `(index, transport-scheme)`
+    /// for the child→supervisor [`crate::subagent::protocol::AgentMsg::IntelHealth`]
+    /// report — transport + index ONLY, NEVER the URL/cid/host or credential (RFC
+    /// 0012 §3.7, mirroring the §4.4 resource-body redaction).
+    pub fn active_identity(&self) -> (usize, &'static str) {
+        (self.active, self.eps[self.active].scheme)
+    }
+
     /// The `agentd://intelligence` resource body (RFC 0018 §4.4): the endpoint
     /// list (transport + index, NEVER the URL/creds), which is active, and each
     /// one's health (state/latency/error-rate). No secret, no URL (RFC 0012

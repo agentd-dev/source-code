@@ -256,6 +256,22 @@ pub fn set_paused(on: bool) {
     let _ = on;
 }
 
+/// Point-in-time set of the intelligence all-endpoints-down gauge
+/// (`agentd_intel_all_down`, RFC 0018 §6 / RFC 0016 §4.3) — 1 while every model
+/// endpoint is down (the latched, eventually-consistent last-child-experience
+/// truth a subagent reports up via `AgentMsg::IntelHealth`; the same flag flips
+/// `/readyz` NotReady). 0 once any endpoint is usable again. Distinct from
+/// `agentd_intel_up` (the active endpoint's reachability): all-down is the
+/// fleet-routing signal (no endpoint usable at all). No-op-safe / metrics-gated.
+pub fn set_intel_all_down(on: bool) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY
+        .intel_all_down
+        .store(u64::from(on), Ordering::Relaxed);
+    #[cfg(not(feature = "metrics"))]
+    let _ = on;
+}
+
 /// Point-in-time set of the subagent-tree shape gauges (RFC 0016 §4.3:
 /// `agentd_active_subagents` / `agentd_tree_depth` / `agentd_tree_breadth`).
 pub fn set_tree_shape(active: u64, depth: u64, breadth: u64) {
@@ -478,6 +494,10 @@ mod imp {
         // --- frozen §4.3: intelligence health --------------------------------
         pub(super) intel_calls: AtomicU64,
         pub(super) intel_up: AtomicU64,
+        // RFC 0018 §6: 1 while ALL model endpoints are down (the latched,
+        // eventually-consistent last-child-experience truth that also flips
+        // `/readyz`). Distinct from `intel_up` (the active endpoint's reachability).
+        pub(super) intel_all_down: AtomicU64,
         intel_errors: LabelCounter<{ INTEL_ERROR_REASONS.len() }>,
 
         // --- RFC 0015 §5.5: tree-pause gauge (0/1) ---------------------------
@@ -541,6 +561,7 @@ mod imp {
                 subagent_stuck_kills: LabelCounter::new(),
                 intel_calls: AtomicU64::new(0),
                 intel_up: AtomicU64::new(0),
+                intel_all_down: AtomicU64::new(0),
                 intel_errors: LabelCounter::new(),
                 paused: AtomicU64::new(0),
                 mcp_connect_failures: LabelCounter::new(),
@@ -672,11 +693,18 @@ mod imp {
             // derived from the same process-wide drain/lame-duck state `/readyz`
             // reports (RFC 0010 §3.7) — read-only, no extra call site.
             gauge(&mut s, "agentd_up", "1 while the process is alive", 1);
-            let ready = u64::from(!crate::signals::draining() && !crate::signals::lame_duck());
+            // `agentd_ready` mirrors `/readyz` exactly (RFC 0010 §3.7 / RFC 0018 §6):
+            // NotReady when draining, lame-ducked, OR all intelligence endpoints are
+            // down — the same three conditions the readiness probe consults.
+            let ready = u64::from(
+                !crate::signals::draining()
+                    && !crate::signals::lame_duck()
+                    && !crate::signals::intel_all_down(),
+            );
             gauge(
                 &mut s,
                 "agentd_ready",
-                "1 when ready to accept work (not draining / lame-ducked)",
+                "1 when ready to accept work (not draining / lame-ducked / intel-all-down)",
                 ready,
             );
             // `agentd_paused` (RFC 0015 §5.5): 1 while the tree is paused at turn
@@ -796,6 +824,14 @@ mod imp {
                 "agentd_intel_up",
                 "1 when the intelligence endpoint is reachable.",
                 g(&self.intel_up),
+            );
+            // `agentd_intel_all_down` (RFC 0018 §6): 1 while EVERY model endpoint is
+            // down — the fleet-routing signal (the same latch that flips /readyz).
+            gauge(
+                &mut s,
+                "agentd_intel_all_down",
+                "1 while all intelligence endpoints are down (RFC 0018 §6).",
+                g(&self.intel_all_down),
             );
             labelled_counter(
                 &mut s,
@@ -1147,6 +1183,19 @@ mod imp {
             // Set via the same atomic `set_paused` writes; renders 1.
             r.paused.store(1, Ordering::Relaxed);
             assert!(r.render().contains("agentd_paused 1"));
+        }
+
+        #[test]
+        fn intel_all_down_gauge_renders_zero_then_one() {
+            // RFC 0018 §6: `agentd_intel_all_down` is a 0/1 gauge, default 0, set
+            // from the latched all-down flag (the same one /readyz reads).
+            let r = Registry::new();
+            let out = r.render();
+            assert!(out.contains("# TYPE agentd_intel_all_down gauge"));
+            assert!(out.contains("agentd_intel_all_down 0"));
+            // Set via the same atomic `set_intel_all_down` writes; renders 1.
+            r.intel_all_down.store(1, Ordering::Relaxed);
+            assert!(r.render().contains("agentd_intel_all_down 1"));
         }
 
         #[test]

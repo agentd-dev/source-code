@@ -106,6 +106,32 @@ pub enum AgentMsg {
     Result { outcome: Outcome },
     /// Terminal: a fatal infrastructure failure (intel/mcp unreachable).
     Failed { error: String },
+    /// The child's intelligence reachability, edge-triggered at the breaker/
+    /// failover seam (RFC 0018 §6). Emitted ONLY on a transition: on **entering**
+    /// all-endpoints-down (every configured endpoint's breaker open / the failover
+    /// sweep exhausted) and on **recovering** (any endpoint usable again). The
+    /// supervisor has no LLM of its own and no live view of a child's breaker
+    /// state, so the child reports it upward; the supervisor latches it into the
+    /// `intel_all_down` process-global the readiness probe + `agentd_intel_all_down`
+    /// gauge + `agentd://intelligence`/`capacity` bodies read (the one latched
+    /// truth, eventually-consistent — see [`crate::signals::set_intel_all_down`]).
+    /// `active` is best-effort transport+index ONLY — NEVER a URL or credential
+    /// (mirrors the `agentd://intelligence` redaction, RFC 0012 §3.7).
+    IntelHealth {
+        all_down: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active: Option<IntelActive>,
+    },
+}
+
+/// Which endpoint is serving the child's intelligence, for [`AgentMsg::IntelHealth`].
+/// The bounded structural identity ONLY — the list index + the transport scheme
+/// (`unix`/`vsock`/`https`) — never the URL/cid/host or any credential (RFC 0012
+/// §3.7, mirroring the `agentd://intelligence` resource redaction).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntelActive {
+    pub index: usize,
+    pub transport: String,
 }
 
 // ---- spawn payload ----
@@ -329,6 +355,55 @@ mod tests {
         let minimal: SwapIntel = serde_json::from_str(r#"{"uri":"unix:/a"}"#).unwrap();
         assert_eq!(minimal.policy, SwapPolicy::FinishOnOld);
         assert!(minimal.model.is_none() && minimal.token.is_none());
+    }
+
+    #[test]
+    fn intel_health_roundtrips_and_carries_no_url_or_secret() {
+        // The child→supervisor reachability report (RFC 0018 §6): tagged like the
+        // other AgentMsgs, edge-triggered, transport+index ONLY (never a URL/cred).
+        let down = AgentMsg::IntelHealth {
+            all_down: true,
+            active: None,
+        };
+        let s = serde_json::to_string(&down).unwrap();
+        assert!(s.contains("\"type\":\"intel_health\""));
+        assert!(s.contains("\"all_down\":true"));
+        // `active` is omitted when absent (the all-down report has no serving ep).
+        assert!(!s.contains("active"));
+        let back: AgentMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            AgentMsg::IntelHealth {
+                all_down: true,
+                active: None
+            }
+        ));
+
+        // The recovered report carries the best-effort active transport+index.
+        let up = AgentMsg::IntelHealth {
+            all_down: false,
+            active: Some(IntelActive {
+                index: 1,
+                transport: "vsock".into(),
+            }),
+        };
+        let s = serde_json::to_string(&up).unwrap();
+        assert!(s.contains("\"all_down\":false"));
+        assert!(s.contains("\"index\":1"));
+        assert!(s.contains("\"transport\":\"vsock\""));
+        // RFC 0012 §3.7: the structural transport scheme only — no scheme-borne
+        // address/cid/host/credential rides this message.
+        assert!(!s.contains("vsock:"), "no full URI in the report: {s}");
+        let back: AgentMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            AgentMsg::IntelHealth { all_down, active } => {
+                assert!(!all_down);
+                let a = active.unwrap();
+                assert_eq!(a.index, 1);
+                assert_eq!(a.transport, "vsock");
+            }
+            other => panic!("expected intel_health, got {other:?}"),
+        }
     }
 
     #[test]

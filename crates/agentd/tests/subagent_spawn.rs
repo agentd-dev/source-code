@@ -98,6 +98,7 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
                     AgentMsg::Turn { .. } => "turn",
                     AgentMsg::Result { .. } => "result",
                     AgentMsg::Failed { .. } => "failed",
+                    AgentMsg::IntelHealth { .. } => "intel_health",
                 };
                 if m == kind {
                     return true;

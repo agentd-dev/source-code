@@ -142,6 +142,18 @@ impl WarmRegistry {
                         dead.push(id.clone());
                         break;
                     }
+                    // RFC 0018 §6: a warm session reports its intel reachability;
+                    // latch it into the process-global readiness/gauge/resource truth
+                    // (eventually-consistent, last-child-experience). A warm-only
+                    // daemon has no `supervise_once` reaction to latch this, so it must
+                    // be latched here too. The notify-then-read fires from the served
+                    // `LiveConfig` path; this daemon-held drain has no subs registry.
+                    Ok((_, AgentMsg::IntelHealth { all_down, .. })) => {
+                        if crate::signals::set_intel_all_down(all_down) {
+                            crate::obs::metrics::set_intel_all_down(all_down);
+                            log.info("intel.health", json!({"session": id, "all_down": all_down}));
+                        }
+                    }
                     Ok(_) => {} // Ready / Pong / Event / Usage — progress, ignore here
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {

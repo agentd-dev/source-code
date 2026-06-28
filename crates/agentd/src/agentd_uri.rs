@@ -12,13 +12,22 @@
 //!     self-MCP — the run/session resources are also subscribable and fire
 //!     `notifications/resources/updated` repeatedly (RFC 0005 §3.3/§3.4).
 
-/// The scheme prefix.
+/// The scheme prefix agentd EMITS (the branded alias, kept until the GA cutover).
 pub const SCHEME: &str = "agentd://";
 
-/// Whether `uri` is an `agentd://` resource — so it routes to agentd's own
-/// resource backends rather than an MCP server.
+/// The neutral (canonical, de-branded) scheme prefix ACCEPTED as an input alias
+/// (ACC SPEC L4 / management-profile.json `x-debranding`). agentd still emits the
+/// branded `agentd://`, but a consumer addressing `agent://…` is honoured too —
+/// the branded spelling is never dropped, neutral is merely also accepted.
+pub const NEUTRAL_SCHEME: &str = "agent://";
+
+/// Whether `uri` is one of agentd's own resources — so it routes to agentd's own
+/// resource backends rather than an MCP server. Accepts EITHER the branded
+/// `agentd://` or the neutral `agent://` prefix (ACC SPEC L4; the two prefixes are
+/// mutually exclusive — `agentd://x` does not start with `agent://`).
 pub fn is_agentd(uri: &str) -> bool {
-    uri.trim().starts_with(SCHEME)
+    let uri = uri.trim();
+    uri.starts_with(SCHEME) || uri.starts_with(NEUTRAL_SCHEME)
 }
 
 /// A parsed `agentd://` resource address.
@@ -114,7 +123,14 @@ impl AgentdResource {
     /// Parse an `agentd://` URI. `None` for a non-agentd scheme or an
     /// unrecognized/empty path.
     pub fn parse(uri: &str) -> Option<AgentdResource> {
-        let rest = uri.trim().strip_prefix(SCHEME)?;
+        // Accept EITHER the branded `agentd://` or the neutral `agent://` prefix
+        // (ACC SPEC L4 de-branding); the rest of the parse is scheme-agnostic.
+        // Branded is tried first (it is the emitted alias); the prefixes are
+        // mutually exclusive so the order is immaterial for correctness.
+        let trimmed = uri.trim();
+        let rest = trimmed
+            .strip_prefix(SCHEME)
+            .or_else(|| trimmed.strip_prefix(NEUTRAL_SCHEME))?;
         // Split the optional `?query` off the path (only `agentd://events` uses
         // one today — the cursor/filters, RFC 0016 §7). Path-only resources see
         // identical behaviour: their `rest` has no `?`, so `path == rest`.
@@ -370,5 +386,63 @@ mod tests {
         assert_eq!(AgentdResource::parse("agentd://run/"), None);
         assert_eq!(AgentdResource::parse("agentd://session/"), None);
         assert_eq!(AgentdResource::parse("file:///x"), None);
+    }
+
+    // --- ACC SPEC L4 de-branding: the neutral `agent://` prefix is also accepted
+    // on input (branded `agentd://` stays accepted + emitted). -----------------
+
+    #[test]
+    fn detects_the_neutral_scheme_too() {
+        // Neutral `agent://` is accepted alongside the branded `agentd://`.
+        assert!(is_agentd("agent://status"));
+        assert!(is_agentd("  agent://events  "));
+        assert!(is_agentd("agentd://status"));
+        // A foreign scheme that merely shares a prefix is not ours.
+        assert!(!is_agentd("agentx://y"));
+        assert!(!is_agentd("agent:/status"));
+    }
+
+    #[test]
+    fn parses_the_neutral_scheme_same_as_branded() {
+        // The neutral spelling resolves to the SAME resource as the branded one.
+        assert_eq!(
+            AgentdResource::parse("agent://status"),
+            Some(AgentdResource::Status)
+        );
+        assert_eq!(
+            AgentdResource::parse("agent://capabilities"),
+            Some(AgentdResource::Capabilities)
+        );
+        assert_eq!(
+            AgentdResource::parse("agent://capabilities/"),
+            Some(AgentdResource::Capabilities)
+        );
+        // events: the bare base and the cursor/filter query both parse.
+        assert_eq!(
+            AgentdResource::parse("agent://events"),
+            Some(AgentdResource::Events(EventsQuery::default()))
+        );
+        assert_eq!(
+            AgentdResource::parse("agent://events?after=9&level=warn"),
+            Some(AgentdResource::Events(EventsQuery {
+                after: 9,
+                level: Some("warn".into()),
+                event_prefixes: vec![],
+            }))
+        );
+        // path-bearing arms strip the neutral prefix identically.
+        assert_eq!(
+            AgentdResource::parse("agent://run/r-7"),
+            Some(AgentdResource::Run("r-7".into()))
+        );
+        assert_eq!(
+            AgentdResource::parse("agent://subagent/0.1"),
+            Some(AgentdResource::Subagent("0.1".into()))
+        );
+        // and the branded spelling still parses (never dropped).
+        assert_eq!(
+            AgentdResource::parse("agentd://status"),
+            Some(AgentdResource::Status)
+        );
     }
 }

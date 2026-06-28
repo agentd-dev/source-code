@@ -1854,9 +1854,13 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
         // as an unknown uri) so a stdio peer can't even confirm it exists.
         Some(crate::agentd_uri::AgentdResource::Inventory) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7 / management-profile.json `gating`: a non-Management
+                // caller of an operator resource gets METHOD_NOT_FOUND (-32601) —
+                // it can't even confirm the resource exists. (Branded message kept
+                // non-disclosing.)
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
+                    json::METHOD_NOT_FOUND,
                     format!("resource not found: {uri}"),
                 );
             }
@@ -1874,9 +1878,13 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
         // never the URL or any credential (RFC 0012 §3.7).
         Some(crate::agentd_uri::AgentdResource::Intelligence) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7 / management-profile.json `gating`: a non-Management
+                // caller of an operator resource gets METHOD_NOT_FOUND (-32601) —
+                // it can't even confirm the resource exists. (Branded message kept
+                // non-disclosing.)
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
+                    json::METHOD_NOT_FOUND,
                     format!("resource not found: {uri}"),
                 );
             }
@@ -1895,9 +1903,13 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
         #[cfg(feature = "cluster")]
         Some(crate::agentd_uri::AgentdResource::Capacity) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7 / management-profile.json `gating`: a non-Management
+                // caller of an operator resource gets METHOD_NOT_FOUND (-32601) —
+                // it can't even confirm the resource exists. (Branded message kept
+                // non-disclosing.)
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
+                    json::METHOD_NOT_FOUND,
                     format!("resource not found: {uri}"),
                 );
             }
@@ -1915,9 +1927,13 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
         // (post-any-reload) view, with NO secret / URL (`effective_view` redacts).
         Some(crate::agentd_uri::AgentdResource::ConfigEffective) => {
             if origin != PeerOrigin::Management {
+                // ACC SPEC L7 / management-profile.json `gating`: a non-Management
+                // caller of an operator resource gets METHOD_NOT_FOUND (-32601) —
+                // it can't even confirm the resource exists. (Branded message kept
+                // non-disclosing.)
                 return Response::err(
                     req.id,
-                    json::RESOURCE_NOT_FOUND,
+                    json::METHOD_NOT_FOUND,
                     format!("resource not found: {uri}"),
                 );
             }
@@ -2087,6 +2103,20 @@ fn tools_call(req: Request, ctx: &ServeCtx, origin: PeerOrigin, log: &Logger) ->
             "cancel" => return handle_cancel(req.id, ctx, &args(), log),
             _ => {}
         }
+    }
+    // A non-Management peer naming an operator tool: the tool is invisible on this
+    // transport (RFC 0015 §3.4 / ACC management-profile.json `gating`, SPEC L7).
+    // Reaching here with an operator-tool name implies a non-Management origin (a
+    // Management peer already returned above), so refuse with METHOD_NOT_FOUND
+    // (-32601) — NOT INVALID_PARAMS — so a stdio peer can't even confirm the
+    // operator surface exists. A genuinely-unknown tool name still falls through to
+    // the INVALID_PARAMS arm below (unchanged — scoped to the origin gate).
+    if crate::capabilities::OPERATOR_TOOLS.contains(&name) {
+        return Response::err(
+            req.id,
+            json::METHOD_NOT_FOUND,
+            format!("method not found: {name}"),
+        );
     }
     match name {
         "status" => {
@@ -2305,21 +2335,82 @@ fn fan_pause(ctx: &ServeCtx, want: bool) -> u64 {
     affected
 }
 
+/// Cancel every in-flight root subtree — the whole run (the ACC management-profile
+/// `cancel{handle:"0"}`/omitted sentinel), mirroring [`fan_pause`]'s dual fan-out:
+/// - warm sessions (`ctx.warm`): send `ControlMsg::Cancel` down the held control
+///   channel, then remove the `Subagent` (its `Drop` runs the SIGKILL+reap kill
+///   ladder) outside the lock — the parallel of the single-handle warm path.
+/// - async runs (`ctx.sessions`): flip the shared `cancel` atomic the run's
+///   supervisor reactor reads (it turns the edge into `ctrl/cancel` to live
+///   children) — the parallel of the single-handle async path. No new path is
+///   invented.
+///
+/// Only live (non-terminal) subtrees are counted into the returned `subtree_size`.
+fn fan_cancel(ctx: &ServeCtx, reason: &str) -> u64 {
+    let mut affected = 0u64;
+    {
+        let mut warm = ctx.warm.lock().unwrap_or_else(|e| e.into_inner());
+        let live: Vec<String> = warm
+            .iter()
+            .filter(|(_, w)| !w.done)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let mut removed = Vec::new();
+        for h in live {
+            if let Some(w) = warm.get_mut(&h) {
+                let _ = w.sub.send(&ControlMsg::Cancel {
+                    reason: reason.to_string(),
+                });
+            }
+            if let Some(r) = warm.remove(&h) {
+                removed.push(r);
+                affected += 1;
+            }
+        }
+        // Release the registry lock before the Subagents' Drop (SIGKILL+reap).
+        drop(warm);
+        drop(removed);
+    }
+    {
+        let reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for s in reg.values() {
+            if s.status.is_terminal() {
+                continue;
+            }
+            s.cancel.store(true, Ordering::Relaxed);
+            affected += 1;
+        }
+    }
+    affected
+}
+
 /// `cancel` (RFC 0015 §4.4) — the instance-scoped wrapper over the served
 /// cancellation by handle (the `subagent.cancel` path). Cancels a tracked warm
 /// session or async run by handle; an unknown handle is `isError:true` inside a
 /// successful result (a racing reap may have already removed it — RFC 0015 §8),
 /// not a protocol error. `cancel{handle:"0"}`/`"served.0"` targets the run, never
 /// the supervisor — distinct from `drain`, which also exits.
-fn handle_cancel(id: Id, ctx: &ServeCtx, args: &Value, _log: &Logger) -> Response {
+fn handle_cancel(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
     let handle = args
         .get("handle")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
-    if handle.is_empty() {
-        return Response::err(id, json::INVALID_PARAMS, "cancel requires a 'handle'");
+    // ACC management-profile.json `cancel`: `handle:"0"` OR an omitted/empty handle
+    // is the sentinel-in-string for the ROOT subtree — i.e. the whole run. Cancel
+    // every live served subtree (the kill ladder), mirroring pause/resume's
+    // tree-wide fan-out. A real handle below still targets just that one subtree
+    // (back-compat).
+    if handle.is_empty() || handle == "0" {
+        let affected = fan_cancel(ctx, &cancel_reason(args));
+        log.info("mcp.cancel", json!({"handle": "0", "affected": affected}));
+        notify_resource_updated_keep(&ctx.subscriptions, crate::agentd_uri::INVENTORY_URI);
+        let body = json!({ "handle": "0", "cancelled": true, "subtree_size": affected });
+        return Response::ok(
+            id,
+            json!({"content": [{"type": "text", "text": format!("cancelling the whole run: {affected} live subtree(s)")}], "structuredContent": body, "isError": false}),
+        );
     }
     // Warm session?
     {
@@ -3051,15 +3142,15 @@ fn cancel_tool_def() -> Value {
         "name": "cancel",
         "description": "Cancel a run or subtree in THIS instance by handle (the management-transport, \
             instance-scoped wrapper over subagent.cancel) — kills the work, keeps the pod (unlike \
-            drain, which also exits). An unknown handle is reported as an error result, not a \
-            failure. Management transport only.",
+            drain, which also exits). handle \"0\" or OMITTED targets the root subtree (the whole \
+            run): every live subtree is cancelled. An unknown handle is reported as an error result, \
+            not a failure. Management transport only.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "handle": {"type": "string", "description": "the run/subtree handle to cancel"},
+                "handle": {"type": "string", "description": "the run/subtree handle to cancel; \"0\" or omitted = the whole run (root subtree)"},
                 "reason": {"type": "string", "description": "surfaced in logs + ctrl/cancel"}
             },
-            "required": ["handle"],
             "additionalProperties": false
         }
     })
@@ -4071,16 +4162,19 @@ mod tests {
             0,
             &log(),
         );
-        assert!(
-            r.error.is_some(),
-            "stdio drain → JSON-RPC unknown-tool error"
+        // ACC SPEC L7 / management-profile.json gating: a non-Management caller of
+        // an operator tool gets METHOD_NOT_FOUND (-32601), not INVALID_PARAMS.
+        assert_eq!(
+            r.error.as_ref().expect("stdio drain → JSON-RPC error").code,
+            json::METHOD_NOT_FOUND,
+            "stdio drain → -32601 METHOD_NOT_FOUND"
         );
         assert_eq!(
             crate::signals::draining(),
             before,
             "a refused stdio drain must not change the latch"
         );
-        // lame-duck and cancel are equally invisible to stdio.
+        // lame-duck and cancel are equally invisible to stdio — same -32601 gate.
         for tool in ["lame-duck", "cancel"] {
             let r = dispatch(
                 req(
@@ -4093,7 +4187,11 @@ mod tests {
                 0,
                 &log(),
             );
-            assert!(r.error.is_some(), "stdio {tool} → unknown-tool error");
+            assert_eq!(
+                r.error.as_ref().expect("stdio op tool → error").code,
+                json::METHOD_NOT_FOUND,
+                "stdio {tool} → -32601 METHOD_NOT_FOUND"
+            );
         }
     }
 
@@ -4382,6 +4480,59 @@ mod tests {
     }
 
     #[test]
+    fn cancel_handle_zero_or_omitted_cancels_the_whole_run() {
+        // ACC management-profile.json: cancel{handle:"0"} (or an omitted handle) is
+        // the root-subtree sentinel — it cancels EVERY live served subtree, not one
+        // handle. Distinct from drain (which also exits the pod).
+        let ctx_a = ctx();
+        insert_running(&ctx_a, "served.1");
+        insert_running(&ctx_a, "served.2");
+        let r = dispatch(
+            req(
+                "tools/call",
+                Some(json!({"name": "cancel", "arguments": {"handle": "0"}})),
+            ),
+            &ctx_a,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("ok");
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["handle"], "0");
+        assert_eq!(v["structuredContent"]["subtree_size"], 2);
+        for h in ["served.1", "served.2"] {
+            assert!(
+                ctx_a.sessions.lock().unwrap()[h]
+                    .cancel
+                    .load(Ordering::Relaxed),
+                "{h} cancel flag set by the whole-run cancel"
+            );
+        }
+
+        // An OMITTED handle is the same sentinel (defaults to the whole run).
+        let ctx2 = ctx();
+        insert_running(&ctx2, "served.3");
+        let r = dispatch(
+            req("tools/call", Some(json!({"name": "cancel", "arguments": {}}))),
+            &ctx2,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = r.result.expect("ok (omitted handle == whole run)");
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["subtree_size"], 1);
+        assert!(
+            ctx2.sessions.lock().unwrap()["served.3"]
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
     fn inventory_read_is_management_gated_and_projects_the_lifecycle_flags() {
         let _g = crate::signals::test_guard();
         let ctx = ctx();
@@ -4426,7 +4577,17 @@ mod tests {
             0,
             &log(),
         );
-        assert!(denied.error.is_some(), "stdio inventory read is refused");
+        // ACC SPEC L7: a non-Management caller of an operator resource gets
+        // METHOD_NOT_FOUND (-32601) — refused as if the resource did not exist.
+        assert_eq!(
+            denied
+                .error
+                .as_ref()
+                .expect("stdio inventory read is refused")
+                .code,
+            json::METHOD_NOT_FOUND,
+            "stdio inventory read → -32601 METHOD_NOT_FOUND"
+        );
     }
 
     #[test]

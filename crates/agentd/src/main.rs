@@ -503,6 +503,11 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
     // the floor contract, never gated on the report landing.
     write_run_report(cfg, status, code, partial, started, ended, log);
 
+    // The PROCESS exit a Job's podFailurePolicy observes — the operator's
+    // `--budget-exit-code` remaps ONLY the two policy budget codes (3/7) here
+    // (RFC 0011 §5.2); the report above kept the canonical projection.
+    let proc_code = exit::apply_budget_remap(code, cfg.budget_exit_code);
+
     match result {
         Ok(SuperviseResult::Completed(outcome)) => {
             print_result(&outcome.result);
@@ -510,22 +515,22 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
                 "proc.exit",
                 json!({"status": outcome.status.as_str(), "partial": outcome.partial}),
             );
-            code
+            proc_code
         }
         Ok(SuperviseResult::Failed(err)) => {
             log.error("proc.exit", json!({"err": err}));
             eprintln!("agentd: {err}");
-            code
+            proc_code
         }
         Ok(SuperviseResult::Killed(reason)) => {
             log.warn("proc.exit", json!({"killed": format!("{reason:?}")}));
             eprintln!("agentd: run terminated ({reason:?})");
-            code
+            proc_code
         }
         Err(e) => {
             log.error("proc.exit", json!({"err": format!("spawn: {e}")}));
             eprintln!("agentd: failed to spawn root subagent: {e}");
-            code
+            proc_code
         }
     }
 }

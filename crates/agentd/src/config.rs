@@ -539,6 +539,17 @@ pub struct Config {
     /// (warned at startup — a reactive daemon has no single terminal outcome,
     /// §6.4).
     pub report_file: Option<String>,
+    /// Operator remap for the two *policy* budget exit codes (`--budget-exit-code
+    /// N`, RFC 0011 §5.2 / ACC exit-codes.table.json `x-budget-exit-code-remap`).
+    /// `None` ⇒ no remap (the canonical table applies). When set, a final process
+    /// exit of `EXIT_PARTIAL` (3) **or** `EXIT_BUDGET` (7) — and ONLY those two,
+    /// the operator-tunable `policy`-intent codes — is returned to the OS as `N`
+    /// instead, so a Job's `podFailurePolicy` can treat a budget/partial outcome
+    /// as success-or-fail per operator policy. Every other code (a deadline 124, a
+    /// refusal 5, a clean 0) is NEVER remapped. The run **report** still records
+    /// the canonical 3/7 projection + the precise `status`, so the durable record
+    /// stays truthful (and schema-valid) regardless of the remap.
+    pub budget_exit_code: Option<i32>,
     /// Capacity of the bounded `agentd://events` ring (`--events-ring N` /
     /// `AGENTD_EVENTS_RING`, RFC 0016 §7.2/§11): the last N emitted lines held in
     /// memory for the live-tail resource. Default 1024. Only consumed when the
@@ -648,6 +659,7 @@ impl Default for Config {
             allow_trifecta: false,
             cron: None,
             report_file: None,
+            budget_exit_code: None,
             events_ring: crate::obs::log::EVENTS_RING_DEFAULT,
             intelligence_headers: std::collections::BTreeMap::new(),
             shard: ShardCfg::default(),
@@ -770,11 +782,41 @@ impl fmt::Display for ConfigError {
     }
 }
 
+/// De-branding normalization (ACC SPEC L4 / management-profile.json
+/// `x-debranding`): accept the neutral `AGENT_*` env prefix as an input alias for
+/// the branded `AGENTD_*` one. Returns the env list with a synthesized
+/// `AGENTD_<X>` entry for every `AGENT_<X>` whose branded form is ABSENT — branded
+/// WINS when both are present (back-compat is preserved). Branded keys are never
+/// dropped, and a non-prefixed key (e.g. `INSTRUCTION`) is untouched. Done once so
+/// every downstream `AGENTD_*` read transparently also honours `AGENT_*`.
+fn debrand_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    let have: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    let mut out: Vec<(String, String)> = env.to_vec();
+    for (k, v) in env {
+        // `AGENTD_*` itself does NOT match `AGENT_` (the 6th char is `D`, not `_`),
+        // so branded keys are never re-aliased; only true neutral keys are.
+        if let Some(suffix) = k.strip_prefix("AGENT_") {
+            let branded = format!("AGENTD_{suffix}");
+            if !have.contains(branded.as_str()) {
+                out.push((branded, v.clone()));
+            }
+        }
+    }
+    out
+}
+
 impl Config {
     /// Resolve config from CLI args (excluding the leading program name) and the
     /// environment, applying precedence (`built-in default < FILE < env < flag`,
     /// RFC 0011 §2.1 / RFC 0017 §3.2) and validating.
     pub fn load(args: &[String], env: &[(String, String)]) -> Result<Config, ConfigError> {
+        // De-branding (ACC SPEC L4): every branded `AGENTD_*` env var also accepts
+        // its neutral `AGENT_*` spelling on input. Normalize ONCE here — for any
+        // `AGENT_<X>` present, synthesize an `AGENTD_<X>` entry iff the branded form
+        // is absent (branded WINS on conflict, preserving back-compat) — so every
+        // downstream `AGENTD_*` read below transparently honours `AGENT_*` too, with
+        // no per-read change. The branded spelling is never dropped, only aliased.
+        let env = debrand_env(env);
         let envmap: HashMap<&str, &str> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -1128,6 +1170,21 @@ impl Config {
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 "--report-file" => c.report_file = Some(take("--report-file")?),
+                // RFC 0011 §5.2 / ACC exit-codes.table.json: remap the two
+                // operator-tunable `policy` budget codes (EXIT_PARTIAL 3 /
+                // EXIT_BUDGET 7) to N at the final process exit. N must be a valid
+                // POSIX exit byte (0..=255); only 3 and 7 are ever remapped.
+                "--budget-exit-code" => {
+                    let v = take("--budget-exit-code")?;
+                    let n: i32 = v
+                        .parse()
+                        .ok()
+                        .filter(|n| (0..=255).contains(n))
+                        .ok_or_else(|| {
+                            usage(format!("invalid --budget-exit-code: {v} (want 0..=255)"))
+                        })?;
+                    c.budget_exit_code = Some(n);
+                }
                 "--events-ring" => {
                     let v = take("--events-ring")?;
                     c.events_ring = v
@@ -2356,6 +2413,7 @@ fn help_text() -> String {
          \x20 --cgroup-pids-max <N>       per-run pids.max (max|count of THREADS; needs --cgroup + delegation)\n\
          \x20 --traceparent <W3C>         continue an upstream trace (or AGENTD_TRACEPARENT)\n\
          \x20 --report-file <PATH>        write the run-outcome report at terminal (atomic; inert for reactive)\n\
+         \x20 --budget-exit-code <N>      remap the policy budget codes (3/7 only) to N at process exit (0..=255)\n\
          \x20 --events-ring <N>           agentd://events ring size (default 1024; needs --serve-mcp + --features events)\n\
          \x20 --capabilities             print the capabilities manifest (JSON) and exit\n\
          \n\
@@ -2396,6 +2454,60 @@ mod tests {
     }
 
     #[test]
+    fn neutral_agent_env_prefix_is_accepted_as_an_alias() {
+        // ACC SPEC L4: the neutral `AGENT_*` prefix is accepted on input wherever
+        // the branded `AGENTD_*` one is — fed through the single envmap normalization.
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENT_INTELLIGENCE".into(), "unix:/neutral".into()),
+            ("AGENT_RUN_ID".into(), "run-neutral".into()),
+            ("AGENT_MAX_STEPS".into(), "42".into()),
+        ];
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.intelligence.as_deref(), Some("unix:/neutral"));
+        assert_eq!(c.run_id, "run-neutral");
+        assert_eq!(c.max_steps, 42);
+    }
+
+    #[test]
+    fn branded_env_wins_over_neutral_on_conflict() {
+        // Both spellings present ⇒ the branded `AGENTD_*` value wins (back-compat),
+        // and the branded-only path still works (neutral merely also accepted).
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/branded".into()),
+            ("AGENT_INTELLIGENCE".into(), "unix:/neutral".into()),
+        ];
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.intelligence.as_deref(), Some("unix:/branded"));
+    }
+
+    #[test]
+    fn debrand_env_synthesizes_branded_only_when_absent() {
+        // Unit-level: a neutral key without a branded counterpart gets a synthesized
+        // branded entry; a present branded key is left untouched (branded wins).
+        let env = vec![
+            ("AGENT_MODE".into(), "loop".into()),
+            ("AGENTD_RUN_ID".into(), "kept".into()),
+            ("AGENT_RUN_ID".into(), "ignored".into()),
+            ("INSTRUCTION".into(), "x".into()),
+        ];
+        let out = debrand_env(&env);
+        let get = |k: &str| {
+            out.iter()
+                .filter(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        // Neutral-only AGENT_MODE → synthesized AGENTD_MODE.
+        assert_eq!(get("AGENTD_MODE"), vec!["loop"]);
+        // Branded present → not overwritten by the neutral form.
+        assert_eq!(get("AGENTD_RUN_ID"), vec!["kept"]);
+        // Non-prefixed keys are passed through unchanged.
+        assert_eq!(get("INSTRUCTION"), vec!["x"]);
+    }
+
+    #[test]
     fn report_file_and_events_ring_parse_from_flag_and_env() {
         // Default: off / the 1024 ring (RFC 0016 §11).
         let c = Config::load(&args(&[]), &base_env()).unwrap();
@@ -2418,6 +2530,23 @@ mod tests {
         let c = Config::load(&args(&["--events-ring", "512"]), &env).unwrap();
         assert_eq!(c.report_file.as_deref(), Some("/env/report.json"));
         assert_eq!(c.events_ring, 512);
+    }
+
+    #[test]
+    fn budget_exit_code_flag_parses_and_range_checks() {
+        // Default: no remap (the canonical table applies).
+        let c = Config::load(&args(&[]), &base_env()).unwrap();
+        assert_eq!(c.budget_exit_code, None);
+        // A valid POSIX exit byte is accepted.
+        let c = Config::load(&args(&["--budget-exit-code", "0"]), &base_env()).unwrap();
+        assert_eq!(c.budget_exit_code, Some(0));
+        let c = Config::load(&args(&["--budget-exit-code", "42"]), &base_env()).unwrap();
+        assert_eq!(c.budget_exit_code, Some(42));
+        // Out of the 0..=255 byte range, or non-numeric ⇒ EXIT_USAGE (2).
+        for bad in ["256", "-1", "nope"] {
+            let e = Config::load(&args(&["--budget-exit-code", bad]), &base_env()).unwrap_err();
+            assert!(matches!(e, ConfigError::Usage(_)), "{bad} must be a usage error");
+        }
     }
 
     #[test]

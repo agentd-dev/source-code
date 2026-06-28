@@ -298,6 +298,22 @@ agentd \
 > runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the MCP
 > client, and all four run modes — is implemented.
 
+> **⚠ Migration (v2.8.0 — breaking).** Before v2.8.0, `--enable-exec` was a bare boolean: it
+> turned on exec and let the model run **any** absolute-path binary. As of v2.8.0 it is an
+> **operator allowlist** (RFC 0012 §3.6) — it now **takes a path** and the bare form is rejected
+> at startup (exit 2 with an actionable error). To migrate, replace the bare flag with one
+> `--enable-exec <abs-path>` per binary you intend to allow (or set `AGENTD_ENABLE_EXEC` to a
+> `:`-separated path list):
+>
+> ```diff
+> - --enable-exec
+> + --enable-exec /usr/bin/git --enable-exec /usr/bin/cargo
+> ```
+>
+> There is intentionally **no** "allow everything" switch — naming the binaries is the security
+> guarantee (the model can only run what you listed). If a deployment genuinely needs a broad set,
+> list each binary explicitly.
+
 ---
 
 ## 7. Secrets handling

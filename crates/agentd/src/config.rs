@@ -869,7 +869,9 @@ impl Config {
                 .collect();
             if paths.is_empty() {
                 return Err(usage(
-                    "AGENTD_ENABLE_EXEC requires at least one allowed binary path (':'-separated)"
+                    "AGENTD_ENABLE_EXEC must be a ':'-separated list of allowed absolute binary paths, e.g. \
+                     `/usr/bin/git:/usr/bin/cargo`. The bare-bool form was removed in v2.8.0: exec is now an \
+                     operator allowlist — the model can only run binaries you list (RFC 0012 §3.6)."
                         .into(),
                 ));
             }
@@ -1065,12 +1067,21 @@ impl Config {
                 // token is missing or another flag). Each path's existence +
                 // executability is checked in `validate()` (exit 2 on a miss).
                 "--enable-exec" => {
-                    let p = take("--enable-exec")?;
+                    // The actionable migration error for BOTH a missing value (bare
+                    // `--enable-exec`) and a following flag (`--enable-exec --x`):
+                    // `take` only errors on a missing value, so map it to the same
+                    // message the `-`-prefixed case below uses (v2.8.0 breaking).
+                    let exec_migration = || {
+                        usage(
+                            "--enable-exec now requires an allowed binary path, e.g. `--enable-exec /usr/bin/git` (repeatable). \
+                             The bare `--enable-exec` (enable-anything) form was removed in v2.8.0: exec is now an operator \
+                             allowlist — the model can only run binaries you list (RFC 0012 §3.6)."
+                                .to_string(),
+                        )
+                    };
+                    let p = take("--enable-exec").map_err(|_| exec_migration())?;
                     if p.starts_with('-') {
-                        return Err(usage(
-                            "--enable-exec requires an allowed binary path (e.g. --enable-exec /usr/bin/git)"
-                                .into(),
-                        ));
+                        return Err(exec_migration());
                     }
                     c.exec_allow.push(PathBuf::from(p));
                 }

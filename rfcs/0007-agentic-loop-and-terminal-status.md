@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-The inner agentic loop is the one place in agent where the model owns
+The inner agentic loop is the one place in agentd where the model owns
 control flow. Everything else — the supervisor (RFC 0002/0003), the MCP
 client/server (RFC 0004/0005), intelligence transport (RFC 0006), the modes
 and router (RFC 0008), subagent spawn (RFC 0009) — exists to *start*,
@@ -67,20 +67,20 @@ abort outcomes whose exit-code mapping is owned by RFC 0011 §5.2, not new
 `TerminalStatus` variants.
 
 The global step / token / deadline cap is a **hard safety system**, not a
-preference: at every soft budget the agent wraps up gracefully and returns a
+preference: at every soft budget the agentd wraps up gracefully and returns a
 labeled partial; `RLIMIT`/`SIGKILL` from the supervisor (RFC 0003) is the
 backstop for a wedged child that cannot wrap up.
 
 **VERIFY is grounded in tool/exec results and MCP resource state — never in
 the model judging itself.** It is loop discipline + a place in the event
-stream, not a second model call. agent ships no LLM-as-judge in core.
+stream, not a second model call. agentd ships no LLM-as-judge in core.
 
 **Errors split three ways:** tool-domain errors and malformed model output
 become **observations** the model adapts to (recoverable, step-consuming);
 transient transport errors get **bounded transport-layer retry** before
 surfacing; fatal infra **aborts** with a matching terminal status.
 
-**Resources reach the agent two ways at once:** a compact catalogue
+**Resources reach the agentd two ways at once:** a compact catalogue
 (URIs + descriptions + mtime/etag, never bodies) is injected for *awareness*;
 the `resource.read` self-tool pulls bodies on demand for *attention*.
 
@@ -173,11 +173,11 @@ Each request is assembled fresh, in this order (assessment §2.6; loop notes
    the parent's full transcript.
 5. **Running transcript** — prior turns as managed by §3.6 compaction.
 
-The scoped tool catalogue (granted MCP tools + agent self-tools) is passed in
+The scoped tool catalogue (granted MCP tools + agentd self-tools) is passed in
 the provider's native `tools` field (RFC 0006), **not** stuffed into system
 text, when the gateway supports tool-calling. When it does not, the catalogue
 is rendered into the system text and the JSON-action fallback parser (§3.3) is
-used. agent ships no tools of its own beyond the self-MCP surface (RFC 0005);
+used. agentd ships no tools of its own beyond the self-MCP surface (RFC 0005);
 tool-description quality is the MCP server author's responsibility — agent
 passes them through faithfully and token-efficiently, and treats every byte of
 server-provided metadata as untrusted (RFC 0012).
@@ -204,7 +204,7 @@ fn handle_tool_call(st: &mut LoopState, mcp: &McpRegistry, call: &ToolCall)
             "you have called `{}` with these arguments {} times with no progress; \
              try a different approach or finish", call.name, *n));
     }
-    // 3. route + call (MCP server or agent self-MCP), with transport retry (§3.5)
+    // 3. route + call (MCP server or agentd self-MCP), with transport retry (§3.5)
     match mcp.call(&call.name, &call.arguments) {
         Ok(result) => {
             // isError:true is a SUCCESSFUL result carrying a domain error → observation
@@ -320,7 +320,7 @@ re-entry/backoff concern (RFC 0008), not this inner detector.
 ### 3.5 VERIFY phase — grounded, never self-judgment
 
 The canonical harness loop is **gather context → act → verify → repeat**, and
-verify is a *named* stage, not implicit. agent implements it as discipline,
+verify is a *named* stage, not implicit. agentd implements it as discipline,
 not as a second model call:
 
 1. **The act phase already produces the ground truth.** Tool results, MCP
@@ -339,11 +339,11 @@ not as a second model call:
      verify against the environment before finishing"*) and the loop continues,
      consuming a step.
    - If no machine-checkable contract was declared, the final is accepted as
-     `completed`; agent does not invent semantic judgment.
+     `completed`; agentd does not invent semantic judgment.
    - A final that explicitly declines the task (the model concludes it *cannot*
      be done) terminates as **`refused`**, not `completed`. This is the
      semantic-refusal status the one-shot exit-code mapping sends to exit 5
-     (RFC 0011 §5.2); it is the model's own verdict, never agent judging.
+     (RFC 0011 §5.2); it is the model's own verdict, never agentd judging.
 3. **No LLM-as-judge in core.** Self-critique without external ground truth
    reinforces blind spots (the Reflexion lesson). If a deployment wants a
    critic, it spawns a subagent with a clean context (RFC 0009) or runs an
@@ -458,8 +458,8 @@ struct ResourceCatalogue { entries: Vec<CatalogueEntry>, byte_budget: usize }
 
 For a **reactive** turn (RFC 0008), the event delivered to the loop carries the
 *changed URI* (+ etag/version when the server provides one), not the new body.
-The agent `resource.read`s the current value if the change is relevant —
-re-reading **current state** on the agent's terms, never auto-inlining a diff,
+The agentd `resource.read`s the current value if the change is relevant —
+re-reading **current state** on the agentd's terms, never auto-inlining a diff,
 which is also what makes redelivery idempotent (RFC 0008's
 re-read-current-state contract).
 
@@ -471,7 +471,7 @@ Apply levers in this order:
 1. **Lever 1 — clear stale tool results (cheapest, safest).** Keep the **last
    M verbatim** (default M = 5), replace older tool-result bodies with a tiny
    stub: `[tool result for read_file(x) elided; re-read if needed]`. Lossless
-   in practice because the agent can re-fetch. Reclaims most bloat in
+   in practice because the agentd can re-fetch. Reclaims most bloat in
    tool-heavy loops.
 2. **Lever 2 — compaction at ~75% of the window (one model call).** When the
    §3.7 forward estimate crosses the high-water mark (default 0.75 of the
@@ -566,7 +566,7 @@ result contract are the same lever viewed from two angles. `distill_result`
   extension (assessment §2.8, RFC 0013); v1 warm sessions are in-memory and
   recovered by idempotent re-trigger (RFC 0008).
 - **Semantic verification of arbitrary instructions** is out: VERIFY checks
-  only machine-checkable contract criteria (§3.5). agent does not judge
+  only machine-checkable contract criteria (§3.5). agentd does not judge
   open-ended task quality.
 
 ---

@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn exe() -> &'static str {
-    env!("CARGO_BIN_EXE_agent")
+    env!("CARGO_BIN_EXE_agentd")
 }
 
 fn start_mock_llm(socket: &std::path::Path, script: &str) -> Child {

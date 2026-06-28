@@ -1,56 +1,49 @@
 # Changelog
 
-All notable changes to **`agent`** (the minimal MCP-native agent runtime, developed
-in the `agentd-dev` org). The format is loosely [Keep a Changelog](https://keepachangelog.com);
-versions are the released git tags (`vX.Y.Z`) and the published image
-`ghcr.io/agentd-dev/agent:X.Y.Z`. `contract_version` is `1.0` and surfaces evolve
-additively, but **breaking changes are called out explicitly** below.
+All notable changes to **`agentd`** — the minimal, MCP-native, reactive agent
+runtime (developed in the `agentd-dev` org). The format is loosely
+[Keep a Changelog](https://keepachangelog.com); versions are the released git tags
+(`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## v3.0.0 — rebrand to `agent` (the neutral cutover) · first public release
+## v1.0.0 — first official release
 
-The runtime is renamed from `agentd` to **`agent`** and fully de-branded to the
-neutral Agent Control Contract (ACC) spellings. This is the first public release;
-the pre-public `agentd` 2.x development line (the M1–M7 build, the control-plane
-wave, and ACC v1 conformance) is preserved in git history but its tags/images are
-not published. Still a static, 3-dependency musl binary; `contract_version` stays
-`1.0`; the default image feature set is unchanged
-(`metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch`).
+The first official, public release of **`agentd`**: one static musl binary
+(serde/serde_json + libc only — 3 dependencies, ~1.3 MB, no async runtime, no TLS,
+no C toolchain), built for Kubernetes. It takes an instruction plus tools from MCP
+servers and runs the agentic loop — as a one-shot, a loop, a schedule, or a
+reactive daemon — supervised, bounded, and observable.
 
-### ⚠ Breaking — the neutral cutover
+`agentd` is the **reference implementation of the neutral Agent Control Contract
+(ACC v1)**: it is named `agentd` (the daemon), but it **speaks the neutral
+`agent` contract** so the agentctl control plane drives it without depending on this
+binary. Concretely, the product/binary/image is `agentd`, while the wire/config
+surfaces are neutral:
 
-The agent now **emits** the neutral ACC tokens and no longer emits the branded
-`agentd*` forms (the legacy spellings are still **accepted on input** — graceful
-for any straggler — but never emitted):
+- **Resources:** `agent://` (status, capabilities, inventory, run, subagent,
+  session, events, intelligence, capacity, config/effective); the legacy `agentd://`
+  spelling is still accepted on reads.
+- **Metrics:** the `agent_` Prometheus prefix (`agent_up`, `agent_runs_total`,
+  `agent_saturation`, `agent_pending_events`, …), `metrics_schema` 1.0.
+- **Manifest:** `--capabilities` emits `agent_version` and an honest `surfaces{}`
+  discovery block; `contract_version` 1.0.
+- **Env:** the downward-API + config convention is `AGENT_*` (the branded `AGENTD_*`
+  spellings remain accepted on input); credentials only via `*_TOKEN[_FILE]`.
+- **`_meta`:** `agent/*` idempotency/claim keys.
 
-- **Binary:** `agentd` → **`agent`** (`[[bin]] name`; the Rust crate stays `agentd`
-  internally).
-- **OCI image:** `ghcr.io/agentd-dev/agentd` → **`ghcr.io/agentd-dev/agent`**.
-- **Resource scheme:** emits **`agent://…`** (status / capabilities / inventory /
-  run / subagent / session / events / intelligence / capacity / config-effective);
-  `agentd://…` still parses on reads.
-- **Metric prefix:** **`agent_`** (e.g. `agent_up`, `agent_runs_total`,
-  `agent_saturation`, `agent_pending_events`); the `agentd_` series are gone.
-- **Manifest version key:** emits **`agent_version`** only; the legacy
-  `agentd_version` key is dropped (the manifest root `anyOf` is satisfied by
-  `agent_version`).
-- **Env convention:** documented as **`AGENT_*`** (downward-API identity, per-endpoint
-  tokens); the branded `AGENTD_*` spellings remain accepted on input. The internal
-  re-exec marker is `AGENT_SUBAGENT`.
-- **`_meta` namespace:** stamps **`agent/*`** (`agent/run_id`, `agent/claim_key`,
-  `agent/instance`, `agent/shard`).
-- **CLI / logs:** the version banner, `--help`, and error prefixes say `agent`.
+### Highlights
 
-agentctl drives the contract, not the binary name, so the rename is transparent
-there; only the deployed **image reference** changes. The golden `--capabilities`
-fixtures were re-captured from the `agent 3.0.0` binary (neutral tokens) and the
-contract-client fixture tests move in lockstep.
-
-### Carried in from the pre-public line (now first-published here)
-
-- **Agent Control Contract (ACC) v1 conformance** — every surface validates against
-  its schema; `CONFORMANCE.md` records the per-surface results and the live
-  validation. `--budget-exit-code` remaps only the policy budget codes (3/7);
-  de-branding input tolerance; uniform `-32601` operator-surface gating.
-- The full M1–M7 MCP-native runtime, the control-plane wave (intelligence
-  resilience, horizontal scaling, hot reload, A2A, pause/resume), and the audit
-  hardening. See git history for the development narrative.
+- **MCP-native runtime** (RFCs 0001–0009): supervisor + re-exec'd subagents, the
+  ReAct loop with a closed terminal-status set, the MCP client/server subset, the
+  self-MCP control surface, and the fork-bomb-safe subagent process model.
+- **Cloud-native contract** (RFCs 0010–0016): the frozen exit-code table
+  (clean drain = 0, not 143), the run-outcome report, the metrics schema, the
+  `agent://events` stream, liveness/readiness probes, and `--budget-exit-code`.
+- **Control plane** (RFCs 0014–0020): the operator management surface (drain /
+  lame-duck / pause / resume / cancel, Management-gated → `-32601`), intelligence
+  resilience + hot-swap, horizontal scaling (sharding + work-claim leases +
+  standby), SIGHUP/inotify hot reload, and A2A interop over vsock.
+- **Security:** the lethal-trifecta (Rule-of-Two) gate as the single `validate()`
+  authority, an exec operator allowlist, and structural secret-freedom (no
+  credential reaches the manifest, the config file, or the identity path).
+- **ACC v1 conformance:** every contract surface validates against its schema and
+  behaves as specified — see `CONFORMANCE.md`.

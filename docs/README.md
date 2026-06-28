@@ -1,10 +1,10 @@
-# agent documentation
+# agentd documentation
 
-`agent` is a small, dependency-light Rust binary that runs **one agent**: you
+`agentd` is a small, dependency-light Rust binary that runs **one agent**: you
 give it an instruction and a single LLM endpoint (the *intelligence*), and it
 runs an agentic loop — think, call a tool, observe, repeat — until the job
 reaches a terminal status or a new event wakes it. Every tool it can call comes
-from an **MCP server** (agent ships none of its own, save a gated `exec`), and
+from an **MCP server** (agentd ships none of its own, save a gated `exec`), and
 it reacts to the world through **MCP resource subscriptions**. A tiny supervisor
 owns lifecycle, triggers, limits, and the process tree; the reasoning lives in
 isolated subagent child processes it can always kill.
@@ -28,7 +28,7 @@ status and the M1–M3 milestones.
 | [getting-started.md](getting-started.md) | Checkout to a first end-to-end run; the 60-second mental model; the same instruction in `once` / `loop` / `reactive` modes. |
 | [configuration.md](configuration.md) | Every flag and env var, precedence (`default < config file < env < flag`), validate-at-startup, intelligence URIs, durations, run-id, drain, exit codes. |
 | [architecture.md](architecture.md) | The two-loop split (supervisor vs. agentic loop), components, the process tree, and how the pieces fit. |
-| [mcp.md](mcp.md) | MCP as the universal interface: the client subset (tools/resources/subscribe, notify-then-read), the stdio transport, and agent's own self-MCP server. |
+| [mcp.md](mcp.md) | MCP as the universal interface: the client subset (tools/resources/subscribe, notify-then-read), the stdio transport, and agentd's own self-MCP server. |
 | [intelligence.md](intelligence.md) | The single LLM endpoint — transports (`unix`/`https`/`vsock`), the OpenAI-compatible wire, native tool-calling, and credential handling. |
 | [modes-and-triggers.md](modes-and-triggers.md) | The four modes as exit predicates; reactive routing (exactly-one-owner, spawn-vs-continue, debounce/coalesce), self-subscribe, and internal schedule/cron. |
 | [subagents.md](subagents.md) | The same-binary re-exec subagent model, the rich spawn payload + output contract, narrowed seeds, the spawn chokepoint, and depth/breadth/rate caps. |

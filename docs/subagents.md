@@ -1,6 +1,6 @@
 # Subagents & the supervised process tree
 
-agent is built from two kinds of process that never blur together:
+agentd is built from two kinds of process that never blur together:
 
 - a **supervisor** — the long-lived root. It owns config, triggers, the MCP
   client connections, the process table, and every lifecycle decision. It does
@@ -53,7 +53,7 @@ fn dispatch_mode() -> Mode {
 }
 ```
 
-When you run `agent`, you start a **supervisor**. It re-execs itself
+When you run `agentd`, you start a **supervisor**. It re-execs itself
 (`/proc/self/exe`) to create each subagent — never a bare instruction on the
 command line (argv is world-readable via `ps`/`/proc`, and instructions/seeds
 may carry untrusted or secrets-adjacent content). The spawn payload travels as
@@ -64,7 +64,7 @@ root subagent, blocks on its result, maps its terminal status to an exit code,
 and exits.
 
 ```console
-$ agent \
+$ agentd \
     --instruction "summarize the open PRs and post a digest" \
     --intelligence unix:/run/intel.sock \
     --mcp github=mcp-server-github \
@@ -441,7 +441,7 @@ domain:
 - **`PR_SET_CHILD_SUBREAPER`** — the supervisor sets this at startup, so a
   grandchild orphaned by a dying subagent reparents to the supervisor, not to
   host PID 1. (If the supervisor is itself PID 1 — the recommended container
-  entrypoint — this is moot; agent is a tini-class init for its own tree and
+  entrypoint — this is moot; agentd is a tini-class init for its own tree and
   needs no external `tini`.)
 - **`PR_SET_PDEATHSIG = SIGKILL`** in every child's early `main` (§2). If the
   supervisor dies, the kernel collapses the tree from the leaves up
@@ -517,7 +517,7 @@ the **single tree-root counter**:
 Per-process `RLIMIT_AS` / `RLIMIT_CPU` (set in `pre_exec`) cap a single runaway
 cheaply. **Honest caveat:** `setrlimit` is per-process; it does **not** bound
 *aggregate subtree memory*. Only the **token** ceiling is enforced in-binary.
-Aggregate memory is a cgroups-v2 / deployment concern (agent is cgroup-*aware*,
+Aggregate memory is a cgroups-v2 / deployment concern (agentd is cgroup-*aware*,
 not cgroup-*requiring*) — size your pod's `resources.limits` for the whole tree,
 not per child.
 
@@ -541,7 +541,7 @@ for sub in declared_subscriptions {
 
 This read-after-subscribe converts edge-triggering into level-triggering across
 the restart boundary: any change that happened while the supervisor was down is
-recovered, because the agent acts on *current state*, not a missed delta. Warm
+recovered, because the agentd acts on *current state*, not a missed delta. Warm
 sessions and dynamic self-subscriptions are **lost** in v1 — recovered by
 idempotent re-trigger (`--run-id` / `AGENT_RUN_ID`), not by resurrection.
 Durable warm-session checkpointing is deferred to v2 (RFC 0013).

@@ -1,6 +1,6 @@
 # Configuration reference
 
-`agent` is configured from the **environment, the command line, and an optional
+`agentd` is configured from the **environment, the command line, and an optional
 local config file** — no network config, ever (RFC 0011 §1). The whole
 configuration is assembled and **validated before any side effect**: a bad flag,
 a missing endpoint, or an unresolvable secret reference exits `2` in
@@ -47,7 +47,7 @@ Example — a flag beats the environment:
 
 ```console
 $ INSTRUCTION='from-env' AGENT_INTELLIGENCE=unix:/run/intel.sock \
-    agent --instruction 'from-flag'
+    agentd --instruction 'from-flag'
 # effective instruction: "from-flag"   (flag wins)
 # effective intelligence: unix:/run/intel.sock  (env, no flag given)
 ```
@@ -66,7 +66,7 @@ with a literal value is rejected at validation (§12).
 `Config::validate()` runs **after** all layers merge and **before** the first
 side effect — no MCP connect, no LLM call, no subagent spawn, no socket bind. It
 is pure-CPU and sub-millisecond. On the first failure it prints
-`agent: <reason>` to stderr and exits **`2`** (`EXIT_USAGE`, a non-retriable
+`agentd: <reason>` to stderr and exits **`2`** (`EXIT_USAGE`, a non-retriable
 config error for a `podFailurePolicy`; RFC 0011 §5).
 
 Validations enforced at startup (each is also collected by `--validate-config`,
@@ -107,8 +107,8 @@ diagnostic). An unrecognized argument is a usage error: `unknown argument:
 <arg>` → exit `2`.
 
 ```console
-$ agent --instruction 'x' --intelligence ftp://nope
-agent: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://nope)
+$ agentd --instruction 'x' --intelligence ftp://nope
+agentd: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://nope)
 $ echo $?
 2
 ```
@@ -231,7 +231,7 @@ is no flag for it (§9, §11).
 
 `--intelligence` is an **ordered, comma-separated endpoint list** (RFC 0018 §3.1).
 A single element is the common case (and exactly the old single-endpoint
-behaviour); multiple elements give sticky-primary **failover** — agent prefers
+behaviour); multiple elements give sticky-primary **failover** — agentd prefers
 the first healthy endpoint and falls back on a circuit-breaker trip. Each element
 is selected by URI scheme (RFC 0006):
 
@@ -257,14 +257,14 @@ token is legal (a public/unauthenticated gateway). A named-but-unreadable token
 
 ```console
 # Single endpoint
-$ agent --instruction 'summarize the queue' \
+$ agentd --instruction 'summarize the queue' \
     --intelligence https://api.example.com/v1 \
     --intelligence-token "$LLM_KEY" --model my-model
 
 # Two endpoints with per-endpoint creds (primary + fallback)
 $ AGENT_INTELLIGENCE_TOKEN="$PRIMARY_KEY" \
   AGENT_INTELLIGENCE_TOKEN_2_FILE=/var/run/secrets/fallback-token \
-  agent --instruction 'summarize the queue' \
+  agentd --instruction 'summarize the queue' \
     --intelligence 'https://primary.internal/v1,https://fallback.internal/v1' \
     --model my-model
 ```
@@ -276,7 +276,7 @@ The endpoint **list** and the `model`/`model-swap` knobs are file-settable and
 
 ## 5. Declaring MCP servers — `--mcp name=command`
 
-All tools come from MCP servers; agent ships none of its own (except the gated
+All tools come from MCP servers; agentd ships none of its own (except the gated
 `exec`). Declare each server with `--mcp`, repeatable:
 
 ```
@@ -290,7 +290,7 @@ declare it in the config file's `mcp_servers[].argv` array, which carries argv
 verbatim (§12), or use a wrapper script.
 
 ```console
-$ agent --instruction 'tidy /data' \
+$ agentd --instruction 'tidy /data' \
     --intelligence unix:/run/intel.sock \
     --mcp fs='mcp-server-fs --root /data' \
     --mcp git='mcp-server-git --repo /data/proj'
@@ -330,14 +330,14 @@ assignment-driven member of a claim-pull pool — see §13. Both `--continue` an
 
 ```console
 # reactive: requires at least one subscription (stdio-only in v1)
-$ agent --instruction 'reconcile on change' \
+$ agentd --instruction 'reconcile on change' \
     --intelligence unix:/run/intel.sock \
     --mode reactive \
     --subscribe 'file:///data/desired.json' \
     --subscribe 'file:///data/observed.json'
 
 # schedule: requires an interval
-$ agent --instruction 'emit hourly digest' \
+$ agentd --instruction 'emit hourly digest' \
     --intelligence unix:/run/intel.sock \
     --mode schedule --interval 1h
 ```
@@ -376,7 +376,7 @@ an unknown unit is a usage error (exit `2`), e.g. `unknown duration unit 'd' in
 outbound MCP `tools/call` `_meta` so backing services can dedupe retries
 (RFC 0011 §6).
 
-- **Default** — when unset, agent mints a per-process id (`time+pid`). It
+- **Default** — when unset, agentd mints a per-process id (`time+pid`). It
   correlates logs/traces across the subagent tree but does **not** dedupe
   retries (each retry gets a fresh id).
 - **For retry-dedupe** — the operator sets a **stable** key per logical unit of
@@ -384,13 +384,13 @@ outbound MCP `tools/call` `_meta` so backing services can dedupe retries
   `run_id` across retries.
 
 ```console
-$ agent --instruction 'enqueue digest' \
+$ agentd --instruction 'enqueue digest' \
     --intelligence unix:/run/intel.sock \
     --mcp queue='mcp-server-queue --addr /run/q.sock' \
     --run-id "$JOB_NAME"
 ```
 
-agent introduces **no local non-idempotent side effects** — it has no built-in
+agentd introduces **no local non-idempotent side effects** — it has no built-in
 durable tools, so all durable output is externalized through MCP, where the key
 acts (RFC 0011 §6.4).
 
@@ -405,7 +405,7 @@ acts (RFC 0011 §6.4).
 lands.
 
 ```console
-$ agent --instruction 'serve reactions' \
+$ agentd --instruction 'serve reactions' \
     --intelligence unix:/run/intel.sock \
     --mode reactive --subscribe 'file:///data/in.json' \
     --drain-timeout 20s
@@ -425,7 +425,7 @@ routing, `continue` topology) never reload (§11).
 
 ## 10. Observability of config
 
-On startup agent validates and emits structured
+On startup agentd validates and emits structured
 JSON-lines telemetry on stderr; the credential is always redacted. Example
 shapes:
 
@@ -534,7 +534,7 @@ The intelligence **credential** itself is *not* a file field — use
 vars (§4).
 
 ```jsonc
-// /etc/agent/config.json — structural config; secrets stay in env / mounted files
+// /etc/agentd/config.json — structural config; secrets stay in env / mounted files
 {
   "config_version": "1.0",
   "intelligence": "https://primary.internal/v1,https://fallback.internal/v1",
@@ -553,9 +553,9 @@ vars (§4).
 ```
 
 ```console
-$ agent --config /etc/agent/config.json \
+$ agentd --config /etc/agentd/config.json \
     --mode reactive \
-    --instruction-file /etc/agent/task.txt   # instruction + secrets via env/flag
+    --instruction-file /etc/agentd/task.txt   # instruction + secrets via env/flag
 ```
 
 For the reloadable-vs-restart-only partition of these fields, see §11.
@@ -564,7 +564,7 @@ For the reloadable-vs-restart-only partition of these fields, see §11.
 
 ## 13. Horizontal scaling — sharding, work-claim, standby (`--features cluster`)
 
-Three `cluster`-gated surfaces let a fleet of identical agent replicas process a
+Three `cluster`-gated surfaces let a fleet of identical agentd replicas process a
 shared workload without duplicating it (RFC 0019). All are **restart-only** (§11).
 Set without the `cluster` feature, each exits `2` rather than silently doing
 nothing.
@@ -599,7 +599,7 @@ pool reuses the existing claim machinery. Reactive-mode only; the named server
 must be a declared `--mcp` server.
 
 > **`AGENT_WARM_INTEL` is forward-compat only.** It defaults to `true` under
-> `--standby` (else `false`) and is accepted, stored, and reported — but agent's
+> `--standby` (else `false`) and is accepted, stored, and reported — but agentd's
 > supervisor runs no LLM loop (each reaction re-execs and connects its own
 > intelligence), so there is **no warm-child pool** to keep warm in v1. The flag
 > exists so a future warm-child-pool build honours operator intent without a
@@ -607,15 +607,15 @@ must be a declared `--mcp` server.
 
 ```console
 # A sharded reactive fleet of N replicas (the ordinal → AGENT_SHARD, §deployment.md)
-$ AGENT_SHARD=2/8 agent --mode reactive \
+$ AGENT_SHARD=2/8 agentd --mode reactive \
     --intelligence unix:/run/intel.sock \
-    --instruction-file /etc/agent/task.txt \
+    --instruction-file /etc/agentd/task.txt \
     --subscribe 'tickets://queue/inbound'
 
 # A work-claim worker leasing each item against a coordination server
-$ agent --mode reactive \
+$ agentd --mode reactive \
     --intelligence unix:/run/intel.sock \
-    --instruction-file /etc/agent/task.txt \
+    --instruction-file /etc/agentd/task.txt \
     --mcp coord='mcp-server-coord --addr /run/coord.sock' \
     --claim 'tickets://queue/inbound=coord' \
     --claim-ttl 45s
@@ -626,8 +626,8 @@ $ agent --mode reactive \
 ## 14. A complete example
 
 ```console
-$ agent \
-    --instruction-file /etc/agent/task.txt \
+$ agentd \
+    --instruction-file /etc/agentd/task.txt \
     --intelligence https://llm.internal/v1 \
     --intelligence-token "$LLM_KEY" \
     --model my-model \
@@ -646,7 +646,7 @@ Equivalent settings via environment (for the env-backed keys), with flags only
 where there is no env equivalent:
 
 ```console
-$ export INSTRUCTION="$(cat /etc/agent/task.txt)"
+$ export INSTRUCTION="$(cat /etc/agentd/task.txt)"
 $ export AGENT_INTELLIGENCE=https://llm.internal/v1
 $ export AGENT_INTELLIGENCE_TOKEN="$LLM_KEY"
 $ export AGENT_MODEL=my-model
@@ -657,7 +657,7 @@ $ export AGENT_DEADLINE=5m
 $ export AGENT_RUN_ID="$JOB_NAME"
 $ export AGENT_DRAIN_TIMEOUT=20s
 $ export AGENT_LOG_LEVEL=info
-$ agent \
+$ agentd \
     --mcp fs='mcp-server-fs --root /data' \
     --mcp queue='mcp-server-queue --addr /run/q.sock' \
     --max-depth 3 \

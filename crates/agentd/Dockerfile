@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p agentd \
         --all-features \
         --locked \
- && cp target/release/agent /usr/local/bin/agent
+ && cp target/release/agentd /usr/local/bin/agentd
 
 # Runtime: distroless/cc:nonroot — ~25 MB, no shell, uid:gid=65532:65532.
 FROM gcr.io/distroless/cc-debian12:nonroot
@@ -43,7 +43,7 @@ LABEL org.opencontainers.image.title="agent" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="agentd.dev"
 
-COPY --from=builder /usr/local/bin/agent /usr/local/bin/agent
+COPY --from=builder /usr/local/bin/agentd /usr/local/bin/agentd
 
 # /healthz + /metrics expose on whatever `--bind` is; 8080 matches
 # the runtime default when no override is passed.
@@ -53,4 +53,4 @@ USER nonroot:nonroot
 
 # No default CMD — callers supply `--config` / `--bind` / etc., or
 # the image ships with `AGENT_EMBED_CONFIG` baked at build time.
-ENTRYPOINT ["/usr/local/bin/agent"]
+ENTRYPOINT ["/usr/local/bin/agentd"]

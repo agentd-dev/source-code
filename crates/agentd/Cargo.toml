@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "3.0.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Minimal, MCP-native, reactive agent runtime (rfcs/0001-mcp-native-agent-runtime.md)"
@@ -13,7 +13,7 @@ name = "agentd"
 path = "src/lib.rs"
 
 [[bin]]
-name = "agent"
+name = "agentd"
 path = "src/main.rs"
 
 # Capability surface is compile-time. The default build is the minimalism

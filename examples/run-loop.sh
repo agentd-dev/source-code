@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-AGENTD="${AGENTD:-agent}"
+AGENTD="${AGENTD:-agentd}"
 
 export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-unix:/run/intel.sock}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here

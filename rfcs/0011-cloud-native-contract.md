@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-`agent` is a single binary that an external scheduler (K8s `Job`/`CronJob`/`Deployment`, Knative, a Nomad task, a bare-metal supervisor) *starts, stops, replicates, and watches*. The orchestrator itself is out of scope (assessment §2.11: "composition is MCP, not a control plane we own"). What is in scope — and what this RFC nails down — is the **contract `agent` honours so an orchestrator can drive it correctly**: how config is sourced and validated, how it behaves on signals, what its exit codes *mean* to a `podFailurePolicy`, and how a retried run avoids duplicating side effects.
+`agentd` is a single binary that an external scheduler (K8s `Job`/`CronJob`/`Deployment`, Knative, a Nomad task, a bare-metal supervisor) *starts, stops, replicates, and watches*. The orchestrator itself is out of scope (assessment §2.11: "composition is MCP, not a control plane we own"). What is in scope — and what this RFC nails down — is the **contract `agentd` honours so an orchestrator can drive it correctly**: how config is sourced and validated, how it behaves on signals, what its exit codes *mean* to a `podFailurePolicy`, and how a retried run avoids duplicating side effects.
 
 This RFC covers assessment §2.10 in implementation depth. The central tension it resolves (per `notes-review-cloud-native-unit.md` §0) is the apparent opposition between two identities:
 
@@ -30,7 +30,7 @@ This RFC owns: the config-precedence rule and validate-at-startup discipline; th
 
 3. **The exit-code table (§5) is a public, machine-actionable API** for `podFailurePolicy`. A clean SIGTERM drain returns **0, not 143.** One-shot maps the root subagent's terminal status to a code. loop/reactive daemons exit only `0`, `143`, or a fatal class.
 
-4. **Idempotency:** accept `AGENT_RUN_ID`/`--run-id` (default a per-process ULID); propagate it into every MCP tool-call `_meta` so backing services dedupe retries. Encourage read-modify-write-through-MCP and make "already done" cheap → exit `0`. `agent` introduces **no local non-idempotent side effects** — it has no built-in tools, so all durable output is externalized through MCP, and this property falls out structurally.
+4. **Idempotency:** accept `AGENT_RUN_ID`/`--run-id` (default a per-process ULID); propagate it into every MCP tool-call `_meta` so backing services dedupe retries. Encourage read-modify-write-through-MCP and make "already done" cheap → exit `0`. `agentd` introduces **no local non-idempotent side effects** — it has no built-in tools, so all durable output is externalized through MCP, and this property falls out structurally.
 
 These decisions are final for v1. Each defers to the assessment doc where it defers (noted inline).
 
@@ -223,7 +223,7 @@ A second `SIGTERM`/`SIGINT` during drain sets `FORCE`. The reactor, on its next 
 No code runs on `SIGKILL`. Safety therefore comes from design, not cleanup:
 
 - The supervisor holds **no durable state** a SIGKILL can corrupt (assessment §2.8 — stateless supervisor; §4 below). Nothing to flush ⇒ nothing to corrupt.
-- Orphaned subagents are reaped by `PR_SET_PDEATHSIG, SIGKILL` on every child (immediate-parent chaining) plus cgroup `cgroup.kill` for tree-wide teardown where delegated (RFC 0003). agent never hard-requires cgroup write access.
+- Orphaned subagents are reaped by `PR_SET_PDEATHSIG, SIGKILL` on every child (immediate-parent chaining) plus cgroup `cgroup.kill` for tree-wide teardown where delegated (RFC 0003). agentd never hard-requires cgroup write access.
 - Everything a SIGKILL interrupts mid-flight is recovered by an **idempotent retried re-run** (§6), not by cleanup.
 
 ---
@@ -306,7 +306,7 @@ A reactive `Deployment` rolled by the operator must therefore look like a **clea
 
 ## 6. Mechanisms — idempotency
 
-A scheduler retries (`backoffLimit`, exponential backoff, at-least-once). A one-shot run must therefore be **safe to execute more than once.** `agent` cannot *make* an arbitrary instruction idempotent — but it provides the mechanism and introduces no non-idempotency of its own.
+A scheduler retries (`backoffLimit`, exponential backoff, at-least-once). A one-shot run must therefore be **safe to execute more than once.** `agentd` cannot *make* an arbitrary instruction idempotent — but it provides the mechanism and introduces no non-idempotency of its own.
 
 ### 6.1 `RUN_ID` — the idempotency key
 
@@ -339,7 +339,7 @@ let run_id: Ulid = env_or_flag("AGENT_RUN_ID", "--run-id")
 }
 ```
 
-A backing service that supports idempotency keys (a queue with dedupe, an HTTP API honouring `Idempotency-Key`) reads `agent/run_id` from `_meta` and collapses a retried side effect to a single effect. This is the only hook `agent` needs to offer; the dedupe lives in the backing service, by design (assessment §2.11).
+A backing service that supports idempotency keys (a queue with dedupe, an HTTP API honouring `Idempotency-Key`) reads `agent/run_id` from `_meta` and collapses a retried side effect to a single effect. This is the only hook `agentd` needs to offer; the dedupe lives in the backing service, by design (assessment §2.11).
 
 ### 6.3 Read-modify-write through MCP; "already done" is cheap
 
@@ -347,9 +347,9 @@ The default system prompt and docs encourage the level-triggered pattern: the ag
 
 ### 6.4 No local non-idempotent side effects — structural
 
-`agent` itself writes nothing durable locally except logs (stdout = the agent's result; stderr = telemetry — both append-only event streams, harmless to duplicate, 12-factor XI). **All durable output goes through MCP backing services** where the idempotency key can act. This is not a discipline we must police — it falls out structurally from the assessment's "**no built-in tools**" decision (§2.11): the only way `agent` can persist anything is to call an MCP server, which is by construction an external backing service. There is no local file write, no local DB, no hidden side effect path for a retry to duplicate.
+`agentd` itself writes nothing durable locally except logs (stdout = the agent's result; stderr = telemetry — both append-only event streams, harmless to duplicate, 12-factor XI). **All durable output goes through MCP backing services** where the idempotency key can act. This is not a discipline we must police — it falls out structurally from the assessment's "**no built-in tools**" decision (§2.11): the only way `agentd` can persist anything is to call an MCP server, which is by construction an external backing service. There is no local file write, no local DB, no hidden side effect path for a retry to duplicate.
 
-**Honest scope statement.** True idempotency is a property of *the instruction + the MCP tools it uses*, which `agent` does not own. Our contract is exactly three guarantees: (1) provide and propagate a stable idempotency key; (2) introduce no non-idempotent local side effects; (3) make "already done" cheap to detect and exit `0` on. Beyond that, idempotency is the operator's composition responsibility — consistent with "composition is MCP, not a control plane we own" (assessment §2.11).
+**Honest scope statement.** True idempotency is a property of *the instruction + the MCP tools it uses*, which `agentd` does not own. Our contract is exactly three guarantees: (1) provide and propagate a stable idempotency key; (2) introduce no non-idempotent local side effects; (3) make "already done" cheap to detect and exit `0` on. Beyond that, idempotency is the operator's composition responsibility — consistent with "composition is MCP, not a control plane we own" (assessment §2.11).
 
 ---
 
@@ -400,7 +400,7 @@ The two deploy shapes are thus the **same binary, same loop, same config machine
 - **No SIGHUP/reload, no live reconfiguration.** Restart-to-reload in v1 (§4.1). Config is a frozen, validated snapshot for a process's lifetime.
 - **No remote/network config.** All input is env + flags + a local file (§3.1).
 - **No warm-session checkpointing in v1.** Restart = rebuild + reconcile (§7); the optional MCP-backed checkpoint is deferred to RFC 0013.
-- **`agent` does not guarantee instruction-level idempotency.** It provides the key, propagates it, and adds no local non-idempotency (§6.4); end-to-end idempotency is the operator's MCP composition.
+- **`agentd` does not guarantee instruction-level idempotency.** It provides the key, propagates it, and adds no local non-idempotency (§6.4); end-to-end idempotency is the operator's MCP composition.
 - **cgroup write access is never required** (degrade to rlimit + PDEATHSIG; mechanics in RFC 0003).
 - **The health surface, log schema, and trace propagation** are RFC 0010, referenced not re-specified.
 
@@ -409,4 +409,4 @@ The two deploy shapes are thus the **same binary, same loop, same config machine
 ## 10. Open items
 
 - **Downward-API grace hint key.** §3.3 assumes the operator injects `terminationGracePeriodSeconds` as `AGENT_POD_GRACE_SECONDS` (or `--pod-grace`) so the drain-vs-grace check can be a hard error rather than a warning. The exact env-var name is a documentation convention to settle in M5; if unset we fall back to the `>= 30s` warning. This is a naming convention, not a design gap.
-- **`agent/run_id` `_meta` key namespace.** §6.2 uses `agent/run_id`; whether to additionally mirror it as a conventional `Idempotency-Key` for HTTP-bridging MCP servers (so they need no agent-specific awareness) is a small documented convention to confirm with the first backing-service integration. Does not block M5.
+- **`agent/run_id` `_meta` key namespace.** §6.2 uses `agent/run_id`; whether to additionally mirror it as a conventional `Idempotency-Key` for HTTP-bridging MCP servers (so they need no agentd-specific awareness) is a small documented convention to confirm with the first backing-service integration. Does not block M5.

@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-agent is a process tree, not a thread pool, and it is reactive — it spends
+agentd is a process tree, not a thread pool, and it is reactive — it spends
 most of its life asleep. Three architectural facts dominate the observability
 design and break the usual web-service assumptions:
 
@@ -295,7 +295,7 @@ JSON/header fields and is therefore free; only span *export* is heavy and gated.
 
 **Ingest (mint-or-adopt):**
 
-- If an inbound `traceparent` arrives — on an inbound MCP request to agent's
+- If an inbound `traceparent` arrives — on an inbound MCP request to agentd's
   self-MCP server (RFC 0005), or via the **`AGENT_TRACEPARENT`** env var when an
   orchestrator starts the pod — adopt its `trace_id` and use its `span_id` as the
   root `parent_span_id`.
@@ -311,7 +311,7 @@ bad trace header).
 
 - **MCP calls:** set `_meta.traceparent` (+ `tracestate`/`baggage` when present)
   on every outbound `tools/call` and `resources/*` (RFC 0004). Two fields in a
-  frame we already build → downstream MCP servers' spans line up even if agent
+  frame we already build → downstream MCP servers' spans line up even if agentd
   only logs.
 - **LLM call:** set the standard `traceparent` HTTP header on the intelligence
   request (RFC 0006).
@@ -445,21 +445,21 @@ Required metric `gen_ai.client.operation.duration`; recommended
 spawn/limit/stuck spans are agent-namespaced custom spans nested under the
 GenAI ones.
 
-**Instrument the client side; do not double-instrument.** agent is an MCP
+**Instrument the client side; do not double-instrument.** agentd is an MCP
 *client*; the server on the other side may also emit `execute_tool`/MCP spans.
-agent instruments the **client side** of the tool call ("I called this tool and
+agentd instruments the **client side** of the tool call ("I called this tool and
 waited") and *propagates* context (§3.6) so the server's spans nest underneath —
 the SEP-414 single-span-tree model. No duplicate spans.
 
 **Export mechanics:** OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`, pushed to a
-**local collector / sidecar** so agent stays thin and needs no batching/retry
+**local collector / sidecar** so agentd stays thin and needs no batching/retry
 sophistication (mirrors the terminate-complexity-at-the-sidecar pattern). Using
 `tracing` + `tracing-opentelemetry` *inside this gate* is acceptable precisely
 because it is opt-in and invisible to the default build.
 
 **Token-accounting honesty (open item alignment):** tokens come from the
 intelligence response `usage` (RFC 0006). A normalising gateway may reshape it;
-agent reads from the normalised response and logs `0`/`null` (never a guess)
+agentd reads from the normalised response and logs `0`/`null` (never a guess)
 when absent, to keep `tokens_total` trustworthy.
 
 ---
@@ -509,7 +509,7 @@ when absent, to keep `tokens_total` trustworthy.
   metrics ride `otel`.
 - **No span export in the default build.** Propagation is on; export is gated.
 - **No MCP `logging` capability.** The MCP 2026-07-28 RC deprecates it in favor
-  of stderr + OpenTelemetry; agent does not implement or advertise it.
+  of stderr + OpenTelemetry; agentd does not implement or advertise it.
 - **No log file management / rotation / shipping in-binary.** stderr only; the
   container runtime / collector owns capture and rotation.
 - **No second scheduling/aggregation subsystem.** Mode B reuses the existing

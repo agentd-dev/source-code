@@ -3,7 +3,7 @@
 **Status:** Accepted (v2 surface, deferred)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 > **Forward note (control-plane track).** Two items here are dependencies of the
 > agentctl control-plane track (RFC 0014): **Streamable HTTP serving** is the
@@ -13,11 +13,11 @@
 > does **not** pull either forward; it references them as the named v2 path.
 
 > **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) reframes **D7b — self-MCP-
-> over-HTTP serving** from *deferred for agent* to **out of scope for agent**.
+> over-HTTP serving** from *deferred for agentd* to **out of scope for agentd**.
 > Serving A2A and the management surface over vsock behind an on-node HTTP↔vsock
 > gateway (RFC 0020 §2–§3; the gateway is the agentctl node-agent, RFC 0014) puts
-> HTTP termination in the gateway — so agent **may never need an HTTP server at
-> all**. D7b's v2 server work is thus the gateway's concern, not a deferred agent
+> HTTP termination in the gateway — so agentd **may never need an HTTP server at
+> all**. D7b's v2 server work is thus the gateway's concern, not a deferred agentd
 > surface; see RFC 0020 §8. (D7a inbound HTTP-client reactivity is untouched.)
 
 ---
@@ -150,10 +150,10 @@ never leak the internal supervision wire outward as `tasks`.
 **WHAT.** Sampling is a **reverse** MCP call: the *server* asks the *client*
 to run an LLM generation (`sampling/createMessage`, notes §5). Critically,
 **sampling is a CLIENT capability** — server→client direction. "A peer uses
-agent's intelligence" therefore means agent would have to act as a
+agentd's intelligence" therefore means agentd would have to act as a
 *sampling-capable client* that services inbound `sampling/createMessage`
 requests by calling its own intelligence endpoint and returning the
-completion. agent **cannot serve sampling as an MCP server** — that is the
+completion. agentd **cannot serve sampling as an MCP server** — that is the
 wrong directionality (assessment §1.3.5).
 
 Wire shape (notes §5.1–§5.2): `params.{messages[], modelPreferences{hints[],
@@ -165,7 +165,7 @@ client declaring `sampling.tools`.
 
 **WHY deferred — both directions.**
 
-- *As client (servicing inbound sampling):* extra surface — agent's agentic
+- *As client (servicing inbound sampling):* extra surface — agentd's agentic
   loop already owns the LLM directly (RFC 0006/0007); servicing
   server-initiated sampling adds a second, externally-triggered path into the
   intelligence endpoint with its own budget/credential/injection concerns.
@@ -183,7 +183,7 @@ not our case). The agentic loop calls the intelligence endpoint itself; no MCP
 peer borrows it.
 
 **v2 entry point.** `mcp/client.rs` inbound dispatch + a new servicing path
-into `intel/client.rs`. `modelPreferences.hints`/priorities map onto agent's
+into `intel/client.rs`. `modelPreferences.hints`/priorities map onto agentd's
 `--model`/gateway routing (notes §5.3). v2 must add per-peer budget accounting
 and treat sampled prompts as untrusted (RFC 0012 trust budget).
 
@@ -194,7 +194,7 @@ and treat sampled prompts as untrusted (RFC 0012 trust budget).
 filesystem boundaries; notifies `notifications/roots/list_changed` on change
 (notes §6). Not-supported ⇒ `-32601`.
 
-**WHY deferred.** A filesystem-scope *signal* to servers; agent is headless
+**WHY deferred.** A filesystem-scope *signal* to servers; agentd is headless
 and does not need to negotiate filesystem boundaries with the servers it
 drives. Marginal value, real surface.
 
@@ -219,11 +219,11 @@ the client renders/answers. Declared as `elicitation:{form:{}, url:{}}`
 in a headless agent. A server's elicitation request has no one to answer it.
 
 **v1 FALLBACK** (assessment §2.5; notes §10.3). Declare no `elicitation`.
-agent never offers an interactive turn. If a server depends on elicitation,
+agentd never offers an interactive turn. If a server depends on elicitation,
 that tool is simply unusable in this deployment — surfaced as a tool-domain
 error/observation to the model (RFC 0007 error taxonomy), not a crash.
 
-**v2 entry point.** Only meaningful if agent ever gains an operator-facing
+**v2 entry point.** Only meaningful if agentd ever gains an operator-facing
 interactive channel; no concrete v2 plan. Listed for completeness of the
 defer record.
 
@@ -234,7 +234,7 @@ and resource-template URIs; gated on the server's `completions` capability
 (notes §1.4).
 
 **WHY deferred.** Autocomplete is an interactive editor/UX feature. Headless
-agent composes full requests; it never needs to autocomplete an argument.
+agentd composes full requests; it never needs to autocomplete an argument.
 
 **v1 FALLBACK** (assessment §2.5; notes §10.3). Never call `completion/*`.
 Ignore the server's `completions` capability. No fallback behaviour is needed
@@ -282,7 +282,7 @@ SSE GET stream** (`GET /mcp`, `Accept: text/event-stream`), parse `event:`/
 §9.2). This is materially more than "a tiny blocking HTTP client" — it is a
 streaming, resumable, reconnecting consumer (assessment §1.3.4, risk #1).
 
-**WHY deferred.** The reactive thesis — agent's edge — is delivered fully
+**WHY deferred.** The reactive thesis — agentd's edge — is delivered fully
 over **stdio resource subscriptions** (assessment §1.3.4: "v1 keeps reactivity
 on stdio only"). An SSE GET client is a large, fiddly addition for a transport
 v1 deployments do not need: the recommended shape connects MCP servers as
@@ -300,7 +300,7 @@ surfaced (notes §10.4 capability gating: "degrade gracefully if a server lacks
 
 #### D7b — Self-MCP-over-HTTP serving (full Streamable HTTP server)
 
-**WHAT.** Serving agent's own self-MCP (RFC 0005) over Streamable HTTP is a
+**WHAT.** Serving agentd's own self-MCP (RFC 0005) over Streamable HTTP is a
 real server: POST + GET on one endpoint, single-`application/json` **and**
 SSE-upgrade responses, `MCP-Session-Id` assignment + echo (400 on missing,
 404 on ended), `MCP-Protocol-Version` header (400 on invalid), `Origin`
@@ -375,7 +375,7 @@ checkpoint is an optimization, never the source of truth).
 
 ### D9 — Emitting `notifications/message` / `notifications/progress` from our server
 
-**WHAT.** As an MCP server, agent could declare `logging` and emit
+**WHAT.** As an MCP server, agentd could declare `logging` and emit
 `notifications/message` (RFC 5424 severities; notes §7) and emit
 `notifications/progress` against inbound `progressToken`s (notes §8.2) to
 stream its internals to a driving client.

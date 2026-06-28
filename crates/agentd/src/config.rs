@@ -1021,7 +1021,7 @@ impl Config {
             match arg.as_str() {
                 "-h" | "--help" => return Err(ConfigError::Help(help_text())),
                 "-V" | "--version" => {
-                    return Err(ConfigError::Version(format!("agent {}\n", crate::VERSION)));
+                    return Err(ConfigError::Version(format!("agentd {}\n", crate::VERSION)));
                 }
                 "--capabilities" => capabilities = true,
                 // Already resolved into the FILE layer above; consume its value
@@ -2317,7 +2317,7 @@ fn apply_config_file(
 }
 
 fn usage(msg: String) -> ConfigError {
-    ConfigError::Usage(format!("agent: {msg}"))
+    ConfigError::Usage(format!("agentd: {msg}"))
 }
 
 fn truthy(v: &str) -> bool {
@@ -2359,10 +2359,10 @@ fn generate_run_id() -> String {
 
 fn help_text() -> String {
     format!(
-        "agent {ver} — a minimal, MCP-native, reactive agent\n\
+        "agentd {ver} — a minimal, MCP-native, reactive agent\n\
          \n\
          USAGE:\n\
-         \x20 agent --instruction <TEXT> --intelligence <URI> [--mcp name=cmd ...] [options]\n\
+         \x20 agentd --instruction <TEXT> --intelligence <URI> [--mcp name=cmd ...] [options]\n\
          \n\
          REQUIRED:\n\
          \x20 --instruction <TEXT>        the task (or INSTRUCTION env)\n\
@@ -2377,7 +2377,7 @@ fn help_text() -> String {
          \n\
          TOOLS / MCP:\n\
          \x20 --mcp name=command          declare an MCP server (repeatable; stdio)\n\
-         \x20 --serve-mcp <TARGET>        serve agent's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
+         \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: unix:/path | vsock:CID:PORT (repeatable; needs --features a2a)\n\
          \x20 --enable-exec <abs-path>    allow the gated exec tool to run this binary (repeatable; or AGENT_ENABLE_EXEC as a ':'-list)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\

@@ -3,13 +3,13 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
 ## 1. Problem / Context
 
-agent's entire action space and reactive surface ride on MCP. Every
+agentd's entire action space and reactive surface ride on MCP. Every
 capability is a tool on some external MCP server; every reactive trigger is a
 `resources/subscribe` + `notifications/resources/updated` round-trip. There are
 no built-in tools. So the MCP **client** half is load-bearing, and it must be
@@ -19,7 +19,7 @@ implemented with the same minimalism bar as the rest of the binary: `std` +
 This RFC specifies (a) the shared JSON-RPC 2.0 **codec** (reader-thread +
 pending-request map + notification dispatch) that both the MCP layer and the
 supervisor↔subagent control channel (RFC 0005) reuse, and (b) the **MCP client
-subset** agent speaks to external servers: lifecycle, tools, resources,
+subset** agentd speaks to external servers: lifecycle, tools, resources,
 subscriptions, liveness, and the stdio transport with its shutdown ladder.
 
 This covers assessment §2.5 (the CLIENT half) and the §1.3 protocol
@@ -381,7 +381,7 @@ All blocks may carry optional `annotations` (`audience`, `priority`,
 
 **THE load-bearing distinction (§1.3 #7):**
 
-| Wire shape | Meaning | agent handling |
+| Wire shape | Meaning | agentd handling |
 |---|---|---|
 | `result.isError == true` | tool-execution error, *successful* JSON-RPC | feed the `content[]` to the model as an **observation**; the model self-corrects; **consumes a step** (RFC 0007) |
 | JSON-RPC `error` (top-level) | protocol/transport fault (unknown tool, bad params, server fault) | a `CallError::Rpc` → **transport/abort policy** (§3.5 error policy below) |
@@ -471,7 +471,7 @@ fn handle_inbound_request(&self, req: Request) {
         "roots/list"            => self.reply_result(req.id, json!({"roots":[]})), // empty list
         "sampling/createMessage"
         | "elicitation/create"  => self.reply_error(req.id, -32601,
-                                       "method not found: agent declares no client capabilities"),
+                                       "method not found: agentd declares no client capabilities"),
         _                       => self.reply_error(req.id, -32601, "method not found"),
     }
 }
@@ -480,7 +480,7 @@ fn handle_inbound_request(&self, req: Request) {
 `ping` is answered promptly with `{}` regardless of state — it is our and the
 server's liveness probe (§3.9). `roots/list` gets `{"roots":[]}` (cheaper than
 arguing; we simply expose no filesystem scope). `sampling/createMessage` is
-**rejected** with `-32601` — agent does not act as a sampling-capable client
+**rejected** with `-32601` — agentd does not act as a sampling-capable client
 in v1 (the intelligence-sharing direction is deferred to RFC 0013, v2). Every
 other unsolicited method → `-32601`.
 
@@ -627,7 +627,7 @@ sequence and §2.5):**
 
 `SIGKILL`/`SIGTERM` use the exact syscalls (`libc::kill(pid, SIGTERM)` /
 `SIGKILL`); the MCP server is a single child (not its own process group from
-agent's view), so we signal the pid directly here. Subagent process-group kill
+agentd's view), so we signal the pid directly here. Subagent process-group kill
 (`killpg`) is a different concern (RFC 0003/0009). The whole MCP-server drain is
 bounded and counts inside `AGENT_DRAIN_TIMEOUT` (RFC 0011). The reader thread's
 `McpEof` confirms exit. A server MAY self-initiate shutdown by closing its

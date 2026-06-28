@@ -1,6 +1,6 @@
-# agent examples
+# agentd examples
 
-Runnable samples for the three operational shapes of **agent** — a one-shot
+Runnable samples for the three operational shapes of **agentd** — a one-shot
 run, an event-reactive daemon, and a polling/work-until-done loop — plus the
 instruction files and MCP server config they use.
 
@@ -23,15 +23,15 @@ instruction files and MCP server config they use.
 | `run-reactive.sh` | `--mode reactive`: idle, wake on MCP resource changes, never exit on its own. Deployment shape. |
 | `run-loop.sh` | `--mode loop`: re-enter on a cadence until a bound or a drain signal. Job-with-deadline / Deployment shape. |
 
-All three scripts assume `agent` is on `$PATH` (override with `AGENTD=/path/to/agent`)
+All three scripts assume `agentd` is on `$PATH` (override with `AGENTD=/path/to/agentd`)
 and that an intelligence endpoint is reachable. Build the binary with
-`cargo build --release`; the binary is at `target/release/agent`.
+`cargo build --release`; the binary is at `target/release/agentd`.
 
 ---
 
 ## Prerequisites
 
-agent ships **no tools of its own** (except a gated `exec`, off by default) and
+agentd ships **no tools of its own** (except a gated `exec`, off by default) and
 talks to **one** intelligence endpoint. So every sample needs two things wired:
 
 1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENT_INTELLIGENCE`.
@@ -43,7 +43,7 @@ talks to **one** intelligence endpoint. So every sample needs two things wired:
 
    The wire is OpenAI-compatible `/chat/completions` with native tool-calling
    (RFC 0006). The credential is passed by **env/flag only**, never read from a
-   config file, and is redacted everywhere agent logs:
+   config file, and is redacted everywhere agentd logs:
 
    ```bash
    export AGENT_INTELLIGENCE=unix:/run/intel.sock
@@ -56,7 +56,7 @@ talks to **one** intelligence endpoint. So every sample needs two things wired:
    **trusted config** and is never built from model- or server-controlled
    strings.
 
-A bad config exits `2` in milliseconds, before any LLM round-trip — agent
+A bad config exits `2` in milliseconds, before any LLM round-trip — agentd
 validates everything up front (e.g. `--mode reactive` with no `--subscribe`, or
 an intelligence URI with an unsupported scheme, both fail fast).
 
@@ -124,7 +124,7 @@ export AGENT_INTELLIGENCE_TOKEN=...
 The script runs (abbreviated):
 
 ```bash
-agent \
+agentd \
   --mode once \
   --instruction-file instructions/research.md \
   --model claude-opus-4 \
@@ -158,7 +158,7 @@ export AGENT_INTELLIGENCE_TOKEN=...
 Abbreviated:
 
 ```bash
-agent \
+agentd \
   --mode reactive \
   --instruction-file instructions/triage.md \
   --model claude-opus-4 \
@@ -166,7 +166,7 @@ agent \
   --mcp "tickets=mcp-server-tickets --project OPS" \
   --subscribe "inbox:///items/new" \
   --max-steps 25 --max-tokens 2000000 \
-  --health-file /run/agent/health --drain-timeout 25s
+  --health-file /run/agentd/health --drain-timeout 25s
 ```
 
 `--mode reactive` **requires** at least one `--subscribe <uri>`; without it the
@@ -196,7 +196,7 @@ export AGENT_INTELLIGENCE_TOKEN=...
 Abbreviated:
 
 ```bash
-agent \
+agentd \
   --mode loop \
   --interval 5m \
   --instruction-file instructions/triage.md \
@@ -213,8 +213,8 @@ loop into a bounded run; omit it (and let the orchestrator own lifecycle) for a
 kept-alive Deployment.
 
 > **Scheduling note.** For production cron, the **recommended** path is an
-> external scheduler (e.g. a k8s CronJob) invoking `agent --mode once …` — robust
-> to clock skew and restart. agent also has a `--mode schedule` (per-fire
+> external scheduler (e.g. a k8s CronJob) invoking `agentd --mode once …` — robust
+> to clock skew and restart. agentd also has a `--mode schedule` (per-fire
 > identical to `once`, requires `--interval <dur>` or `--cron <expr>`) for
 > non-orchestrated deployments (RFC 0008).
 
@@ -222,7 +222,7 @@ kept-alive Deployment.
 
 ## What a run logs
 
-agent emits structured JSON lines on stderr (one event per line). The intended
+agentd emits structured JSON lines on stderr (one event per line). The intended
 v1 shape, illustrative:
 
 ```json
@@ -233,13 +233,13 @@ v1 shape, illustrative:
 ```
 
 Credentials never appear in any log line — the `--intelligence-token` value is
-redacted (`***`) in all agent output, including panic messages.
+redacted (`***`) in all agentd output, including panic messages.
 
 ---
 
 ## Flag reference (used by these samples)
 
-Every flag below is in `crates/agentd/src/config.rs`; run `agent --help` for the
+Every flag below is in `crates/agentd/src/config.rs`; run `agentd --help` for the
 full list. Anything env-settable (12-factor) is shown with its env var.
 
 | Flag | Env | Meaning |
@@ -261,7 +261,7 @@ full list. Anything env-settable (12-factor) is shown with its env var.
 | `--log-level <L>` | `AGENT_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
 | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
 | `--health-file <PATH>` | — | liveness heartbeat file |
-| `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | serve agent's own MCP (stdio/unix; HTTP serving is roadmap) |
+| `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | serve agentd's own MCP (stdio/unix; HTTP serving is roadmap) |
 | `--enable-exec` | `AGENT_ENABLE_EXEC` | expose the gated `exec` tool (off by default) |
 
 Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,

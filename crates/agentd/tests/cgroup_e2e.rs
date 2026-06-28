@@ -56,7 +56,7 @@ fn once_mode_places_the_root_in_a_cgroup_and_removes_it_on_exit() {
         eprintln!("skip: cgroup-v2 tree not writable on this host");
         return;
     }
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(exe, &llm_sock);
@@ -143,7 +143,7 @@ fn once_mode_applies_hard_limits_when_the_parent_delegates_controllers() {
     }
     let _cleanup = Cleanup(mgr.clone());
 
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(exe, &llm_sock);

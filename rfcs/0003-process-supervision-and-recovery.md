@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 ---
 
@@ -13,7 +13,7 @@ RFC 0001 §3/§4.1 states supervision as a one-line responsibility — "spawn,
 track, reap, enforce limits." That is a slogan. The reliability review found
 twelve concrete gaps; the architecture-decision document elevates them to
 binding mechanisms in §2.8. This RFC is the implementation-ready specification
-for those mechanisms: how agent, as the crash-resilient root of a process
+for those mechanisms: how agentd, as the crash-resilient root of a process
 tree, **detects** that a child is dead or stuck, **kills** a subtree without
 killing itself, **recovers** after its own crash, and **accounts** for spend
 across the whole tree.
@@ -129,7 +129,7 @@ let is_pid1 = (unsafe { libc::getpid() } == 1); // first-class container case
 
 `is_pid1` changes nothing functionally — `PR_SET_CHILD_SUBREAPER` already routes
 orphans to us — but it is logged (`proc.start`) and documented: **the
-recommended container entrypoint is agent itself; we are a tini-class init for
+recommended container entrypoint is agentd itself; we are a tini-class init for
 our tree and do not require an external `tini`.**
 
 `SIGCHLD`, `SIGTERM`, `SIGINT` are installed via `sigaction` with `SA_RESTART`
@@ -293,7 +293,7 @@ warning.
 
 ### 3.5 (kill) The bounded depth-first kill ladder
 
-Triggered by: SIGTERM/SIGINT to agent (drain — RFC 0011 owns the choreography,
+Triggered by: SIGTERM/SIGINT to agentd (drain — RFC 0011 owns the choreography,
 this RFC owns the ladder), a Detector A/B/C verdict on one subtree, or a budget
 breach (§3.8). Each subagent is its own **process group** (`setpgid(0,0)` in
 `pre_exec`, §3.9) so a subtree is signalled atomically with `killpg`.
@@ -487,7 +487,7 @@ after PDEATHSIG + getppid recheck succeed.
 
 ### 3.10 cgroup-v2 awareness (not requirement)
 
-agent is cgroup-v2-**aware** but **never hard-requires cgroup write access**
+agentd is cgroup-v2-**aware** but **never hard-requires cgroup write access**
 (assessment §2.8). At startup:
 
 - **Read** `/sys/fs/cgroup/memory.max` and `memory.high` if present; log them
@@ -519,7 +519,7 @@ accumulated usage) so a bounded restart (§3.7) is possible. On supervisor
    each `resources/subscribe`, issue `resources/read` on the same URI. This
    converts edge-triggering into level-triggering across the restart boundary:
    any change that happened while the supervisor was down is recovered, because
-   the agent acts on *current state*, not a missed delta (idempotent re-trigger,
+   the agentd acts on *current state*, not a missed delta (idempotent re-trigger,
    assessment §2.6 at-least-once-via-re-read-current-state).
 
 ```

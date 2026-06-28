@@ -45,10 +45,10 @@ RUN if [ -n "$FEATURES" ]; then \
 FROM scratch
 
 # OCI image metadata (populated by CI via --build-arg; harmless defaults locally).
-ARG VERSION="3.0.0"
+ARG VERSION="1.0.0"
 ARG REVISION="unknown"
 ARG CREATED="1970-01-01T00:00:00Z"
-LABEL org.opencontainers.image.title="agent" \
+LABEL org.opencontainers.image.title="agentd" \
       org.opencontainers.image.description="Minimal, MCP-native, reactive agent runtime — one static binary for k8s." \
       org.opencontainers.image.source="https://github.com/agentd-dev/source-code" \
       org.opencontainers.image.documentation="https://github.com/agentd-dev/source-code/blob/main/docs/deployment.md" \
@@ -58,11 +58,11 @@ LABEL org.opencontainers.image.title="agent" \
       org.opencontainers.image.created="${CREATED}" \
       org.opencontainers.image.base.name="scratch"
 
-COPY --from=builder /build/target/release/agent /agent
+COPY --from=builder /build/target/release/agentd /agentd
 # Non-root by uid (scratch has no /etc/passwd; the kernel just uses the number).
 # Matches the k8s manifests' runAsUser/runAsGroup 65532 (examples/k8s/).
 USER 65532:65532
 # agentd needs INSTRUCTION + an intelligence endpoint (env/flags); an external
 # scheduler (e.g. a k8s Job/CronJob/Deployment) drives lifecycle. See
 # docs/deployment.md and examples/k8s/.
-ENTRYPOINT ["/agent"]
+ENTRYPOINT ["/agentd"]

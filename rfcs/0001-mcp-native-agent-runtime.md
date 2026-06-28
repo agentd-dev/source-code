@@ -3,7 +3,7 @@
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25
-**Part of:** the agent rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
+**Part of:** the agentd rewrite — binding decisions in docs/design/00-architecture-assessment.md; core in RFC 0001
 
 **Supersedes:** all prior RFCs (the bounded-workflow-DAG design is retired).
 
@@ -11,7 +11,7 @@
 
 ## 0. One paragraph
 
-`agent` is a small, dependency-light Rust binary that runs **one agent**. You
+`agentd` is a small, dependency-light Rust binary that runs **one agent**. You
 give it an `INSTRUCTION` and a way to reach an LLM (**intelligence**), and it
 runs an agentic loop: think, call tools, observe, repeat — until the job is
 done or a new event wakes it. It has **no built-in tools of its own**; every
@@ -20,14 +20,14 @@ is that it **reacts to the world through MCP resource subscriptions** — a
 resource changing upstream is what triggers a run, a continuation, or a fresh
 iteration. The actual reasoning happens inside **subagent processes** that a
 **supervisor** owns and watches, so agents nest: a parent spawns and controls
-children as an OS process tree. And `agent` **speaks MCP in both directions** —
+children as an OS process tree. And `agentd` **speaks MCP in both directions** —
 it is an MCP *client* to the servers it uses, and an MCP *server* exposing
 itself, so agents can be wired to each other with the same protocol they use
 for everything else. It runs standalone from a shell, or inside a container that
 an external scheduler (e.g. a Kubernetes operator — **not part of this project**)
 starts, stops, and replicates.
 
-This RFC is the **front door** of the agent RFC set. It is the readable
+This RFC is the **front door** of the agentd RFC set. It is the readable
 narrative core: the thesis, the two-loop split, the components, the deployment
 shapes, and the non-goals. Every mechanism it names is specified in depth in one
 of the sub-RFCs (0002–0013); this document cross-references them by number rather
@@ -39,7 +39,7 @@ ever diverge, **the assessment wins**.
 
 ## 1. Why rewrite
 
-The previous `agent` was a *bounded workflow runtime*: a predeclared, validated
+The previous `agentd` was a *bounded workflow runtime*: a predeclared, validated
 TOML DAG where the model filled one node and control flow was structure, not
 model output. That design optimised for auditability and refused model-owned
 control. It was internally consistent and we are deliberately leaving it behind.
@@ -53,19 +53,19 @@ to call a model. We are building a **lean agent** whose value is:
    no TLS, and no C/C++ toolchain (RFC 0002). The runtime is small enough to read
    in an afternoon.
 2. **MCP as the universal interface.** Tools, triggers, and composition all flow
-   through the Model Context Protocol. `agent` does not ship a tool library, a
+   through the Model Context Protocol. `agentd` does not ship a tool library, a
    policy DSL, a workflow language, or a plugin host. If you want a capability,
    you connect an MCP server. This collapses an enormous amount of surface area
    into one well-specified protocol.
 3. **Reactivity through resource subscriptions.** Most agent runtimes are
-   request/response or cron. `agent` **subscribes to MCP resources** and treats
+   request/response or cron. `agentd` **subscribes to MCP resources** and treats
    their updates as triggers — a long-lived agent that sits idle and wakes when
    the world it watches changes. An agent can even subscribe *itself* to a
    resource mid-reasoning to arrange its own future wake-up. This — the reactive
    loop — is the single most novel thing in the design and is unbuilt elsewhere
-   in the ecosystem; it is agent's edge (RFC 0008).
-4. **Composability by being MCP on both sides.** Because `agent` is also an MCP
-   server, one `agent` can drive another, a parent can control its children, and
+   in the ecosystem; it is agentd's edge (RFC 0008).
+4. **Composability by being MCP on both sides.** Because `agentd` is also an MCP
+   server, one `agentd` can drive another, a parent can control its children, and
    a fleet of agents can be wired together — all with the same protocol, no
    bespoke clustering layer (RFC 0005).
 5. **Process-isolated subagents.** Agentic work runs in child processes, not
@@ -86,7 +86,7 @@ The rewrite starts from scratch. This RFC is the target.
   by step/token/time/depth budgets, not by a declared graph.
 - **No built-in tool catalogue.** No `fs`, `http`, `shell`, `data` tool families
   baked into the binary. The one exception (`exec`) is surfaced *as* an MCP tool
-  served by agent's own self-MCP, off by default (RFC 0005, RFC 0012).
+  served by agentd's own self-MCP, off by default (RFC 0005, RFC 0012).
 - **No embedded policy engine, no Rego, no JSON-Schema validator, no signing
   subsystem** as core. The outer boundary (container, VM, the MCP subset you
   grant) is the security model; capability scoping is the *granted MCP subset*
@@ -97,7 +97,7 @@ The rewrite starts from scratch. This RFC is the target.
   avoid.** Concurrency is OS processes plus a few threads, never an executor.
   Every dependency earns its place against the minimalism bar (RFC 0002).
 - **No Kubernetes operator, CRDs, or controller in this repository.** External
-  schedulers orchestrate `agent`. We make `agent` a *good citizen* to be
+  schedulers orchestrate `agentd`. We make `agentd` a *good citizen* to be
   scheduled — clean signals, a public exit-code contract, structured logs,
   health — and stop there (RFC 0011). Composition between agents is MCP, not a
   control plane we own.
@@ -114,13 +114,13 @@ The rewrite starts from scratch. This RFC is the target.
 
 ```
                     ┌──────────────────────────────────────────────┐
-                    │              agent (main process)            │
+                    │              agentd (main process)           │
                     │                 = SUPERVISOR (a REACTOR)      │
                     │           no LLM dependency, never reasons    │
                     │                                               │
   INSTRUCTION ─────▶│  • parse + validate config (env/flags/file)  │
   intelligence ────▶│  • connect MCP servers (as CLIENT)           │──┐ MCP client
-  MCP server defs ─▶│  • serve agent's own MCP (as SERVER)        │◀─┘ MCP server
+  MCP server defs ─▶│  • serve agentd's own MCP (as SERVER)       │◀─┘ MCP server
                     │  • arm triggers: once │ loop │ reactive │ sch │
                     │  • subscribe to MCP resources  ◀──────────── │── notifications/
                     │  • recv_timeout(merged mpsc): one blocking   │   resources/updated
@@ -144,7 +144,7 @@ The rewrite starts from scratch. This RFC is the target.
              ▼
    ┌───────────────────────────────────────────────────────┐
    │  MCP servers (external): filesystem, github, db, …     │
-   │  + agent's own self-MCP (subagent.*, subscribe, exec) │
+   │  + agentd's own self-MCP (subagent.*, subscribe, exec) │
    └───────────────────────────────────────────────────────┘
 ```
 
@@ -183,8 +183,8 @@ Responsibilities, and nothing more:
    gated on what that server advertised, and every `*/list` follows pagination
    cursors. These connections are *shared infrastructure*; subagents are granted
    scoped subsets of them (RFC 0004, §6.3).
-3. **Self MCP server.** Serve `agent`'s own MCP endpoint over **stdio (when a
-   parent/peer spawned this agent as a subprocess) and/or a unix-socket on
+3. **Self MCP server.** Serve `agentd`'s own MCP endpoint over **stdio (when a
+   parent/peer spawned this agentd as a subprocess) and/or a unix-socket on
    `--serve-mcp unix:…`** (RFC 0005). It exposes subagent-control tools, the
    subscription tools, the gated `exec` tool, and subscribable state resources.
    Note: serving the self-MCP on stdout and printing a `once`-mode result on
@@ -208,7 +208,7 @@ state (RFC 0003).
 
 ### 4.2 The subagent (process)
 
-A subagent is the same `agent` binary launched in **subagent mode** (re-exec of
+A subagent is the same `agentd` binary launched in **subagent mode** (re-exec of
 `argv[0]`, not a separate artifact — keeps distribution to one binary). It
 receives, in its **spawn payload** over the control channel (RFC 0009):
 
@@ -282,7 +282,7 @@ original draft; they are corrected once and for all:**
 
 - **Notify-then-read.** `notifications/resources/updated` carries **only the
   `{uri}`** (optionally a `title`) — **no payload, no diff**. The supervisor (or
-  the woken agent) must issue a fresh `resources/read` on wake to learn what
+  the woken agentd) must issue a fresh `resources/read` on wake to learn what
   changed. The reactive loop is therefore **two round-trips and can race**
   (the resource may change again before the read), which makes per-route
   **debounce + coalesce** mandatory, not optional (RFC 0008).
@@ -301,7 +301,7 @@ On wake, the router resolves the event to one of:
 
 - **Spawn** — start a fresh root subagent for the event (stateless reaction).
 - **Continue** — deliver the event into an existing, warm session and re-enter
-  its agentic loop in the same context (stateful reaction: the agent "wakes,"
+  its agentic loop in the same context (stateful reaction: the agentd "wakes,"
   re-reads current state, and keeps working).
 
 Routing is **exactly-one-owner**: every `updated{uri}` matches exactly one route
@@ -316,9 +316,9 @@ Examples: watch a `file://` resource for inbound work; enumerate and subscribe t
 concrete `db://…` row URIs; watch *another agent's* exposed `agent://…`
 resource (§8) to react to a sibling's progress.
 
-Crucially, **an agent can arrange its own triggers.** Mid-reasoning, a subagent
+Crucially, **an agentd can arrange its own triggers.** Mid-reasoning, a subagent
 calls the `subscribe` self-tool; the supervisor auto-creates a
-`continue(this_session)` route, the agent ends its turn, and it is re-entered in
+`continue(this_session)` route, the agentd ends its turn, and it is re-entered in
 the same session when that resource updates. **Self-subscription as
 self-scheduling** is the capability the runtime is built around (RFC 0008).
 
@@ -369,7 +369,7 @@ is a disjunction of cheap per-turn checks, each with a distinct terminal status
 (content-hash unchanged for N turns, default 3) · `loop_detected` (per-tool repeat
 cap K, default 3) · `refused` · `cancelled` · `crashed`.
 
-The global step/token/deadline cap is non-negotiable. At every budget the agent
+The global step/token/deadline cap is non-negotiable. At every budget the agentd
 wraps up gracefully and returns partials; RLIMIT/`SIGKILL` are the backstop for
 wedged children. **Error taxonomy:** tool-domain errors and malformed model output
 become observations (recoverable, step-consuming); transient transport errors get
@@ -428,14 +428,14 @@ turns). Async (`{async:true}` handle / completion-as-self-resource) and detached
 
 ## 7. Intelligence and MCP — the two external dependencies
 
-`agent` reaches exactly two kinds of outside system: an **intelligence** endpoint
+`agentd` reaches exactly two kinds of outside system: an **intelligence** endpoint
 (the LLM) and **MCP servers** (everything else). These are **different wires** —
 the intelligence transports carry the LLM wire, **not MCP** — and must not be
 conflated.
 
 ### 7.1 MCP servers (the only tool source)
 
-- **Roles.** `agent` is an MCP **client/host** to N servers, an MCP **server** to
+- **Roles.** `agentd` is an MCP **client/host** to N servers, an MCP **server** to
   whoever drives it (§8), and uses MCP **subscriptions** as triggers (§5.3). One
   protocol, three roles.
 - **Target version.** MCP **2025-11-25**, interoperating down to 2024-11-05. Pin
@@ -454,7 +454,7 @@ conflated.
   + `notifications/resources/list_changed`; `ping` both ways;
   `notifications/cancelled` when abandoning an in-flight request;
   `notifications/progress` (reset request timeout with an absolute ceiling) and
-  `notifications/message` (fold into logs). `agent` **declares NO client
+  `notifications/message` (fold into logs). `agentd` **declares NO client
   capabilities** (no roots/sampling/elicitation/tasks); it answers `roots/list`
   with `{"roots":[]}` and rejects an unsolicited `sampling/createMessage`
   (RFC 0004).
@@ -462,7 +462,7 @@ conflated.
   subagent may call is the parent's grant (§6.3).
 
 There is no built-in tool that is not either an MCP tool from one of these servers
-or one of `agent`'s own self-MCP tools (§8). That invariant is the whole point.
+or one of `agentd`'s own self-MCP tools (§8). That invariant is the whole point.
 
 ### 7.2 Intelligence (the LLM transport)
 
@@ -476,7 +476,7 @@ transport-agnostic hand-rolled HTTP/1.1+framed client over `Read + Write`
 - **`https://…`** — a model provider or gateway over TLS (behind the `tls`
   feature; `rustls`/`ring`/`webpki-roots`). The standalone-CLI case. Most builds
   terminate TLS at a sidecar and link no TLS at all (RFC 0002).
-- **`vsock:<cid>:<port>`** — for `agent` inside a microVM / confidential enclave
+- **`vsock:<cid>:<port>`** — for `agentd` inside a microVM / confidential enclave
   reaching a host gateway across the virtio socket (behind the `vsock` feature).
   Strong isolation; no TCP stack exposed inside the guest.
 
@@ -494,15 +494,15 @@ persisted, never in transcripts, with a build-time key probe for fast-fail
 ### 7.3 What MCP features v1 does NOT use (and why)
 
 The assessment's MCP review surfaced three 2025-11-25 features that *look*
-purpose-built for agent. They are **acknowledged and deferred to v2 (RFC 0013)**,
+purpose-built for agentd. They are **acknowledged and deferred to v2 (RFC 0013)**,
 not adopted, for honest minimalism:
 
 - **Tasks** (durable/pollable/deferred-result requests) are the spec-native shape
   for the *external-facing* long-running surface. v1 falls back to
   request/response + `progress` + `cancel`.
 - **Sampling** (`sampling/createMessage`) is the spec-correct way for a peer to
-  "use agent's intelligence" — but it is a **server→client** request where
-  **sampling is a CLIENT capability**, so agent would have to act as a
+  "use agentd's intelligence" — but it is a **server→client** request where
+  **sampling is a CLIENT capability**, so agentd would have to act as a
   *sampling-capable client*, the **opposite wiring** from "expose a server, peer
   connects." **v1 declares no client capabilities and implements sampling in
   neither direction.** (This corrects the original draft's implied directionality.)
@@ -520,15 +520,15 @@ stdio/unix-socket only.** The term is **"Streamable HTTP"**; the old
 
 ---
 
-## 8. agent as an MCP server (self-wiring + the internal tools)
+## 8. agentd as an MCP server (self-wiring + the internal tools)
 
-`agent` exposes its **own MCP server**, served over **stdio (when spawned as a
+`agentd` exposes its **own MCP server**, served over **stdio (when spawned as a
 subprocess by a parent/peer) and a unix socket when `--serve-mcp unix:…`**
 (RFC 0005; stdio-serving and `once`-mode result-on-stdout are mutually exclusive
 per process, RFC 0005 §3.6). This one decision delivers three
-things at once: it gives the agent its internal tools through the exact mechanism
+things at once: it gives the agentd its internal tools through the exact mechanism
 it already uses for external tools; it lets a parent control children with that
-same mechanism; and it lets *other* MCP clients (including another `agent`) wire
+same mechanism; and it lets *other* MCP clients (including another `agentd`) wire
 to it — composing agents without any new protocol.
 
 **Tools the self-MCP exposes** (v1; names illustrative):
@@ -539,10 +539,10 @@ to it — composing agents without any new protocol.
 - `subagent.send(handle, message)` / `subagent.cancel(handle)` /
   `subagent.status(handle)` — inject, control, introspect.
 - `subscribe(resource_uri)` / `unsubscribe(resource_uri)` — register/clear interest
-  in an MCP resource so its updates trigger this agent (§5.3). Self-subscribe
-  auto-creates a `continue(this_session)` route — the agent schedules its own
+  in an MCP resource so its updates trigger this agentd (§5.3). Self-subscribe
+  auto-creates a `continue(this_session)` route — the agentd schedules its own
   future wake.
-- `resource.read(uri)` — pull a resource body on demand (the agent reacts to
+- `resource.read(uri)` — pull a resource body on demand (the agentd reacts to
   *current state*, per notify-then-read).
 - `exec(argv, …)` — run a local command. **Off by default** (RFC 0012), enabled
   only when config opts in *and* the binary exists; folded into the same OS-limit
@@ -553,11 +553,11 @@ It declares `tools:{listChanged:true}` and **emits
 scope narrowing) — the original draft implied dynamic scoping but never named this
 (RFC 0004, RFC 0005).
 
-**Resources the self-MCP exposes** — the agent's own session/run/subagent state as
+**Resources the self-MCP exposes** — the agentd's own session/run/subagent state as
 readable **and subscribable** resources, advertised as
 `resources:{subscribe:true,listChanged:true}`, emitting
 `notifications/resources/updated{uri}` on state transitions, under a custom
-`agent://…` scheme (legal; only other agent instances understand its semantics).
+`agent://…` scheme (legal; only other agentd instances understand its semantics).
 This is what makes **agent-to-agent reactivity** and **async subagent completion**
 work: agent X subscribes to agent Y's `agent://session/…` resource and Y's state
 change wakes X. Because notifications are payload-less, design the resource
@@ -569,7 +569,7 @@ granularity so a single `resources/read` on wake is cheap and meaningful (RFC 00
 
 The requirement "no tools except those from MCP servers" and the allowance "may
 run a command like bash" reconcile cleanly: **`exec` is itself an MCP tool**,
-served by agent's own self-MCP (§8). So the invariant holds — *every* tool the
+served by agentd's own self-MCP (§8). So the invariant holds — *every* tool the
 model can call is an MCP tool — while a deliberate, gated local-execution escape
 hatch exists. `exec` is **disabled by default**, **capability-checked** (the binary
 must exist → absent, not a runtime error), and **isolated** under the same OS
@@ -612,7 +612,7 @@ services can dedupe retries (RFC 0011).
 
 ## 11. Deployment shapes
 
-- **Standalone CLI.** `agent --instruction "…" --intelligence https://… --mcp
+- **Standalone CLI.** `agentd --instruction "…" --intelligence https://… --mcp
   fs=… --mcp github=…`. One-shot by default; prints the result and exits. No
   daemon, no socket, no state.
 - **Container.** The same binary; config via env. Intelligence via a unix-socket
@@ -620,9 +620,9 @@ services can dedupe retries (RFC 0011).
   gateway; MCP servers either bundled in the image (stdio children) or reached as
   sidecars. Reactive or loop mode makes it a long-lived workload.
 - **Scheduled by an external operator (e.g. Kubernetes).** The operator — **not in
-  this repo** — decides when and how many `agent` instances run: a `Job`/`CronJob`
+  this repo** — decides when and how many `agentd` instances run: a `Job`/`CronJob`
   for one-shot work, a `Deployment` for a long-lived reactive agent, replicas for
-  fan-out. `agent`'s obligations are only to be a clean citizen: a bounded
+  fan-out. `agentd`'s obligations are only to be a clean citizen: a bounded
   `SIGTERM` drain (**`AGENT_DRAIN_TIMEOUT` < `terminationGracePeriodSeconds`** —
   the top cloud-native footgun, validated at startup), a clean drain that returns
   **0 (not 143)**, the public exit-code contract, structured stderr logs, and a
@@ -638,7 +638,7 @@ services can dedupe retries (RFC 0011).
 The model is deliberately thin, leaning on the deployment and on structural
 isolation as the moat (RFC 0012):
 
-- **Outer boundary** is the container / VM / enclave. `agent` does not
+- **Outer boundary** is the container / VM / enclave. `agentd` does not
   reimplement sandboxing.
 - **Capability scoping** is by *granted MCP subset*, interpreted as a **Rule-of-Two
   trust budget**: a subagent narrows monotonically down the tree, and a grant that
@@ -648,7 +648,7 @@ isolation as the moat (RFC 0012):
 - **All MCP server content is untrusted — including tool descriptions, schemas,
   and annotations** (tool poisoning). Never build a launch command from
   model/server-controlled strings; surface/log tool descriptions for operator
-  audit. stdio is the default transport (limits server reach to agent only).
+  audit. stdio is the default transport (limits server reach to agentd only).
 - **SSRF defenses** in the hand-rolled HTTP client: enforce HTTPS in prod, block
   RFC-1918 / loopback / link-local by default, validate redirects, with an
   explicit dev opt-out (RFC 0012).
@@ -697,7 +697,7 @@ detail.
 
 ## 14. Summary
 
-`agent` is a **small, MCP-native, reactive agent**: an instruction, a model, MCP
+`agentd` is a **small, MCP-native, reactive agent**: an instruction, a model, MCP
 servers for every tool, a model-owned loop running in isolated subagent processes
 that nest into a supervised tree, triggered by — and emitting — MCP resource
 updates, and exposing itself as an MCP server so agents compose with the same

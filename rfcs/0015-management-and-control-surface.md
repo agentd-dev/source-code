@@ -3,7 +3,7 @@
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agent rewrite — control-plane track (RFC 0014); extends the self-MCP server & control protocol (RFC 0005)
+**Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the self-MCP server & control protocol (RFC 0005)
 
 > **A2A alignment (RFC 0020).** RFC 0020 (A2A-over-vsock) builds two surfaces here
 > into the agent mesh, with no new source of truth: (1) the capabilities manifest
@@ -12,22 +12,22 @@
 > vsock serving transport (§3) also carries the A2A **server profile** (feature
 > `a2a`) alongside this management/self-MCP profile — same listener, same codec
 > (RFC 0004), same one trust domain (§3.3) where the vsock peer is the node-agent
-> (RFC 0020 §2/§4). agent carries none of A2A's HTTP/SSE/OAuth/webhook machinery;
+> (RFC 0020 §2/§4). agentd carries none of A2A's HTTP/SSE/OAuth/webhook machinery;
 > that lives in the gateway. See RFC 0020.
 
 ---
 
 ## 1. Problem / Context
 
-RFC 0014 splits the world: `agent` is the **data plane** (one static binary that
+RFC 0014 splits the world: `agentd` is the **data plane** (one static binary that
 runs the bounded agentic loop), `agentctl` is the **control plane** (a CLI, a
 `kubectl agent[s]` plugin, and a Kubernetes operator that provisions, scales, and
 observes a *fleet*). The umbrella's load-bearing move is to make **vsock
-bidirectional**: agent already *dials out* over vsock for intelligence (RFC
+bidirectional**: agentd already *dials out* over vsock for intelligence (RFC
 0006); if it can also **serve** its self-MCP over vsock, an `agentctl` node-agent
-DaemonSet manages every local agent pod host-side — control *and* telemetry —
+DaemonSet manages every local agentd pod host-side — control *and* telemetry —
 and the pod can run with **no cluster networking at all** (vsock-out for the
-model, vsock-in for management). That is the strongest isolation posture agent
+model, vsock-in for management). That is the strongest isolation posture agentd
 can offer and the natural backend for `kubectl agent`.
 
 This RFC lands the first sub-RFC of that track — the one the rest depend on
@@ -44,11 +44,11 @@ depend on"). It specifies three things and nothing more:
 3. **The capabilities manifest** — the shared spine RFC 0014 §5 sketched and
    explicitly delegated here ("the manifest's exact schema is owned by RFC 0015 §
    capabilities"). One machine-readable document, emitted as a one-shot
-   (`agent --capabilities`) and as a live resource (`agent://capabilities`),
+   (`agentd --capabilities`) and as a live resource (`agent://capabilities`),
    that tells agentctl what an instance *is*, what it can do, and which contract
    versions it speaks.
 
-The discipline is RFC 0014 §3 verbatim: **agent exposes primitives; agentctl
+The discipline is RFC 0014 §3 verbatim: **agentd exposes primitives; agentctl
 owns policy.** Everything here is a primitive (a resource to read, a tool to
 call, a transport to bind). The Kubernetes-facing translation — CRDs, the
 reconcile loop, `kubectl agent tree`'s rendering, RBAC, dashboards — lives
@@ -84,7 +84,7 @@ construction (RFC 0014 §3.3) and belongs in agentctl.
    stdio served *into a parent agent* (a peer subagent must not drain its
    supervisor); §3.4.
 
-3. **The capabilities manifest is the contract spine.** `agent --capabilities`
+3. **The capabilities manifest is the contract spine.** `agentd --capabilities`
    prints the manifest JSON to **stdout and exits `0`** (one-shot, side-effect
    free, before any MCP connect); `agent://capabilities` returns the same
    document as a live, subscribable resource. Its schema (§5) carries
@@ -93,10 +93,10 @@ construction (RFC 0014 §3.3) and belongs in agentctl.
    and a **`surfaces`** block declaring which control-plane contracts this binary
    actually serves — so agentctl degrades gracefully (RFC 0014 §7).
 
-4. **Instance identity comes from the Kubernetes downward API, env-only.** agent
+4. **Instance identity comes from the Kubernetes downward API, env-only.** agentd
    reads pod name / uid / node / namespace from operator-injected env vars
    (`valueFrom.fieldRef`) and surfaces them in `capabilities.identity` and
-   `agent://status`. **agent never calls the kube API** — no client, no
+   `agent://status`. **agentd never calls the kube API** — no client, no
    in-cluster config, no service-account token read. Env in, nothing else (§6).
 
 5. **Capability absence is not an error.** An operator tool or resource that a
@@ -212,10 +212,10 @@ the vsock port trusts whoever owns the host side of the VM boundary. In both cas
 **the transport is the access control** — there is no in-band auth, no token, no
 session-is-authn confusion (RFC 0012 §2 decision: no auth as core).
 
-Who provisions the device is **not agent's concern** (RFC 0014 §6): the
-node-agent sets up the vsock CID/port and the host-side model service; agent only
+Who provisions the device is **not agentd's concern** (RFC 0014 §6): the
+node-agent sets up the vsock CID/port and the host-side model service; agentd only
 *uses* the CID/port it is given (RFC 0006 makes the same statement for the
-client). agent binds, accepts, and serves. The operator's job is to ensure only
+client). agentd binds, accepts, and serves. The operator's job is to ensure only
 the trusted node-agent can reach that vsock port — exactly the posture a unix
 socket's mode/owner gives on the filesystem.
 
@@ -232,7 +232,7 @@ The self-MCP `tools/list` is **already per-caller gated** (RFC 0005 §3.2: a
 caller's scope narrows the available set; `tools/list_changed` fires on change).
 This RFC reuses that exact mechanism. The operator tools (§4) and the operator
 resources (§5) are listed **iff** the connecting peer's `PeerOrigin` is
-`Management` (vsock or unix) — i.e. iff the peer is reaching agent over a
+`Management` (vsock or unix) — i.e. iff the peer is reaching agentd over a
 management transport:
 
 | Peer origin | Transport | Work tools (RFC 0005) | Operator tools (§4) | Operator resources (§5) |
@@ -412,7 +412,7 @@ instruction/event into a warm subagent session via the `ctrl/inject` control
 message (RFC 0005 §4.3). agentctl's `attach` opens a management connection, calls
 `subagent.send{handle, event}`, and streams the resulting `agent://events`
 (RFC 0016) and `agent://subagent/{handle}` `updated` notifications back to the
-operator's terminal. agent adds nothing: the warm-session steering primitive
+operator's terminal. agentd adds nothing: the warm-session steering primitive
 already exists, and reinventing it would fork the control surface. This RFC only
 *names* the mapping so the umbrella's `kubectl agent attach` row (RFC 0014 §4) has
 a concrete backing.
@@ -440,13 +440,13 @@ RFC 0016**, not here; this RFC only declares that it is part of the operator
 profile and is listed on the management transport. Do not read its schema into
 this RFC.
 
-### 5.2 `agent://capabilities` and `agent --capabilities` — the manifest
+### 5.2 `agent://capabilities` and `agentd --capabilities` — the manifest
 
 The capabilities manifest is the **shared spine** of the whole control-plane track
 (RFC 0014 §5, which delegates the exact schema here). It is emitted two ways from
 the **same builder**, so the one-shot and the live resource never drift:
 
-- **One-shot:** `agent --capabilities` builds the manifest, writes it as JSON to
+- **One-shot:** `agentd --capabilities` builds the manifest, writes it as JSON to
   **stdout**, and exits **`0`**. It is **side-effect free and runs before any MCP
   connect, LLM call, or socket bind** (the RFC 0011 §3.3 discipline): it reflects
   static config + build features + downward-API env, with the live fields
@@ -462,7 +462,7 @@ Full schema (jsonc; every field is part of the frozen contract — §6 of RFC 00
 
 ```jsonc
 {
-  "contract_version": "1.0",            // the agentctl<->agent contract major.minor (RFC 0014 §3.4)
+  "contract_version": "1.0",            // the agentctl<->agentd contract major.minor (RFC 0014 §3.4)
   "agent_version": "2.1.0",            // env!("CARGO_PKG_VERSION")
   "build_features": ["metrics","serve-mcp","vsock","cron","otel"], // compiled-in cargo features
 
@@ -509,7 +509,7 @@ Full schema (jsonc; every field is part of the frozen contract — §6 of RFC 00
     "metrics_schema": "1.0",             // frozen metrics schema version (RFC 0016)
     "events":         true,              // agent://events served (RFC 0016)
     "hot_reload":     true,              // SIGHUP / file-watch reload (RFC 0017)
-    "config_validate": true,             // agent --validate-config available (RFC 0017)
+    "config_validate": true,             // agentd --validate-config available (RFC 0017)
     "exit_codes":     "RFC-0011-§5"      // the exit-code table version this binary honours
   }
 }
@@ -533,7 +533,7 @@ Full schema (jsonc; every field is part of the frozen contract — §6 of RFC 00
   `Secret` newtype has no `Serialize` (RFC 0012 §3.7), so it cannot reach the
   builder.
 - `contract_version` is the field agentctl negotiates on (RFC 0014 §3.4). It is
-  the **agentctl↔agent contract** version, distinct from `agent_version` (the
+  the **agentctl↔agentd contract** version, distinct from `agent_version` (the
   binary release) and from `metrics_schema` (RFC 0016, versioned independently and
   surfaced here so a scraper can branch).
 
@@ -541,7 +541,7 @@ Full schema (jsonc; every field is part of the frozen contract — §6 of RFC 00
 
 `inventory` is the instance-local view of the running subagent tree: per-node
 status, depth, and usage. It is the read model behind `kubectl agent tree` and
-`kubectl agent describe` (RFC 0014 §4). It is **instance-local** — agent reports
+`kubectl agent describe` (RFC 0014 §4). It is **instance-local** — agentd reports
 *its* tree, never a fleet view; cross-instance aggregation is agentctl's job
 (RFC 0014 §6). The supervisor already holds every field (it is the source of truth
 for the tree — RFC 0003); `inventory` is a pure projection of supervisor state, so
@@ -635,17 +635,17 @@ state is observable. agentctl reads them via the `/metrics` surface declared in
 
 > Resolves RFC 0019 §12 ("`work.*` tool names are a frozen contract — confirm
 > ownership") and the matching item in §10 below. RFC 0019 §3 defines the *claim
-> lifecycle* agent honours; this subsection is the **single frozen authority** for
+> lifecycle* agentd honours; this subsection is the **single frozen authority** for
 > the tool **names**, **argument shapes**, and the **`_meta` convention** so a
 > fleet and its coordination server agree. The umbrella (RFC 0014 §3.4) ratifies it
 > here, in RFC 0015, because it is a control-plane contract agentctl negotiates on —
-> even though agent *calls* these tools (it does not serve them; cf. §4, which is
-> tools agent serves). agentctl, or the source MCP server, **provides** `work.*`;
-> agent is a participant, exactly as RFC 0011 §6 makes it a participant in the
+> even though agentd *calls* these tools (it does not serve them; cf. §4, which is
+> tools agentd serves). agentctl, or the source MCP server, **provides** `work.*`;
+> agentd is a participant, exactly as RFC 0011 §6 makes it a participant in the
 > idempotency contract.
 
-**Direction & discovery.** Unlike the operator tools (§4, served *by* agent on the
-management transport), `work.*` are tools agent *calls* on a coordination MCP
+**Direction & discovery.** Unlike the operator tools (§4, served *by* agentd on the
+management transport), `work.*` are tools agentd *calls* on a coordination MCP
 server (the source server, or a thin claim/lease server the operator runs) over the
 ordinary MCP client codec (RFC 0004). Their JSON-Schemas are the server's, found via
 `tools/list`. The **names and `_meta` keys** below are frozen; the server owns the
@@ -665,8 +665,8 @@ result schema.
 { "name":"work.release","arguments":{ "lease_id": "<opaque>", "reason": "<string>" } }  // relinquish; re-claimable now
 ```
 
-**The `_meta` convention (frozen).** agent stamps these onto the `work.*`
-`tools/call` (the `agent/*` namespace is reserved for this contract):
+**The `_meta` convention (frozen).** agentd stamps these onto the `work.*`
+`tools/call` (the `agentd/*` namespace is reserved for this contract):
 
 | `_meta` key | Value | Purpose |
 |---|---|---|
@@ -689,7 +689,7 @@ the wire shape differs.
 > exact tool name + `expect_lease`/`new_lease` argument shape) is left unfrozen
 > **until a concrete resource-lease coordination server exists to validate it
 > against** — freezing a CAS contract speculatively risks a wrong shape that could
-> double-grant, the one thing the convention must never do. agent's claim client
+> double-grant, the one thing the convention must never do. agentd's claim client
 > therefore dispatches a `claim.style=resource` route to a loud error (and startup
 > validation rejects it), never a silent misbehaviour; the path slots in behind the
 > existing `ClaimOutcome` once the CAS shape is frozen against a real consumer.
@@ -723,15 +723,15 @@ agentctl places a `claim` route only on instances advertising `claim`.
 
 ## 6. Mechanism — instance identity from the downward API (env-only)
 
-agent surfaces pod identity (`identity` block in §5.2/§5.4) by reading
+agentd surfaces pod identity (`identity` block in §5.2/§5.4) by reading
 **operator-injected environment variables**, set from the Kubernetes downward API
-via `valueFrom.fieldRef`. **agent never calls the kube API** — there is no kube
+via `valueFrom.fieldRef`. **agentd never calls the kube API** — there is no kube
 client, no in-cluster config, no service-account token read; that would pull a
 dependency and a cluster coupling the minimalism moat forbids (RFC 0014 §3.3) and
 belongs in agentctl. Env in, manifest/status out.
 
 The operator's pod spec injects (conventional names, fixed by this RFC so agentctl
-and agent agree — the one naming contract here):
+and agentd agree — the one naming contract here):
 
 ```yaml
 # agentctl's pod template (lives in agentctl, shown for the contract)
@@ -765,7 +765,7 @@ Rules:
   vars are simply unset and the `identity` fields are absent/`null`. The manifest
   and `agent://status` are valid with `run_id` alone (always present, RFC 0011 §6).
   No env var here is *required*; their absence is never a config error.
-- **Identity is descriptive, never load-bearing.** agent uses these for
+- **Identity is descriptive, never load-bearing.** agentd uses these for
   correlation/labelling only; it makes **no decision** based on `node`/`namespace`
   (no placement, no scheduling — that is agentctl, RFC 0014 §6). This keeps the
   values pure metadata.
@@ -798,14 +798,14 @@ Concretely:
   peer is the host, i.e. the node-agent (§3.3). One trust domain. The operator
   ensures only the trusted node-agent can reach the guest vsock port, exactly as it
   ensures only trusted principals can open the unix socket.
-- **stdio:** a peer reaching agent over stdio is a *parent agent / harness* that
+- **stdio:** a peer reaching agentd over stdio is a *parent agent / harness* that
   spawned it (RFC 0005 §3.6); it gets the **work** profile only — operator tools
   are not listed to it (§3.4). A subagent cannot drain its supervisor.
 
-This is honest minimalism (RFC 0012 §3.8): agent ships **no network-exposed
+This is honest minimalism (RFC 0012 §3.8): agentd ships **no network-exposed
 control surface it cannot secure**. The management surface is reachable only over a
 unix socket (filesystem perms) or vsock (VM boundary) — both confinement
-properties of the *deployment*, not in-band tokens agent would have to validate.
+properties of the *deployment*, not in-band tokens agentd would have to validate.
 A network-exposed (TCP/HTTP) management transport, with the auth model and
 `Origin`/session hardening it requires (RFC 0012 §3.8), is **deferred to RFC 0013**
 and out of scope here.
@@ -828,7 +828,7 @@ does not list the corresponding tool/resource and reports it `false`/absent in
   manages it by liveness + exit codes + logs only (RFC 0014 §7).
 - `vsock` not compiled in → `--serve-mcp vsock:…` is exit 2 (§3.1); `unix:` still
   works. A `vsock`-built binary running with `--serve-mcp unix:…` reports
-  `"management":"unix:/run/agent.sock"` and is fully manageable host-side over the
+  `"management":"unix:/run/agentd.sock"` and is fully manageable host-side over the
   unix socket — vsock is one management transport, not the only one.
 - The metrics/events/hot-reload surfaces off → reported `false` in `surfaces`;
   agentctl reads the manifest and does not attempt those operations.
@@ -861,7 +861,7 @@ agentctl picks per intent (§4.4).
 A spawned subagent therefore cannot discover or invoke `drain`/`lame-duck`/etc.
 against its parent.
 
-**`--capabilities` before connectivity.** `agent --capabilities` never connects,
+**`--capabilities` before connectivity.** `agentd --capabilities` never connects,
 never binds, never spawns; it exits `0` with the static+env view (§5.2). Live
 fields (`intelligence.healthy`, node counts) read as their unknown/zero values.
 This is the admission-time probe and must not have side effects (RFC 0011 §3.3).
@@ -870,14 +870,14 @@ This is the admission-time probe and must not have side effects (RFC 0011 §3.3)
 is not a liveness signal — liveness is the supervisor heartbeat (RFC 0010 §3.7),
 independent of any served connection. agentctl reconnecting after a node-agent
 restart sees the same instance (correlated by `identity.uid`), re-`initialize`s,
-and re-subscribes; agent holds no per-connection durable state (RFC 0011 §7), so
+and re-subscribes; agentd holds no per-connection durable state (RFC 0011 §7), so
 reconnect is a clean re-read.
 
 **Contract-version mismatch.** agentctl reads `contract_version` first; if it does
 not understand the **major**, it refuses to drive the instance (RFC 0014 §3.4) and
-falls back to liveness + exit-code + log management. agent never *rejects* an
+falls back to liveness + exit-code + log management. agentd never *rejects* an
 agentctl on version grounds — it serves the manifest and lets the client decide; a
-newer agentctl drives an older agent within the same major additively.
+newer agentctl drives an older agentd within the same major additively.
 
 **`drain` vs grace.** A `drain` tool call honours the same `AGENT_DRAIN_TIMEOUT`
 < `terminationGracePeriodSeconds` invariant (RFC 0011 §3.3): an optional
@@ -890,14 +890,14 @@ can never push drain past the pod grace and lose the clean `0` exit.
 
 Per RFC 0014 §6, restated for this surface:
 
-- **No Kubernetes anything in agent.** No CRDs, no operator reconcile loop, no
-  `kubectl` plugin, no RBAC, no leader election, no in-cluster client. agent reads
+- **No Kubernetes anything in agentd.** No CRDs, no operator reconcile loop, no
+  `kubectl` plugin, no RBAC, no leader election, no in-cluster client. agentd reads
   four downward-API env vars (§6) and nothing else from the cluster.
 - **No fleet view, no cross-instance aggregation.** `agent://inventory` is
   instance-local; `kubectl agent tree` *across* a fleet is agentctl stitching many
   per-instance inventories (RFC 0014 §6).
 - **No scheduling/placement decisions.** `identity.node`/`namespace` are
-  descriptive metadata; agent makes no placement decision (RFC 0014 §6).
+  descriptive metadata; agentd makes no placement decision (RFC 0014 §6).
 - **No network-exposed (TCP/HTTP) management transport, no auth model.** Deferred
   with the self-MCP-over-HTTP hardening to RFC 0013 (RFC 0012 §3.8). v1 management
   is vsock + unix only.
@@ -906,9 +906,9 @@ Per RFC 0014 §6, restated for this surface:
 - **No `force` tool, no dashboards, no alert rules.** Force is the second signal
   (RFC 0011 §4.3); dashboards/alerts are agentctl over the RFC 0016 metrics.
 - **Provisioning the vsock device / host model service** — the node-agent's job
-  (RFC 0014 §6); agent only binds the CID/port it is given (§3.3).
+  (RFC 0014 §6); agentd only binds the CID/port it is given (§3.3).
 
-agent's contribution is to make each of these **cheap to build** by exposing the
+agentd's contribution is to make each of these **cheap to build** by exposing the
 right primitive — never to implement them.
 
 ---
@@ -921,7 +921,7 @@ right primitive — never to implement them.
   flagged the grace-hint name as an unsettled documentation convention; this RFC
   proposes the whole `AGENT_POD_*`/`AGENT_NODE_NAME` family as the one contract.
   The umbrella (RFC 0014) should ratify this family once so agentctl's pod template
-  and agent's `identity.rs` cannot drift.
+  and agentd's `identity.rs` cannot drift.
 - **`surfaces` schema co-ownership with RFC 0016/0017/0018.** The `surfaces` block
   (§5.2) names fields owned by sibling RFCs (`metrics_schema` → RFC 0016,
   `hot_reload`/`config_validate` → RFC 0017, intelligence detail → RFC 0018). This
@@ -933,16 +933,16 @@ right primitive — never to implement them.
   `1.x`; the umbrella should own the rule that *any* sub-RFC adding a `surfaces`
   key bumps the **minor** (not the major), and pin which changes are major.
 - **vsock CID convention for multi-pod-per-VM.** §3.1 binds `VMADDR_CID_ANY` per
-  process, assuming one agent per guest network namespace. If a future deployment
-  runs multiple agent pods sharing one VM/CID, port allocation becomes the
+  process, assuming one agentd per guest network namespace. If a future deployment
+  runs multiple agentd pods sharing one VM/CID, port allocation becomes the
   node-agent's responsibility (it already provisions the device, §3.3); worth a
   one-line confirmation in the umbrella that port-per-pod is the node-agent's job,
-  not agent's.
+  not agentd's.
 - **`pause` semantics vs reactive subscriptions.** §4.3 pauses agentic loops but
   leaves subscriptions armed (events still arrive, just not processed until
   `resume`). Whether agentctl's `kubectl agent pause` should *also* imply pausing
   subscription routing is a policy call for agentctl; the umbrella should note that
-  agent offers both levers (`pause` for loops, `lame-duck` for readiness) and the
+  agentd offers both levers (`pause` for loops, `lame-duck` for readiness) and the
   composition is agentctl's.
 
 ---

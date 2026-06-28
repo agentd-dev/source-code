@@ -117,7 +117,7 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
 
 #[test]
 fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("llm.sock");
     let mut llm = start_mock_llm(exe, &sock);
@@ -165,7 +165,7 @@ fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
 
 #[test]
 fn subagent_round_trips_ready_then_failed() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let mut tree = Tree::new(Caps::default());
     let node = tree.mint_root().unwrap();
 

@@ -1,10 +1,10 @@
-# agent
+# agentd
 
 **A minimal, MCP-native, reactive agent runtime.** One small Rust binary runs
 **one agent**: hand it an instruction and a single LLM endpoint, and it runs an
 agentic loop — think, call a tool, observe, repeat — until the task reaches a
 terminal status or a new event wakes it. Every tool comes from an **MCP server**
-(agent ships none of its own, save a gated `exec`); it reaches exactly **one**
+(agentd ships none of its own, save a gated `exec`); it reaches exactly **one**
 LLM endpoint; and it reacts to the world through **MCP resource subscriptions**.
 It is built to be a cloud-native unit of work — drop it into a `Job`, a
 `CronJob`, or a long-lived reactive `Deployment`.
@@ -16,18 +16,18 @@ It is built to be a cloud-native unit of work — drop it into a `Job`, a
    fast, idles cheaply, and drops into a container or a microVM. A tiny
    supervisor owns lifecycle and limits and **never talks to the LLM**, so it
    stays robust no matter how the model behaves.
-2. **MCP as the universal interface.** agent has no built-in `fs`/`http`/`shell`
+2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
    tool library. Every capability is an MCP server you declare with `--mcp`.
    One protocol in, one protocol out — tools and resources are all MCP.
-3. **Reactivity via resource subscriptions.** Instead of polling, an agent
+3. **Reactivity via resource subscriptions.** Instead of polling, an agentd
    **idles at near-zero CPU and wakes when an MCP resource it subscribed to
-   changes**. An upstream change is the trigger; an agent can even subscribe
+   changes**. An upstream change is the trigger; an agentd can even subscribe
    itself mid-reasoning to schedule its own future wake.
-4. **Composability by being an MCP server.** agent can serve **its own MCP**
-   (`--serve-mcp`), so one agent is just another tool/resource surface another
-   agent connects to. Agents compose like Unix processes.
+4. **Composability by being an MCP server.** agentd can serve **its own MCP**
+   (`--serve-mcp`), so one agentd is just another tool/resource surface another
+   agentd connects to. agentd instances compose like Unix processes.
 5. **Process-isolated subagents.** A parent spawns a child by re-exec'ing the
-   same binary; agents nest as an OS **process tree**. The reasoning lives in
+   same binary; agentd instances nest as an OS **process tree**. The reasoning lives in
    children the supervisor can `SIGKILL` — a runaway or crashing model is always
    contained, and a narrowed spawn payload keeps each child's context (and trust)
    scoped.
@@ -36,17 +36,17 @@ It is built to be a cloud-native unit of work — drop it into a `Job`, a
 
 ```console
 $ cargo build -p agentd --release
-$ ./target/release/agent --version
-agent 0.1.0
+$ ./target/release/agentd --version
+agentd 0.1.0
 
 # one-shot run: instruction + one LLM endpoint + one MCP server, then exit
-$ ./target/release/agent \
+$ ./target/release/agentd \
     --instruction "Read /data/report.md and write a 3-bullet summary to /data/summary.md" \
     --intelligence unix:/run/intel.sock \
     --mcp "fs=mcp-server-fs --root /data"
 ```
 
-stdout carries the agent's result; stderr carries JSON-lines telemetry; the exit
+stdout carries the agentd's result; stderr carries JSON-lines telemetry; the exit
 code maps the terminal status. Bad config exits `2` in milliseconds, before any
 LLM round-trip. See [docs/getting-started.md](docs/getting-started.md).
 
@@ -54,14 +54,14 @@ LLM round-trip. See [docs/getting-started.md](docs/getting-started.md).
 
 ```console
 # once (default): run to a terminal status, then exit — Job / CLI shape
-$ agent --instruction "..." --intelligence unix:/run/intel.sock --mode once
+$ agentd --instruction "..." --intelligence unix:/run/intel.sock --mode once
 
 # loop: re-enter on a cadence until a bound or a drain signal
-$ agent --instruction "..." --intelligence unix:/run/intel.sock \
+$ agentd --instruction "..." --intelligence unix:/run/intel.sock \
     --mode loop --interval 5m --deadline 24h
 
 # reactive: idle, wake on MCP resource changes (requires >=1 --subscribe)
-$ agent --instruction "..." --intelligence unix:/run/intel.sock \
+$ agentd --instruction "..." --intelligence unix:/run/intel.sock \
     --mode reactive --subscribe "file:///data/inbox"
 ```
 
@@ -70,7 +70,7 @@ prefer an external scheduler firing `--mode once`.)
 
 ## Status
 
-agent is **implemented and shipped.** Config parse + validate, exit codes,
+agentd is **implemented and shipped.** Config parse + validate, exit codes,
 JSON-lines logging, signal handling, the supervisor reactor, the MCP client, the
 intelligence client, the agentic loop, all four run modes, the reactive router,
 subagents (sync + async/detach), and the served self-MCP all run today. The

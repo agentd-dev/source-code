@@ -10,10 +10,10 @@ Type=simple
 Environment=AGENT_INTELLIGENCE=unix:/run/intelligence.sock
 # Secrets via EnvironmentFile (mode 0600), never on the command line or a config
 # file (RFC 0011 §3.2). The file sets AGENT_INTELLIGENCE_TOKEN=...
-EnvironmentFile=/etc/agent/triage.env
-ExecStart=/usr/local/bin/agent \
+EnvironmentFile=/etc/agentd/triage.env
+ExecStart=/usr/local/bin/agentd \
   --mode reactive \
-  --instruction-file /etc/agent/triage.txt \
+  --instruction-file /etc/agentd/triage.txt \
   --model my-model \
   --mcp tickets=mcp-server-tickets \
   --subscribe tickets://queue/inbound \

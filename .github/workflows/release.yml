@@ -44,10 +44,10 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/agent" dist/
+          cp "target/${{ matrix.target }}/release/agentd" dist/
           cd dist
-          tar czf "agent-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" agent
-          rm agent
+          tar czf "agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" agentd
+          rm agentd
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -72,7 +72,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/agent
+          images: ghcr.io/${{ github.repository_owner }}/agentd
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -96,18 +96,18 @@ jobs:
       - name: Sign image (keyless)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/agent@${DIGEST}"
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/agentd@${DIGEST}"
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository_owner }}/agent@${{ steps.build.outputs.digest }}
+          image: ghcr.io/${{ github.repository_owner }}/agentd@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
           upload-release-assets: false
       - name: Attest SBOM
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/${{ github.repository_owner }}/agent@${DIGEST}"
+        run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/${{ github.repository_owner }}/agentd@${DIGEST}"
 
   # Aggregate SHA256 checksums over the released binaries, after they upload.
   checksums:
@@ -123,7 +123,7 @@ jobs:
           mkdir -p dist && cd dist
           gh release download "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
-            --pattern 'agent-*'
+            --pattern 'agentd-*'
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - uses: softprops/action-gh-release@v2

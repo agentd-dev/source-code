@@ -1,15 +1,15 @@
-# RFC 0014: agent as a managed workload — the control-plane (agentctl) contract
+# RFC 0014: agentd as a managed workload — the control-plane (agentctl) contract
 
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
-**Part of:** the agent rewrite — extends the cloud-native contract (RFC 0011); umbrella for RFCs 0015–0019
+**Part of:** the agentd rewrite — extends the cloud-native contract (RFC 0011); umbrella for RFCs 0015–0019
 
 > **A2A alignment (RFC 0020).** A2A-over-vsock joins this track as the mesh's
 > agent↔agent *work* surface, orthogonal to the operator plane and complementary
 > to MCP. The **node-agent is also the A2A gateway** — a dumb HTTP↔vsock transport
 > bridge and policy-enforcement point (TLS/auth/webhooks/durable task history live
-> there, not in agent; RFC 0020 §2–3). The capabilities manifest (§5) is also an
+> there, not in agentd; RFC 0020 §2–3). The capabilities manifest (§5) is also an
 > **A2A Agent Card** projection. RFC 0020 owns the binding; this RFC's core
 > (operator management — provision/scale/observe/config/intelligence) is unchanged.
 
@@ -17,25 +17,25 @@
 
 ## 1. Problem / Context
 
-`agent` is the **data plane**: a single static binary that takes an instruction
+`agentd` is the **data plane**: a single static binary that takes an instruction
 + tools (MCP) + an intelligence endpoint and runs the agentic loop, supervised
 and bounded. A separate project — **`agentctl`** (a CLI, a `kubectl` plugin
 exposing `kubectl agent[s] …`, and a Kubernetes operator) — is the **control
-plane**: it provisions agent instances into a cluster, supplies intelligence by
+plane**: it provisions agentd instances into a cluster, supplies intelligence by
 mounting **vsock** to a host-side model service, scales the fleet, and collects
 monitoring / observes / manages the running instances.
 
 RFC 0011 §1 deliberately scoped the orchestrator **out**: *"composition is MCP,
 not a control plane we own"* (assessment §2.11). This RFC track **does not revoke
-that boundary — it sharpens it.** agent still does not become a control plane,
+that boundary — it sharpens it.** agentd still does not become a control plane,
 does not learn about Kubernetes, CRDs, scheduling, or dashboards, and grows no
 cluster dependency. What it gains is a **clean, frozen, machine-readable contract
-surface** so that an external control plane can drive a *fleet* of agent
+surface** so that an external control plane can drive a *fleet* of agentd
 instances correctly. The asymmetry is the whole design:
 
-> **agent exposes primitives; agentctl owns policy.** Every capability in this
+> **agentd exposes primitives; agentctl owns policy.** Every capability in this
 > track is a primitive (a manifest to read, a resource to subscribe, a metric to
-> scrape, a config to reload, a signal to honour) reachable over agent's
+> scrape, a config to reload, a signal to honour) reachable over agentd's
 > existing transports. The Kubernetes-facing translation — CRDs, the operator
 > reconcile loop, the `kubectl` plugin, autoscalers, Grafana dashboards, alert
 > rules — lives entirely in `agentctl`.
@@ -65,12 +65,12 @@ and indexes the five concrete contracts that follow.
         └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The load-bearing idea is to make **vsock bidirectional**. agent already dials
-*out* over vsock for intelligence (RFC 0006). If agent can also **serve** its
+The load-bearing idea is to make **vsock bidirectional**. agentd already dials
+*out* over vsock for intelligence (RFC 0006). If agentd can also **serve** its
 self-MCP over vsock, then an `agentctl` node-agent DaemonSet manages every agent
 pod on its node host-side, over vsock, for both control and telemetry — and the
 agent pod can run with **no cluster networking at all** (vsock-out for the model,
-vsock-in for management). That is the strongest isolation posture agent can
+vsock-in for management). That is the strongest isolation posture agentd can
 offer and the natural backend for `kubectl agent`. Cluster-network serving (TCP /
 Streamable-HTTP, RFC 0013) remains an alternative transport for the same surface,
 not a precondition.
@@ -79,9 +79,9 @@ not a precondition.
 
 ## 3. Decision — four principles
 
-1. **Primitives, not policy.** agent ships read/subscribe/reload/signal
+1. **Primitives, not policy.** agentd ships read/subscribe/reload/signal
    primitives. agentctl composes them into reconciliation, scaling, and UX. No
-   Kubernetes concept enters agent.
+   Kubernetes concept enters agentd.
 
 2. **Reuse MCP; invent no new protocol.** The management surface is a *profile*
    of the existing self-MCP (RFC 0005) — more `agent://` resources and a small
@@ -110,10 +110,10 @@ not a precondition.
 |---|---|---|
 | **0015** Management & control surface | `--serve-mcp vsock:PORT`; the operator MCP profile (`agent://capabilities` / `inventory` / `events`; tools `drain`, `lame-duck`, `pause`/`resume`, `cancel`, `attach`→`subagent.send`); instance identity from the downward API | the backend for `kubectl agent <x> describe / tree / logs / attach / drain` over vsock |
 | **0016** Telemetry & lifecycle contract | the **frozen** Prometheus metrics schema, the versioned exit-code table (extends RFC 0011 §5 / RFC 0010), machine-readable run-outcome reports, the `agent://events` stream, and stuck-detector → `/healthz` liveness | standard dashboards, alert rules, `podFailurePolicy`, cost/quota aggregation, `kubectl agents results/top` |
-| **0017** Declarative config & hot reload | a declarative config file (lands the RFC 0011/0013 file layer), `agent --validate-config` + a JSON-schema export, `SIGHUP`/file-watch **hot reload** (MCP servers / subscriptions / model), file-based secret refs | ConfigMap-driven, admission-validated, restart-free reconfiguration |
+| **0017** Declarative config & hot reload | a declarative config file (lands the RFC 0011/0013 file layer), `agentd --validate-config` + a JSON-schema export, `SIGHUP`/file-watch **hot reload** (MCP servers / subscriptions / model), file-based secret refs | ConfigMap-driven, admission-validated, restart-free reconfiguration |
 | **0018** Intelligence transport resilience | multi-endpoint failover (`--intelligence vsock:a,vsock:b`), endpoint health as a metric/resource, **runtime model/endpoint hot-swap**, an optional model-discovery handshake | survive a host model-service move/upgrade with no restart; model-aware placement |
 | **0019** Horizontal scaling | work-**claim/lease** on reactive events (so N replicas don't double-process), `--shard K/N` partitioning, the autoscaling signal set, an optional warm-pool/standby mode | KEDA/HPA-driven horizontal scale of reactive workers; warm fast-start |
-| **0020** A2A interop over vsock | A2A served over vsock (manifest = Agent Card; a run = a Task), with the node-agent acting as a dumb HTTP↔vsock bridge + PEP (TLS/auth/SSE/webhooks/durable history) | the node-agent becomes the on-node **A2A gateway**; agent is a first-class agent in the mesh, carrying no HTTP/auth/persistence |
+| **0020** A2A interop over vsock | A2A served over vsock (manifest = Agent Card; a run = a Task), with the node-agent acting as a dumb HTTP↔vsock bridge + PEP (TLS/auth/SSE/webhooks/durable history) | the node-agent becomes the on-node **A2A gateway**; agentd is a first-class agent in the mesh, carrying no HTTP/auth/persistence |
 
 **Durability / checkpoint-restore** for long-lived stateful fleet agents (resume
 a warm session/run after a pod reschedule, rather than re-trigger idempotently)
@@ -127,7 +127,7 @@ but does not pull it forward.
 
 Everything in this track hangs off one primitive — a **machine-readable
 capabilities manifest** an agent instance reports, both as a one-shot
-(`agent --capabilities` → stdout JSON, exits 0) and as a live resource
+(`agentd --capabilities` → stdout JSON, exits 0) and as a live resource
 (`agent://capabilities` over the served self-MCP). It is how agentctl discovers
 what an instance is, what it can do, and which contract versions it speaks:
 
@@ -169,11 +169,11 @@ A thing is **defined once**, by its owning RFC; others **name** it and defer.
 
 | Surface | Owner | Others |
 |---|---|---|
-| Management transport (`--serve-mcp vsock:PORT`), the operator tool/resource **namespace** (every `agent://…` operator resource and operator tool — incl. any `work.*`/`assign`/`reload` verb agent *exposes*), the **capabilities-manifest schema**, instance identity, `PeerOrigin` gating | **0015** | sub-RFCs register new operator tools/resources by referencing 0015's namespace, never a parallel surface |
+| Management transport (`--serve-mcp vsock:PORT`), the operator tool/resource **namespace** (every `agent://…` operator resource and operator tool — incl. any `work.*`/`assign`/`reload` verb agentd *exposes*), the **capabilities-manifest schema**, instance identity, `PeerOrigin` gating | **0015** | sub-RFCs register new operator tools/resources by referencing 0015's namespace, never a parallel surface |
 | The **frozen metric set** (every metric name/label/HELP), the **exit-code contract** framing around RFC 0011 §5, **run-outcome reports**, `agent://events` | **0016** | other RFCs *name* a metric they emit; its definition lives in 0016 |
 | The **config-file schema**, `--validate-config` / `--config-schema`, the **hot-reload** mechanism + the **reloadable-field allowlist**, file-based secret refs | **0017** | 0018 adds `intelligence`/`model` to the allowlist by reference |
 | Intelligence multi-endpoint / failover / health / hot-swap / model-discovery | **0018** | — |
-| Work-claim/lease + shard **semantics**, autoscaling **intent** | **0019** | metrics it scales on are defined in 0016; `work.*` are conventions on the *coordination* MCP server (agent participates), not a server agent runs |
+| Work-claim/lease + shard **semantics**, autoscaling **intent** | **0019** | metrics it scales on are defined in 0016; `work.*` are conventions on the *coordination* MCP server (agentd participates), not a server agentd runs |
 
 ### 6.2 `surfaces{}` is the single discovery point
 
@@ -199,7 +199,7 @@ mechanism. Its keys and owners: `management`,`operator_tools` (0015); `metrics`,
 
 ### 6.4 The Kubernetes env convention (downward API, read-only)
 
-agent reads these from the environment **only** — `valueFrom.fieldRef` the
+agentd reads these from the environment **only** — `valueFrom.fieldRef` the
 operator injects — and **never** calls the kube API (no client, no in-cluster
 config, no service-account read). All optional; descriptive, not load-bearing.
 
@@ -227,9 +227,9 @@ config file never carries a credential (RFC 0011, RFC 0012).
 - Dashboards, alert-rule definitions, long-term metric/trace storage.
 - Cross-instance aggregation, fleet-wide views, a fleet control database.
 - Provisioning the vsock device / host model service (the node-agent's job);
-  agent only *uses* the vsock CID/port it is given.
+  agentd only *uses* the vsock CID/port it is given.
 
-agent's contribution is to make each of those **cheap to build** by exposing the
+agentd's contribution is to make each of those **cheap to build** by exposing the
 right primitive — never to implement them.
 
 ---
@@ -237,11 +237,11 @@ right primitive — never to implement them.
 ## 8. Rollout & compatibility
 
 - The track is **purely additive** and entirely behind existing/!new feature
-  gates; a default `agent` build is unchanged, and an instance that ships none
+  gates; a default `agentd` build is unchanged, and an instance that ships none
   of the control-plane surfaces simply reports them `false` in its manifest, so
   agentctl degrades gracefully (it manages what it can: liveness + exit codes +
   logs, exactly as today).
-- `contract_version` starts at **1.0** and moves additively; agentctl and agent
+- `contract_version` starts at **1.0** and moves additively; agentctl and agentd
   negotiate on it. The metrics schema and exit-code table version independently
   but are surfaced in the manifest (§5) so a scraper/dashboard can branch.
 - Each sub-RFC lands independently in milestone order (RFC 0015 first — it

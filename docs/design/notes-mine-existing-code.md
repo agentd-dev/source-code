@@ -1,11 +1,11 @@
-# Salvage notes: mining the retired bounded-workflow `agent` for the MCP-native rewrite
+# Salvage notes: mining the retired bounded-workflow `agentd` for the MCP-native rewrite
 
 **Status:** Design artifact (input to RFC 0001 implementation).
 **Date:** 2026-06-25.
 **Scope:** `/root/agentd-dev/source-code/crates/agentd/src` — the retired
 bounded-workflow-DAG runtime, treated as a *parts bin*. Target design is
 `rfcs/0001-mcp-native-agent-runtime.md` (minimal, dependency-light, Rust,
-MCP-native, reactive, process-tree subagents, agent-as-MCP-server).
+MCP-native, reactive, process-tree subagents, agentd-as-MCP-server).
 
 Verdict legend:
 - **KEEP-AS-IS** — lift the file/module nearly verbatim; only drop the
@@ -259,7 +259,7 @@ are precise salvage points the new MCP-server-over-HTTP transport (RFC §8,
   Content-Length body, with `MAX_HEADERS_BYTES` (16 KiB) and
   `MAX_BODY_BYTES` (1 MiB) caps and the 431/413 responses, plus the
   `silent_close` idle-timeout signal. This is a clean, hardened, std-only
-  HTTP request reader. **Lift it** as the basis for serving agent's own
+  HTTP request reader. **Lift it** as the basis for serving agentd's own
   MCP over HTTP/SSE and for a trivial `/healthz`.
 - **The accept loop + graceful-drain machinery** (`spawn`, `ServerHandle`,
   `InFlightGuard`, `shutdown_and_drain`, lines 166-233, 411-565) — the
@@ -268,7 +268,7 @@ are precise salvage points the new MCP-server-over-HTTP transport (RFC §8,
   (not the route/TLS/auth-laden specifics).
 - **`/healthz` handler** (lines 656-664) — trivial, keep the idea.
 - `parse_urlencoded` / `parse_multipart` / `percent_decode` (lines
-  1365-1506) — only relevant if agent's self-MCP ever accepts webhook
+  1365-1506) — only relevant if agentd's self-MCP ever accepts webhook
   bodies; for v1 (JSON-RPC/SSE MCP transport) **DROP**.
 - **DROP entirely:** routing-to-workflow, auth, rate limit, idempotency
   store, TLS hot-reload, `respond`-node handling, `/metrics`-from-engine.
@@ -290,7 +290,7 @@ This is the **closest existing analogue to the new agentic loop (RFC
   subagent process* talking up a control channel.
 - The tool surface is a hard-coded six-tool `ToolBroker` (lines 414-548)
   with policy gates. The new loop's tools are **entirely the scoped MCP
-  catalogue + agent self-tools** — no built-in broker. So the broker is
+  catalogue + agentd self-tools** — no built-in broker. So the broker is
   **DROP**, but its *shape* (route a named tool call, capture result-or-
   error JSON, append to transcript) is the template.
 - It uses a homegrown `{"action":...}` JSON protocol parsed from prose.
@@ -578,4 +578,4 @@ notification routing + subscribe), (2) the supervised subagent **process
 tree** (spawn/scope/control/reap/depth-limit), (3) the supervisor↔subagent
 **control channel** (length-framed JSON-RPC, lifting `read_frame`/
 `write_frame`), (4) **native tool-calling** in the intelligence request/
-response, and (5) agent serving its **own MCP server**.
+response, and (5) agentd serving its **own MCP server**.

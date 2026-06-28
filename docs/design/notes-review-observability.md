@@ -50,7 +50,7 @@ RFC 0001 has three properties that dominate the observability design, and they a
 not the usual web-service properties:
 
 - **It is a process tree, not a thread pool.** The unit of intelligence is a child
-  *process* (`agent` re-exec'd, RFC §4.2), nesting to a supervised tree (§6.3).
+  *process* (`agentd` re-exec'd, RFC §4.2), nesting to a supervised tree (§6.3).
   Correlation therefore has to survive a **process boundary** and reconstruct a
   *tree*, not just a request. `ps`/`pstree` already show the OS tree; our job is to
   make the *logs* reassemble the same tree off-box.
@@ -59,7 +59,7 @@ not the usual web-service properties:
   limits, triggers, subscriptions, drain), and the subagent's telemetry is about
   *reasoning* (loop steps, tool calls, tokens). These are two different schemas and
   should be labeled as such (`comp: "supervisor"` vs `comp: "agent"`).
-- **It is reactive and long-idle.** A reactive agent (§5.3) spends most of its life
+- **It is reactive and long-idle.** A reactive agentd (§5.3) spends most of its life
   asleep, subscribed to MCP resources, doing *nothing*. "Healthy and idle" must be
   distinguishable from "hung," and "woke on a resource update" must be a
   first-class, traceable event. This is the single biggest difference from a normal
@@ -80,7 +80,7 @@ Everything below is shaped by those three facts.
   non-trivial dependency cone (`tracing-core`, `sharded-slab`, `thread_local`,
   `nu-ansi-term`/`matchers`/`regex` via the env-filter, etc.). It is excellent and
   idiomatic, but it is **designed for an async, in-process, many-threaded** world.
-  `agent` is deliberately *processes + a few threads* (§12: "no async runtime").
+  `agentd` is deliberately *processes + a few threads* (§12: "no async runtime").
   We do not get the payoff that justifies `tracing`'s weight.
 - The thing `tracing` buys you — span context plumbed implicitly through async tasks
   — we get **for free from the process tree**: a subagent's span context is just its
@@ -108,8 +108,8 @@ just do that injection by hand from `LogCtx` instead of via an SDK.
 
 A hard rule for a good cloud-native citizen and for one-shot CLI ergonomics:
 
-- **stdout = the agent's *answer* only** (the final result of a one-shot run, or the
-  control-channel JSON when in subagent mode). This keeps `agent --instruction … |
+- **stdout = the agentd's *answer* only** (the final result of a one-shot run, or the
+  control-channel JSON when in subagent mode). This keeps `agentd --instruction … |
   jq` clean and keeps the result machine-parseable.
 - **stderr = all structured telemetry** (every log line / event). Log collectors in
   K8s capture both streams anyway; separating them means a human or a pipe gets the
@@ -190,7 +190,7 @@ Keep it a small, closed, dotted vocabulary. Proposed v1 set:
   content capture on). **(maps to GenAI `execute_tool`)**
 - `tool.result` — fields: `server`, `tool`, `call_id`, `ok`, `dur_ms`,
   `result_bytes` (`result` only if content capture on).
-- `loop.final` — agent produced its result; fields: `step`, `result_status`,
+- `loop.final` — agentd produced its result; fields: `step`, `result_status`,
   `result_bytes`.
 - `loop.error` — fields: `err`, `step`.
 
@@ -223,10 +223,10 @@ Health is **mode-specific** here, which most designs get wrong by assuming a ser
 |---|---|---|---|
 | **one-shot** (§5.1) | Implicit; the run is the readiness. | n/a (bounded). | **exit code** is the entire health signal. |
 | **loop/interval** (§5.2) | Config parsed, MCP connected, first tick armed → `proc.ready`. | Heartbeat advances each tick; watchdog if a tick overruns its deadline. | exit code on terminate. |
-| **reactive** (§5.3) | Subscriptions established (`resources/subscribe` ACKed) → `proc.ready`. | **Hard part:** the agent is *supposed* to be idle. Liveness = "the supervisor's event loop is still pumping and subscriptions are still live," **not** "work is happening." | exit code on terminate. |
+| **reactive** (§5.3) | Subscriptions established (`resources/subscribe` ACKed) → `proc.ready`. | **Hard part:** the agentd is *supposed* to be idle. Liveness = "the supervisor's event loop is still pumping and subscriptions are still live," **not** "work is happening." | exit code on terminate. |
 
 The reactive row is why liveness must be measured at the **supervisor event loop**,
-not at the agent. A healthy reactive agent can be idle for hours; that is success,
+not at the agent. A healthy reactive agentd can be idle for hours; that is success,
 not a hang. So:
 
 - **Liveness** = the supervisor heartbeat (a monotonically increasing counter +
@@ -355,17 +355,17 @@ and `baggage`** ([MCP RC](https://blog.modelcontextprotocol.io/posts/2026-07-28-
 A trace that starts upstream "can follow a tool call through the client SDK, the MCP
 server, and whatever the server calls downstream, and show up as a single span tree."
 
-This is a gift to `agent`'s design: **trace propagation into tools is now a protocol
+This is a gift to `agentd`'s design: **trace propagation into tools is now a protocol
 feature, not something we invent.** And the same RC **deprecates MCP's own `logging`
 capability in favor of stderr + OpenTelemetry** — which validates our default
 (stderr JSON) and our gated `otel` path as exactly the two halves the ecosystem
 chose.
 
-### 5.2 What `agent` propagates, and where
+### 5.2 What `agentd` propagates, and where
 
 Even in the **default (no-otel) build**, do the cheap half of context propagation:
 
-- **Ingest.** If a `traceparent` arrives — on an inbound MCP request to `agent`'s
+- **Ingest.** If a `traceparent` arrives — on an inbound MCP request to `agentd`'s
   self-MCP server (§8), or via `AGENT_TRACEPARENT` env when an orchestrator starts
   the pod — adopt its `trace_id` and use the incoming `span_id` as `parent_span_id`.
   If none arrives, **mint a `trace_id` per `run_id`** so the run is self-correlated.
@@ -373,7 +373,7 @@ Even in the **default (no-otel) build**, do the cheap half of context propagatio
   `resources/*`, set `_meta.traceparent` (+ `tracestate`/`baggage`) to the current
   span. This is *just two JSON fields in a frame we already build* — essentially free
   and worth doing always, because it makes downstream MCP servers' traces line up
-  even if `agent` itself only logs.
+  even if `agentd` itself only logs.
 - **Propagate to intelligence.** On the LLM HTTP call, set the standard
   `traceparent` HTTP header. Same near-zero cost.
 - **Propagate to subagents.** The spawn payload (§6.2) carries the parent's
@@ -408,9 +408,9 @@ Metrics in the otel build follow the conventions too: the **required**
 supervisor's spawn/limit/stuck spans are `agent`-namespaced custom spans nested
 under the GenAI ones.
 
-**Important nuance — capture, don't double-instrument.** `agent` is an MCP *client*.
+**Important nuance — capture, don't double-instrument.** `agentd` is an MCP *client*.
 The MCP server on the other side may *also* emit `execute_tool`/MCP spans. To avoid
-duplicate spans, `agent` instruments the **client side of the tool call** (the
+duplicate spans, `agentd` instruments the **client side of the tool call** (the
 `execute_tool` span representing "I called this tool and waited") and *propagates*
 context so the server's own spans (if any) nest underneath — exactly the SEP-414
 single-span-tree model. The conventions explicitly anticipate this layering.
@@ -418,7 +418,7 @@ single-span-tree model. The conventions explicitly anticipate this layering.
 ### 5.4 Export mechanics (otel feature only)
 
 - **OTLP/HTTP** (protobuf or JSON) to a collector endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT`.
-  Prefer pushing to a **local collector / sidecar** so `agent` itself stays thin and
+  Prefer pushing to a **local collector / sidecar** so `agentd` itself stays thin and
   doesn't need batching/retry sophistication. This mirrors RFC §7.2's "terminate
   complexity at the sidecar" pattern.
 - Implementation may legitimately use `tracing` + `tracing-opentelemetry` + the OTel
@@ -434,7 +434,7 @@ RFC already passes a structured spawn payload over the control channel (§6.2).
 
 ### 6.1 The correlation contract carried at spawn
 
-When the supervisor (or a parent agent via `subagent.spawn`, §8) launches a child,
+When the supervisor (or a parent agentd via `subagent.spawn`, §8) launches a child,
 the spawn payload — alongside instruction/context/scope/limits — carries a
 **`telemetry` block**:
 
@@ -468,7 +468,7 @@ Two viable wirings; recommend **(A) for K8s, (B) available for nesting depth**:
 - **(A) Child writes its own stderr.** Each subagent writes JSON lines directly to
   *its* stderr, which the container runtime/collector already captures. Because every
   line self-identifies (`run_id`/`agent_path`/`trace_id`), no aggregation in
-  `agent` is needed. Cleanest for a cloud-native collector; the supervisor never
+  `agentd` is needed. Cleanest for a cloud-native collector; the supervisor never
   becomes a logging bottleneck.
 - **(B) Child telemetry framed up the control channel.** Telemetry events also ride
   the existing event stream the child sends its parent (§6.1 "every loop turn streams
@@ -548,7 +548,7 @@ hand-rolled JSON logger and the file/exit-code health.
    (§2.3) is *ours* and stable regardless. Gate the experimental opt-in explicitly.
 2. **Token accounting source of truth.** Tokens come from the intelligence response
    (`usage`), but a normalising gateway (RFC §7.2) may reshape it. Decide that
-   `agent` reads usage from the *normalised* gateway response and logs `0`/`null`
+   `agentd` reads usage from the *normalised* gateway response and logs `0`/`null`
    (not a guess) when absent — never estimate, to keep `tokens_total` trustworthy.
 3. **Content-capture redaction completeness.** Even with `--log-content`, secrets in
    tool args (e.g. a token passed to an MCP tool) must be redacted. Needs an explicit

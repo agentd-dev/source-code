@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-AGENTD="${AGENTD:-agent}"
+AGENTD="${AGENTD:-agentd}"
 
 export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-unix:/run/intel.sock}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
@@ -31,6 +31,6 @@ exec "$AGENTD" \
   --subscribe "inbox:///items/new" \
   --max-steps 25 \
   --max-tokens 2000000 \
-  --health-file /run/agent/health \
+  --health-file /run/agentd/health \
   --drain-timeout 25s \
   --log-level info

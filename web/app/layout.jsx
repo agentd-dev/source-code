@@ -3,14 +3,14 @@ import Link from "next/link";
 
 export const metadata = {
   metadataBase: new URL("https://agentd.dev"),
-  title: "agent — a small, cloud-native AI agent runtime, MCP-native",
+  title: "agentd — a small, cloud-native AI agent runtime, MCP-native",
   description:
-    "agent is a minimal, MCP-native, reactive agent runtime: one static binary " +
+    "agentd is a minimal, MCP-native, reactive agent runtime: one static binary " +
     "that takes an instruction and tools from MCP servers and runs the agentic " +
     "loop — as a one-shot, a daemon, or a reactive service. Supervised, bounded, " +
     "observable. ~1.3 MB, 3 dependencies, k8s-ready.",
   keywords: [
-    "agent",
+    "agentd",
     "MCP",
     "Model Context Protocol",
     "AI agent",
@@ -21,7 +21,7 @@ export const metadata = {
     "Rust",
   ],
   openGraph: {
-    title: "agent — a small, cloud-native AI agent runtime",
+    title: "agentd — a small, cloud-native AI agent runtime",
     description:
       "An instruction + tools from MCP + one static binary. Run the agentic loop as a one-shot, a daemon, or a reactive service.",
     type: "website",
@@ -34,7 +34,7 @@ function Nav() {
     <header className="sticky top-0 z-40 border-b border-[var(--line)] bg-[var(--bg)]/80 backdrop-blur">
       <nav aria-label="primary" className="mx-auto flex max-w-5xl items-center gap-6 px-4 py-3 text-sm">
         <Link href="/" className="font-bold text-[var(--fg-strong)]">
-          agent<span className="text-[var(--dim)]">@</span>
+          agentd<span className="text-[var(--dim)]">@</span>
           <span className="text-[var(--green)]">~</span>
         </Link>
         <Link href="/#mcp" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
@@ -66,7 +66,7 @@ function Footer() {
       <div className="mx-auto flex max-w-5xl flex-col gap-4 px-4 py-10 text-xs text-[var(--dim)] sm:flex-row sm:items-center sm:justify-between">
         <div>
           <span className="text-[var(--green)]">$</span>{" "}
-          <span className="text-[var(--fg)]">agent</span> — a minimal, MCP-native, reactive agent
+          <span className="text-[var(--fg)]">agentd</span> — a minimal, MCP-native, reactive agent
           runtime · MIT
         </div>
         <div className="flex gap-5">

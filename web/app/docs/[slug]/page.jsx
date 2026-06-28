@@ -10,7 +10,7 @@ export function generateStaticParams() {
 export async function generateMetadata({ params }) {
   const { slug } = await params;
   const doc = DOCS.find((d) => d.slug === slug);
-  return { title: `agent docs — ${doc ? doc.title : slug}` };
+  return { title: `agentd docs — ${doc ? doc.title : slug}` };
 }
 
 // Map markdown links to the right destination: a `*.md` doc the site hosts → its

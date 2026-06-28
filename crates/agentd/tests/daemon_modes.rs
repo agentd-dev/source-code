@@ -21,7 +21,7 @@ fn sigterm(pid: u32) {
 #[test]
 #[cfg(unix)]
 fn loop_mode_fires_runs_then_drains_to_exit_0_on_sigterm() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let mut child = Command::new(exe)
         .args([
             "--mode",
@@ -80,7 +80,7 @@ fn loop_mode_fires_runs_then_drains_to_exit_0_on_sigterm() {
 fn reactive_mode_drains_to_exit_0_on_sigterm() {
     // The reactive daemon must, on SIGTERM, stop accepting work, unsubscribe,
     // and exit 0 — the same cloud-native drain contract as loop/schedule.
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
     let mut child = Command::new(exe)
         .args([
@@ -133,7 +133,7 @@ fn reactive_mode_drains_to_exit_0_on_sigterm() {
 #[test]
 #[cfg(unix)]
 fn daemon_writes_a_live_health_file() {
-    let exe = env!("CARGO_BIN_EXE_agent");
+    let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
     let hf = dir.path().join("health.json");
 

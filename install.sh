@@ -1,5 +1,5 @@
 #!/bin/sh
-# agent installer — https://agentd.dev/install.sh
+# agentd installer — https://agentd.dev/install.sh
 #
 #   curl -fsSL https://agentd.dev/install.sh | sh
 #
@@ -17,8 +17,8 @@ set -eu
 REPO="agentd-dev/source-code"
 API="https://api.github.com/repos/${REPO}/releases"
 
-say()  { printf '\033[1magent\033[0m %s\n' "$*"; }
-fail() { printf '\033[1magent\033[0m error: %s\n' "$*" >&2; exit 1; }
+say()  { printf '\033[1magentd\033[0m %s\n' "$*"; }
+fail() { printf '\033[1magentd\033[0m error: %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || fail "required tool '$1' not found"; }
 need uname
@@ -50,7 +50,7 @@ case "$OS" in
       *) fail "unsupported macOS arch '$ARCH' (Apple Silicon only today; build from source: cargo build --release -p agentd)" ;;
     esac ;;
   MINGW*|MSYS*|CYGWIN*|Windows_NT)
-    fail "on Windows, grab agent-<version>-x86_64-pc-windows-msvc.zip from https://github.com/${REPO}/releases" ;;
+    fail "on Windows, grab agentd-<version>-x86_64-pc-windows-msvc.zip from https://github.com/${REPO}/releases" ;;
   *)
     fail "unsupported OS '$OS'; build from source: cargo build --release -p agentd" ;;
 esac
@@ -63,7 +63,7 @@ else
   [ "$VERSION" ] || fail "could not resolve the latest release tag"
 fi
 
-ASSET="agent-${VERSION}-${TARGET}.tar.gz"
+ASSET="agentd-${VERSION}-${TARGET}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
 
 # --- download + unpack -------------------------------------------------------
@@ -73,10 +73,10 @@ trap 'rm -rf "$TMP"' EXIT
 say "downloading ${ASSET} ..."
 fetch_to "$URL" "$TMP/$ASSET" || fail "download failed: $URL"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
-[ -x "$TMP/agent" ] || fail "archive did not contain an executable 'agent'"
+[ -x "$TMP/agentd" ] || fail "archive did not contain an executable 'agentd'"
 
 # Smoke-check the binary actually runs on this machine.
-"$TMP/agent" --version >/dev/null 2>&1 || fail "downloaded binary failed to execute"
+"$TMP/agentd" --version >/dev/null 2>&1 || fail "downloaded binary failed to execute"
 
 # --- install -----------------------------------------------------------------
 DIR="${AGENT_INSTALL_DIR:-}"
@@ -89,15 +89,15 @@ if [ -z "$DIR" ]; then
   fi
 fi
 
-install -m 0755 "$TMP/agent" "$DIR/agent" 2>/dev/null || {
-  cp "$TMP/agent" "$DIR/agent" && chmod 0755 "$DIR/agent"
+install -m 0755 "$TMP/agentd" "$DIR/agentd" 2>/dev/null || {
+  cp "$TMP/agentd" "$DIR/agentd" && chmod 0755 "$DIR/agentd"
 }
 
-say "installed $("$DIR/agent" --version | head -1) to ${DIR}/agent"
+say "installed $("$DIR/agentd" --version | head -1) to ${DIR}/agentd"
 
 case ":$PATH:" in
   *":$DIR:"*) : ;;
   *) say "note: ${DIR} is not on your PATH — add: export PATH=\"${DIR}:\$PATH\"" ;;
 esac
 
-say "next: agent --help · docs: https://agentd-dev.github.io/source-code/"
+say "next: agentd --help · docs: https://agentd-dev.github.io/source-code/"

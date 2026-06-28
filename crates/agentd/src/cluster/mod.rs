@@ -9,9 +9,13 @@
 //!     (RFC 0019 §9), gated behind serve-mcp like the other served resources.
 //!
 //! The work-claim / lease convention (§3) is the cross-instance-ownership half of
-//! this feature (RFC 0015 §5.6 froze the `work.*` contract): see [`claim`].
-//! Standby mode (§7) and the mock work-server are a separate follow-up — this
-//! module does not build them.
+//! this feature (RFC 0015 §5.6 froze the `work.*` contract): see [`claim`] — both
+//! spawn-claim and continue-claim are wired into the reactor. Standby (§7) is also
+//! built (a claim-pull route over an assignment channel, in `config`/`triggers`).
+//! The only deferred bits are the `claim.style=resource` CAS path (a documented
+//! stub — the CAS wire contract isn't frozen) and a standby warm-child pool; the
+//! mock work-server used to conformance-test the convention lives in the
+//! `agentd-conformance` crate, not here.
 
 pub mod claim;
 pub mod shard;

@@ -45,8 +45,11 @@ events = ["serve-mcp"]
 # Horizontal scaling (RFC 0019): `--shard K/N` partitioning + the autoscaling
 # signal set + the agentd://capacity read surface. Dependency-free — the shard
 # predicate is a hand-rolled FNV-1a (no hashbrown/siphash/sha2), pure CPU; the
-# capacity resource rides serve-mcp (gated like events/intelligence). Claim/lease
-# + standby are DEFERRED (RFC 0019 §12), so neither is built here.
+# capacity resource rides serve-mcp (gated like events/intelligence). Also the
+# work-claim/lease cross-instance ownership (RFC 0015 §5.6 work.* contract; spawn-
+# AND continue-claim) + standby (a claim-pull assignment channel). The only
+# deferred bits: the claim.style=resource CAS path (a documented stub) and a
+# standby warm-child pool.
 cluster = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []

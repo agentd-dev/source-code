@@ -504,7 +504,8 @@ mod imp {
         // --- RFC 0019 §5.1: horizontal-scaling signals ----------------------
         // `agentd_saturation` is stored as basis points (0..=10000) and rendered
         // as a float in [0,1]. `agentd_shard_skipped_total` counts out-of-shard
-        // drops; `agentd_claims_lost_total` is frozen-but-unfed (claim is deferred).
+        // drops; `agentd_claims_lost_total` is fed by the claim gate (work-claim
+        // ships) alongside the granted/released counters.
         saturation_bp: AtomicU64,
         pub(super) shard_skipped: AtomicU64,
         pub(super) claims_lost: AtomicU64,
@@ -1213,7 +1214,7 @@ mod imp {
         #[test]
         fn horizontal_scaling_signals_render() {
             // RFC 0019 §5.1: saturation (float [0,1]), shard-skip counter, and the
-            // frozen-but-unfed claims-lost counter.
+            // claims-lost counter (fed by the claim gate).
             let r = Registry::new();
             // 35/64 in-flight → 5468 bp → 0.5468 (basis-point granularity).
             r.set_saturation(35, 64);

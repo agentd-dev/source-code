@@ -23,47 +23,67 @@ class.
 
 Every flag and env var on this page is taken verbatim from
 [`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agentd --help`).
-If a flag is not in `--help`, it does not exist in v1.
+If a flag is not in `--help`, it does not exist. See
+[`configuration.md`](configuration.md) for the **complete** flag/env reference,
+the config-file schema, and the reloadable-vs-restart-only partition.
 
 ---
 
 ## The config surface you will actually use
 
-Precedence, top wins: **built-in default < env var < CLI flag** (a config-file
-layer slots between default and env in a later milestone). Everything is
-env-settable; **secrets are env/flag only, never a file** (RFC 0011 §3.2).
+Precedence, top wins: **built-in default < config file < env var < CLI flag**.
+The config file (`--config`/`AGENTD_CONFIG`) is **live** (RFC 0017) — a local JSON
+document for structural config (MCP inventory, subscriptions, limits, the
+intelligence endpoint list + headers). Everything else is env-settable;
+**secrets are env/flag/mounted-file only, never inline in the config file**
+(RFC 0011 §3.2; the file may carry `{{secret:NAME}}` / `{{secret-file:PATH}}`
+*references*).
 
 | Concern | Env | Flag |
 |---|---|---|
 | Instruction | `INSTRUCTION` | `--instruction <TEXT>` / `--instruction-file <PATH>` |
-| Intelligence transport | `AGENTD_INTELLIGENCE` | `--intelligence unix:/… │ https://… │ vsock:cid:port` |
-| Intelligence creds | `AGENTD_INTELLIGENCE_TOKEN` | `--intelligence-token <T>` |
-| Model | `AGENTD_MODEL` | `--model <NAME>` |
+| Config file | `AGENTD_CONFIG` | `--config <PATH>` |
+| Intelligence list | `AGENTD_INTELLIGENCE` | `--intelligence unix:/… │ https://… │ vsock:cid:port` (comma-list = failover) |
+| Intelligence creds | `AGENTD_INTELLIGENCE_TOKEN` / `…_FILE`, `…_<N>` / `…_<N>_FILE` | `--intelligence-token <T>` / `--intelligence-token-file <PATH>` |
+| Model / swap policy | `AGENTD_MODEL` / `AGENTD_MODEL_SWAP` | `--model <NAME>` / `--model-swap finish-on-old│restart-turn` |
 | MCP server | — | `--mcp name=command …` (repeatable, stdio) |
-| Serve self-MCP | `AGENTD_SERVE_MCP` | `--serve-mcp unix:/…` |
+| Serve self-MCP | `AGENTD_SERVE_MCP` | `--serve-mcp unix:/… │ vsock:PORT │ vsock:CID:PORT` (`serve-mcp` feat.) |
+| A2A peer | `AGENTD_A2A_PEER` | `--a2a-peer name=endpoint` (repeatable; `a2a` feat.) |
 | Enable exec tool | `AGENTD_ENABLE_EXEC` | `--enable-exec` |
 | Mode | `AGENTD_MODE` | `--mode once│loop│reactive│schedule` |
-| Subscriptions | — | `--subscribe <uri>` (repeatable; reactive) |
-| Interval | — | `--interval <dur>` (loop/schedule) |
+| Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
+| Interval / cron | `AGENTD_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
+| **Sharding** | `AGENTD_SHARD`, `AGENTD_SHARD_TIMER` | `--shard K/N` (`cluster` feat.) |
+| **Work-claim** | `AGENTD_CLAIM_TTL`, `AGENTD_CLAIM_RENEW_FRACTION` | `--claim <uri>=<srv>[:tool]`, `--claim-ttl`, `--claim-renew-fraction` (`cluster` feat.) |
+| **Standby** | `AGENTD_STANDBY`, `AGENTD_ASSIGN_FROM`, `AGENTD_WARM_INTEL` | `--standby`, `--assign-from <srv>:<uri>` (`cluster` feat.) |
 | Max steps | `AGENTD_MAX_STEPS` | `--max-steps <N>` (default 50) |
 | Max tokens | `AGENTD_MAX_TOKENS` | `--max-tokens <N>` (default 200000) |
 | Deadline | `AGENTD_DEADLINE` | `--deadline <dur>` (default 600s) |
 | Max depth | — | `--max-depth <N>` (default 4) |
 | **Run ID** | `AGENTD_RUN_ID` | `--run-id <ID>` (idempotency key) |
 | Log level | `AGENTD_LOG_LEVEL` | `--log-level trace│debug│info│warn│error` |
+| Log content | `AGENTD_LOG_CONTENT` | `--log-content` |
 | **Drain timeout** | `AGENTD_DRAIN_TIMEOUT` | `--drain-timeout <dur>` (default 25s) |
 | Health file | — | `--health-file <PATH>` |
+| Metrics/probes | `AGENTD_METRICS_ADDR` | `--metrics-addr host:port` (`metrics` feat.) |
+| Per-run cgroup | `AGENTD_CGROUP` / `…_MEMORY_MAX` / `…_PIDS_MAX` | `--cgroup auto│PATH`, `--cgroup-memory-max`, `--cgroup-pids-max` |
+| Report / events | `AGENTD_REPORT_FILE`, `AGENTD_EVENTS_RING` | `--report-file <PATH>`, `--events-ring <N>` |
+| **Hot reload** | `AGENTD_WATCH_CONFIG` | `--watch-config` (`config-watch` feat.) + SIGHUP (`hot-reload` feat.) |
 
 Durations accept `ms`/`s`/`m`/`h` or a bare integer (seconds): `600s`, `5m`,
-`2h`, `250ms`, `30`. The intelligence URI must be `unix:/path`,
+`2h`, `250ms`, `30`. Each intelligence list element must be `unix:/path`,
 `https://host/…`, or `vsock:cid:port` (`http://` is dev-only and the client
-warns). Config is validated **before any side effect** — a typo'd flag exits `2`
-in milliseconds, not after an LLM round-trip.
+warns). Config is validated **before any side effect** — a typo'd flag, a
+feature-gated flag in a build without its feature, or an unresolvable secret
+reference exits `2` in milliseconds, not after an LLM round-trip.
 
-> **Roadmap markers.** v1 reactivity is **stdio-only** (no reactive-over-HTTP);
-> self-MCP serving is **stdio/unix only** (HTTP serving deferred); MCP
-> tasks/sampling/roots are deferred (RFC 0013). Items below are tagged
-> **(roadmap)** where they do not ship in v1.
+> **Scope markers.** Reactivity is **stdio MCP only** (subscriptions ride stdio
+> MCP server children); self-MCP serving is **unix/vsock** (no HTTP serving of
+> the self-MCP); MCP tasks/sampling/roots are deferred (RFC 0013). The
+> `cluster` work-claim `:resource` style is a stub (`:tool` is the working
+> style), and `AGENTD_WARM_INTEL` is forward-compat only — see
+> [`configuration.md`](configuration.md) §13. Items below are tagged where they
+> do not ship.
 
 ---
 
@@ -204,27 +224,63 @@ it **larger** than `--drain-timeout`.
 ## 3. Container — minimal scratch/distroless image
 
 agentd is `std` + `libc`, statically linkable, with no async runtime, no C
-toolchain, and **no built-in tools** — so the image is tiny. The recommended
-entrypoint is `agentd` itself: it sets `PR_SET_CHILD_SUBREAPER` and reaps
-orphans, acting as a tini-class init for its own process tree (RFC 0003 §3.1).
-You do **not** need an external `tini`.
+toolchain, and **no built-in tools** — so the image is tiny (~1.3 MB on
+`scratch`). The recommended entrypoint is `agentd` itself: it sets
+`PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
+own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
+
+The published image (`Dockerfile` at the repo root) ships the **dependency-free
+cloud-native feature set** by default —
+`FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch"`. Every
+one is hand-rolled and adds **no** dependency (serde/serde_json + libc only, 3
+deps; no async runtime, no TLS, no C toolchain), so the binary stays the
+minimalism target. What each adds:
+
+| Feature | Adds |
+|---|---|
+| `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`--metrics-addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
+| `serve-mcp` | agentd serving its own MCP (`--serve-mcp`) so other agents compose with it; also the substrate for `events`/`a2a`/the capacity surface. |
+| `cron` | UTC 5-field cron scheduling for `--mode schedule` (`--cron`). |
+| `otel` | OTLP-over-HTTP/JSON span export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
+| `cluster` | Horizontal scaling: `--shard K/N` partitioning, work-claim leases (`--claim`), standby pools (`--standby`/`--assign-from`), the autoscaling signal set, and the `agentd://capacity` read surface. |
+| `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a reactive quiesce boundary. |
+| `config-watch` | The `inotify` file-watch reload trigger (`--watch-config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
+
+Build a narrower (or wider) surface with `--build-arg FEATURES=…`. `tls` and
+`vsock` are **not** in the default set (they change the dial transport — see the
+TLS note below); `events`/`a2a` ride `serve-mcp`; `FEATURES=` builds the pure,
+flag-free minimal binary.
 
 ```dockerfile
-# Build a static musl binary, default feature set (no TLS, no async runtime).
+# syntax=docker/dockerfile:1
+# Static musl binary on scratch — the dependency-free cloud-native feature set.
 FROM rust:1-alpine AS build
+ARG FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch"
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p agentd --target x86_64-unknown-linux-musl
+# Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
+# static; one Dockerfile yields native-static amd64 AND arm64 via buildx.
+RUN if [ -n "$FEATURES" ]; then \
+      cargo build --release --locked -p agentd --features "$FEATURES"; \
+    else \
+      cargo build --release --locked -p agentd; \
+    fi
 
 # scratch: nothing but the binary. (Swap for gcr.io/distroless/static if you
 # want a CA bundle + /etc/passwd without managing them yourself.)
 FROM scratch
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/agentd /agentd
+COPY --from=build /src/target/release/agentd /agentd
+# Non-root by uid (scratch has no /etc/passwd; the kernel uses the number).
+USER 65532:65532
 # MCP server binaries are part of the agent's toolset — add them alongside:
 # COPY --from=build /path/to/mcp-server-tickets /usr/local/bin/
 ENTRYPOINT ["/agentd"]
 ```
+
+> **Build-arg, not flag.** `FEATURES` selects what the **binary** can do; it is a
+> compile-time choice, not a runtime flag. A runtime flag that needs an unbuilt
+> feature exits `2` — e.g. `--shard 2/8` on an image built without `cluster`.
 
 ### TLS is off by default — terminate it in a sidecar
 
@@ -248,15 +304,29 @@ the agent process.
 
 ### Health surface
 
-Pass `--health-file <PATH>`; agentd heartbeats it while the reactor is live, so
-an exec-style probe can `test` its freshness. An HTTP `/healthz` listener is
-part of the v1 observability surface (RFC 0010) for orchestrators that prefer
-HTTP probes; prefer the health file for the scratch image since it needs no
-extra listener. (See the K8s probes below.)
+Two options, both live:
 
-> **(roadmap)** `--serve-mcp` lets other agents compose with this one over MCP,
-> but v1 serving is **stdio/unix only** — HTTP serving of the self-MCP is
-> deferred (RFC 0013). Do not expose `--serve-mcp` over a TCP port in v1.
+- **`--metrics-addr host:port`** (`metrics` feature, in the default image) serves
+  `/healthz` + `/readyz` + `/metrics` over HTTP. This is the right choice for the
+  **scratch image**, which has no shell to run an exec probe: point the k8s
+  liveness probe at `/healthz` and readiness at `/readyz`. The bare `:port` form
+  binds all IPv4 interfaces so the kubelet reaches it at the pod IP. (See the K8s
+  probes below.)
+- **`--health-file <PATH>`** — agentd heartbeats it while the reactor is live, so
+  an exec-style probe can `test` its freshness. Useful where you do not want an
+  HTTP listener at all.
+
+`/healthz` returns 200 while the **supervisor** tick is fresh and 503 once it
+goes stale; `/readyz` flips to not-ready on drain so the pod leaves rotation. An
+idle reactive agent is healthy — liveness tracks the supervisor, not whether work
+is flowing.
+
+> **Self-MCP scope.** `--serve-mcp` lets other agents compose with this one over
+> MCP and is **unix/vsock only** (`serve-mcp` + optionally `vsock` features) —
+> there is no HTTP serving of the self-MCP (RFC 0013). The same unix/vsock
+> listener also carries the management transport and (with `--features a2a`) the
+> A2A method surface — see [the management transport](#management-over-vsock--a-node-agent)
+> below. Do not expose `--serve-mcp` over a TCP port.
 
 ---
 
@@ -427,26 +497,146 @@ liveness (RFC 0003 §3.4, RFC 0010). Set `resources.limits.memory` deliberately:
 aggregate subtree memory is a cgroup/pod concern, not enforced in-binary, so an
 OOM surfaces as `137` and means "raise the limit" (RFC 0003 §3.8).
 
+### 4d. StatefulSet — a sharded reactive fleet (`cluster` feature)
+
+To process a shared workload across N replicas without duplicating it, run a
+**sharded fleet** (RFC 0019; needs an image built with `--features cluster`). The
+idiom maps a **StatefulSet pod ordinal → `AGENTD_SHARD=K/N`**: each pod owns shard
+`K` of `N`, and `replicas` is `N`. The ordinal is in the pod's hostname
+(`agentd-shard-0`, `-1`, …), so the container derives `K` from it; agentctl
+injects `AGENTD_SHARD` the same way. Shard identity is **restart-only** — a
+reload never changes it (a re-shard is a rolling restart).
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agentd-shard
+spec:
+  serviceName: agentd-shard
+  replicas: 8                       # == N (the shard count)
+  selector: { matchLabels: { app: agentd-shard } }
+  template:
+    metadata: { labels: { app: agentd-shard } }
+    spec:
+      terminationGracePeriodSeconds: 30   # > --drain-timeout
+      containers:
+        - name: agentd
+          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with `cluster`
+          # Derive K from the StatefulSet ordinal (the trailing -N of the hostname)
+          # and export AGENTD_SHARD=K/8 before exec'ing agentd.
+          command: ["/bin/sh", "-c"]   # use a shell image, or bake this into an entrypoint
+          args:
+            - |
+              K="${HOSTNAME##*-}"
+              exec /agentd --mode reactive \
+                --instruction-file /etc/agentd/task.txt \
+                --intelligence unix:/run/intel/intel.sock \
+                --subscribe tickets://queue/inbound \
+                --metrics-addr :9090 --drain-timeout 25s
+          env:
+            - name: AGENTD_SHARD
+              value: "0/8"            # overwritten below from the ordinal…
+          # …or, on the scratch image (no shell), set AGENTD_SHARD directly per
+          # pod via a small admission/operator that reads the ordinal. The shard
+          # gate is the only sharding wiring agentd needs.
+```
+
+Because shard ownership is a pure FNV-1a gate over the resource URI/key, the
+replicas are share-nothing: each independently subscribes to the full set and
+**processes only the items hashing to its shard**. For at-most-once processing of
+an item that more than one replica could see, layer **work-claim** on top
+(`--claim <uri>=<coord-server>`, [`configuration.md`](configuration.md) §13) so a
+lease — not just the hash — decides ownership. `AGENTD_SHARD_TIMER` (`shard0` |
+`keyed`) controls timer firing for a sharded `schedule`/`loop` fleet.
+
+### 4e. Hot reload via a ConfigMap (`hot-reload` / `config-watch` features)
+
+A reactive daemon can apply a new **structural** config without a restart
+(RFC 0017 §5; see [`configuration.md`](configuration.md) §11 for the
+reloadable-vs-restart-only partition). Mount the config file from a ConfigMap and
+either send `SIGHUP` or run `--watch-config`:
+
+- **`--watch-config`** (`config-watch` feature) arms an `inotify` watch on the
+  config file's directory. A `kubectl apply` of the ConfigMap is an atomic
+  volume-symlink swap, which the watch sees — agentd re-reads, **validates**, and
+  applies the reloadable subset (model, the intelligence endpoint list, limits,
+  `subscribe`, `log_level`, `mcp_servers` re-handshake) in place. An invalid
+  candidate keeps the running config — nothing is half-applied. A diff that
+  touches a **restart-only** field (mode, run-id, serve-mcp, exec, drain, shard,
+  claim/standby, continue topology) is **refused** with `reason="restart_required"`
+  (roll the pod).
+- **`SIGHUP`** (`hot-reload` feature) is the portable trigger if you would rather
+  signal than watch: `kubectl exec … -- kill -HUP 1`, or an operator that signals
+  after editing the ConfigMap.
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: agentd
+          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with config-watch
+          args:
+            - --mode=reactive
+            - --config=/etc/agentd/config.json      # mounted from the ConfigMap
+            - --watch-config                        # reload on a ConfigMap update
+            - --instruction-file=/etc/agentd/task.txt
+            - --metrics-addr=:9090
+            - --drain-timeout=25s
+          volumeMounts:
+            - { name: config, mountPath: /etc/agentd, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: agentd-config }        # holds config.json (+ task.txt)
+```
+
+Secrets never live in the ConfigMap: the file carries only structural config and
+`{{secret:NAME}}` / `{{secret-file:PATH}}` references, resolved from env vars or
+mounted Secret files at load/reload ([`configuration.md`](configuration.md) §12).
+
+### Management over vsock + a node-agent
+
+The same `--serve-mcp` listener that exposes the self-MCP also carries the
+**management transport** — status, subagent introspection, and (with
+`--features a2a`) the A2A method surface — over a **unix socket or AF_VSOCK port**
+(`--serve-mcp vsock:PORT`, `--features vsock`). vsock is the right transport when
+a host/enclave **node-agent** drives a guest agentd across a VM boundary
+(Firecracker/Kata): no shared filesystem, no TCP port to firewall. There is **no
+HTTP** management surface — keep this off any TCP port. The node-agent (the thing
+that issues management RPCs, signals reloads, and reads `agentd://` resources) is
+**external** and not part of agentd; agentd only honours the transport contract.
+
 ---
 
 ## Runnable manifests
 
-See [`examples/`](../examples/) for the manifests above as standalone files:
+See [`examples/k8s/`](../examples/k8s/) for the manifests above as standalone
+files:
 
-- `examples/k8s-job.yaml` — one-shot `Job` with `podFailurePolicy`
-- `examples/k8s-cronjob.yaml` — scheduled `CronJob`
-- `examples/k8s-deployment-reactive.yaml` — reactive `Deployment` with probes
-- `examples/Dockerfile` — scratch image
+- `examples/k8s/job-once.yaml` — one-shot `Job` with `podFailurePolicy`
+- `examples/k8s/cronjob-schedule.yaml` — scheduled `CronJob`
+- `examples/k8s/deployment-reactive.yaml` — reactive `Deployment` with HTTP probes
+- `examples/docker/Dockerfile` — the static-on-scratch image
 - `examples/systemd-agentd.service` — reactive systemd unit
 
 ---
 
 ## See also
 
+- [`docs/configuration.md`](configuration.md): the **complete** flag/env
+  reference, the config-file schema (§12), the reloadable-vs-restart-only
+  partition (§11), and the `cluster` sharding/claim/standby surface (§13).
 - [RFC 0011 — cloud-native contract](../rfcs/0011-cloud-native-contract.md):
   config precedence, signals, the exit-code table, idempotency.
 - [RFC 0003 — process supervision & recovery](../rfcs/0003-process-supervision-and-recovery.md):
   the kill ladder, reaping, restart governor, rebuild + reconcile.
 - [RFC 0008 — modes & reactive routing](../rfcs/0008-execution-modes-and-reactive-routing.md):
   the exit predicates per mode, read-after-subscribe.
-- [`docs/design/PLAN.md`](design/PLAN.md): current build status, M1–M3.
+- [RFC 0017 — declarative config & hot reload](../rfcs/0017-declarative-config-and-hot-reload.md):
+  the config file, `--validate-config`/`--config-schema`, SIGHUP/`--watch-config`.
+- [RFC 0018 — intelligence transport resilience](../rfcs/0018-intelligence-transport-resilience.md):
+  the endpoint list, per-endpoint creds, `--model-swap`.
+- [RFC 0019 — horizontal scaling](../rfcs/0019-horizontal-scaling.md):
+  sharding, work-claim leases, standby pools.
+- [`docs/design/PLAN.md`](design/PLAN.md): current build status.

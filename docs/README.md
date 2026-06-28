@@ -35,10 +35,13 @@ status and the M1–M3 milestones.
 | [observability.md](observability.md) | JSON-lines telemetry, the line schema + event vocabulary, the correlation tuple / `agent_path` subtree trick, health, and metrics-from-logs. |
 | [security.md](security.md) | The granted-MCP-subset trust budget (Rule-of-Two), untrusted-content stance, SSRF defenses, the gated `exec` tool, and secrets handling. |
 | [deployment.md](deployment.md) | Deployment shapes — standalone CLI, Kubernetes Job/CronJob, reactive Deployment, systemd — drain choreography, and the exit-code contract. |
+| [operations.md](operations.md) | The control plane: the management transport (unix/vsock), the operator tools (`drain`/`lame-duck`/`pause`/`resume`/`cancel`), the capabilities manifest + `surfaces{}`, and hot reload (SIGHUP + ConfigMap file-watch). |
+| [scaling.md](scaling.md) | Horizontal scaling — `--shard K/N` partitioning, work-claim leases for cross-instance ownership, standby, and the autoscaling signals + `agentd://capacity`. |
 
 ## See also
 
-- **[`../rfcs/README.md`](../rfcs/README.md)** — the normative RFC set (0001–0013).
+- **[`../rfcs/README.md`](../rfcs/README.md)** — the normative RFC set (0001–0020,
+  including the agentctl control-plane track 0014–0020).
 - **[design/](design/)** — the binding [architecture assessment](design/00-architecture-assessment.md),
   the [build plan](design/PLAN.md), and the supporting research/review notes.
 - **[`../examples/SAMPLES.md`](../examples/SAMPLES.md)** — runnable samples for the

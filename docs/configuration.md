@@ -1,15 +1,22 @@
 # Configuration reference
 
-`agentd` is configured entirely from the **environment and the command line** — no
-network config, ever (RFC 0011 §1). The whole configuration is assembled and
-**validated before any side effect**: a bad flag or a missing endpoint exits `2`
-in milliseconds, not after an LLM round-trip or an MCP handshake.
+`agentd` is configured from the **environment, the command line, and an optional
+local config file** — no network config, ever (RFC 0011 §1). The whole
+configuration is assembled and **validated before any side effect**: a bad flag,
+a missing endpoint, or an unresolvable secret reference exits `2` in
+milliseconds, not after an LLM round-trip or an MCP handshake.
 
 > **Build status.** The runtime is implemented: config validation, the agentic
 > loop, the supervisor + subagent tree, the MCP client, all four run modes, the
-> reactive router + self-scheduling, and the served self-MCP are live (see
-> [`docs/design/PLAN.md`](design/PLAN.md)). The flag/env surface below is the
-> stable v1 surface, derived verbatim from the binary's `--help` + `Config`.
+> reactive router + self-scheduling, the served self-MCP, the declarative config
+> file (`--config`) with hot reload (SIGHUP + inotify), horizontal scaling
+> (`--shard`/`--claim`/`--standby`, `cluster` feature), and multi-endpoint
+> intelligence failover are all live (see [`docs/design/PLAN.md`](design/PLAN.md)).
+> The flag/env surface below is derived verbatim from the binary's `--help`
+> (`help_text()`) and the actual flag/env parsing in
+> [`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs). Where a flag
+> needs a build feature, that is called out — a feature-gated flag that is set
+> in a build without its feature exits `2`, never silently no-ops.
 
 ---
 
@@ -21,14 +28,18 @@ a lower layer):
 
 ```
 built-in default  <  config file  <  env var  <  CLI flag
-   (lowest)           (roadmap)                    (highest)
+   (lowest)        (--config; live)              (highest)
 ```
 
 - **built-in default** — the compiled-in defaults (see the table below).
-- **config file** — *(roadmap)* a local-only file for verbose structural lists
-  (MCP server argv arrays), never for secrets. Not yet implemented; the env+flag
-  layers are live today. It will slot between *default* and *env* without
-  changing any flag/env name (RFC 0011 §3.1).
+- **config file** — a local-only JSON file (`--config <path>` / `AGENTD_CONFIG`)
+  carrying verbose **structural** config (the MCP-server inventory, declared
+  subscriptions, A2A peers, limits, model/log knobs, intelligence endpoint list +
+  headers). **Live** (RFC 0017 §3). It slots between *default* and *env*, so env
+  and flags still override it. **Repeatable list flags ADD to the file's lists**
+  (`--mcp`/`--subscribe`/`--a2a-peer` append to what the file declares). Secrets
+  are **never** stored in the file — only `{{secret:NAME}}` / `{{secret-file:PATH}}`
+  *references* (§12). See §12 for the full file schema.
 - **env var** — every setting that has an env equivalent (12-factor). Live.
 - **CLI flag** — highest precedence; overrides env. Live.
 
@@ -41,9 +52,12 @@ $ INSTRUCTION='from-env' AGENTD_INTELLIGENCE=unix:/run/intel.sock \
 # effective intelligence: unix:/run/intel.sock  (env, no flag given)
 ```
 
-**Secrets are env/flag only** — never the (roadmap) config file. The
+**Secrets are env/flag only** — never inline in the config file. The
 `--intelligence-token` value is redacted everywhere it could surface
-(`Debug` output prints `***`, logs never carry it).
+(`Debug` output prints `***`, logs never carry it). The config file may carry
+**references** to secrets (`{{secret:NAME}}` → an env var, `{{secret-file:PATH}}`
+→ a mounted file) but never an inline credential — a credential-shaped header
+with a literal value is rejected at validation (§12).
 
 ---
 
@@ -55,20 +69,42 @@ is pure-CPU and sub-millisecond. On the first failure it prints
 `agentd: <reason>` to stderr and exits **`2`** (`EXIT_USAGE`, a non-retriable
 config error for a `podFailurePolicy`; RFC 0011 §5).
 
-Validations enforced at startup:
+Validations enforced at startup (each is also collected by `--validate-config`,
+§12):
 
 | Check | Failure message (exit 2) |
 |---|---|
 | instruction present & non-blank | `missing instruction (INSTRUCTION env or --instruction)` |
 | intelligence endpoint present | `missing intelligence endpoint (AGENTD_INTELLIGENCE or --intelligence)` |
-| intelligence URI scheme supported | `intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: …)` |
+| every intelligence list element's scheme supported | `intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: …)` |
+| every per-endpoint token *file* readable | (the secret-file read error) |
 | every `--mcp` has a name and command | `mcp server '<name>' has empty name or command` |
 | `--max-steps` > 0 | `--max-steps must be > 0` |
-| `--mode reactive` has ≥1 subscription | `--mode reactive requires at least one --subscribe <uri>` |
-| `--mode schedule` has an interval | `--mode schedule requires --interval <dur>` |
+| `--events-ring` > 0 | `--events-ring must be > 0` |
+| `--mode reactive` has ≥1 `--subscribe`/`--continue` | `--mode reactive requires at least one --subscribe or --continue <uri>` |
+| `--continue` only with `--mode reactive` | `--continue is only valid with --mode reactive` |
+| `--mode schedule` has an interval or cron | `--mode schedule requires --interval <dur> or --cron <expr>` |
+| `--cron` only with `--mode schedule` | `--cron is only valid with --mode schedule` |
+| `--cgroup-memory-max`/`--cgroup-pids-max` need `--cgroup` | `--cgroup-memory-max/--cgroup-pids-max require --cgroup` |
+| `--cgroup-*-max` not `0` | `--cgroup-pids-max must be > 0 … or 'max'` / `--cgroup-memory-max must be > 0 or 'max'` |
+| `--serve-mcp` target scheme/port valid | `--serve-mcp: scheme unsupported …` |
+| `--shard K/N` well-formed (`N>0`, `K<N`) | `--shard: K must be < N (got K/N)` / `--shard: N must be > 0` |
+| `N>1` needs the `cluster` feature | `--shard requires the 'cluster' build feature` |
+| `--claim` needs the `cluster` feature | `--claim requires the 'cluster' build feature` |
+| each `--claim`/`--assign-from` server is a declared `--mcp` | `--claim route '<uri>' names coordination server '<srv>', which is not a declared --mcp server` |
+| `--claim-renew-fraction` in `(0, 1)` | `--claim-renew-fraction must be in (0, 1) (got: …)` |
+| `--standby`/`--assign-from` need the `cluster` feature | `--standby / --assign-from require the 'cluster' build feature` |
+| `--standby`/`--assign-from` only with `--mode reactive` | `--standby / --assign-from are only valid with --mode reactive` |
+| `--watch-config` needs the `config-watch` feature | `--watch-config requires the 'config-watch' build feature` |
+| `--watch-config` needs a `--config` file | `--watch-config requires a config file (--config / AGENTD_CONFIG)` |
+| `--a2a-peer` needs the `a2a` feature; each endpoint scheme valid | `--a2a-peer requires the 'a2a' build feature` |
+| no inline secret-shaped `intelligence_headers` value; refs resolve | `intelligence_headers['…'] looks like a credential but has an inline value …` |
 
-`-h`/`--help` and `-V`/`--version` short-circuit before validation and exit `0`.
-An unrecognized argument is a usage error: `unknown argument: <arg>` → exit `2`.
+`-h`/`--help`, `-V`/`--version`, `--capabilities`, `--config-schema`, and
+`--validate-config` short-circuit before run-required validation and exit `0`
+(`--validate-config` exits `0` on a valid config, `2` if it collected any
+diagnostic). An unrecognized argument is a usage error: `unknown argument:
+<arg>` → exit `2`.
 
 ```console
 $ agentd --instruction 'x' --intelligence ftp://nope
@@ -81,69 +117,160 @@ $ echo $?
 
 ## 3. The flag / env table
 
-Every flag below is derived verbatim from the binary's `--help` and
-`Config::load`. **Only these flags and env vars exist.** A blank **Env** cell
-means the setting is **flag-only** in v1 (no environment equivalent is wired up).
+Every flag below is derived verbatim from the binary's `--help` (`help_text()`)
+and the flag/env parsing in `Config::load`. **Only these flags and env vars
+exist.** A blank **Env** cell means the setting is **flag-only** (no environment
+equivalent is wired up); a blank in the other direction (`AGENTD_*` with no flag
+column entry) is noted inline. Flags that need a build feature say so — set
+without the feature, they exit `2` (§2), never silently no-op.
+
+### 3.1 Core / required
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--instruction <TEXT>` | `INSTRUCTION` | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule`. |
+| `--instruction <TEXT>` | `INSTRUCTION` | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule` (and reactive, which reuses it per reaction). |
 | `--instruction-file <PATH>` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). Sets `instruction`. |
-| `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | *(none; required)* | LLM endpoint. `unix:/path` \| `https://host/…` \| `vsock:cid:port` (see §4). |
-| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | *(none)* | Bearer/API key. **Never logged**; redacted as `***`. |
-| `--model <NAME>` | `AGENTD_MODEL` | *(none)* | Model id passed to the endpoint. |
-| `--mcp name=command` | — | *(none)* | Declare an MCP server (stdio). Repeatable. See §5. |
-| `--serve-mcp <unix:/path>` | `AGENTD_SERVE_MCP` | *(off)* | Serve agentd's own MCP so agents compose. stdio/unix only in v1 (HTTP serving is roadmap). |
+| `--intelligence <LIST>` | `AGENTD_INTELLIGENCE` | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `unix:/path` \| `https://host/…` \| `vsock:cid:port` (see §4). |
+| `--config <PATH>` | `AGENTD_CONFIG` | *(none)* | Load a declarative JSON config file (§12). |
+
+### 3.2 Intelligence
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | *(none)* | Bearer/API key for endpoint 1. **Never logged**; redacted as `***`. |
+| `--intelligence-token-file <PATH>` | `AGENTD_INTELLIGENCE_TOKEN_FILE` | *(none)* | Read endpoint 1's token from a mounted file (rotation-friendly). Inline `--intelligence-token`/env wins over it. |
+| — | `AGENTD_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | *(none)* | Per-endpoint credential for endpoint *N* (1-indexed; endpoint 1 uses the bare names above, endpoint 2 → `_2`/`_2_FILE`, etc.). A named-but-unreadable `…_FILE` is exit `2` at startup (fail fast before failover). Env-only. |
+| `--model <NAME>` | `AGENTD_MODEL` | *(none)* | Model id passed to the endpoint. **Reloadable** (§11). |
+| `--model-swap <P>` | `AGENTD_MODEL_SWAP` | `finish-on-old` | What an in-flight run does when a reload changes `model`: `finish-on-old` (the in-flight turn finishes on the old model, the next turn uses the new one) \| `restart-turn` (the in-flight turn is re-run on the new model from the same pre-turn state). An endpoint repoint with the model unchanged is always finish-on-old regardless (RFC 0018 §5). |
+
+### 3.3 Tools / MCP / delegation
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `--mcp name=command` | — | *(none)* | Declare an MCP server (stdio). Repeatable. See §5. **Reloadable** (§11). |
+| `--serve-mcp <TARGET>` | `AGENTD_SERVE_MCP` | *(off)* | Serve agentd's own MCP so agents compose: `unix:/path` \| `vsock:PORT` \| `vsock:CID:PORT` (`vsock` needs `--features vsock`; bare `vsock:PORT` binds the wildcard CID). Needs `--features serve-mcp`. |
+| `--a2a-peer name=<ENDPOINT>` | `AGENTD_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `unix:/path` \| `vsock:CID:PORT`. Repeatable (the env channel declares one). Needs `--features a2a`. |
 | `--enable-exec` | `AGENTD_ENABLE_EXEC` | `false` | Expose the gated `exec` tool (off by default; RFC 0012). Env accepts `1`/`true`/`yes`/`on`. |
-| `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server. Repeatable. |
+| `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server (order-independent). Repeatable. |
 | `--allow-trifecta` | `AGENTD_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
+
+### 3.4 Mode & triggers
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
 | `--mode once\|loop\|reactive\|schedule` | `AGENTD_MODE` | `once` | Selects the exit predicate (RFC 0008). See §6. |
-| `--subscribe <uri>` | — | *(none)* | Subscribe to an MCP resource (reactive mode). Repeatable. |
+| `--subscribe <uri>` | — | *(none)* | Subscribe to an MCP resource (reactive mode); each event spawns a fresh run. Repeatable. |
+| `--continue <uri>` | — | *(none)* | Like `--subscribe`, but route every event on the URI into **one warm session** (in order). Reactive only. Repeatable. |
 | `--interval <dur>` | — | *(none)* | loop/schedule interval (duration syntax, §7). |
 | `--cron <5-field>` | `AGENTD_CRON` | *(none)* | UTC cron schedule for `--mode schedule` (needs `--features cron`; §6). |
 | `--max-steps <N>` | `AGENTD_MAX_STEPS` | `50` | Per-run step cap. Must be > 0. |
-| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | `200000` | Token budget for the run. |
+| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | `200000` | Token budget for the run. **Reloadable** (§11). |
 | `--deadline <dur>` | `AGENTD_DEADLINE` | `600s` | Wall-clock deadline (duration syntax, §7). |
 | `--max-depth <N>` | — | `4` | Subagent tree depth cap (RFC 0009). |
+
+### 3.5 Sharding / work-claim / standby (`--features cluster`)
+
+Horizontal scaling (RFC 0019). All of these are **restart-only** (§11) and
+need the `cluster` build feature; set without it (with `N>1` for the shard),
+each exits `2`. See §13 for the fleet model.
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `--shard K/N` | `AGENTD_SHARD` | `0/1` | Partition the URI/key space across a fleet: this replica owns shard `K` of `N` (FNV-1a hash gate). `0/1` is unsharded (the default; no feature needed). `N==0` or `K>=N` is exit `2`. agentctl injects `AGENTD_SHARD` from a StatefulSet ordinal (§13). |
+| — | `AGENTD_SHARD_TIMER` | `shard0` | Timer-route behaviour for a sharded `schedule`/`loop` fleet: `shard0` (only shard 0 fires the fleet-wide ticker) \| `keyed` (every replica fires; a per-tick key gate is applied elsewhere). Env-only. |
+| `--claim <uri>=<srv>[:style]` | — | *(none)* | Claim an item before a reactive worker processes it: lease it against coordination MCP server `<srv>` (a declared `--mcp` server), proceed only on a granted lease. The URI is also subscribed + routed. `style` is `tool` (default). `resource` parses but is a **CAS stub — not implemented**; use `tool` (see §13). Repeatable. |
+| `--claim-ttl <dur>` | `AGENTD_CLAIM_TTL` | `30s` | Requested lease TTL for `work.claim` (the server is the authority; this is the request). |
+| `--claim-renew-fraction <F>` | `AGENTD_CLAIM_RENEW_FRACTION` | `0.33` | Renew heartbeat at `ttl*F`, `F` in `(0, 1)`. In the synchronous-spawn v1 the renew is a documented no-op — the value is carried forward for the manifest. |
+| `--standby` | `AGENTD_STANDBY` | `false` | Run a warm, **assignment-driven** reactive worker that races `work.claim` on a shared pending resource (claim-pull) instead of its own content subscriptions. Reactive mode only. |
+| `--assign-from <srv>:<uri>` | `AGENTD_ASSIGN_FROM` | *(none)* | The shared assignment resource the standby pool claim-pulls from: server `<srv>` (a declared `--mcp` server) owns resource `<uri>`. Desugars into a claim route + a subscribe, so the pool reuses the claim machinery with no new code. Implies reactive mode. |
+| — | `AGENTD_WARM_INTEL` | `true` when `--standby`, else `false` | Keep the intelligence session warm in standby. **Forward-compat only** — there is no warm-child pool today, so this is accepted, stored, and reported but pre-warms nothing (see §13). Env-only. |
+
+### 3.6 Runtime / observability / security
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
 | `--run-id <ID>` | `AGENTD_RUN_ID` | *(auto)* | Idempotency key (§8). Default: a per-process id (time+pid). |
-| `--log-level <L>` | `AGENTD_LOG_LEVEL` | `info` | `trace`\|`debug`\|`info`\|`warn`\|`error`. |
+| `--log-level <L>` | `AGENTD_LOG_LEVEL` | `info` | `trace`\|`debug`\|`info`\|`warn`\|`error`. **Reloadable** (§11). |
 | `--log-content` | `AGENTD_LOG_CONTENT` | `false` | Log tool args/results, not just lengths (RFC 0010 §2.9). Off by default (content-capture-off); propagates to children. |
 | `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | `25s` | Graceful drain budget. Keep **< pod `terminationGracePeriodSeconds`** (RFC 0011 §3.3). |
 | `--health-file <PATH>` | — | *(none)* | Liveness heartbeat file (exec-probe target; RFC 0010). |
 | `--metrics-addr <ADDR>` | `AGENTD_METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr — `host:port`, or `:port` for all IPv4 interfaces (read-only; restrict via firewall/NetworkPolicy if exposed). Needs `--features metrics`. |
+| `--cgroup <auto\|PATH>` | `AGENTD_CGROUP` | *(off)* | Per-run cgroup-v2 child for atomic `cgroup.kill` teardown: `auto` (derive `<own-cgroup>/agentd`) or an absolute path under `/sys/fs/cgroup`. Best-effort — disabled if not writable (RFC 0010). |
+| `--cgroup-memory-max <SIZE>` | `AGENTD_CGROUP_MEMORY_MAX` | *(none)* | Per-run `memory.max`: `max` or a size (`512M`/`2G`/bytes). Needs `--cgroup` + a parent that can delegate the `memory` controller. `0` is rejected. |
+| `--cgroup-pids-max <N>` | `AGENTD_CGROUP_PIDS_MAX` | *(none)* | Per-run `pids.max`: `max` or a count. **Counts threads** — set it generously. Needs `--cgroup` + delegation. `0` is rejected. |
 | `--traceparent <W3C>` | `AGENTD_TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id (RFC 0010). |
+| `--report-file <PATH>` | `AGENTD_REPORT_FILE` | *(off)* | Write the run-outcome report at the terminal transition (atomic temp+rename). Inert for `--mode reactive` (warned at startup; a daemon has no single terminal outcome). RFC 0016. |
+| `--events-ring <N>` | `AGENTD_EVENTS_RING` | `1024` | Capacity of the in-memory `agentd://events` live-tail ring. Must be > 0. Only consumed when the `events` surface is served (`--serve-mcp` + `--features events`). RFC 0016. |
+| `--capabilities` | — | — | Print the capabilities manifest (JSON) and exit `0` — the side-effect-free admission probe; succeeds with no instruction. RFC 0015. |
 | `-h`, `--help` | — | — | Print help and exit `0`. |
 | `-V`, `--version` | — | — | Print version and exit `0`. |
 
-> **Not yet wired.** RFC 0011 §3.2 sketches a broader surface
+### 3.7 Config file & hot reload (RFC 0017)
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `--config <PATH>` | `AGENTD_CONFIG` | *(none)* | Load a declarative JSON config file (§12). The lowest non-default precedence layer. |
+| `--validate-config` | — | — | Load + validate (file + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free; needs no instruction to validate. |
+| `--config-schema` | — | — | Print the config-file JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free (short-circuits before the file is even read). |
+| `--watch-config` | `AGENTD_WATCH_CONFIG` | `false` | Watch the `--config` file's directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs `--features config-watch` **and** a `--config`/`AGENTD_CONFIG` file (both validated, exit `2`). See §11. |
+
+Hot reload itself (the `hot-reload` feature) is triggered by **SIGHUP** — there
+is no flag for it (§9, §11).
+
+> **Not wired.** RFC 0011 §3.2 once sketched a broader surface
 > (`--log-format`/`AGENTD_LOG_FORMAT`, `--health-addr`/`AGENTD_HEALTH_ADDR` —
 > `/healthz` is instead served by the `metrics` feature on `--metrics-addr`,
 > `RUST_LOG`, env equivalents for `--interval`/`--subscribe`/`--max-depth`,
-> `AGENTD_MCP_CONFIG`/`--mcp-config`, `--pod-grace`/`AGENTD_POD_GRACE_SECONDS`,
+> `--mcp-config` — superseded by `--config`, `--pod-grace`/`AGENTD_POD_GRACE_SECONDS`,
 > a `--budget-exit-code`). **None of these exist in the binary today** — do not
-> rely on them. Only the table above is real.
+> rely on them. Only the tables above are real.
 
 ---
 
-## 4. Intelligence URI schemes
+## 4. Intelligence endpoints — schemes & failover
 
-The single LLM endpoint is selected by URI scheme (RFC 0006). The validator
-accepts exactly these prefixes:
+`--intelligence` is an **ordered, comma-separated endpoint list** (RFC 0018 §3.1).
+A single element is the common case (and exactly the old single-endpoint
+behaviour); multiple elements give sticky-primary **failover** — agentd prefers
+the first healthy endpoint and falls back on a circuit-breaker trip. Each element
+is selected by URI scheme (RFC 0006):
 
 | Scheme | Form | Use |
 |---|---|---|
 | `unix:` | `unix:/run/intel.sock` | Local unix-domain socket (a sidecar/broker). |
-| `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint. Pair with `--intelligence-token`. |
-| `vsock:` | `vsock:2:5000` | VM-to-host vsock (`cid:port`), e.g. a Firecracker/Kata guest. |
+| `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint (needs `--features tls` to dial). Pair with a token. |
+| `vsock:` | `vsock:2:5000` | VM-to-host vsock (`cid:port`), e.g. a Firecracker/Kata guest (needs `--features vsock` to dial). |
 | `http:` | `http://127.0.0.1:8080` | **Dev only** — accepted, but the client warns (no TLS). |
 
-Anything else (e.g. `ftp://…`) fails validation with exit `2`.
+Every element's scheme is validated at startup; an unknown scheme on **any**
+element (e.g. `ftp://…`) is exit `2`. A scheme this build cannot dial (`https:`
+without `tls`, `vsock:` without `vsock`) passes the startup scheme check and is
+surfaced by the client as `Unsupported` at dial time — so a `--validate-config`/
+`--capabilities` probe of an https endpoint on a no-TLS build still passes.
+
+**Per-endpoint credentials.** Endpoint 1 uses `--intelligence-token` /
+`AGENTD_INTELLIGENCE_TOKEN` (or `…_FILE`). Later endpoints are 1-indexed by env
+only: endpoint 2 → `AGENTD_INTELLIGENCE_TOKEN_2` (or `AGENTD_INTELLIGENCE_TOKEN_2_FILE`),
+endpoint 3 → `_3`, and so on. The inline value wins over the file; an absent
+token is legal (a public/unauthenticated gateway). A named-but-unreadable token
+*file* on any listed endpoint is exit `2` at startup — fail fast, not on failover.
 
 ```console
+# Single endpoint
 $ agentd --instruction 'summarize the queue' \
     --intelligence https://api.example.com/v1 \
     --intelligence-token "$LLM_KEY" --model my-model
+
+# Two endpoints with per-endpoint creds (primary + fallback)
+$ AGENTD_INTELLIGENCE_TOKEN="$PRIMARY_KEY" \
+  AGENTD_INTELLIGENCE_TOKEN_2_FILE=/var/run/secrets/fallback-token \
+  agentd --instruction 'summarize the queue' \
+    --intelligence 'https://primary.internal/v1,https://fallback.internal/v1' \
+    --model my-model
 ```
+
+The endpoint **list** and the `model`/`model-swap` knobs are file-settable and
+**reloadable** — a ConfigMap repoint is a hot-swap, not a restart (§11, §12).
 
 ---
 
@@ -157,9 +284,10 @@ All tools come from MCP servers; agentd ships none of its own (except the gated
 ```
 
 The spec is split once on `=`: the left side is the server **name**, the right
-side is the **command**, whitespace-split into argv (an M1 simplification; the
-roadmap config-file layer will carry argv arrays verbatim for commands with
-spaces/quotes).
+side is the **command**, whitespace-split into argv. The flag form does not
+support quoting/escaping — for a command with spaces or quotes in an argument,
+declare it in the config file's `mcp_servers[].argv` array, which carries argv
+verbatim (§12), or use a wrapper script.
 
 ```console
 $ agentd --instruction 'tidy /data' \
@@ -191,8 +319,14 @@ across modes.
 |---|---|---|
 | `once` *(default)* | Run the instruction once to a terminal status, then exit. | — |
 | `loop` | Keep working until a bound (steps/deadline/token) or signal. | — |
-| `reactive` | Idle; wake on MCP resource updates. Exits only on signal/fatal. | ≥1 `--subscribe <uri>` |
+| `reactive` | Idle; wake on MCP resource updates. Exits only on signal/fatal. | ≥1 `--subscribe <uri>` or `--continue <uri>` |
 | `schedule` | Per-fire identical to `once`, driven by an internal timer. | `--interval <dur>` or `--cron <5-field>` (`cron` feature) |
+
+`--continue <uri>` is a reactive variant of `--subscribe`: every event on the URI
+re-enters **one warm session** in order (instead of a fresh spawn per event).
+`--standby` + `--assign-from` (`cluster` feature) turn a reactive worker into an
+assignment-driven member of a claim-pull pool — see §13. Both `--continue` and
+`--standby`/`--assign-from` are reactive-only (exit `2` otherwise).
 
 ```console
 # reactive: requires at least one subscription (stdio-only in v1)
@@ -278,8 +412,14 @@ $ agentd --instruction 'serve reactions' \
 ```
 
 A **second** `SIGTERM`/`SIGINT` forces an immediate `SIGKILL` of all process
-groups. `SIGHUP`/reload is dropped — config is a frozen, validated snapshot;
-restart to reconfigure (RFC 0011 §4.1).
+groups.
+
+**`SIGHUP` reloads** in a `--features hot-reload` build (§11): it re-reads the
+config file and applies the **reloadable subset** at a reactive quiesce boundary,
+validate-first. In a build **without** `hot-reload`, `SIGHUP` keeps its default
+disposition (terminates) — restart to reconfigure. Restart-only fields (mode,
+`run_id`, `serve_mcp`, `enable_exec`, `drain_timeout`, shard/claim/standby
+routing, `continue` topology) never reload (§11).
 
 ---
 
@@ -304,7 +444,186 @@ body or the credential. The exact log schema is owned by RFC 0010 (see
 
 ---
 
-## 11. A complete example
+## 11. Hot reload & the reloadable/restart-only partition (RFC 0017 §5)
+
+In a `--features hot-reload` build a running **reactive** daemon can apply a new
+config without a process restart. Two triggers funnel into the **identical**
+reload routine:
+
+- **`SIGHUP`** — the portable, dependency-free default (always available when
+  `hot-reload` is built).
+- **`--watch-config`** (`--features config-watch`) — an `inotify` watch on the
+  config file's *parent directory*, so a Kubernetes ConfigMap volume swap (an
+  atomic directory-symlink rename) is seen and reloads in place. Needs a
+  `--config`/`AGENTD_CONFIG` file (else exit `2` — watching nothing is a usage
+  error).
+
+Reload is **validate-first**: the new file is re-read and re-merged through the
+*same* `Config::load` validation pipeline (built-in < file < env < flag). An
+invalid candidate is the same exit-2-class error startup would raise — the
+**running config is kept**, nothing is half-applied. A coherence check (RFC 0017
+§5.4) then rejects the reload if any **restart-only** field changed.
+
+**Reloadable subset** (applied live at a quiesce boundary):
+
+- `model`, `model_swap`, `max_tokens` — and the limits sub-object (`max_steps`,
+  `max_depth`, `deadline`)
+- `intelligence` (the endpoint **list**) — repointed via the runtime hot-swap
+  primitive; in-flight turns follow `--model-swap` policy (RFC 0018 §5)
+- `mcp_servers` — re-handshaked live (removed servers stop+reap, added servers
+  spawn+handshake+subscribe with read-after-subscribe)
+- `subscribe`, `log_level`, `intelligence_headers`
+
+**Restart-only fields** (`RESTART_ONLY_FIELDS`) — a reload whose diff touches any
+of these is **refused** with `reason="restart_required"` (agentctl rolls a pod
+restart):
+
+`mode`, `run_id`, `serve_mcp`, `enable_exec`, `drain_timeout`, `shard`,
+`claim_routes`, `standby`, `assign_from`, `continue_subscribe`.
+
+`--validate-config` runs the same coherence check (against no running config, so
+it reports the reloadable-subset consistency errors an admission webhook needs).
+
+> **Note.** None of the restart-only fields are file-settable in today's config
+> schema (§12) — they are env/flag only — so a file edit can only ever touch the
+> reloadable subset. The partition is enforced regardless, so a future widened
+> schema stays safe.
+
+---
+
+## 12. The config file (`--config`, RFC 0017 §3)
+
+`--config <PATH>` / `AGENTD_CONFIG` loads a single **JSON** document (JSON, not
+YAML — `serde_yaml` is a forbidden dependency; render a ConfigMap as JSON).
+`//` and `/* */` comments are tolerated. It is the **lowest non-default
+precedence layer**: env and flags override it, and repeatable list flags
+(`--mcp`/`--subscribe`/`--a2a-peer`) **add to** the file's lists. An unknown key
+is a hard error (`deny_unknown_fields` → exit `2`) — the most common config typo,
+closed at parse time. Print the schema with `--config-schema` (Draft 2020-12,
+exit `0`); validate a candidate with `--validate-config`.
+
+**The file carries only structural config, never secrets.** Settable fields
+(everything else stays env/flag):
+
+| File field | Maps to | Notes |
+|---|---|---|
+| `config_version` | — | Optional; pins the schema major agentctl validated against. |
+| `intelligence` | `--intelligence` | The endpoint **list** URI. Reloadable. Transport scheme only — never a credential. |
+| `model_swap` | `--model-swap` | `finish-on-old`\|`restart-turn`. |
+| `model` | `--model` | Reloadable. |
+| `max_tokens` | `--max-tokens` | |
+| `limits.max_steps` / `limits.max_depth` / `limits.deadline_secs` | `--max-steps` / `--max-depth` / `--deadline` | `deadline_secs` is whole seconds. |
+| `mcp_servers[]` | `--mcp` + `--mcp-tags` | `{name, command, argv[], transport?, env_passthrough[], tags{glob:[…]}}`. `argv` carries arguments verbatim (no whitespace-split). `transport` is `stdio` (default) or `unix`. `tags` is a glob→tag-list map flattened to the server's tag set. Seeds the list. |
+| `subscribe[]` | `--subscribe` | Each string is one subscription URI. Seeds the list. |
+| `a2a_peers[]` | `--a2a-peer` | `{name, endpoint}`. Seeds the list. |
+| `log_level` | `--log-level` | Reloadable. |
+| `intelligence_headers{}` | *(file-only)* | Declared intelligence HTTP headers (RFC 0006 §3). **No flag/env equivalent** — settable only here. Values may carry `{{secret:NAME}}` / `{{secret-file:PATH}}` refs; a credential-shaped header (e.g. `Authorization`) with an *inline* value is rejected (exit `2`). |
+
+**Secret references.** A header (or any file value that needs one) carries a
+secret by **reference**, never inline:
+
+- `{{secret:NAME}}` — resolved from the environment variable `NAME`.
+- `{{secret-file:PATH}}` — resolved by reading the mounted file at `PATH`.
+
+Every referenced env var must be set and every referenced file readable at
+startup, else exit `2`. The resolved value is never stored in `Config` or logged
+(header NAMES only ever appear in `Debug`/`config.loaded`/`agentd://config/effective`).
+The intelligence **credential** itself is *not* a file field — use
+`--intelligence-token` / `AGENTD_INTELLIGENCE_TOKEN`, `--intelligence-token-file` /
+`AGENTD_INTELLIGENCE_TOKEN_FILE`, or the per-endpoint `_<N>` / `_<N>_FILE` env
+vars (§4).
+
+```jsonc
+// /etc/agentd/config.json — structural config; secrets stay in env / mounted files
+{
+  "config_version": "1.0",
+  "intelligence": "https://primary.internal/v1,https://fallback.internal/v1",
+  "model": "my-model",
+  "model_swap": "finish-on-old",
+  "limits": { "max_steps": 80, "max_depth": 3, "deadline_secs": 300 },
+  "mcp_servers": [
+    { "name": "fs",    "command": "mcp-server-fs",    "argv": ["--root", "/data"],
+      "tags": { "*": ["sensitive"] } },
+    { "name": "queue", "command": "mcp-server-queue", "argv": ["--addr", "/run/q.sock"] }
+  ],
+  "subscribe": ["tickets://queue/inbound"],
+  "intelligence_headers": { "anthropic-version": "2023-06-01",
+                            "authorization": "Bearer {{secret:LLM_KEY}}" }
+}
+```
+
+```console
+$ agentd --config /etc/agentd/config.json \
+    --mode reactive \
+    --instruction-file /etc/agentd/task.txt   # instruction + secrets via env/flag
+```
+
+For the reloadable-vs-restart-only partition of these fields, see §11.
+
+---
+
+## 13. Horizontal scaling — sharding, work-claim, standby (`--features cluster`)
+
+Three `cluster`-gated surfaces let a fleet of identical agentd replicas process a
+shared workload without duplicating it (RFC 0019). All are **restart-only** (§11).
+Set without the `cluster` feature, each exits `2` rather than silently doing
+nothing.
+
+**Sharding — `--shard K/N` / `AGENTD_SHARD`.** This replica owns shard `K` of `N`
+(an FNV-1a hash over the URI/key decides ownership). `0/1` (the default) is
+unsharded and needs no feature. `N==0` or `K>=N` is exit `2`. agentctl injects
+`AGENTD_SHARD=K/N` from a StatefulSet pod ordinal; a `--shard` flag overrides it.
+`AGENTD_SHARD_TIMER` (`shard0` default | `keyed`) controls timer-route behaviour
+for a sharded `schedule`/`loop` fleet. Shard identity is immutable — restart-only.
+
+**Work-claim — `--claim <uri>=<server>[:style]`.** Before a reactive worker
+processes `<uri>`, it claims it against the coordination MCP server `<server>` (a
+declared `--mcp` server advertising the `work.*` tools) and proceeds only on a
+granted lease — so two replicas never process the same item. The claimed URI is
+**also** subscribed and routed. Repeatable. Lease knobs: `--claim-ttl` (default
+`30s`) requests the lease TTL; `--claim-renew-fraction` (default `0.33`, in
+`(0,1)`) sets the renew heartbeat at `ttl*F`.
+
+> **`:resource` is a stub.** The `style` suffix is `tool` (the default — calls
+> the four `work.*` tools directly) or `resource`. `resource` **parses** but its
+> CAS path is **not implemented** in v1 — use `tool`. The renew heartbeat is also
+> a documented no-op in the synchronous-spawn v1 (the fraction is carried for the
+> manifest and forward compatibility).
+
+**Standby — `--standby` + `--assign-from <server>:<uri>`.** A standby worker is a
+**reactive** worker held warm and driven by an *assignment channel* instead of
+its own content subscriptions: on the shared pending resource's update, every
+standby member races `work.claim` and processes only what it wins (claim-pull,
+RFC 0019 §7.2). `--assign-from` desugars into a claim route + a subscribe, so the
+pool reuses the existing claim machinery. Reactive-mode only; the named server
+must be a declared `--mcp` server.
+
+> **`AGENTD_WARM_INTEL` is forward-compat only.** It defaults to `true` under
+> `--standby` (else `false`) and is accepted, stored, and reported — but agentd's
+> supervisor runs no LLM loop (each reaction re-execs and connects its own
+> intelligence), so there is **no warm-child pool** to keep warm in v1. The flag
+> exists so a future warm-child-pool build honours operator intent without a
+> config break; today it pre-warms nothing.
+
+```console
+# A sharded reactive fleet of N replicas (the ordinal → AGENTD_SHARD, §deployment.md)
+$ AGENTD_SHARD=2/8 agentd --mode reactive \
+    --intelligence unix:/run/intel.sock \
+    --instruction-file /etc/agentd/task.txt \
+    --subscribe 'tickets://queue/inbound'
+
+# A work-claim worker leasing each item against a coordination server
+$ agentd --mode reactive \
+    --intelligence unix:/run/intel.sock \
+    --instruction-file /etc/agentd/task.txt \
+    --mcp coord='mcp-server-coord --addr /run/coord.sock' \
+    --claim 'tickets://queue/inbound=coord' \
+    --claim-ttl 45s
+```
+
+---
+
+## 14. A complete example
 
 ```console
 $ agentd \
@@ -345,4 +664,4 @@ $ agentd \
     --health-file /run/agentd/health
 ```
 
-(`--mcp`, `--max-depth`, and `--health-file` are flag-only in v1.)
+(`--mcp`, `--max-depth`, and `--health-file` are flag-only — no env equivalent.)

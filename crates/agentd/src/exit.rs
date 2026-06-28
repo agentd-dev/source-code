@@ -136,7 +136,15 @@ mod tests {
         assert_eq!(apply_budget_remap(BUDGET, Some(0)), 0);
         assert_eq!(apply_budget_remap(BUDGET, Some(1)), 1);
         // …and NOTHING else does, even though some share the `policy` intent.
-        for code in [SUCCESS, GENERIC, USAGE, INTEL_UNAVAILABLE, REFUSED, MCP_REQUIRED_DOWN, DEADLINE] {
+        for code in [
+            SUCCESS,
+            GENERIC,
+            USAGE,
+            INTEL_UNAVAILABLE,
+            REFUSED,
+            MCP_REQUIRED_DOWN,
+            DEADLINE,
+        ] {
             assert_eq!(
                 apply_budget_remap(code, Some(0)),
                 code,

@@ -4534,7 +4534,10 @@ mod tests {
         let ctx2 = ctx();
         insert_running(&ctx2, "served.3");
         let r = dispatch(
-            req("tools/call", Some(json!({"name": "cancel", "arguments": {}}))),
+            req(
+                "tools/call",
+                Some(json!({"name": "cancel", "arguments": {}})),
+            ),
             &ctx2,
             PeerOrigin::Management,
             &writer(),

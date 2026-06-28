@@ -2545,7 +2545,10 @@ mod tests {
         // Out of the 0..=255 byte range, or non-numeric ⇒ EXIT_USAGE (2).
         for bad in ["256", "-1", "nope"] {
             let e = Config::load(&args(&["--budget-exit-code", bad]), &base_env()).unwrap_err();
-            assert!(matches!(e, ConfigError::Usage(_)), "{bad} must be a usage error");
+            assert!(
+                matches!(e, ConfigError::Usage(_)),
+                "{bad} must be a usage error"
+            );
         }
     }
 

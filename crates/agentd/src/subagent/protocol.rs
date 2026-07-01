@@ -168,13 +168,6 @@ pub struct SpawnPayload {
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
     pub depth: u32,
-    /// The operator allowlist of absolute binary paths the gated `exec` self-tool
-    /// may invoke (from `--enable-exec <abs-path>`; inherited by children). EMPTY ⇒
-    /// exec is off and the tool is never advertised (RFC 0012 §3.6: the executable
-    /// is fixed by config, never model-named). `#[serde(default)]` keeps older
-    /// frames (which carry no list = exec off) parseable.
-    #[serde(default)]
-    pub exec_allow: Vec<String>,
     /// Run as a **warm continue-session**: after each turn, stay alive and wait
     /// for the next injected event ([`ControlMsg::Inject`]) instead of exiting,
     /// continuing the same transcript (RFC 0008 §spawn-vs-continue). Default
@@ -270,7 +263,6 @@ mod tests {
                 log_content: false,
             },
             depth: 1,
-            exec_allow: Vec::new(),
             warm: false,
         }
     }

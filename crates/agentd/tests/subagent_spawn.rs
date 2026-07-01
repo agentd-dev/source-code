@@ -44,7 +44,6 @@ fn bogus_payload() -> SpawnPayload {
             log_content: false,
         },
         depth: 0,
-        exec_allow: Vec::new(),
         warm: false,
     }
 }

@@ -40,6 +40,12 @@ a2a = ["serve-mcp"]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
+# OAuth 2.1 client-credentials (M2M) auth for remote intelligence/MCP endpoints
+# (RFC 0006 §auth): fetch+cache a bearer token from a token endpoint, refresh on
+# expiry. Dependency-free — reuses the hand-rolled HTTP client + serde_json + the
+# sec::secret resolver; the form encoder is hand-rolled (no url/form_urlencoded
+# crate). Rides `tls` for an https token endpoint (the common case).
+oauth = []
 # The agent://events live-event resource (RFC 0016 §7): a bounded in-memory
 # ring of the RFC 0010 §3.2 JSON lines, served over the self-MCP with the RFC
 # 0005 notify-then-read cursor. Rides serve-mcp (it's a served resource); no dep

@@ -123,7 +123,7 @@ fn exit_mcp_down(h: &Harness) -> Outcome {
         "--subscribe",
         "file:///in.json",
         "--mcp",
-        "bad=/nonexistent/agentd-conf-mcp-server",
+        "bad=unix:/nonexistent/agentd-conf-mcp.sock",
         "--log-level",
         "error",
     ]);

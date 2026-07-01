@@ -138,6 +138,46 @@ fn read_http(stream: &UnixStream) -> Option<(String, Vec<u8>)> {
     Some((request_line, body))
 }
 
+/// A one-shot Streamable-HTTP JSON-RPC `POST` over a unix socket — a test client
+/// for driving a server directly (the work-claim protocol probe). Returns the
+/// parsed JSON-RPC response Value. Panics on any I/O error (a conformance probe).
+pub fn post(socket: &str, req: &Value) -> Value {
+    let path = socket.strip_prefix("unix:").unwrap_or(socket);
+    let mut stream = UnixStream::connect(path)
+        .unwrap_or_else(|e| panic!("mcp_http_server::post: connect {path}: {e}"));
+    let body = serde_json::to_vec(req).expect("serialize request");
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream.write_all(&body).expect("write body");
+    stream.flush().ok();
+
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status).expect("read status");
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).expect("read header") == 0 {
+            break;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut buf = vec![0u8; content_length];
+    reader.read_exact(&mut buf).expect("read body");
+    serde_json::from_slice(&buf).unwrap_or(Value::Null)
+}
+
 fn write_json(stream: &mut UnixStream, payload: &Value) {
     let body = serde_json::to_vec(payload).unwrap_or_default();
     let head = format!(

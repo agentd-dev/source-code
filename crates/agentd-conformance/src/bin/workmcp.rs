@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `workmcp <state-file> [item-uri]` — a minimal, spec-correct MCP server that
-//! serves the FROZEN `work.*` coordination contract (RFC 0015 §5.6) with
+//! `workmcp <unix-socket> <state-file> [item-uri]` — a minimal, spec-correct
+//! Streamable HTTP MCP server (over a unix socket) that serves the FROZEN
+//! `work.*` coordination contract (RFC 0015 §5.6) with
 //! **atomic single-grant** lease semantics, so the cross-instance claim
 //! convention (RFC 0019 §3) is testable end-to-end. agentd connects to it as an
 //! MCP client (the coordination server a `--claim` route names).
 //!
-//! It is modelled on `confmcp.rs`: a line-based stdio NDJSON JSON-RPC server,
-//! independent of the agentd library on purpose. Beyond the handshake +
+//! It is modelled on `confmcp.rs`: an HTTP-over-unix JSON-RPC server (via the
+//! shared `mcp_http_server`), independent of the agentd library. Beyond the
+//! handshake +
 //! resource methods (so a reactive agentd can subscribe to the work item and be
 //! poked into a reaction), it advertises and serves the four `work.*` tools:
 //!
@@ -27,10 +29,11 @@
 //! Single-threaded except for the one `subscribe`-triggered `updated` push
 //! `confmcp` also uses; the lease map lives on the main thread.
 
+use agentd_conformance::mcp_http_server::serve;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,40 +66,31 @@ struct State {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let state_path = args.next().expect("usage: workmcp <state-file> [item-uri]");
+    let socket = args
+        .next()
+        .expect("usage: workmcp <unix-socket> <state-file> [item-uri]");
+    let state_path = args
+        .next()
+        .expect("usage: workmcp <unix-socket> <state-file> [item-uri]");
     let item_uri = args.next().unwrap_or_else(|| "work:///item/1".to_string());
 
     // The lease state is the SHARED FILE, not in-process memory. Each `work.*`
     // call flocks the state file, reloads the current state from disk, applies its
     // decision, and writes it back under the lock (load-modify-store). This makes
     // the FILE the single serializing point ACROSS PROCESSES — so two reactive
-    // agentd daemons, each with their OWN workmcp child pointed at the SAME state
+    // agentd daemons, each pointed at their OWN workmcp server on the SAME state
     // file, still grant a contended item exactly once (RFC 0019 §3.1 / §8 row 1).
     // (A single-process driver — the protocol-level checks — works identically: it
     // locks, reads back its own last write, applies, writes.)
     //
-    // NB: we do NOT seed-write the state file at startup. A reactive agentd passes
-    // its `--mcp work=…` server to the spawned reaction too, so a SECOND workmcp
-    // process exists (the child's) pointed at the SAME state file — but the child
-    // never issues a `work.*` `tools/call`, so it must never write. Writing only
-    // under a tools/call (below) keeps the file owned by whichever process
-    // actually claims/acks. The check treats a missing file as "no calls yet".
+    // NB: we do NOT seed-write the state file at startup — writing only under a
+    // tools/call keeps the file owned by whichever process actually claims/acks.
+    // The check treats a missing file as "no calls yet".
 
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(req) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-
+    serve(&socket, move |req, notifier| {
         let method = req["method"].as_str().unwrap_or("");
-        let id = req.get("id").cloned();
         // Requests carry an id; notifications don't and get no reply.
-        let Some(id) = id else { continue };
+        let id = req.get("id").cloned()?;
 
         let result = match method {
             "initialize" => json!({
@@ -112,40 +106,39 @@ fn main() {
             "resources/read" => {
                 json!({"contents": [{"uri": item_uri, "mimeType": "text/plain", "text": "work pending"}]})
             }
-            "resources/subscribe" | "resources/unsubscribe" => json!({}),
+            "resources/unsubscribe" => json!({}),
+            "resources/subscribe" => {
+                // After a subscribe, push one resources/updated (on the GET SSE
+                // stream) for the work item so a reactive agentd fires a reaction
+                // (which then runs the claim gate). Same pattern confmcp uses.
+                let notifier = notifier.clone();
+                let uri = item_uri.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    notifier.push(json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/resources/updated",
+                        "params": {"uri": uri}
+                    }));
+                });
+                json!({})
+            }
             "tools/call" => {
                 // Flock-serialized load-modify-store: lock the state file, reload
                 // the shared state, apply, persist, unlock. This is the
                 // cross-process single serializing point (two daemons' workmcp
-                // children racing one item still grant once).
+                // servers racing one item still grant once).
                 with_locked_state(&state_path, |state| handle_tool_call(&req["params"], state))
             }
             _ => {
-                reply(
-                    &stdout,
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}}),
-                );
-                continue;
+                return Some(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                }));
             }
         };
-        reply(
-            &stdout,
-            json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        );
-
-        // After a subscribe, push one resources/updated for the work item so a
-        // reactive agentd fires a reaction (which then runs the claim gate). Same
-        // pattern confmcp uses to make the client path observable.
-        if method == "resources/subscribe" {
-            let uri = item_uri.clone();
-            std::thread::spawn(move || {
-                let stdout = io::stdout();
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                let note = json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}});
-                reply(&stdout, note);
-            });
-        }
-    }
+        Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+    });
 }
 
 /// The four frozen `work.*` tools (RFC 0015 §5.6) plus a `work.dump` introspection
@@ -485,10 +478,4 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
-}
-
-fn reply(stdout: &io::Stdout, msg: Value) {
-    let mut w = stdout.lock();
-    let _ = writeln!(w, "{msg}");
-    let _ = w.flush();
 }

@@ -43,6 +43,7 @@ pub fn checks() -> Vec<Check> {
 /// loop telemetry.
 fn run_loop(h: &Harness, script: &str, with_mcp: bool) -> (RunResult, crate::harness::MockLlm) {
     let llm = h.mock_llm(script);
+    let tmp = h.tempdir();
     let mut args: Vec<String> = vec![
         "--instruction".into(),
         "use the resource if needed".into(),
@@ -53,13 +54,16 @@ fn run_loop(h: &Harness, script: &str, with_mcp: bool) -> (RunResult, crate::har
         "--log-level".into(),
         "info".into(),
     ];
-    if with_mcp {
+    // Hold the mock server alive for the whole run (dropped at fn end, after run).
+    let _mock = if with_mcp {
+        let sock = tmp.path().join("mock.sock");
+        let mock = h.spawn_mock_mcp(&sock, "file:///in.json", false);
         args.push("--mcp".into());
-        args.push(format!(
-            "{} --no-emit",
-            h.mock_mcp_spec("mock", "file:///in.json")
-        ));
-    }
+        args.push(format!("mock={}", mock.endpoint()));
+        Some(mock)
+    } else {
+        None
+    };
     let argref: Vec<&str> = args.iter().map(String::as_str).collect();
     (h.run(&argref), llm)
 }
@@ -146,7 +150,10 @@ fn budget_bounds_the_loop(h: &Harness) -> Outcome {
     // The read script needs 2 steps (tool, then answer); capped at 1 it can't
     // converge, so the loop must stop on its step budget rather than run away.
     let llm = h.mock_llm("read");
-    let mcp = format!("{} --no-emit", h.mock_mcp_spec("mock", "file:///in.json"));
+    let tmp = h.tempdir();
+    let sock = tmp.path().join("mock.sock");
+    let _mock = h.spawn_mock_mcp(&sock, "file:///in.json", false);
+    let mcp = format!("mock={}", _mock.endpoint());
     let r = h.run(&[
         "--instruction",
         "use the resource",

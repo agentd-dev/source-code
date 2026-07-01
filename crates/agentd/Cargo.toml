@@ -27,7 +27,7 @@ default = ["tls"]
 # provider (no cmake/C build dep) + bundled webpki roots — so a scratch container
 # has trust anchors with no system CA bundle. On by default; opt out with
 # `--no-default-features` to reach https only via a TLS-terminating sidecar.
-tls = ["dep:rustls", "dep:webpki-roots"]
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
 # Enclave / microVM intelligence transport (AF_VSOCK).
 vsock = ["dep:vsock"]
 # Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
@@ -98,6 +98,8 @@ serde_json = "1"
 # --- feature: tls ---
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
+# PEM parsing for mTLS client certs/keys (pure Rust; reuses rustls-pki-types).
+rustls-pemfile = { version = "2", optional = true }
 # --- feature: vsock ---
 vsock = { version = "0.5", optional = true }
 # --- feature: serve-mcp --- blocking std UnixListener; no dependency.

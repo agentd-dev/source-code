@@ -7,6 +7,10 @@ pub mod http;
 // Auth material resolution for remote MCP endpoints (RFC 0012 §3.7): materialize
 // secret-free `{{secret:…}}` header templates into wire headers at connect time.
 pub mod auth;
+// OAuth 2.1 client-credentials (M2M) token source for endpoints behind an OAuth
+// gateway (RFC 0006 §auth). Feature-gated; dependency-free.
+#[cfg(feature = "oauth")]
+pub mod oauth;
 // Built-in mock MCP server (the hidden `--internal-mock-mcp` mode) for the test
 // + conformance suites. In debug it's always present (so `cargo test` works with
 // no flag); in release it ships only under `internal-mocks`, so the production

@@ -133,7 +133,6 @@ fn run() -> i32 {
             "max_tokens": cfg.max_tokens,
             "deadline_ms": cfg.deadline.map(|d| d.as_millis() as u64),
             "max_depth": cfg.max_depth,
-            "enable_exec": cfg.enable_exec,
             "log_content": cfg.log_content,
             "serve_mcp": cfg.serve_mcp.is_some(),
             "intel_scheme": cfg.intelligence.as_deref().and_then(|u| u.split(':').next()),
@@ -626,11 +625,6 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
             log_content: cfg.log_content,
         },
         depth: 0,
-        exec_allow: cfg
-            .exec_allow
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect(),
         warm: false, // root runs are one-shot; warm continue-sessions are daemon-minted
     }
 }

@@ -155,9 +155,8 @@ impl HttpTransport {
 
     /// Attach a mutual-TLS client identity (used only for `https://` endpoints).
     #[cfg(feature = "tls")]
-    pub fn with_identity(mut self, identity: Option<ClientIdentity>) -> Self {
+    pub fn set_identity(&mut self, identity: Option<ClientIdentity>) {
         self.identity = identity;
-        self
     }
 
     pub fn scheme(&self) -> &'static str {

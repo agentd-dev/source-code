@@ -187,6 +187,18 @@ impl McpClient {
         })
     }
 
+    /// Attach a mutual-TLS client identity (a mounted cert chain + key) for a
+    /// `https://` endpoint. A no-op on the stdio transport and on non-TLS
+    /// endpoints (the identity is only presented during the TLS handshake).
+    /// RFC 0012 §3.7: the key never leaves the process (see [`crate::net::tls`]).
+    #[cfg(feature = "tls")]
+    pub fn with_identity(mut self, identity: crate::net::tls::ClientIdentity) -> Self {
+        if let Transport::Http { http, .. } = &mut self.transport {
+            http.set_identity(Some(identity));
+        }
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

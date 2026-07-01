@@ -12,8 +12,68 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The protocol version agentd advertises in `initialize`.
-pub const PROTOCOL_VERSION: &str = "2025-11-25";
+/// The MCP protocol revisions agentd's client understands, **newest first**
+/// (MCP versions the spec's `YYYY-MM-DD` date form, and dates sort
+/// chronologically). The head is the LATEST — advertised in `initialize`
+/// (lifecycle §version-negotiation: the client "SHOULD send the *latest* version
+/// it supports"). To support a newly-released revision, add its date at the FRONT
+/// — agentd's narrow client surface (initialize / ping / tools/{list,call} /
+/// resources/{list,read,subscribe,unsubscribe}) is stable across every revision
+/// to date, so a bump is a one-line change here.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25", // current (modelcontextprotocol.io/specification/versioning)
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+
+/// The latest protocol version agentd advertises in `initialize` (the head of
+/// [`SUPPORTED_PROTOCOL_VERSIONS`]).
+pub const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+
+/// The version a spec-compliant Streamable HTTP server assumes when a request
+/// carries no `MCP-Protocol-Version` header (RFC transports §protocol-version-
+/// header). agentd always sends the header post-initialize, so this is only the
+/// documented fallback contract.
+pub const DEFAULT_NEGOTIATED_VERSION: &str = "2025-03-26";
+
+/// Is `v` a revision this client explicitly understands?
+pub fn is_supported_version(v: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&v)
+}
+
+/// Does `s` have the MCP `YYYY-MM-DD` version shape? (Cheap structural check, not
+/// a calendar validation — enough to tell a date revision from a bogus string.)
+pub fn is_date_version(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, &c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
+/// Negotiate the session protocol version from the server's `initialize` response
+/// (lifecycle §version-negotiation). The server echoes our advertised version if
+/// it supports it, else returns another version it supports.
+///
+/// * A version we **know** → adopt it.
+/// * An **unknown but newer** well-formed date → adopt it optimistically
+///   (forward-compat: a future revision keeps our stable method subset, so a
+///   brand-new server is reachable *before* we add its date above) — the caller
+///   should log that it is speaking an unrecognized revision.
+/// * Anything else (an older-unknown or malformed version) → `None`: the client
+///   cannot agree on a version and SHOULD disconnect.
+pub fn negotiate_version(server_version: &str) -> Option<String> {
+    if is_supported_version(server_version) {
+        return Some(server_version.to_string());
+    }
+    if is_date_version(server_version) && server_version > PROTOCOL_VERSION {
+        return Some(server_version.to_string());
+    }
+    None
+}
 
 /// Method + notification names (RFC 0004 §wire).
 pub mod method {
@@ -260,6 +320,53 @@ fn content_text(items: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_version_is_the_head_of_the_supported_list() {
+        assert_eq!(PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS[0]);
+        assert_eq!(PROTOCOL_VERSION, "2025-11-25");
+        // The list is ordered newest-first (dates sort chronologically).
+        let mut sorted = SUPPORTED_PROTOCOL_VERSIONS.to_vec();
+        sorted.sort_unstable();
+        sorted.reverse();
+        assert_eq!(sorted.as_slice(), SUPPORTED_PROTOCOL_VERSIONS);
+    }
+
+    #[test]
+    fn is_date_version_recognizes_the_shape() {
+        assert!(is_date_version("2025-11-25"));
+        assert!(is_date_version("2026-07-01"));
+        assert!(!is_date_version("2025-11-5")); // wrong length
+        assert!(!is_date_version("2025/11/25")); // wrong separators
+        assert!(!is_date_version("1.0.0"));
+        assert!(!is_date_version("twenty-fifth"));
+    }
+
+    #[test]
+    fn negotiate_adopts_known_versions() {
+        // Our latest, and any older known revision the server may downgrade to.
+        for v in SUPPORTED_PROTOCOL_VERSIONS {
+            assert_eq!(negotiate_version(v).as_deref(), Some(*v));
+        }
+    }
+
+    #[test]
+    fn negotiate_accepts_a_newer_unknown_revision_forward_compat() {
+        // A future dated revision (this month's upcoming one, before we add it):
+        // adopted optimistically so a brand-new server is still reachable.
+        let future = "2099-01-01";
+        assert!(!is_supported_version(future));
+        assert_eq!(negotiate_version(future).as_deref(), Some(future));
+    }
+
+    #[test]
+    fn negotiate_refuses_unknown_old_or_malformed_versions() {
+        // An OLDER unknown date we can't speak → disconnect.
+        assert_eq!(negotiate_version("2020-01-01"), None);
+        // A malformed / non-date version string → disconnect.
+        assert_eq!(negotiate_version("1.0.0"), None);
+        assert_eq!(negotiate_version(""), None);
+    }
 
     #[test]
     fn initialize_result_parses_capabilities() {

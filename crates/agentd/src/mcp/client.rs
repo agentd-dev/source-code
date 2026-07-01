@@ -18,7 +18,8 @@ use crate::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
 use crate::wire::mcp::{
     CallToolResult, ClientCapabilities, Implementation, InitializeParams, InitializeResult,
     ListResourcesResult, ListToolsResult, PROTOCOL_VERSION, ReadResourceParams, ReadResourceResult,
-    Resource, ServerCapabilities, SubscribeParams, Tool, method,
+    Resource, SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Tool, method,
+    negotiate_version,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -68,6 +69,9 @@ pub struct McpClient {
     events: Mutex<Option<EventStreamHandle>>,
     next_id: AtomicI64,
     caps: ServerCapabilities,
+    /// The protocol version negotiated at `initialize` (RFC 0004 lifecycle
+    /// §version-negotiation); `None` until then.
+    protocol_version: Option<String>,
     timeout: Duration,
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
     /// `{"agent/run_id": …}`) so backing services can dedupe retries
@@ -107,6 +111,7 @@ impl McpClient {
             events: Mutex::new(None),
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
+            protocol_version: None,
             timeout,
             tool_meta: None,
         })
@@ -183,9 +188,33 @@ impl McpClient {
             self.request_with_timeout(method::INITIALIZE, Some(to_value(&params)), timeout)?;
         let init: InitializeResult = serde_json::from_value(result)
             .map_err(|e| McpError::Transport(format!("bad initialize result: {e}")))?;
+
+        // Version negotiation (lifecycle §version-negotiation): the server echoes
+        // our version if it supports it, else returns one it does. Adopt its choice
+        // iff we can speak it; otherwise we cannot agree and must disconnect.
+        let negotiated = negotiate_version(&init.protocol_version).ok_or_else(|| {
+            McpError::Transport(format!(
+                "server '{}' offered unsupported MCP protocol version '{}' \
+                 (agentd speaks {:?})",
+                self.name, init.protocol_version, SUPPORTED_PROTOCOL_VERSIONS
+            ))
+        })?;
+        // Echo it on every subsequent request as MCP-Protocol-Version (a Streamable
+        // HTTP MUST) — set BEFORE `notifications/initialized`, which is the first
+        // request that must carry the header.
+        self.http.set_protocol_version(negotiated.clone());
+        self.protocol_version = Some(negotiated);
+
         self.caps = init.capabilities;
         self.notify(method::INITIALIZED, None)?;
         Ok(())
+    }
+
+    /// The protocol version negotiated with the server at `initialize`, once the
+    /// handshake has run (`None` before). Sent as `MCP-Protocol-Version` on every
+    /// subsequent request.
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.protocol_version.as_deref()
     }
 
     /// `tools/list`, following cursor pagination to completion. Empty when the

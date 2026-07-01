@@ -19,12 +19,15 @@ use serde_json::{Value, json};
 #[derive(Default)]
 struct Seen {
     session_ids: Vec<Option<String>>,
+    protocol_versions: Vec<Option<String>>,
     methods: Vec<String>,
 }
 
-/// One parsed HTTP request: the JSON-RPC body + the `Mcp-Session-Id` header.
+/// One parsed HTTP request: the JSON-RPC body + the `Mcp-Session-Id` /
+/// `MCP-Protocol-Version` headers.
 struct HttpReq {
     session_id: Option<String>,
+    protocol_version: Option<String>,
     body: Value,
 }
 
@@ -37,6 +40,7 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
     }
     let mut content_length = 0usize;
     let mut session_id = None;
+    let mut protocol_version = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -53,13 +57,19 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
                 content_length = val.parse().unwrap_or(0);
             } else if key == "mcp-session-id" {
                 session_id = Some(val);
+            } else if key == "mcp-protocol-version" {
+                protocol_version = Some(val);
             }
         }
     }
     let mut buf = vec![0u8; content_length];
     reader.read_exact(&mut buf).ok()?;
     let body: Value = serde_json::from_slice(&buf).ok()?;
-    Some(HttpReq { session_id, body })
+    Some(HttpReq {
+        session_id,
+        protocol_version,
+        body,
+    })
 }
 
 fn write_json(stream: &mut TcpStream, extra_header: &str, payload: &Value) {
@@ -116,6 +126,7 @@ fn spawn_mock() -> (String, Arc<Mutex<Seen>>) {
             {
                 let mut g = seen_thread.lock().unwrap();
                 g.session_ids.push(req.session_id.clone());
+                g.protocol_versions.push(req.protocol_version.clone());
                 g.methods.push(method.clone());
             }
             match method.as_str() {
@@ -185,6 +196,14 @@ fn streamable_http_full_lifecycle() {
         McpClient::connect("mock", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
     client.initialize().expect("initialize handshake");
 
+    // Version negotiation: the client advertised its latest (2025-11-25) but the
+    // server responded with 2025-06-18 — the client must ADOPT the server's choice.
+    assert_eq!(
+        client.protocol_version(),
+        Some("2025-06-18"),
+        "the client adopts the version the server negotiated"
+    );
+
     // Capabilities were parsed from the initialize result.
     assert!(client.capabilities().supports_tools(), "tools advertised");
     assert!(
@@ -212,16 +231,26 @@ fn streamable_http_full_lifecycle() {
     let read = client.read_resource("mock://res").expect("resources/read");
     assert_eq!(read.contents.len(), 1);
 
-    // The server-assigned session id was echoed on every post-initialize request.
+    // The session id AND the negotiated MCP-Protocol-Version are echoed on every
+    // post-initialize request; the `initialize` request itself carries neither
+    // (nothing agreed yet — the version header is a "subsequent request" MUST).
     let g = seen.lock().unwrap();
     let init_idx = g.methods.iter().position(|m| m == "initialize").unwrap();
-    for (i, sid) in g.session_ids.iter().enumerate() {
+    assert_eq!(
+        g.protocol_versions[init_idx], None,
+        "the initialize request must NOT carry MCP-Protocol-Version"
+    );
+    for (i, method) in g.methods.iter().enumerate() {
         if i > init_idx {
             assert_eq!(
-                sid.as_deref(),
+                g.session_ids[i].as_deref(),
                 Some("sess-1"),
-                "request #{i} ({}) must echo the session id",
-                g.methods[i]
+                "request #{i} ({method}) must echo the session id"
+            );
+            assert_eq!(
+                g.protocol_versions[i].as_deref(),
+                Some("2025-06-18"),
+                "request #{i} ({method}) must carry the negotiated MCP-Protocol-Version"
             );
         }
     }
@@ -275,6 +304,59 @@ fn notification_get_stream_delivers_server_pushes() {
     // Dropping the client stops the notification thread cleanly.
     drop(client);
     let _ = std::fs::remove_file(&sock);
+}
+
+/// A one-shot mock that answers `initialize` with a fixed `protocolVersion`, to
+/// drive the negotiation edge cases. Returns its endpoint.
+fn spawn_fixed_version_mock(version: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let Some(req) = read_http_request(&stream) else {
+                continue;
+            };
+            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+            let payload = json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fixed", "version": "0"}
+                }
+            });
+            write_json(&mut stream, "", &payload);
+        }
+    });
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+#[test]
+fn initialize_rejects_an_unsupported_protocol_version() {
+    // The server offers a version agentd cannot speak (an old unknown date) → the
+    // client cannot agree and disconnects with a transport error (lifecycle
+    // §version-negotiation: "SHOULD disconnect").
+    let endpoint = spawn_fixed_version_mock("2020-01-01");
+    let mut client =
+        McpClient::connect("old", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
+    let err = client.initialize();
+    assert!(
+        err.is_err(),
+        "an unsupported protocol version must fail initialize: {err:?}"
+    );
+    assert!(client.protocol_version().is_none());
+}
+
+#[test]
+fn initialize_accepts_a_future_protocol_version_forward_compat() {
+    // A future dated revision the client doesn't know yet is adopted optimistically
+    // (forward-compat), so a brand-new server is still reachable.
+    let endpoint = spawn_fixed_version_mock("2099-01-01");
+    let mut client = McpClient::connect("future", &endpoint, Vec::new(), Duration::from_secs(5))
+        .expect("connect");
+    client.initialize().expect("a newer revision is accepted");
+    assert_eq!(client.protocol_version(), Some("2099-01-01"));
 }
 
 #[test]

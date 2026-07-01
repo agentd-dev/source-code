@@ -1449,16 +1449,29 @@ fn dispatch(
     log: &Logger,
 ) -> Response {
     match req.method.as_str() {
-        "initialize" => Response::ok(
-            req.id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                // `resources.subscribe` advertises that a peer can subscribe to an
-                // agentd:// resource and be pushed updates (e.g. a run completing).
-                "capabilities": {"tools": {}, "resources": {"subscribe": true}},
-                "serverInfo": {"name": "agentd", "version": crate::VERSION}
-            }),
-        ),
+        "initialize" => {
+            // Version negotiation (RFC 0004 lifecycle §version-negotiation): echo
+            // the peer's requested version when we support it, else our latest.
+            let requested = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str);
+            let version = match requested {
+                Some(v) if crate::wire::mcp::is_supported_version(v) => v,
+                _ => PROTOCOL_VERSION,
+            };
+            Response::ok(
+                req.id,
+                json!({
+                    "protocolVersion": version,
+                    // `resources.subscribe` advertises that a peer can subscribe to an
+                    // agentd:// resource and be pushed updates (e.g. a run completing).
+                    "capabilities": {"tools": {}, "resources": {"subscribe": true}},
+                    "serverInfo": {"name": "agentd", "version": crate::VERSION}
+                }),
+            )
+        }
         "ping" => Response::ok(req.id, json!({})),
         // The work tools are listed to every peer; the operator tools
         // (drain/lame-duck/cancel) only to a `Management` peer (RFC 0015 §3.4) —

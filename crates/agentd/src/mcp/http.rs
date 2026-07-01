@@ -140,6 +140,11 @@ pub struct HttpTransport {
     #[cfg(feature = "tls")]
     identity: Option<ClientIdentity>,
     session: Mutex<Option<String>>,
+    /// The protocol version negotiated at `initialize`, echoed on every later
+    /// request as `MCP-Protocol-Version` (RFC transports §protocol-version-header
+    /// — a MUST for Streamable HTTP). `None` until the client sets it, so the
+    /// `initialize` request itself carries no header (no version agreed yet).
+    protocol_version: Mutex<Option<String>>,
 }
 
 impl HttpTransport {
@@ -150,6 +155,7 @@ impl HttpTransport {
             #[cfg(feature = "tls")]
             identity: None,
             session: Mutex::new(None),
+            protocol_version: Mutex::new(None),
         }
     }
 
@@ -157,6 +163,12 @@ impl HttpTransport {
     #[cfg(feature = "tls")]
     pub fn set_identity(&mut self, identity: Option<ClientIdentity>) {
         self.identity = identity;
+    }
+
+    /// Record the negotiated protocol version, sent as `MCP-Protocol-Version` on
+    /// every subsequent request (called by the client after `initialize`).
+    pub fn set_protocol_version(&self, version: String) {
+        *self.protocol_version.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
     }
 
     pub fn scheme(&self) -> &'static str {
@@ -236,6 +248,16 @@ impl HttpTransport {
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
         }
+        // MCP-Protocol-Version on every post-initialize request (a Streamable HTTP
+        // MUST). `None` only before/at initialize, when no version is agreed yet.
+        let protocol = self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(v) = &protocol {
+            headers.push(("MCP-Protocol-Version", v));
+        }
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
@@ -291,6 +313,16 @@ impl HttpTransport {
         let session = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
+        }
+        // The notification stream is opened post-initialize (from subscribe), so
+        // the negotiated version is always known here (Streamable HTTP MUST).
+        let protocol = self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(v) = &protocol {
+            headers.push(("MCP-Protocol-Version", v));
         }
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));

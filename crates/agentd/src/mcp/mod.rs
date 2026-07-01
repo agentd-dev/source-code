@@ -11,15 +11,12 @@ pub mod auth;
 // gateway (RFC 0006 §auth). Feature-gated; dependency-free.
 #[cfg(feature = "oauth")]
 pub mod oauth;
-// Built-in mock MCP server (the hidden `--internal-mock-mcp` mode) for the test
-// + conformance suites. In debug it's always present (so `cargo test` works with
-// no flag); in release it ships only under `internal-mocks`, so the production
-// binary carries no test scaffolding.
-#[cfg(any(feature = "internal-mocks", debug_assertions))]
-pub mod mock;
-// The Streamable HTTP counterpart of `mock` (v2.0.0): serves the same one-resource
-// reactive MCP over a unix socket, so the test/conformance harness drives agentd's
-// HTTP transport end to end. Same gating as `mock`.
+// Built-in Streamable HTTP mock MCP server (the hidden `--internal-mock-mcp-http`
+// mode, v2.0.0) for the test + conformance suites: serves a one-resource reactive
+// MCP over a unix socket, so the harness drives agentd's HTTP transport end to end.
+// In debug it's always present (so `cargo test` works with no flag); in release it
+// ships only under `internal-mocks`, so the production binary carries no test
+// scaffolding.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
 

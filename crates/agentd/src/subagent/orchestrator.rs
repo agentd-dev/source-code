@@ -921,13 +921,13 @@ mod tests {
             mcp_servers: vec![
                 McpServerSpec {
                     name: "fs".into(),
-                    command: vec!["a".into()],
+                    endpoint: "unix:/a.sock".into(),
                     tags: Vec::new(),
                     ..Default::default()
                 },
                 McpServerSpec {
                     name: "db".into(),
-                    command: vec!["b".into()],
+                    endpoint: "unix:/b.sock".into(),
                     tags: Vec::new(),
                     ..Default::default()
                 },

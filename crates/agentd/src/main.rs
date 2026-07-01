@@ -25,17 +25,6 @@ fn main() {
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
 
-    // Hidden built-in mock MCP server (tests / dev):
-    // `--internal-mock-mcp <uri> [--no-emit]`. Compiled only when the mock
-    // modules are (debug builds, or release `--features internal-mocks`); the
-    // production binary omits this dispatch entirely.
-    #[cfg(any(feature = "internal-mocks", debug_assertions))]
-    if argv.get(1).map(String::as_str) == Some("--internal-mock-mcp") {
-        let uri = argv.get(2).map(String::as_str).unwrap_or("mock://resource");
-        let emit = !argv.iter().any(|a| a == "--no-emit");
-        return agentd::mcp::mock::run(uri, emit);
-    }
-
     // Hidden built-in Streamable HTTP mock MCP server (v2.0.0 tests/dev):
     // `--internal-mock-mcp-http <unix-socket> <uri> [--no-emit]`. Same gating as
     // the stdio mock; serves the reactive one-resource MCP over the socket.

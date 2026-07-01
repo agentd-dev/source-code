@@ -1311,9 +1311,9 @@ fn arm_added_subscription(
 ///    effort), drop the `McpClient` (its Drop runs the stdio shutdown ladder /
 ///    kill+reap), remove from `servers`/`server_order`. Any URI it owned that is
 ///    STILL a wanted subscription is RE-HOMED onto a surviving server below.
-///  * **changed** (same name, different command/argv/tags): remove-then-add — a
-///    command/argv change is a new process.
-///  * **added** (in new, not in running): `McpClient::spawn` + `initialize` +
+///  * **changed** (same name, different endpoint/headers/tags): remove-then-add —
+///    an endpoint change is a new connection.
+///  * **added** (in new, not in running): `McpClient::from_spec` + `initialize` +
 ///    re-stamp the run-id/traceparent tool `_meta` (matching the connect path);
 ///    append to `servers`/`server_order`. A failed add is CONTAINED — logged
 ///    `mcp.connect.fail`, the server simply absent (RFC 0007 tool-domain absence)
@@ -2197,25 +2197,24 @@ mod tests {
     /// whether its command/argv/tags differ: removed / added / changed / unchanged.
     #[cfg(feature = "hot-reload")]
     #[test]
-    fn mcp_server_reload_is_diffed_by_name_and_command_and_tags() {
+    fn mcp_server_reload_is_diffed_by_name_and_endpoint_and_tags() {
         use crate::config::{Config, McpServerSpec, Mode};
-        let srv = |name: &str, cmd: &[&str]| McpServerSpec {
+        let srv = |name: &str, ep: &str| McpServerSpec {
             name: name.into(),
-            command: cmd.iter().map(|s| s.to_string()).collect(),
-            tags: vec![],
+            endpoint: ep.into(),
             ..Default::default()
         };
         let running = Config {
             mode: Mode::Reactive,
-            mcp_servers: vec![srv("a", &["a-cmd"]), srv("b", &["b-cmd"])],
+            mcp_servers: vec![srv("a", "unix:/a.sock"), srv("b", "unix:/b.sock")],
             ..Config::default()
         };
-        // ADD c, REMOVE b, CHANGE a's command, KEEP nothing identical to a.
+        // ADD c, REMOVE b, CHANGE a's endpoint, KEEP nothing identical to a.
         let mut new = running.clone();
         new.mcp_servers = vec![
-            srv("a", &["a-cmd-v2"]), // changed (command differs)
-            srv("c", &["c-cmd"]),    // added
-                                     // b removed
+            srv("a", "unix:/a-v2.sock"), // changed (endpoint differs)
+            srv("c", "unix:/c.sock"),    // added
+                                         // b removed
         ];
         // reloadable_changes must flag mcp_servers as changed.
         assert!(reloadable_changes(&running, &new).contains(&"mcp_servers"));
@@ -2232,7 +2231,7 @@ mod tests {
         // c: in new, not running → ADDED.
         assert!(by_name(&running.mcp_servers, "c").is_none(), "c is added");
 
-        // An identical server set (same name+command+tags) is NO change.
+        // An identical server set (same name+endpoint+tags) is NO change.
         assert!(!reloadable_changes(&running, &running).contains(&"mcp_servers"));
 
         // A tag-only change still counts (the apply remove-then-adds it).
@@ -2255,7 +2254,7 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
-            r#"{{"mcp_servers":[{{"name":"s","command":"cmd","tags":{{"*":["untrusted_input","sensitive","egress"]}}}}]}}"#
+            r#"{{"mcp_servers":[{{"name":"s","endpoint":"unix:/s.sock","tags":{{"*":["untrusted_input","sensitive","egress"]}}}}]}}"#
         )
         .unwrap();
         f.flush().unwrap();

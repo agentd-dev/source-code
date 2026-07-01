@@ -12,6 +12,7 @@
 
 pub mod checks;
 pub mod harness;
+pub mod mcp_http_server;
 pub mod report;
 
 pub use harness::Harness;

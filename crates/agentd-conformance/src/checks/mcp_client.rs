@@ -51,9 +51,28 @@ fn records(h: &Harness) -> &'static [Value] {
 fn record_client_requests(h: &Harness) -> Vec<Value> {
     let tmp = h.tempdir();
     let rec = tmp.path().join("rec.jsonl");
+    let sock = tmp.path().join("confmcp.sock");
     let uri = "file:///conf-watch.json";
-    let mcp = format!("ref={} {} {}", h.confmcp().display(), rec.display(), uri);
 
+    // Launch confmcp as a Streamable HTTP MCP server on a unix socket; agentd
+    // connects to it (v2.0.0 — no stdio spawn).
+    let mut confmcp = std::process::Command::new(h.confmcp())
+        .arg(&sock)
+        .arg(&rec)
+        .arg(uri)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn confmcp");
+    let sock_deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        if Instant::now() >= sock_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mcp = format!("ref=unix:{}", sock.display());
     let daemon = h.spawn(&[
         "--mode",
         "reactive",
@@ -72,20 +91,19 @@ fn record_client_requests(h: &Harness) -> Vec<Value> {
     // The reaction's subagent issues tools/list — the last of the client's
     // discovery path to land. Wait for it (or give up after a generous window).
     let deadline = Instant::now() + Duration::from_secs(12);
-    loop {
+    let reqs = loop {
         let reqs = read_records(&rec);
         let saw_subscribe = reqs.iter().any(|r| r["method"] == "resources/subscribe");
         let saw_tools = reqs.iter().any(|r| r["method"] == "tools/list");
-        if saw_subscribe && saw_tools {
-            drop(daemon);
-            return reqs;
-        }
-        if Instant::now() >= deadline {
-            drop(daemon);
-            return read_records(&rec);
+        if (saw_subscribe && saw_tools) || Instant::now() >= deadline {
+            break reqs;
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    drop(daemon);
+    let _ = confmcp.kill();
+    let _ = confmcp.wait();
+    reqs
 }
 
 fn read_records(path: &std::path::Path) -> Vec<Value> {

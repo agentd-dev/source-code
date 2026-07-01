@@ -131,6 +131,24 @@ impl McpClient {
         })
     }
 
+    /// Build a client from a declared [`McpServerSpec`]: an `endpoint` server
+    /// connects over Streamable HTTP (resolving its secret-free auth header
+    /// templates at this moment), a legacy `command` server spawns over stdio.
+    /// Call [`Self::initialize`] before any tool/resource call.
+    pub fn from_spec(
+        spec: &crate::config::McpServerSpec,
+        timeout: Duration,
+    ) -> Result<McpClient, McpError> {
+        match &spec.endpoint {
+            Some(endpoint) => {
+                let headers = crate::mcp::auth::resolve_headers(&spec.headers)
+                    .map_err(McpError::Transport)?;
+                McpClient::connect(&spec.name, endpoint, headers, timeout)
+            }
+            None => McpClient::spawn(&spec.name, &spec.command, timeout),
+        }
+    }
+
     /// Spawn `command` (argv) as a stdio MCP server and start the reader
     /// thread. Call [`Self::initialize`] before any tool/resource call.
     ///

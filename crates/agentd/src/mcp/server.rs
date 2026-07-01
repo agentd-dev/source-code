@@ -3196,11 +3196,13 @@ mod tests {
                     name: "fs".into(),
                     command: vec!["a".into()],
                     tags: Vec::new(),
+                    ..Default::default()
                 },
                 McpServerSpec {
                     name: "db".into(),
                     command: vec!["b".into()],
                     tags: Vec::new(),
+                    ..Default::default()
                 },
             ],
             a2a_peers: Vec::new(),

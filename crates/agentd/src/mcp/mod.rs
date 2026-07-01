@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod client;
+// The Streamable HTTP client transport (RFC 0004): reach a remote MCP server over
+// https/http/unix/vsock — no local process spawn (RFC 0012, v2.0.0). Endpoint
+// resolution + the POST-JSON-RPC / SSE request path live here; `client` drives it.
+pub mod http;
 // Built-in mock MCP server (the hidden `--internal-mock-mcp` mode) for the test
 // + conformance suites. In debug it's always present (so `cargo test` works with
 // no flag); in release it ships only under `internal-mocks`, so the production

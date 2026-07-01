@@ -8,18 +8,19 @@
 # agentd serving its own MCP for composability, UTC-cron scheduling, OTLP trace
 # export, horizontal scaling (sharding + work-claim leases + autoscaling signals +
 # the capacity surface), and SIGHUP + inotify config hot-reload (a ConfigMap volume
-# swap reloads in place). Every one of those is hand-rolled and adds NO dependency,
-# so the binary stays the minimalism target —
-# serde/serde_json + libc only (3 deps), no async runtime, no TLS, no C toolchain
-# — links statically against musl, and ships on an empty base: ~1.3 MB, no shell,
-# no libc, no package manager. Nothing to attack or patch.
+# swap reloads in place). Every one of those is hand-rolled and adds NO dependency.
+# As of v2.0.0, HTTPS is the primary transport for both intelligence and MCP, so
+# `tls` is ON by DEFAULT: the binary carries pure-Rust rustls (`ring`, no cmake/C)
+# + bundled webpki roots — serde/serde_json + libc + rustls/ring/webpki-roots, no
+# async runtime, no C toolchain — links statically against musl, and ships on an
+# empty base: ~few MB, no shell, no libc, no package manager. Nothing to attack.
 #
 # Change the capability surface at build time with FEATURES, e.g.:
-#   docker build --build-arg FEATURES=metrics,serve-mcp,cron,otel,tls,vsock .
-#   docker build --build-arg FEATURES= .          # the pure, flag-free minimal binary
-# Adding `tls` pulls rustls (pure-Rust `ring`, no cmake) + bundled webpki-roots, so
-# even an https:// intelligence endpoint needs no system CA bundle. The default,
-# TLS-free image reaches intelligence over `unix:` to a TLS-terminating sidecar.
+#   docker build --build-arg FEATURES=metrics,serve-mcp,cron,otel,vsock .
+#   docker build --build-arg FEATURES= .          # the flag-free build (still TLS via default)
+# `tls` (default) needs no system CA bundle — the webpki roots are bundled. To drop
+# TLS entirely (reach https only via a `unix:` TLS-terminating sidecar), build with
+# cargo `--no-default-features`.
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.88-alpine AS builder

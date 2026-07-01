@@ -140,18 +140,16 @@ pub struct HttpTransport {
     #[cfg(feature = "tls")]
     identity: Option<ClientIdentity>,
     session: Mutex<Option<String>>,
-    timeout: Duration,
 }
 
 impl HttpTransport {
-    pub fn new(endpoint: McpEndpoint, headers: Vec<(String, String)>, timeout: Duration) -> Self {
+    pub fn new(endpoint: McpEndpoint, headers: Vec<(String, String)>) -> Self {
         HttpTransport {
             endpoint,
             headers,
             #[cfg(feature = "tls")]
             identity: None,
             session: Mutex::new(None),
-            timeout,
         }
     }
 
@@ -166,14 +164,15 @@ impl HttpTransport {
         self.endpoint.scheme()
     }
 
-    /// Open a fresh connection to the endpoint as a boxed byte stream.
-    fn connect(&self) -> Result<Box<dyn http::Stream>, HttpError> {
+    /// Open a fresh connection to the endpoint as a boxed byte stream, applying
+    /// `timeout` as the connect + read/write bound (each request opens its own
+    /// connection, so the per-call timeout governs the whole exchange).
+    fn connect(&self, timeout: Duration) -> Result<Box<dyn http::Stream>, HttpError> {
         match &self.endpoint {
             McpEndpoint::Tcp {
                 host, port, tls, ..
             } => {
-                let tcp =
-                    http::connect_tcp(host, *port, self.timeout).map_err(HttpError::Connect)?;
+                let tcp = http::connect_tcp(host, *port, timeout).map_err(HttpError::Connect)?;
                 if *tls {
                     #[cfg(feature = "tls")]
                     {
@@ -194,14 +193,14 @@ impl HttpTransport {
             McpEndpoint::Unix { socket, .. } => {
                 // `net::unixsock::connect` exists on every platform (a non-unix
                 // build returns an Unsupported error), matching the intel path.
-                let s = crate::net::unixsock::connect(socket, self.timeout)
-                    .map_err(HttpError::Connect)?;
+                let s =
+                    crate::net::unixsock::connect(socket, timeout).map_err(HttpError::Connect)?;
                 Ok(Box::new(s))
             }
             McpEndpoint::Vsock { cid, port, .. } => {
                 #[cfg(feature = "vsock")]
                 {
-                    let s = crate::net::vsock::connect(*cid, *port, self.timeout)
+                    let s = crate::net::vsock::connect(*cid, *port, timeout)
                         .map_err(HttpError::Connect)?;
                     Ok(Box::new(s))
                 }
@@ -226,9 +225,10 @@ impl HttpTransport {
         &self,
         request_id: Option<i64>,
         body: &[u8],
+        timeout: Duration,
         mut on_notification: F,
     ) -> Result<Option<Value>, HttpError> {
-        let mut stream = self.connect()?;
+        let mut stream = self.connect(timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![
             ("Content-Type", "application/json"),
             ("Accept", "application/json, text/event-stream"),

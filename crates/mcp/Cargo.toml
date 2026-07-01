@@ -1,0 +1,22 @@
+# The reusable Model Context Protocol base library: wire types + the version/era
+# model + (progressively) the transport dialects, client, and server that agentd's
+# runtime builds on. Deliberately free of agentd internals so it can be reused and
+# so the multi-version (legacy handshake ↔ modern stateless) logic lives in one
+# place. Dependency budget mirrors agentd: serde + serde_json only.
+[package]
+name = "mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Model Context Protocol base library: wire types, version/era negotiation, transports"
+license = "Apache-2.0"
+repository = "https://github.com/agentd-dev/source-code"
+publish = false
+
+[lib]
+name = "mcp"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -17,6 +17,11 @@ pub mod oauth;
 // binary carries no test scaffolding.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock;
+// The Streamable HTTP counterpart of `mock` (v2.0.0): serves the same one-resource
+// reactive MCP over a unix socket, so the test/conformance harness drives agentd's
+// HTTP transport end to end. Same gating as `mock`.
+#[cfg(any(feature = "internal-mocks", debug_assertions))]
+pub mod mock_http;
 
 // agentd serving its own MCP over a unix socket (composability, RFC 0005) and
 // over vsock (the agentctl management transport, RFC 0015 §3). Feature-gated,

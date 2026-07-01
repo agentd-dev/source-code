@@ -36,6 +36,20 @@ fn run() -> i32 {
         return agentd::mcp::mock::run(uri, emit);
     }
 
+    // Hidden built-in Streamable HTTP mock MCP server (v2.0.0 tests/dev):
+    // `--internal-mock-mcp-http <unix-socket> <uri> [--no-emit]`. Same gating as
+    // the stdio mock; serves the reactive one-resource MCP over the socket.
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    if argv.get(1).map(String::as_str) == Some("--internal-mock-mcp-http") {
+        let socket = argv
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("/tmp/agentd-mock-mcp.sock");
+        let uri = argv.get(3).map(String::as_str).unwrap_or("mock://resource");
+        let emit = !argv.iter().any(|a| a == "--no-emit");
+        return agentd::mcp::mock_http::run(socket, uri, emit);
+    }
+
     // Hidden built-in mock LLM (tests / observe-suite):
     // `--internal-mock-llm <socket> [final|read|schedule]`. Same gating as the
     // mock MCP dispatch above.

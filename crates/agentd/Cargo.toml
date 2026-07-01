@@ -16,14 +16,17 @@ path = "src/lib.rs"
 name = "agentd"
 path = "src/main.rs"
 
-# Capability surface is compile-time. The default build is the minimalism
-# target: no async runtime, no TLS, no C/C++ toolchain — single-digit
-# first-party crates. Everything heavier is feature-gated and OFF by
-# default. See rfcs/0002 §dependency-budget.
+# Capability surface is compile-time. The default build stays lean — no async
+# runtime, no C/C++ toolchain, single-digit first-party crates — but as of v2.0.0
+# HTTPS is the primary transport for both intelligence and MCP, so `tls` is ON by
+# default (pure-Rust rustls+ring, no cmake/C build dep). Everything else heavier is
+# feature-gated and OFF by default. See rfcs/0002 §dependency-budget.
 [features]
-default = []
-# Direct https:// intelligence/MCP when TLS is not sidecar-terminated.
-# rustls with the `ring` provider (no cmake/C build dep) + bundled roots.
+default = ["tls"]
+# Direct https:// intelligence/MCP (the default transport). rustls with the `ring`
+# provider (no cmake/C build dep) + bundled webpki roots — so a scratch container
+# has trust anchors with no system CA bundle. On by default; opt out with
+# `--no-default-features` to reach https only via a TLS-terminating sidecar.
 tls = ["dep:rustls", "dep:webpki-roots"]
 # Enclave / microVM intelligence transport (AF_VSOCK).
 vsock = ["dep:vsock"]

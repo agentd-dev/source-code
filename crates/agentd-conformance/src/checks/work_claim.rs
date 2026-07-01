@@ -29,10 +29,10 @@
 //!     "already-done" collapse), so the loser is refused regardless of whether it
 //!     races while the winner holds the lease or after the winner has acked.
 
+use crate::mcp_http_server;
 use crate::{Category, Check, Harness, Outcome};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -169,19 +169,13 @@ fn e2e_claim_then_ack_once(h: &Harness) -> Outcome {
 
     // SOURCE: confmcp serves `item` and pushes one updated after subscribe.
     let src_rec = tmp.path().join("src.jsonl");
-    let source = format!(
-        "src={} {} {}",
-        h.confmcp().display(),
-        src_rec.display(),
-        item
-    );
+    let src_sock = tmp.path().join("src.sock");
+    let src_server = h.spawn_confmcp(&src_sock, &src_rec, item);
+    let source = format!("src={}", src_server.endpoint());
     // COORDINATION: workmcp serves the frozen work.* tools + the same item URI.
-    let coord = format!(
-        "work={} {} {}",
-        h.workmcp().display(),
-        state.display(),
-        item
-    );
+    let work_sock = tmp.path().join("work.sock");
+    let work_server = h.spawn_workmcp(&work_sock, &state, item);
+    let coord = format!("work={}", work_server.endpoint());
 
     // The cluster build is REQUIRED: `--claim` exits 2 on a default build.
     let daemon = h.spawn_cluster(&[
@@ -264,21 +258,19 @@ fn two_instance_race_grants_once(h: &Harness) -> Outcome {
     // store). Each daemon's confmcp source pushes one `updated{item}` after
     // subscribe, so BOTH daemons are woken for the same item and race the claim.
     let mut daemons = Vec::new();
+    // Hold every mock server subprocess alive for the whole race (dropped last).
+    let mut servers = Vec::new();
     for n in 0..2 {
         let src_rec = tmp.path().join(format!("src{n}.jsonl"));
-        let source = format!(
-            "src={} {} {}",
-            h.confmcp().display(),
-            src_rec.display(),
-            item
-        );
-        // Both coordination children point at the one shared `state` file.
-        let coord = format!(
-            "work={} {} {}",
-            h.workmcp().display(),
-            state.display(),
-            item
-        );
+        let src_sock = tmp.path().join(format!("src{n}.sock"));
+        let src_server = h.spawn_confmcp(&src_sock, &src_rec, item);
+        let source = format!("src={}", src_server.endpoint());
+        // Both coordination servers point at the one shared `state` file.
+        let work_sock = tmp.path().join(format!("work{n}.sock"));
+        let work_server = h.spawn_workmcp(&work_sock, &state, item);
+        let coord = format!("work={}", work_server.endpoint());
+        servers.push(src_server);
+        servers.push(work_server);
         let d = h.spawn_cluster(&[
             "--mode",
             "reactive",
@@ -356,58 +348,49 @@ fn read_state(path: &Path) -> Option<Value> {
 
 // ───────────────────────── a stdio JSON-RPC client ────────────────────────
 
-/// A minimal line-based JSON-RPC client over a child's stdio, to drive `workmcp`
-/// directly for the protocol-level checks. Built around raw JSON (never agentd's
-/// codec) — a conformance probe, not a peer.
+/// A minimal HTTP-over-unix JSON-RPC client to drive `workmcp` directly for the
+/// protocol-level checks. Built around raw JSON (never agentd's codec) — a
+/// conformance probe, not a peer.
 struct WorkServer {
     child: Child,
-    stdin: std::process::ChildStdin,
-    reader: BufReader<std::process::ChildStdout>,
+    socket: PathBuf,
     id: i64,
 }
 
 impl WorkServer {
-    /// Spawn `workmcp <state> <item>` and complete the MCP handshake.
+    /// Spawn `workmcp <socket> <state> <item>` and complete the MCP handshake.
     fn start(h: &Harness, state: &Path, item: &str) -> WorkServer {
-        let mut child = Command::new(h.workmcp())
+        let socket = state.with_extension("driver.sock");
+        let _ = std::fs::remove_file(&socket);
+        let child = Command::new(h.workmcp())
+            .arg(&socket)
             .arg(state)
             .arg(item)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn workmcp");
-        let stdin = child.stdin.take().expect("workmcp stdin");
-        let reader = BufReader::new(child.stdout.take().expect("workmcp stdout"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "workmcp socket never bound");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut s = WorkServer {
             child,
-            stdin,
-            reader,
+            socket,
             id: 0,
         };
         let _ = s.call("initialize", json!({}));
         s
     }
 
-    /// Send a JSON-RPC request, return the `result` value (panics on no reply).
+    /// Send a JSON-RPC request over HTTP, returning the `result` value.
     fn call(&mut self, method: &str, params: Value) -> Value {
         self.id += 1;
-        let line = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params})
-            .to_string();
-        writeln!(self.stdin, "{line}").expect("write to workmcp");
-        self.stdin.flush().ok();
-        // Skip any notification lines (no id) until our response arrives.
-        loop {
-            let mut buf = String::new();
-            let n = self.reader.read_line(&mut buf).expect("read from workmcp");
-            assert!(n != 0, "workmcp closed stdout before replying to {method}");
-            let Ok(v) = serde_json::from_str::<Value>(&buf) else {
-                continue;
-            };
-            if v.get("id").and_then(Value::as_i64) == Some(self.id) {
-                return v["result"].clone();
-            }
-        }
+        let req = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params});
+        let endpoint = format!("unix:{}", self.socket.display());
+        let resp = mcp_http_server::post(&endpoint, &req);
+        resp["result"].clone()
     }
 
     /// Call a `work.*` tool, returning the parsed `structuredContent` body.
@@ -438,5 +421,6 @@ impl Drop for WorkServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
     }
 }

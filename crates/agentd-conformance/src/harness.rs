@@ -200,6 +200,32 @@ impl Harness {
         &self.workmcp
     }
 
+    /// Launch the built-in agentd Streamable HTTP mock MCP server on `socket`,
+    /// serving one resource at `uri` (`emit` pushes a resources/updated after
+    /// subscribe). Blocks until the socket binds; the guard kills it on drop.
+    pub fn spawn_mock_mcp(&self, socket: &Path, uri: &str, emit: bool) -> ConfServer {
+        let mut args: Vec<&Path> =
+            vec![Path::new("--internal-mock-mcp-http"), socket, Path::new(uri)];
+        if !emit {
+            args.push(Path::new("--no-emit"));
+        }
+        ConfServer::spawn(&self.agentd, &args, socket)
+    }
+
+    /// Launch `confmcp` as a Streamable HTTP MCP server on `socket`, recording
+    /// requests to `rec` and serving resource `uri`. Blocks until the socket
+    /// binds; the returned guard kills it on drop. agentd dials `.endpoint()`.
+    pub fn spawn_confmcp(&self, socket: &Path, rec: &Path, uri: &str) -> ConfServer {
+        ConfServer::spawn(&self.confmcp, &[socket, rec, Path::new(uri)], socket)
+    }
+
+    /// Launch `workmcp` as a Streamable HTTP MCP server on `socket`, backed by the
+    /// shared lease `state` file and serving item `uri`. Blocks until the socket
+    /// binds; the returned guard kills it on drop.
+    pub fn spawn_workmcp(&self, socket: &Path, state: &Path, uri: &str) -> ConfServer {
+        ConfServer::spawn(&self.workmcp, &[socket, state, Path::new(uri)], socket)
+    }
+
     pub fn tempdir(&self) -> TempDir {
         TempDir::new()
     }
@@ -235,10 +261,6 @@ impl Harness {
         }
     }
 
-    /// The `--mcp` spec for the built-in mock MCP server serving `uri`.
-    pub fn mock_mcp_spec(&self, name: &str, uri: &str) -> String {
-        format!("{name}={} --internal-mock-mcp {uri}", self.agentd.display())
-    }
 
     /// Spawn agentd as a long-lived daemon with `args`; returns a guard that
     /// SIGTERMs it on drop (or via [`Daemon::sigterm`] / [`Daemon::wait`]).
@@ -293,6 +315,52 @@ impl Harness {
             client,
             _tmp: tmp,
         }
+    }
+}
+
+/// A spawned conformance MCP server (`confmcp`/`workmcp`) serving Streamable HTTP
+/// over a unix socket. agentd (or a probe) dials [`ConfServer::endpoint`]. Killed
+/// and its socket removed on drop.
+pub struct ConfServer {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl ConfServer {
+    fn spawn(bin: &Path, args: &[&Path], socket: &Path) -> ConfServer {
+        let _ = std::fs::remove_file(socket);
+        let child = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "conformance mcp server socket never bound: {}",
+                socket.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ConfServer {
+            child,
+            socket: socket.to_path_buf(),
+        }
+    }
+
+    /// The `unix:<socket>` endpoint agentd connects to.
+    pub fn endpoint(&self) -> String {
+        format!("unix:{}", self.socket.display())
+    }
+}
+
+impl Drop for ConfServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
     }
 }
 

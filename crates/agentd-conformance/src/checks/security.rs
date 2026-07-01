@@ -35,7 +35,7 @@ const TRIFECTA_ARGS: &[&str] = &[
     "--intelligence",
     "unix:/nonexistent/agentd-conf.sock",
     "--mcp",
-    "fs=/bin/true",
+    "fs=unix:/nonexistent/fs.sock",
     "--mcp-tags",
     "fs=untrusted_input,sensitive,egress",
 ];

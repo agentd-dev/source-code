@@ -724,7 +724,7 @@ mod tests {
             &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "unix:/x")],
             &[
                 "--mcp",
-                "vault=mcp-vault --secret-cmd",
+                "vault=unix:/vault.sock",
                 "--mcp-tags",
                 "vault=sensitive",
             ],

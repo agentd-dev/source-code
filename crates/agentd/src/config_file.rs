@@ -88,34 +88,21 @@ pub struct LimitsFile {
     pub deadline_secs: Option<u64>,
 }
 
-/// One MCP server. As of v2.0.0 the transport is a remote `endpoint`
-/// (`https://`/`http://`/`unix:`/`vsock:`, RFC 0004 Streamable HTTP) with optional
-/// secret-free auth `headers`; the legacy `command`/`argv` (stdio) is retained for
-/// the test mock only. Exactly one of `endpoint` / `command` is set. `tags` is the
+/// One MCP server, reached over the v2.0.0 Streamable HTTP transport: a remote
+/// `endpoint` (`https://`/`http://`/`unix:`/`vsock:`, RFC 0004) with optional
+/// secret-free auth `headers` (RFC 0012 — no local process spawn). `tags` is the
 /// RFC 0012 §3.1 glob→tags wire (the loader flattens a `{"*": ["sensitive"]}` map
 /// to the server's tag set).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerFile {
     pub name: String,
-    /// Legacy stdio argv[0] (mutually exclusive with `endpoint`).
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub argv: Vec<String>,
     /// Remote MCP endpoint (the v2.0.0 transport).
-    #[serde(default)]
     pub endpoint: Option<String>,
-    /// Auth/framing header templates for an `endpoint` server — values MAY
-    /// interpolate `{{secret:NAME}}` / `{{secret-file:PATH}}`, never inline
-    /// secrets (RFC 0012 §3.7).
+    /// Auth/framing header templates — values MAY interpolate `{{secret:NAME}}` /
+    /// `{{secret-file:PATH}}`, never inline secrets (RFC 0012 §3.7).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// `stdio` (default) — the only transport the client speaks today.
-    pub transport: Option<String>,
-    /// Names only — values come from the process env, never inline (no secrets).
-    #[serde(default)]
-    pub env_passthrough: Vec<String>,
     /// Glob→trifecta-tags (RFC 0012 §3.1). An untagged server ⇒ `untrusted_input`.
     #[serde(default)]
     pub tags: BTreeMap<String, Vec<String>>,
@@ -284,18 +271,14 @@ pub fn config_schema() -> Value {
             "McpServer": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["name"],
+                "required": ["name", "endpoint"],
                 "properties": {
                     "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-                    "command": { "type": "string" },
-                    "argv": { "type": "array", "items": { "type": "string" } },
                     "endpoint": { "type": "string" },
                     "headers": {
                         "type": "object",
                         "additionalProperties": { "type": "string" }
                     },
-                    "transport": { "enum": ["stdio", "unix"] },
-                    "env_passthrough": { "type": "array", "items": { "type": "string" } },
                     "tags": {
                         "type": "object",
                         "additionalProperties": {
@@ -330,7 +313,8 @@ mod tests {
             "max_tokens": 2000000,
             "limits": { "max_steps": 200, "max_depth": 4, "deadline_secs": 600 },
             "mcp_servers": [
-                { "name": "web", "command": "mcp-fetch", "argv": ["--timeout", "30"],
+                { "name": "web", "endpoint": "https://web.example.com/mcp",
+                  "headers": { "Authorization": "Bearer {{secret:WEB_TOKEN}}" },
                   "tags": { "*": ["untrusted_input"] } }
             ],
             "subscribe": ["fs:file:///watch/inbox"],
@@ -343,7 +327,10 @@ mod tests {
         assert_eq!(cf.max_tokens, Some(2_000_000));
         assert_eq!(cf.limits.unwrap().max_steps, Some(200));
         assert_eq!(cf.mcp_servers.len(), 1);
-        assert_eq!(cf.mcp_servers[0].command, "mcp-fetch");
+        assert_eq!(
+            cf.mcp_servers[0].endpoint.as_deref(),
+            Some("https://web.example.com/mcp")
+        );
         assert_eq!(cf.subscribe, vec!["fs:file:///watch/inbox"]);
         assert_eq!(cf.a2a_peers[0].name, "mesh");
         assert_eq!(cf.log_level.as_deref(), Some("info"));
@@ -444,7 +431,7 @@ mod tests {
                 "model_swap" => json!("finish-on-old"),
                 "max_tokens" => json!(1),
                 "limits" => json!({}),
-                "mcp_servers" => json!([{ "name": "a", "command": "c" }]),
+                "mcp_servers" => json!([{ "name": "a", "endpoint": "unix:/a.sock" }]),
                 "subscribe" => json!(["u"]),
                 "a2a_peers" => json!([{ "name": "p", "endpoint": "unix:/x" }]),
                 "intelligence_headers" => json!({ "h": "v" }),

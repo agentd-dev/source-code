@@ -244,7 +244,7 @@ mod tests {
             },
             mcp_servers: vec![McpServerSpec {
                 name: "fs".into(),
-                command: vec!["mcp-fs".into()],
+                endpoint: "unix:/mcp-fs.sock".into(),
                 tags: Vec::new(),
                 ..Default::default()
             }],

@@ -446,21 +446,78 @@ mod tests {
     /// `sh` server replies only to the FIRST request (initialize, id=1, advertising
     /// `tools`) then hangs, so the reader thread stays alive (no fast-fail) and the
     /// `work.release` (id=2) blocks until the supplied timeout fires.
+    /// A coordination server (HTTP over unix) that answers `initialize` (advertising
+    /// tools) but then HANGS on every later request — accepts the connection and
+    /// reads forever without replying — so a `work.release` reaches the request
+    /// layer and blocks until its per-call timeout fires (not a fast-fail).
+    fn spawn_hung_coord_server() -> String {
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir().join(format!(
+            "agentd-coord-hung-{}-{}.sock",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind hung coord server");
+        let endpoint = format!("unix:{}", path.display());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(stream) = conn else { continue };
+                std::thread::spawn(move || handle_hung(stream));
+            }
+        });
+        fn handle_hung(mut stream: UnixStream) {
+            // Read the whole request (crudely — to the double CRLF + a bit of body).
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let text = String::from_utf8_lossy(&buf);
+            if text.contains("\"initialize\"") {
+                let body = br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"hung","version":"0"}}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            } else if text.contains("notifications/initialized") {
+                let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            } else {
+                // Any real request (the release): hang — read+discard, never reply.
+                let mut sink = [0u8; 256];
+                while stream.read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+            }
+        }
+        endpoint
+    }
+
     #[test]
     fn release_within_honours_its_bound_against_a_hung_server() {
         use crate::mcp::client::McpClient;
-        // Reply to the first line (initialize) with a tools-advertising result,
-        // then read+discard forever (alive but silent on every later request).
-        let script = r#"IFS= read -r _first; printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"hung","version":"0"}}}\n'; while IFS= read -r _l; do :; done; sleep 3600"#;
-        let mut client = McpClient::spawn(
+        let endpoint = spawn_hung_coord_server();
+        let mut client = McpClient::connect(
             "coord-hung",
-            &["sh".to_string(), "-c".to_string(), script.to_string()],
+            &endpoint,
+            Vec::new(),
             Duration::from_secs(60), // DEFAULT 60s — the per-call bound must win.
         )
-        .expect("spawn the hung coordination server");
+        .expect("connect to the hung coordination server");
         client
             .initialize()
-            .expect("handshake completes (id=1 answered)");
+            .expect("handshake completes (initialize answered)");
         assert!(
             client.capabilities().supports_tools(),
             "server advertises tools so the release reaches the request layer"

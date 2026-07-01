@@ -432,19 +432,46 @@ impl A2aEndpoint {
     }
 }
 
-/// A declared MCP server: a name and the argv to spawn it (stdio transport).
-/// Serializable because it travels in the subagent spawn payload as the
-/// child's scoped server subset (RFC 0005, RFC 0009).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A declared MCP server. Serializable because it travels in the subagent spawn
+/// payload as the child's scoped server subset (RFC 0005, RFC 0009).
+///
+/// As of v2.0.0 the production transport is a remote [`endpoint`](Self::endpoint)
+/// reached over Streamable HTTP (RFC 0004; RFC 0012 — no local process spawn).
+/// The legacy stdio [`command`](Self::command) is retained ONLY for the
+/// test/conformance mock until it moves to HTTP; a spec carries exactly one of
+/// the two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct McpServerSpec {
     pub name: String,
+    /// Legacy stdio argv. Mutually exclusive with [`endpoint`](Self::endpoint);
+    /// retained for the test/conformance mock (production no longer emits it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    /// Remote MCP endpoint — `https://…` / `http://…` / `unix:/path` /
+    /// `vsock:cid:port` (RFC 0004 Streamable HTTP). The v2.0.0 transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Secret-FREE auth/framing header templates for an `endpoint` server (e.g.
+    /// `("Authorization", "Bearer {{secret:MCP_TOKEN}}")`), resolved at connect
+    /// time (RFC 0012 §3.7 — no credential in the spec/manifest/payload/logs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
     /// Operator-declared capability tags (`--mcp-tags`) for the Rule-of-Two
     /// trifecta check (RFC 0012 §3.1). Travels in the spawn payload so a child's
     /// narrowed grant carries the same tags. Empty = untagged (the check treats
     /// an untagged server conservatively as `untrusted_input`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TrifectaTag>,
+}
+
+/// Does `s` name a remote MCP endpoint (rather than a stdio argv command)? The
+/// four Streamable-HTTP transport schemes agentd dials (RFC 0004 / RFC 0006).
+pub fn is_mcp_endpoint(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("https://")
+        || s.starts_with("http://")
+        || s.starts_with("unix:")
+        || s.starts_with("vsock:")
 }
 
 /// The fully-resolved, validated configuration.
@@ -1387,11 +1414,36 @@ impl Config {
         // fast at startup rather than discover an unreadable secret on failover.
         validate_endpoint_token_files(self.intelligence.as_deref().unwrap())?;
         for s in &self.mcp_servers {
-            if s.name.is_empty() || s.command.is_empty() {
-                return Err(usage(format!(
-                    "mcp server '{}' has empty name or command",
-                    s.name
-                )));
+            if s.name.is_empty() {
+                return Err(usage("mcp server has an empty name".into()));
+            }
+            match (&s.endpoint, s.command.is_empty()) {
+                // The v2.0.0 transport: a remote endpoint. Validate it parses and
+                // its auth header templates resolve at startup (RFC 0012 §3.7 —
+                // fail fast, don't discover an unreadable secret on first use).
+                (Some(endpoint), true) => {
+                    crate::mcp::http::McpEndpoint::parse(endpoint).map_err(|e| {
+                        usage(format!("mcp server '{}': {e}", s.name))
+                    })?;
+                    crate::mcp::auth::headers_resolvable(&s.headers).map_err(|e| {
+                        usage(format!("mcp server '{}' header: {e}", s.name))
+                    })?;
+                }
+                // A server declares an endpoint AND a command — ambiguous.
+                (Some(_), false) => {
+                    return Err(usage(format!(
+                        "mcp server '{}' declares both an endpoint and a command",
+                        s.name
+                    )));
+                }
+                // Legacy stdio argv (the test/conformance mock).
+                (None, false) => {}
+                (None, true) => {
+                    return Err(usage(format!(
+                        "mcp server '{}' has neither an endpoint nor a command",
+                        s.name
+                    )));
+                }
             }
         }
         if self.max_steps == 0 {
@@ -1960,21 +2012,33 @@ fn validate_endpoint_token_files(uri: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Parse `--mcp name=cmd arg arg`. The command is whitespace-split into argv;
-/// quoting/escaping is not supported (declare such servers via a wrapper
-/// script).
+/// Parse `--mcp name=<endpoint-or-command>`. When the value is a remote endpoint
+/// (`https://`/`http://`/`unix:`/`vsock:`, RFC 0004) it's the Streamable HTTP
+/// transport; otherwise it's legacy stdio argv (whitespace-split; no
+/// quoting/escaping — declare such servers via a wrapper script). The legacy form
+/// exists only for the test/conformance mock (v2.0.0 production uses endpoints).
 fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
-    let (name, cmd) = spec
+    let (name, rhs) = spec
         .split_once('=')
-        .ok_or_else(|| usage(format!("--mcp must be name=command (got: {spec})")))?;
-    let command: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
-    if name.is_empty() || command.is_empty() {
-        return Err(usage(format!("--mcp '{spec}' has empty name or command")));
+        .ok_or_else(|| usage(format!("--mcp must be name=endpoint|command (got: {spec})")))?;
+    if name.is_empty() || rhs.trim().is_empty() {
+        return Err(usage(format!("--mcp '{spec}' has empty name or value")));
+    }
+    if is_mcp_endpoint(rhs) {
+        return Ok(McpServerSpec {
+            name: name.to_string(),
+            endpoint: Some(rhs.trim().to_string()),
+            ..Default::default()
+        });
+    }
+    let command: Vec<String> = rhs.split_whitespace().map(str::to_string).collect();
+    if command.is_empty() {
+        return Err(usage(format!("--mcp '{spec}' has an empty command")));
     }
     Ok(McpServerSpec {
         name: name.to_string(),
         command,
-        tags: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -2175,6 +2239,7 @@ fn apply_config_file(
             name: s.name,
             command,
             tags,
+            ..Default::default()
         });
     }
     c.subscribe.extend(cf.subscribe);
@@ -3104,6 +3169,46 @@ mod tests {
             c.mcp_servers[0].command,
             vec!["mcp-server-fs", "--root", "/data"]
         );
+        assert_eq!(c.mcp_servers[0].endpoint, None);
+    }
+
+    #[test]
+    fn mcp_endpoint_spec_parsing() {
+        // A URL-shaped `--mcp` value is the Streamable HTTP transport, not argv.
+        assert!(is_mcp_endpoint("https://mcp.example.com/mcp"));
+        assert!(is_mcp_endpoint("http://localhost:8080/mcp"));
+        assert!(is_mcp_endpoint("unix:/run/mcp.sock"));
+        assert!(is_mcp_endpoint("vsock:3:5000"));
+        assert!(!is_mcp_endpoint("mcp-server-fs --root /data"));
+
+        for ep in ["https://mcp.example.com/mcp", "unix:/run/mcp.sock", "vsock:3:5000"] {
+            let spec = parse_mcp_spec(&format!("fs={ep}")).unwrap();
+            assert_eq!(spec.name, "fs");
+            assert_eq!(spec.endpoint.as_deref(), Some(ep));
+            assert!(spec.command.is_empty(), "endpoint specs carry no argv");
+        }
+    }
+
+    #[test]
+    fn mcp_endpoint_and_command_are_mutually_exclusive_at_validate() {
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+        ];
+        // A valid endpoint spec loads clean.
+        let mut c =
+            Config::load(&args(&["--mcp", "fs=https://mcp.example.com/mcp"]), &env).unwrap();
+        assert!(c.validate().is_ok());
+        // Adding a command makes it ambiguous (endpoint XOR command).
+        c.mcp_servers[0].command = vec!["a".into()];
+        assert!(c.validate().is_err(), "both endpoint and command must fail");
+        // Neither is also rejected.
+        c.mcp_servers[0].command.clear();
+        c.mcp_servers[0].endpoint = None;
+        assert!(
+            c.validate().is_err(),
+            "neither endpoint nor command must fail"
+        );
     }
 
     #[test]
@@ -3885,6 +3990,7 @@ mod tests {
                     name: "added".into(),
                     command: vec!["mcp-new".into()],
                     tags: vec![],
+                    ..Default::default()
                 }]
             },
             // RFC 0018 §5.1: an endpoint repoint is a reloadable hot-swap.
@@ -3916,6 +4022,7 @@ mod tests {
             name: "extra".into(),
             command: vec!["mcp-extra".into()],
             tags: vec![],
+            ..Default::default()
         });
         assert!(
             Config::reload_coherence_check(&added, Some(&running), true).is_ok(),
@@ -3927,6 +4034,7 @@ mod tests {
             name: "s".into(),
             command: vec!["mcp-orig".into()],
             tags: vec![],
+            ..Default::default()
         }];
         let mut edited = with_server.clone();
         edited.mcp_servers[0].command = vec!["mcp-edited".into()];
@@ -4001,11 +4109,13 @@ mod tests {
                 name: "dup".into(),
                 command: vec!["a".into()],
                 tags: vec![],
+                ..Default::default()
             },
             McpServerSpec {
                 name: "dup".into(),
                 command: vec!["b".into()],
                 tags: vec![],
+                ..Default::default()
             },
         ];
         let diags = Config::reload_coherence_check(&cfg, None, false)

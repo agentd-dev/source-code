@@ -246,6 +246,7 @@ mod tests {
                 name: "fs".into(),
                 command: vec!["mcp-fs".into()],
                 tags: Vec::new(),
+                ..Default::default()
             }],
             a2a_peers: Vec::new(),
             limits: Limits {

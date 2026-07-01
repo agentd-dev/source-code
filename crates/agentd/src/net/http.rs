@@ -26,7 +26,10 @@ use std::time::Duration;
 /// being an unbounded allocation from a hostile peer.
 pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
-/// Any bidirectional byte stream the HTTP client can run over.
+/// Any bidirectional byte stream the HTTP client can run over. `Box<dyn Stream>`
+/// is itself `Read + Write` (via std's `impl<R: Read + ?Sized> Read for Box<R>`),
+/// so an OWNED boxed stream can be handed to [`send_streaming`] by value — used
+/// by the long-lived MCP notification SSE reader.
 pub trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 

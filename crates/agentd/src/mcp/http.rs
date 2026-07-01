@@ -278,7 +278,47 @@ impl HttpTransport {
             Ok(Some(v))
         }
     }
+
+    /// Open the long-lived server→client notification stream: a `GET` that the
+    /// server answers with `text/event-stream`, carrying JSON-RPC notifications
+    /// (e.g. `resources/updated`). Returns an owning SSE reader. `read_timeout`
+    /// bounds each read so the caller's loop can poll a stop flag between events
+    /// (clean shutdown). Errors if the server has no push channel (non-2xx or a
+    /// non-SSE response) — the caller then runs without server-initiated pushes.
+    pub fn open_events(&self, read_timeout: Duration) -> Result<EventStream, HttpError> {
+        let stream = self.connect(read_timeout)?;
+        let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];
+        let session = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(sid) = &session {
+            headers.push(("Mcp-Session-Id", sid));
+        }
+        for (k, v) in &self.headers {
+            headers.push((k.as_str(), v.as_str()));
+        }
+        let resp = http::send_streaming(
+            stream,
+            self.endpoint.host_header(),
+            "GET",
+            self.endpoint.http_path(),
+            &headers,
+            b"",
+        )
+        .map_err(HttpError::Http)?;
+        if !resp.is_success() {
+            return Err(HttpError::Status(resp.status));
+        }
+        if !resp.is_event_stream() {
+            return Err(HttpError::Unsupported(
+                "server has no GET SSE notification stream".into(),
+            ));
+        }
+        Ok(resp.sse())
+    }
 }
+
+/// An owning SSE reader over the notification `GET` stream (a boxed transport
+/// stream, so it survives on the notification thread).
+pub type EventStream = http::SseReader<std::io::BufReader<Box<dyn http::Stream>>>;
 
 /// Route one SSE event: if its `data` is the JSON-RPC response for `request_id`,
 /// return it; a message without a matching id (a notification/other) is handed to

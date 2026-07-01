@@ -228,6 +228,56 @@ fn streamable_http_full_lifecycle() {
 }
 
 #[test]
+fn notification_get_stream_delivers_server_pushes() {
+    // The built-in HTTP mock (debug/internal-mocks) serves the reactive
+    // one-resource MCP over a unix socket and pushes a resources/updated on the
+    // GET SSE stream after a subscribe. Prove agentd's notification thread
+    // receives it (the reactive-over-HTTP push channel).
+    let sock = format!(
+        "/tmp/agentd-mcp-notify-{}-{}.sock",
+        std::process::id(),
+        line!()
+    );
+    let sock_thread = sock.clone();
+    std::thread::spawn(move || {
+        agentd::mcp::mock_http::run(&sock_thread, "mock://res", true);
+    });
+    // Wait for the socket to appear.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(std::time::Instant::now() < deadline, "mock socket never bound");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut client = McpClient::connect(
+        "mock",
+        &format!("unix:{sock}"),
+        Vec::new(),
+        Duration::from_secs(5),
+    )
+    .expect("connect");
+    client.initialize().expect("initialize");
+    assert!(client.capabilities().supports_subscribe());
+    client.subscribe("mock://res").expect("subscribe");
+
+    // Poll for the pushed notification (delivered on the GET SSE stream).
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut got = Vec::new();
+    while got.is_empty() && std::time::Instant::now() < deadline {
+        got = client.drain_notifications();
+        if got.is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert_eq!(got.len(), 1, "one resources/updated pushed over the GET stream");
+    assert_eq!(got[0].method, "notifications/resources/updated");
+
+    // Dropping the client stops the notification thread cleanly.
+    drop(client);
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn connect_to_dead_endpoint_surfaces_transport_error() {
     // Nothing is listening on this port; initialize must fail fast, not hang.
     let mut client = McpClient::connect(

@@ -88,16 +88,29 @@ pub struct LimitsFile {
     pub deadline_secs: Option<u64>,
 }
 
-/// One MCP server — `name`/`command`/`argv` map to a `--mcp name="command argv…"`
-/// flag group; `tags` is the RFC 0012 §3.1 glob→tags wire (the loader flattens a
-/// `{"*": ["sensitive"]}` map to the server's tag set).
+/// One MCP server. As of v2.0.0 the transport is a remote `endpoint`
+/// (`https://`/`http://`/`unix:`/`vsock:`, RFC 0004 Streamable HTTP) with optional
+/// secret-free auth `headers`; the legacy `command`/`argv` (stdio) is retained for
+/// the test mock only. Exactly one of `endpoint` / `command` is set. `tags` is the
+/// RFC 0012 §3.1 glob→tags wire (the loader flattens a `{"*": ["sensitive"]}` map
+/// to the server's tag set).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerFile {
     pub name: String,
+    /// Legacy stdio argv[0] (mutually exclusive with `endpoint`).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub argv: Vec<String>,
+    /// Remote MCP endpoint (the v2.0.0 transport).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Auth/framing header templates for an `endpoint` server — values MAY
+    /// interpolate `{{secret:NAME}}` / `{{secret-file:PATH}}`, never inline
+    /// secrets (RFC 0012 §3.7).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// `stdio` (default) — the only transport the client speaks today.
     pub transport: Option<String>,
     /// Names only — values come from the process env, never inline (no secrets).
@@ -271,11 +284,16 @@ pub fn config_schema() -> Value {
             "McpServer": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["name", "command"],
+                "required": ["name"],
                 "properties": {
                     "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
                     "command": { "type": "string" },
                     "argv": { "type": "array", "items": { "type": "string" } },
+                    "endpoint": { "type": "string" },
+                    "headers": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
                     "transport": { "enum": ["stdio", "unix"] },
                     "env_passthrough": { "type": "array", "items": { "type": "string" } },
                     "tags": {

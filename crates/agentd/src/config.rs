@@ -2199,18 +2199,29 @@ fn apply_config_file(
         c.log_level = Level::parse(&level)
             .ok_or_else(|| usage(format!("config file: invalid log_level: {level}")))?;
     }
-    // mcp_servers: each file object → one McpServerSpec (command + argv → argv;
-    // the glob→tags map flattens to the union of declared tags). Seeds the list.
+    // mcp_servers: each file object → one McpServerSpec. An `endpoint` server is
+    // the v2.0.0 HTTP transport (with secret-free header templates); a `command`
+    // server is legacy stdio argv. The glob→tags map flattens to the union of
+    // declared tags. Seeds the list.
     for s in cf.mcp_servers {
-        if s.name.is_empty() || s.command.is_empty() {
+        if s.name.is_empty() {
+            return Err(usage("config file: an mcp server has an empty name".into()));
+        }
+        if s.endpoint.is_some() && !s.command.is_empty() {
             return Err(usage(format!(
-                "config file: mcp server '{}' has an empty name or command",
+                "config file: mcp server '{}' declares both an endpoint and a command",
+                s.name
+            )));
+        }
+        if s.endpoint.is_none() && s.command.is_empty() {
+            return Err(usage(format!(
+                "config file: mcp server '{}' has neither an endpoint nor a command",
                 s.name
             )));
         }
         if let Some(t) = &s.transport {
-            // stdio is the only transport the client speaks today; reject an
-            // unknown one at parse (exit 2) rather than silently ignoring it.
+            // stdio is the only legacy transport; reject an unknown one at parse
+            // (exit 2) rather than silently ignoring it.
             if t != "stdio" && t != "unix" {
                 return Err(usage(format!(
                     "config file: mcp server '{}' has unsupported transport '{t}' (want stdio)",
@@ -2218,8 +2229,18 @@ fn apply_config_file(
                 )));
             }
         }
-        let mut command = vec![s.command];
-        command.extend(s.argv);
+        let (command, endpoint, headers) = match s.endpoint {
+            Some(ep) => (
+                Vec::new(),
+                Some(ep),
+                s.headers.into_iter().collect::<Vec<(String, String)>>(),
+            ),
+            None => {
+                let mut command = vec![s.command];
+                command.extend(s.argv);
+                (command, None, Vec::new())
+            }
+        };
         let mut tags: Vec<TrifectaTag> = Vec::new();
         for tag_list in s.tags.values() {
             for t in tag_list {
@@ -2238,8 +2259,9 @@ fn apply_config_file(
         c.mcp_servers.push(McpServerSpec {
             name: s.name,
             command,
+            endpoint,
+            headers,
             tags,
-            ..Default::default()
         });
     }
     c.subscribe.extend(cf.subscribe);

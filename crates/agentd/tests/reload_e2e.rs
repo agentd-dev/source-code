@@ -13,6 +13,9 @@
 //! `hot-reload` feature (the SIGHUP handler is feature-gated) + unix.
 #![cfg(all(feature = "hot-reload", unix))]
 
+mod common;
+
+use common::spawn_mock_mcp;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -33,7 +36,7 @@ fn sigterm(pid: u32) {
 /// the file to `new_file`, then SIGTERM and return (exit_code, stderr).
 fn run_reload(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
+    let mock = spawn_mock_mcp("file:///in.json", false);
 
     // Write the initial config file (a reloadable-only file: model + log_level).
     let dir = tempfile::tempdir().expect("tempdir");
@@ -53,7 +56,7 @@ fn run_reload(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--log-level",
             "info",
         ])
@@ -119,7 +122,7 @@ fn sighup_applies_a_reloadable_change_then_drains_to_exit_0() {
 /// `--intelligence` flag is passed (a flag would override the file + pin it).
 fn run_reload_intel_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
+    let mock = spawn_mock_mcp("file:///in.json", false);
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg_path = dir.path().join("agentd.json");
     std::fs::write(&cfg_path, initial_file).expect("write initial config");
@@ -135,7 +138,7 @@ fn run_reload_intel_in_file(initial_file: &str, new_file: &str) -> (Option<i32>,
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--log-level",
             "info",
         ])
@@ -279,27 +282,25 @@ fn run_reload_mcp_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, S
 fn sighup_re_handshakes_mcp_servers_on_reload_add_and_remove() {
     // RFC 0017 §5.1/§5.3 step 4: `mcp_servers` is now RELOADABLE — a live
     // re-handshake at the quiesce boundary. The reload here REMOVES `mockA` (its
-    // McpClient Drop runs the stdio shutdown ladder) and ADDS `mockB` + a new
+    // McpClient Drop stops the HTTP notification thread) and ADDS `mockB` + a new
     // subscription on its URI. We observe the re-handshake in the event stream:
     // config.reloaded names mcp_servers, a reload-kind mcp.connect fires for the
     // added server, a reload-kind subscribe + read-after-subscribe arms the new
-    // URI — and the daemon stays up and drains to exit 0.
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    // URI — and the daemon stays up and drains to exit 0. The servers are declared
+    // as remote HTTP endpoints (v2.0.0) — two mock servers on unix sockets.
+    let mock_a = spawn_mock_mcp("file:///a.json", false);
+    let mock_b = spawn_mock_mcp("file:///b.json", false);
     let initial = format!(
         r#"{{ "model": "m", "log_level": "info",
-            "mcp_servers": [
-              {{ "name": "mockA", "command": "{exe}",
-                 "argv": ["--internal-mock-mcp", "file:///a.json", "--no-emit"] }}
-            ],
-            "subscribe": ["file:///a.json"] }}"#
+            "mcp_servers": [ {{ "name": "mockA", "endpoint": "{}" }} ],
+            "subscribe": ["file:///a.json"] }}"#,
+        mock_a.uri()
     );
     let changed = format!(
         r#"{{ "model": "m", "log_level": "info",
-            "mcp_servers": [
-              {{ "name": "mockB", "command": "{exe}",
-                 "argv": ["--internal-mock-mcp", "file:///b.json", "--no-emit"] }}
-            ],
-            "subscribe": ["file:///b.json"] }}"#
+            "mcp_servers": [ {{ "name": "mockB", "endpoint": "{}" }} ],
+            "subscribe": ["file:///b.json"] }}"#,
+        mock_b.uri()
     );
     let (code, out) = run_reload_mcp_in_file(&initial, &changed);
 
@@ -330,30 +331,28 @@ fn sighup_re_handshakes_mcp_servers_on_reload_add_and_remove() {
 }
 
 #[test]
-fn sighup_contained_failure_when_an_added_mcp_server_cannot_spawn() {
+fn sighup_contained_failure_when_an_added_mcp_server_cannot_connect() {
     // RFC 0017 §5.3 contained-failure: a reload that ADDS a server which cannot
-    // spawn (a nonexistent command) is CONTAINED — the failed add logs
+    // connect (an unreachable endpoint) is CONTAINED — the failed add logs
     // mcp.connect.fail (the server is simply absent, a tool-domain absence, RFC
     // 0007), the reload still APPLIES (config.reloaded), and the daemon stays up +
     // drains to exit 0. It is NOT a rollback and NOT a daemon abort.
-    let exe = env!("CARGO_BIN_EXE_agentd");
+    let mock_a = spawn_mock_mcp("file:///a.json", false);
     let initial = format!(
         r#"{{ "model": "m", "log_level": "info",
-            "mcp_servers": [
-              {{ "name": "mockA", "command": "{exe}",
-                 "argv": ["--internal-mock-mcp", "file:///a.json", "--no-emit"] }}
-            ],
-            "subscribe": ["file:///a.json"] }}"#
+            "mcp_servers": [ {{ "name": "mockA", "endpoint": "{}" }} ],
+            "subscribe": ["file:///a.json"] }}"#,
+        mock_a.uri()
     );
-    // Keep mockA, ADD a server whose command does not exist → contained add-fail.
+    // Keep mockA, ADD a server whose endpoint is unreachable → contained add-fail.
     let changed = format!(
         r#"{{ "model": "m", "log_level": "info",
             "mcp_servers": [
-              {{ "name": "mockA", "command": "{exe}",
-                 "argv": ["--internal-mock-mcp", "file:///a.json", "--no-emit"] }},
-              {{ "name": "broken", "command": "/nonexistent/agentd-mcp-xyz", "argv": [] }}
+              {{ "name": "mockA", "endpoint": "{}" }},
+              {{ "name": "broken", "endpoint": "unix:/nonexistent/agentd-broken.sock" }}
             ],
-            "subscribe": ["file:///a.json"] }}"#
+            "subscribe": ["file:///a.json"] }}"#,
+        mock_a.uri()
     );
     let (code, out) = run_reload_mcp_in_file(&initial, &changed);
 

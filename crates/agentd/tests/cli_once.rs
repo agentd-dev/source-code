@@ -72,7 +72,7 @@ fn reactive_exits_6_when_required_mcp_server_is_down() {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            "bad=/nonexistent/mcp-server",
+            "bad=unix:/nonexistent/agentd-mcp.sock",
             "--log-level",
             "error",
         ])

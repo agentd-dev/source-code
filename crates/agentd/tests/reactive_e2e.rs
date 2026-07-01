@@ -7,16 +7,20 @@
 //! intelligence endpoint, but the reactive *behaviour* is fully visible and
 //! auditable in the event stream.
 
+mod common;
+
+use common::spawn_mock_mcp;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// Run reactive agentd for `run_ms` against the mock MCP server (extra mock
-/// args appended via `mock_args`), then return the captured stderr telemetry.
-fn run_reactive_capture(mock_args: &str, run_ms: u64) -> String {
+/// Run reactive agentd for `run_ms` against the HTTP mock MCP server (`emit`
+/// controls the post-subscribe push), then return the captured stderr telemetry.
+fn run_reactive_capture(emit: bool, run_ms: u64) -> String {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    // The mock MCP server is the agentd binary itself in its hidden mock mode.
-    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json{mock_args}");
+    // The mock MCP server runs as a separate process; agentd connects over its
+    // unix-socket HTTP endpoint (v2.0.0 — no stdio spawn).
+    let mock = spawn_mock_mcp("file:///in.json", emit);
 
     let mut child = Command::new(exe)
         .args([
@@ -29,7 +33,7 @@ fn run_reactive_capture(mock_args: &str, run_ms: u64) -> String {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--log-level",
             "info",
         ])
@@ -54,8 +58,8 @@ fn run_reactive_capture(mock_args: &str, run_ms: u64) -> String {
 
 #[test]
 fn reactive_observably_reacts_to_a_resource_update() {
-    // Mock emits a resources/updated ~200ms after subscribe.
-    let out = run_reactive_capture("", 1800);
+    // Mock pushes a resources/updated on the GET SSE stream after subscribe.
+    let out = run_reactive_capture(true, 1800);
 
     assert!(
         out.contains(r#""event":"subscribe""#),
@@ -82,7 +86,7 @@ fn trace_context_propagates_across_the_agent_tree() {
     // supervisor's and the spawned subagent's log lines — one auditable trace
     // for the whole run (RFC 0010 §context-propagation).
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json");
+    let mock = spawn_mock_mcp("file:///in.json", true);
     let trace_id = "1234567890abcdef1234567890abcdef";
     let traceparent = format!("00-{trace_id}-1111111111111111-01");
 
@@ -97,7 +101,7 @@ fn trace_context_propagates_across_the_agent_tree() {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--traceparent",
             &traceparent,
             "--log-level",
@@ -140,9 +144,9 @@ fn trace_context_propagates_across_the_agent_tree() {
 
 #[test]
 fn read_after_subscribe_reacts_without_an_emitted_update() {
-    // `--no-emit`: the mock pushes NO update. The agent must still react to the
+    // `emit=false`: the mock pushes NO update. The agent must still react to the
     // resource's current state on startup (read-after-subscribe, §2.8).
-    let out = run_reactive_capture(" --no-emit", 1500);
+    let out = run_reactive_capture(false, 1500);
 
     assert!(
         out.contains(r#""event":"subscribe""#),

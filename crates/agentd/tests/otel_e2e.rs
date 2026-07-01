@@ -4,6 +4,9 @@
 //! Runs only under `cargo test --features otel`.
 #![cfg(all(unix, feature = "otel"))]
 
+mod common;
+
+use common::spawn_mock_mcp;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -66,10 +69,7 @@ fn a_run_exports_invoke_agent_chat_and_execute_tool_spans() {
     let mut llm = start_mock_llm(&sock, "read");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!(
-        "mock={} --internal-mock-mcp file:///in.json --no-emit",
-        exe()
-    );
+    let mock = spawn_mock_mcp("file:///in.json", false);
     let status = Command::new(exe())
         .args([
             "--mode",
@@ -79,7 +79,7 @@ fn a_run_exports_invoke_agent_chat_and_execute_tool_spans() {
             "--intelligence",
             &intel,
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--model",
             "my-model",
             "--log-level",

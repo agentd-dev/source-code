@@ -5,6 +5,9 @@
 //! actual agentic loop — every other test stubs the intelligence endpoint.
 #![cfg(unix)]
 
+mod common;
+
+use common::spawn_mock_mcp;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -91,10 +94,7 @@ fn once_mode_runs_a_tool_call_react_cycle() {
     let mut llm = start_mock_llm(&sock, "read");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!(
-        "mock={} --internal-mock-mcp file:///in.json --no-emit",
-        exe()
-    );
+    let mock = spawn_mock_mcp("file:///in.json", false);
     let (code, stdout, stderr) = run_once(&[
         "--mode",
         "once",
@@ -103,7 +103,7 @@ fn once_mode_runs_a_tool_call_react_cycle() {
         "--intelligence",
         &intel,
         "--mcp",
-        &mcp,
+        &mock.mcp_arg("mock"),
         "--log-level",
         "info",
     ]);
@@ -140,10 +140,7 @@ fn reactive_self_scheduling_fires_a_wake() {
     let mut llm = start_mock_llm(&sock, "schedule");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!(
-        "mock={} --internal-mock-mcp file:///in.json --no-emit",
-        exe()
-    );
+    let mock = spawn_mock_mcp("file:///in.json", false);
     let mut child = Command::new(exe())
         .args([
             "--mode",
@@ -155,7 +152,7 @@ fn reactive_self_scheduling_fires_a_wake() {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--log-level",
             "info",
         ])
@@ -203,10 +200,7 @@ fn reactive_self_subscribe_arms_a_warm_continue_route() {
     let mut llm = start_mock_llm(&sock, "subscribe");
 
     let intel = format!("unix:{}", sock.display());
-    let mcp = format!(
-        "mock={} --internal-mock-mcp file:///in.json --no-emit",
-        exe()
-    );
+    let mock = spawn_mock_mcp("file:///in.json", false);
     let mut child = Command::new(exe())
         .args([
             "--mode",
@@ -218,7 +212,7 @@ fn reactive_self_subscribe_arms_a_warm_continue_route() {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--log-level",
             "info",
         ])
@@ -315,9 +309,9 @@ fn reactive_run_rolls_token_usage_up_to_agent_tokens_total() {
     let mut llm = start_mock_llm(&sock, "final");
 
     let intel = format!("unix:{}", sock.display());
-    // `--internal-mock-mcp` (no `--no-emit`) pushes one resources/updated after the
-    // subscribe, firing exactly one reaction — one real subagent run.
-    let mcp = format!("mock={} --internal-mock-mcp file:///in.json", exe());
+    // The HTTP mock (emit=true) pushes one resources/updated on the GET SSE stream
+    // after the subscribe, firing exactly one reaction — one real subagent run.
+    let mock = spawn_mock_mcp("file:///in.json", true);
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let mut child = Command::new(exe())
@@ -331,7 +325,7 @@ fn reactive_run_rolls_token_usage_up_to_agent_tokens_total() {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--metrics-addr",
             &addr,
             "--log-level",

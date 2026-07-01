@@ -7,6 +7,9 @@
 //! No live LLM — each run's subagent fails fast on an unreachable intelligence
 //! endpoint, but the *scheduling* behaviour is fully visible.
 
+mod common;
+
+use common::spawn_mock_mcp;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -81,7 +84,7 @@ fn reactive_mode_drains_to_exit_0_on_sigterm() {
     // The reactive daemon must, on SIGTERM, stop accepting work, unsubscribe,
     // and exit 0 — the same cloud-native drain contract as loop/schedule.
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let mcp = format!("mock={exe} --internal-mock-mcp file:///in.json --no-emit");
+    let mock = spawn_mock_mcp("file:///in.json", false);
     let mut child = Command::new(exe)
         .args([
             "--mode",
@@ -93,7 +96,7 @@ fn reactive_mode_drains_to_exit_0_on_sigterm() {
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            &mcp,
+            &mock.mcp_arg("mock"),
             "--log-level",
             "info",
         ])

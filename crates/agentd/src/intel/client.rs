@@ -394,7 +394,9 @@ impl Transport {
 fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
     let tcp = crate::net::http::connect_tcp(host, port, timeout)?;
     Ok(Box::new(
-        crate::net::tls::connect(tcp, host).map_err(IntelError::Transport)?,
+        // Server-auth TLS today; an optional client identity (mTLS) is threaded
+        // through in the auth chunk (Phase E).
+        crate::net::tls::connect(tcp, host, None).map_err(IntelError::Transport)?,
     ))
 }
 

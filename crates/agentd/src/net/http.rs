@@ -6,8 +6,12 @@
 //! carries the intelligence wire over TCP, TLS, unix sockets, and vsock
 //! alike — the transport is just the stream.
 //!
-//! This client does non-streaming request/response only (`Connection: close`,
-//! content-length or chunked); it does not implement SSE streaming.
+//! Two request paths: [`send`] buffers the whole response (the LLM/intelligence
+//! path), and [`send_streaming`] returns the status + headers plus a live reader
+//! so the caller can either buffer it (`application/json`) or pump it as an **SSE**
+//! stream ([`SseReader`]) — the MCP Streamable HTTP transport, where a response may
+//! be a single JSON body or a `text/event-stream`, and a long-lived GET carries
+//! server→client notifications.
 //! `connect_tcp` is intentionally unguarded: agentd's HTTP client only ever
 //! dials the *operator-configured* intelligence endpoint, which the model
 //! cannot influence. The SSRF classifier (`net::ssrf`) exists for any future
@@ -167,7 +171,9 @@ pub fn send<S: Read + Write + ?Sized>(
     read_response(&mut reader)
 }
 
-fn read_response<R: BufRead>(r: &mut R) -> io::Result<Response> {
+/// Read the status line + headers off a response, leaving the reader positioned
+/// at the start of the body. Header names are lowercased.
+fn read_head<R: BufRead>(r: &mut R) -> io::Result<(u16, Vec<(String, String)>)> {
     let mut status_line = String::new();
     r.read_line(&mut status_line)?;
     let status = parse_status(&status_line)?;
@@ -186,6 +192,11 @@ fn read_response<R: BufRead>(r: &mut R) -> io::Result<Response> {
             headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
         }
     }
+    Ok((status, headers))
+}
+
+fn read_response<R: BufRead>(r: &mut R) -> io::Result<Response> {
+    let (status, headers) = read_head(r)?;
 
     let content_length = headers
         .iter()
@@ -284,6 +295,173 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+/// A streamed response: status + headers, plus the reader positioned at the body.
+/// The caller decides how to drain it — [`into_body`] to buffer (`application/json`)
+/// or [`sse`] to pump it as an SSE event stream (`text/event-stream`). Owns the
+/// underlying stream, matching the MCP client's per-request connection model.
+pub struct StreamingResponse<S: Read + Write> {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    reader: BufReader<S>,
+}
+
+impl<S: Read + Write> StreamingResponse<S> {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    }
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+    /// The lowercased `Content-Type` (media type only, params stripped).
+    pub fn content_type(&self) -> Option<&str> {
+        self.header("content-type")
+            .map(|v| v.split(';').next().unwrap_or(v).trim())
+    }
+    /// `true` when the body is `text/event-stream` (Streamable HTTP SSE).
+    pub fn is_event_stream(&self) -> bool {
+        self.content_type() == Some("text/event-stream")
+    }
+    /// Buffer the whole body (capped), honoring `Content-Length`/`chunked`/close.
+    pub fn into_body(mut self) -> io::Result<Vec<u8>> {
+        let content_length = self
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-length")
+            .and_then(|(_, v)| v.parse::<usize>().ok());
+        let chunked = self
+            .headers
+            .iter()
+            .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
+        if chunked {
+            read_chunked(&mut self.reader)
+        } else if let Some(n) = content_length {
+            read_exact_capped(&mut self.reader, n)
+        } else {
+            read_to_end_capped(&mut self.reader)
+        }
+    }
+    /// Consume into an [`SseReader`] to pump `text/event-stream` events.
+    pub fn sse(self) -> SseReader<BufReader<S>> {
+        SseReader::new(self.reader)
+    }
+}
+
+/// Issue one request over an OWNED `stream` and return the status + headers +
+/// body reader WITHOUT draining the body (unlike [`send`]). Adds `Host`,
+/// `Connection: close`, and `Content-Length`; the caller supplies the rest
+/// (`Accept`, `Authorization`, `Content-Type`, `Mcp-Session-Id`, …).
+pub fn send_streaming<S: Read + Write>(
+    mut stream: S,
+    host_header: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> io::Result<StreamingResponse<S>> {
+    let mut req: Vec<u8> = Vec::with_capacity(256 + body.len());
+    write!(req, "{method} {path} HTTP/1.1\r\n")?;
+    write!(req, "Host: {host_header}\r\n")?;
+    req.extend_from_slice(b"Connection: close\r\n");
+    for (k, v) in headers {
+        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CR/LF in header",
+            ));
+        }
+        write!(req, "{k}: {v}\r\n")?;
+    }
+    write!(req, "Content-Length: {}\r\n\r\n", body.len())?;
+    req.extend_from_slice(body);
+    stream.write_all(&req)?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let (status, headers) = read_head(&mut reader)?;
+    Ok(StreamingResponse {
+        status,
+        headers,
+        reader,
+    })
+}
+
+/// One parsed SSE event (RFC 6455-style `text/event-stream`). For MCP, `data` is
+/// a JSON-RPC message; `event`/`id` are the optional SSE field lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+    pub id: Option<String>,
+}
+
+/// A blocking, line-based SSE reader. `next_event` accumulates `field: value`
+/// lines and emits one [`SseEvent`] per blank-line separator (multiple `data:`
+/// lines join with `\n`), returning `Ok(None)` at end of stream. Bounded per
+/// event by [`MAX_RESPONSE`] so a hostile stream cannot exhaust memory.
+pub struct SseReader<R: BufRead> {
+    r: R,
+}
+
+impl<R: BufRead> SseReader<R> {
+    pub fn new(r: R) -> SseReader<R> {
+        SseReader { r }
+    }
+
+    /// Read the next event, or `Ok(None)` at EOF. Comment lines (`:` prefix) and
+    /// unknown fields are ignored per the SSE spec.
+    pub fn next_event(&mut self) -> io::Result<Option<SseEvent>> {
+        let mut ev = SseEvent::default();
+        let mut saw_field = false;
+        let mut total = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = self.r.read_line(&mut line)?;
+            if n == 0 {
+                // EOF: flush a pending event if one was in progress.
+                return Ok(if saw_field { Some(ev) } else { None });
+            }
+            total += n;
+            if total > MAX_RESPONSE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SSE event exceeds cap",
+                ));
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                // Blank line dispatches the accumulated event.
+                if saw_field {
+                    return Ok(Some(ev));
+                }
+                continue; // stray blank line between events
+            }
+            if line.starts_with(':') {
+                continue; // comment
+            }
+            let (field, value) = match line.split_once(':') {
+                Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+                None => (line, ""), // a bare field name with empty value
+            };
+            saw_field = true;
+            match field {
+                "event" => ev.event = Some(value.to_string()),
+                "id" => ev.id = Some(value.to_string()),
+                "data" => {
+                    if !ev.data.is_empty() {
+                        ev.data.push('\n');
+                    }
+                    ev.data.push_str(value);
+                }
+                _ => {} // retry/unknown — ignore
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +520,101 @@ mod tests {
         let _ = &mut sink;
         let err = send(&mut stream, "h", "POST", "/", &[("X", "a\r\nEvil: 1")], b"").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A fake duplex stream: reads return a canned server response, writes are
+    /// captured (so a request/response round-trip is testable without sockets).
+    struct FakeStream {
+        resp: Cursor<Vec<u8>>,
+        sink: Vec<u8>,
+    }
+    impl Read for FakeStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.resp.read(buf)
+        }
+    }
+    impl Write for FakeStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.sink.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sse_events(body: &str) -> Vec<SseEvent> {
+        let mut r = SseReader::new(BufReader::new(Cursor::new(body.as_bytes().to_vec())));
+        let mut out = Vec::new();
+        while let Some(e) = r.next_event().unwrap() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn sse_parses_events_with_event_id_and_data() {
+        let body = "event: message\nid: 7\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        let evs = sse_events(body);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event.as_deref(), Some("message"));
+        assert_eq!(evs[0].id.as_deref(), Some("7"));
+        assert_eq!(evs[0].data, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    }
+
+    #[test]
+    fn sse_joins_multi_data_lines_and_ignores_comments() {
+        // Comment line, then an event whose data spans two `data:` lines.
+        let body = ": keep-alive\ndata: line1\ndata: line2\n\ndata: second\n\n";
+        let evs = sse_events(body);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].data, "line1\nline2");
+        assert_eq!(evs[1].data, "second");
+    }
+
+    #[test]
+    fn sse_flushes_trailing_event_without_final_blank_line() {
+        let evs = sse_events("data: only\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "only");
+    }
+
+    #[test]
+    fn send_streaming_reads_head_then_buffers_json_body() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: abc123\r\nContent-Length: 11\r\n\r\n{\"ok\":true}".to_string();
+        let stream = FakeStream {
+            resp: Cursor::new(raw.into_bytes()),
+            sink: Vec::new(),
+        };
+        let resp = send_streaming(
+            stream,
+            "h",
+            "POST",
+            "/mcp",
+            &[("Accept", "application/json")],
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.is_success());
+        assert_eq!(resp.content_type(), Some("application/json"));
+        assert!(!resp.is_event_stream());
+        assert_eq!(resp.header("mcp-session-id"), Some("abc123"));
+        assert_eq!(resp.into_body().unwrap(), b"{\"ok\":true}");
+    }
+
+    #[test]
+    fn send_streaming_detects_event_stream_and_pumps_sse() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":1}}\n\n".to_string();
+        let stream = FakeStream {
+            resp: Cursor::new(raw.into_bytes()),
+            sink: Vec::new(),
+        };
+        let resp = send_streaming(stream, "h", "POST", "/mcp", &[], b"{}").unwrap();
+        assert!(resp.is_event_stream());
+        let mut sse = resp.sse();
+        let ev = sse.next_event().unwrap().expect("one event");
+        assert!(ev.data.contains("\"id\":1"));
+        assert!(sse.next_event().unwrap().is_none());
     }
 }

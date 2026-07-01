@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::BufReader;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -80,18 +80,34 @@ pub struct McpClient {
     tool_meta: Option<Value>,
 }
 
+type NotifQueue = Arc<Mutex<VecDeque<json::Notification>>>;
+
 /// The wire transport behind a client. Both variants present the same
 /// request/notify/notification surface to [`McpClient`].
 enum Transport {
     /// Streamable HTTP over a `https`/`http`/`unix`/`vsock` endpoint. Notifications
-    /// captured off a POST's SSE response are queued here for `drain_notifications`.
+    /// are queued here from two sources: those captured off a POST's SSE response,
+    /// and the long-lived server→client `GET` SSE stream (`events`, started lazily
+    /// on the first subscribe — the reactive push channel).
     Http {
-        http: HttpTransport,
-        notifications: Mutex<VecDeque<json::Notification>>,
+        http: Arc<HttpTransport>,
+        notifications: NotifQueue,
+        events: Mutex<Option<EventStream>>,
     },
     /// A stdio child process demuxed by a reader thread.
     Stdio(StdioTransport),
 }
+
+/// The background notification-stream thread + its stop flag (RFC 0004 §GET SSE).
+struct EventStream {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+/// Each read on the notification `GET` stream is bounded so the loop can poll its
+/// stop flag between events (clean shutdown) — the reactive push cadence is far
+/// below this, so a live update is never delayed by it.
+const EVENT_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The stdio child transport: the classic reader-thread split (a dedicated thread
 /// parses inbound frames, resolving pending requests by id or queuing
@@ -121,8 +137,9 @@ impl McpClient {
         Ok(McpClient {
             name: name.to_string(),
             transport: Transport::Http {
-                http: HttpTransport::new(ep, headers),
-                notifications: Mutex::new(VecDeque::new()),
+                http: Arc::new(HttpTransport::new(ep, headers)),
+                notifications: Arc::new(Mutex::new(VecDeque::new())),
+                events: Mutex::new(None),
             },
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
@@ -211,8 +228,12 @@ impl McpClient {
     /// RFC 0012 §3.7: the key never leaves the process (see [`crate::net::tls`]).
     #[cfg(feature = "tls")]
     pub fn with_identity(mut self, identity: crate::net::tls::ClientIdentity) -> Self {
-        if let Transport::Http { http, .. } = &mut self.transport {
-            http.set_identity(Some(identity));
+        // The Arc is unshared here (called right after connect, before the event
+        // thread), so get_mut succeeds; a no-op if it were somehow already shared.
+        if let Transport::Http { http, .. } = &mut self.transport
+            && let Some(h) = Arc::get_mut(http)
+        {
+            h.set_identity(Some(identity));
         }
         self
     }
@@ -414,7 +435,40 @@ impl McpClient {
             Some(to_value(&SubscribeParams { uri: uri.into() })),
             timeout,
         )?;
+        // On HTTP, server→client updates ride the long-lived GET SSE stream — open
+        // it lazily now that we're subscribing (idempotent; a no-op on stdio).
+        self.ensure_event_stream();
         Ok(())
+    }
+
+    /// Start the background notification `GET` SSE thread if it isn't running
+    /// (HTTP transport only). Idempotent. Notifications land in the shared queue
+    /// drained by [`Self::drain_notifications`]. If the server has no push channel
+    /// the thread exits quietly and the client runs pull-only.
+    fn ensure_event_stream(&self) {
+        let Transport::Http {
+            http,
+            notifications,
+            events,
+        } = &self.transport
+        else {
+            return;
+        };
+        let mut guard = events.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let http = Arc::clone(http);
+        let queue = Arc::clone(notifications);
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name(format!("mcp-events:{}", self.name))
+            .spawn(move || event_loop(http, queue, stop_thread))
+            .ok();
+        if let Some(handle) = handle {
+            *guard = Some(EventStream { stop, handle });
+        }
     }
 
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
@@ -487,6 +541,7 @@ impl McpClient {
             Transport::Http {
                 http,
                 notifications,
+                ..
             } => {
                 let body = serde_json::to_vec(&req)
                     .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
@@ -561,6 +616,7 @@ impl McpClient {
             Transport::Http {
                 http,
                 notifications,
+                ..
             } => {
                 let body = serde_json::to_vec(&note)
                     .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
@@ -579,16 +635,75 @@ impl McpClient {
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // Only the stdio transport owns a child to reap. Closing stdin signals
-        // shutdown; child.kill() is the backstop; the reader thread sees stdout
-        // EOF and exits. (The supervisor kill-ladder governs subagent process
-        // groups, not these stdio servers.) The HTTP transport holds no process
-        // and no persistent socket (a request opens+closes its own connection).
-        if let Transport::Stdio(s) = &mut self.transport
-            && let Some(mut child) = s.child.take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
+        match &mut self.transport {
+            // Stop the notification thread: set its stop flag; it wakes within
+            // EVENT_READ_TIMEOUT (its read bound) and exits. The per-request
+            // connections open+close themselves, so there is nothing else to reap.
+            Transport::Http { events, .. } => {
+                if let Some(ev) = events.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+                    ev.stop.store(true, Ordering::SeqCst);
+                    let _ = ev.handle.join();
+                }
+            }
+            // Closing stdin signals shutdown; child.kill() is the backstop; the
+            // reader thread sees stdout EOF and exits. (The supervisor kill-ladder
+            // governs subagent process groups, not these stdio servers.)
+            Transport::Stdio(s) => {
+                if let Some(mut child) = s.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
+/// The notification `GET` SSE thread: (re)open the server→client stream and pump
+/// its JSON-RPC notifications into the shared queue until `stop`. Reconnects on a
+/// transient drop; gives up if the server has no push channel (a non-2xx / non-SSE
+/// response), leaving the client pull-only.
+fn event_loop(http: Arc<HttpTransport>, queue: NotifQueue, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        let mut sse = match http.open_events(EVENT_READ_TIMEOUT) {
+            Ok(s) => s,
+            // No usable push channel — stop trying (don't spin).
+            Err(HttpError::Status(_)) | Err(HttpError::Unsupported(_)) => return,
+            // Transient (connect/HTTP) — back off, then retry unless stopping.
+            Err(_) => {
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+        };
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match sse.next_event() {
+                Ok(Some(ev)) => {
+                    if let Ok(note) = serde_json::from_str::<json::Notification>(&ev.data) {
+                        queue
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back(note);
+                    }
+                }
+                Ok(None) => break, // clean EOF — reconnect
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // Idle read timeout — loop to re-check the stop flag.
+                    continue;
+                }
+                Err(_) => break, // stream error — reconnect
+            }
         }
     }
 }

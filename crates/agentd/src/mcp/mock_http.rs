@@ -124,7 +124,10 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
 }
 
 /// The long-lived `GET` SSE stream: hold it open and deliver the one-shot
-/// `resources/updated` armed by a subscribe. Exits when the peer closes.
+/// `resources/updated` armed by a subscribe. Deliberately sends NO keep-alive
+/// comments — the client polls its stop flag via a read timeout between events,
+/// and a stream of comments would keep its SSE reader busy and defeat that. The
+/// thread loops until the process exits (a test mock; the harness reaps it).
 fn serve_notifications(stream: &mut UnixStream, state: &State) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
@@ -138,18 +141,15 @@ fn serve_notifications(stream: &mut UnixStream, state: &State) {
                 Some(json!({"uri": state.uri})),
             );
             let data = serde_json::to_string(&note).unwrap_or_default();
-            if stream.write_all(format!("data: {data}\n\n").as_bytes()).is_err() {
-                return;
-            }
-            let _ = stream.flush();
-        } else {
-            // Keep-alive comment; also how we detect a closed peer (write fails).
-            if stream.write_all(b":\n\n").is_err() {
+            if stream
+                .write_all(format!("data: {data}\n\n").as_bytes())
+                .is_err()
+            {
                 return;
             }
             let _ = stream.flush();
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 

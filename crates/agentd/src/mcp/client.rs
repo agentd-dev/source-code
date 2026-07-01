@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MCP client over a stdio child process. RFC 0004.
+//! MCP client. RFC 0004.
 //!
-//! Spawns a server (`Command`), speaks newline-delimited JSON-RPC 2.0 over its
-//! stdin/stdout, and routes traffic with the classic split: a dedicated
-//! **reader thread** parses every inbound frame and either resolves a pending
-//! request (by id) or hands a notification to the caller; request senders
-//! block on a per-request channel with a timeout (the OLD runtime had *no*
-//! MCP timeouts — a hung server wedged the node; we fix that here).
-//!
-//! Each client connects one server and implements the client subset from RFC 0004:
+//! One client connects one server and implements the client subset from RFC 0004:
 //! initialize + capability store, tools (list+call), resources (list+read),
-//! subscribe/unsubscribe, ping. We declare **no** client capabilities and
-//! answer server→client `ping`/`roots/list` minimally, rejecting `sampling`.
+//! subscribe/unsubscribe, ping. We declare **no** client capabilities and answer
+//! server→client `ping`/`roots/list` minimally, rejecting `sampling`.
+//!
+//! Two transports sit behind [`Transport`], sharing the request/notify/notification
+//! surface:
+//!
+//! * **Streamable HTTP** ([`Self::connect`], [`super::http`]) — the v2.0.0 remote
+//!   transport (RFC 0012: no local process spawn). Each request is one POST of a
+//!   JSON-RPC frame over a fresh connection to a `https`/`http`/`unix`/`vsock`
+//!   endpoint; the response is `application/json` or an SSE stream. Per-request
+//!   timeouts are the socket connect+read bound.
+//! * **stdio child** ([`Self::spawn`]) — the legacy transport being retired: a
+//!   `Command` speaking newline-delimited JSON-RPC over stdin/stdout, demuxed by a
+//!   dedicated **reader thread** (by id) with per-request channels. Kept only until
+//!   the test/conformance mock moves to HTTP (then removed with the exec surface).
 
 use crate::json::{self, Id, Incoming, RpcError, frame};
+use crate::mcp::http::{HttpError, HttpTransport, McpEndpoint};
 use crate::wire::mcp::{
     CallToolResult, ClientCapabilities, Implementation, InitializeParams, InitializeResult,
     ListResourcesResult, ListToolsResult, PROTOCOL_VERSION, ReadResourceParams, ReadResourceResult,
@@ -21,7 +28,7 @@ use crate::wire::mcp::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::BufReader;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -63,10 +70,7 @@ type SharedWriter = Arc<Mutex<ChildStdin>>;
 /// A connected (and, after [`McpClient::initialize`], handshaken) MCP server.
 pub struct McpClient {
     name: String,
-    child: Option<Child>,
-    writer: SharedWriter,
-    pending: Pending,
-    notifications: Mutex<Receiver<json::Notification>>,
+    transport: Transport,
     next_id: AtomicI64,
     caps: ServerCapabilities,
     timeout: Duration,
@@ -74,12 +78,64 @@ pub struct McpClient {
     /// `{"agent/run_id": …}`) so backing services can dedupe retries
     /// (RFC 0011 §idempotency).
     tool_meta: Option<Value>,
-    _reader: JoinHandle<()>,
+}
+
+/// The wire transport behind a client. Both variants present the same
+/// request/notify/notification surface to [`McpClient`].
+enum Transport {
+    /// Streamable HTTP over a `https`/`http`/`unix`/`vsock` endpoint. Notifications
+    /// captured off a POST's SSE response are queued here for `drain_notifications`.
+    Http {
+        http: HttpTransport,
+        notifications: Mutex<VecDeque<json::Notification>>,
+    },
+    /// A stdio child process demuxed by a reader thread.
+    Stdio(StdioTransport),
+}
+
+/// The stdio child transport: the classic reader-thread split (a dedicated thread
+/// parses inbound frames, resolving pending requests by id or queuing
+/// notifications; senders block on a per-request channel with a timeout).
+struct StdioTransport {
+    child: Option<Child>,
+    writer: SharedWriter,
+    pending: Pending,
+    notifications: Mutex<Receiver<json::Notification>>,
+    reader: JoinHandle<()>,
 }
 
 impl McpClient {
+    /// Connect to a remote MCP server over Streamable HTTP (RFC 0004). `endpoint`
+    /// is `https://…` / `http://…` / `unix:/path` / `vsock:cid:port`. `headers`
+    /// are caller-owned request headers (auth/framing — resolved secret values,
+    /// never templates or logs). No process is spawned (RFC 0012). Call
+    /// [`Self::initialize`] before any tool/resource call.
+    pub fn connect(
+        name: &str,
+        endpoint: &str,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> Result<McpClient, McpError> {
+        let ep = McpEndpoint::parse(endpoint)
+            .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
+        Ok(McpClient {
+            name: name.to_string(),
+            transport: Transport::Http {
+                http: HttpTransport::new(ep, headers),
+                notifications: Mutex::new(VecDeque::new()),
+            },
+            next_id: AtomicI64::new(1),
+            caps: ServerCapabilities::default(),
+            timeout,
+            tool_meta: None,
+        })
+    }
+
     /// Spawn `command` (argv) as a stdio MCP server and start the reader
     /// thread. Call [`Self::initialize`] before any tool/resource call.
+    ///
+    /// The legacy transport, retained only for the test/conformance mock until it
+    /// moves to HTTP; production config no longer produces stdio servers (v2.0.0).
     pub fn spawn(name: &str, command: &[String], timeout: Duration) -> Result<McpClient, McpError> {
         let (prog, args) = command.split_first().ok_or_else(|| {
             McpError::Transport(format!("mcp server '{name}' has an empty command"))
@@ -117,15 +173,17 @@ impl McpClient {
 
         Ok(McpClient {
             name: name.to_string(),
-            child: Some(child),
-            writer,
-            pending,
-            notifications: Mutex::new(notif_rx),
+            transport: Transport::Stdio(StdioTransport {
+                child: Some(child),
+                writer,
+                pending,
+                notifications: Mutex::new(notif_rx),
+                reader,
+            }),
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
             timeout,
             tool_meta: None,
-            _reader: reader,
         })
     }
 
@@ -346,12 +404,20 @@ impl McpClient {
         Ok(())
     }
 
-    /// Drain any notifications the reader thread has queued (e.g.
+    /// Drain any notifications queued since the last drain (e.g.
     /// `notifications/resources/updated`). The reactive router
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
     pub fn drain_notifications(&self) -> Vec<json::Notification> {
-        let rx = self.notifications.lock().unwrap();
-        rx.try_iter().collect()
+        match &self.transport {
+            Transport::Http { notifications, .. } => {
+                let mut q = notifications.lock().unwrap_or_else(|e| e.into_inner());
+                q.drain(..).collect()
+            }
+            Transport::Stdio(s) => {
+                let rx = s.notifications.lock().unwrap_or_else(|e| e.into_inner());
+                rx.try_iter().collect()
+            }
+        }
     }
 
     // ---- internals ----
@@ -376,7 +442,7 @@ impl McpClient {
     }
 
     /// Send one JSON-RPC request and block up to `timeout` for the matching
-    /// response. The default-timeout `request` delegates here with `self.timeout`;
+    /// response. The default-timeout callers delegate here with `self.timeout`;
     /// the reactor-thread management path passes the SHORT bound (RFC 0016 §10) so
     /// a slow-but-alive server cannot block the reactor past the liveness window.
     fn request_with_timeout(
@@ -385,25 +451,56 @@ impl McpClient {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, McpError> {
-        // Fail FAST if the reader thread has already exited (the server's stdout
-        // hit EOF / a read error). Without this, a request after the reader is gone
-        // registers a pending sender nothing will ever resolve, so `recv_timeout`
-        // blocks for the FULL per-request timeout (up to 60s) — which can wedge a
-        // best-effort drain/reload unsubscribe. A dead reader means the connection
-        // is gone; surface it immediately as a transport error (RFC 0004).
-        if self._reader.is_finished() {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let req = json::Request::new(id, method, params);
+        match &self.transport {
+            Transport::Http {
+                http,
+                notifications,
+            } => {
+                let body = serde_json::to_vec(&req)
+                    .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
+                let msg = http
+                    .send(Some(id), &body, timeout, |n| queue_notification(notifications, n))
+                    .map_err(|e| http_err(&self.name, method, e))?
+                    .ok_or_else(|| {
+                        McpError::Transport(format!("no response to {method} on '{}'", self.name))
+                    })?;
+                let resp: json::Response = serde_json::from_value(msg).map_err(|e| {
+                    McpError::Transport(format!("bad {method} response on '{}': {e}", self.name))
+                })?;
+                match resp.error {
+                    Some(err) => Err(McpError::Rpc(err)),
+                    None => Ok(resp.result.unwrap_or(Value::Null)),
+                }
+            }
+            Transport::Stdio(s) => self.request_stdio(s, id, &req, method, timeout),
+        }
+    }
+
+    /// The stdio request path: register a pending sender, write the frame, block
+    /// on the per-request channel up to `timeout`. Fast-fails if the reader thread
+    /// has already exited (a dead connection would otherwise block the full
+    /// timeout on a sender nothing will resolve).
+    fn request_stdio(
+        &self,
+        s: &StdioTransport,
+        id: i64,
+        req: &json::Request,
+        method: &str,
+        timeout: Duration,
+    ) -> Result<Value, McpError> {
+        if s.reader.is_finished() {
             return Err(McpError::Transport(format!(
                 "server '{}' connection is closed (reader exited)",
                 self.name
             )));
         }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        s.pending.lock().unwrap().insert(id, tx);
 
-        let req = json::Request::new(id, method, params);
-        if let Err(e) = write_msg(&self.writer, &req) {
-            self.pending.lock().unwrap().remove(&id);
+        if let Err(e) = write_msg(&s.writer, req) {
+            s.pending.lock().unwrap().remove(&id);
             return Err(McpError::Transport(e.to_string()));
         }
 
@@ -413,7 +510,7 @@ impl McpClient {
                 None => Ok(resp.result.unwrap_or(Value::Null)),
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&id);
+                s.pending.lock().unwrap().remove(&id);
                 // Best-effort cancel so the server can stop work (RFC 0004).
                 let _ = self.notify(
                     method::NOTIFY_CANCELLED,
@@ -429,21 +526,72 @@ impl McpClient {
     }
 
     fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
-        write_msg(&self.writer, &json::Notification::new(method, params))
-            .map_err(|e| McpError::Transport(e.to_string()))
+        let note = json::Notification::new(method, params);
+        match &self.transport {
+            Transport::Http {
+                http,
+                notifications,
+            } => {
+                let body = serde_json::to_vec(&note)
+                    .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
+                http.send(None, &body, self.timeout, |n| {
+                    queue_notification(notifications, n)
+                })
+                .map_err(|e| http_err(&self.name, method, e))?;
+                Ok(())
+            }
+            Transport::Stdio(s) => {
+                write_msg(&s.writer, &note).map_err(|e| McpError::Transport(e.to_string()))
+            }
+        }
     }
 }
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        // Closing stdin signals shutdown; child.kill() is the backstop. The
-        // reader thread sees stdout EOF and exits. (MCP server children are
-        // reaped here directly; the supervisor kill-ladder in supervisor/kill.rs
-        // governs subagent process groups, not these stdio servers.)
-        if let Some(mut child) = self.child.take() {
+        // Only the stdio transport owns a child to reap. Closing stdin signals
+        // shutdown; child.kill() is the backstop; the reader thread sees stdout
+        // EOF and exits. (The supervisor kill-ladder governs subagent process
+        // groups, not these stdio servers.) The HTTP transport holds no process
+        // and no persistent socket (a request opens+closes its own connection).
+        if let Transport::Stdio(s) = &mut self.transport
+            && let Some(mut child) = s.child.take()
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// Map a [`HttpError`] onto the client's error domain, folding socket timeouts
+/// into [`McpError::Timeout`] so the management-timeout callers (which treat a
+/// timeout as a best-effort failure) behave identically across transports.
+fn http_err(name: &str, method: &str, e: HttpError) -> McpError {
+    use std::io::ErrorKind;
+    match e {
+        HttpError::Connect(io) | HttpError::Http(io) => match io.kind() {
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+                McpError::Timeout(format!("{method} on '{name}'"))
+            }
+            _ => McpError::Transport(format!("{method} on '{name}': {io}")),
+        },
+        HttpError::Status(code) => {
+            McpError::Transport(format!("{method} on '{name}': server returned HTTP {code}"))
+        }
+        HttpError::Unsupported(m) => McpError::Transport(m),
+        HttpError::NoResponse => {
+            McpError::Transport(format!("{method} on '{name}': no JSON-RPC response"))
+        }
+    }
+}
+
+/// Queue a raw notification Value captured off an HTTP response (a JSON-RPC
+/// message with no matching request id). Non-notification frames (e.g. a
+/// server→client request) that don't deserialize are dropped — v1 declares no
+/// client capabilities, so there is nothing to answer.
+fn queue_notification(queue: &Mutex<VecDeque<json::Notification>>, n: Value) {
+    if let Ok(note) = serde_json::from_value::<json::Notification>(n) {
+        queue.lock().unwrap_or_else(|e| e.into_inner()).push_back(note);
     }
 }
 
@@ -498,8 +646,8 @@ fn id_num(id: &Id) -> Option<i64> {
     }
 }
 
-/// The reader thread: parse every inbound frame and dispatch. Exits on EOF or
-/// a fatal read error, after which pending requests see `Disconnected`.
+/// The stdio reader thread: parse every inbound frame and dispatch. Exits on EOF
+/// or a fatal read error, after which pending requests see `Disconnected`.
 fn reader_loop(
     mut reader: BufReader<std::process::ChildStdout>,
     pending: Pending,
@@ -595,7 +743,46 @@ mod tests {
     }
 
     #[test]
-    fn management_timeout_bounds_a_call_on_a_non_responding_server() {
+    fn http_err_folds_socket_timeout_into_timeout_variant() {
+        use std::io::{Error, ErrorKind};
+        let e = http_err(
+            "fs",
+            "tools/call",
+            HttpError::Http(Error::new(ErrorKind::WouldBlock, "read timed out")),
+        );
+        assert!(matches!(e, McpError::Timeout(_)), "got {e:?}");
+        // A non-2xx HTTP status is a transport error, not a timeout.
+        let e = http_err("fs", "initialize", HttpError::Status(503));
+        assert!(matches!(e, McpError::Transport(_)), "got {e:?}");
+    }
+
+    #[test]
+    fn queue_notification_enqueues_notifications_and_drops_others() {
+        let q = Mutex::new(VecDeque::new());
+        // A real notification is queued.
+        queue_notification(
+            &q,
+            json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"x"}}),
+        );
+        // A response frame (has id, no method) is not a notification → dropped.
+        queue_notification(&q, json!({"jsonrpc":"2.0","id":1,"result":{}}));
+        let drained: Vec<_> = q.lock().unwrap().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].method, "notifications/resources/updated");
+    }
+
+    #[test]
+    fn connect_rejects_a_bad_endpoint() {
+        // McpClient isn't Debug, so match the Result rather than unwrap_err().
+        match McpClient::connect("bad", "ftp://nope/", Vec::new(), Duration::from_secs(1)) {
+            Err(McpError::Transport(_)) => {}
+            Err(other) => panic!("expected a Transport error, got {other:?}"),
+            Ok(_) => panic!("expected connect to reject an unsupported scheme"),
+        }
+    }
+
+    #[test]
+    fn management_timeout_bounds_a_call_on_a_non_responding_stdio_server() {
         // A server that is ALIVE but never replies: `sleep` reads nothing and
         // writes nothing, so its stdout never produces a frame, the reader thread
         // stays blocked on the read (alive — so the fast-fail-on-dead-reader path

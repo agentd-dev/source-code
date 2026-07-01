@@ -6,7 +6,7 @@
 # the ReAct loop) and asserts each contract, never linking the agent library.
 [workspace]
 resolver = "3"
-members = ["crates/agentd", "crates/agentd-conformance"]
+members = ["crates/mcp", "crates/agentd", "crates/agentd-conformance"]
 
 # Release profile for a distributable single binary: size-first, LTO'd, stripped,
 # abort-on-panic. This is a cloud appliance shipped on `scratch`, so a smaller

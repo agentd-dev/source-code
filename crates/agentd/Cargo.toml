@@ -95,6 +95,9 @@ otel = []
 internal-mocks = []
 
 [dependencies]
+# The reusable MCP base library (workspace crate): wire types + the version/era
+# model + (progressively) the transport dialects. In-tree, no extra external dep.
+mcp = { path = "../mcp" }
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.
 # Keep all wire types in one module (json/, wire/) so a swap to miniserde
 # stays mechanical (rfcs/0002).

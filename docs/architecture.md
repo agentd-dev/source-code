@@ -16,8 +16,9 @@ Where this overview simplifies, those win.
 > (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all four
 > run modes (once/loop/reactive/schedule), the reactive router, the
 > self-scheduling/self-subscribe self-tools, and the served self-MCP
-> (`--serve-mcp`), with the tls/vsock/serve-mcp/cron/metrics surfaces feature-gated.
-> The example runs below describe live behavior.
+> (`--serve-mcp`), with the serve-https/a2a/cron/metrics/run-graph surfaces
+> feature-gated. Every network surface is HTTPS (the default `tls` build); agentd
+> links no unix/vsock transport. The example runs below describe live behavior.
 
 ---
 
@@ -30,10 +31,10 @@ until the job is done or a new event wakes it.
 
 Three properties define it:
 
-- **MCP is the only tool source.** agentd ships **no built-in tool library**.
-  Every capability comes from an [MCP](https://modelcontextprotocol.io) server
-  it connects to. The single exception, a gated `exec`, is itself surfaced *as*
-  an MCP tool on agentd's own self-MCP, off by default.
+- **MCP is the only tool source.** agentd ships **no built-in tool library** and
+  runs no local code. Every capability comes from an
+  [MCP](https://modelcontextprotocol.io) server it connects to; its only built-in
+  tools are its self/control primitives (spawn a subagent, subscribe, run a graph).
 - **It reacts.** agentd subscribes to MCP **resources** and treats their
   updates as triggers. A long-lived agentd can sit idle at near-zero cost and
   wake when the world it watches changes. An agentd can even subscribe *itself*
@@ -123,7 +124,7 @@ whole tree collapses from the leaves up rather than leaking orphans (RFC 0003).
              ▼
    ┌──────────────────────────────────────────────────────────┐
    │  MCP servers (external): filesystem, github, db, …        │
-   │  + agent's own self-MCP (subagent.*, subscribe, exec)    │
+   │  + agent's own self-MCP (subagent.*, subscribe, graph.*)  │
    └──────────────────────────────────────────────────────────┘
 ```
 
@@ -236,9 +237,9 @@ crates/agentd/src/
   mcp/
     client.rs          reader-thread + pending-request map + notification dispatch
     registry.rs        name→server-handle map; resolve(); per-server caps cache
-    server.rs          self-MCP server (tools/resources); stdio + unix
+    server.rs          self-MCP request/dispatch (tools/resources) + HTTP serving
   intel/
-    client.rs          transport selection (unix/https/vsock) + request timeout
+    client.rs          HTTPS transport (loopback http for dev) + request timeout
     openai.rs          openai-compatible adapter (+ native tool-calls)
     anthropic.rs       anthropic adapter
   agentloop/          the ReAct loop (subagent side)
@@ -267,16 +268,20 @@ crates/agentd/src/
     health.rs          heartbeat, --health-file, /healthz+/readyz   [http surface opt-in]
     trace.rs           W3C context propagation (default) + OTLP export [feature: otel]
     metrics.rs         atomic counters → Prometheus text          [feature: metrics]
+  graph/             agent-authored run-graph: model + validation + driver [feature: run-graph]
   sec/
-    secrets.rs         resolve(name) env/file front door; Debug=***
+    secret.rs          resolve(name) env/file front door; Debug=***
     scope.rs           tool-scope grant + Rule-of-Two tag check
-    exec.rs            gated exec tool (reader-threads + timeout-kill + signal-extract)
   signals.rs           sigaction (no SA_RESTART) + self-pipe; SIGTERM/INT/CHLD/PIPE
 ```
 
-Cargo features are all **off by default**: `tls`, `vsock`, `serve-mcp`, `cron`,
-`metrics`, `otel`. The default Linux build is single-digit first-party crates —
-no async runtime, no C toolchain, no TLS.
+The transport primitives (`http`/`tls`/`unixsock`/`vsock` and the MCP wire/server
+framing) now live in the reusable **`crates/net`** and **`crates/mcp`** — they
+retain the unix/vsock capability for reuse, but **agentd itself uses only HTTP(S)**.
+There is **no `exec` module** — agentd runs no local code. The default build links
+`tls` (HTTPS is the transport); `serve-https`/`a2a`/`cron`/`metrics`/`otel`/`cluster`/
+`run-graph` are opt-in. The default Linux build is single-digit first-party crates —
+no async runtime, no C toolchain.
 
 Two boundaries are worth internalizing as a contributor:
 
@@ -301,11 +306,11 @@ A single `once` invocation, end to end:
               →  validate FULLY before any side effect.
               Bad/missing config → exit 2 in milliseconds (no LLM round-trip).
 
-2. CONNECT    for each --mcp server: spawn it as a stdio child, run the MCP
-              `initialize` handshake, negotiate the protocol version, and store
+2. CONNECT    for each --mcp server: connect to its remote HTTP endpoint, run the
+              MCP `initialize` handshake, negotiate the protocol version, and store
               its advertised capabilities. Every later call is gated on those
               caps; every */list follows pagination cursors.
-              (Optionally serve agentd's own MCP over --serve-mcp unix:… .)
+              (Optionally serve agentd's own MCP over --serve-mcp https://… with mTLS/bearer auth.)
 
 3. SPAWN      the supervisor spawns the ROOT subagent (re-exec of argv[0]) with:
                 · instruction + output contract (objective, format, boundaries)
@@ -376,7 +381,7 @@ stalled · loop_detected · cancelled · crashed
 $ agentd \
     --instruction "Summarize the open TODOs under /work and write SUMMARY.md" \
     --intelligence https://gw.example/v1 \
-    --mcp fs="mcp-server-fs --root /work" \
+    --mcp fs=https://mcp-fs.internal/mcp \
     --max-steps 40 --deadline 600s
 ```
 
@@ -439,13 +444,13 @@ self-tool, the supervisor auto-creates a `continue(this_session)` route, the
 agentd ends its turn, and it is re-entered in the same session when that resource
 updates.
 
-> **v1 scope boundaries (roadmap markers):**
-> - **Reactivity is stdio-only in v1.** Receiving MCP notifications over HTTP
->   needs a long-lived SSE GET stream; reactive-over-HTTP is **deferred
->   (roadmap)**.
-> - **Self-MCP serving is stdio/unix-socket only in v1.** A real Streamable HTTP
->   server (sessions, Origin checks, SSE upgrade, resumability) is **deferred
->   (roadmap)**.
+> **Scope boundaries:**
+> - **Reactivity rides Streamable HTTP.** Subscriptions are `resources/subscribe`
+>   against the owning MCP server; the client holds the SSE stream open and processes
+>   pushed `notifications/resources/updated` (notify-then-read).
+> - **Self-MCP serving is HTTP(S)** with mTLS/bearer auth (loopback `http://` for
+>   dev) — a full Streamable-HTTP server (POST + `subscriptions/listen` SSE), framed
+>   by the reusable `mcp` crate.
 > - **`subagent.spawn` defaults to synchronous** — it blocks the parent's turn
 >   and returns the distilled result. `{async}` / `{detach}` spawns and
 >   completion-as-self-resource (`agent://subagent/<handle>`) also ship.
@@ -459,10 +464,9 @@ updates.
 
 agentd reaches exactly two kinds of outside system, on **different wires**:
 
-- **Intelligence (the LLM).** One minimal abstraction, transport selected by a
-  URI in `AGENT_INTELLIGENCE` / `--intelligence`: `unix:/path` (a sidecar
-  gateway, the common same-pod case), `https://…` (behind the `tls` feature),
-  or `vsock:<cid>:<port>` (an enclave/microVM, behind the `vsock` feature). The
+- **Intelligence (the LLM).** One minimal abstraction over **HTTPS**, named by a
+  URI in `AGENT_INTELLIGENCE` / `--intelligence`: `https://…` (the default `tls`
+  build), or a **loopback** `http://` for a same-host dev gateway. The
   canonical in-binary wire is **OpenAI-compatible `/chat/completions` with
   native tool-calling**; exactly two adapters ship in-binary
   (`openai-compatible` + `anthropic`), with other provider quirks pushed to the

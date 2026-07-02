@@ -459,3 +459,167 @@ pub fn spawn_accept_vsock(
         })
         .map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::Request;
+    use std::io::BufReader;
+    use std::os::unix::net::UnixStream;
+
+    // --- lifecycle / version negotiation ---------------------------------
+
+    fn info() -> Value {
+        json!({"name": "test-server", "version": "9.9.9"})
+    }
+    fn caps() -> Value {
+        json!({"tools": {}, "resources": {"subscribe": true}})
+    }
+
+    #[test]
+    fn initialize_echoes_a_supported_requested_version() {
+        // A legacy client requesting a version we support gets it echoed back.
+        let want = crate::version::SUPPORTED_PROTOCOL_VERSIONS[1]; // a non-latest supported one
+        let req = Request::new(1, "initialize", Some(json!({"protocolVersion": want})));
+        let resp = lifecycle_response(&req, &info(), &caps()).expect("lifecycle handled");
+        let r = resp.result.expect("ok");
+        assert_eq!(r["protocolVersion"], want);
+        assert_eq!(r["serverInfo"]["name"], "test-server");
+        assert!(r["capabilities"]["resources"]["subscribe"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn initialize_falls_back_to_latest_legacy_for_an_unsupported_version() {
+        // An unknown/too-old version isn't echoed — we answer with our own latest.
+        let req = Request::new(1, "initialize", Some(json!({"protocolVersion": "1999-01-01"})));
+        let resp = lifecycle_response(&req, &info(), &caps()).expect("handled");
+        let r = resp.result.expect("ok");
+        assert_eq!(r["protocolVersion"], crate::version::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn initialize_defaults_when_no_version_is_requested() {
+        let req = Request::new(1, "initialize", Some(json!({})));
+        let resp = lifecycle_response(&req, &info(), &caps()).expect("handled");
+        assert_eq!(
+            resp.result.expect("ok")["protocolVersion"],
+            crate::version::PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn server_discover_advertises_every_supported_version() {
+        // The modern stateless probe learns our full version list + caps in one call.
+        let req = Request::new(7, method::SERVER_DISCOVER, None);
+        let resp = lifecycle_response(&req, &info(), &caps()).expect("handled");
+        let r = resp.result.expect("ok");
+        assert_eq!(r["resultType"], "complete");
+        let listed = r["supportedVersions"].as_array().expect("array");
+        assert_eq!(listed.len(), crate::version::SUPPORTED_PROTOCOL_VERSIONS.len());
+        assert!(listed.iter().any(|v| v == crate::version::FIRST_MODERN_VERSION));
+        assert!(listed.iter().any(|v| v == crate::version::PROTOCOL_VERSION));
+        assert_eq!(r["serverInfo"]["name"], "test-server");
+    }
+
+    #[test]
+    fn ping_is_an_empty_ok_and_domain_methods_fall_through() {
+        let ping = Request::new(1, "ping", None);
+        assert_eq!(
+            lifecycle_response(&ping, &info(), &caps())
+                .expect("handled")
+                .result,
+            Some(json!({}))
+        );
+        // A non-lifecycle method is the handler's job — the helper declines it.
+        let dom = Request::new(2, "tools/call", None);
+        assert!(lifecycle_response(&dom, &info(), &caps()).is_none());
+    }
+
+    // --- subscription registry ------------------------------------------
+
+    /// A writer whose pushes can be read back off its peer end.
+    fn wired() -> (SharedWriter, BufReader<UnixStream>) {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        // Bound the read so a "should push nothing" assertion can't hang.
+        rx.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        (Arc::new(Mutex::new(ServeStream::Unix(tx))), BufReader::new(rx))
+    }
+
+    /// Read one pushed notification and return `(method, uri-or-empty)`.
+    fn read_note(rx: &mut BufReader<UnixStream>) -> (String, String) {
+        let bytes = frame::read_line(rx).expect("read").expect("a frame");
+        let v: Value = serde_json::from_slice(&bytes).expect("json");
+        let method = v["method"].as_str().unwrap_or_default().to_string();
+        let uri = v["params"]["uri"].as_str().unwrap_or_default().to_string();
+        (method, uri)
+    }
+
+    /// Assert nothing more was pushed (the bounded read times out / hits EOF).
+    fn assert_silent(rx: &mut BufReader<UnixStream>) {
+        assert!(
+            !matches!(frame::read_line(rx), Ok(Some(_))),
+            "expected no further push"
+        );
+    }
+
+    #[test]
+    fn register_is_idempotent_per_connection() {
+        let subs: SubRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (w, _rx) = wired();
+        register_subscriber(&subs, "res://a", 1, &w);
+        register_subscriber(&subs, "res://a", 1, &w); // same conn again — no dup
+        let g = subs.lock().unwrap();
+        assert_eq!(g.get("res://a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notify_updated_consumes_but_keep_retains() {
+        let subs: SubRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (w, mut rx) = wired();
+        register_subscriber(&subs, "res://run", 1, &w);
+
+        // keep-variant fires and leaves the subscription in place …
+        notify_resource_updated_keep(&subs, "res://run");
+        let (m, uri) = read_note(&mut rx);
+        assert_eq!(m, method::NOTIFY_RESOURCES_UPDATED);
+        assert_eq!(uri, "res://run");
+        assert!(subs.lock().unwrap().contains_key("res://run"));
+
+        // … the consume-variant fires once and drops the entry.
+        notify_resource_updated(&subs, "res://run");
+        let (_m, uri2) = read_note(&mut rx);
+        assert_eq!(uri2, "res://run");
+        assert!(!subs.lock().unwrap().contains_key("res://run"));
+    }
+
+    #[test]
+    fn drop_and_conn_cleanup_remove_subscriptions() {
+        let subs: SubRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (w, _rx) = wired();
+        register_subscriber(&subs, "res://a", 1, &w);
+        register_subscriber(&subs, "res://b", 1, &w);
+
+        drop_subscription(&subs, "res://a", 1);
+        assert!(!subs.lock().unwrap().contains_key("res://a"));
+        assert!(subs.lock().unwrap().contains_key("res://b"));
+
+        remove_conn_subscriptions(&subs, 1);
+        assert!(subs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn broadcast_distinct_writes_once_per_connection() {
+        let subs: SubRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (w, mut rx) = wired();
+        // Same connection subscribed to two resources → one distinct writer.
+        register_subscriber(&subs, "res://a", 1, &w);
+        register_subscriber(&subs, "res://b", 1, &w);
+
+        let note = Notification::new(method::NOTIFY_TOOLS_LIST_CHANGED, None);
+        broadcast_distinct(&subs, &note);
+
+        let (m, _) = read_note(&mut rx);
+        assert_eq!(m, method::NOTIFY_TOOLS_LIST_CHANGED);
+        assert_silent(&mut rx); // not written twice
+    }
+}

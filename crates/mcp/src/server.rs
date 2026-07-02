@@ -16,13 +16,15 @@
 //! type-erases unix vs. vsock so the framing, threading, and dispatch are entirely
 //! transport-agnostic ("the unix server with the socket type swapped").
 
-use crate::rpc::{Notification, frame};
+use crate::rpc::{Incoming, Notification, Request, Response, frame};
 use crate::wire::method;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{self, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 /// Which transport a connection arrived on, and therefore its trust domain (RFC
@@ -237,4 +239,223 @@ pub fn broadcast_distinct(subs: &SubRegistry, note: &Notification) {
             let _ = frame::write_line(&mut *wl, note);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The connection framework: the lifecycle/version machinery, the `Handler` seam,
+// and the blocking thread-per-connection listeners. An embedder implements
+// [`Handler`] for its domain surface and calls [`serve_unix`] / [`serve_vsock`];
+// everything below is transport- and domain-agnostic.
+// ---------------------------------------------------------------------------
+
+/// The embedder's domain seam. The framework owns the transport, the framing, the
+/// connection lifecycle, and the subscription registry; the `Handler` supplies the
+/// *meaning* — which tools/resources exist, who may call/read/subscribe to what.
+///
+/// Lifecycle (`initialize` / `server/discover` / `ping`) is NOT routed here: a
+/// handler answers it once, version-aware, by calling [`lifecycle_response`] at the
+/// top of its [`dispatch`](Handler::dispatch) (so the multi-version negotiation
+/// lives in one place). Everything else — `tools/*`, `resources/*`, and any custom
+/// method — flows through `dispatch`.
+pub trait Handler: Send + Sync + 'static {
+    /// Route one request to a response. `origin` is the caller's trust domain;
+    /// `writer`/`conn` identify the connection so a `resources/subscribe` can
+    /// register a push target via [`register_subscriber`]. Called from the
+    /// connection's own thread — implementations do their own locking.
+    fn dispatch(&self, req: Request, origin: PeerOrigin, writer: &SharedWriter, conn: u64)
+    -> Response;
+
+    /// Called once when a connection is accepted (before its first request), for
+    /// logging/metrics. Default: nothing.
+    fn on_connect(&self, _origin: PeerOrigin, _conn: u64) {}
+
+    /// Called once when a connection's reader loop ends. The framework has already
+    /// dropped the connection's subscriptions; this is for logging/metrics or any
+    /// embedder-side per-connection cleanup. Default: nothing.
+    fn on_disconnect(&self, _origin: PeerOrigin, _conn: u64) {}
+}
+
+/// Answer the three lifecycle methods every MCP server must handle, in ONE place,
+/// version-aware across both eras — the server-side mirror of the client's version
+/// negotiation. Returns `Some(response)` for `initialize` / `server/discover` /
+/// `ping`, or `None` if `req.method` is a domain method the [`Handler`] must route.
+///
+///   * `initialize` (legacy handshake): negotiate the protocol version — echo the
+///     peer's requested version when it's [supported](crate::version::is_supported_version),
+///     else fall back to our latest legacy [`PROTOCOL_VERSION`](crate::version::PROTOCOL_VERSION).
+///   * `server/discover` (modern, stateless): advertise the full
+///     [`SUPPORTED_PROTOCOL_VERSIONS`](crate::version::SUPPORTED_PROTOCOL_VERSIONS)
+///     list + capabilities in one call, so a modern client needn't fall back to the
+///     legacy handshake. This is what makes the embedder a *dual-era server*.
+///   * `ping`: an empty result.
+///
+/// `server_info` is the `{name, version}` object and `capabilities` the advertised
+/// capability object; both are echoed verbatim into the two lifecycle replies. When
+/// the crate gains support for a new protocol version, both replies pick it up here
+/// without the embedder changing anything.
+pub fn lifecycle_response(
+    req: &Request,
+    server_info: &Value,
+    capabilities: &Value,
+) -> Option<Response> {
+    match req.method.as_str() {
+        "initialize" => {
+            let requested = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str);
+            let version = match requested {
+                Some(v) if crate::version::is_supported_version(v) => v,
+                _ => crate::version::PROTOCOL_VERSION,
+            };
+            Some(Response::ok(
+                req.id.clone(),
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": capabilities,
+                    "serverInfo": server_info,
+                }),
+            ))
+        }
+        method::SERVER_DISCOVER => Some(Response::ok(
+            req.id.clone(),
+            json!({
+                "resultType": "complete",
+                "supportedVersions": crate::version::SUPPORTED_PROTOCOL_VERSIONS,
+                "capabilities": capabilities,
+                "serverInfo": server_info,
+            }),
+        )),
+        "ping" => Some(Response::ok(req.id.clone(), json!({}))),
+        _ => None,
+    }
+}
+
+/// Serve one accepted connection to completion: the blocking NDJSON read loop.
+/// Requests get a reply (through the shared writer, which a background thread may
+/// also push notifications on — the Mutex serializes them); notifications
+/// (`initialized`, …) are read and dropped. On EOF/hangup the connection's
+/// subscriptions are dropped so no push ever targets a dead socket. A write timeout
+/// bounds a stalled-but-alive peer so it can't pin the writer Mutex (and a pushing
+/// thread) forever.
+pub fn handle_conn(
+    stream: ServeStream,
+    origin: PeerOrigin,
+    handler: &Arc<dyn Handler>,
+    subs: &SubRegistry,
+    conn_counter: &AtomicU64,
+    write_timeout: Duration,
+) {
+    let writer: SharedWriter = match stream.try_clone() {
+        Ok(w) => {
+            let _ = w.set_write_timeout(Some(write_timeout));
+            Arc::new(Mutex::new(w))
+        }
+        Err(_) => return,
+    };
+    let conn = conn_counter.fetch_add(1, Ordering::Relaxed);
+    handler.on_connect(origin, conn);
+    let mut reader = BufReader::new(stream);
+    while let Ok(Some(bytes)) = frame::read_line(&mut reader) {
+        if let Ok(Incoming::Request(req)) = serde_json::from_slice::<Incoming>(&bytes) {
+            let resp = handler.dispatch(req, origin, &writer, conn);
+            let wrote = writer
+                .lock()
+                .is_ok_and(|mut w| frame::write_line(&mut *w, &resp).is_ok());
+            if !wrote {
+                break; // peer hung up mid-reply
+            }
+        }
+    }
+    remove_conn_subscriptions(subs, conn); // don't push to a dead socket
+    handler.on_disconnect(origin, conn);
+}
+
+/// Bind a unix socket for serving, clearing any stale socket file first. Returned
+/// separately from the accept loop so the caller can log/act on a successful bind
+/// (or propagate the bind error) before the accept thread starts.
+pub fn bind_unix(path: &str) -> io::Result<UnixListener> {
+    // A stale socket from a crashed prior run would block the bind; clear it.
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path)
+}
+
+/// Spawn the background accept thread for `listener`: one blocking thread per
+/// connection, each running [`handle_conn`] against `handler`. Peers arrive in the
+/// [`PeerOrigin::Management`] trust domain (they dialed a listener). Returns once
+/// the accept thread is spawned; a thread-spawn failure is surfaced as the error.
+pub fn spawn_accept_unix(
+    listener: UnixListener,
+    handler: Arc<dyn Handler>,
+    subs: SubRegistry,
+    conn_counter: Arc<AtomicU64>,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("serve-mcp".into())
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let handler = Arc::clone(&handler);
+                let subs = Arc::clone(&subs);
+                let conn_counter = Arc::clone(&conn_counter);
+                thread::Builder::new()
+                    .name("serve-mcp-conn".into())
+                    .spawn(move || {
+                        handle_conn(
+                            ServeStream::Unix(stream),
+                            PeerOrigin::Management,
+                            &handler,
+                            &subs,
+                            &conn_counter,
+                            write_timeout,
+                        )
+                    })
+                    .ok();
+            }
+        })
+        .map(|_| ())
+}
+
+/// Bind an AF_VSOCK `(cid, port)` for serving — the management transport (RFC 0015
+/// §3.2). The vsock counterpart of [`bind_unix`].
+#[cfg(feature = "vsock")]
+pub fn bind_vsock(cid: u32, port: u32) -> io::Result<vsock::VsockListener> {
+    vsock::VsockListener::bind_with_cid_port(cid, port)
+}
+
+/// Spawn the background accept thread for a vsock `listener` — byte-for-byte
+/// [`spawn_accept_unix`] with the socket type swapped (the same [`handle_conn`], no
+/// new framing). Peers arrive in [`PeerOrigin::Management`].
+#[cfg(feature = "vsock")]
+pub fn spawn_accept_vsock(
+    listener: vsock::VsockListener,
+    handler: Arc<dyn Handler>,
+    subs: SubRegistry,
+    conn_counter: Arc<AtomicU64>,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("serve-mcp-vsock".into())
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let handler = Arc::clone(&handler);
+                let subs = Arc::clone(&subs);
+                let conn_counter = Arc::clone(&conn_counter);
+                thread::Builder::new()
+                    .name("serve-mcp-conn".into())
+                    .spawn(move || {
+                        handle_conn(
+                            ServeStream::Vsock(stream),
+                            PeerOrigin::Management,
+                            &handler,
+                            &subs,
+                            &conn_counter,
+                            write_timeout,
+                        )
+                    })
+                    .ok();
+            }
+        })
+        .map(|_| ())
 }

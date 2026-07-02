@@ -11,20 +11,18 @@
 //! resources/subscribe push.
 
 use crate::config::Config;
-use crate::json::{self, Id, Incoming, Notification, Request, Response, frame};
+use crate::json::{self, Id, Notification, Request, Response};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
 use crate::supervisor::cgroup;
 use crate::supervisor::reactor::{SuperviseResult, supervise_once, supervise_swappable};
 use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
-use crate::wire::mcp::{PROTOCOL_VERSION, method};
+use crate::wire::mcp::method;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::BufReader;
-use std::os::unix::net::UnixListener;
-// `UnixStream` is only named in the test seam now that `ServeStream` moved to the
-// crate (the accept loop wraps the listener's streams without naming the type).
+// `UnixStream` is only named in the test seam now that `ServeStream` + the
+// transport/listener framework moved to the crate.
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -1184,59 +1182,50 @@ impl ServeHandle {
     }
 }
 
-/// Bind `path` and serve the self-MCP on a background accept thread (one thread
-/// per connection). Returns a [`ServeHandle`] (for shutdown drain), or the bind
-/// error so the caller decides if it's fatal.
-pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHandle> {
-    // A stale socket from a crashed prior run would block the bind; clear it.
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
-    log.info(
-        "mcp.serving",
-        json!({"transport": "unix", "path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
-    );
-    let handle = ServeHandle {
+/// Build the shutdown handle from a served context — the Arc-shared registries the
+/// driver drains + publishes the run report through. Shared by the unix + vsock
+/// `serve*` entry points (identical, transport-independent).
+fn serve_handle(ctx: &ServeCtx) -> ServeHandle {
+    ServeHandle {
         sessions: Arc::clone(&ctx.sessions),
         warm: Arc::clone(&ctx.warm),
         inflight: Arc::clone(&ctx.inflight),
         report: Arc::clone(&ctx.report),
         subscriptions: Arc::clone(&ctx.subscriptions),
         run_uri: crate::agentd_uri::run_uri(&ctx.run_id),
-    };
+    }
+}
+
+/// Bind `path` and serve the self-MCP on a background accept thread (one thread per
+/// connection). Returns a [`ServeHandle`] (for shutdown drain), or the bind error
+/// so the caller decides if it's fatal. The transport + framing + connection loop
+/// live in the reusable [`mcp::server`](::mcp::server) framework; this only supplies
+/// the agentd domain surface (via [`ServeHandler`]) and the served-resource log.
+pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHandle> {
+    let listener = ::mcp::server::bind_unix(path)?; // bind first; propagate a bind failure
+    log.info(
+        "mcp.serving",
+        json!({"transport": "unix", "path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
+    );
+    let handle = serve_handle(&ctx);
     // Coalesce ring-growth into `agentd://events` notifications (RFC 0016 §7.2).
     #[cfg(feature = "events")]
     spawn_events_notifier(Arc::clone(&ctx.subscriptions));
-    let ctx = Arc::new(ctx);
-    thread::Builder::new()
-        .name("serve-mcp".into())
-        .spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let ctx = Arc::clone(&ctx);
-                let log = log.clone();
-                // One blocking thread per peer connection (RFC §3.6). A unix
-                // `--serve-mcp` peer is in the management trust domain (§3.3).
-                thread::Builder::new()
-                    .name("serve-mcp-conn".into())
-                    .spawn(move || {
-                        handle_conn(
-                            ServeStream::Unix(stream),
-                            PeerOrigin::Management,
-                            &ctx,
-                            &log,
-                        )
-                    })
-                    .ok();
-            }
-        })?;
+    let subs = Arc::clone(&ctx.subscriptions);
+    let conn_counter = Arc::clone(&ctx.conn_counter);
+    let write_timeout = ctx.drain_timeout;
+    let handler: Arc<dyn ::mcp::server::Handler> = Arc::new(ServeHandler {
+        ctx: Arc::new(ctx),
+        log,
+    });
+    ::mcp::server::spawn_accept_unix(listener, handler, subs, conn_counter, write_timeout)?;
     Ok(handle)
 }
 
-/// Bind a vsock `(cid, port)` and serve the self-MCP — the **management
-/// transport** (RFC 0015 §3.2). Byte-for-byte the unix server with the socket
-/// type swapped: a blocking `VsockListener`, thread-per-connection, the same
-/// generic [`handle_conn`]; no async, no new framing. Peers arrive in
-/// [`PeerOrigin::Management`]. Returns a [`ServeHandle`] for shutdown drain (the
-/// session/warm/inflight registries are shared with `ctx`), or the bind error.
+/// Bind a vsock `(cid, port)` and serve the self-MCP — the **management transport**
+/// (RFC 0015 §3.2). Byte-for-byte the unix server with the socket type swapped (the
+/// same framework, no new framing). Peers arrive in [`PeerOrigin::Management`].
+/// Returns a [`ServeHandle`] for shutdown drain, or the bind error.
 #[cfg(feature = "vsock")]
 pub fn serve_vsock(
     cid: u32,
@@ -1244,81 +1233,55 @@ pub fn serve_vsock(
     ctx: ServeCtx,
     log: Logger,
 ) -> std::io::Result<ServeHandle> {
-    let listener = vsock::VsockListener::bind_with_cid_port(cid, port)?;
+    let listener = ::mcp::server::bind_vsock(cid, port)?;
     log.info(
         "mcp.serving",
         json!({"transport": "vsock", "cid": cid, "port": port, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
     );
-    let handle = ServeHandle {
-        sessions: Arc::clone(&ctx.sessions),
-        warm: Arc::clone(&ctx.warm),
-        inflight: Arc::clone(&ctx.inflight),
-        report: Arc::clone(&ctx.report),
-        subscriptions: Arc::clone(&ctx.subscriptions),
-        run_uri: crate::agentd_uri::run_uri(&ctx.run_id),
-    };
+    let handle = serve_handle(&ctx);
     // Coalesce ring-growth into `agentd://events` notifications (RFC 0016 §7.2).
     #[cfg(feature = "events")]
     spawn_events_notifier(Arc::clone(&ctx.subscriptions));
-    let ctx = Arc::new(ctx);
-    thread::Builder::new()
-        .name("serve-mcp-vsock".into())
-        .spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let ctx = Arc::clone(&ctx);
-                let log = log.clone();
-                thread::Builder::new()
-                    .name("serve-mcp-conn".into())
-                    .spawn(move || {
-                        handle_conn(
-                            ServeStream::Vsock(stream),
-                            PeerOrigin::Management,
-                            &ctx,
-                            &log,
-                        )
-                    })
-                    .ok();
-            }
-        })?;
+    let subs = Arc::clone(&ctx.subscriptions);
+    let conn_counter = Arc::clone(&ctx.conn_counter);
+    let write_timeout = ctx.drain_timeout;
+    let handler: Arc<dyn ::mcp::server::Handler> = Arc::new(ServeHandler {
+        ctx: Arc::new(ctx),
+        log,
+    });
+    ::mcp::server::spawn_accept_vsock(listener, handler, subs, conn_counter, write_timeout)?;
     Ok(handle)
 }
 
-fn handle_conn(stream: ServeStream, origin: PeerOrigin, ctx: &ServeCtx, log: &Logger) {
-    // The write half is shared (Arc<Mutex>) so a run thread can push a
-    // notification on it concurrently with this thread writing a reply. A write
-    // timeout bounds a stalled-but-alive peer so it can't pin the writer Mutex
-    // (and a run thread's notification) forever — matching the rest of the crate's
-    // sockets.
-    let writer: SharedWriter = match stream.try_clone() {
-        Ok(w) => {
-            let _ = w.set_write_timeout(Some(ctx.drain_timeout));
-            Arc::new(Mutex::new(w))
-        }
-        Err(_) => return,
-    };
-    let conn = ctx.conn_counter.fetch_add(1, Ordering::Relaxed);
-    log.info(
-        "mcp.connect",
-        json!({"origin": origin.as_str(), "conn": conn}),
-    );
-    let mut reader = BufReader::new(stream);
-    while let Ok(Some(bytes)) = frame::read_line(&mut reader) {
-        // Requests get a reply; notifications (initialized, …) do not.
-        if let Ok(Incoming::Request(req)) = serde_json::from_slice::<Incoming>(&bytes) {
-            let resp = dispatch(req, ctx, origin, &writer, conn, log);
-            let wrote = writer
-                .lock()
-                .is_ok_and(|mut w| frame::write_line(&mut *w, &resp).is_ok());
-            if !wrote {
-                break; // peer hung up mid-reply
-            }
-        }
+/// Plugs agentd's domain dispatch into the reusable [`mcp::server`](::mcp::server)
+/// connection framework: the framework owns the transport, framing, lifecycle, and
+/// subscription registry and calls this per request / per connection. Holds the
+/// Arc-shared [`ServeCtx`] and the daemon `Logger`.
+struct ServeHandler {
+    ctx: Arc<ServeCtx>,
+    log: Logger,
+}
+
+impl ::mcp::server::Handler for ServeHandler {
+    fn dispatch(
+        &self,
+        req: Request,
+        origin: PeerOrigin,
+        writer: &SharedWriter,
+        conn: u64,
+    ) -> Response {
+        dispatch(req, &self.ctx, origin, writer, conn, &self.log)
     }
-    ::mcp::server::remove_conn_subscriptions(&ctx.subscriptions, conn); // don't push to a dead socket
-    log.debug(
-        "mcp.disconnect",
-        json!({"origin": origin.as_str(), "conn": conn}),
-    );
+
+    fn on_connect(&self, origin: PeerOrigin, conn: u64) {
+        self.log
+            .info("mcp.connect", json!({"origin": origin.as_str(), "conn": conn}));
+    }
+
+    fn on_disconnect(&self, origin: PeerOrigin, conn: u64) {
+        self.log
+            .debug("mcp.disconnect", json!({"origin": origin.as_str(), "conn": conn}));
+    }
 }
 
 /// Route one JSON-RPC request to a response. `writer`/`conn` identify the calling
@@ -1352,45 +1315,21 @@ fn dispatch(
     conn: u64,
     log: &Logger,
 ) -> Response {
+    // Lifecycle (`initialize` legacy handshake + version negotiation,
+    // `server/discover` modern stateless discovery, `ping`) is answered once,
+    // version-aware across both eras, by the reusable crate — so agentd stays a
+    // dual-era SERVER without duplicating the negotiation, and a new protocol
+    // version is picked up centrally. `capabilities`: `resources.subscribe`
+    // advertises that a peer can subscribe to an agentd:// resource and be pushed
+    // updates (e.g. a run completing).
+    if let Some(resp) = ::mcp::server::lifecycle_response(
+        &req,
+        &json!({"name": "agentd", "version": crate::VERSION}),
+        &json!({"tools": {}, "resources": {"subscribe": true}}),
+    ) {
+        return resp;
+    }
     match req.method.as_str() {
-        "initialize" => {
-            // Version negotiation (RFC 0004 lifecycle §version-negotiation): echo
-            // the peer's requested version when we support it, else our latest.
-            let requested = req
-                .params
-                .as_ref()
-                .and_then(|p| p.get("protocolVersion"))
-                .and_then(Value::as_str);
-            let version = match requested {
-                Some(v) if crate::wire::mcp::is_supported_version(v) => v,
-                _ => PROTOCOL_VERSION,
-            };
-            Response::ok(
-                req.id,
-                json!({
-                    "protocolVersion": version,
-                    // `resources.subscribe` advertises that a peer can subscribe to an
-                    // agentd:// resource and be pushed updates (e.g. a run completing).
-                    "capabilities": {"tools": {}, "resources": {"subscribe": true}},
-                    "serverInfo": {"name": "agentd", "version": crate::VERSION}
-                }),
-            )
-        }
-        // Modern (2026-07-28+, stateless) discovery: a peer that opens with
-        // `server/discover` instead of `initialize` learns our versions +
-        // capabilities in one stateless call (RFC 0004 §discover). Answering it
-        // makes agentd a dual-era SERVER (a modern client no longer has to fall
-        // back to the legacy handshake against us).
-        "server/discover" => Response::ok(
-            req.id,
-            json!({
-                "resultType": "complete",
-                "supportedVersions": crate::wire::mcp::SUPPORTED_PROTOCOL_VERSIONS,
-                "capabilities": {"tools": {}, "resources": {"subscribe": true}},
-                "serverInfo": {"name": "agentd", "version": crate::VERSION}
-            }),
-        ),
-        "ping" => Response::ok(req.id, json!({})),
         // The work tools are listed to every peer; the operator tools
         // (drain/lame-duck/cancel) only to a `Management` peer (RFC 0015 §3.4) —
         // a stdio-spawned subagent must never see, much less call, them.
@@ -3158,7 +3097,7 @@ mod tests {
             &log(),
         );
         let v = r.result.expect("ok");
-        assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(v["protocolVersion"], crate::wire::mcp::PROTOCOL_VERSION);
         assert!(v["capabilities"]["tools"].is_object());
         assert_eq!(v["serverInfo"]["name"], "agentd");
     }
@@ -3179,7 +3118,10 @@ mod tests {
         let d: crate::wire::mcp::DiscoverResult =
             serde_json::from_value(r.result.expect("ok")).expect("parses as DiscoverResult");
         assert!(d.supported_versions.contains(&"2026-07-28".to_string()));
-        assert!(d.supported_versions.contains(&PROTOCOL_VERSION.to_string()));
+        assert!(
+            d.supported_versions
+                .contains(&crate::wire::mcp::PROTOCOL_VERSION.to_string())
+        );
         assert!(d.capabilities.supports_tools());
         assert!(d.capabilities.supports_subscribe());
         assert_eq!(d.server_info.unwrap().name, "agentd");

@@ -3357,7 +3357,7 @@ mod tests {
         // The served manifest is the canonical RFC 0015 §5.2 schema (the same
         // builder as the `--capabilities` one-shot): contract_version + top-level
         // mode + identity.run_id from the downward-API/run id.
-        assert_eq!(body["contract_version"], "1.0");
+        assert_eq!(body["contract_version"], "2.0");
         assert_eq!(body["identity"]["run_id"], "r1");
         assert_eq!(body["mode"], "reactive");
     }
@@ -4351,7 +4351,7 @@ mod tests {
             .clone();
 
         let swap = SwapIntel {
-            uri: "vsock:7:9000".into(),
+            uri: "https://gw.example:9000".into(),
             token: Some("rotated".into()),
             model: Some("claude-haiku-4".into()),
             policy: crate::config::SwapPolicy::FinishOnOld,
@@ -4361,7 +4361,7 @@ mod tests {
         assert_eq!(reached, 2);
         let (got, _gen) = ch.take_newer(0).expect("the swap landed in the live run");
         assert_eq!(got.model.as_deref(), Some("claude-haiku-4"));
-        assert_eq!(got.uri, "vsock:7:9000");
+        assert_eq!(got.uri, "https://gw.example:9000");
     }
 
     #[test]

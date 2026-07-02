@@ -50,21 +50,21 @@ pub mod oauth;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
 
-// agentd serving its own MCP over a unix socket (composability, RFC 0005) and
-// over vsock (the agentctl management transport, RFC 0015 §3). Feature-gated,
-// no deps (blocking listener, thread-per-connection).
+// agentd serving its own MCP over HTTP(S) — the composability / agentctl control
+// plane (RFC 0005 / RFC 0015 §3). The reusable `mcp::server` framework owns the
+// transport + lifecycle; this module is the agentd domain surface.
 #[cfg(feature = "serve-mcp")]
 pub mod server;
 
 // The A2A (Agent2Agent) v1.0 unary method surface, served over the same self-MCP
 // listener (RFC 0020). A thin binding onto the served-run machinery — a Task IS a
 // served run. Feature-gated (`a2a = ["serve-mcp"]`), no deps (reuses the RFC 0004
-// JSON-RPC codec + the vsock/unix management transport).
+// JSON-RPC codec over the HTTP(S) transport).
 #[cfg(feature = "a2a")]
 pub mod a2a;
 
 // agentd-as-A2A-client: the remote-A2A-agent delegation backend (RFC 0020 §3).
-// Connects to a declared peer over the unix/vsock transport + the RFC 0004
+// Connects to a declared peer over HTTP(S) + the RFC 0004
 // JSON-RPC codec, runs `a2a.SendMessage` then polls `a2a.GetTask` to a terminal
 // state, and returns the distillate. Reuses the wire types from `a2a`; no deps.
 #[cfg(feature = "a2a")]

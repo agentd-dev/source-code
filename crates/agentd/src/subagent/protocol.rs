@@ -327,7 +327,7 @@ mod tests {
         // token rides the wire (like Spawn) but is never logged — the resource
         // body / events carry transport+index only.
         let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
-            uri: "vsock:5:9090,vsock:5:9091".into(),
+            uri: "https://gw-a.example,https://gw-b.example".into(),
             token: Some("rotated-secret".into()),
             model: Some("claude-haiku-4".into()),
             policy: SwapPolicy::RestartTurn,
@@ -338,7 +338,7 @@ mod tests {
         let back: ControlMsg = serde_json::from_str(&s).unwrap();
         match back {
             ControlMsg::SwapIntel(p) => {
-                assert_eq!(p.uri, "vsock:5:9090,vsock:5:9091");
+                assert_eq!(p.uri, "https://gw-a.example,https://gw-b.example");
                 assert_eq!(p.model.as_deref(), Some("claude-haiku-4"));
                 assert_eq!(p.policy, SwapPolicy::RestartTurn);
             }
@@ -378,23 +378,23 @@ mod tests {
             all_down: false,
             active: Some(IntelActive {
                 index: 1,
-                transport: "vsock".into(),
+                transport: "https".into(),
             }),
         };
         let s = serde_json::to_string(&up).unwrap();
         assert!(s.contains("\"all_down\":false"));
         assert!(s.contains("\"index\":1"));
-        assert!(s.contains("\"transport\":\"vsock\""));
+        assert!(s.contains("\"transport\":\"https\""));
         // RFC 0012 §3.7: the structural transport scheme only — no scheme-borne
         // address/cid/host/credential rides this message.
-        assert!(!s.contains("vsock:"), "no full URI in the report: {s}");
+        assert!(!s.contains("https://"), "no full URI in the report: {s}");
         let back: AgentMsg = serde_json::from_str(&s).unwrap();
         match back {
             AgentMsg::IntelHealth { all_down, active } => {
                 assert!(!all_down);
                 let a = active.unwrap();
                 assert_eq!(a.index, 1);
-                assert_eq!(a.transport, "vsock");
+                assert_eq!(a.transport, "https");
             }
             other => panic!("expected intel_health, got {other:?}"),
         }

@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 /// The `x-agentd-contract-version` the schema carries (ties to the capabilities
 /// manifest's `contract_version`, RFC 0014 §5 / RFC 0017 §4.2). Kept equal to the
 /// manifest's contract version by `tests::schema_contract_version_matches_manifest`.
-pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
+pub const SCHEMA_CONTRACT_VERSION: &str = "2.0";
 
 /// The deserialized config-file shape — one source of truth for the loader, the
 /// validator, and the `--config-schema` generator. `serde` only.
@@ -89,7 +89,7 @@ pub struct LimitsFile {
 }
 
 /// One MCP server, reached over the v2.0.0 Streamable HTTP transport: a remote
-/// `endpoint` (`https://`/`http://`/`unix:`/`vsock:`, RFC 0004) with optional
+/// `endpoint` (`https://host[:port][/path]`, loopback `http://` for dev; RFC 0004) with optional
 /// secret-free auth `headers` (RFC 0012 — no local process spawn). `tags` is the
 /// RFC 0012 §3.1 glob→tags wire (the loader flattens a `{"*": ["sensitive"]}` map
 /// to the server's tag set).

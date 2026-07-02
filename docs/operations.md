@@ -47,6 +47,15 @@ Needs `--features serve-https`. Trust is **never** derived from the transport �
 non-loopback bind **must** configure mTLS and/or a bearer, or startup fails; there
 is no open control plane.
 
+**Certificate rotation is live.** The serve identity is read from the
+`--serve-cert`/`--serve-key`/`--serve-client-ca` **paths**, re-checked
+(throttled, ~1s) on accept: swapping the mounted files in place — a
+cert-manager renewal rotating a Kubernetes Secret mount — is served on the next
+connection with **no restart, no rebind, no dropped listener**. A bad
+intermediate write degrades to the last-good identity (never down); auth
+*posture* (whether client certs are required) is fixed at startup — only the
+PEM contents rotate.
+
 ```console
 $ agentd \
     --instruction 'reconcile on change' \

@@ -269,47 +269,128 @@ impl ServerIdentity {
 /// (or an unverifiable one) fails the handshake and never reaches the protocol
 /// layer; [`ServerTlsStream::conn::peer_certificates`] is then always `Some`
 /// for accepted peers, the strong identity the embedder can gate trust on.
+///
+/// Built [`from_paths`](TlsAcceptor::from_paths), the acceptor is **live**: it
+/// re-stats the PEM files (throttled) on accept and rebuilds its config when
+/// they change — so a mounted-Secret rotation (cert-manager renewal swaps the
+/// file atomically) is picked up with no restart and no dropped listener. A
+/// failed reload keeps serving the last-good identity (observable via
+/// [`last_reload_error`](TlsAcceptor::last_reload_error)).
 pub struct TlsAcceptor {
-    config: Arc<ServerConfig>,
+    config: Mutex<Arc<ServerConfig>>,
     client_auth: bool,
+    reload: Option<ReloadSource>,
+}
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
+
+/// How often, at most, an accept re-stats the identity files (throttles the
+/// stat syscalls under high accept rates; rotation cadence is months).
+const RELOAD_CHECK_TTL: Duration = Duration::from_secs(1);
+
+/// The file-backed identity a live acceptor watches.
+struct ReloadSource {
+    cert: PathBuf,
+    key: PathBuf,
+    client_ca: Option<PathBuf>,
+    state: Mutex<ReloadState>,
+}
+
+struct ReloadState {
+    checked_at: Instant,
+    mtimes: (SystemTime, SystemTime, Option<SystemTime>),
+    generation: u64,
+    last_error: Option<String>,
 }
 
 impl std::fmt::Debug for TlsAcceptor {
     /// Structural only — never key material (RFC 0012 §3.7).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TlsAcceptor {{ client_auth: {} }}", self.client_auth)
+        write!(
+            f,
+            "TlsAcceptor {{ client_auth: {}, live: {} }}",
+            self.client_auth,
+            self.reload.is_some()
+        )
     }
 }
 
+/// Build a server config from identity + optional client-CA PEM — shared by the
+/// static constructor and every live reload.
+fn build_server_config(
+    identity: ServerIdentity,
+    client_ca_pem: Option<&[u8]>,
+) -> io::Result<Arc<ServerConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("ring provides TLS 1.2 + 1.3");
+    let builder = match client_ca_pem {
+        Some(ca) => {
+            let roots = roots_from_pem(ca)?;
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| io::Error::other(format!("tls: bad client CA: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let config = builder
+        .with_single_cert(identity.certs, identity.key)
+        .map_err(|e| io::Error::other(format!("tls: bad server identity: {e}")))?;
+    Ok(Arc::new(config))
+}
+
+fn mtime(path: &Path) -> io::Result<SystemTime> {
+    std::fs::metadata(path)?.modified()
+}
+
 impl TlsAcceptor {
-    /// Build an acceptor from the server identity. `client_ca_pem` enables
+    /// Build a **static** acceptor from in-memory PEM. `client_ca_pem` enables
     /// mutual TLS: peers must present a certificate chaining to one of the CAs
     /// in the bundle. Without it, any TLS client can connect (transport
     /// encryption only — the embedder must gate trust some other way, e.g. a
-    /// bearer credential).
+    /// bearer credential). No rotation: prefer [`TlsAcceptor::from_paths`] for
+    /// a mounted identity.
     pub fn new(identity: ServerIdentity, client_ca_pem: Option<&[u8]>) -> io::Result<TlsAcceptor> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let builder = ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .expect("ring provides TLS 1.2 + 1.3");
         let client_auth = client_ca_pem.is_some();
-        let builder = match client_ca_pem {
-            Some(ca) => {
-                let roots = roots_from_pem(ca)?;
-                let verifier =
-                    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
-                        .build()
-                        .map_err(|e| io::Error::other(format!("tls: bad client CA: {e}")))?;
-                builder.with_client_cert_verifier(verifier)
-            }
-            None => builder.with_no_client_auth(),
-        };
-        let config = builder
-            .with_single_cert(identity.certs, identity.key)
-            .map_err(|e| io::Error::other(format!("tls: bad server identity: {e}")))?;
         Ok(TlsAcceptor {
-            config: Arc::new(config),
+            config: Mutex::new(build_server_config(identity, client_ca_pem)?),
             client_auth,
+            reload: None,
+        })
+    }
+
+    /// Build a **live** acceptor from PEM file paths: the identity (and client
+    /// CA, when given) is re-read when the files change, so a rotated mounted
+    /// Secret is served without a restart. Whether client certs are REQUIRED is
+    /// fixed by `client_ca`'s presence at build time (the *content* may rotate;
+    /// the auth posture may not). A reload failure keeps the last-good identity.
+    pub fn from_paths(
+        cert: &Path,
+        key: &Path,
+        client_ca: Option<&Path>,
+    ) -> io::Result<TlsAcceptor> {
+        let identity = ServerIdentity::from_pem(&std::fs::read(cert)?, &std::fs::read(key)?)?;
+        let ca_pem = client_ca.map(std::fs::read).transpose()?;
+        let config = build_server_config(identity, ca_pem.as_deref())?;
+        let mtimes = (mtime(cert)?, mtime(key)?, client_ca.map(mtime).transpose()?);
+        Ok(TlsAcceptor {
+            config: Mutex::new(config),
+            client_auth: client_ca.is_some(),
+            reload: Some(ReloadSource {
+                cert: cert.to_path_buf(),
+                key: key.to_path_buf(),
+                client_ca: client_ca.map(Path::to_path_buf),
+                state: Mutex::new(ReloadState {
+                    checked_at: Instant::now(),
+                    mtimes,
+                    generation: 0,
+                    last_error: None,
+                }),
+            }),
         })
     }
 
@@ -318,12 +399,93 @@ impl TlsAcceptor {
         self.client_auth
     }
 
+    /// How many live reloads have been applied (0 = the initial identity; a
+    /// static acceptor never advances). For status surfaces / tests.
+    pub fn reload_generation(&self) -> u64 {
+        self.reload.as_ref().map_or(0, |r| {
+            r.state.lock().unwrap_or_else(|e| e.into_inner()).generation
+        })
+    }
+
+    /// The most recent reload failure, if the CURRENT state is degraded (a
+    /// successful reload clears it). The acceptor keeps serving the last-good
+    /// identity through failures — this is how the embedder can see them.
+    pub fn last_reload_error(&self) -> Option<String> {
+        self.reload.as_ref().and_then(|r| {
+            r.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_error
+                .clone()
+        })
+    }
+
+    /// Force an immediate file check (bypasses the throttle) — for tests and
+    /// an explicit reload signal. No-op on a static acceptor.
+    pub fn force_reload_check(&self) {
+        self.maybe_reload(Duration::ZERO);
+    }
+
+    /// Throttled check-and-swap: re-stat the identity files at most once per
+    /// `ttl`; on an mtime change, re-read + rebuild and swap the config in.
+    /// Every failure (stat, read, parse) records `last_error` and KEEPS the
+    /// last-good config — a rotation must never take the listener down.
+    fn maybe_reload(&self, ttl: Duration) {
+        let Some(src) = &self.reload else { return };
+        let mut st = src.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.checked_at.elapsed() < ttl {
+            return;
+        }
+        st.checked_at = Instant::now();
+        let stat = (|| -> io::Result<_> {
+            Ok((
+                mtime(&src.cert)?,
+                mtime(&src.key)?,
+                src.client_ca.as_deref().map(mtime).transpose()?,
+            ))
+        })();
+        let mtimes = match stat {
+            Ok(m) => m,
+            Err(e) => {
+                st.last_error = Some(format!("stat: {e}"));
+                return;
+            }
+        };
+        if mtimes == st.mtimes {
+            return;
+        }
+        let rebuilt = (|| -> io::Result<Arc<ServerConfig>> {
+            let identity =
+                ServerIdentity::from_pem(&std::fs::read(&src.cert)?, &std::fs::read(&src.key)?)?;
+            let ca_pem = src.client_ca.as_deref().map(std::fs::read).transpose()?;
+            build_server_config(identity, ca_pem.as_deref())
+        })();
+        match rebuilt {
+            Ok(config) => {
+                *self.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+                st.mtimes = mtimes;
+                st.generation += 1;
+                st.last_error = None;
+            }
+            Err(e) => {
+                st.last_error = Some(format!("reload: {e}"));
+            }
+        }
+    }
+
     /// Wrap an accepted TCP connection in server-side TLS, driving the
     /// handshake to completion so failures (including a missing/invalid client
-    /// certificate under mTLS) surface HERE, not on the first read.
+    /// certificate under mTLS) surface HERE, not on the first read. A live
+    /// acceptor first applies any pending identity rotation (throttled).
     pub fn accept(&self, tcp: TcpStream) -> io::Result<ServerTlsStream> {
-        let conn = ServerConnection::new(self.config.clone())
-            .map_err(|e| io::Error::other(format!("tls: {e}")))?;
+        self.maybe_reload(RELOAD_CHECK_TTL);
+        let config = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let conn =
+            ServerConnection::new(config).map_err(|e| io::Error::other(format!("tls: {e}")))?;
         let mut stream = StreamOwned::new(conn, tcp);
         while stream.conn.is_handshaking() {
             stream

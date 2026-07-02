@@ -1256,11 +1256,15 @@ pub struct HttpsServeConfig {
     pub bind: String,
     /// TLS vs plaintext (plaintext is loopback-only, enforced at config).
     pub tls: bool,
-    /// Server cert / key PEM bytes (empty when `!tls`).
-    pub cert_pem: Vec<u8>,
-    pub key_pem: Vec<u8>,
-    /// Client-CA PEM enabling mutual TLS (the primary `Management` identity).
-    pub client_ca_pem: Option<Vec<u8>>,
+    /// Server cert / key PEM **file paths** (`--serve-cert`/`--serve-key`;
+    /// `None` when `!tls`). Paths, not bytes, so the acceptor is LIVE: a
+    /// mounted-Secret rotation (cert-manager renewal) is re-read on accept and
+    /// served with no restart ([`crate::net::tls::TlsAcceptor::from_paths`]).
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    /// Client-CA PEM **file path** enabling mutual TLS (the primary
+    /// `Management` identity) — also live-reloaded on rotation.
+    pub client_ca_path: Option<String>,
     /// Resolved bearer token (the alternative auth). `None` when unset.
     pub bearer: Option<String>,
 }
@@ -1319,13 +1323,28 @@ pub fn serve_https(
 ) -> std::io::Result<ServeHandle> {
     let listener = ::mcp::http_server::bind_tcp(&tls_cfg.bind)?;
     let acceptor = if tls_cfg.tls {
-        let id = crate::net::tls::ServerIdentity::from_pem(&tls_cfg.cert_pem, &tls_cfg.key_pem)?;
-        let acc = crate::net::tls::TlsAcceptor::new(id, tls_cfg.client_ca_pem.as_deref())?;
+        // LIVE acceptor (paths, not bytes): a cert-manager renewal that swaps
+        // the mounted PEM files is re-read on accept and served with no
+        // restart; a bad intermediate write degrades to last-good.
+        let (cert, key) = match (&tls_cfg.cert_path, &tls_cfg.key_path) {
+            (Some(c), Some(k)) => (c, k),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "https serve target without --serve-cert/--serve-key (config validation should have refused this)",
+                ));
+            }
+        };
+        let acc = crate::net::tls::TlsAcceptor::from_paths(
+            std::path::Path::new(cert),
+            std::path::Path::new(key),
+            tls_cfg.client_ca_path.as_deref().map(std::path::Path::new),
+        )?;
         ::mcp::http_server::HttpAcceptor::Tls(acc)
     } else {
         ::mcp::http_server::HttpAcceptor::Plain
     };
-    let mtls = tls_cfg.client_ca_pem.is_some();
+    let mtls = tls_cfg.client_ca_path.is_some();
     log.info(
         "mcp.serving",
         json!({

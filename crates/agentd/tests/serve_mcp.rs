@@ -401,9 +401,13 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
         r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
     ));
 
-    // The run drains (~5-7s) → its resource changed → we are pushed an update.
+    // The run drains (~5-7s from the `hang` mock + kill ladder) → its resource
+    // changed → we are pushed an update. The deadline is generous (45s) because
+    // the whole e2e suite runs in parallel on ~2 cores in CI, so the drain +
+    // push can be CPU-starved well past 20s under load — still a fast failure on
+    // a genuine hang, not a scheduler lottery (matches the warm-session fix).
     assert!(
-        recv_resource_updated(&rx, &uri, Instant::now() + Duration::from_secs(20)),
+        recv_resource_updated(&rx, &uri, Instant::now() + Duration::from_secs(45)),
         "expected a pushed notifications/resources/updated for {uri}"
     );
 

@@ -5,6 +5,55 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.1.0 — real A2A interoperability + MCP server hardening
+
+A compliance-review release: a deep audit of the A2A, MCP, and control/management
+surfaces found the control plane and the MCP client sound, and the A2A binding
+object-correct but not interoperable. This makes A2A genuinely conformant and
+hardens the served MCP endpoint. `contract_version` stays 2.0.
+
+### Changed — A2A wire (now the A2A spec §9 JSON-RPC binding, verbatim)
+
+Verified against the current A2A spec + `a2a.proto`. agentd interoperates with a
+conformant, non-agentd A2A peer in both directions now.
+
+- **Method names are the spec's bare PascalCase** (`SendMessage`, `GetTask`,
+  `CancelTask`, `ListTasks`, `SendStreamingMessage`, `SubscribeToTask`). The
+  server accepts BOTH these and the legacy `a2a.`-prefixed spelling (backward
+  compatible); agentd's own client now SENDS the bare names. The operator-admin
+  methods keep their `a2a.` prefix (they are agentd extensions, not A2A).
+  *Upgrade ordering:* servers accept both, so upgrade servers before clients.
+- **`SendMessage`** returns the `SendMessageResponse` oneof envelope
+  `{"task": <Task>}` (was a bare Task); GetTask/CancelTask stay bare Task.
+- **`returnImmediately` defaults to `false` (blocking)** per the spec — a
+  config-less `SendMessage` blocks to a terminal Task; pass `true` for the async
+  WORKING Task. (Behavior change for an external caller that omitted the config
+  and expected async; agentd's own client uses streaming and is unaffected.)
+- **`CancelTask` on a terminal task** → `UnsupportedOperationError` (-32004),
+  not a Task read.
+- **The non-spec `final` flag is removed** from status frames — termination is
+  the terminal task state + stream close (spec §3.5.2), on server and client.
+
+Discovery stays config-based (`--a2a-peer`); push-notification config + the
+extended AgentCard remain documented omissions.
+
+### Changed — MCP Streamable-HTTP server hardening
+
+- **`Origin` validation** (a Streamable-HTTP spec MUST): a request whose `Origin`
+  header is present and not loopback is rejected `403` — the DNS-rebinding
+  defense. A non-browser caller (no `Origin`) is unaffected; this closes the
+  dev-loopback `AllowAll` exposure.
+- **`Mcp-Session-Id`** is now a per-`initialize` unique id instead of the constant
+  `srv` (a correlation handle, not a credential — no new dependency).
+
+### Fixed
+
+- `agent://capabilities` no longer advertises a removed `exec` tool or a
+  nonexistent isolation block; `agent://intelligence`'s redaction wording is
+  precise (host:port + transport, never the path or a credential).
+- The agentd.dev landing page + site nav updated to the HTTPS/workflows/A2A
+  reality (it still described the pre-pivot v1 runtime).
+
 ## v2.0.0 — the HTTPS-everywhere runtime, agent-authored workflows, and CEL
 
 A **breaking** major: every transport is now HTTP(S), the last local-execution

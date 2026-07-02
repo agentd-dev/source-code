@@ -1,10 +1,17 @@
 # RFC 0020: A2A interoperability over vsock — agentd as a first-class agent in the mesh
 
-> **⚠ SUPERSEDED — transport (target-vision pivot, 2026-07-02).** The unix/vsock
-> transport this RFC specifies is replaced by **HTTPS** (mTLS/bearer auth; loopback
-> `http://` for dev); operator control is unified into the `a2a.*` method family. The
-> contracts (methods/resources/semantics) still hold — only the transport does not.
-> See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+> **⚠ SUPERSEDED — transport + wire (target-vision pivot 2026-07-02; A2A-conformance 2026-07-02).**
+> The unix/vsock transport this RFC specifies is replaced by **HTTPS+SSE**
+> (mTLS/bearer auth; loopback `http://` for dev), served DIRECTLY — there is no
+> HTTP↔vsock gateway. Operator control is unified into the `a2a.*` admin method
+> family. The A2A protocol binding is now the **A2A spec §9 JSON-RPC binding
+> verbatim**: bare PascalCase method names (`SendMessage`, `GetTask`, … — the
+> `a2a.`-prefixed spelling is still accepted on input), the `SendMessageResponse`
+> `{task}` envelope, `returnImmediately` defaulting to blocking, `CancelTask` of a
+> terminal task → `UnsupportedOperationError`, and no non-spec `final` flag
+> (termination is terminal-state + stream close). The AUTHORITATIVE description is
+> the `crates/agentd/src/mcp/a2a.rs` module doc; this RFC's method-naming/streaming
+> prose is historical. See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
 
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok

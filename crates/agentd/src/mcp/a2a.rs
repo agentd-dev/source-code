@@ -1,44 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A2A v1.0 unary method surface, served over the existing self-MCP listener.
-//! RFC 0020. [feature: a2a]
+//! A2A (Agent2Agent) v1.0 method surface, served as REAL A2A over the self-MCP
+//! HTTP(S) listener. [feature: a2a]
 //!
 //! A2A (Agent2Agent, Linux-Foundation) is the standardized agent↔agent wire;
 //! agentd is already task-shaped (a served run *is* a Task), so this module is a
-//! thin **binding**, not a new engine: it re-frames A2A JSON-RPC `a2a.<Method>`
-//! calls onto the same served-spawn machinery [`crate::mcp::server`] already runs
-//! for `subagent.spawn` (the async path) and reads them back from the same
-//! `sessions` registry. The heavy A2A network machinery — HTTP, SSE, OAuth,
-//! webhooks, durable `ListTasks` history — lives in the on-node gateway (RFC 0020
-//! §2/§7); agentd carries none of it.
+//! thin **binding**, not a new engine: it re-frames A2A JSON-RPC calls onto the
+//! same served-spawn machinery [`crate::mcp::server`] already runs for
+//! `subagent.spawn` (the async path) and reads them back from the same `sessions`
+//! registry.
 //!
-//! **Trust:** the A2A surface is the *external agent* surface and is served only
-//! to a [`PeerOrigin::Management`](crate::mcp::server::PeerOrigin) peer (the
-//! trusted vsock/unix management transport, RFC 0015 §3.3) — the gateway is the
-//! PEP that already authenticated the client. A `Stdio` peer (a spawned subagent)
-//! gets `-32601`.
+//! **Wire = the A2A spec JSON-RPC binding (spec §9).** The method names are the
+//! spec's bare PascalCase — `SendMessage`, `SendStreamingMessage`, `GetTask`,
+//! `CancelTask`, `ListTasks`, `SubscribeToTask` — so a conformant, non-agentd A2A
+//! peer interoperates directly. agentd ALSO accepts each with a legacy `a2a.`
+//! prefix (its pre-2.1 clients + the operator-admin family below), and its own
+//! client sends the bare names; so both directions are conformant while old
+//! deployments keep working. Object shapes are the A2A proto's proto3-JSON
+//! (`TASK_STATE_*`, `ROLE_USER`, camelCase, the `{text}` Part oneof); `SendMessage`
+//! returns the `SendMessageResponse` oneof `{"task": <Task>}`, GetTask/CancelTask
+//! return a bare Task, ListTasks returns `{tasks:[…]}`.
 //!
-//! **Wire convention:** methods are `a2a.SendMessage` / `a2a.GetTask` /
-//! `a2a.CancelTask` / `a2a.ListTasks` (the `a2a.<Method>` dotted convention over
-//! the NDJSON JSON-RPC codec, RFC 0004), plus the streaming pair
-//! `a2a.SendStreamingMessage` / `a2a.SubscribeToTask` (A2A-2). The agentctl gateway
-//! MUST emit exactly these method names when bridging HTTP↔vsock.
+//! **Streaming (spec §3.5).** A `SendStreamingMessage`/`SubscribeToTask` reply is a
+//! `text/event-stream` of `StreamResponse` frames
+//! (`{"jsonrpc":"2.0","id":<id>,"result":{"statusUpdate"|"artifactUpdate":…}}`): the
+//! intermediate frames are written to the connection writer and the terminal one is
+//! RETURNED (the HTTP transport writes it and closes the stream). Termination is by
+//! the terminal task STATE + stream close — agentd emits no non-spec `final` flag.
+//! agentd does status-level streaming only: the distillate is one `artifactUpdate`
+//! (`lastChunk:true`) on a completed run (RFC 0009 §8). Discovery is config-based
+//! (`--a2a-peer`), not an AgentCard fetch; push-notification config + the extended
+//! AgentCard are not served (`-32601`) — documented omissions.
 //!
-//! **Streaming convention (agentd↔gateway):** A2A v1.0 status-level streaming maps
-//! onto the NDJSON JSON-RPC reply channel as a *multi-frame response*: for one
-//! streaming request `id`, agentd emits SEVERAL frames
-//! `{"jsonrpc":"2.0","id":<id>,"result":<StreamResponse>}` — the intermediate ones
-//! written directly to the connection writer, the FINAL one returned as the
-//! dispatch [`Response`] (which `handle_conn` writes as the last frame). The final
-//! frame is the one whose `statusUpdate.final == true`. The gateway re-frames this
-//! sequence to SSE (RFC 0020): each `result` becomes one `StreamResponse` SSE event
-//! and the stream closes on the `final` status. **Caveat:** these intermediate
-//! frames all share the request `id`, so the gateway MUST consume an `a2a.Send`
-//! `StreamingMessage`/`SubscribeToTask` reply as a STREAM (read frames until
-//! `statusUpdate.final == true`), NOT as a single id-correlated unary reply — the
-//! same-`id` frames would otherwise look like duplicate responses. agentd does
-//! **status-level** streaming only: the distillate artifact is delivered ONCE, in a
-//! single `artifactUpdate` frame on a completed run (the distillate-only invariant,
-//! RFC 0009 §8) — there is no partial-artifact streaming.
+//! **Trust:** the A2A surface is served only to a
+//! [`PeerOrigin::Management`](crate::mcp::server::PeerOrigin) peer (verified mTLS
+//! cert or constant-time bearer — never the transport). A `Stdio` peer gets
+//! `-32601`. The operator-admin methods (`a2a.Drain`/`Cancel`/…) share this gate
+//! but keep the `a2a.` prefix — they are agentd extensions, not A2A protocol.
 
 use crate::json::{self, Id, Request, Response};
 use crate::mcp::server::{ServeCtx, SharedWriter};
@@ -48,8 +45,40 @@ use serde_json::{Value, json};
 // ── A2A-specific JSON-RPC error codes (RFC 0020 / A2A spec) ──────────────────
 
 /// A2A `TaskNotFound`: a `GetTask`/`CancelTask`/`SubscribeToTask` for an `id` not
-/// in the registry.
+/// in the registry (A2A spec §5.4).
 pub const TASK_NOT_FOUND: i64 = -32001;
+/// A2A `UnsupportedOperation` (A2A spec §5.4): the requested operation is not
+/// supported for the task's current state — e.g. `CancelTask` on a task already
+/// in a terminal state.
+pub const UNSUPPORTED_OPERATION: i64 = -32004;
+
+/// The A2A JSON-RPC protocol method names — the spec §9 binding's bare PascalCase.
+/// agentd also accepts each with a legacy `a2a.` prefix (see [`bare_a2a`]).
+const A2A_METHODS: &[&str] = &[
+    "SendMessage",
+    "SendStreamingMessage",
+    "GetTask",
+    "CancelTask",
+    "ListTasks",
+    "SubscribeToTask",
+];
+
+/// The bare A2A method name — an optional legacy `a2a.` prefix stripped.
+fn bare_a2a(method: &str) -> &str {
+    method.strip_prefix("a2a.").unwrap_or(method)
+}
+
+/// Whether `method` routes to [`dispatch_a2a`]: a bare A2A protocol name, an
+/// `a2a.`-prefixed protocol name, or an `a2a.`-prefixed operator-admin method (the
+/// operator family keeps its prefix — an agentd extension, not A2A protocol).
+pub fn routes_to_a2a(method: &str) -> bool {
+    method.starts_with("a2a.") || A2A_METHODS.contains(&method)
+}
+
+/// Whether `method` is an A2A STREAMING method (its reply is an SSE stream).
+pub fn is_streaming(method: &str) -> bool {
+    matches!(bare_a2a(method), "SendStreamingMessage" | "SubscribeToTask")
+}
 
 // ── A2A object schemas (proto-derived; RFC 0020 §5) ──────────────────────────
 
@@ -124,12 +153,12 @@ impl TaskState {
 // live here (not in the client module) so client and server share ONE A2A wire
 // vocabulary — no duplicated (de)serialization.
 
-/// Build the `params` for an `a2a.SendMessage` request carrying `objective` as a
+/// Build the `params` for a `SendMessage` request carrying `objective` as a
 /// single text `Part` of one `ROLE_USER` message (`message_id` minted by the
 /// caller). The optional `output_contract` rides as a second text part so the
 /// remote agent gets the same delegation contract a local subagent would
 /// (RFC 0009 §spawn-payload). `returnImmediately:true` (the default) → an async
-/// Task the client then polls via `a2a.GetTask`.
+/// Task the client then polls via `GetTask`.
 pub fn send_message_params(
     objective: &str,
     output_contract: Option<&str>,
@@ -148,8 +177,8 @@ pub fn send_message_params(
     })
 }
 
-/// The `id` (task handle) of a `Task` value returned by `a2a.SendMessage` /
-/// `a2a.GetTask`. Empty if absent (a malformed reply the client surfaces as an
+/// The `id` (task handle) of a `Task` value returned by `SendMessage` /
+/// `GetTask`. Empty if absent (a malformed reply the client surfaces as an
 /// error).
 pub fn task_id_of(task: &Value) -> String {
     task.get("id")
@@ -301,18 +330,17 @@ fn snapshot_to_task(handle: &str, state: TaskState, result: Option<&Value>) -> V
 // frame as a serde `Value` (one key set per the oneof), so a frame is exactly
 // `{"jsonrpc":"2.0","id":<id>,"result":<here>}`.
 
-/// A2A `TaskStatusUpdateEvent` → the `statusUpdate` arm of a `StreamResponse`.
-/// `is_final` is the wire `final` flag (renamed — `final` is a Rust keyword): the
-/// gateway closes the SSE stream on the frame whose `final == true`. `contextId` is
-/// always present here (agentd mints it deterministically from the handle), so the
-/// `Option` is only for shape-completeness with the proto.
-fn status_update_frame(task_id: &str, context_id: &str, state: TaskState, is_final: bool) -> Value {
+/// A2A `TaskStatusUpdateEvent` → the `statusUpdate` arm of a `StreamResponse`. The
+/// A2A proto `TaskStatusUpdateEvent` has NO `final` field (a strict proto-JSON
+/// parser rejects unknown fields), so agentd emits none: a stream terminates by
+/// CLOSING once the task reaches a terminal state (A2A spec §3.5.2). agentd writes
+/// the terminal `statusUpdate` as the last frame and closes the connection after it.
+fn status_update_frame(task_id: &str, context_id: &str, state: TaskState) -> Value {
     json!({
         "statusUpdate": {
             "taskId": task_id,
             "contextId": context_id,
             "status": task_status(state),
-            "final": is_final,
         }
     })
 }
@@ -340,10 +368,10 @@ fn artifact_update_frame(task_id: &str, context_id: &str, distillate: &Value) ->
 }
 
 /// Wrap a `StreamResponse` payload as one JSON-RPC reply frame
-/// `{"jsonrpc":"2.0","id":<id>,"result":<stream_response>}` and write it directly
-/// to the connection writer (the agentd↔gateway streaming convention — see the
-/// module doc). Best-effort: a dead peer fails the write and the run still records
-/// its terminal session for a later `GetTask`.
+/// `{"jsonrpc":"2.0","id":<id>,"result":<stream_response>}` and write it to the
+/// connection writer (per-transport: an SSE `data:` event over HTTP). Best-effort:
+/// a dead peer fails the write and the run still records its terminal session for a
+/// later `GetTask`.
 fn write_stream_frame(writer: &SharedWriter, id: &Id, stream_response: Value) {
     let frame = Response::ok(id.clone(), stream_response);
     if let Ok(mut w) = writer.lock() {
@@ -377,17 +405,20 @@ pub fn dispatch_a2a(
     if let Some(resp) = crate::mcp::server::dispatch_operator(method, &req, ctx, log) {
         return resp;
     }
-    match method {
-        "a2a.SendMessage" => send_message(req, ctx, log),
-        "a2a.GetTask" => get_task(req, ctx),
-        "a2a.CancelTask" => cancel_task(req, ctx),
-        "a2a.ListTasks" => list_tasks(req, ctx),
-        // Status-level streaming (A2A-2): emit a multi-frame StreamResponse stream
-        // on `writer`, returning the terminal frame. See the module doc.
-        "a2a.SendStreamingMessage" => send_streaming_message(req, ctx, writer, log),
-        "a2a.SubscribeToTask" => subscribe_to_task(req, ctx, writer),
-        // push-notification-config + GetExtendedAgentCard are gateway-owned
-        // (RFC 0020 §7): agentd does not serve them → method-not-found.
+    // Match the SPEC method name (bare PascalCase), accepting the legacy `a2a.`
+    // prefix too — so a conformant peer's `SendMessage` and an old client's
+    // `SendMessage` both route here.
+    match bare_a2a(method) {
+        "SendMessage" => send_message(req, ctx, log),
+        "GetTask" => get_task(req, ctx),
+        "CancelTask" => cancel_task(req, ctx),
+        "ListTasks" => list_tasks(req, ctx),
+        // Status-level streaming: emit a multi-frame StreamResponse stream on
+        // `writer`, returning the terminal frame. See the module doc.
+        "SendStreamingMessage" => send_streaming_message(req, ctx, writer, log),
+        "SubscribeToTask" => subscribe_to_task(req, ctx, writer),
+        // push-notification-config + the extended AgentCard are not served
+        // (discovery is config-based) → method-not-found.
         _ => Response::err(
             req.id,
             json::METHOD_NOT_FOUND,
@@ -396,7 +427,7 @@ pub fn dispatch_a2a(
     }
 }
 
-/// `a2a.SendMessage` (params: `SendMessageRequest`) → a **Task**. The concatenated
+/// `SendMessage` (params: `SendMessageRequest`) → a **Task**. The concatenated
 /// text parts become the run instruction; the run is spawned via the SAME
 /// served-spawn async machinery `subagent.spawn{async}` uses, returning
 /// immediately with a `TASK_STATE_WORKING` Task whose `id` is the served handle
@@ -411,33 +442,38 @@ fn send_message(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
         return Response::err(
             id,
             json::INVALID_PARAMS,
-            "a2a.SendMessage requires a message with at least one non-empty text part",
+            "SendMessage requires a message with at least one non-empty text part",
         );
     }
-    // returnImmediately defaults to true (async Task); false → block on the sync
-    // served-spawn and return the terminal Task.
+    // A2A `returnImmediately` defaults to FALSE — a config-less SendMessage BLOCKS
+    // until the task reaches a terminal state and returns the terminal Task (A2A
+    // spec §3.1); `true` returns immediately with a WORKING Task the caller polls
+    // via GetTask.
     let return_immediately = params
         .get("configuration")
         .and_then(|c| c.get("returnImmediately"))
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
 
-    if return_immediately {
+    let task = if return_immediately {
+        // A just-dispatched async run is WORKING (already executing on its
+        // background thread); SUBMITTED is the pre-dispatch state.
         match ctx.a2a_spawn_async(&instruction, log) {
-            // A just-dispatched async run is WORKING (it is already executing on
-            // its background thread); SUBMITTED is the pre-dispatch state.
-            Ok(handle) => Response::ok(id, snapshot_to_task(&handle, TaskState::Working, None)),
-            Err(msg) => Response::err(id, json::INTERNAL_ERROR, msg),
+            Ok(handle) => snapshot_to_task(&handle, TaskState::Working, None),
+            Err(msg) => return Response::err(id, json::INTERNAL_ERROR, msg),
         }
     } else {
         // Blocking: map the sync served-spawn's terminal outcome to a Task.
         let (handle, status, result) = ctx.a2a_spawn_sync(&instruction, log);
         let state = terminal_to_state(&status);
-        Response::ok(id, snapshot_to_task(&handle, state, result.as_ref()))
-    }
+        snapshot_to_task(&handle, state, result.as_ref())
+    };
+    // `SendMessage` returns `SendMessageResponse` — a oneof `{task|message}`;
+    // agentd always produces a Task, so the result is `{"task": <Task>}` (proto).
+    Response::ok(id, json!({ "task": task }))
 }
 
-/// `a2a.SendStreamingMessage` (params: `SendMessageRequest`, same shape as
+/// `SendStreamingMessage` (params: `SendMessageRequest`, same shape as
 /// `SendMessage`) → a STREAM of `StreamResponse` frames (status-level; RFC 0020).
 /// The concatenated text parts become the run instruction; the run is then executed
 /// **synchronously** on this connection thread (`supervise_once`), exactly like
@@ -469,7 +505,7 @@ fn send_streaming_message(
         return Response::err(
             id,
             json::INVALID_PARAMS,
-            "a2a.SendStreamingMessage requires a message with at least one non-empty text part",
+            "SendStreamingMessage requires a message with at least one non-empty text part",
         );
     }
     // Run the served-spawn synchronously, streaming the WORKING frame the instant the
@@ -482,7 +518,7 @@ fn send_streaming_message(
         write_stream_frame(
             writer,
             &id,
-            status_update_frame(handle, &context_id, TaskState::Working, false),
+            status_update_frame(handle, &context_id, TaskState::Working),
         );
     });
     let context_id = context
@@ -500,10 +536,10 @@ fn send_streaming_message(
             artifact_update_frame(&handle, &context_id, distillate),
         );
     }
-    Response::ok(id, status_update_frame(&handle, &context_id, state, true))
+    Response::ok(id, status_update_frame(&handle, &context_id, state))
 }
 
-/// `a2a.SubscribeToTask` (params: `{id}`) → a STREAM of `StreamResponse` frames for
+/// `SubscribeToTask` (params: `{id}`) → a STREAM of `StreamResponse` frames for
 /// an EXISTING served run (status-level; RFC 0020). Looks the run up by handle:
 ///
 ///   * unknown → `-32001 TaskNotFound` (a normal error Response; nothing streamed),
@@ -513,9 +549,8 @@ fn send_streaming_message(
 ///     POLL the sessions registry (~`POLL_INTERVAL`) until the run reaches a terminal
 ///     status OR a bounded deadline (the drain timeout); on terminal, write the
 ///     artifact frame (completed-only) directly and RETURN the terminal frame. If the
-///     deadline elapses first, RETURN a non-final-looking-but-`final:true` WORKING
-///     terminal frame is avoided — instead the last observed running state is closed
-///     out as `final:true` so the gateway's SSE stream always terminates.
+///     deadline elapses first, the last observed state is written as the terminal
+///     frame and the stream closes — so the SSE stream always terminates.
 fn subscribe_to_task(req: Request, ctx: &ServeCtx, writer: &SharedWriter) -> Response {
     let id = req.id.clone();
     let task_id = task_id_param(&req);
@@ -537,13 +572,13 @@ fn subscribe_to_task(req: Request, ctx: &ServeCtx, writer: &SharedWriter) -> Res
                 artifact_update_frame(&task_id, &context_id, distillate),
             );
         }
-        return Response::ok(id, status_update_frame(&task_id, &context_id, state, true));
+        return Response::ok(id, status_update_frame(&task_id, &context_id, state));
     }
     // Still running → stream WORKING, then poll until terminal or the deadline.
     write_stream_frame(
         writer,
         &id,
-        status_update_frame(&task_id, &context_id, TaskState::Working, false),
+        status_update_frame(&task_id, &context_id, TaskState::Working),
     );
     let (status, result) = ctx.a2a_poll_until_terminal(&task_id);
     let state = terminal_to_state(&status);
@@ -556,10 +591,10 @@ fn subscribe_to_task(req: Request, ctx: &ServeCtx, writer: &SharedWriter) -> Res
             artifact_update_frame(&task_id, &context_id, distillate),
         );
     }
-    Response::ok(id, status_update_frame(&task_id, &context_id, state, true))
+    Response::ok(id, status_update_frame(&task_id, &context_id, state))
 }
 
-/// `a2a.GetTask` (params: `{id, historyLength?}`) → a **Task**. Reads the served
+/// `GetTask` (params: `{id, historyLength?}`) → a **Task**. Reads the served
 /// run by `id` from the registry and projects it: a still-running run is
 /// `TASK_STATE_WORKING`; a terminal run maps via [`terminal_to_state`], and a
 /// terminal *completed* run carries the distillate as the single artifact (the
@@ -576,7 +611,7 @@ fn get_task(req: Request, ctx: &ServeCtx) -> Response {
     }
 }
 
-/// `a2a.CancelTask` (params: `{id}`) → a **Task** in `TASK_STATE_CANCELED`. Wraps
+/// `CancelTask` (params: `{id}`) → a **Task** in `TASK_STATE_CANCELED`. Wraps
 /// the existing served cancel (the `subagent.cancel` path): requests cancellation
 /// of the still-running run by handle (it then drains its subtree via the kill
 /// ladder). An unknown `id` → `-32001`. An already-terminal run is returned in its
@@ -587,14 +622,13 @@ fn cancel_task(req: Request, ctx: &ServeCtx) -> Response {
     match ctx.a2a_cancel(&task_id) {
         // Cancel requested (the run was live): report CANCELED.
         Some(true) => Response::ok(id, snapshot_to_task(&task_id, TaskState::Canceled, None)),
-        // Already-terminal → return its real state (cancel-of-finished is a read).
-        Some(false) => match ctx.a2a_task_snapshot(&task_id) {
-            Some((status, result)) => {
-                let state = state_from_status(&status);
-                Response::ok(id, snapshot_to_task(&task_id, state, result.as_ref()))
-            }
-            None => Response::err(id, TASK_NOT_FOUND, "task not found"),
-        },
+        // Already terminal → A2A `UnsupportedOperationError` (spec §5.4): a task in
+        // a terminal state cannot be canceled.
+        Some(false) => Response::err(
+            id,
+            UNSUPPORTED_OPERATION,
+            "task is in a terminal state and cannot be canceled",
+        ),
         None => Response::err(id, TASK_NOT_FOUND, "task not found"),
     }
 }
@@ -892,6 +926,45 @@ mod tests {
         )
     }
 
+    #[test]
+    fn dispatch_accepts_bare_spec_names_and_the_legacy_prefix() {
+        // Routing: the bare A2A spec names AND the legacy `a2a.` prefix reach the
+        // A2A handler; MCP methods do not; the operator admin family keeps its
+        // prefix (a bare `Drain` is not routed).
+        assert!(routes_to_a2a("SendMessage")); // conformant peer
+        assert!(routes_to_a2a("a2a.SendMessage")); // legacy client
+        assert!(routes_to_a2a("a2a.Drain")); // operator admin (prefixed)
+        assert!(!routes_to_a2a("tools/call")); // an MCP method
+        assert!(!routes_to_a2a("Drain")); // bare admin is NOT routed
+        assert!(is_streaming("SendStreamingMessage"));
+        assert!(is_streaming("a2a.SubscribeToTask"));
+        assert!(!is_streaming("SendMessage"));
+
+        // End to end: a bare `GetTask` for an unknown id returns the A2A
+        // TaskNotFound (-32001), proving the BARE name actually dispatched (not a
+        // -32601 method-not-found) — i.e. a conformant peer interoperates.
+        let ctx = ctx();
+        let (w, _r) = readable_writer();
+        for m in ["GetTask", "a2a.GetTask"] {
+            let resp = dispatch_a2a(m, req(m, Some(json!({"id": "nope"}))), &ctx, &w, &log());
+            assert_eq!(
+                resp.error.expect("err").code,
+                TASK_NOT_FOUND,
+                "{m} routed to the A2A handler"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_task_of_a_terminal_task_is_unsupported_operation() {
+        // A2A spec §5.4: canceling a task already in a terminal state is
+        // `UnsupportedOperationError` (-32004), not a Task read.
+        let ctx = ctx();
+        ctx.a2a_seed_done("served.0", "completed", json!("done"));
+        let r = cancel_task(req("CancelTask", Some(json!({"id": "served.0"}))), &ctx);
+        assert_eq!(r.error.expect("err").code, UNSUPPORTED_OPERATION);
+    }
+
     /// Read one NDJSON frame off the peer end and parse it as JSON.
     fn read_frame(reader: &mut BufReader<UnixStream>) -> Value {
         let mut line = String::new();
@@ -921,7 +994,6 @@ mod tests {
         // Frame 1 (written to the writer): WORKING, not final.
         let f1 = stream_result(&mut reader);
         assert_eq!(f1["statusUpdate"]["status"]["state"], "TASK_STATE_WORKING");
-        assert_eq!(f1["statusUpdate"]["final"], false);
         let task_id = f1["statusUpdate"]["taskId"].as_str().unwrap().to_string();
         assert_eq!(f1["statusUpdate"]["contextId"], format!("ctx-{task_id}"));
 
@@ -931,7 +1003,6 @@ mod tests {
             final_sr["statusUpdate"]["status"]["state"],
             "TASK_STATE_FAILED"
         );
-        assert_eq!(final_sr["statusUpdate"]["final"], true);
         assert_eq!(final_sr["statusUpdate"]["taskId"], task_id);
         assert!(
             final_sr.get("artifactUpdate").is_none(),
@@ -988,7 +1059,6 @@ mod tests {
             final_sr["statusUpdate"]["status"]["state"],
             "TASK_STATE_COMPLETED"
         );
-        assert_eq!(final_sr["statusUpdate"]["final"], true);
     }
 
     #[test]
@@ -1012,7 +1082,6 @@ mod tests {
                 final_sr["statusUpdate"]["status"]["state"], want_state,
                 "{status}"
             );
-            assert_eq!(final_sr["statusUpdate"]["final"], true);
             // No artifact frame was written: the only readable line is... none. We
             // can't block on read here (it would hang), so instead assert the RETURN
             // carries no artifact and trust the handler only writes the artifact on

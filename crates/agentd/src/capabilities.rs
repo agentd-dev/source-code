@@ -410,13 +410,16 @@ fn a2a_surface() -> Value {
             // Status-level streaming: SendStreamingMessage + SubscribeToTask emit a
             // StreamResponse frame stream (distillate-only artifact on completion).
             "streaming": true,
+            // The A2A spec §9 JSON-RPC binding names (bare PascalCase) — a
+            // conformant peer calls these directly; the legacy `a2a.`-prefixed
+            // spelling is still accepted on input for backward compatibility.
             "methods": [
-                "a2a.SendMessage",
-                "a2a.GetTask",
-                "a2a.CancelTask",
-                "a2a.ListTasks",
-                "a2a.SendStreamingMessage",
-                "a2a.SubscribeToTask",
+                "SendMessage",
+                "GetTask",
+                "CancelTask",
+                "ListTasks",
+                "SendStreamingMessage",
+                "SubscribeToTask",
             ],
         })
     } else {
@@ -656,12 +659,12 @@ mod tests {
             assert_eq!(
                 a2a["methods"],
                 json!([
-                    "a2a.SendMessage",
-                    "a2a.GetTask",
-                    "a2a.CancelTask",
-                    "a2a.ListTasks",
-                    "a2a.SendStreamingMessage",
-                    "a2a.SubscribeToTask"
+                    "SendMessage",
+                    "GetTask",
+                    "CancelTask",
+                    "ListTasks",
+                    "SendStreamingMessage",
+                    "SubscribeToTask"
                 ])
             );
         } else {

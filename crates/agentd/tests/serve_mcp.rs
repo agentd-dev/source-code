@@ -810,26 +810,31 @@ fn send_streaming_message_streams_sse_frames_over_http() {
         "streaming method upgrades to SSE; head:\n{head}"
     );
 
-    // Events: WORKING (final:false) → artifact (distillate) → final:true.
+    // Events: WORKING → artifact (distillate) → terminal COMPLETED, then close.
+    // Termination is by the terminal task state + stream close (A2A spec §3.5.2 —
+    // agentd emits no non-spec `final` flag).
     let mut data_events: Vec<String> = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break; // server closed after the final frame
+            break; // server closed the stream after the terminal frame
         }
         let line = line.trim_end();
         if let Some(data) = line.strip_prefix("data: ") {
             data_events.push(data.to_string());
-            if data.contains("\"final\":true") {
+            if data.contains("TASK_STATE_COMPLETED") {
                 break;
             }
         }
     }
+    // No `final` flag on the wire (spec-conformant).
     assert!(
-        data_events
-            .iter()
-            .any(|d| d.contains("TASK_STATE_WORKING") && d.contains("\"final\":false")),
+        !data_events.iter().any(|d| d.contains("\"final\"")),
+        "no non-spec `final` flag is emitted: {data_events:?}"
+    );
+    assert!(
+        data_events.iter().any(|d| d.contains("TASK_STATE_WORKING")),
         "a WORKING frame streamed before the terminal one: {data_events:?}"
     );
     assert!(
@@ -841,8 +846,8 @@ fn send_streaming_message_streams_sse_frames_over_http() {
     assert!(
         data_events
             .last()
-            .is_some_and(|d| d.contains("TASK_STATE_COMPLETED") && d.contains("\"final\":true")),
-        "the stream ends on the final COMPLETED frame: {data_events:?}"
+            .is_some_and(|d| d.contains("TASK_STATE_COMPLETED")),
+        "the stream ends on the terminal COMPLETED frame: {data_events:?}"
     );
 
     sigterm(server.id());

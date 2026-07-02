@@ -1217,7 +1217,7 @@ impl ::mcp::server::Handler for ServeHandler {
     /// to `text/event-stream` instead of a unary reply.
     #[cfg(feature = "a2a")]
     fn streams(&self, method: &str) -> bool {
-        matches!(method, "a2a.SendStreamingMessage" | "a2a.SubscribeToTask")
+        crate::mcp::a2a::is_streaming(method)
     }
 
     fn dispatch(
@@ -1440,7 +1440,7 @@ fn dispatch(
         // its `a2a.*` call falls through to the `-32601` catch-all below. Gated on
         // the `a2a` feature: without it, `a2a.*` is just an unknown method.
         #[cfg(feature = "a2a")]
-        m if m.starts_with("a2a.") && origin == PeerOrigin::Management => {
+        m if crate::mcp::a2a::routes_to_a2a(m) && origin == PeerOrigin::Management => {
             let method = m.to_string(); // own it so `req` can move into the handler
             // `writer` is threaded in so the streaming handlers
             // (`a2a.SendStreamingMessage`/`a2a.SubscribeToTask`) can write their
@@ -1672,7 +1672,7 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
             // on every origin. The run id is fixed at startup, so the uri never 404s.
             "uri": "agent://capabilities",
             "name": "capabilities",
-            "description": "This agentd's self-description: identity, the declared capability surface (intelligence transport, MCP servers, exec, limits, isolation), and live daemon counters.",
+            "description": "This agentd's self-description: identity, the compiled build features, the declared capability surface (intelligence transport, MCP servers, limits, auth), and live daemon counters.",
             "mimeType": "application/json"
         }),
         json!({
@@ -1709,7 +1709,7 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
         list.push(json!({
             "uri": crate::agentd_uri::INTELLIGENCE_URI,
             "name": "intelligence",
-            "description": "The intelligence-endpoint health view: the ordered endpoint list (transport + index, never the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, and the all-down flag. Subscribable — pushed on breaker / active / all-down transitions.",
+            "description": "The intelligence-endpoint health view: the ordered endpoint list (transport + host:port + index, never the path or any credential), which is active, each one's breaker state / EWMA latency / error rate, and the all-down flag. Subscribable — pushed on breaker / active / all-down transitions.",
             "mimeType": "application/json"
         }));
         // agentd://config/effective — the live, redacted reloadable-config view
@@ -5090,17 +5090,17 @@ mod tests {
         }
 
         #[test]
-        fn send_message_with_a_text_part_returns_a_working_task() {
-            // returnImmediately defaults true → an async Task with an id + a
-            // non-terminal (WORKING) state. (This DOES launch a background run; the
-            // mock-llm/mock-mcp child fails fast under the test config, but the
-            // SendMessage reply is synchronous + independent of the run outcome.)
+        fn send_message_return_immediately_wraps_a_working_task() {
+            // `returnImmediately:true` → an async WORKING Task, wrapped in the
+            // SendMessageResponse `{task}` envelope (A2A proto). Launches a
+            // background run; the reply is synchronous + independent of the outcome.
             let r = dispatch(
                 req(
-                    "a2a.SendMessage",
+                    "SendMessage", // the bare A2A spec method name
                     Some(json!({
                         "message": {"messageId": "m1", "role": "ROLE_USER",
-                                    "parts": [{"text": "summarize the doc"}]}
+                                    "parts": [{"text": "summarize the doc"}]},
+                        "configuration": {"returnImmediately": true}
                     })),
                 ),
                 &ctx(),
@@ -5109,13 +5109,42 @@ mod tests {
                 0,
                 &log(),
             );
-            let task = r.result.expect("SendMessage → a Task");
+            let sr = r.result.expect("SendMessage → SendMessageResponse");
+            let task = &sr["task"];
             assert!(
                 task["id"].as_str().unwrap().starts_with("served."),
-                "task id is the served handle: {task}"
+                "SendMessageResponse.task carries the served handle: {sr}"
             );
             assert_eq!(task["status"]["state"], "TASK_STATE_WORKING");
             assert!(task["contextId"].as_str().is_some(), "contextId minted");
+        }
+
+        #[test]
+        fn send_message_defaults_to_blocking_and_wraps_a_terminal_task() {
+            // A config-less SendMessage BLOCKS (A2A default) → the sync served-spawn
+            // runs to a terminal state (fails fast under the test config), and the
+            // result is the `{task}` envelope carrying a TERMINAL state.
+            let r = dispatch(
+                req(
+                    "SendMessage",
+                    Some(json!({
+                        "message": {"role": "ROLE_USER", "parts": [{"text": "do it"}]}
+                    })),
+                ),
+                &ctx(),
+                PeerOrigin::Management,
+                &writer(),
+                0,
+                &log(),
+            );
+            let sr = r.result.expect("SendMessage → SendMessageResponse");
+            let state = sr["task"]["status"]["state"].as_str().unwrap();
+            assert!(
+                state.starts_with("TASK_STATE_")
+                    && state != "TASK_STATE_WORKING"
+                    && state != "TASK_STATE_SUBMITTED",
+                "a blocking SendMessage returns a terminal task, got {state}"
+            );
         }
 
         #[test]
@@ -5289,7 +5318,6 @@ mod tests {
             );
             // The returned frame is the FINAL statusUpdate (terminal, final:true).
             let final_sr = r.result.expect("final frame");
-            assert_eq!(final_sr["statusUpdate"]["final"], true);
             assert!(
                 final_sr["statusUpdate"]["status"]["state"]
                     .as_str()
@@ -5306,7 +5334,6 @@ mod tests {
                 f1["result"]["statusUpdate"]["status"]["state"],
                 "TASK_STATE_WORKING"
             );
-            assert_eq!(f1["result"]["statusUpdate"]["final"], false);
         }
 
         #[test]

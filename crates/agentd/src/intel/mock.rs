@@ -39,9 +39,15 @@ pub fn run(addr_file: &str, script: &str) -> i32 {
         eprintln!("mock-llm: write {addr_file}: {e}");
         return crate::exit::GENERIC;
     }
-    // One request per connection (the intel client uses Connection: close).
+    // One request per connection (the intel client uses Connection: close) —
+    // handled on its OWN thread, so a `slow`/`hang` script sleeps only its own
+    // request. A sequential accept loop serialized every caller behind the
+    // slowest in-flight one, which coupled concurrent tests' timing (the warm-
+    // session flake) and would make two runs sharing one mock queue behind a
+    // 12s hang.
     for stream in listener.incoming().flatten() {
-        handle(stream, script);
+        let script = script.to_string();
+        std::thread::spawn(move || handle(stream, &script));
     }
     0
 }

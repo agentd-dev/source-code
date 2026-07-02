@@ -459,7 +459,10 @@ fn a_warm_session_runs_a_turn_per_send() {
         .expect("handle")
         .to_string();
 
-    let t1 = poll_warm_turns(&peer, &handle, 1, Instant::now() + Duration::from_secs(15));
+    // Generous: the cold chain (served spawn → child → LLM turn) is <1s idle,
+    // but CI runs the whole suite in parallel on two cores — the old 15s deadline
+    // was the flake.
+    let t1 = poll_warm_turns(&peer, &handle, 1, Instant::now() + Duration::from_secs(45));
     assert!(t1 >= 1, "the warm session runs turn 1 from the instruction");
 
     // send another message → a SECOND turn over the same live session.
@@ -478,7 +481,7 @@ fn a_warm_session_runs_a_turn_per_send() {
         "send reports the awaited turn: {sent}"
     );
 
-    let t2 = poll_warm_turns(&peer, &handle, 2, Instant::now() + Duration::from_secs(15));
+    let t2 = poll_warm_turns(&peer, &handle, 2, Instant::now() + Duration::from_secs(45));
     assert!(
         t2 >= 2,
         "the SAME session ran a second turn from the injected message"

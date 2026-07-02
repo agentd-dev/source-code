@@ -42,8 +42,8 @@ agentd 0.1.0
 # one-shot run: instruction + one LLM endpoint + one MCP server, then exit
 $ ./target/release/agentd \
     --instruction "Read /data/report.md and write a 3-bullet summary to /data/summary.md" \
-    --intelligence unix:/run/intel.sock \
-    --mcp "fs=mcp-server-fs --root /data"
+    --intelligence https://gw.example/v1 \
+    --mcp fs=https://mcp-fs.internal/mcp
 ```
 
 stdout carries the agentd's result; stderr carries JSON-lines telemetry; the exit
@@ -54,14 +54,14 @@ LLM round-trip. See [docs/getting-started.md](docs/getting-started.md).
 
 ```console
 # once (default): run to a terminal status, then exit — Job / CLI shape
-$ agentd --instruction "..." --intelligence unix:/run/intel.sock --mode once
+$ agentd --instruction "..." --intelligence https://gw.example/v1 --mode once
 
 # loop: re-enter on a cadence until a bound or a drain signal
-$ agentd --instruction "..." --intelligence unix:/run/intel.sock \
+$ agentd --instruction "..." --intelligence https://gw.example/v1 \
     --mode loop --interval 5m --deadline 24h
 
 # reactive: idle, wake on MCP resource changes (requires >=1 --subscribe)
-$ agentd --instruction "..." --intelligence unix:/run/intel.sock \
+$ agentd --instruction "..." --intelligence https://gw.example/v1 \
     --mode reactive --subscribe "file:///data/inbox"
 ```
 
@@ -73,10 +73,13 @@ prefer an external scheduler firing `--mode once`.)
 agentd is **implemented and shipped.** Config parse + validate, exit codes,
 JSON-lines logging, signal handling, the supervisor reactor, the MCP client, the
 intelligence client, the agentic loop, all four run modes, the reactive router,
-subagents (sync + async/detach), and the served self-MCP all run today. The
-default build holds a 3-dependency minimalism moat; `tls`/`vsock`/`serve-mcp`/
-`cron`/`metrics`/`otel` are feature-gated. See
-**[docs/design/PLAN.md](docs/design/PLAN.md)**.
+subagents (sync + async/detach), and the served self-MCP all run today. Every
+network surface is HTTPS (intelligence, the MCP client, the served self-MCP, A2A,
+and operator control — mTLS/bearer auth, loopback `http://` for dev); agentd links
+no unix/vsock transport. Agent-authored cyclic **run-graphs** ship under
+`--features run-graph`. The default build holds a 3-dependency minimalism moat;
+`serve-https`/`a2a`/`cron`/`metrics`/`otel`/`cluster`/`run-graph` are feature-gated.
+See **[docs/design/00-target-vision-pivot.md](docs/design/00-target-vision-pivot.md)**.
 
 ## Links
 

@@ -51,28 +51,27 @@ fn records(h: &Harness) -> &'static [Value] {
 fn record_client_requests(h: &Harness) -> Vec<Value> {
     let tmp = h.tempdir();
     let rec = tmp.path().join("rec.jsonl");
-    let sock = tmp.path().join("confmcp.sock");
+    let addr_file = tmp.path().join("confmcp.addr");
     let uri = "file:///conf-watch.json";
 
-    // Launch confmcp as a Streamable HTTP MCP server on a unix socket; agentd
-    // connects to it (v2.0.0 — no stdio spawn).
+    // Launch confmcp as a Streamable HTTP MCP server on loopback TCP (announcing
+    // through the addr-file); agentd connects to it over http://<addr>.
     let mut confmcp = std::process::Command::new(h.confmcp())
-        .arg(&sock)
+        .arg(&addr_file)
         .arg(&rec)
         .arg(uri)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn confmcp");
-    let sock_deadline = Instant::now() + Duration::from_secs(5);
-    while !sock.exists() {
-        if Instant::now() >= sock_deadline {
-            break;
-        }
+    let addr_deadline = Instant::now() + Duration::from_secs(5);
+    while !addr_file.exists() {
+        assert!(Instant::now() < addr_deadline, "confmcp never announced");
         std::thread::sleep(Duration::from_millis(10));
     }
+    let addr = std::fs::read_to_string(&addr_file).expect("read confmcp addr-file");
 
-    let mcp = format!("ref=unix:{}", sock.display());
+    let mcp = format!("ref=http://{}", addr.trim());
     let daemon = h.spawn(&[
         "--mode",
         "reactive",

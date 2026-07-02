@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Configuration: precedence + validate-at-startup. RFC 0011 §2-§3.
 //!
-//! Precedence, top wins: `built-in default < env var < CLI flag`. Everything
-//! is env-settable (12-factor). The whole config is validated **before any
-//! side effect** — a bad config exits `2` in milliseconds, not after an LLM
+//! Precedence, top wins: `built-in default < config FILE < env var < CLI flag`
+//! (RFC 0017 §3.2). Everything is env-settable (12-factor). The optional
+//! declarative JSON file ([`crate::config_file`], `--config`/`AGENTD_CONFIG`)
+//! carries only verbose structural config (MCP-server inventory, declared
+//! subscriptions, A2A peers, limits, model/log knobs) and **never** secrets —
+//! those stay env/flag only. The whole config is validated **before any side
+//! effect** — a bad config exits `2` in milliseconds, not after an LLM
 //! round-trip.
-//!
-//! A config-file layer (which would slot between default and env) is
-//! intentionally not built — env/flag are the complete, stable surface, and
-//! secrets are env/flag only.
 
 use crate::obs::log::Level;
 use crate::sec::scope::TrifectaTag;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The subagent side of the control channel. RFC 0005, RFC 0003, RFC 0009.
 //!
-//! Entered when `main` sees `AGENTD_SUBAGENT` set. The child:
+//! Entered when `main` sees `AGENT_SUBAGENT` set. The child:
 //! 1. installs `PR_SET_PDEATHSIG` so a supervisor death collapses it (must be
 //!    here — `pre_exec`'s setting is cleared by `execve`);
 //! 2. reads its [`SpawnPayload`] (first control frame) from stdin;

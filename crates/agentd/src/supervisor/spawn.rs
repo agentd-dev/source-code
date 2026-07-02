@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Spawning a subagent process. RFC 0009 §re-exec, RFC 0003 §process-group.
 //!
-//! A subagent is the **same binary re-exec'd** with `AGENTD_SUBAGENT` set, so
+//! A subagent is the **same binary re-exec'd** with `AGENT_SUBAGENT` set, so
 //! the one artifact is CLI, supervisor, and subagent. Each child is put in its
 //! own **process group** (`setpgid` in `pre_exec`) so the kill ladder can
 //! `killpg` a whole subtree (RFC 0003). The supervisor delivers the

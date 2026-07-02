@@ -459,6 +459,87 @@ fn streamable_http_modern_stateless_lifecycle() {
 }
 
 #[test]
+fn modern_subscriptions_listen_delivers_pushes() {
+    // Modern reactive: `subscriptions/listen` replaces resources/subscribe + the
+    // removed GET stream. Prove agentd opens the listen stream with a
+    // resourceSubscriptions filter and receives resources/updated on it.
+    let listen_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let bodies = Arc::clone(&listen_bodies);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let Some(req) = read_http_request(&stream) else {
+                continue;
+            };
+            let method = req.body["method"].as_str().unwrap_or("");
+            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+            match method {
+                "server/discover" => {
+                    let payload = json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"resources": {"subscribe": true}},
+                        "serverInfo": {"name": "modern", "version": "0"}
+                    }});
+                    write_json(&mut stream, "", &payload);
+                }
+                "subscriptions/listen" => {
+                    bodies.lock().unwrap().push(req.body.clone());
+                    // Respond with an SSE stream: the ack, then a resources/updated,
+                    // then hold the connection open (a long-lived stream).
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes());
+                    let ack = json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"notifications":{"resourceSubscriptions":["mock://res"]}}});
+                    let upd = json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"uri":"mock://res"}});
+                    let _ = stream.write_all(format!("data: {ack}\n\ndata: {upd}\n\n").as_bytes());
+                    let _ = stream.flush();
+                    // Hold the stream open so the client doesn't reconnect+dup.
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+                _ => write_json(&mut stream, "", &json!({"jsonrpc":"2.0","id":id,"result":{}})),
+            }
+        }
+    });
+
+    let mut client =
+        McpClient::connect("modern", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
+    client.initialize().expect("establish");
+    assert_eq!(client.era(), agentd::wire::mcp::Era::Modern);
+    assert!(client.capabilities().supports_subscribe());
+    client.subscribe("mock://res").expect("subscribe (opens listen)");
+
+    // The resources/updated push arrives on the listen stream.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut updated = Vec::new();
+    while std::time::Instant::now() < deadline {
+        updated = client
+            .drain_notifications()
+            .into_iter()
+            .filter(|n| n.method == "notifications/resources/updated")
+            .collect();
+        if !updated.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(updated.len(), 1, "one resources/updated over subscriptions/listen");
+
+    // The listen request carried the resourceSubscriptions filter + modern _meta.
+    let b = listen_bodies.lock().unwrap();
+    assert_eq!(
+        b[0]["params"]["notifications"]["resourceSubscriptions"][0],
+        "mock://res"
+    );
+    assert_eq!(
+        b[0]["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+        "2026-07-28"
+    );
+    drop(client);
+}
+
+#[test]
 fn connect_to_dead_endpoint_surfaces_transport_error() {
     // Nothing is listening on this port; initialize must fail fast, not hang.
     let mut client = McpClient::connect(

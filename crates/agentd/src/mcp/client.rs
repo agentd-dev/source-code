@@ -27,7 +27,7 @@ use crate::wire::mcp::{
 use ::mcp::modern;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,8 +69,13 @@ pub struct McpClient {
     /// response, and the long-lived server→client `GET` SSE stream (`events`).
     notifications: NotifQueue,
     /// The background notification-stream thread, started lazily on first
-    /// subscribe (the reactive push channel).
+    /// subscribe (the reactive push channel — a `GET` stream on legacy, a
+    /// `subscriptions/listen` POST stream on modern).
     events: Mutex<Option<EventStreamHandle>>,
+    /// The resource URIs subscribed to. On modern this is the filter the
+    /// `subscriptions/listen` stream is (re)opened with; legacy subscribes
+    /// per-URI over `resources/subscribe` and doesn't need it.
+    subscribed_uris: Mutex<BTreeSet<String>>,
     next_id: AtomicI64,
     caps: ServerCapabilities,
     /// The protocol version negotiated at `initialize`/discovery; `None` until then.
@@ -115,6 +120,7 @@ impl McpClient {
             http: Arc::new(HttpTransport::new(ep, headers)),
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             events: Mutex::new(None),
+            subscribed_uris: Mutex::new(BTreeSet::new()),
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
             protocol_version: None,
@@ -484,19 +490,29 @@ impl McpClient {
                 self.name
             )));
         }
+        if self.era == Era::Modern {
+            // Modern: `resources/subscribe` is replaced by `subscriptions/listen` —
+            // record the URI and (re)open the listen stream with the full filter.
+            self.subscribed_uris
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(uri.to_string());
+            self.restart_modern_listen();
+            return Ok(());
+        }
+        // Legacy: register per-URI over `resources/subscribe`, then open the GET
+        // notification stream (lazily; idempotent).
         self.request_with_timeout(
             method::RESOURCES_SUBSCRIBE,
             Some(to_value(&SubscribeParams { uri: uri.into() })),
             timeout,
         )?;
-        // Server→client updates ride the long-lived GET SSE stream — open it lazily
-        // now that we're subscribing (idempotent).
         self.ensure_event_stream();
         Ok(())
     }
 
-    /// Start the background notification `GET` SSE thread if it isn't running.
-    /// Idempotent. Notifications land in the shared queue drained by
+    /// Start the background LEGACY notification `GET` SSE thread if it isn't
+    /// running. Idempotent. Notifications land in the shared queue drained by
     /// [`Self::drain_notifications`]. If the server has no push channel the thread
     /// exits quietly and the client runs pull-only.
     fn ensure_event_stream(&self) {
@@ -517,6 +533,65 @@ impl McpClient {
         }
     }
 
+    /// (Re)open the MODERN `subscriptions/listen` stream with the current URI set.
+    /// The filter is carried in one request, so adding/removing a URI restarts the
+    /// stream. Stops any prior stream first; a no-op when nothing is subscribed.
+    fn restart_modern_listen(&self) {
+        self.stop_event_stream();
+        let uris: Vec<String> = self
+            .subscribed_uris
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        if uris.is_empty() {
+            return;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let version = self
+            .protocol_version
+            .clone()
+            .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
+        let mut params = json!({ "notifications": { "resourceSubscriptions": uris } });
+        modern::inject_client_meta(&mut params, &version, &client_info());
+        let routing: Vec<(String, String)> = modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let req = json::Request::new(id, method::SUBSCRIPTIONS_LISTEN, Some(params));
+        let body = match serde_json::to_vec(&req) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let http = Arc::clone(&self.http);
+        let queue = Arc::clone(&self.notifications);
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name(format!("mcp-listen:{}", self.name))
+            .spawn(move || modern_listen_loop(http, queue, stop_thread, body, routing))
+            .ok();
+        if let Some(handle) = handle {
+            *self.events.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(EventStreamHandle { stop, handle });
+        }
+    }
+
+    /// Stop the background notification thread (either era) if one is running.
+    fn stop_event_stream(&self) {
+        if let Some(ev) = self
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            ev.stop.store(true, Ordering::SeqCst);
+            let _ = ev.handle.join();
+        }
+    }
+
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
         self.unsubscribe_within(uri, self.timeout)
     }
@@ -526,6 +601,16 @@ impl McpClient {
     /// unsubscribe, both best-effort: a slow server here must not block the reactor
     /// or the drain past the liveness window / drain budget.
     pub fn unsubscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
+        if self.era == Era::Modern {
+            // Modern: drop the URI and re-open `subscriptions/listen` with the rest
+            // (or stop the stream if none remain).
+            self.subscribed_uris
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(uri);
+            self.restart_modern_listen();
+            return Ok(());
+        }
         self.request_with_timeout(
             method::RESOURCES_UNSUBSCRIBE,
             Some(to_value(&SubscribeParams { uri: uri.into() })),
@@ -735,6 +820,37 @@ fn event_loop(http: Arc<HttpTransport>, queue: NotifQueue, stop: Arc<AtomicBool>
             // No usable push channel — stop trying (don't spin).
             Err(HttpError::Status(_, _)) | Err(HttpError::Unsupported(_)) => return,
             // Transient (connect/HTTP) — back off, then retry unless stopping.
+            Err(_) => {
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+        };
+        pump_events(&mut sse, &queue, &stop);
+    }
+}
+
+/// The MODERN notification thread: (re)open the `subscriptions/listen` POST stream
+/// with the pre-built request `body` + routing headers, and pump its notifications
+/// (the acknowledgment + the opted-in change notifications) into the queue until
+/// `stop`. Reconnects on a transient drop; gives up if the server rejects the
+/// listen (non-2xx / non-SSE), leaving the client pull-only.
+fn modern_listen_loop(
+    http: Arc<HttpTransport>,
+    queue: NotifQueue,
+    stop: Arc<AtomicBool>,
+    body: Vec<u8>,
+    routing: Vec<(String, String)>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut sse = match http.open_listen(EVENT_READ_TIMEOUT, &body, &refs) {
+            Ok(s) => s,
+            Err(HttpError::Status(_, _)) | Err(HttpError::Unsupported(_)) => return,
             Err(_) => {
                 for _ in 0..20 {
                     if stop.load(Ordering::Relaxed) {

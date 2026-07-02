@@ -540,6 +540,62 @@ fn modern_subscriptions_listen_delivers_pushes() {
 }
 
 #[test]
+fn client_prompts_and_completions() {
+    // A server advertising prompts + completions; exercise list_prompts /
+    // get_prompt / complete (era-agnostic — this mock is legacy).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let Some(req) = read_http_request(&stream) else {
+                continue;
+            };
+            let method = req.body["method"].as_str().unwrap_or("");
+            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+            let payload = match method {
+                "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{"prompts":{},"completions":{}},
+                    "serverInfo":{"name":"p","version":"0"}}}),
+                "prompts/list" => json!({"jsonrpc":"2.0","id":id,"result":{
+                    "prompts":[{"name":"greet","arguments":[{"name":"who","required":true}]}]}}),
+                "prompts/get" => json!({"jsonrpc":"2.0","id":id,"result":{
+                    "description":"greeting",
+                    "messages":[{"role":"user","content":{"type":"text","text":"Hello!"}}]}}),
+                "completion/complete" => json!({"jsonrpc":"2.0","id":id,"result":{
+                    "completion":{"values":["alice","alan"],"hasMore":false}}}),
+                _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"nope"}}),
+            };
+            write_json(&mut stream, "", &payload);
+        }
+    });
+
+    let mut client =
+        McpClient::connect("p", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
+    client.initialize().expect("initialize");
+    assert!(client.capabilities().supports_prompts());
+    assert!(client.capabilities().supports_completions());
+
+    let prompts = client.list_prompts().expect("prompts/list");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].name, "greet");
+    assert_eq!(prompts[0].arguments[0].required, Some(true));
+
+    let got = client
+        .get_prompt("greet", Some(json!({"who": "world"})))
+        .expect("prompts/get");
+    assert_eq!(got.messages.len(), 1);
+    assert_eq!(got.description.as_deref(), Some("greeting"));
+
+    let comp = client
+        .complete(json!({"type": "ref/prompt", "name": "greet"}), json!({"name": "who", "value": "al"}))
+        .expect("completion/complete");
+    assert_eq!(comp.completion.values, ["alice", "alan"]);
+}
+
+#[test]
 fn connect_to_dead_endpoint_surfaces_transport_error() {
     // Nothing is listening on this port; initialize must fail fast, not hang.
     let mut client = McpClient::connect(

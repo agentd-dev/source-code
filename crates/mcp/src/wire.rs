@@ -27,6 +27,11 @@ pub mod method {
     pub const RESOURCES_READ: &str = "resources/read";
     pub const RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
     pub const RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
+    pub const RESOURCES_TEMPLATES_LIST: &str = "resources/templates/list";
+    pub const PROMPTS_LIST: &str = "prompts/list";
+    pub const PROMPTS_GET: &str = "prompts/get";
+    pub const COMPLETION_COMPLETE: &str = "completion/complete";
+    pub const LOGGING_SET_LEVEL: &str = "logging/setLevel";
 
     // Modern (2026-07-28+, stateless) methods.
     /// Query a server's supported versions + capabilities + identity in one call
@@ -154,6 +159,12 @@ impl ServerCapabilities {
             .and_then(|r| r.subscribe)
             .unwrap_or(false)
     }
+    pub fn supports_prompts(&self) -> bool {
+        self.prompts.is_some()
+    }
+    pub fn supports_completions(&self) -> bool {
+        self.completions.is_some()
+    }
 }
 
 // ---- tools ----
@@ -272,6 +283,92 @@ pub struct ResourceUpdatedParams {
     pub title: Option<String>,
 }
 
+// ---- prompts ----
+
+/// A prompt template a server offers (RFC 0004 §prompts). `arguments` describe
+/// the template's fill-ins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prompt {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<PromptArgument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPromptsResult {
+    pub prompts: Vec<Prompt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// `prompts/get` params — the template name + its argument fills (all strings).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPromptParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
+/// `prompts/get` result — the rendered messages. `messages[]` is kept as
+/// `Vec<Value>` (each `{role, content}`) for forward-compat with content types.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GetPromptResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+}
+
+// ---- completion ----
+
+/// `completion/complete` params: what to complete (a `ref` to a prompt or
+/// resource template) and the argument being typed. Kept as `Value` — the `ref`
+/// shape varies by target and revision (forward-compat).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteParams {
+    #[serde(rename = "ref")]
+    pub reference: Value,
+    pub argument: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompleteResult {
+    #[serde(default)]
+    pub completion: Completion,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Completion {
+    #[serde(default)]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
+}
+
 /// Extract human-readable text from an MCP `content[]` / `contents[]` array.
 /// Text parts are concatenated; other known parts are noted by type.
 fn content_text(items: &[Value]) -> String {
@@ -343,5 +440,45 @@ mod tests {
         let r: ListToolsResult = serde_json::from_str(json).unwrap();
         assert_eq!(r.tools.len(), 1);
         assert_eq!(r.next_cursor.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn discover_result_parses() {
+        let json = r#"{
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28", "2025-11-25"],
+            "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {}},
+            "serverInfo": {"name": "s", "version": "1"},
+            "ttlMs": 3600000, "cacheScope": "public"
+        }"#;
+        let d: DiscoverResult = serde_json::from_str(json).unwrap();
+        assert_eq!(d.supported_versions, ["2026-07-28", "2025-11-25"]);
+        assert!(d.capabilities.supports_tools());
+        assert!(d.capabilities.supports_subscribe());
+        assert!(d.capabilities.supports_prompts());
+        assert_eq!(d.ttl_ms, Some(3_600_000));
+    }
+
+    #[test]
+    fn prompts_and_completion_parse() {
+        let list: ListPromptsResult = serde_json::from_str(
+            r#"{"prompts": [{"name": "greet", "arguments": [{"name": "who", "required": true}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(list.prompts[0].name, "greet");
+        assert_eq!(list.prompts[0].arguments[0].name, "who");
+        assert_eq!(list.prompts[0].arguments[0].required, Some(true));
+
+        let got: GetPromptResult = serde_json::from_str(
+            r#"{"description": "d", "messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(got.messages.len(), 1);
+
+        let comp: CompleteResult =
+            serde_json::from_str(r#"{"completion": {"values": ["alice", "bob"], "hasMore": false}}"#)
+                .unwrap();
+        assert_eq!(comp.completion.values, ["alice", "bob"]);
+        assert_eq!(comp.completion.has_more, Some(false));
     }
 }

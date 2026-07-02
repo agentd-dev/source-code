@@ -16,12 +16,13 @@
 use crate::json::{self, RpcError};
 use crate::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
 use crate::wire::mcp::{
-    CallToolResult, ClientCapabilities, DiscoverResult, Era, Implementation, InitializeParams,
-    InitializeResult, LATEST_MODERN_VERSION, ListResourcesResult, ListToolsResult, PROTOCOL_VERSION,
-    ReadResourceParams, ReadResourceResult, Resource, SUPPORTED_PROTOCOL_VERSIONS,
-    ServerCapabilities, SubscribeParams, Tool, UnsupportedProtocolVersion,
-    UNSUPPORTED_PROTOCOL_VERSION_CODE, best_mutual_version, is_modern_error_code, method,
-    negotiate_version,
+    CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
+    GetPromptParams, GetPromptResult, Implementation, InitializeParams, InitializeResult,
+    LATEST_MODERN_VERSION, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Resource,
+    SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Tool,
+    UnsupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION_CODE, best_mutual_version,
+    is_modern_error_code, method, negotiate_version,
 };
 // The modern (stateless) request builders live alongside `wire` in the mcp crate.
 use ::mcp::modern;
@@ -451,6 +452,67 @@ impl McpClient {
             }
         }
         Ok(resources)
+    }
+
+    /// `prompts/list`, following cursor pagination to completion. Empty when the
+    /// server doesn't advertise `prompts`.
+    pub fn list_prompts(&self) -> Result<Vec<Prompt>, McpError> {
+        if !self.caps.supports_prompts() {
+            return Ok(Vec::new());
+        }
+        let mut prompts = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let page: ListPromptsResult = self.request_as(method::PROMPTS_LIST, params)?;
+            prompts.extend(page.prompts);
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(prompts)
+    }
+
+    /// `prompts/get` — render the named prompt template with `arguments` (a flat
+    /// string map). Gated on the server advertising `prompts`.
+    pub fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<GetPromptResult, McpError> {
+        if !self.caps.supports_prompts() {
+            return Err(McpError::Capability(format!(
+                "server '{}' has no prompts",
+                self.name
+            )));
+        }
+        let params = GetPromptParams {
+            name: name.to_string(),
+            arguments,
+        };
+        self.request_as(method::PROMPTS_GET, Some(to_value(&params)))
+    }
+
+    /// `completion/complete` — argument autocompletion for a prompt / resource-
+    /// template `reference`. Gated on the server advertising `completions`.
+    pub fn complete(
+        &self,
+        reference: Value,
+        argument: Value,
+    ) -> Result<CompleteResult, McpError> {
+        if !self.caps.supports_completions() {
+            return Err(McpError::Capability(format!(
+                "server '{}' has no completions",
+                self.name
+            )));
+        }
+        let params = CompleteParams {
+            reference,
+            argument,
+            context: None,
+        };
+        self.request_as(method::COMPLETION_COMPLETE, Some(to_value(&params)))
     }
 
     pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {

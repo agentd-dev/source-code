@@ -3,8 +3,8 @@
 `agentd` is a small, dependency-light Rust binary that runs **one agent**. You
 give it an instruction and a way to reach an LLM, and it runs an agentic loop —
 think, call tools, observe, repeat — until the job is done or a new event wakes
-it. Every tool it can call comes from an **MCP server**; agentd ships none of its
-own (except a gated `exec`). It reaches exactly **one** LLM endpoint, the
+it. Every task tool it can call comes from an **MCP server**; agentd ships none of its
+own and runs no local code. It reaches exactly **one** LLM endpoint, the
 *intelligence*. And it reacts to the world through **MCP resource
 subscriptions** — a resource changing upstream is what triggers a run.
 
@@ -42,22 +42,24 @@ artifact to ship.
 
 ### Optional features
 
-The default build links no TLS and no vsock. Turn them on only when you need
-them (each is gated so it never weighs down a minimal build):
+The default build links `tls` (the `https://` transport with bundled roots) — the
+only transport agentd uses. Turn on the rest only when you need them (each is gated
+so it never weighs down a minimal build):
 
 ```console
-$ cargo build -p agentd --release --features tls      # https:// intelligence endpoints
-$ cargo build -p agentd --release --features vsock     # vsock: intelligence (enclave/microVM)
-$ cargo build -p agentd --release --features tls,vsock,serve-mcp,cron
+$ cargo build -p agentd --release                                 # default: tls (https)
+$ cargo build -p agentd --release --features serve-https,a2a      # served self-MCP + A2A
+$ cargo build -p agentd --release --features serve-https,cluster,run-graph
 ```
 
-The common container pattern terminates TLS at a sidecar and links **no** TLS in
-the binary — agentd talks to the sidecar over a unix socket.
+To keep TLS out of the binary entirely, terminate it at a same-host sidecar and
+point agentd at it over a **loopback `http://`** endpoint (`--no-default-features`).
 
 ### Minimal container
 
 The binary needs nothing but libc (or build fully static for `FROM scratch`).
-A minimal image is just the binary plus whatever MCP servers you bundle:
+A minimal image is just the binary — MCP servers are **remote HTTP endpoints**, so
+they are not bundled into the agentd image:
 
 ```dockerfile
 FROM rust:1-bookworm AS build
@@ -67,8 +69,6 @@ RUN cargo build -p agentd --release
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/agentd /usr/local/bin/agentd
-# bundle any stdio MCP servers you want available as children, e.g.:
-# COPY --from=build /usr/local/bin/mcp-server-fs /usr/local/bin/
 ENTRYPOINT ["agentd"]
 ```
 
@@ -103,12 +103,12 @@ Three facts are the whole design:
    runaway or crashing model is always isolated in a child the supervisor can
    `SIGKILL`.
 2. **MCP is the only tool source.** agentd ships no `fs`/`http`/`shell` tool
-   library. Want a capability? Connect an MCP server with `--mcp`. (The one
-   exception, `exec`, is itself surfaced as an MCP tool from agentd's own
-   self-MCP, and is off by default.)
+   library and runs no local code. Want a capability? Connect an MCP server with
+   `--mcp`. Its only built-in tools are its self/control primitives (spawn a
+   subagent, subscribe, run a graph).
 3. **One intelligence endpoint.** A single LLM endpoint named by a URI in
-   `--intelligence` — `unix:`, `https://`, or `vsock:`. This is the LLM wire,
-   not MCP; the two are different channels.
+   `--intelligence` — `https://` (or a loopback `http://` for a same-host dev
+   gateway). This is the LLM wire, not MCP; the two are different channels.
 
 Output discipline: **stdout carries the agent's result; stderr carries
 JSON-lines telemetry.** This holds for a one-shot run and is the convention every
@@ -125,24 +125,23 @@ to do something with a file.
 ```console
 $ agentd \
     --instruction "Read /data/report.md and write a 3-bullet summary to /data/summary.md" \
-    --intelligence unix:/run/intel.sock \
-    --mcp "fs=mcp-server-fs --root /data"
+    --intelligence https://gw.example/v1 \
+    --mcp fs=https://mcp-fs.internal/mcp
 ```
 
 Three things are wired here:
 
 - **`--instruction`** — the task. (Use `--instruction-file <path>` to read it
   from a file, or set the `INSTRUCTION` env var.)
-- **`--intelligence unix:/run/intel.sock`** — the LLM, reached over a unix-socket
-  gateway sidecar (the common same-pod case). A direct provider would be
-  `--intelligence https://api.example.com/v1` with `--intelligence-token`
-  (requires the `tls` feature). The endpoint must be `unix:`, `https://`, or
-  `vsock:` — anything else is rejected at startup with exit 2.
-- **`--mcp "fs=mcp-server-fs --root /data"`** — declare an MCP server named `fs`.
-  The value is `name=command args…`; agentd spawns `mcp-server-fs --root /data`
-  as a stdio child and discovers its tools via `tools/list`. **Quote the whole
-  `name=command args` as one shell argument** so the server's own flags
-  (`--root /data`) aren't parsed by agentd. Repeat `--mcp` for more servers.
+- **`--intelligence https://gw.example/v1`** — the LLM endpoint. A direct provider
+  is `--intelligence https://api.openai.com/v1/...` with `--intelligence-token`; a
+  same-host gateway sidecar is `--intelligence http://127.0.0.1:4000/v1` (loopback
+  `http://` is the only plaintext allowed). Any other scheme — or a non-loopback
+  `http://` — is rejected at startup with exit 2.
+- **`--mcp fs=https://mcp-fs.internal/mcp`** — declare an MCP server named `fs`. The
+  value is `name=<endpoint>`; agentd connects to that **remote Streamable-HTTP MCP
+  endpoint** (it spawns no process) and discovers its tools via `tools/list`. Repeat
+  `--mcp` for more servers; declare per-server auth headers in the config file.
 
 ### Read the telemetry (stderr) and the result (stdout)
 
@@ -209,8 +208,8 @@ iterations / wall-clock deadline / tree-wide token ceiling) or a `SIGTERM`.
 ```console
 $ agentd \
     --instruction "Check /data/inbox for new files; process each into /data/done" \
-    --intelligence unix:/run/intel.sock \
-    --mcp "fs=mcp-server-fs --root /data" \
+    --intelligence https://gw.example/v1 \
+    --mcp fs=https://mcp-fs.internal/mcp \
     --mode loop \
     --interval 5m \
     --deadline 24h
@@ -236,8 +235,8 @@ you subscribe to concrete resource URIs; an upstream change is the trigger.
 ```console
 $ agentd \
     --instruction "When a file appears in the inbox, process it into /data/done" \
-    --intelligence unix:/run/intel.sock \
-    --mcp "fs=mcp-server-fs --root /data" \
+    --intelligence https://gw.example/v1 \
+    --mcp fs=https://mcp-fs.internal/mcp \
     --mode reactive \
     --subscribe "file:///data/inbox"
 ```
@@ -265,11 +264,11 @@ An agentd can even subscribe **itself** to a resource mid-reasoning (via the
 `subscribe` self-tool) to schedule its own future wake — the capability the
 runtime is built around.
 
-> **v1 scope (roadmap notes).** Reactivity is **stdio-only** in v1 — only stdio
-> MCP servers deliver notifications; reactive-over-HTTP is deferred (roadmap).
-> Serving agentd's own MCP (`--serve-mcp`) is **stdio/unix-socket only**;
-> HTTP serving is deferred (roadmap). Subagent spawning defaults to
-> **synchronous**; `{async}`/`{detach}` dispositions also ship. MCP
+> **Scope notes.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions;
+> serving agentd's own MCP (`--serve-mcp`) is over HTTP(S) with mTLS/bearer auth
+> (loopback `http://` for dev). Subagent spawning defaults to **synchronous**;
+> `{async}`/`{detach}` dispositions also ship. Agent-authored cyclic **run-graphs**
+> ship under `--features run-graph` ([run-graphs.md](run-graphs.md)). MCP
 > tasks/sampling/roots are deferred ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).
 
 ---

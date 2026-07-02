@@ -59,8 +59,12 @@ pub enum GraphStatus {
     Crashed,
 }
 
-/// The graph run budget → the layer-1 termination guard. A total node-visit cap; the
-/// per-node visit cap (layer 2) and progress guard (layer 3) arrive with cycles (P2).
+/// Per-node visit cap (termination layer 2): a node visited more than this many
+/// times is a runaway cycle → `LoopDetected`, even under a large step budget.
+pub const MAX_VISITS_PER_NODE: u32 = 100;
+
+/// The graph run budget → the layer-1 termination guard (a total node-visit cap).
+/// Layers 2 (per-node visit cap) and 3 (progress guard) are enforced by the driver.
 #[derive(Debug, Clone)]
 pub struct GraphBudget {
     max_steps: u32,
@@ -84,6 +88,15 @@ impl GraphBudget {
     pub fn steps(&self) -> u32 {
         self.steps
     }
+}
+
+/// A deterministic hash of the blackboard (the `BTreeMap` serializes in a stable key
+/// order) for the progress guard — two identical blackboards hash equal.
+fn bb_hash(bb: &Blackboard) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(bb).unwrap_or_default().hash(&mut h);
+    h.finish()
 }
 
 /// The execution surface a graph driver needs: run an `Agent` turn and call a `Tool`.
@@ -123,24 +136,55 @@ fn edge_for(is_error: bool) -> &'static str {
 pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, budget: &mut GraphBudget) -> GraphOutcome {
     let mut bb: Blackboard = BTreeMap::new();
     let mut node_id = graph.start.clone();
+    // Termination bookkeeping: per-node visit count (layer 2) and the blackboard hash
+    // last seen ON ENTRY to each node (layer 3 — a revisit with an unchanged board).
+    let mut visits: BTreeMap<String, u32> = BTreeMap::new();
+    let mut entry_hash: BTreeMap<String, u64> = BTreeMap::new();
     loop {
+        // Layer 1 — total step budget.
         if !budget.step() {
             let result = bb_result(&bb, None);
             return GraphOutcome::engine(GraphStatus::Exhausted, result, budget.steps());
         }
+        // Layer 2 — per-node visit cap (a runaway cycle, even under a large budget).
+        let v = visits.entry(node_id.clone()).or_insert(0);
+        *v += 1;
+        if *v > MAX_VISITS_PER_NODE {
+            let result = bb_result(&bb, None);
+            return GraphOutcome::engine(GraphStatus::LoopDetected, result, budget.steps());
+        }
+        // Layer 3 — progress guard: re-entering a node with an unchanged blackboard
+        // means the cycle back to here made no progress → stalled.
+        let h = bb_hash(&bb);
+        if entry_hash.get(&node_id) == Some(&h) {
+            let result = bb_result(&bb, None);
+            return GraphOutcome::engine(GraphStatus::Stalled, result, budget.steps());
+        }
+        entry_hash.insert(node_id.clone(), h);
+
         let Some(node) = graph.nodes.get(&node_id) else {
             // A dangling edge slipped past validation → fail closed.
             return GraphOutcome::engine(GraphStatus::Crashed, Value::Null, budget.steps());
         };
 
-        // Halt terminates immediately, projecting `result_from` from the blackboard.
-        if let Node::Halt { status, result_from } = node {
-            let result = bb_result(&bb, result_from.as_deref());
-            return GraphOutcome::halt(*status, result, budget.steps());
-        }
-
-        // Effectful nodes: run, write, then follow the emitted label.
+        // Effectful nodes produce `(label, edges)` and fall through to edge-follow;
+        // Halt returns; Branch + the unsupported kinds transition/return directly.
         let (label, edges) = match node {
+            // Halt terminates immediately, projecting `result_from`.
+            Node::Halt { status, result_from } => {
+                let result = bb_result(&bb, result_from.as_deref());
+                return GraphOutcome::halt(*status, result, budget.steps());
+            }
+            // Branch: the first case whose predicate holds wins, else `default`. It
+            // writes nothing and emits no ok/error label — it transitions directly.
+            Node::Branch { cases, default, .. } => {
+                node_id = cases
+                    .iter()
+                    .find(|c| c.when.eval(&bb))
+                    .map_or(default, |c| &c.goto)
+                    .clone();
+                continue;
+            }
             Node::Agent {
                 instruction,
                 output_contract,
@@ -165,7 +209,7 @@ pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, budget: &mut GraphBudget) 
                 write(&mut bb, writes, val);
                 (edge_for(is_err), edges)
             }
-            // Branch/Wait/Subgraph land in later phases; fail closed until then.
+            // Wait/Subgraph land in later phases; fail closed until then.
             _ => return GraphOutcome::engine(GraphStatus::Crashed, Value::Null, budget.steps()),
         };
 
@@ -235,6 +279,10 @@ mod tests {
         tools: BTreeMap<String, (Value, bool)>,
         calls: Vec<String>,
         last_blackboard: Blackboard,
+        /// When an agent's instruction equals this, return an INCREMENTING counter
+        /// `{"n": k}` (a progressing loop body) instead of a scripted constant.
+        counting: Option<String>,
+        counter: i64,
     }
 
     impl GraphExec for MockExec {
@@ -247,6 +295,10 @@ mod tests {
         ) -> (Value, bool) {
             self.calls.push(format!("agent:{instruction}"));
             self.last_blackboard = blackboard.clone();
+            if self.counting.as_deref() == Some(instruction) {
+                self.counter += 1;
+                return (json!({ "n": self.counter }), false);
+            }
             self.agents
                 .get(instruction)
                 .cloned()
@@ -371,12 +423,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_node_kind_fails_closed_in_p1() {
-        // A Branch node is a P2 feature; the P1 driver must fail closed on it.
+    fn an_unsupported_node_kind_fails_closed() {
+        // A Wait node is a P4 feature; until then the driver must fail closed on it.
         let g: Graph = serde_json::from_value(json!({
-            "start": "b",
+            "start": "w",
             "nodes": {
-                "b": {"kind": "branch", "cases": [], "default": "h"},
+                "w": {"kind": "wait", "on_uri": "file:///x", "timeout_ms": 1000, "edges": {"updated": "h"}},
                 "h": {"kind": "halt", "status": "completed"}
             }
         }))
@@ -385,5 +437,112 @@ mod tests {
         let mut budget = GraphBudget::new(10);
         let out = drive(&g, &mut exec, &mut budget);
         assert_eq!(out.status, GraphStatus::Crashed);
+    }
+
+    // ── P2: branches, cycles, termination ────────────────────────────────────
+
+    /// tick (agent, writes "c") → gate (branch on c/n) → tick | done. A back-edge
+    /// (gate → tick) makes it a real cycle.
+    fn counter_loop(exit_at: i64) -> Graph {
+        serde_json::from_value(json!({
+            "start": "tick",
+            "nodes": {
+                "tick": {"kind": "agent", "instruction": "tick", "writes": "c", "edges": {"ok": "gate"}},
+                "gate": {
+                    "kind": "branch",
+                    "cases": [
+                        {"when": {"op": "gt", "key": "c", "pointer": "/n", "value": exit_at as f64}, "goto": "done"}
+                    ],
+                    "default": "tick"
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "c"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_branch_routes_on_the_blackboard() {
+        // The gate exits once the counter passes 2 (n=3): tick,gate,tick,gate,tick,gate,done.
+        let g = counter_loop(2);
+        assert!(g.validate().is_ok(), "a cyclic graph with a reachable halt is valid");
+        let mut exec = MockExec {
+            counting: Some("tick".into()),
+            ..MockExec::default()
+        };
+        let mut budget = GraphBudget::new(1000);
+        let out = drive(&g, &mut exec, &mut budget);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(out.result, json!({"n": 3}), "exited when the counter passed 2");
+        // Three loop iterations: (tick,gate) × 3 then done.
+        assert_eq!(out.steps, 7);
+    }
+
+    #[test]
+    fn a_branch_falls_through_to_default() {
+        // No case matches (default routes onward); with a constant body it stalls,
+        // proving `default` was taken (the case predicate never fired).
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "const", "writes": "k", "edges": {"ok": "b"}},
+                "b": {
+                    "kind": "branch",
+                    "cases": [{"when": {"op": "eq", "key": "k", "value": "never"}, "goto": "done"}],
+                    "default": "a"
+                },
+                "done": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        exec.agents.insert("const".into(), (json!("always"), false));
+        let mut budget = GraphBudget::new(1000);
+        let out = drive(&g, &mut exec, &mut budget);
+        // The default keeps looping with no progress → Stalled (layer 3).
+        assert_eq!(out.status, GraphStatus::Stalled);
+    }
+
+    #[test]
+    fn a_non_progressing_loop_is_stalled() {
+        // A bare self-loop whose body writes the same value every time. The agent
+        // node re-enters with an unchanged blackboard → Stalled.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "spin",
+            "nodes": {
+                "spin": {"kind": "agent", "instruction": "const", "writes": "k", "edges": {"ok": "gate"}},
+                "gate": {"kind": "branch", "cases": [], "default": "spin"}
+            }
+        }))
+        .unwrap();
+        // (No Halt reachable → validation rejects it; drive it directly to prove the
+        // runtime guard independent of author-time validation.)
+        let mut exec = MockExec::default();
+        exec.agents.insert("const".into(), (json!(1), false));
+        let mut budget = GraphBudget::new(1000);
+        let out = drive(&g, &mut exec, &mut budget);
+        assert_eq!(out.status, GraphStatus::Stalled);
+        assert!(out.steps < 10, "stalls fast, not at the budget: {}", out.steps);
+    }
+
+    #[test]
+    fn a_progressing_but_unbounded_loop_hits_the_visit_cap() {
+        // The body PROGRESSES each iteration (an incrementing counter, so never
+        // Stalled) but the gate never exits (exit_at unreachably high) → the per-node
+        // visit cap trips first: LoopDetected (layer 2), before the step budget.
+        let g = counter_loop(1_000_000);
+        let mut exec = MockExec {
+            counting: Some("tick".into()),
+            ..MockExec::default()
+        };
+        let mut budget = GraphBudget::new(100_000);
+        let out = drive(&g, &mut exec, &mut budget);
+        assert_eq!(out.status, GraphStatus::LoopDetected);
+        // Tripped at the per-node cap (~2 visits/iteration), well under the budget.
+        assert!(
+            out.steps < 100_000,
+            "loop-detected before budget exhaustion: {}",
+            out.steps
+        );
     }
 }

@@ -30,7 +30,9 @@ pub mod intel; // intelligence client + provider adapters
 // so `crate::json::*` keeps resolving (MCP + the supervisor↔subagent channel).
 pub use ::mcp::rpc as json;
 pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
-pub mod net; // hand-rolled HTTP/1.1 (non-streaming), unix-socket, (tls/vsock gated)
+// Transport primitives now live in the reusable `net` crate; re-export so
+// `crate::net::*` keeps resolving across the runtime (mcp transport + intel).
+pub use ::net;
 pub mod obs; // logging, health, tracing, metrics
 pub mod report; // run-outcome reports — the kubectl-agents-results backend (RFC 0016 §6)
 pub mod sec; // secrets, tool-scope, gated exec

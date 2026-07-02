@@ -27,9 +27,10 @@ default = ["tls"]
 # provider (no cmake/C build dep) + bundled webpki roots — so a scratch container
 # has trust anchors with no system CA bundle. On by default; opt out with
 # `--no-default-features` to reach https only via a TLS-terminating sidecar.
-tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
-# Enclave / microVM intelligence transport (AF_VSOCK).
-vsock = ["dep:vsock"]
+tls = ["net/tls"]
+# Enclave / microVM intelligence transport (AF_VSOCK). Enables the `net` crate's
+# vsock connects AND agentd's own direct use (the served vsock listener + a2a).
+vsock = ["net/vsock", "dep:vsock"]
 # Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
 # (RFC 0005 §3.6) — no dep. (mio/epoll is a future high-fan-in optimisation.)
 serve-mcp = []
@@ -96,20 +97,20 @@ internal-mocks = []
 
 [dependencies]
 # The reusable MCP base library (workspace crate): wire types + the version/era
-# model + (progressively) the transport dialects. In-tree, no extra external dep.
+# model + the modern dialect helpers + the JSON-RPC codec. In-tree.
 mcp = { path = "../mcp" }
+# Shared transport primitives (workspace crate): the HTTP/1.1+SSE client, unix +
+# feature-gated tls/vsock connects, SSRF guard. Owns the rustls/webpki deps
+# (agentd's `tls` feature maps to `net/tls`).
+net = { path = "../net" }
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.
 # Keep all wire types in one module (json/, wire/) so a swap to miniserde
 # stays mechanical (rfcs/0002).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# --- feature: tls ---
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"], optional = true }
-webpki-roots = { version = "0.26", optional = true }
-# PEM parsing for mTLS client certs/keys (pure Rust; reuses rustls-pki-types).
-rustls-pemfile = { version = "2", optional = true }
-# --- feature: vsock ---
+# --- feature: vsock --- agentd uses the vsock crate directly (served listener +
+# a2a) in addition to `net/vsock`.
 vsock = { version = "0.5", optional = true }
 # --- feature: serve-mcp --- blocking std UnixListener; no dependency.
 # --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.

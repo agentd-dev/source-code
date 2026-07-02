@@ -5,7 +5,7 @@
 //! For agentd running inside a microVM / confidential enclave, reaching a model
 //! gateway on the host across the virtio-socket boundary — no TCP stack exposed
 //! in the guest. `VsockStream` is `Read + Write`, so it drops into the
-//! transport-agnostic HTTP client ([`crate::net::http`]).
+//! transport-agnostic HTTP client ([`crate::http`]).
 
 use std::io;
 use std::time::Duration;

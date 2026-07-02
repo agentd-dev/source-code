@@ -3,7 +3,7 @@
 //!
 //! The common same-pod case: a model gateway (or an MCP server) listening on
 //! a unix socket, spoken to with the same hand-rolled HTTP/1.1 client as TCP
-//! ([`crate::net::http`]) — the socket is just the byte stream.
+//! ([`crate::http`]) — the socket is just the byte stream.
 
 #[cfg(unix)]
 mod imp {

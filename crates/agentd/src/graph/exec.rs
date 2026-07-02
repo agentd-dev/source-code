@@ -13,8 +13,8 @@
 //! + intelligence client, so a workflow inherits their transport/auth/resilience.
 
 use super::{
-    drive, drive_budgeted, resume, Blackboard, DriveResult, FieldType, Graph, GraphExec,
-    GraphOutcome, GraphStatus, WaitOutcome,
+    drive, drive_budgeted, drive_seeded, resume, Blackboard, DriveResult, FieldType, Graph,
+    GraphExec, GraphOutcome, GraphStatus, WaitOutcome,
 };
 use crate::agentloop::action::SelfHandler;
 use crate::agentloop::runner::{run_loop, LoopInput};
@@ -35,6 +35,21 @@ pub const GRAPH_MAX_STEPS: u32 = 10_000;
 /// The completion cap for one `Infer` ask — structured extraction answers are small
 /// by construction; a runaway answer is truncated, fails the parse, and re-asks.
 const INFER_MAX_TOKENS: u32 = 2048;
+
+/// Everything needed to build a FRESH `SessionExec` with its own connections —
+/// the per-lane recipe `Foreach { parallel: N }` workers use. Plain data
+/// (endpoint/specs/limits), no live connections; each lane connects itself so
+/// no client is shared across threads. The token (inside `intel_token`) is a
+/// secret — no Debug.
+pub struct ExecFactory {
+    pub intel_uri: String,
+    pub intel_token: Option<String>,
+    pub model: String,
+    pub server_specs: Vec<McpServerSpec>,
+    pub max_steps: u32,
+    pub max_tokens: u64,
+    pub node_timeout: Duration,
+}
 
 /// Parse a model's structured answer as JSON, tolerating the common wrappers: a
 /// leading/trailing code fence and prose around the object (first `{` … last `}`).
@@ -78,7 +93,7 @@ pub fn drive_pinned(
     deadline: Option<Instant>,
     log: &Logger,
 ) -> Result<GraphOutcome, String> {
-    let intel = IntelClient::from_parts(intel_uri, intel_token)
+    let intel = IntelClient::from_parts(intel_uri, intel_token.clone())
         .map_err(|e| format!("intelligence: {e}"))?;
     let mut servers: Vec<McpClient> = Vec::new();
     for spec in server_specs {
@@ -87,6 +102,15 @@ pub fn drive_pinned(
             .map_err(|e| format!("mcp server '{}': {e}", spec.name))?;
         servers.push(client);
     }
+    let factory = ExecFactory {
+        intel_uri: intel_uri.to_string(),
+        intel_token,
+        model: model.to_string(),
+        server_specs: server_specs.to_vec(),
+        max_steps,
+        max_tokens,
+        node_timeout,
+    };
     Ok(drive_connected(
         graph,
         &intel,
@@ -96,6 +120,7 @@ pub fn drive_pinned(
         max_tokens,
         node_timeout,
         deadline,
+        Some(factory),
         log,
     ))
 }
@@ -115,10 +140,12 @@ pub fn drive_connected(
     max_tokens: u64,
     node_timeout: Duration,
     deadline: Option<Instant>,
+    factory: Option<ExecFactory>,
     log: &Logger,
 ) -> GraphOutcome {
     let mut exec = SessionExec::new(intel, servers, log, model, max_steps, max_tokens, node_timeout)
-        .with_deadline(deadline);
+        .with_deadline(deadline)
+        .with_factory(factory);
     let mut result = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
     loop {
         match result {
@@ -203,6 +230,9 @@ pub struct SessionExec<'a> {
     deadline: Option<Instant>,
     /// Intelligence tokens consumed since the driver last drained them.
     pending_tokens: u64,
+    /// The per-lane connection recipe for parallel `Foreach` (absent → the
+    /// parallel hook degrades to sequential on THIS exec's connections).
+    factory: Option<std::sync::Arc<ExecFactory>>,
 }
 
 impl<'a> SessionExec<'a> {
@@ -226,6 +256,7 @@ impl<'a> SessionExec<'a> {
             node_timeout,
             deadline: None,
             pending_tokens: 0,
+            factory: None,
         }
     }
 
@@ -233,6 +264,39 @@ impl<'a> SessionExec<'a> {
     pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
         self
+    }
+
+    /// Attach the per-lane connection recipe enabling parallel `Foreach` lanes.
+    pub fn with_factory(mut self, factory: Option<ExecFactory>) -> Self {
+        self.factory = factory.map(std::sync::Arc::new);
+        self
+    }
+
+    /// Drive a foreach BODY on this exec's own connections, resolving nested
+    /// waits — shared by the sequential hook and each parallel lane.
+    fn drive_body(&mut self, body: &Graph, seed: Blackboard) -> (Value, bool) {
+        let max_steps = self.max_steps;
+        let mut result = drive_seeded(body, self, max_steps, seed);
+        loop {
+            match result {
+                DriveResult::Done(o) => {
+                    return (o.result, o.status != GraphStatus::Completed);
+                }
+                DriveResult::Suspended(s) => {
+                    self.log.info(
+                        "workflow.wait",
+                        serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms, "foreach_body": true}),
+                    );
+                    let outcome = wait_for_uri(
+                        self.servers,
+                        &s.on_uri,
+                        Duration::from_millis(s.timeout_ms),
+                        self.log,
+                    );
+                    result = resume(body, s.state, self, outcome);
+                }
+            }
+        }
     }
 
     /// The per-node deadline: the node's own timeout, shortened to whatever
@@ -427,6 +491,125 @@ impl GraphExec for SessionExec<'_> {
     fn deadline_exceeded(&self) -> bool {
         self.deadline.is_some_and(|d| Instant::now() >= d)
     }
+
+    fn run_body(&mut self, body: &Graph, seed: Blackboard) -> (Value, bool) {
+        self.drive_body(body, seed)
+    }
+
+    /// Parallel `Foreach` lanes: up to `parallel` worker threads, EACH building
+    /// its own intelligence + MCP connections from the [`ExecFactory`] recipe (no
+    /// live client crosses a thread), pulling items off a shared queue. Per-item
+    /// deadline checks; every lane's model usage folds back into this exec's
+    /// pending tokens, so the workflow's shared pool still accounts for the whole
+    /// batch (charged when the batch returns — a batch may overshoot the pool by
+    /// at most its own in-flight usage, then the walk stops). Without a factory,
+    /// degrades to sequential on this exec's connections.
+    fn run_body_parallel(
+        &mut self,
+        body: &Graph,
+        seeds: Vec<(usize, Blackboard)>,
+        parallel: u32,
+    ) -> Vec<(usize, Value, bool)> {
+        let Some(factory) = self.factory.clone() else {
+            return seeds
+                .into_iter()
+                .map(|(i, seed)| {
+                    let (v, e) = self.drive_body(body, seed);
+                    (i, v, e)
+                })
+                .collect();
+        };
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Mutex;
+
+        let lanes = (parallel as usize).min(seeds.len()).max(1);
+        let queue: Mutex<VecDeque<(usize, Blackboard)>> = Mutex::new(seeds.into());
+        let out: Mutex<Vec<(usize, Value, bool)>> = Mutex::new(Vec::new());
+        let lane_tokens = AtomicU64::new(0);
+        let deadline = self.deadline;
+        let log = self.log;
+
+        std::thread::scope(|scope| {
+            for lane in 0..lanes {
+                let factory = std::sync::Arc::clone(&factory);
+                let queue = &queue;
+                let out = &out;
+                let lane_tokens = &lane_tokens;
+                scope.spawn(move || {
+                    // Each lane owns its connections — a failed setup drains no
+                    // items (other lanes still empty the queue); its error is
+                    // logged once.
+                    let intel =
+                        match IntelClient::from_parts(&factory.intel_uri, factory.intel_token.clone()) {
+                            Ok(i) => i,
+                            Err(e) => {
+                                log.warn(
+                                    "workflow.foreach.lane_failed",
+                                    serde_json::json!({"lane": lane, "err": format!("intel: {e}")}),
+                                );
+                                return;
+                            }
+                        };
+                    let mut servers: Vec<McpClient> = Vec::new();
+                    for spec in &factory.server_specs {
+                        match crate::mcp::from_spec(spec, Duration::from_secs(60))
+                            .and_then(|mut c| c.initialize().map(|()| c))
+                        {
+                            Ok(c) => servers.push(c),
+                            Err(e) => {
+                                log.warn(
+                                    "workflow.foreach.lane_failed",
+                                    serde_json::json!({"lane": lane, "err": format!("mcp '{}': {e}", spec.name)}),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    let mut exec = SessionExec::new(
+                        &intel,
+                        &servers,
+                        log,
+                        &factory.model,
+                        factory.max_steps,
+                        factory.max_tokens,
+                        factory.node_timeout,
+                    )
+                    .with_deadline(deadline);
+                    loop {
+                        let item = queue.lock().expect("foreach queue").pop_front();
+                        let Some((i, seed)) = item else { break };
+                        if deadline.is_some_and(|d| Instant::now() >= d) {
+                            out.lock().expect("foreach out").push((
+                                i,
+                                Value::String("workflow deadline exceeded".into()),
+                                true,
+                            ));
+                            continue;
+                        }
+                        let (v, e) = exec.drive_body(body, seed);
+                        lane_tokens.fetch_add(exec.take_tokens(), Ordering::Relaxed);
+                        out.lock().expect("foreach out").push((i, v, e));
+                    }
+                });
+            }
+        });
+
+        self.pending_tokens = self
+            .pending_tokens
+            .saturating_add(lane_tokens.load(std::sync::atomic::Ordering::Relaxed));
+        let mut results = out.into_inner().expect("foreach out");
+        // Items no lane processed (every lane failed to connect) are errors, not
+        // silent drops.
+        for (i, _) in queue.into_inner().expect("foreach queue") {
+            results.push((
+                i,
+                Value::String("no foreach lane available (all lanes failed to connect)".into()),
+                true,
+            ));
+        }
+        results
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -594,6 +777,62 @@ mod tests {
         let mut exec = exec.with_deadline(Some(Instant::now() - Duration::from_millis(1)));
         assert!(exec.deadline_exceeded(), "past deadline detected");
         let _ = &mut exec;
+    }
+
+    #[test]
+    fn parallel_foreach_lanes_process_items_with_positional_results() {
+        // parallel=3 lanes, each building its own exec from the factory (empty
+        // server specs; the assign-only body never dials intelligence). Ten
+        // items, results restored positionally, zero model calls.
+        let dir = tempfile::tempdir().unwrap();
+        let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
+        let intel = IntelClient::from_parts(&url, None).unwrap();
+        let lg = log();
+        let factory = ExecFactory {
+            intel_uri: url.clone(),
+            intel_token: None,
+            model: "mock".into(),
+            server_specs: Vec::new(),
+            max_steps: 50,
+            max_tokens: 100_000,
+            node_timeout: Duration::from_secs(10),
+        };
+        let mut exec =
+            SessionExec::new(&intel, &[], &lg, "mock", 50, 100_000, Duration::from_secs(10))
+                .with_factory(Some(factory));
+        let items: Vec<Value> = (0..10).map(|i| json!({"n": i})).collect();
+        let g: Graph = serde_json::from_value(json!({
+            "start": "fan",
+            "nodes": {
+                "fan": {
+                    "kind": "foreach",
+                    "items": items,
+                    "body": {
+                        "start": "shape",
+                        "nodes": {
+                            "shape": {"kind": "assign", "value": {"n": {"$from": "item", "pointer": "/n"}, "at": {"$from": "index"}}, "writes": "out", "edges": {"ok": "h"}},
+                            "h": {"kind": "halt", "status": "completed", "result_from": "out"}
+                        }
+                    },
+                    "parallel": 3,
+                    "writes": "results",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "results"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "results"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let DriveResult::Done(out) = drive(&g, &mut exec, 100) else {
+            panic!("completes");
+        };
+        assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.reason);
+        let arr = out.result.as_array().unwrap();
+        assert_eq!(arr.len(), 10);
+        for (i, v) in arr.iter().enumerate() {
+            assert_eq!(v, &json!({"n": i, "at": i}), "positional integrity at {i}");
+        }
     }
 
     #[test]

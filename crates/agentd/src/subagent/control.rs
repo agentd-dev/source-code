@@ -617,6 +617,15 @@ fn run_workflow_child(
     let wall = Duration::from_millis(payload.limits.deadline_ms.max(1));
     let deadline = Some(Instant::now() + wall);
     let model = payload.intelligence.model.clone().unwrap_or_default();
+    let factory = crate::graph::ExecFactory {
+        intel_uri: payload.intelligence.uri.clone(),
+        intel_token: payload.intelligence.token.clone(),
+        model: model.clone(),
+        server_specs: payload.mcp_servers.clone(),
+        max_steps: payload.limits.max_steps,
+        max_tokens: payload.limits.max_tokens,
+        node_timeout: wall,
+    };
     let o = drive_connected(
         graph,
         intel,
@@ -626,6 +635,7 @@ fn run_workflow_child(
         payload.limits.max_tokens,
         wall,
         deadline,
+        Some(factory),
         log,
     );
 

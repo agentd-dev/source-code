@@ -13,8 +13,8 @@
 //! + intelligence client, so a workflow inherits their transport/auth/resilience.
 
 use super::{
-    drive, resume, Blackboard, DriveResult, FieldType, Graph, GraphExec, GraphOutcome,
-    GraphStatus, WaitOutcome,
+    drive, drive_budgeted, resume, Blackboard, DriveResult, FieldType, Graph, GraphExec,
+    GraphOutcome, GraphStatus, WaitOutcome,
 };
 use crate::agentloop::action::SelfHandler;
 use crate::agentloop::runner::{run_loop, LoopInput};
@@ -75,6 +75,7 @@ pub fn drive_pinned(
     max_steps: u32,
     max_tokens: u64,
     node_timeout: Duration,
+    deadline: Option<Instant>,
     log: &Logger,
 ) -> Result<GraphOutcome, String> {
     let intel = IntelClient::from_parts(intel_uri, intel_token)
@@ -86,12 +87,14 @@ pub fn drive_pinned(
             .map_err(|e| format!("mcp server '{}': {e}", spec.name))?;
         servers.push(client);
     }
-    let mut exec = SessionExec::new(&intel, &servers, log, model, max_steps, max_tokens, node_timeout);
+    let mut exec = SessionExec::new(&intel, &servers, log, model, max_steps, max_tokens, node_timeout)
+        .with_deadline(deadline);
 
     // Drive to a terminal outcome, resolving each `Wait` in-process (block-until-update
     // -or-timeout). The graph's step budget accumulates across resumes, so even a Wait
-    // loop is bounded.
-    let mut result = drive(graph, &mut exec, GRAPH_MAX_STEPS);
+    // loop is bounded — and `max_tokens` is the WHOLE-WORKFLOW intelligence pool
+    // (charged via take_tokens), not a per-node grant multiplied by the walk.
+    let mut result = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
     loop {
         match result {
             DriveResult::Done(outcome) => return Ok(outcome),
@@ -169,6 +172,11 @@ pub struct SessionExec<'a> {
     max_steps: u32,
     max_tokens: u64,
     node_timeout: Duration,
+    /// Whole-workflow wall-clock deadline (drives [`GraphExec::deadline_exceeded`]
+    /// and shortens each node's own deadline to what remains).
+    deadline: Option<Instant>,
+    /// Intelligence tokens consumed since the driver last drained them.
+    pending_tokens: u64,
 }
 
 impl<'a> SessionExec<'a> {
@@ -190,6 +198,24 @@ impl<'a> SessionExec<'a> {
             max_steps,
             max_tokens,
             node_timeout,
+            deadline: None,
+            pending_tokens: 0,
+        }
+    }
+
+    /// Set the whole-workflow wall-clock deadline.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// The per-node deadline: the node's own timeout, shortened to whatever
+    /// remains of the whole-workflow deadline.
+    fn node_deadline(&self) -> Instant {
+        let own = Instant::now() + self.node_timeout;
+        match self.deadline {
+            Some(d) if d < own => d,
+            _ => own,
         }
     }
 }
@@ -215,12 +241,15 @@ impl GraphExec for SessionExec<'_> {
             model: self.model.clone(),
             max_steps: self.max_steps,
             max_tokens: self.max_tokens,
-            deadline: Instant::now() + self.node_timeout,
+            deadline: self.node_deadline(),
             cancel: None,
         };
         let mut handler = LeafHandler;
         match run_loop(self.intel, self.servers, &input, &mut handler, self.log) {
-            Ok((outcome, _usage)) => (outcome.result, outcome.status != TerminalStatus::Completed),
+            Ok((outcome, usage)) => {
+                self.pending_tokens = self.pending_tokens.saturating_add(usage.total());
+                (outcome.result, outcome.status != TerminalStatus::Completed)
+            }
             Err(e) => (Value::String(e.to_string()), true),
         }
     }
@@ -271,12 +300,21 @@ impl GraphExec for SessionExec<'_> {
             max_tokens: 64,
             temperature: None,
         };
-        let answer = self.intel.complete(&req).ok()?.text?;
+        let resp = self.intel.complete(&req).ok()?;
+        self.pending_tokens = self.pending_tokens.saturating_add(resp.usage.total());
+        let answer = resp.text?;
         let lower = answer.to_lowercase();
+        // Exact match first; else the LONGEST contained label — so overlapping
+        // labels ("done" vs "not-done") resolve to the more specific one.
         choices
             .iter()
             .find(|c| lower == c.to_lowercase())
-            .or_else(|| choices.iter().find(|c| lower.contains(&c.to_lowercase())))
+            .or_else(|| {
+                choices
+                    .iter()
+                    .filter(|c| lower.contains(&c.to_lowercase()))
+                    .max_by_key(|c| c.len())
+            })
             .cloned()
     }
 
@@ -321,27 +359,47 @@ impl GraphExec for SessionExec<'_> {
             max_tokens: INFER_MAX_TOKENS,
             temperature: None,
         };
-        let answer = self
-            .intel
-            .complete(&req)
-            .map_err(|e| e.to_string())?
-            .text
-            .ok_or("empty completion")?;
+        let resp = self.intel.complete(&req).map_err(|e| e.to_string())?;
+        self.pending_tokens = self.pending_tokens.saturating_add(resp.usage.total());
+        let answer = resp.text.ok_or("empty completion")?;
         parse_json_answer(&answer)
     }
 
     fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _blackboard: &Blackboard) -> (Value, bool) {
-        // Sync: drive the nested graph inline with this same executor. (An `async`
-        // subgraph spawned as a detached, capped subtree is the daemon-side follow-up;
-        // a nested Wait cannot suspend inline, so it is reported as an error.)
+        // Sync: drive the nested graph inline with this same executor, resolving a
+        // nested `Wait` the same way the top level does (subscribe + block until
+        // update-or-timeout) — a subgraph is a full workflow, waits included. (An
+        // `async` subgraph spawned as a detached subtree is the daemon-side follow-up.)
         let max_steps = self.max_steps;
-        match drive(graph, self, max_steps) {
-            DriveResult::Done(o) => (o.result, o.status != GraphStatus::Completed),
-            DriveResult::Suspended(_) => (
-                Value::String("subgraph suspended on a Wait (unsupported inline)".into()),
-                true,
-            ),
+        let mut result = drive(graph, self, max_steps);
+        loop {
+            match result {
+                DriveResult::Done(o) => {
+                    return (o.result, o.status != GraphStatus::Completed);
+                }
+                DriveResult::Suspended(s) => {
+                    self.log.info(
+                        "workflow.wait",
+                        serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms, "nested": true}),
+                    );
+                    let outcome = wait_for_uri(
+                        self.servers,
+                        &s.on_uri,
+                        Duration::from_millis(s.timeout_ms),
+                        self.log,
+                    );
+                    result = resume(graph, s.state, self, outcome);
+                }
+            }
         }
+    }
+
+    fn take_tokens(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_tokens)
+    }
+
+    fn deadline_exceeded(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 }
 
@@ -470,6 +528,46 @@ mod tests {
             "prose-wrapped"
         );
         assert!(parse_json_answer("no json here").is_err());
+    }
+
+    #[test]
+    fn judge_prefers_the_longest_matching_label() {
+        // The mock answers "mock-llm done". Both "done" and "llm done" are
+        // contained; the LONGEST match wins so overlapping labels resolve to the
+        // more specific one.
+        let dir = tempfile::tempdir().unwrap();
+        let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
+        let intel = IntelClient::from_parts(&url, None).unwrap();
+        let lg = log();
+        let mut exec =
+            SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let bb = Blackboard::new();
+        let choice = exec.judge(
+            "state?",
+            &bb,
+            &[],
+            &["done".to_string(), "llm done".to_string()],
+        );
+        assert_eq!(choice.as_deref(), Some("llm done"), "longest contained label");
+    }
+
+    #[test]
+    fn session_exec_reports_consumed_tokens_and_deadline() {
+        // The mock stamps usage on every completion; take_tokens drains it, and a
+        // past deadline flips deadline_exceeded.
+        let dir = tempfile::tempdir().unwrap();
+        let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
+        let intel = IntelClient::from_parts(&url, None).unwrap();
+        let lg = log();
+        let mut exec =
+            SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        assert!(!exec.deadline_exceeded(), "no deadline set");
+        let _ = exec.judge("q?", &Blackboard::new(), &[], &["done".to_string()]);
+        assert!(exec.take_tokens() > 0, "judge usage accumulated");
+        assert_eq!(exec.take_tokens(), 0, "drained");
+        let mut exec = exec.with_deadline(Some(Instant::now() - Duration::from_millis(1)));
+        assert!(exec.deadline_exceeded(), "past deadline detected");
+        let _ = &mut exec;
     }
 
     #[test]

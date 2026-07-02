@@ -319,6 +319,10 @@ impl Orchestrator {
         };
         let model = self.intelligence.model.clone().unwrap_or_default();
         let node_timeout = Duration::from_millis(self.child_limits.deadline_ms);
+        // The whole workflow shares the child's wall budget: each node may use up
+        // to the child deadline, and the WALK stops at that same wall (checked per
+        // node entry) — plus the shared token pool below.
+        let deadline = Some(std::time::Instant::now() + node_timeout);
         let result = crate::graph::drive_pinned(
             &graph,
             &self.intelligence.uri,
@@ -328,6 +332,7 @@ impl Orchestrator {
             self.child_limits.max_steps,
             self.child_limits.max_tokens,
             node_timeout,
+            deadline,
             &self.log,
         );
         match result {
@@ -340,7 +345,9 @@ impl Orchestrator {
                 let summary = json!({
                     "workflow_id": id,
                     "status": format!("{:?}", o.status),
+                    "reason": o.reason,
                     "steps": o.steps,
+                    "tokens": o.tokens,
                     "result": o.result,
                 });
                 (summary.to_string(), is_err)

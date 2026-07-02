@@ -638,6 +638,9 @@ fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
     let payload = root_payload(cfg);
     let model = payload.intelligence.model.clone().unwrap_or_default();
     let node_timeout = cfg.deadline.unwrap_or(Duration::from_secs(600));
+    // The operator's --deadline bounds the WHOLE workflow (checked per node entry),
+    // and --max-tokens is the whole-workflow intelligence pool.
+    let deadline = Some(std::time::Instant::now() + node_timeout);
     let result = drive_pinned(
         &graph,
         &payload.intelligence.uri,
@@ -647,6 +650,7 @@ fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
         cfg.max_steps,
         cfg.max_tokens,
         node_timeout,
+        deadline,
         log,
     );
     let outcome = match result {
@@ -676,7 +680,12 @@ fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
     };
     log.info(
         "proc.exit",
-        json!({"workflow_status": format!("{:?}", outcome.status), "steps": outcome.steps, "code": code}),
+        json!({
+            "workflow_status": format!("{:?}", outcome.status),
+            "reason": outcome.reason,
+            "steps": outcome.steps,
+            "code": code,
+        }),
     );
     code
 }

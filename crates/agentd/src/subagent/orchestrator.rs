@@ -206,7 +206,10 @@ impl Orchestrator {
         }
         let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
         if uri.is_empty() {
-            return ("error: await_resource requires a non-empty 'uri'".into(), true);
+            return (
+                "error: await_resource requires a non-empty 'uri'".into(),
+                true,
+            );
         }
         let Some(cond) = args.get("condition") else {
             return (
@@ -216,15 +219,20 @@ impl Orchestrator {
         };
         // Validate the predicate now so a bad one is refused as a tool result.
         if let Err(e) = crate::triggers::router::Condition::from_json(cond) {
-            return (format!("error: invalid await_resource condition: {e}"), true);
+            return (
+                format!("error: invalid await_resource condition: {e}"),
+                true,
+            );
         }
         self.subscriptions.push(SubscriptionRequest {
             uri: uri.to_string(),
             action: SubscriptionAction::Subscribe,
             condition: Some(cond.clone()),
         });
-        self.log
-            .info("self.await_resource", json!({"uri": uri, "condition": cond}));
+        self.log.info(
+            "self.await_resource",
+            json!({"uri": uri, "condition": cond}),
+        );
         (
             format!(
                 "parked: the daemon will re-enter this session when {uri} satisfies the condition"
@@ -245,14 +253,20 @@ impl Orchestrator {
             return refused("maximum workflows defined for this run");
         }
         let Some(graph_val) = args.get("workflow") else {
-            return ("error: workflow.define requires a 'workflow' object".into(), true);
+            return (
+                "error: workflow.define requires a 'workflow' object".into(),
+                true,
+            );
         };
         let graph: crate::graph::Graph = match serde_json::from_value(graph_val.clone()) {
             Ok(g) => g,
             Err(e) => return (format!("error: malformed workflow: {e}"), true),
         };
         if let Err(errs) = graph.validate() {
-            return (format!("error: invalid workflow: {}", errs.join("; ")), true);
+            return (
+                format!("error: invalid workflow: {}", errs.join("; ")),
+                true,
+            );
         }
         self.workflow_seq += 1;
         let id = format!("w{}", self.workflow_seq);
@@ -273,7 +287,10 @@ impl Orchestrator {
     /// leaves the stored graph UNCHANGED and is refused as a tool result.
     #[cfg(feature = "workflow")]
     fn workflow_patch(&mut self, args: &Value) -> (String, bool) {
-        let id = args.get("workflow_id").and_then(Value::as_str).unwrap_or("");
+        let id = args
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if id.is_empty() {
             return ("error: workflow.patch requires 'workflow_id'".into(), true);
         }
@@ -291,7 +308,8 @@ impl Orchestrator {
         }
         let n = patched.nodes.len();
         self.workflows.insert(id.to_string(), patched);
-        self.log.info("workflow.patch", json!({"workflow_id": id, "nodes": n}));
+        self.log
+            .info("workflow.patch", json!({"workflow_id": id, "nodes": n}));
         (format!("workflow {id} patched ({n} nodes)"), false)
     }
 
@@ -307,7 +325,10 @@ impl Orchestrator {
     #[cfg(feature = "workflow")]
     fn workflow_run(&mut self, args: &Value) -> (String, bool) {
         use crate::graph::GraphStatus;
-        let id = args.get("workflow_id").and_then(Value::as_str).unwrap_or("");
+        let id = args
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if id.is_empty() {
             return ("error: workflow.run requires 'workflow_id'".into(), true);
         }
@@ -491,7 +512,10 @@ impl Orchestrator {
             Some(v) => match serde_json::from_value::<crate::graph::Graph>(v.clone()) {
                 Ok(g) => {
                     if let Err(errs) = g.validate() {
-                        return (format!("error: invalid workflow: {}", errs.join("; ")), true);
+                        return (
+                            format!("error: invalid workflow: {}", errs.join("; ")),
+                            true,
+                        );
                     }
                     Some(g)
                 }
@@ -1221,7 +1245,8 @@ fn workflow_define_tool_def() -> ToolDef {
     #[allow(unused_mut)]
     let mut def = ToolDef {
         name: "workflow.define".into(),
-        description: "Define a workflow: a graph of nodes connected by labelled edges — cycles and \
+        description:
+            "Define a workflow: a graph of nodes connected by labelled edges — cycles and \
             conditional branches allowed — that agentd drives to process work items by itself. \
             Node kinds: agent (a full agentic turn), tool (one MCP call; args may embed \
             {\"$from\": key, \"pointer\": \"/p\", \"default\": v} blackboard references), assign \
@@ -1236,7 +1261,7 @@ fn workflow_define_tool_def() -> ToolDef {
             structurally (it must be able to reach a halt) and returns a workflow id you then pass \
             to workflow.run. Use this to orchestrate multi-step, looping, or conditional work \
             without hand-holding each turn."
-            .into(),
+                .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -1551,7 +1576,9 @@ mod tests {
                 "h": {"kind": "halt", "status": "completed"}
             }
         });
-        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
+        let (obs, err) = root
+            .handle("workflow.define", &json!({"workflow": g}))
+            .unwrap();
         assert!(!err, "{obs}");
         let id = obs.split_whitespace().nth(2).unwrap().to_string(); // "workflow defined: w1 (...)"
         // A valid additive patch is accepted.
@@ -1604,16 +1631,25 @@ mod tests {
                 "fail": {"kind": "halt", "status": "crashed"}
             }
         });
-        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
+        let (obs, err) = root
+            .handle("workflow.define", &json!({"workflow": g}))
+            .unwrap();
         assert!(!err, "{obs}");
         let id = obs.split_whitespace().nth(2).unwrap().to_string();
         // Run it: the agent node fails on refused intel → error edge → crashed halt.
-        let (obs, err) = root.handle("workflow.run", &json!({"workflow_id": id})).unwrap();
+        let (obs, err) = root
+            .handle("workflow.run", &json!({"workflow_id": id}))
+            .unwrap();
         assert!(err, "a graph that halts crashed is an error result: {obs}");
-        assert!(obs.contains("\"status\""), "workflow.run returns a status summary: {obs}");
+        assert!(
+            obs.contains("\"status\""),
+            "workflow.run returns a status summary: {obs}"
+        );
         // An unknown / missing id is refused (never drives).
         assert!(
-            root.handle("workflow.run", &json!({"workflow_id": "gX"})).unwrap().1,
+            root.handle("workflow.run", &json!({"workflow_id": "gX"}))
+                .unwrap()
+                .1,
             "unknown id refused"
         );
         assert!(
@@ -1633,7 +1669,11 @@ mod tests {
             logger(),
         );
         assert!(!child.tools().iter().any(|t| t.name == "workflow.define"));
-        assert!(child.handle("workflow.define", &json!({"workflow": {}})).is_none());
+        assert!(
+            child
+                .handle("workflow.define", &json!({"workflow": {}}))
+                .is_none()
+        );
 
         let mut root = Orchestrator::from_payload(
             "agentd".into(),
@@ -1653,7 +1693,9 @@ mod tests {
                 "h": {"kind": "halt", "status": "completed"}
             }
         });
-        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
+        let (obs, err) = root
+            .handle("workflow.define", &json!({"workflow": g}))
+            .unwrap();
         assert!(!err, "{obs}");
         assert!(obs.contains("workflow defined"), "{obs}");
         // A structurally invalid graph (a bare self-loop, no reachable halt) is
@@ -1662,7 +1704,9 @@ mod tests {
             "start": "a",
             "nodes": {"a": {"kind": "agent", "instruction": "spin", "edges": {"ok": "a"}}}
         });
-        let (obs, err) = root.handle("workflow.define", &json!({"workflow": bad})).unwrap();
+        let (obs, err) = root
+            .handle("workflow.define", &json!({"workflow": bad}))
+            .unwrap();
         assert!(err, "no-halt graph must be refused: {obs}");
         assert!(obs.contains("invalid workflow"), "{obs}");
         // Missing 'graph' arg is refused.
@@ -1720,7 +1764,9 @@ mod tests {
                 "h": {"kind": "halt", "status": "completed"}
             }
         });
-        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
+        let (obs, err) = root
+            .handle("workflow.define", &json!({"workflow": g}))
+            .unwrap();
         assert!(!err, "{obs}");
         let id = obs.split_whitespace().nth(2).unwrap().to_string();
         // detach → the spawn path returns a HANDLE immediately (the child drives
@@ -1935,7 +1981,10 @@ mod tests {
         // Sanity: the guard is checking a non-trivial set (the root reactive +
         // delegation primitives are actually present).
         for expect in ["subagent.spawn", "schedule", "subscribe", "unsubscribe"] {
-            assert!(names.iter().any(|n| n == expect), "root advertises {expect}");
+            assert!(
+                names.iter().any(|n| n == expect),
+                "root advertises {expect}"
+            );
         }
         // Principle 2: no advertised self-tool is a local-exec primitive.
         for n in &names {

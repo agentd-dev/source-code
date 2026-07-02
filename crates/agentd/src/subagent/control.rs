@@ -672,9 +672,7 @@ fn run_workflow_child(
             log,
         );
         return match result {
-            crate::graph::DriveResult::Done(o) => {
-                finish_workflow_child(o, entry_tokens, up, log)
-            }
+            crate::graph::DriveResult::Done(o) => finish_workflow_child(o, entry_tokens, up, log),
             crate::graph::DriveResult::Suspended(s) => {
                 log.info(
                     "workflow.suspended",
@@ -1095,14 +1093,26 @@ mod tests {
         // No swap pending → never a restart.
         assert!(!restart_turn_pending(&pending, "m"));
         // A finish-on-old swap (even a model change) → never a restart.
-        *pending.lock().unwrap() = Some(swap_to("https://a.example", Some("big"), SwapPolicy::FinishOnOld));
+        *pending.lock().unwrap() = Some(swap_to(
+            "https://a.example",
+            Some("big"),
+            SwapPolicy::FinishOnOld,
+        ));
         assert!(!restart_turn_pending(&pending, "small"));
         // A restart-turn swap that does NOT change the model (endpoint repoint) →
         // never a restart (a repoint is always finish-on-old / invisible, §5.1).
-        *pending.lock().unwrap() = Some(swap_to("https://a.example", Some("small"), SwapPolicy::RestartTurn));
+        *pending.lock().unwrap() = Some(swap_to(
+            "https://a.example",
+            Some("small"),
+            SwapPolicy::RestartTurn,
+        ));
         assert!(!restart_turn_pending(&pending, "small"));
         // A restart-turn swap that DOES change the model → a restart.
-        *pending.lock().unwrap() = Some(swap_to("https://a.example", Some("big"), SwapPolicy::RestartTurn));
+        *pending.lock().unwrap() = Some(swap_to(
+            "https://a.example",
+            Some("big"),
+            SwapPolicy::RestartTurn,
+        ));
         assert!(restart_turn_pending(&pending, "small"));
     }
 
@@ -1144,7 +1154,8 @@ mod tests {
         // RFC 0018 §5.2: an unparseable new list never tears a working run — the
         // old client is kept; only the model (a plain string) is still adopted.
         let pending: PendingSwap = Arc::new(Mutex::new(None));
-        let mut intel = IntelClient::from_parts("https://old.example,https://old2.example", None).unwrap();
+        let mut intel =
+            IntelClient::from_parts("https://old.example,https://old2.example", None).unwrap();
         let mut model = "old".to_string();
         *pending.lock().unwrap() = Some(swap_to("", Some("new"), SwapPolicy::FinishOnOld));
         apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());

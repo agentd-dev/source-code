@@ -127,18 +127,13 @@ mod imp {
         }
     }
 
-    pub fn eval(
-        expr: &str,
-        vars: &[(&str, &Value)],
-    ) -> Result<cel_interpreter::Value, String> {
+    pub fn eval(expr: &str, vars: &[(&str, &Value)]) -> Result<cel_interpreter::Value, String> {
         let program = compile(expr)?;
         let mut ctx = cel_interpreter::Context::default();
         for (name, value) in vars {
             ctx.add_variable_from_value(name.to_string(), to_cel(value));
         }
-        program
-            .execute(&ctx)
-            .map_err(|e| format!("CEL eval: {e}"))
+        program.execute(&ctx).map_err(|e| format!("CEL eval: {e}"))
     }
 }
 
@@ -171,9 +166,7 @@ mod tests {
             let vars = vec![("a", &a), ("b", &b)];
             assert!(eval_bool("a.count + 1 > b.limit * 1", &vars).unwrap());
             assert!(eval_bool("a.items.exists(i, i.s == 'bad')", &vars).unwrap());
-            assert!(
-                eval_bool("a.items.filter(i, i.s == 'ok').size() == 1", &vars).unwrap()
-            );
+            assert!(eval_bool("a.items.filter(i, i.s == 'ok').size() == 1", &vars).unwrap());
             // Non-bool result is an error, not a coercion.
             assert!(eval_bool("a.count", &vars).is_err());
             // An undeclared reference is an eval error (callers fail closed).
@@ -186,8 +179,11 @@ mod tests {
             let vars = vec![("scan", &scan)];
             let v = eval_value("scan.items.filter(i, i.ok).map(i, i.id)", &vars).unwrap();
             assert_eq!(v, json!([1, 3]));
-            let v = eval_value("{'total': scan.items.size(), 'first': scan.items[0].id}", &vars)
-                .unwrap();
+            let v = eval_value(
+                "{'total': scan.items.size(), 'first': scan.items[0].id}",
+                &vars,
+            )
+            .unwrap();
             assert_eq!(v, json!({"total": 3, "first": 1}));
         }
     }

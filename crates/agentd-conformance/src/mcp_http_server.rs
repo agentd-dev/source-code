@@ -77,9 +77,8 @@ where
     }
     // POST: one JSON-RPC frame.
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
-        let _ = stream.write_all(
-            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let _ = stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     };
     match handle(&req, &notifier) {

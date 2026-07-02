@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 // keep resolving for the sibling `a2a` module and tests, and imports the
 // subscription-registry helpers (identical signatures) so this module's many
 // notify call sites read unchanged.
-pub use ::mcp::server::{PeerOrigin, ServeStream};
 pub(crate) use ::mcp::server::SharedWriter;
+pub use ::mcp::server::{PeerOrigin, ServeStream};
 use ::mcp::server::{
     SubRegistry, notify_resource_updated, notify_resource_updated_keep, register_subscriber,
 };
@@ -203,6 +203,7 @@ struct ServedSession {
     /// tools toggle it; the run's supervisor reactor forwards `ctrl/pause`/
     /// `ctrl/resume` to its live children on each edge. The async parallel of
     /// `cancel` — a shared atomic the reactor reads, never the child directly.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
     paused: Arc<AtomicBool>,
     /// Per-run intelligence hot-swap channel (RFC 0018 §5.2): a hot reload that
     /// touches `intelligence`/`model` publishes the new config here; the run's
@@ -1230,13 +1231,17 @@ impl ::mcp::server::Handler for ServeHandler {
     }
 
     fn on_connect(&self, origin: PeerOrigin, conn: u64) {
-        self.log
-            .info("mcp.connect", json!({"origin": origin.as_str(), "conn": conn}));
+        self.log.info(
+            "mcp.connect",
+            json!({"origin": origin.as_str(), "conn": conn}),
+        );
     }
 
     fn on_disconnect(&self, origin: PeerOrigin, conn: u64) {
-        self.log
-            .debug("mcp.disconnect", json!({"origin": origin.as_str(), "conn": conn}));
+        self.log.debug(
+            "mcp.disconnect",
+            json!({"origin": origin.as_str(), "conn": conn}),
+        );
     }
 }
 
@@ -2115,7 +2120,10 @@ fn admin_result(resp: Response) -> Response {
             Response::err(resp.id, json::INVALID_PARAMS, msg)
         }
         Some(r) => {
-            let body = r.get("structuredContent").cloned().unwrap_or_else(|| json!({}));
+            let body = r
+                .get("structuredContent")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             Response::ok(resp.id, body)
         }
         None => resp,
@@ -2130,6 +2138,7 @@ fn admin_result(resp: Response) -> Response {
 /// timeout (never above it, so an admin call can't push drain past the pod grace,
 /// RFC 0015 §8) — the latch itself carries no deadline, so the clamp only shapes
 /// the reported `eta_ms`.
+#[cfg(feature = "a2a")]
 fn handle_drain(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
     crate::signals::request_drain();
     let drain_timeout_ms = ctx.drain_timeout.as_millis() as u64;
@@ -2166,6 +2175,7 @@ fn handle_drain(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response 
 /// exiting. The override only ever pushes *toward* NotReady: clearing it restores
 /// the genuine computed readiness (it can't assert Ready over a not-ready
 /// supervisor — here, a drain in progress still holds `/readyz` down). Reversible.
+#[cfg(feature = "a2a")]
 fn handle_lame_duck(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
     // Default false: the unqualified call lame-ducks the instance (§4.2).
     let want_ready = args.get("ready").and_then(Value::as_bool).unwrap_or(false);
@@ -2202,6 +2212,7 @@ fn handle_lame_duck(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Respo
 /// instance-wide pause flag (so `agentd://inventory.paused` + the `agentd_paused`
 /// gauge reflect it, and runs launched while paused start paused). Returns
 /// `{paused:true, affected:N}` — N = the count of subtrees that took the message.
+#[cfg(feature = "a2a")]
 fn handle_pause(id: Id, ctx: &ServeCtx, log: &Logger) -> Response {
     crate::signals::set_paused(true);
     crate::obs::metrics::set_paused(true);
@@ -2224,6 +2235,7 @@ fn handle_pause(id: Id, ctx: &ServeCtx, log: &Logger) -> Response {
 /// `resume` (RFC 0015 §4.3) — clear a prior `pause`: fan `ctrl/resume` to every
 /// in-flight root subagent so each loop continues at its next turn. Clears the
 /// instance-wide pause flag. Returns `{paused:false, affected:N}`.
+#[cfg(feature = "a2a")]
 fn handle_resume(id: Id, ctx: &ServeCtx, log: &Logger) -> Response {
     crate::signals::set_paused(false);
     crate::obs::metrics::set_paused(false);
@@ -2255,6 +2267,7 @@ fn handle_resume(id: Id, ctx: &ServeCtx, log: &Logger) -> Response {
 ///
 /// Only live (non-terminal) subtrees are counted — a finished run can neither
 /// pause nor resume, so it does not contribute to `affected`.
+#[cfg(feature = "a2a")]
 fn fan_pause(ctx: &ServeCtx, want: bool) -> u64 {
     let mut affected = 0u64;
     let msg = if want {
@@ -2297,6 +2310,7 @@ fn fan_pause(ctx: &ServeCtx, want: bool) -> u64 {
 ///   invented.
 ///
 /// Only live (non-terminal) subtrees are counted into the returned `subtree_size`.
+#[cfg(feature = "a2a")]
 fn fan_cancel(ctx: &ServeCtx, reason: &str) -> u64 {
     let mut affected = 0u64;
     {
@@ -2341,6 +2355,7 @@ fn fan_cancel(ctx: &ServeCtx, reason: &str) -> u64 {
 /// successful result (a racing reap may have already removed it — RFC 0015 §8),
 /// not a protocol error. `cancel{handle:"0"}`/`"served.0"` targets the run, never
 /// the supervisor — distinct from `drain`, which also exits.
+#[cfg(feature = "a2a")]
 fn handle_cancel(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
     let handle = args
         .get("handle")
@@ -2410,6 +2425,7 @@ fn handle_cancel(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response
 }
 
 /// The cancel reason surfaced into `ctrl/cancel` + logs (RFC 0015 §4.4).
+#[cfg(feature = "a2a")]
 fn cancel_reason(args: &Value) -> String {
     args.get("reason")
         .and_then(Value::as_str)
@@ -3026,7 +3042,6 @@ fn session_cancel_tool_def() -> Value {
     })
 }
 
-
 #[cfg(all(test, feature = "serve-https"))]
 mod https_auth_tests {
     use super::{AgentdHttpAuth, PeerOrigin, ct_eq};
@@ -3040,7 +3055,10 @@ mod https_auth_tests {
     fn mtls_client_cert_mints_management() {
         // A verified peer cert is trusted regardless of any bearer config.
         let auth = AgentdHttpAuth { bearer: None };
-        assert_eq!(auth.authenticate(&parts(&[], true)), Some(PeerOrigin::Management));
+        assert_eq!(
+            auth.authenticate(&parts(&[], true)),
+            Some(PeerOrigin::Management)
+        );
     }
 
     #[test]
@@ -3048,12 +3066,21 @@ mod https_auth_tests {
         let auth = AgentdHttpAuth {
             bearer: Some("s3cret-token".into()),
         };
-        let ok = [("authorization".to_string(), "Bearer s3cret-token".to_string())];
-        assert_eq!(auth.authenticate(&parts(&ok, false)), Some(PeerOrigin::Management));
+        let ok = [(
+            "authorization".to_string(),
+            "Bearer s3cret-token".to_string(),
+        )];
+        assert_eq!(
+            auth.authenticate(&parts(&ok, false)),
+            Some(PeerOrigin::Management)
+        );
         // Wrong token, wrong scheme, and no header are all refused.
         let wrong = [("authorization".to_string(), "Bearer nope".to_string())];
         assert_eq!(auth.authenticate(&parts(&wrong, false)), None);
-        let basic = [("authorization".to_string(), "Basic s3cret-token".to_string())];
+        let basic = [(
+            "authorization".to_string(),
+            "Basic s3cret-token".to_string(),
+        )];
         assert_eq!(auth.authenticate(&parts(&basic, false)), None);
         assert_eq!(auth.authenticate(&parts(&[], false)), None);
     }
@@ -4070,6 +4097,7 @@ mod tests {
     // ── RFC 0015 chunk 3: the operator surface (drain / lame-duck / cancel,
     //    agentd://inventory, and the PeerOrigin gate). ──────────────────────────
 
+    #[cfg(feature = "a2a")]
     fn tool_names(r: &Response) -> Vec<String> {
         r.result
             .as_ref()
@@ -4090,7 +4118,14 @@ mod tests {
         // appears in `tools/list` — on either origin — and `OPERATOR_TOOLS`
         // now names A2A methods, none of which is a tool.
         for origin in [PeerOrigin::Management, PeerOrigin::Stdio] {
-            let listed = dispatch(req("tools/list", None), &ctx(), origin, &writer(), 0, &log());
+            let listed = dispatch(
+                req("tools/list", None),
+                &ctx(),
+                origin,
+                &writer(),
+                0,
+                &log(),
+            );
             let names = tool_names(&listed);
             for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
                 assert!(
@@ -4130,7 +4165,10 @@ mod tests {
         );
         // A non-Management caller of an admin method gets METHOD_NOT_FOUND (-32601).
         assert_eq!(
-            r.error.as_ref().expect("stdio a2a.Drain → JSON-RPC error").code,
+            r.error
+                .as_ref()
+                .expect("stdio a2a.Drain → JSON-RPC error")
+                .code,
             json::METHOD_NOT_FOUND,
             "stdio a2a.Drain → -32601 METHOD_NOT_FOUND"
         );
@@ -4240,7 +4278,10 @@ mod tests {
             // §4.2: can't assert Ready over a draining supervisor. The admin family
             // reports a refusal as a JSON-RPC error (INVALID_PARAMS), not a result.
             assert_eq!(
-                off.error.as_ref().expect("refusal is a protocol error").code,
+                off.error
+                    .as_ref()
+                    .expect("refusal is a protocol error")
+                    .code,
                 json::INVALID_PARAMS,
                 "clearing lame-duck under drain → INVALID_PARAMS"
             );
@@ -4403,7 +4444,10 @@ mod tests {
             0,
             &log(),
         );
-        let e = r.error.as_ref().expect("cancel of an unknown handle → error");
+        let e = r
+            .error
+            .as_ref()
+            .expect("cancel of an unknown handle → error");
         assert_eq!(e.code, json::INVALID_PARAMS);
         assert!(e.message.contains("no such handle"), "{}", e.message);
     }
@@ -4613,7 +4657,9 @@ mod tests {
         let cfg = crate::config::Config {
             run_id: "r1".into(),
             mode: crate::config::Mode::Reactive,
-            intelligence: Some("https://gw-a.example:8443,https://gw-b.example/v1/secret-path".into()),
+            intelligence: Some(
+                "https://gw-a.example:8443,https://gw-b.example/v1/secret-path".into(),
+            ),
             intelligence_token: Some("super-secret-tok".into()),
             model: Some("claude-opus-4".into()),
             ..crate::config::Config::default()

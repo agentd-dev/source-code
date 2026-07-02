@@ -56,7 +56,9 @@ pub fn inject_client_meta(
 /// carry no name/uri (no `Mcp-Name` header is sent for those).
 pub fn mcp_name(method: &str, params: &Value) -> Option<String> {
     match method {
-        "tools/call" | "prompts/get" => params.get("name").and_then(Value::as_str).map(String::from),
+        "tools/call" | "prompts/get" => {
+            params.get("name").and_then(Value::as_str).map(String::from)
+        }
         "resources/read" => params.get("uri").and_then(Value::as_str).map(String::from),
         _ => None,
     }
@@ -203,8 +205,7 @@ fn validate_header_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("empty x-mcp-header".into());
     }
-    let is_tchar =
-        |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+    let is_tchar = |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
     if !name.bytes().all(is_tchar) {
         return Err(format!("x-mcp-header '{name}' is not a valid HTTP token"));
     }
@@ -214,8 +215,7 @@ fn validate_header_name(name: &str) -> Result<(), String> {
 /// Standard Base64 (RFC 4648, with `=` padding). Hand-rolled — no base64 crate
 /// (the minimalism moat); only used for the header sentinel above.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -256,7 +256,10 @@ mod tests {
         let caps = json!({"extensions": {"io.modelcontextprotocol/tasks": {}}});
         inject_client_meta(&mut params, "2026-07-28", &client(), &caps);
         let meta = &params["_meta"];
-        assert_eq!(meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
+        assert_eq!(
+            meta["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
         assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], "agentd");
         assert_eq!(
             meta["io.modelcontextprotocol/clientInfo"]["version"],
@@ -264,8 +267,7 @@ mod tests {
         );
         // The declared capabilities ride along (e.g. the tasks extension).
         assert_eq!(
-            meta["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                ["io.modelcontextprotocol/tasks"],
+            meta["io.modelcontextprotocol/clientCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
             json!({})
         );
         // The original params are preserved.
@@ -301,7 +303,10 @@ mod tests {
             "=?base64?SGVsbG8sIOS4lueVjA==?="
         );
         // A space forces encoding.
-        assert_eq!(header_value("a b"), format!("=?base64?{}?=", base64_encode(b"a b")));
+        assert_eq!(
+            header_value("a b"),
+            format!("=?base64?{}?=", base64_encode(b"a b"))
+        );
         // A value that looks like the sentinel is itself encoded.
         assert!(header_value("=?base64?x?=").starts_with("=?base64?"));
     }
@@ -334,36 +339,46 @@ mod tests {
     #[test]
     fn validate_accepts_valid_and_rejects_invalid() {
         // Valid: primitive, reachable, unique.
-        assert!(validate_x_mcp_headers(&json!({
-            "type": "object",
-            "properties": {"r": {"type": "string", "x-mcp-header": "Region"}}
-        }))
-        .is_ok());
+        assert!(
+            validate_x_mcp_headers(&json!({
+                "type": "object",
+                "properties": {"r": {"type": "string", "x-mcp-header": "Region"}}
+            }))
+            .is_ok()
+        );
         // number type is not permitted.
-        assert!(validate_x_mcp_headers(&json!({
-            "properties": {"n": {"type": "number", "x-mcp-header": "N"}}
-        }))
-        .is_err());
+        assert!(
+            validate_x_mcp_headers(&json!({
+                "properties": {"n": {"type": "number", "x-mcp-header": "N"}}
+            }))
+            .is_err()
+        );
         // Duplicate (case-insensitive) names.
-        assert!(validate_x_mcp_headers(&json!({
-            "properties": {
-                "a": {"type": "string", "x-mcp-header": "Dup"},
-                "b": {"type": "string", "x-mcp-header": "dup"}
-            }
-        }))
-        .is_err());
+        assert!(
+            validate_x_mcp_headers(&json!({
+                "properties": {
+                    "a": {"type": "string", "x-mcp-header": "Dup"},
+                    "b": {"type": "string", "x-mcp-header": "dup"}
+                }
+            }))
+            .is_err()
+        );
         // Not statically reachable (under `items`).
-        assert!(validate_x_mcp_headers(&json!({
-            "properties": {"list": {"type": "array",
-                "items": {"type": "object", "properties": {
-                    "x": {"type": "string", "x-mcp-header": "X"}}}}}
-        }))
-        .is_err());
+        assert!(
+            validate_x_mcp_headers(&json!({
+                "properties": {"list": {"type": "array",
+                    "items": {"type": "object", "properties": {
+                        "x": {"type": "string", "x-mcp-header": "X"}}}}}
+            }))
+            .is_err()
+        );
         // Invalid HTTP token character.
-        assert!(validate_x_mcp_headers(&json!({
-            "properties": {"a": {"type": "string", "x-mcp-header": "bad name"}}
-        }))
-        .is_err());
+        assert!(
+            validate_x_mcp_headers(&json!({
+                "properties": {"a": {"type": "string", "x-mcp-header": "bad name"}}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -174,8 +174,7 @@ fn sighup_applies_an_intelligence_repoint_as_a_hot_swap() {
     // RELOADABLE hot-swap — applied (config.reloaded + intel.swap), NOT rejected.
     // The endpoints are unreachable (no live LLM), but the reload BEHAVIOUR — the
     // swap is accepted, the daemon stays up, drains to 0 — is fully observable.
-    let initial =
-        r#"{ "intelligence": "http://127.0.0.2:9", "model": "m", "log_level": "info" }"#;
+    let initial = r#"{ "intelligence": "http://127.0.0.2:9", "model": "m", "log_level": "info" }"#;
     let changed = r#"{ "intelligence": "http://127.0.0.3:9,http://127.0.0.4:9", "model": "m", "model_swap": "restart-turn", "log_level": "info" }"#;
     let (code, out) = run_reload_intel_in_file(initial, changed);
 

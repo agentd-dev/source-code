@@ -88,7 +88,10 @@ impl Peer {
                     addr: addr.to_string(),
                 };
             }
-            assert!(Instant::now() < deadline, "served HTTP port never accepted: {addr}");
+            assert!(
+                Instant::now() < deadline,
+                "served HTTP port never accepted: {addr}"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
@@ -113,7 +116,8 @@ impl Peer {
         }
         let mut payload = String::new();
         reader.read_to_string(&mut payload).expect("read rpc body");
-        serde_json::from_str(&payload).unwrap_or_else(|e| panic!("reply not json ({e}): {payload:?}"))
+        serde_json::from_str(&payload)
+            .unwrap_or_else(|e| panic!("reply not json ({e}): {payload:?}"))
     }
 
     /// Open a modern `subscriptions/listen` SSE stream for `uris`; returns a
@@ -226,20 +230,19 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // tools/list advertises `status`
-    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-    );
+    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert_eq!(list["result"]["tools"][0]["name"], "status", "list: {list}");
 
     // tools/call status returns this daemon's live state
-    let status = peer.rpc(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status"}}"#,
-    );
+    let status =
+        peer.rpc(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status"}}"#);
     assert_eq!(status["result"]["isError"], false, "status: {status}");
     assert_eq!(status["result"]["structuredContent"]["mode"], "loop");
     assert!(status["result"]["structuredContent"]["uptime_ms"].is_number());
 
     // an unknown tool is a JSON-RPC error, not a panic
-    let bad = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ghost"}}"#,
-    );
+    let bad =
+        peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ghost"}}"#);
     assert!(bad["error"].is_object(), "bad tool should error: {bad}");
 
     // subagent.spawn delegates a real run. The spawned agent fails on the
@@ -268,15 +271,15 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // resources/list advertises the agentd:// surface
-    let res_list = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#,
-    );
+    let res_list = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#);
     assert_eq!(
         res_list["result"]["resources"][0]["uri"], "agent://status",
         "resources/list: {res_list}"
     );
 
     // resources/read agentd://status returns a contents body with the live state
-    let res_read = peer.rpc(r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"agentd://status"}}"#,
+    let res_read = peer.rpc(
+        r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"agentd://status"}}"#,
     );
     let entry = &res_read["result"]["contents"][0];
     assert_eq!(
@@ -292,7 +295,8 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // an unknown agentd:// uri is a JSON-RPC error
-    let bad_read = peer.rpc(r#"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"agentd://ghost"}}"#,
+    let bad_read = peer.rpc(
+        r#"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"agentd://ghost"}}"#,
     );
     assert!(
         bad_read["error"].is_object(),
@@ -311,8 +315,7 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let (mut child, addr) = start_idle_daemon(exe, "http://127.0.0.1:9");
 
     let peer = Peer::connect(&addr);
-    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-    );
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
 
     // async spawn → a handle immediately, status running (NON-blocking).
     let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing","async":true}}}"#,
@@ -323,9 +326,7 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let handle = sc["handle"].as_str().expect("handle").to_string();
 
     // poll the registry until the run terminates → failed (intel unreachable)
-    let body = poll_until_done(&peer, &handle,
-        Instant::now() + Duration::from_secs(20),
-    );
+    let body = poll_until_done(&peer, &handle, Instant::now() + Duration::from_secs(20));
     assert_eq!(
         body["status"], "failed",
         "intel-unreachable async run → failed: {body}"
@@ -444,8 +445,7 @@ fn a_warm_session_runs_a_turn_per_send() {
     let (mut child, addr) = start_idle_daemon(exe, &intel);
 
     let peer = Peer::connect(&addr);
-    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-    );
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
 
     // warm spawn → a live session (turn 1 runs from the instruction).
     let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"hello","warm":true}}}"#,
@@ -459,10 +459,7 @@ fn a_warm_session_runs_a_turn_per_send() {
         .expect("handle")
         .to_string();
 
-    let t1 = poll_warm_turns(&peer, &handle,
-        1,
-        Instant::now() + Duration::from_secs(15),
-    );
+    let t1 = poll_warm_turns(&peer, &handle, 1, Instant::now() + Duration::from_secs(15));
     assert!(t1 >= 1, "the warm session runs turn 1 from the instruction");
 
     // send another message → a SECOND turn over the same live session.
@@ -481,10 +478,7 @@ fn a_warm_session_runs_a_turn_per_send() {
         "send reports the awaited turn: {sent}"
     );
 
-    let t2 = poll_warm_turns(&peer, &handle,
-        2,
-        Instant::now() + Duration::from_secs(15),
-    );
+    let t2 = poll_warm_turns(&peer, &handle, 2, Instant::now() + Duration::from_secs(15));
     assert!(
         t2 >= 2,
         "the SAME session ran a second turn from the injected message"
@@ -533,8 +527,7 @@ fn concurrent_async_runs_do_not_serialize() {
     let (mut child, addr) = start_idle_daemon(exe, &intel);
 
     let peer = Peer::connect(&addr);
-    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-    );
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
 
     let spawn_async = |id: u32| -> String {
         let line = format!(
@@ -560,9 +553,7 @@ fn concurrent_async_runs_do_not_serialize() {
 
     // Run 2 reaches a terminal "cancelled" promptly (drain ladder ~5-7s) —
     // well inside the 12s hang of run 1.
-    let body2 = poll_until_done(&peer, &h2,
-        Instant::now() + Duration::from_secs(15),
-    );
+    let body2 = poll_until_done(&peer, &h2, Instant::now() + Duration::from_secs(15));
     assert_eq!(body2["status"], "cancelled", "run 2 drained: {body2}");
 
     // ...and run 1 is STILL running at that moment (not blocked, not finished) —
@@ -594,8 +585,7 @@ fn cancel_drains_a_live_async_run() {
     let (mut child, addr) = start_idle_daemon(exe, &intel);
 
     let peer = Peer::connect(&addr);
-    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-    );
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
 
     let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a slow thing","async":true}}}"#,
     );
@@ -617,9 +607,7 @@ fn cancel_drains_a_live_async_run() {
 
     // It reaches a terminal "cancelled" state well before the 30s hang → the
     // reactor's per-run cancel token drained the live subtree.
-    let body = poll_until_done(&peer, &handle,
-        Instant::now() + Duration::from_secs(20),
-    );
+    let body = poll_until_done(&peer, &handle, Instant::now() + Duration::from_secs(20));
     assert_eq!(
         body["status"], "cancelled",
         "a cancelled live run is reported cancelled: {body}"
@@ -645,13 +633,11 @@ fn management_peer_drives_the_operator_surface() {
     let (mut child, addr) = start_idle_daemon(exe, "http://127.0.0.1:9");
 
     let peer = Peer::connect(&addr);
-    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-    );
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
 
     // Operator control is the A2A admin family now — NOT tools. tools/list to a
     // management peer carries the self/work tools but none of the operator surface.
-    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-    );
+    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let names: Vec<&str> = list["result"]["tools"]
         .as_array()
         .unwrap()
@@ -659,7 +645,10 @@ fn management_peer_drives_the_operator_surface() {
         .filter_map(|t| t["name"].as_str())
         .collect();
     for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
-        assert!(!names.contains(&t), "operator control is not a tool: {names:?}");
+        assert!(
+            !names.contains(&t),
+            "operator control is not a tool: {names:?}"
+        );
     }
     assert!(names.contains(&"status"), "self tools present: {names:?}");
 
@@ -677,8 +666,7 @@ fn management_peer_drives_the_operator_surface() {
     // subagents on this idle daemon → affected:0) and is reversible. NOT a drain
     // and NOT a lame-duck: readiness is unchanged by pause (RFC 0015 §4.3). The
     // admin methods return the structured body directly (no tool-result envelope).
-    let pause = peer.rpc(r#"{"jsonrpc":"2.0","id":31,"method":"a2a.Pause"}"#,
-    );
+    let pause = peer.rpc(r#"{"jsonrpc":"2.0","id":31,"method":"a2a.Pause"}"#);
     assert!(pause["error"].is_null(), "pause: {pause}");
     assert_eq!(pause["result"]["paused"], true);
     assert_eq!(pause["result"]["affected"], 0);
@@ -696,8 +684,7 @@ fn management_peer_drives_the_operator_surface() {
     assert_eq!(inv_p["ready"], true, "pause is not lame-duck → still ready");
     assert_eq!(inv_p["draining"], false, "pause is not drain");
     // a2a.Resume clears it.
-    let resume = peer.rpc(r#"{"jsonrpc":"2.0","id":33,"method":"a2a.Resume"}"#,
-    );
+    let resume = peer.rpc(r#"{"jsonrpc":"2.0","id":33,"method":"a2a.Resume"}"#);
     assert_eq!(resume["result"]["paused"], false);
     let inv_r: serde_json::Value = serde_json::from_str(
         peer.rpc(r#"{"jsonrpc":"2.0","id":34,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
@@ -709,8 +696,7 @@ fn management_peer_drives_the_operator_surface() {
     assert_eq!(inv_r["paused"], false, "resume cleared the flag: {inv_r}");
 
     // a2a.LameDuck flips readiness in the projection (no exit, no drain).
-    let ld = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"a2a.LameDuck"}"#,
-    );
+    let ld = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"a2a.LameDuck"}"#);
     assert!(ld["error"].is_null(), "lame-duck: {ld}");
     assert_eq!(ld["result"]["ready"], false);
     let inv2 = peer.rpc(r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
@@ -724,8 +710,8 @@ fn management_peer_drives_the_operator_surface() {
 
     // a2a.Cancel of an unknown handle is a JSON-RPC error (the admin family reports
     // a refusal as INVALID_PARAMS, not an isError result).
-    let bad = peer.rpc(r#"{"jsonrpc":"2.0","id":6,"method":"a2a.Cancel","params":{"handle":"0.9.9"}}"#,
-    );
+    let bad =
+        peer.rpc(r#"{"jsonrpc":"2.0","id":6,"method":"a2a.Cancel","params":{"handle":"0.9.9"}}"#);
     assert!(bad["result"].is_null(), "cancel refusal is an error: {bad}");
     assert_eq!(bad["error"]["code"], -32602, "INVALID_PARAMS: {bad}");
     assert!(
@@ -738,8 +724,7 @@ fn management_peer_drives_the_operator_surface() {
 
     // a2a.Drain returns a snapshot immediately and latches draining; the daemon
     // then winds down and exits clean. (Tested last so the daemon can exit.)
-    let drain = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"a2a.Drain"}"#,
-    );
+    let drain = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"a2a.Drain"}"#);
     assert!(drain["error"].is_null(), "drain: {drain}");
     assert_eq!(drain["result"]["draining"], true);
     assert!(drain["result"]["drain_timeout_ms"].is_number());
@@ -817,7 +802,8 @@ fn send_streaming_message_streams_sse_frames_over_http() {
         head.push_str(&line);
     }
     assert!(
-        head.to_lowercase().contains("content-type: text/event-stream"),
+        head.to_lowercase()
+            .contains("content-type: text/event-stream"),
         "streaming method upgrades to SSE; head:\n{head}"
     );
 
@@ -844,7 +830,9 @@ fn send_streaming_message_streams_sse_frames_over_http() {
         "a WORKING frame streamed before the terminal one: {data_events:?}"
     );
     assert!(
-        data_events.iter().any(|d| d.contains("artifactUpdate") && d.contains("mock-llm done")),
+        data_events
+            .iter()
+            .any(|d| d.contains("artifactUpdate") && d.contains("mock-llm done")),
         "the distillate artifact frame streamed: {data_events:?}"
     );
     assert!(
@@ -958,6 +946,7 @@ fn one_agentd_delegates_to_another_over_a2a() {
 }
 
 /// Wait up to `timeout` for `child` to exit; return its code (None on timeout).
+#[cfg(feature = "a2a")]
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
     let deadline = Instant::now() + timeout;
     loop {

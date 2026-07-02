@@ -440,7 +440,10 @@ fn serve_self_mcp_https(
         match std::fs::read(p) {
             Ok(b) => Some(b),
             Err(e) => {
-                log.error("mcp.serve_fail", json!({"read": what, "path": p, "err": e.to_string()}));
+                log.error(
+                    "mcp.serve_fail",
+                    json!({"read": what, "path": p, "err": e.to_string()}),
+                );
                 None
             }
         }
@@ -467,7 +470,10 @@ fn serve_self_mcp_https(
         Some(tmpl) => match agentd::sec::secret::resolve(tmpl, &|k| std::env::var(k).ok()) {
             Ok(tok) => Some(tok),
             Err(e) => {
-                log.error("mcp.serve_fail", json!({"resolve": "serve-bearer", "err": e}));
+                log.error(
+                    "mcp.serve_fail",
+                    json!({"resolve": "serve-bearer", "err": e}),
+                );
                 return None;
             }
         },
@@ -485,7 +491,10 @@ fn serve_self_mcp_https(
     match agentd::mcp::server::serve_https(tls_cfg, ctx, log.clone()) {
         Ok(handle) => Some((handle, live_config)),
         Err(e) => {
-            log.error("mcp.serve_fail", json!({"transport": "https", "err": e.to_string()}));
+            log.error(
+                "mcp.serve_fail",
+                json!({"transport": "https", "err": e.to_string()}),
+            );
             None
         }
     }
@@ -638,7 +647,10 @@ fn load_workflow(path: &str, log: &Logger) -> Result<agentd::graph::Graph, i32> 
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            log.error("proc.exit", json!({"err": format!("read workflow '{path}': {e}")}));
+            log.error(
+                "proc.exit",
+                json!({"err": format!("read workflow '{path}': {e}")}),
+            );
             eprintln!("agentd: cannot read workflow file '{path}': {e}");
             return Err(exit::USAGE);
         }

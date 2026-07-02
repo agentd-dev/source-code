@@ -734,7 +734,11 @@ mod tests {
             }
         }
         assert_eq!(n_mcp, mcp.len(), "every MCP tool classified");
-        assert_eq!(n_self, SELF_CONTROL_TOOLS.len(), "every self tool classified");
+        assert_eq!(
+            n_self,
+            SELF_CONTROL_TOOLS.len(),
+            "every self tool classified"
+        );
         // Principle 2: the self/control class holds NO local-exec primitive.
         for bad in [
             "exec", "shell", "bash", "sh", "command", "system", "eval", "run",

@@ -28,9 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod driver;
 pub use driver::{
-    drive, drive_budgeted, drive_seeded, resume, Blackboard, DriveResult, GraphBudget,
-    GraphExec, GraphOutcome, GraphState, GraphStatus, JoinWait, Suspension, WaitOutcome,
-    MAX_VALUE_BYTES,
+    Blackboard, DriveResult, GraphBudget, GraphExec, GraphOutcome, GraphState, GraphStatus,
+    JoinWait, MAX_VALUE_BYTES, Suspension, WaitOutcome, drive, drive_budgeted, drive_seeded,
+    resume,
 };
 
 /// The LIVE reactive-workflow snapshot (`agent://workflow`): the daemon
@@ -60,7 +60,9 @@ pub mod live {
 }
 
 mod exec;
-pub use exec::{drive_connected, drive_connected_once, drive_pinned, ExecFactory, SessionExec, GRAPH_MAX_STEPS};
+pub use exec::{
+    ExecFactory, GRAPH_MAX_STEPS, SessionExec, drive_connected, drive_connected_once, drive_pinned,
+};
 
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;
@@ -278,10 +280,7 @@ pub fn resolve_refs(
 /// missing or non-scalar is an error (the node takes its `error` edge). RFC
 /// 6901 escaping is applied to expanded STRING values (`~` → `~0`, `/` → `~1`)
 /// so a key containing a slash cannot smuggle in extra path segments.
-fn expand_pointer(
-    pointer: &str,
-    blackboard: &BTreeMap<String, Value>,
-) -> Result<String, String> {
+fn expand_pointer(pointer: &str, blackboard: &BTreeMap<String, Value>) -> Result<String, String> {
     if !pointer.contains('{') {
         return Ok(pointer.to_string());
     }
@@ -643,10 +642,7 @@ pub enum Pred {
 /// against another); anything else is the literal itself. `None` when a
 /// reference does not resolve — the enclosing predicate is then `false`
 /// (fail-closed, even for `ne`: an unknown right-hand side compares to nothing).
-fn pred_value<'a>(
-    value: &'a Value,
-    blackboard: &'a BTreeMap<String, Value>,
-) -> Option<&'a Value> {
+fn pred_value<'a>(value: &'a Value, blackboard: &'a BTreeMap<String, Value>) -> Option<&'a Value> {
     match value {
         Value::Object(m) if m.contains_key("$from") => {
             let key = m.get("$from")?.as_str()?;
@@ -663,61 +659,94 @@ impl Pred {
     /// (never panics), so an incomplete blackboard just fails the predicate.
     pub fn eval(&self, blackboard: &BTreeMap<String, Value>) -> bool {
         match self {
-            Pred::Eq { key, pointer, value } => {
-                match (at(blackboard, key, pointer), pred_value(value, blackboard)) {
-                    (Some(l), Some(r)) => l == r,
-                    _ => false,
-                }
-            }
-            Pred::Ne { key, pointer, value } => match pred_value(value, blackboard) {
+            Pred::Eq {
+                key,
+                pointer,
+                value,
+            } => match (at(blackboard, key, pointer), pred_value(value, blackboard)) {
+                (Some(l), Some(r)) => l == r,
+                _ => false,
+            },
+            Pred::Ne {
+                key,
+                pointer,
+                value,
+            } => match pred_value(value, blackboard) {
                 // An absent LEFT side is "not equal" (as before); an unresolvable
                 // RIGHT-side reference is fail-closed false.
                 Some(r) => at(blackboard, key, pointer) != Some(r),
                 None => false,
             },
-            Pred::Lt { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
-                .is_some_and(|(l, r)| l < r),
-            Pred::Gt { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
-                .is_some_and(|(l, r)| l > r),
-            Pred::Lte { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
-                .is_some_and(|(l, r)| l <= r),
-            Pred::Gte { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
-                .is_some_and(|(l, r)| l >= r),
-            Pred::In { key, pointer, values } => {
-                at(blackboard, key, pointer).is_some_and(|l| {
-                    values
-                        .iter()
-                        .any(|v| pred_value(v, blackboard).is_some_and(|r| r == l))
-                })
-            }
-            Pred::StartsWith { key, pointer, value } => at(blackboard, key, pointer)
+            Pred::Lt {
+                key,
+                pointer,
+                value,
+            } => num_cmp(blackboard, key, pointer, value).is_some_and(|(l, r)| l < r),
+            Pred::Gt {
+                key,
+                pointer,
+                value,
+            } => num_cmp(blackboard, key, pointer, value).is_some_and(|(l, r)| l > r),
+            Pred::Lte {
+                key,
+                pointer,
+                value,
+            } => num_cmp(blackboard, key, pointer, value).is_some_and(|(l, r)| l <= r),
+            Pred::Gte {
+                key,
+                pointer,
+                value,
+            } => num_cmp(blackboard, key, pointer, value).is_some_and(|(l, r)| l >= r),
+            Pred::In {
+                key,
+                pointer,
+                values,
+            } => at(blackboard, key, pointer).is_some_and(|l| {
+                values
+                    .iter()
+                    .any(|v| pred_value(v, blackboard).is_some_and(|r| r == l))
+            }),
+            Pred::StartsWith {
+                key,
+                pointer,
+                value,
+            } => at(blackboard, key, pointer)
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.starts_with(value.as_str())),
-            Pred::EndsWith { key, pointer, value } => at(blackboard, key, pointer)
+            Pred::EndsWith {
+                key,
+                pointer,
+                value,
+            } => at(blackboard, key, pointer)
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.ends_with(value.as_str())),
-            Pred::Len { key, pointer, min, max } => {
+            Pred::Len {
+                key,
+                pointer,
+                min,
+                max,
+            } => {
                 let len = match at(blackboard, key, pointer) {
                     Some(Value::String(s)) => Some(s.chars().count() as u64),
                     Some(Value::Array(a)) => Some(a.len() as u64),
                     Some(Value::Object(o)) => Some(o.len() as u64),
                     _ => None,
                 };
-                len.is_some_and(|n| {
-                    min.is_none_or(|lo| n >= lo) && max.is_none_or(|hi| n <= hi)
-                })
+                len.is_some_and(|n| min.is_none_or(|lo| n >= lo) && max.is_none_or(|hi| n <= hi))
             }
             Pred::Exists { key, pointer } => {
                 at(blackboard, key, pointer).is_some_and(|v| !v.is_null())
             }
-            Pred::Contains { key, pointer, value } => {
+            Pred::Contains {
+                key,
+                pointer,
+                value,
+            } => {
                 let Some(needle) = pred_value(value, blackboard) else {
                     return false;
                 };
                 match at(blackboard, key, pointer) {
-                    Some(Value::String(s)) => {
-                        needle.as_str().is_some_and(|n| s.contains(n))
-                    }
+                    Some(Value::String(s)) => needle.as_str().is_some_and(|n| s.contains(n)),
                     Some(Value::Array(a)) => a.contains(needle),
                     _ => false,
                 }
@@ -741,15 +770,15 @@ impl Pred {
             Pred::In { values, .. } if values.is_empty() => {
                 Some("`in` with an empty values set can never hold".into())
             }
-            Pred::Len { min: Some(lo), max: Some(hi), .. } if lo > hi => {
-                Some(format!("`len` bounds are inverted (min {lo} > max {hi})"))
-            }
+            Pred::Len {
+                min: Some(lo),
+                max: Some(hi),
+                ..
+            } if lo > hi => Some(format!("`len` bounds are inverted (min {lo} > max {hi})")),
             Pred::Cel { expr } => crate::cel::compile_check(expr)
                 .err()
                 .map(|e| format!("`cel` predicate: {e}")),
-            Pred::All { preds } | Pred::Any { preds } => {
-                preds.iter().find_map(|p| p.check())
-            }
+            Pred::All { preds } | Pred::Any { preds } => preds.iter().find_map(|p| p.check()),
             Pred::Not { pred } => pred.check(),
             _ => None,
         }
@@ -789,7 +818,11 @@ impl Node {
             | Node::Join { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges.values().collect(),
-            Node::Branch { cases, default, semantic } => {
+            Node::Branch {
+                cases,
+                default,
+                semantic,
+            } => {
                 let mut t: Vec<&NodeId> = cases.iter().map(|c| &c.goto).collect();
                 t.push(default);
                 // A Tier-2 semantic branch can also route to any of its choice nodes.
@@ -866,11 +899,7 @@ impl Graph {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errs = Vec::new();
         self.validate_into(0, &mut errs);
-        if errs.is_empty() {
-            Ok(())
-        } else {
-            Err(errs)
-        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 
     fn validate_into(&self, depth: u32, errs: &mut Vec<String>) {
@@ -921,7 +950,9 @@ impl Graph {
                 }
             }
             match node {
-                Node::Wait { timeout_ms, on_uri, .. } => {
+                Node::Wait {
+                    timeout_ms, on_uri, ..
+                } => {
                     if *timeout_ms == 0 {
                         errs.push(format!("Wait node {id:?} has timeout_ms=0 (must be > 0)"));
                     }
@@ -929,7 +960,12 @@ impl Graph {
                         errs.push(format!("Wait node {id:?} has an empty on_uri"));
                     }
                 }
-                Node::Assign { writes, value, expr, .. } => {
+                Node::Assign {
+                    writes,
+                    value,
+                    expr,
+                    ..
+                } => {
                     if writes.trim().is_empty() {
                         errs.push(format!("Assign node {id:?} has an empty writes key"));
                     }
@@ -952,7 +988,12 @@ impl Graph {
                         None => {}
                     }
                 }
-                Node::Infer { schema, retries, check, .. } => {
+                Node::Infer {
+                    schema,
+                    retries,
+                    check,
+                    ..
+                } => {
                     if schema.is_empty() {
                         errs.push(format!("Infer node {id:?} has an empty schema"));
                     }
@@ -1117,8 +1158,14 @@ mod tests {
         // The cycle (work → fetch) is representable by construction.
         assert!(matches!(g.nodes["work"], Node::Tool { .. }));
         let work_targets = g.nodes["work"].targets();
-        assert!(work_targets.contains(&&"fetch".to_string()), "back-edge present");
-        assert!(work_targets.contains(&&"done".to_string()), "error-edge present");
+        assert!(
+            work_targets.contains(&&"fetch".to_string()),
+            "back-edge present"
+        );
+        assert!(
+            work_targets.contains(&&"done".to_string()),
+            "error-edge present"
+        );
     }
 
     #[test]
@@ -1180,7 +1227,10 @@ mod tests {
         let mut nodes = BTreeMap::new();
         nodes.insert(
             "h".to_string(),
-            Node::Halt { status: TerminalStatus::Completed, result_from: None },
+            Node::Halt {
+                status: TerminalStatus::Completed,
+                result_from: None,
+            },
         );
         for i in 0..=MAX_NODES {
             let mut edges = BTreeMap::new();
@@ -1198,7 +1248,10 @@ mod tests {
                 },
             );
         }
-        let g = Graph { start: "h".into(), nodes };
+        let g = Graph {
+            start: "h".into(),
+            nodes,
+        };
         let errs = g.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("max")), "{errs:?}");
     }
@@ -1220,14 +1273,21 @@ mod tests {
         };
         assert!(gt.eval(&bb));
         // Composition + missing paths are false, never panics.
-        let both = Pred::All { preds: vec![eq.clone(), gt] };
+        let both = Pred::All {
+            preds: vec![eq.clone(), gt],
+        };
         assert!(both.eval(&bb));
         let missing = Pred::Exists {
             key: "absent".into(),
             pointer: "/x".into(),
         };
         assert!(!missing.eval(&bb));
-        assert!(Pred::Not { pred: Box::new(missing) }.eval(&bb));
+        assert!(
+            Pred::Not {
+                pred: Box::new(missing)
+            }
+            .eval(&bb)
+        );
     }
 
     #[test]
@@ -1249,7 +1309,11 @@ mod tests {
         .unwrap();
         g.apply_patch(patch).expect("additive patch applies");
         assert!(g.nodes.contains_key("b"));
-        assert_eq!(g.nodes["a"].targets().len(), 2, "a now has ok + error edges");
+        assert_eq!(
+            g.nodes["a"].targets().len(),
+            2,
+            "a now has ok + error edges"
+        );
         assert!(g.validate().is_ok());
     }
 
@@ -1276,7 +1340,11 @@ mod tests {
         .unwrap();
         assert!(g.apply_patch(retarget).is_err(), "no edge retarget");
         // The graph is UNCHANGED after a rejected patch.
-        assert_eq!(g.nodes["a"].targets(), vec!["h"], "rejected patch left it intact");
+        assert_eq!(
+            g.nodes["a"].targets(),
+            vec!["h"],
+            "rejected patch left it intact"
+        );
     }
 
     #[test]
@@ -1335,15 +1403,10 @@ mod tests {
             !p(json!({"op":"in","key":"item","pointer":"/status","values":["closed"]})).eval(&bb)
         );
         assert!(
-            p(json!({"op":"starts_with","key":"item","pointer":"/tag","value":"urgent"}))
-                .eval(&bb)
+            p(json!({"op":"starts_with","key":"item","pointer":"/tag","value":"urgent"})).eval(&bb)
         );
-        assert!(
-            p(json!({"op":"ends_with","key":"item","pointer":"/tag","value":"ops"})).eval(&bb)
-        );
-        assert!(
-            p(json!({"op":"len","key":"item","pointer":"/list","min":1,"max":3})).eval(&bb)
-        );
+        assert!(p(json!({"op":"ends_with","key":"item","pointer":"/tag","value":"ops"})).eval(&bb));
+        assert!(p(json!({"op":"len","key":"item","pointer":"/list","min":1,"max":3})).eval(&bb));
         assert!(!p(json!({"op":"len","key":"item","pointer":"/list","min":4})).eval(&bb));
         // Total over missing paths / non-strings — false, never a panic.
         assert!(!p(json!({"op":"starts_with","key":"item","pointer":"/n","value":"5"})).eval(&bb));
@@ -1366,7 +1429,10 @@ mod tests {
         }))
         .unwrap();
         let errs = g.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("empty values set")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("empty values set")),
+            "{errs:?}"
+        );
         assert!(errs.iter().any(|e| e.contains("inverted")), "{errs:?}");
     }
 
@@ -1401,13 +1467,18 @@ mod tests {
             "verdict": "string", "score": "number", "extra_ok": "any"
         }))
         .unwrap();
-        assert!(check_schema(
-            &schema,
-            &json!({"verdict": "ok", "score": 1, "extra_ok": [1], "unlisted": true})
-        )
-        .is_ok());
+        assert!(
+            check_schema(
+                &schema,
+                &json!({"verdict": "ok", "score": 1, "extra_ok": [1], "unlisted": true})
+            )
+            .is_ok()
+        );
         let e = check_schema(&schema, &json!({"verdict": 5, "extra_ok": 1})).unwrap_err();
-        assert!(e.contains("verdict") && e.contains("score"), "every miss named: {e}");
+        assert!(
+            e.contains("verdict") && e.contains("score"),
+            "every miss named: {e}"
+        );
         assert!(check_schema(&schema, &json!("not an object")).is_err());
     }
 
@@ -1425,10 +1496,19 @@ mod tests {
         .unwrap();
         let errs = g.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("retry.max")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("retry.backoff_ms")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("retry.backoff_ms")),
+            "{errs:?}"
+        );
         assert!(errs.iter().any(|e| e.contains("empty schema")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("retries must be")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("empty writes key")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("retries must be")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("empty writes key")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -1457,11 +1537,7 @@ mod tests {
         bb.insert("field".to_string(), json!("a/b"));
         bb.insert("obj".to_string(), json!({"a/b": "slashed"}));
         // {index} expands to the scalar → /items/2.
-        let v = resolve_refs(
-            &json!({"$from": "scan", "pointer": "/items/{index}"}),
-            &bb,
-        )
-        .unwrap();
+        let v = resolve_refs(&json!({"$from": "scan", "pointer": "/items/{index}"}), &bb).unwrap();
         assert_eq!(v, json!(30));
         // A string segment is RFC-6901-escaped (a slash can't add path levels).
         let v = resolve_refs(&json!({"$from": "obj", "pointer": "/{field}"}), &bb).unwrap();
@@ -1479,14 +1555,24 @@ mod tests {
         bb.insert("b".to_string(), json!({"n": 7, "limit": 5}));
         let p = |v: serde_json::Value| -> Pred { serde_json::from_value(v).unwrap() };
         // eq across two keys.
-        assert!(p(json!({"op":"eq","key":"a","pointer":"/n","value":{"$from":"b","pointer":"/n"}})).eval(&bb));
+        assert!(
+            p(json!({"op":"eq","key":"a","pointer":"/n","value":{"$from":"b","pointer":"/n"}}))
+                .eval(&bb)
+        );
         // numeric compare against a referenced value.
-        assert!(p(json!({"op":"gt","key":"a","pointer":"/n","value":{"$from":"b","pointer":"/limit"}})).eval(&bb));
+        assert!(
+            p(json!({"op":"gt","key":"a","pointer":"/n","value":{"$from":"b","pointer":"/limit"}}))
+                .eval(&bb)
+        );
         // in with a referenced element.
         assert!(p(json!({"op":"in","key":"a","pointer":"/tag","values":[{"$from":"a","pointer":"/tag"}]})).eval(&bb));
         // An unresolvable REFERENCE is fail-closed false — even for ne.
-        assert!(!p(json!({"op":"ne","key":"a","pointer":"/n","value":{"$from":"ghost"}})).eval(&bb));
-        assert!(!p(json!({"op":"eq","key":"a","pointer":"/n","value":{"$from":"ghost"}})).eval(&bb));
+        assert!(
+            !p(json!({"op":"ne","key":"a","pointer":"/n","value":{"$from":"ghost"}})).eval(&bb)
+        );
+        assert!(
+            !p(json!({"op":"eq","key":"a","pointer":"/n","value":{"$from":"ghost"}})).eval(&bb)
+        );
         // Literals still work exactly as before.
         assert!(p(json!({"op":"gte","key":"a","pointer":"/n","value":7})).eval(&bb));
     }
@@ -1535,15 +1621,24 @@ mod tests {
         }))
         .unwrap();
         let errs = bad.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("parallel must be")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("unknown node \"ghost\"")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("parallel must be")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("unknown node \"ghost\"")),
+            "{errs:?}"
+        );
     }
 
     #[cfg(feature = "cel")]
     #[test]
     fn cel_predicates_and_assign_exprs_evaluate_and_validate() {
         let mut bb = BTreeMap::new();
-        bb.insert("scan".to_string(), json!({"items": [{"ok": true}, {"ok": false}]}));
+        bb.insert(
+            "scan".to_string(),
+            json!({"items": [{"ok": true}, {"ok": false}]}),
+        );
         bb.insert("limit".to_string(), json!(1));
         let p: Pred = serde_json::from_value(
             json!({"op": "cel", "expr": "scan.items.filter(i, i.ok).size() >= limit"}),
@@ -1566,7 +1661,11 @@ mod tests {
         }))
         .unwrap();
         let errs = g.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("cel") && e.contains("parse")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("cel") && e.contains("parse")),
+            "{errs:?}"
+        );
         // Assign: value XOR expr, expr compile-checked.
         let g: Graph = serde_json::from_value(json!({
             "start": "a",
@@ -1577,7 +1676,10 @@ mod tests {
         }))
         .unwrap();
         let errs = g.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("both value and expr")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("both value and expr")),
+            "{errs:?}"
+        );
     }
 
     #[cfg(all(feature = "workflow", not(feature = "cel")))]
@@ -1593,7 +1695,10 @@ mod tests {
         }))
         .unwrap();
         let errs = g.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("'cel' build feature")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("'cel' build feature")),
+            "{errs:?}"
+        );
         // And an assign expr likewise.
         let g: Graph = serde_json::from_value(json!({
             "start": "a",
@@ -1604,7 +1709,10 @@ mod tests {
         }))
         .unwrap();
         let errs = g.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("'cel' build feature")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("'cel' build feature")),
+            "{errs:?}"
+        );
     }
 
     #[test]

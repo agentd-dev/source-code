@@ -34,8 +34,13 @@ const CONTRACT_VERSION: &str = "2.0";
 /// routes exactly this set (a drift-guard test enforces the 1:1), so the manifest
 /// and the live surface cannot diverge (RFC 0015 §5.2). `a2a.Pause`/`a2a.Resume`
 /// fan `ctrl/pause`/`ctrl/resume` to suspend the tree at turn boundaries (§4.3).
-pub const OPERATOR_TOOLS: &[&str] =
-    &["a2a.Drain", "a2a.LameDuck", "a2a.Pause", "a2a.Resume", "a2a.Cancel"];
+pub const OPERATOR_TOOLS: &[&str] = &[
+    "a2a.Drain",
+    "a2a.LameDuck",
+    "a2a.Pause",
+    "a2a.Resume",
+    "a2a.Cancel",
+];
 
 /// Build the capabilities manifest from resolved config + identity.
 ///
@@ -602,7 +607,13 @@ mod tests {
         if cfg!(feature = "a2a") {
             assert_eq!(
                 s["operator_tools"],
-                json!(["a2a.Drain", "a2a.LameDuck", "a2a.Pause", "a2a.Resume", "a2a.Cancel"])
+                json!([
+                    "a2a.Drain",
+                    "a2a.LameDuck",
+                    "a2a.Pause",
+                    "a2a.Resume",
+                    "a2a.Cancel"
+                ])
             );
         } else {
             assert_eq!(s["operator_tools"], json!([]));
@@ -740,7 +751,10 @@ mod tests {
     #[test]
     fn limits_block_carries_caps_and_config() {
         let cfg = cfg_with(
-            &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "https://intel.example")],
+            &[
+                ("INSTRUCTION", "x"),
+                ("AGENTD_INTELLIGENCE", "https://intel.example"),
+            ],
             &["--max-depth", "3", "--max-steps", "99"],
         );
         let id = Identity::from_env(&cfg.run_id);
@@ -757,7 +771,10 @@ mod tests {
     #[test]
     fn mcp_servers_carry_name_and_tags_not_command() {
         let cfg = cfg_with(
-            &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "https://intel.example")],
+            &[
+                ("INSTRUCTION", "x"),
+                ("AGENTD_INTELLIGENCE", "https://intel.example"),
+            ],
             &[
                 "--mcp",
                 "vault=https://vault.example/mcp",

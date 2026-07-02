@@ -659,12 +659,23 @@ pub fn run_reactive(
             // A suspended reactive WORKFLOW's wait resolving: consume this
             // delivery as the resume trigger (never a normal reaction).
             #[cfg(feature = "workflow")]
-            if wf_suspended.as_ref().is_some_and(|(_, uri, _)| *uri == delivery.uri) {
+            if wf_suspended
+                .as_ref()
+                .is_some_and(|(_, uri, _)| *uri == delivery.uri)
+            {
                 let (state, uri, _) = wf_suspended.take().expect("checked");
                 disarm_workflow_wait(&uri, &mut router, &mut owner, &servers, log);
                 let value = serde_json::from_str::<serde_json::Value>(&content)
                     .unwrap_or(serde_json::Value::String(content.clone()));
-                let o = resume_workflow(&exe, &base, state, false, Some(value), cfg.drain_timeout, log);
+                let o = resume_workflow(
+                    &exe,
+                    &base,
+                    state,
+                    false,
+                    Some(value),
+                    cfg.drain_timeout,
+                    log,
+                );
                 match handle_workflow_outcome(
                     o,
                     &mut wf_suspended,
@@ -946,7 +957,10 @@ pub fn run_reactive(
         // A suspended reactive WORKFLOW whose wait timed out: resume it on the
         // `timeout` edge (the wait's own clock, independent of any update).
         #[cfg(feature = "workflow")]
-        if wf_suspended.as_ref().is_some_and(|(_, _, deadline)| now >= *deadline) {
+        if wf_suspended
+            .as_ref()
+            .is_some_and(|(_, _, deadline)| now >= *deadline)
+        {
             let (state, uri, _) = wf_suspended.take().expect("checked");
             disarm_workflow_wait(&uri, &mut router, &mut owner, &servers, log);
             log.info("workflow.wait.timeout", json!({"on_uri": uri}));
@@ -1481,12 +1495,10 @@ fn apply_mcp_server_diff(
         // must not block the reactor (and starve the liveness heartbeat) for the
         // full ~60s. A timeout is a contained `mcp.connect.fail` — the server is
         // simply absent (RFC 0007 / RFC 0017 §5.3 contained-failure), never fatal.
-        match crate::mcp::from_spec(spec, Duration::from_secs(60)).and_then(
-            |mut c| {
-                c.initialize_within(crate::obs::health::management_timeout())
-                    .map(|()| c)
-            },
-        ) {
+        match crate::mcp::from_spec(spec, Duration::from_secs(60)).and_then(|mut c| {
+            c.initialize_within(crate::obs::health::management_timeout())
+                .map(|()| c)
+        }) {
             Ok(mut c) => {
                 // Re-stamp the run-id (retry dedup, RFC 0011) + traceparent
                 // (tracing, RFC 0010) tool `_meta`, exactly like the connect path.
@@ -2137,8 +2149,15 @@ fn handle_workflow_outcome(
         .and_then(|w| w.get("suspended"))
         .cloned();
     if let Some(susp) = suspended {
-        let on_uri = susp.get("on_uri").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        let timeout_ms = susp.get("timeout_ms").and_then(serde_json::Value::as_u64).unwrap_or(1);
+        let on_uri = susp
+            .get("on_uri")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let timeout_ms = susp
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
         let state: crate::graph::GraphState =
             match serde_json::from_value(susp.get("state").cloned().unwrap_or_default()) {
                 Ok(s) => s,
@@ -2309,12 +2328,8 @@ fn apply_effects(
                         // re-entry fire only when the resource reaches the wanted
                         // state (the in-turn wait).
                         router.add_route(
-                            Route::new(
-                                &req.uri,
-                                Disposition::Continue(req.uri.clone()),
-                                DEBOUNCE,
-                            )
-                            .with_condition(condition),
+                            Route::new(&req.uri, Disposition::Continue(req.uri.clone()), DEBOUNCE)
+                                .with_condition(condition),
                         );
                         log.info("trigger.armed", json!({"kind": kind, "uri": req.uri, "server": server, "disposition": "continue"}));
                     }
@@ -2452,8 +2467,9 @@ mod tests {
         // The reactor's decision point (pivot Phase 5.2): a conditional delivery
         // fires ONLY when the freshly-read content satisfies the predicate — the
         // "daemon fires only on match" behaviour behind `await_resource`.
-        let cond = Condition::from_json(&json!({"pointer": "/status", "op": "eq", "value": "ready"}))
-            .unwrap();
+        let cond =
+            Condition::from_json(&json!({"pointer": "/status", "op": "eq", "value": "ready"}))
+                .unwrap();
         let some = Some(cond);
         // Match → fire.
         assert!(condition_met(&some, r#"{"status":"ready"}"#));
@@ -2463,7 +2479,10 @@ mod tests {
         assert!(!condition_met(&some, "not json at all"));
         // No condition → always fire (the v1 fire-on-any behaviour is preserved).
         assert!(condition_met(&None, r#"{"anything":true}"#));
-        assert!(condition_met(&None, "even non-json fires when unconditional"));
+        assert!(condition_met(
+            &None,
+            "even non-json fires when unconditional"
+        ));
     }
 
     /// The mcp_servers reload diff/apply DECISION logic (RFC 0017 §5.3 step 4),
@@ -2489,7 +2508,7 @@ mod tests {
         new.mcp_servers = vec![
             srv("a", "https://a-v2.example"), // changed (endpoint differs)
             srv("c", "https://c.example"),    // added
-                                         // b removed
+                                              // b removed
         ];
         // reloadable_changes must flag mcp_servers as changed.
         assert!(reloadable_changes(&running, &new).contains(&"mcp_servers"));
@@ -2543,7 +2562,10 @@ mod tests {
         ];
         let env = vec![
             ("INSTRUCTION".to_string(), "x".to_string()),
-            ("AGENTD_INTELLIGENCE".to_string(), "https://intel.example".to_string()),
+            (
+                "AGENTD_INTELLIGENCE".to_string(),
+                "https://intel.example".to_string(),
+            ),
         ];
         // The candidate fails to load (the trifecta gate in validate() refuses it).
         let err = Config::reload(&args, &env).unwrap_err();

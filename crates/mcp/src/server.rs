@@ -250,7 +250,10 @@ pub fn notify_resource_updated_keep(subs: &SubRegistry, uri: &str) {
 }
 
 fn push_updated(writers: &[SharedWriter], uri: &str) {
-    let note = Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({ "uri": uri })));
+    let note = Notification::new(
+        method::NOTIFY_RESOURCES_UPDATED,
+        Some(json!({ "uri": uri })),
+    );
     for w in writers {
         if let Ok(mut wl) = w.lock() {
             let _ = wl.write_notification(&note);
@@ -307,8 +310,13 @@ pub trait Handler: Send + Sync + 'static {
     /// `writer`/`conn` identify the connection so a `resources/subscribe` can
     /// register a push target via [`register_subscriber`]. Called from the
     /// connection's own thread — implementations do their own locking.
-    fn dispatch(&self, req: Request, origin: PeerOrigin, writer: &SharedWriter, conn: u64)
-    -> Response;
+    fn dispatch(
+        &self,
+        req: Request,
+        origin: PeerOrigin,
+        writer: &SharedWriter,
+        conn: u64,
+    ) -> Response;
 
     /// Called once when a connection is accepted (before its first request), for
     /// logging/metrics. Default: nothing.
@@ -539,13 +547,21 @@ mod tests {
         let r = resp.result.expect("ok");
         assert_eq!(r["protocolVersion"], want);
         assert_eq!(r["serverInfo"]["name"], "test-server");
-        assert!(r["capabilities"]["resources"]["subscribe"].as_bool().unwrap());
+        assert!(
+            r["capabilities"]["resources"]["subscribe"]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[test]
     fn initialize_falls_back_to_latest_legacy_for_an_unsupported_version() {
         // An unknown/too-old version isn't echoed — we answer with our own latest.
-        let req = Request::new(1, "initialize", Some(json!({"protocolVersion": "1999-01-01"})));
+        let req = Request::new(
+            1,
+            "initialize",
+            Some(json!({"protocolVersion": "1999-01-01"})),
+        );
         let resp = lifecycle_response(&req, &info(), &caps()).expect("handled");
         let r = resp.result.expect("ok");
         assert_eq!(r["protocolVersion"], crate::version::PROTOCOL_VERSION);
@@ -569,8 +585,15 @@ mod tests {
         let r = resp.result.expect("ok");
         assert_eq!(r["resultType"], "complete");
         let listed = r["supportedVersions"].as_array().expect("array");
-        assert_eq!(listed.len(), crate::version::SUPPORTED_PROTOCOL_VERSIONS.len());
-        assert!(listed.iter().any(|v| v == crate::version::FIRST_MODERN_VERSION));
+        assert_eq!(
+            listed.len(),
+            crate::version::SUPPORTED_PROTOCOL_VERSIONS.len()
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|v| v == crate::version::FIRST_MODERN_VERSION)
+        );
         assert!(listed.iter().any(|v| v == crate::version::PROTOCOL_VERSION));
         assert_eq!(r["serverInfo"]["name"], "test-server");
     }
@@ -595,8 +618,12 @@ mod tests {
     fn wired() -> (SharedWriter, BufReader<UnixStream>) {
         let (tx, rx) = UnixStream::pair().unwrap();
         // Bound the read so a "should push nothing" assertion can't hang.
-        rx.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-        (Arc::new(Mutex::new(ServeStream::Unix(tx))), BufReader::new(rx))
+        rx.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        (
+            Arc::new(Mutex::new(ServeStream::Unix(tx))),
+            BufReader::new(rx),
+        )
     }
 
     /// Read one pushed notification and return `(method, uri-or-empty)`.

@@ -494,7 +494,9 @@ mod tests {
                 let _ = stream.write_all(body);
                 let _ = stream.flush();
             } else if text.contains("notifications/initialized") {
-                let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
             } else {
                 // Any real request (the release): hang — read+discard, never reply.
                 let mut sink = [0u8; 256];

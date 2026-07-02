@@ -93,8 +93,12 @@ impl Condition {
         let value = v.get("value").cloned();
         let op = match op {
             "exists" => CondOp::Exists,
-            "eq" => CondOp::Eq(value.ok_or_else(|| "condition op 'eq' requires 'value'".to_string())?),
-            "ne" => CondOp::Ne(value.ok_or_else(|| "condition op 'ne' requires 'value'".to_string())?),
+            "eq" => {
+                CondOp::Eq(value.ok_or_else(|| "condition op 'eq' requires 'value'".to_string())?)
+            }
+            "ne" => {
+                CondOp::Ne(value.ok_or_else(|| "condition op 'ne' requires 'value'".to_string())?)
+            }
             "gt" => CondOp::Gt(
                 value
                     .and_then(|x| x.as_f64())
@@ -108,7 +112,9 @@ impl Condition {
             "contains" => CondOp::Contains(
                 value
                     .and_then(|x| x.as_str().map(str::to_string))
-                    .ok_or_else(|| "condition op 'contains' requires a string 'value'".to_string())?,
+                    .ok_or_else(|| {
+                        "condition op 'contains' requires a string 'value'".to_string()
+                    })?,
             ),
             "cel" => {
                 let expr = v
@@ -117,8 +123,7 @@ impl Condition {
                     .ok_or_else(|| "condition op 'cel' requires a string 'expr'".to_string())?;
                 // Compile-checked NOW — a malformed (or feature-less) predicate
                 // must refuse to arm, never mis-evaluate later.
-                crate::cel::compile_check(expr)
-                    .map_err(|e| format!("condition 'cel': {e}"))?;
+                crate::cel::compile_check(expr).map_err(|e| format!("condition 'cel': {e}"))?;
                 CondOp::Cel(expr.to_string())
             }
             other => return Err(format!("unknown condition op: {other:?}")),
@@ -144,9 +149,9 @@ impl Condition {
             },
             // The expression sees the value AT the pointer (default: the whole
             // document) as `content`. Errors/non-bool are a non-match.
-            CondOp::Cel(expr) => at.is_some_and(|v| {
-                crate::cel::eval_bool(expr, &[("content", v)]).unwrap_or(false)
-            }),
+            CondOp::Cel(expr) => {
+                at.is_some_and(|v| crate::cel::eval_bool(expr, &[("content", v)]).unwrap_or(false))
+            }
         }
     }
 }
@@ -489,8 +494,7 @@ mod tests {
             .unwrap();
         assert!(eq.eval(&json!({"status": "ready"})));
         assert!(!eq.eval(&json!({"status": "working"})));
-        let gt =
-            Condition::from_json(&json!({"pointer": "/n", "op": "gt", "value": 10})).unwrap();
+        let gt = Condition::from_json(&json!({"pointer": "/n", "op": "gt", "value": 10})).unwrap();
         assert!(gt.eval(&json!({"n": 11})));
         assert!(!gt.eval(&json!({"n": 10})));
         let contains =
@@ -521,7 +525,9 @@ mod tests {
         .unwrap();
         assert!(c.eval(&serde_json::json!({"stats": {"done": 5, "total": 9}})));
         // A malformed expression refuses to ARM (parse error, not a dud route).
-        assert!(Condition::from_json(&serde_json::json!({"op": "cel", "expr": "a >=< 1"})).is_err());
+        assert!(
+            Condition::from_json(&serde_json::json!({"op": "cel", "expr": "a >=< 1"})).is_err()
+        );
     }
 
     #[cfg(not(feature = "cel"))]
@@ -534,12 +540,15 @@ mod tests {
 
     #[test]
     fn condition_eval_on_missing_pointer_is_a_non_match() {
-        let c = Condition::from_json(&json!({"pointer": "/missing", "op": "eq", "value": 1}))
-            .unwrap();
-        assert!(!c.eval(&json!({"present": 1})), "absent pointer never matches eq");
+        let c =
+            Condition::from_json(&json!({"pointer": "/missing", "op": "eq", "value": 1})).unwrap();
+        assert!(
+            !c.eval(&json!({"present": 1})),
+            "absent pointer never matches eq"
+        );
         // ne holds when the wanted value is simply absent.
-        let ne = Condition::from_json(&json!({"pointer": "/missing", "op": "ne", "value": 1}))
-            .unwrap();
+        let ne =
+            Condition::from_json(&json!({"pointer": "/missing", "op": "ne", "value": 1})).unwrap();
         assert!(ne.eval(&json!({"present": 1})));
     }
 
@@ -547,8 +556,8 @@ mod tests {
     fn a_conditional_route_carries_its_condition_into_the_delivery() {
         // The router matches by URI (content-free); the condition rides along on the
         // Delivery for the reactor to evaluate post-read.
-        let cond = Condition::from_json(&json!({"pointer": "/ready", "op": "eq", "value": true}))
-            .unwrap();
+        let cond =
+            Condition::from_json(&json!({"pointer": "/ready", "op": "eq", "value": true})).unwrap();
         let route = Route::new("file:///w.json", Disposition::Spawn, ms(0))
             .with_condition(Some(cond.clone()));
         let mut r = Router::new(vec![route]);
@@ -562,7 +571,11 @@ mod tests {
             "the delivery carries the route's condition"
         );
         // An unconditional route delivers with no condition (v1 fire-on-any).
-        let mut r2 = Router::new(vec![Route::new("file:///w.json", Disposition::Spawn, ms(0))]);
+        let mut r2 = Router::new(vec![Route::new(
+            "file:///w.json",
+            Disposition::Spawn,
+            ms(0),
+        )]);
         assert!(r2.on_updated("file:///w.json", t0));
         assert_eq!(r2.due(t0)[0].condition, None);
     }

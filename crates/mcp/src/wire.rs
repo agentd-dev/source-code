@@ -583,9 +583,10 @@ mod tests {
         .unwrap();
         assert_eq!(got.messages.len(), 1);
 
-        let comp: CompleteResult =
-            serde_json::from_str(r#"{"completion": {"values": ["alice", "bob"], "hasMore": false}}"#)
-                .unwrap();
+        let comp: CompleteResult = serde_json::from_str(
+            r#"{"completion": {"values": ["alice", "bob"], "hasMore": false}}"#,
+        )
+        .unwrap();
         assert_eq!(comp.completion.values, ["alice", "bob"]);
         assert_eq!(comp.completion.has_more, Some(false));
     }

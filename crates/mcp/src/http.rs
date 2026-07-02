@@ -171,14 +171,20 @@ impl HttpTransport {
     /// Record the negotiated protocol version, sent as `MCP-Protocol-Version` on
     /// every subsequent request (called by the client after `initialize`/discovery).
     pub fn set_protocol_version(&self, version: String) {
-        *self.protocol_version.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(version);
     }
 
     /// Clear the negotiated version — the legacy `initialize` request must carry no
     /// `MCP-Protocol-Version` header (nothing agreed yet), so this resets what a
     /// prior modern probe set.
     pub fn clear_protocol_version(&self) {
-        *self.protocol_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn scheme(&self) -> &'static str {
@@ -214,15 +220,14 @@ impl HttpTransport {
             McpEndpoint::Unix { socket, .. } => {
                 // `net::unixsock::connect` exists on every platform (a non-unix
                 // build returns an Unsupported error), matching the intel path.
-                let s =
-                    net::unixsock::connect(socket, timeout).map_err(HttpError::Connect)?;
+                let s = net::unixsock::connect(socket, timeout).map_err(HttpError::Connect)?;
                 Ok(Box::new(s))
             }
             McpEndpoint::Vsock { cid, port, .. } => {
                 #[cfg(feature = "vsock")]
                 {
-                    let s = net::vsock::connect(*cid, *port, timeout)
-                        .map_err(HttpError::Connect)?;
+                    let s =
+                        net::vsock::connect(*cid, *port, timeout).map_err(HttpError::Connect)?;
                     Ok(Box::new(s))
                 }
                 #[cfg(not(feature = "vsock"))]
@@ -255,7 +260,11 @@ impl HttpTransport {
             ("Content-Type", "application/json"),
             ("Accept", "application/json, text/event-stream"),
         ];
-        let session = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
         }
@@ -329,7 +338,11 @@ impl HttpTransport {
     pub fn open_events(&self, read_timeout: Duration) -> Result<EventStream, HttpError> {
         let stream = self.connect(read_timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];
-        let session = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
         }
@@ -434,7 +447,8 @@ fn route_message<F: FnMut(Value)>(
     on_notification: &mut F,
 ) -> Option<Value> {
     let v: Value = serde_json::from_str(&ev.data).ok()?;
-    let id_matches = matches!((request_id, v.get("id").and_then(Value::as_i64)), (Some(a), Some(b)) if a == b);
+    let id_matches =
+        matches!((request_id, v.get("id").and_then(Value::as_i64)), (Some(a), Some(b)) if a == b);
     if id_matches {
         Some(v)
     } else {
@@ -467,14 +481,26 @@ mod tests {
 
     #[test]
     fn parse_http_unix_vsock() {
-        assert_eq!(McpEndpoint::parse("http://localhost:8080/mcp").unwrap().scheme(), "http");
+        assert_eq!(
+            McpEndpoint::parse("http://localhost:8080/mcp")
+                .unwrap()
+                .scheme(),
+            "http"
+        );
         let u = McpEndpoint::parse("unix:/run/fs.sock").unwrap();
         assert_eq!(u.scheme(), "unix");
         assert_eq!(u.host_header(), "localhost");
         assert_eq!(u.http_path(), "/");
         let v = McpEndpoint::parse("vsock:3:5000").unwrap();
         assert_eq!(v.scheme(), "vsock");
-        assert!(matches!(v, McpEndpoint::Vsock { cid: 3, port: 5000, .. }));
+        assert!(matches!(
+            v,
+            McpEndpoint::Vsock {
+                cid: 3,
+                port: 5000,
+                ..
+            }
+        ));
     }
 
     #[test]

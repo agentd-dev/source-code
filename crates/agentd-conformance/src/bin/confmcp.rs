@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `confmcp <unix-socket> <record-file> [resource-uri]` — a minimal, spec-correct
+//! `confmcp <addr-file> <record-file> [resource-uri]` — a minimal, spec-correct
 //! **Streamable HTTP** MCP server that agentd connects to as a client (over
-//! `unix:<socket>`), used by the MCP-client conformance family. It answers the
+//! `http://<addr>`), used by the MCP-client conformance family. It answers the
 //! handshake + discovery + resource methods and **appends every request it
 //! receives** (one JSON object per line) to `<record-file>` so the suite can
 //! assert exactly what agentd's client sent. Independent of the agentd library.
@@ -13,17 +13,17 @@ use std::io::Write;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let socket = args
+    let addr_file = args
         .next()
-        .expect("usage: confmcp <unix-socket> <record-file> [uri]");
+        .expect("usage: confmcp <addr-file> <record-file> [uri]");
     let record_path = args
         .next()
-        .expect("usage: confmcp <unix-socket> <record-file> [uri]");
+        .expect("usage: confmcp <addr-file> <record-file> [uri]");
     let uri = args
         .next()
         .unwrap_or_else(|| "file:///conf-watch.json".to_string());
 
-    serve(&socket, move |req, notifier| {
+    serve(&addr_file, move |req, notifier| {
         record(&record_path, req);
         let method = req["method"].as_str().unwrap_or("");
         // Requests have an id; notifications don't and get no reply.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `workmcp <unix-socket> <state-file> [item-uri]` — a minimal, spec-correct
+//! `workmcp <addr-file> <state-file> [item-uri]` — a minimal, spec-correct
 //! Streamable HTTP MCP server (over a unix socket) that serves the FROZEN
 //! `work.*` coordination contract (RFC 0015 §5.6) with
 //! **atomic single-grant** lease semantics, so the cross-instance claim
@@ -66,12 +66,12 @@ struct State {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let socket = args
+    let addr_file = args
         .next()
-        .expect("usage: workmcp <unix-socket> <state-file> [item-uri]");
+        .expect("usage: workmcp <addr-file> <state-file> [item-uri]");
     let state_path = args
         .next()
-        .expect("usage: workmcp <unix-socket> <state-file> [item-uri]");
+        .expect("usage: workmcp <addr-file> <state-file> [item-uri]");
     let item_uri = args.next().unwrap_or_else(|| "work:///item/1".to_string());
 
     // The lease state is the SHARED FILE, not in-process memory. Each `work.*`
@@ -87,7 +87,7 @@ fn main() {
     // tools/call keeps the file owned by whichever process actually claims/acks.
     // The check treats a missing file as "no calls yet".
 
-    serve(&socket, move |req, notifier| {
+    serve(&addr_file, move |req, notifier| {
         let method = req["method"].as_str().unwrap_or("");
         // Requests carry an id; notifications don't and get no reply.
         let id = req.get("id").cloned()?;

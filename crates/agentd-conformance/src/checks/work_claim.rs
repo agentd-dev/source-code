@@ -32,7 +32,7 @@
 use crate::mcp_http_server;
 use crate::{Category, Check, Harness, Outcome};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -353,17 +353,18 @@ fn read_state(path: &Path) -> Option<Value> {
 /// conformance probe, not a peer.
 struct WorkServer {
     child: Child,
-    socket: PathBuf,
+    endpoint: String,
     id: i64,
 }
 
 impl WorkServer {
-    /// Spawn `workmcp <socket> <state> <item>` and complete the MCP handshake.
+    /// Spawn `workmcp <addr-file> <state> <item>` (loopback TCP) and complete the
+    /// MCP handshake.
     fn start(h: &Harness, state: &Path, item: &str) -> WorkServer {
-        let socket = state.with_extension("driver.sock");
-        let _ = std::fs::remove_file(&socket);
+        let addr_file = state.with_extension("driver.addr");
+        let _ = std::fs::remove_file(&addr_file);
         let child = Command::new(h.workmcp())
-            .arg(&socket)
+            .arg(&addr_file)
             .arg(state)
             .arg(item)
             .stdout(Stdio::null())
@@ -371,13 +372,14 @@ impl WorkServer {
             .spawn()
             .expect("spawn workmcp");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
-            assert!(Instant::now() < deadline, "workmcp socket never bound");
+        while !addr_file.exists() {
+            assert!(Instant::now() < deadline, "workmcp never announced");
             std::thread::sleep(Duration::from_millis(10));
         }
+        let addr = std::fs::read_to_string(&addr_file).expect("read workmcp addr-file");
         let mut s = WorkServer {
             child,
-            socket,
+            endpoint: format!("http://{}", addr.trim()),
             id: 0,
         };
         let _ = s.call("initialize", json!({}));
@@ -388,8 +390,7 @@ impl WorkServer {
     fn call(&mut self, method: &str, params: Value) -> Value {
         self.id += 1;
         let req = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params});
-        let endpoint = format!("unix:{}", self.socket.display());
-        let resp = mcp_http_server::post(&endpoint, &req);
+        let resp = mcp_http_server::post(&self.endpoint, &req);
         resp["result"].clone()
     }
 
@@ -421,6 +422,6 @@ impl Drop for WorkServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
+        // The addr-file lives under the check's TempDir, cleaned on its drop.
     }
 }

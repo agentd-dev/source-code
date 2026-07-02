@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cel-interpreter",
  "libc",
@@ -17,7 +17,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-conformance"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libc",
  "serde_json",
@@ -344,7 +344,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "net",
  "serde",

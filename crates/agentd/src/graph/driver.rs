@@ -17,7 +17,7 @@
 //! persists, watches, and hands back to [`resume`]. `Subgraph` (P5), a dangling edge,
 //! or an unhandled label fail CLOSED (`Crashed`) rather than panicking.
 
-use super::{Graph, Node, NodeId};
+use super::{FieldType, Graph, Node, NodeId, Retry};
 use crate::agentloop::stop::TerminalStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -214,6 +214,22 @@ pub trait GraphExec {
     fn run_subgraph(&mut self, _graph: &Graph, _async_: bool, _blackboard: &Blackboard) -> (Value, bool) {
         (Value::Null, true)
     }
+
+    /// Run an `Infer` node's single structured ask: fold the `reads` into `prompt`
+    /// (with `feedback` from a failed validation appended on a re-ask) and return
+    /// the model's answer PARSED as JSON. The driver owns schema validation + the
+    /// re-ask loop. Default impl: `Err` — a build/exec with no intelligence degrades
+    /// safely to the node's `error` edge.
+    fn infer(
+        &mut self,
+        _prompt: &str,
+        _blackboard: &Blackboard,
+        _reads: &[String],
+        _schema: &BTreeMap<String, FieldType>,
+        _feedback: Option<&str>,
+    ) -> Result<Value, String> {
+        Err("this executor has no intelligence wired for infer".into())
+    }
 }
 
 /// The label an effectful node emits given whether it errored.
@@ -223,6 +239,34 @@ fn edge_for(is_error: bool) -> &'static str {
     } else {
         "ok"
     }
+}
+
+/// Run one effectful attempt, honouring an in-node [`Retry`] policy: on an error
+/// result, re-run up to `retry.max` more times, sleeping `backoff_ms` between
+/// attempts. Every retry charges the step budget; `None` means the budget ran out
+/// mid-retry (the caller reports `Exhausted`). Retries stay within ONE node visit,
+/// so the loop/stall guards are not tripped by an intentionally-identical retry.
+fn with_retry(
+    retry: Option<&Retry>,
+    budget: &mut GraphBudget,
+    mut attempt: impl FnMut() -> (Value, bool),
+) -> Option<(Value, bool)> {
+    let (mut val, mut is_err) = attempt();
+    if let (true, Some(r)) = (is_err, retry) {
+        for _ in 0..r.max {
+            if !budget.step() {
+                return None;
+            }
+            if r.backoff_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(r.backoff_ms));
+            }
+            (val, is_err) = attempt();
+            if !is_err {
+                break;
+            }
+        }
+    }
+    Some((val, is_err))
 }
 
 /// Start a fresh graph run: enter `start` with a total step cap of `max_steps`.
@@ -371,20 +415,78 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 output_contract,
                 reads,
                 writes,
+                retry,
                 edges,
                 ..
             } => {
-                let (val, is_err) = exec.run_agent(
-                    instruction,
-                    output_contract.as_deref(),
-                    &state.blackboard,
-                    reads,
-                );
+                let GraphState { blackboard, budget, .. } = state;
+                let attempt = with_retry(retry.as_ref(), budget, || {
+                    exec.run_agent(instruction, output_contract.as_deref(), blackboard, reads)
+                });
+                let Some((val, is_err)) = attempt else {
+                    return exhausted(state);
+                };
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
-            Node::Tool { server, tool, args, writes, edges } => {
-                let (val, is_err) = exec.call_tool(server, tool, args);
+            Node::Tool { server, tool, args, writes, retry, edges } => {
+                // Resolve `$from` references against the CURRENT blackboard once;
+                // retries re-call with the same resolved args (nothing can change
+                // the board between in-node attempts). An unresolvable reference
+                // is an error result — the tool is never called with a bad shape.
+                let (val, is_err) = match super::resolve_refs(args, &state.blackboard) {
+                    Err(e) => (Value::String(format!("argument error: {e}")), true),
+                    Ok(resolved) => {
+                        let GraphState { budget, .. } = state;
+                        match with_retry(retry.as_ref(), budget, || {
+                            exec.call_tool(server, tool, &resolved)
+                        }) {
+                            Some(r) => r,
+                            None => return exhausted(state),
+                        }
+                    }
+                };
+                write(&mut state.blackboard, writes, val);
+                (edge_for(is_err), edges)
+            }
+            // Pure data shaping: resolve the value template against the blackboard.
+            // No model, no tool — deterministic and cheap.
+            Node::Assign { value, writes, edges } => {
+                let (val, is_err) = match super::resolve_refs(value, &state.blackboard) {
+                    Ok(v) => (v, false),
+                    Err(e) => (Value::String(format!("assign error: {e}")), true),
+                };
+                state.blackboard.insert(writes.clone(), val);
+                (edge_for(is_err), edges)
+            }
+            // One structured intelligence ask, schema-checked, with bounded
+            // validation-feedback re-asks INSIDE the attempt (≤ MAX_INFER_RETRIES,
+            // cheap) and the generic in-node retry policy around it.
+            Node::Infer { prompt, reads, schema, writes, retries, retry, edges } => {
+                let GraphState { blackboard, budget, .. } = state;
+                let attempt = with_retry(retry.as_ref(), budget, || {
+                    let mut feedback: Option<String> = None;
+                    for _ in 0..=*retries {
+                        match exec.infer(prompt, blackboard, reads, schema, feedback.as_deref()) {
+                            Err(e) => return (Value::String(format!("infer error: {e}")), true),
+                            Ok(v) => match super::check_schema(schema, &v) {
+                                Ok(()) => return (v, false),
+                                Err(e) => feedback = Some(e),
+                            },
+                        }
+                    }
+                    (
+                        Value::String(format!(
+                            "infer: the answer failed the schema after {} attempts: {}",
+                            retries + 1,
+                            feedback.unwrap_or_default()
+                        )),
+                        true,
+                    )
+                });
+                let Some((val, is_err)) = attempt else {
+                    return exhausted(state);
+                };
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
@@ -410,6 +512,17 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             }
         }
     }
+}
+
+/// The budget ran out (possibly mid-retry): report `Exhausted` with whatever the
+/// blackboard holds.
+fn exhausted(state: &GraphState) -> DriveResult {
+    let result = bb_result(&state.blackboard, None);
+    DriveResult::Done(GraphOutcome::engine(
+        GraphStatus::Exhausted,
+        result,
+        state.steps(),
+    ))
 }
 
 /// Write a node's result to its `writes` key (a no-op when the node writes nothing).
@@ -465,8 +578,17 @@ mod tests {
     struct MockExec {
         agents: BTreeMap<String, (Value, bool)>,
         tools: BTreeMap<String, (Value, bool)>,
+        /// Per-tool scripted SEQUENCES (consumed front-first) — for retry tests
+        /// where a tool must fail N times then succeed. Falls back to `tools`.
+        tool_seq: BTreeMap<String, std::collections::VecDeque<(Value, bool)>>,
         calls: Vec<String>,
         last_blackboard: Blackboard,
+        /// Every args value `call_tool` received, in order — proves substitution.
+        tool_args: Vec<Value>,
+        /// Scripted `infer` answers, consumed front-first (`Err` = transport-ish).
+        infers: std::collections::VecDeque<Result<Value, String>>,
+        /// The `feedback` each infer call received — proves the re-ask loop.
+        infer_feedbacks: Vec<Option<String>>,
         /// When an agent's instruction equals this, return an INCREMENTING counter
         /// `{"n": k}` (a progressing loop body) instead of a scripted constant.
         counting: Option<String>,
@@ -495,10 +617,31 @@ mod tests {
                 .unwrap_or((Value::Null, false))
         }
 
-        fn call_tool(&mut self, server: &str, tool: &str, _args: &Value) -> (Value, bool) {
+        fn call_tool(&mut self, server: &str, tool: &str, args: &Value) -> (Value, bool) {
             let key = format!("{server}.{tool}");
             self.calls.push(format!("tool:{key}"));
+            self.tool_args.push(args.clone());
+            if let Some(seq) = self.tool_seq.get_mut(&key)
+                && let Some(next) = seq.pop_front()
+            {
+                return next;
+            }
             self.tools.get(&key).cloned().unwrap_or((Value::Null, false))
+        }
+
+        fn infer(
+            &mut self,
+            prompt: &str,
+            _blackboard: &Blackboard,
+            _reads: &[String],
+            _schema: &BTreeMap<String, super::FieldType>,
+            feedback: Option<&str>,
+        ) -> Result<Value, String> {
+            self.calls.push(format!("infer:{prompt}"));
+            self.infer_feedbacks.push(feedback.map(str::to_string));
+            self.infers
+                .pop_front()
+                .unwrap_or(Err("no scripted infer answer".into()))
         }
 
         fn judge(
@@ -1020,5 +1163,186 @@ mod tests {
         };
         // Default run_subgraph → (Null, true) → the error edge → the crashed halt.
         assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
+    }
+
+    // ── W2: assign, $from substitution, infer, retry ─────────────────────────
+
+    #[test]
+    fn assign_shapes_data_and_tool_args_resolve_refs() {
+        // fetch (agent, writes item) → shape (assign: project item/id + a constant)
+        // → send (tool whose args embed $from refs) → done. Proves the data flowed
+        // agent → assign → tool without a model call in between.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "fetch",
+            "nodes": {
+                "fetch": {"kind": "agent", "instruction": "fetch", "writes": "item", "edges": {"ok": "shape", "error": "fail"}},
+                "shape": {
+                    "kind": "assign",
+                    "value": {"id": {"$from": "item", "pointer": "/id"}, "mode": "fast", "missing_ok": {"$from": "item", "pointer": "/nope", "default": 0}},
+                    "writes": "req",
+                    "edges": {"ok": "send", "error": "fail"}
+                },
+                "send": {
+                    "kind": "tool", "server": "q", "tool": "push",
+                    "args": {"payload": {"$from": "req"}},
+                    "writes": "out",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "out"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.agents
+            .insert("fetch".into(), (json!({"id": 42, "noise": "x"}), false));
+        exec.tools.insert("q.push".into(), (json!("queued"), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        // The tool received the SHAPED args: the projected id, the constant, and
+        // the defaulted missing pointer — not the raw item.
+        assert_eq!(
+            exec.tool_args.last().unwrap(),
+            &json!({"payload": {"id": 42, "mode": "fast", "missing_ok": 0}})
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_tool_ref_takes_the_error_edge_without_calling_the_tool() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "send",
+            "nodes": {
+                "send": {"kind": "tool", "server": "q", "tool": "push", "args": {"x": {"$from": "absent"}}, "writes": "err", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "err"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge taken");
+        // The tool itself was NEVER called (no bad-shape call), and the error names
+        // the missing key.
+        assert!(exec.tool_args.is_empty(), "no tool call on a bad ref");
+        assert!(
+            out.result.as_str().unwrap().contains("absent"),
+            "{:?}",
+            out.result
+        );
+    }
+
+    #[test]
+    fn infer_validates_reasks_with_feedback_then_succeeds() {
+        // First answer misses the schema (no "verdict"), the driver re-asks WITH
+        // feedback, the second answer passes → ok edge, parsed object on the board.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "classify",
+            "nodes": {
+                "classify": {
+                    "kind": "infer", "prompt": "classify it",
+                    "schema": {"verdict": "string", "score": "number"},
+                    "retries": 2, "writes": "c",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "c"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.infers.push_back(Ok(json!({"score": 5})));
+        exec.infers
+            .push_back(Ok(json!({"verdict": "approve", "score": 5})));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(out.result, json!({"verdict": "approve", "score": 5}));
+        // Two asks: the first with no feedback, the second carrying the miss.
+        assert_eq!(exec.infer_feedbacks.len(), 2);
+        assert!(exec.infer_feedbacks[0].is_none());
+        assert!(
+            exec.infer_feedbacks[1].as_deref().unwrap().contains("verdict"),
+            "{:?}",
+            exec.infer_feedbacks[1]
+        );
+    }
+
+    #[test]
+    fn infer_exhausting_its_reasks_takes_the_error_edge() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "classify",
+            "nodes": {
+                "classify": {
+                    "kind": "infer", "prompt": "classify",
+                    "schema": {"verdict": "string"},
+                    "retries": 1, "writes": "c",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "refused", "result_from": "c"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        exec.infers.push_back(Ok(json!({"wrong": 1})));
+        exec.infers.push_back(Ok(json!(["not an object"])));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Refused), "error edge");
+        assert!(
+            out.result.as_str().unwrap().contains("failed the schema"),
+            "{:?}",
+            out.result
+        );
+    }
+
+    #[test]
+    fn a_retry_policy_reruns_a_flaky_tool_then_succeeds() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "t",
+            "nodes": {
+                "t": {"kind": "tool", "server": "s", "tool": "flaky", "retry": {"max": 2, "backoff_ms": 0}, "writes": "r", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "r"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.tool_seq.insert(
+            "s.flaky".into(),
+            vec![
+                (json!("boom"), true),
+                (json!("boom"), true),
+                (json!("finally"), false),
+            ]
+            .into(),
+        );
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed, "3rd attempt succeeded");
+        assert_eq!(out.result, json!("finally"));
+        // 1 visit + 2 retries charged + the halt visit.
+        assert_eq!(out.steps, 4, "each retry charges the budget");
+        assert_eq!(exec.tool_args.len(), 3, "three attempts made");
+    }
+
+    #[test]
+    fn retries_stop_when_the_budget_runs_out() {
+        // Budget 2: the visit charges 1, the first retry charges 1, the second
+        // retry is DENIED → Exhausted (not an infinite retry storm).
+        let g: Graph = serde_json::from_value(json!({
+            "start": "t",
+            "nodes": {
+                "t": {"kind": "tool", "server": "s", "tool": "dead", "retry": {"max": 5, "backoff_ms": 0}, "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        exec.tools.insert("s.dead".into(), (json!("x"), true));
+        let out = run(&g, &mut exec, 2);
+        assert_eq!(out.status, GraphStatus::Exhausted);
+        assert_eq!(exec.tool_args.len(), 2, "visit + one retry, then stopped");
     }
 }

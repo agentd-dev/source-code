@@ -12,7 +12,10 @@
 //! It touches NO process-supervision code — it composes the existing loop + MCP client
 //! + intelligence client, so a workflow inherits their transport/auth/resilience.
 
-use super::{drive, resume, Blackboard, DriveResult, Graph, GraphExec, GraphOutcome, GraphStatus, WaitOutcome};
+use super::{
+    drive, resume, Blackboard, DriveResult, FieldType, Graph, GraphExec, GraphOutcome,
+    GraphStatus, WaitOutcome,
+};
 use crate::agentloop::action::SelfHandler;
 use crate::agentloop::runner::{run_loop, LoopInput};
 use crate::agentloop::stop::TerminalStatus;
@@ -22,11 +25,36 @@ use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
 use crate::wire::intel::{Message, Request, ToolDef};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// The graph run's total node-visit cap (layer-1 backstop) — generous, since a graph
 /// is many node visits; the graph's own budget/validation/termination bound the walk.
 pub const GRAPH_MAX_STEPS: u32 = 10_000;
+
+/// The completion cap for one `Infer` ask — structured extraction answers are small
+/// by construction; a runaway answer is truncated, fails the parse, and re-asks.
+const INFER_MAX_TOKENS: u32 = 2048;
+
+/// Parse a model's structured answer as JSON, tolerating the common wrappers: a
+/// leading/trailing code fence and prose around the object (first `{` … last `}`).
+/// Strictly parsed first, so a clean answer costs nothing extra.
+fn parse_json_answer(answer: &str) -> Result<Value, String> {
+    let t = answer.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return Ok(v);
+    }
+    if let (Some(a), Some(b)) = (t.find('{'), t.rfind('}'))
+        && b > a
+        && let Ok(v) = serde_json::from_str::<Value>(&t[a..=b])
+    {
+        return Ok(v);
+    }
+    Err(format!(
+        "the answer was not valid JSON: {}",
+        t.chars().take(120).collect::<String>()
+    ))
+}
 
 /// Drive a pinned/stored graph SYNCHRONOUSLY to a terminal [`GraphOutcome`] against
 /// freshly-connected intelligence + MCP servers (pivot Phase 7 · P6). The single
@@ -252,6 +280,56 @@ impl GraphExec for SessionExec<'_> {
             .cloned()
     }
 
+    fn infer(
+        &mut self,
+        prompt: &str,
+        blackboard: &Blackboard,
+        reads: &[String],
+        schema: &BTreeMap<String, FieldType>,
+        feedback: Option<&str>,
+    ) -> Result<Value, String> {
+        // One tool-less completion asked to emit ONLY a JSON object with the schema
+        // fields. The driver validates + re-asks; this method just asks and parses.
+        let mut ctx = String::new();
+        for k in reads {
+            if let Some(v) = blackboard.get(k) {
+                ctx.push_str(&format!("{k} = {v}\n"));
+            }
+        }
+        let fields: Vec<String> = schema
+            .iter()
+            .map(|(f, t)| format!("\"{f}\": {t:?}"))
+            .collect();
+        let mut question = format!(
+            "{ctx}\n{prompt}\n\nReply with ONLY a JSON object carrying these fields: {{{}}}",
+            fields.join(", ")
+        );
+        if let Some(fb) = feedback {
+            question.push_str(&format!(
+                "\n\nYour previous answer was invalid: {fb}. Reply again with ONLY the corrected JSON object."
+            ));
+        }
+        let req = Request {
+            model: self.model.clone(),
+            messages: vec![
+                Message::system(
+                    "You are a structured extraction engine. Reply with ONLY one JSON object — no prose, no code fences.",
+                ),
+                Message::user(&question),
+            ],
+            tools: Vec::new(),
+            max_tokens: INFER_MAX_TOKENS,
+            temperature: None,
+        };
+        let answer = self
+            .intel
+            .complete(&req)
+            .map_err(|e| e.to_string())?
+            .text
+            .ok_or("empty completion")?;
+        parse_json_answer(&answer)
+    }
+
     fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _blackboard: &Blackboard) -> (Value, bool) {
         // Sync: drive the nested graph inline with this same executor. (An `async`
         // subgraph spawned as a detached, capped subtree is the daemon-side follow-up;
@@ -346,6 +424,52 @@ mod tests {
             &["done".to_string(), "pending".to_string()],
         );
         assert_eq!(choice.as_deref(), Some("done"), "judge picked the matching label");
+    }
+
+    #[test]
+    fn session_exec_infers_structured_json_against_the_mock_llm() {
+        // The `json` script answers a pure JSON object; infer parses it and the
+        // driver-side schema check accepts it end to end through a real Infer node.
+        let dir = tempfile::tempdir().unwrap();
+        let url = start_mock_llm(&dir.path().join("llm.addr"), "json");
+        let intel = IntelClient::from_parts(&url, None).unwrap();
+        let lg = log();
+        let mut exec =
+            SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let g: Graph = serde_json::from_value(json!({
+            "start": "i",
+            "nodes": {
+                "i": {"kind": "infer", "prompt": "verdict?", "schema": {"verdict": "string", "score": "number"}, "writes": "c", "edges": {"ok": "h", "error": "f"}},
+                "h": {"kind": "halt", "status": "completed", "result_from": "c"},
+                "f": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        let DriveResult::Done(out) = drive(&g, &mut exec, 100) else {
+            panic!("no wait — should complete");
+        };
+        assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.result);
+        assert_eq!(out.result, json!({"verdict": "approve", "score": 9}));
+    }
+
+    #[test]
+    fn parse_json_answer_tolerates_fences_and_prose() {
+        assert_eq!(
+            parse_json_answer(r#"{"a": 1}"#).unwrap(),
+            json!({"a": 1}),
+            "strict"
+        );
+        assert_eq!(
+            parse_json_answer("```json\n{\"a\": 1}\n```").unwrap(),
+            json!({"a": 1}),
+            "fenced"
+        );
+        assert_eq!(
+            parse_json_answer("Sure! Here you go: {\"a\": 1} — anything else?").unwrap(),
+            json!({"a": 1}),
+            "prose-wrapped"
+        );
+        assert!(parse_json_answer("no json here").is_err());
     }
 
     #[test]

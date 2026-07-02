@@ -1,5 +1,10 @@
 # RFC 0009: Subagent process model & nesting
 
+> **⚠ SUPERSEDED — transport (target-vision pivot, 2026-07-02).** References to a
+> unix/vsock transport in this RFC are superseded by **HTTPS** (mTLS/bearer auth;
+> loopback `http://` for dev); operator control is the `a2a.*` method family. The
+> contracts still hold — only the transport does not. See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+
 **Status:** Accepted (shipped v1)
 **Author:** Andrii Tsok
 **Date:** 2026-06-25

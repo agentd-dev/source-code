@@ -1,5 +1,11 @@
 # RFC 0014: agentd as a managed workload — the control-plane (agentctl) contract
 
+> **⚠ SUPERSEDED — transport (target-vision pivot, 2026-07-02).** The unix/vsock
+> transport this RFC specifies is replaced by **HTTPS** (mTLS/bearer auth; loopback
+> `http://` for dev); operator control is unified into the `a2a.*` method family. The
+> contracts (methods/resources/semantics) still hold — only the transport does not.
+> See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+
 **Status:** Proposed (agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27

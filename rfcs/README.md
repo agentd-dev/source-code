@@ -1,5 +1,18 @@
 # agentd RFCs — index
 
+> **⚠ Transport superseded by the target-vision pivot (2026-07-02).** These RFCs
+> were written when agentd's intelligence, control plane, and A2A rode **unix/vsock**.
+> agentd has since pivoted to **HTTPS everywhere**: intelligence, the MCP client, the
+> served self-MCP, A2A, and operator control are all HTTP(S) with mTLS/bearer auth
+> (loopback `http://` for dev); operator control is unified into the `a2a.*` method
+> family; and the `exec` self-tool was **removed** (agentd runs no local code). The
+> RFC *contracts* (methods, resources, semantics, exit codes) still hold — only the
+> **transport** and the exec surface changed. The authoritative, verified plan is
+> **[`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md)**;
+> where an RFC and that document diverge on transport/exec, the pivot wins. Affected
+> RFCs carry a banner. Run-graphs (an agent-orchestration feature) are documented in
+> **[`../docs/run-graphs.md`](../docs/run-graphs.md)**.
+
 This directory holds the agentd RFC set. **0001–0013** are the rewrite core
 (Accepted, shipped v1): RFC **0001** is the readable narrative front door, and
 **0002–0013** specify each mechanism area in depth. **0014–0020** are the

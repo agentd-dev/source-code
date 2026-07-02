@@ -27,42 +27,50 @@ config-reload notifications come with it.
 
 Two MCP surfaces speak the *same* dialect but live in different trust domains:
 
-- **Stdio** — the process's own stdin/stdout. This is the driving harness (the
-  parent that spawned this agent, or the `subagent.*` control path). Every
-  agentd serves the self-MCP over stdio always.
-- **Management** — a peer that connected to a `--serve-mcp` listener. This is
-  the operator / `agentctl` channel.
+- **Stdio** — the in-process / same-trust caller: the driving harness (the parent
+  that spawned this agent) and the agent's own loop reaching the self-tools. This
+  origin is always available in-process; it is not a network listener.
+- **Management** — a request that authenticated on the `--serve-mcp` HTTP(S)
+  listener (a verified mTLS cert, or a matched bearer). This is the operator /
+  `agentctl` channel.
 
-You arm the management transport with `--serve-mcp` (env `AGENT_SERVE_MCP`):
+You arm the management transport with `--serve-mcp` (env `AGENT_SERVE_MCP`) — an
+HTTP(S) listener served by the reusable `mcp` crate's HTTP/1.1 + SSE framing:
 
-| Form | Meaning | Needs |
+| Form | Meaning | Auth |
 |---|---|---|
-| `--serve-mcp unix:/run/agent.sock` | a unix-domain socket | `--features serve-mcp` |
-| `--serve-mcp vsock:PORT` | vsock, wildcard CID (`VMADDR_CID_ANY`) | `--features serve-mcp,vsock` |
-| `--serve-mcp vsock:CID:PORT` | vsock, explicit CID:port (a Firecracker/Kata guest) | `--features serve-mcp,vsock` |
+| `--serve-mcp https://0.0.0.0:8443` + `--serve-cert`/`--serve-key`/`--serve-client-ca` | TLS with **mutual-TLS** client auth | a verified client cert → `Management` |
+| `--serve-mcp https://0.0.0.0:8443` + `--serve-bearer <token>` | TLS with a **bearer token** | a constant-time-matched `Authorization: Bearer …` → `Management` |
+| `--serve-mcp http://127.0.0.1:8080` | **loopback only**, no auth (dev) | any loopback peer → `Management` |
+
+Needs `--features serve-https`. Trust is **never** derived from the transport — a
+non-loopback bind **must** configure mTLS and/or a bearer, or startup fails; there
+is no open control plane.
 
 ```console
 $ agentd \
     --instruction 'reconcile on change' \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --mode reactive --subscribe file:///data/desired.json \
-    --serve-mcp unix:/run/agent.sock
+    --serve-mcp https://0.0.0.0:8443 \
+    --serve-cert /etc/agentd/tls/server.crt \
+    --serve-key /etc/agentd/tls/server.key \
+    --serve-client-ca /etc/agentd/tls/clients-ca.crt
 ```
 
-Both unix and vsock are served by the same blocking, thread-per-connection
-listener (no async, no new framing) — vsock is "the unix server with the socket
-type swapped". A peer on either is in the **Management** origin; the process's
-own stdio is the **Stdio** origin.
+A request that authenticates (a verified mTLS cert, or a matched bearer) is in the
+**Management** origin; the process's own stdio — the driving harness / `subagent.*`
+control path — is the **Stdio** origin. agentd links no unix/vsock listener.
 
 ### 1.1 The origin gate
 
 The trust split is enforced by *transport origin*, not an in-band flag:
 
-- **Operator tools** (`drain`, `lame-duck`, `pause`, `resume`, `cancel`) are
-  listed and callable **only** to a Management peer. A Stdio peer (a spawned
-  subagent driving its own loop) cannot even *see* them in `tools/list`, and a
-  `tools/call` for one falls through to an unknown-tool error. So a subagent can
-  never drain or pause its own supervisor.
+- **Operator control** is the **A2A admin method family** (`a2a.Drain`,
+  `a2a.LameDuck`, `a2a.Pause`, `a2a.Resume`, `a2a.Cancel`) — not tools. It is
+  callable **only** by a Management peer; a Stdio peer (a spawned subagent driving
+  its own loop) that calls one falls through to `-32601` (method-not-found), as if
+  it did not exist. So a subagent can never drain or pause its own supervisor.
 - The **operator-facing resources** (`agent://inventory`,
   `agent://intelligence`, `agent://config/effective`, `agent://capacity`,
   `agent://events`) are likewise Management-only — listed, readable, and
@@ -79,22 +87,25 @@ it tries to use one.
 
 ---
 
-## 2. The operator tools
+## 2. The operator control methods
 
-These five tools steer a running instance without an in-band config change. They
-are listed to a Management peer by `tools/list` and invoked by `tools/call`.
-Each returns a JSON `structuredContent` body alongside human text. The names are
-a single frozen constant shared with the capabilities manifest
-(`capabilities::OPERATOR_TOOLS`), so what an instance *advertises* and what it
-*serves* can never drift.
+These five **A2A admin methods** steer a running instance without an in-band config
+change. Operator control is unified into the one A2A method family (so operators
+drive a single authenticated HTTPS control protocol) — a Management peer invokes
+them as JSON-RPC `a2a.*` methods, and each returns its structured body directly (a
+refusal is a JSON-RPC error, not an `isError` result). The names are a single frozen
+constant shared with the capabilities manifest (`capabilities::OPERATOR_TOOLS`,
+surfaced as `surfaces.operator_tools`), and a drift-guard test enforces the 1:1 with
+the served dispatch, so what an instance *advertises* and what it *serves* can never
+diverge.
 
-| Tool | What it does | Exits the process? | Readiness |
+| Method | What it does | Exits the process? | Readiness |
 |---|---|---|---|
-| `drain` | Begin a graceful drain (identical to SIGTERM) → exit `0` | yes, eventually | → NotReady |
-| `lame-duck` | Advertise NotReady without draining or exiting | no | → NotReady (reversible) |
-| `pause` | Suspend the whole agentic tree at turn boundaries | no | unchanged |
-| `resume` | Clear a prior `pause` | no | unchanged |
-| `cancel` | Cancel one run/subtree by handle | no | unchanged |
+| `a2a.Drain` | Begin a graceful drain (identical to SIGTERM) → exit `0` | yes, eventually | → NotReady |
+| `a2a.LameDuck` | Advertise NotReady without draining or exiting | no | → NotReady (reversible) |
+| `a2a.Pause` | Suspend the whole agentic tree at turn boundaries | no | unchanged |
+| `a2a.Resume` | Clear a prior `a2a.Pause` | no | unchanged |
+| `a2a.Cancel` | Cancel one run/subtree by handle | no | unchanged |
 
 ### 2.1 `drain` — graceful shutdown for a rolling update
 
@@ -104,9 +115,9 @@ boundaries, then the process exits **`0`** (a clean drain is `0`, never `143`).
 It returns **immediately** with a snapshot — it does **not** block until exit.
 
 ```jsonc
-// tools/call → drain
-{ "name":"drain", "arguments":{ "deadline_ms": 20000 } }   // deadline_ms optional
-// result.structuredContent
+// a2a.Drain — params are the args directly (no nested "arguments")
+{ "jsonrpc":"2.0", "id":1, "method":"a2a.Drain", "params":{ "deadline_ms": 20000 } }
+// result (the structured body, returned directly)
 { "draining":true, "in_flight":2, "eta_ms":20000,
   "drain_timeout_ms":25000, "started_at":"2026-06-28T10:00:00.123Z" }
 ```
@@ -128,17 +139,17 @@ new work". It is the rolling-update primitive when you want to bleed an instance
 off the load path *before* you drain or replace it.
 
 ```jsonc
-{ "name":"lame-duck", "arguments":{} }                 // default: NotReady
-{ "name":"lame-duck", "arguments":{ "ready":true } }   // clear the override
-// result.structuredContent
+{ "method":"a2a.LameDuck", "params":{} }                 // default: NotReady
+{ "method":"a2a.LameDuck", "params":{ "ready":true } }   // clear the override
+// result
 { "ready":false, "since":"2026-06-28T10:00:00.123Z", "in_flight":2 }
 ```
 
 The override only ever pushes *toward* NotReady. `ready:true` clears it and
 restores the genuine computed readiness — but it can't assert Ready over a
 not-ready supervisor: if a `drain` is already in progress, `ready:true` is
-**refused** (an error result) rather than silently flipping a flag with no
-effect, because the drain latch is one-way.
+**refused** — a JSON-RPC `INVALID_PARAMS` error, not a silent no-op — because the
+drain latch is one-way.
 
 ### 2.3 `pause` / `resume` — freeze the tree at turn boundaries
 
@@ -155,10 +166,10 @@ management, still bumps liveness). Use it for live debugging, or to hold a tree
 still while you swap the model service underneath it.
 
 ```jsonc
-{ "name":"pause", "arguments":{} }
-// result.structuredContent
+{ "method":"a2a.Pause", "params":{} }
+// result
 { "paused":true, "affected":3 }     // 3 live subtrees suspending at their next turn
-{ "name":"resume", "arguments":{} }
+{ "method":"a2a.Resume", "params":{} }
 { "paused":false, "affected":3 }
 ```
 
@@ -180,15 +191,15 @@ handle**, walking the kill ladder over that run's subtree — but it leaves the 
 running (unlike `drain`, which also exits).
 
 ```jsonc
-{ "name":"cancel", "arguments":{ "handle":"served.2", "reason":"superseded" } }
-// result.structuredContent
+{ "method":"a2a.Cancel", "params":{ "handle":"served.2", "reason":"superseded" } }
+// result
 { "handle":"served.2", "cancelled":true }
 ```
 
-An **unknown handle** is reported as an `isError:true` result (a racing reap may
-have already removed it), *not* a JSON-RPC protocol error — the same observation
--vs-fault distinction agentd honours everywhere ([mcp §1.4](mcp.md)). A handle
-that is already terminal returns `cancelled:false, reason:"already finished"`.
+An **unknown handle** is a JSON-RPC `INVALID_PARAMS` error carrying `no such handle`
+(a racing reap may have already removed it) — the admin methods report a refusal as
+a protocol error, not a result. A handle that is already terminal returns
+`cancelled:false, reason:"already finished"`.
 `reason` is surfaced into the `ctrl/cancel` frame and the logs.
 
 ---
@@ -211,7 +222,7 @@ It is exposed two ways, from **one** builder so they never drift:
   discovery onto `intelligence.models`).
 
 ```console
-$ agentd --instruction x --intelligence unix:/run/intel.sock --capabilities
+$ agentd --instruction x --intelligence https://gw.example/v1 --capabilities
 { "contract_version":"1.0", "agent_version":"…", "build_features":[…],
   "identity":{…}, "mode":"once", "model":null,
   "intelligence":{ "transport":"unix", "endpoints":1, "healthy":"unknown", … },

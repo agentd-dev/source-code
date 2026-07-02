@@ -483,8 +483,8 @@ impl A2aEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct McpServerSpec {
     pub name: String,
-    /// Remote MCP endpoint — `https://…` / `http://…` / `unix:/path` /
-    /// `vsock:cid:port` (RFC 0004 Streamable HTTP).
+    /// Remote MCP endpoint — `https://host[:port][/path]` (loopback `http://`
+    /// for dev), reached over RFC 0004 Streamable HTTP.
     pub endpoint: String,
     /// Secret-FREE auth/framing header templates (e.g. `("Authorization", "Bearer
     /// {{secret:MCP_TOKEN}}")`), resolved at connect time (RFC 0012 §3.7 — no
@@ -503,10 +503,41 @@ pub struct McpServerSpec {
 /// schemes agentd dials (RFC 0004 / RFC 0006).
 pub fn is_mcp_endpoint(s: &str) -> bool {
     let s = s.trim();
-    s.starts_with("https://")
-        || s.starts_with("http://")
-        || s.starts_with("unix:")
-        || s.starts_with("vsock:")
+    // HTTPS-only (pivot Phase 3): a remote Streamable HTTP endpoint. `http://` is
+    // admitted here (scheme shape only); the loopback carve-out + the retired
+    // unix:/vsock: rejection are enforced in `mcp_endpoint_scheme_ok`, the gate
+    // every server (CLI + config-file) flows through at validation.
+    s.starts_with("https://") || s.starts_with("http://")
+}
+
+/// Whether an MCP-server endpoint scheme is admissible: `https://`, or a loopback
+/// `http://` (dev). The retired `unix:`/`vsock:` schemes and non-loopback
+/// plaintext are rejected. This is the agentd-side gate applied BEFORE the
+/// reusable crate's `McpEndpoint::parse` (which still accepts the sockets) so a
+/// config-file server — which bypasses `is_mcp_endpoint` / CLI parsing — is held
+/// to the same HTTPS-only rule.
+pub fn mcp_endpoint_scheme_ok(endpoint: &str) -> Result<(), ConfigError> {
+    let e = endpoint.trim();
+    if e.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = e.strip_prefix("http://") {
+        let host = rest.split('/').next().unwrap_or(rest);
+        let host = if host.starts_with('[') {
+            host.split(']').next().map_or(host, |h| &h[1..])
+        } else {
+            host.rsplit_once(':').map_or(host, |(h, _)| h)
+        };
+        if crate::net::http::is_loopback_host(host) {
+            return Ok(());
+        }
+        return Err(usage(format!(
+            "mcp endpoint plaintext http:// is allowed for loopback only; use https:// (got: {endpoint})"
+        )));
+    }
+    Err(usage(format!(
+        "mcp endpoint must be https://host[:port][/path] (got: {endpoint})"
+    )))
 }
 
 /// The fully-resolved, validated configuration.
@@ -1496,6 +1527,11 @@ impl Config {
             if s.endpoint.trim().is_empty() {
                 return Err(usage(format!("mcp server '{}' has no endpoint", s.name)));
             }
+            // HTTPS-only gate FIRST (pivot Phase 3): the reusable crate parser
+            // still accepts unix:/vsock:, so hold every server — CLI and
+            // config-file alike — to http(s) before delegating to it.
+            mcp_endpoint_scheme_ok(&s.endpoint)
+                .map_err(|e| usage(format!("mcp server '{}': {e}", s.name)))?;
             // Validate the endpoint parses and its auth header templates resolve at
             // startup (RFC 0012 §3.7 — fail fast, don't discover an unreadable
             // secret on first use).
@@ -2105,8 +2141,8 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     }
     if !is_mcp_endpoint(endpoint) {
         return Err(usage(format!(
-            "--mcp '{spec}': endpoint must be https://|http://|unix:|vsock: \
-             (stdio MCP servers were removed in v2.0.0)"
+            "--mcp '{spec}': endpoint must be https://host[:port][/path] \
+             (loopback http:// for dev)"
         )));
     }
     Ok(McpServerSpec {
@@ -2392,8 +2428,8 @@ fn help_text() -> String {
          \x20 --model-swap <finish-on-old|restart-turn>  in-flight model-change policy (default finish-on-old; or AGENT_MODEL_SWAP)\n\
          \n\
          TOOLS / MCP:\n\
-         \x20 --mcp name=endpoint         declare a remote MCP server (repeatable; https://|http://|unix:|vsock:)\n\
-         \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
+         \x20 --mcp name=endpoint         declare a remote MCP server (repeatable; https://host[:port][/path])\n\
+         \x20 --serve-mcp <TARGET>        serve agentd's own MCP over HTTP(S): https://host:port (or loopback http:// for dev)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: https://host[:port] (repeatable; needs --features a2a)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
          \x20 --allow-trifecta            permit all three capability legs in one agent\n\
@@ -2580,7 +2616,7 @@ mod tests {
     fn mcp_tags_attach_to_their_server_order_independent() {
         // --mcp-tags before its --mcp still resolves.
         let c = Config::load(
-            &args(&["--mcp-tags", "fs=sensitive,egress", "--mcp", "fs=unix:/fs.sock"]),
+            &args(&["--mcp-tags", "fs=sensitive,egress", "--mcp", "fs=https://fs.example"]),
             &base_env(),
         )
         .unwrap();
@@ -2593,13 +2629,13 @@ mod tests {
     #[test]
     fn mcp_tags_unknown_server_or_tag_is_usage_error() {
         let bad_server = Config::load(
-            &args(&["--mcp", "fs=unix:/fs.sock", "--mcp-tags", "ghost=egress"]),
+            &args(&["--mcp", "fs=https://fs.example", "--mcp-tags", "ghost=egress"]),
             &base_env(),
         )
         .unwrap_err();
         assert!(matches!(bad_server, ConfigError::Usage(_)));
         let bad_tag = Config::load(
-            &args(&["--mcp", "fs=unix:/fs.sock", "--mcp-tags", "fs=bogus"]),
+            &args(&["--mcp", "fs=https://fs.example", "--mcp-tags", "fs=bogus"]),
             &base_env(),
         )
         .unwrap_err();
@@ -2820,7 +2856,7 @@ mod tests {
                 "--mode",
                 "reactive",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--claim",
                 "file:///inbox/42.json=coord",
             ]),
@@ -2865,7 +2901,7 @@ mod tests {
                 "--mode",
                 "reactive",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--continue",
                 "file:///inbox/42.json",
                 "--claim",
@@ -2896,7 +2932,7 @@ mod tests {
                 "--mode",
                 "reactive",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--claim",
                 "file:///inbox/42.json=coord",
             ]),
@@ -2919,7 +2955,7 @@ mod tests {
                 "--mode",
                 "reactive",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--claim",
                 "file:///inbox/42.json=coord",
             ]),
@@ -2976,7 +3012,7 @@ mod tests {
             ]
         };
         let reactive = |extra: &[&str]| -> Vec<String> {
-            let mut a = vec!["--mode", "reactive", "--mcp", "coord=unix:/coord.sock"];
+            let mut a = vec!["--mode", "reactive", "--mcp", "coord=https://coord.example"];
             a.extend_from_slice(extra);
             args(&a)
         };
@@ -3029,7 +3065,7 @@ mod tests {
                 "reactive",
                 "--standby",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--assign-from",
                 "coord:work://pending",
             ]),
@@ -3051,7 +3087,7 @@ mod tests {
                 "reactive",
                 "--standby",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--claim",
                 "work://pending=coord:resource",
                 "--assign-from",
@@ -3097,7 +3133,7 @@ mod tests {
             &args(&[
                 "--standby",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--assign-from",
                 "coord:work://pending",
             ]),
@@ -3145,7 +3181,7 @@ mod tests {
                 "reactive",
                 "--standby",
                 "--mcp",
-                "coord=unix:/coord.sock",
+                "coord=https://coord.example",
                 "--assign-from",
                 "coord:work://pending",
             ]),
@@ -3159,7 +3195,7 @@ mod tests {
 
     #[test]
     fn trifecta_grant_tags_defaults_untagged_to_untrusted() {
-        let c = Config::load(&args(&["--mcp", "fs=unix:/fs.sock"]), &base_env()).unwrap();
+        let c = Config::load(&args(&["--mcp", "fs=https://fs.example"]), &base_env()).unwrap();
         let tags = c.trifecta_grant_tags();
         assert!(tags.contains(&TrifectaTag::UntrustedInput)); // untagged server
         assert!(!tags.contains(&TrifectaTag::Sensitive)); // one leg → not a trifecta
@@ -3202,7 +3238,7 @@ mod tests {
     #[test]
     fn capabilities_reflects_present_config() {
         // With config present, the manifest reflects it (no validation needed).
-        let c = Config::load(&args(&["--capabilities", "--mcp", "fs=unix:/fs.sock"]), &base_env());
+        let c = Config::load(&args(&["--capabilities", "--mcp", "fs=https://fs.example"]), &base_env());
         let json = match c.unwrap_err() {
             ConfigError::Capabilities(s) => s,
             other => panic!("expected Capabilities, got {other:?}"),
@@ -3243,18 +3279,34 @@ mod tests {
 
     #[test]
     fn mcp_endpoint_spec_parsing() {
+        // HTTPS-only (pivot Phase 3): remote Streamable HTTP endpoints.
         assert!(is_mcp_endpoint("https://mcp.example.com/mcp"));
         assert!(is_mcp_endpoint("http://localhost:8080/mcp"));
-        assert!(is_mcp_endpoint("unix:/run/mcp.sock"));
-        assert!(is_mcp_endpoint("vsock:3:5000"));
-        // A stdio argv command is no longer a valid `--mcp` value (v2.0.0).
+        // The retired socket schemes and a stdio argv command are NOT endpoints.
+        assert!(!is_mcp_endpoint("unix:/run/mcp.sock"));
+        assert!(!is_mcp_endpoint("vsock:3:5000"));
         assert!(!is_mcp_endpoint("mcp-server-fs --root /data"));
         assert!(parse_mcp_spec("fs=mcp-server-fs --root /data").is_err());
+        assert!(parse_mcp_spec("fs=unix:/run/mcp.sock").is_err());
 
-        for ep in ["https://mcp.example.com/mcp", "unix:/run/mcp.sock", "vsock:3:5000"] {
+        for ep in ["https://mcp.example.com/mcp", "http://127.0.0.1:8080/mcp"] {
             let spec = parse_mcp_spec(&format!("fs={ep}")).unwrap();
             assert_eq!(spec.name, "fs");
             assert_eq!(spec.endpoint, ep);
+        }
+    }
+
+    #[test]
+    fn mcp_endpoint_scheme_gate_is_https_only() {
+        // The validation gate every server (CLI + config-file) flows through.
+        assert!(mcp_endpoint_scheme_ok("https://mcp.example/mcp").is_ok());
+        assert!(mcp_endpoint_scheme_ok("http://127.0.0.1:8080/mcp").is_ok());
+        for bad in [
+            "unix:/run/mcp.sock",
+            "vsock:3:5000",
+            "http://mcp.example:8080/mcp",
+        ] {
+            assert!(mcp_endpoint_scheme_ok(bad).is_err(), "{bad} must be rejected");
         }
     }
 
@@ -3467,7 +3519,7 @@ mod tests {
         // The retired socket schemes and non-loopback plaintext are rejected at
         // load (exit 2) before any side effect.
         for bad in [
-            "mesh=unix:/run/peer.sock",
+            "mesh=https://mesh.example",
             "mesh=vsock:2:5005",
             "mesh=http://peer.example:9000",
             "mesh=tcp:9000",
@@ -3638,7 +3690,7 @@ mod tests {
                 "--config",
                 file.path().to_str().unwrap(),
                 "--mcp",
-                "fs=unix:/fs.sock",
+                "fs=https://fs.example",
                 "--subscribe",
                 "fs:file:///b",
             ]),
@@ -3808,7 +3860,7 @@ mod tests {
             &[
                 "--validate-config",
                 "--mcp",
-                "s=unix:/s.sock",
+                "s=https://s.example",
                 "--mcp-tags",
                 "s=untrusted_input,sensitive,egress",
             ],
@@ -3828,7 +3880,7 @@ mod tests {
         // `--validate-config` returns an invalid verdict — they can never disagree.
         let trifecta = [
             "--mcp",
-            "s=unix:/s.sock",
+            "s=https://s.example",
             "--mcp-tags",
             "s=untrusted_input,sensitive,egress",
         ];
@@ -4044,7 +4096,7 @@ mod tests {
                     timer: TimerShardMode::Shard0,
                 }
             },
-            |c: &mut Config| c.serve_mcp = Some("unix:/run/x.sock".into()),
+            |c: &mut Config| c.serve_mcp = Some("https://a.example:8443".into()),
             |c: &mut Config| c.drain_timeout = Duration::from_secs(99),
         ] {
             let mut new = running.clone();
@@ -4122,7 +4174,7 @@ mod tests {
             ..Default::default()
         }];
         let mut edited = with_server.clone();
-        edited.mcp_servers[0].endpoint = "unix:/mcp-edited.sock".into();
+        edited.mcp_servers[0].endpoint = "https://mcp-edited.example".into();
         assert!(
             Config::reload_coherence_check(&edited, Some(&with_server), true).is_ok(),
             "editing an MCP server must pass the coherence check (it is reloadable)"
@@ -4223,7 +4275,7 @@ mod tests {
             match f {
                 "mode" => a.mode = Mode::Loop,
                 "run_id" => a.run_id = "x".into(),
-                "serve_mcp" => a.serve_mcp = Some("unix:/s".into()),
+                "serve_mcp" => a.serve_mcp = Some("https://s.example:8443".into()),
                 "drain_timeout" => a.drain_timeout = Duration::from_secs(123),
                 "shard" => {
                     a.shard = ShardCfg {
@@ -4269,7 +4321,7 @@ mod tests {
             "https://user:embedded-cred@api.example/v1".into(),
         ));
         let mut cfg = Config::load(
-            &args(&["--mcp", "vault=unix:/run/vault-secret.sock"]),
+            &args(&["--mcp", "vault=https://vault.example/mcp"]),
             &env,
         )
         .unwrap();

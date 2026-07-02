@@ -227,13 +227,14 @@ fn a2a_peers(cfg: &Config) -> Value {
         .a2a_peers
         .iter()
         .map(|p| {
-            let transport = if p.endpoint.starts_with("vsock:") {
-                "vsock"
-            } else if p.endpoint.starts_with("unix:") {
-                "unix"
-            } else {
-                "unknown"
-            };
+            // A2A peers are HTTP(S)-only (pivot Phase 3); report the structural
+            // scheme, never the URL (RFC 0012 §3.7).
+            let transport =
+                if p.endpoint.starts_with("https://") || p.endpoint.starts_with("http://") {
+                    "https"
+                } else {
+                    "unknown"
+                };
             json!({ "name": p.name, "transport": transport })
         })
         .collect();
@@ -673,7 +674,7 @@ mod tests {
             &[
                 ("INSTRUCTION", "x"),
                 ("AGENTD_INTELLIGENCE", "https://intel.example"),
-                ("AGENTD_SERVE_MCP", "unix:/run/agentd.sock"),
+                ("AGENTD_SERVE_MCP", "http://127.0.0.1:8443"),
             ],
             &[],
         );
@@ -690,14 +691,14 @@ mod tests {
             &[
                 ("INSTRUCTION", "x"),
                 ("AGENTD_INTELLIGENCE", "https://intel.example"),
-                ("AGENTD_SERVE_MCP", "unix:/run/agentd.sock"),
+                ("AGENTD_SERVE_MCP", "http://127.0.0.1:8443"),
                 ("AGENTD_METRICS_ADDR", ":9090"),
             ],
             &[],
         );
         let id = Identity::from_env(&cfg.run_id);
         let s = &manifest(&cfg, &id, false)["surfaces"];
-        assert_eq!(s["management"], json!("unix:/run/agentd.sock"));
+        assert_eq!(s["management"], json!("http://127.0.0.1:8443"));
         assert_eq!(s["metrics"], json!(":9090"));
     }
 
@@ -724,7 +725,7 @@ mod tests {
             &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "https://intel.example")],
             &[
                 "--mcp",
-                "vault=unix:/vault.sock",
+                "vault=https://vault.example/mcp",
                 "--mcp-tags",
                 "vault=sensitive",
             ],

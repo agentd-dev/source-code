@@ -608,9 +608,7 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
 /// projects to the same exit table as a one-shot run.
 #[cfg(feature = "run-graph")]
 fn run_graph(cfg: &Config, log: &Logger) -> i32 {
-    use agentd::graph::{drive, DriveResult, GraphStatus, SessionExec};
-    use agentd::intel::client::IntelClient;
-    use agentd::mcp::client::McpClient;
+    use agentd::graph::{drive_pinned, DriveResult, GraphStatus};
     use std::time::Duration;
 
     // Load + parse + validate the pinned graph (fail-closed at the operator boundary).
@@ -635,57 +633,41 @@ fn run_graph(cfg: &Config, log: &Logger) -> i32 {
         return exit::USAGE;
     }
 
-    // The SAME intelligence + MCP a normal run uses (reuse the resolved payload).
+    // Drive it against the SAME intelligence + MCP a normal run uses (the shared
+    // `drive_pinned` path — identical to the agent-authored `graph.run` self-tool).
     let payload = root_payload(cfg);
-    let intel = match IntelClient::from_parts(
-        &payload.intelligence.uri,
-        payload.intelligence.token.clone(),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            log.error("proc.exit", json!({"err": format!("intel: {e}")}));
-            eprintln!("agentd: intelligence: {e}");
-            return exit::INTEL_UNAVAILABLE;
-        }
-    };
-    let mut servers: Vec<McpClient> = Vec::new();
-    for spec in &cfg.mcp_servers {
-        match agentd::mcp::from_spec(spec, Duration::from_secs(60))
-            .and_then(|mut c| c.initialize().map(|()| c))
-        {
-            Ok(c) => servers.push(c),
-            Err(e) => {
-                log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
-                eprintln!("agentd: MCP server '{}' failed: {e}", spec.name);
-                return exit::MCP_REQUIRED_DOWN;
-            }
-        }
-    }
-
-    // Drive it. Each Agent node runs a ReAct turn under the run's per-node limits; the
-    // graph step cap is generous (a graph is many node visits) — the graph's own
-    // validation + termination layers bound the walk.
     let model = payload.intelligence.model.clone().unwrap_or_default();
     let node_timeout = cfg.deadline.unwrap_or(Duration::from_secs(600));
-    let mut exec = SessionExec::new(
-        &intel,
-        &servers,
-        log,
+    let result = drive_pinned(
+        &graph,
+        &payload.intelligence.uri,
+        payload.intelligence.token.clone(),
         &model,
+        &cfg.mcp_servers,
         cfg.max_steps,
         cfg.max_tokens,
         node_timeout,
+        log,
     );
-    const GRAPH_MAX_STEPS: u32 = 10_000;
-    let outcome = match drive(&graph, &mut exec, GRAPH_MAX_STEPS) {
-        DriveResult::Done(o) => o,
-        DriveResult::Suspended(s) => {
+    let outcome = match result {
+        Ok(DriveResult::Done(o)) => o,
+        Ok(DriveResult::Suspended(s)) => {
             log.error("graph.suspended", json!({"on_uri": s.on_uri}));
             eprintln!(
                 "agentd: graph suspended on a Wait ({}) — `--mode graph` is one-shot; a Wait needs a reactive daemon",
                 s.on_uri
             );
             return exit::GENERIC;
+        }
+        Err(e) => {
+            log.error("proc.exit", json!({"err": e.clone()}));
+            eprintln!("agentd: {e}");
+            // A failed intelligence/MCP setup maps to the matching infra exit code.
+            return if e.starts_with("intelligence") {
+                exit::INTEL_UNAVAILABLE
+            } else {
+                exit::MCP_REQUIRED_DOWN
+            };
         }
     };
 

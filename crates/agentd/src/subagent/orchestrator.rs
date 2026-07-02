@@ -295,6 +295,67 @@ impl Orchestrator {
         (format!("graph {id} patched ({n} nodes)"), false)
     }
 
+    /// `graph.run` (pivot Phase 7 · P6, `--features run-graph`) — the "agent
+    /// orchestrates BY ITSELF" primitive: drive a graph the agent defined to a
+    /// terminal status, returning its status + projected result as the tool result.
+    /// SYNCHRONOUS — it runs in the agent's own (child) process (per the design:
+    /// the driver is NOT in the daemon), bounded by the graph's budget + termination
+    /// layers. Reuses [`drive_pinned`](crate::graph::drive_pinned), so it behaves
+    /// identically to the operator `--mode graph`. A `Wait` node is unsupported here
+    /// (no reactor to resume it — that is the reactive-daemon path); the call blocks
+    /// until the graph terminates (uncancellable mid-run — a documented v1 limit).
+    #[cfg(feature = "run-graph")]
+    fn graph_run(&mut self, args: &Value) -> (String, bool) {
+        use crate::graph::{DriveResult, GraphStatus};
+        let id = args.get("graph_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return ("error: graph.run requires 'graph_id'".into(), true);
+        }
+        let Some(graph) = self.graphs.get(id).cloned() else {
+            return (
+                format!("error: no such graph '{id}' — define it with graph.define first"),
+                true,
+            );
+        };
+        let model = self.intelligence.model.clone().unwrap_or_default();
+        let node_timeout = Duration::from_millis(self.child_limits.deadline_ms);
+        let result = crate::graph::drive_pinned(
+            &graph,
+            &self.intelligence.uri,
+            self.intelligence.token.clone(),
+            &model,
+            &self.mcp_servers,
+            self.child_limits.max_steps,
+            self.child_limits.max_tokens,
+            node_timeout,
+            &self.log,
+        );
+        match result {
+            Ok(DriveResult::Done(o)) => {
+                let is_err = o.status != GraphStatus::Completed;
+                self.log.info(
+                    "graph.run",
+                    json!({"graph_id": id, "status": format!("{:?}", o.status), "steps": o.steps}),
+                );
+                let summary = json!({
+                    "graph_id": id,
+                    "status": format!("{:?}", o.status),
+                    "steps": o.steps,
+                    "result": o.result,
+                });
+                (summary.to_string(), is_err)
+            }
+            Ok(DriveResult::Suspended(s)) => (
+                format!(
+                    "graph '{id}' suspended on a Wait ({}) — graph.run is synchronous; a Wait needs the reactive daemon path",
+                    s.on_uri
+                ),
+                true,
+            ),
+            Err(e) => (format!("error: graph.run setup failed: {e}"), true),
+        }
+    }
+
     /// Queue a future self-wake-up (RFC 0008 §self-scheduling). Bounded; refused
     /// as a tool result (never crashes). Effective only under a daemon — the
     /// requests ride out on the run's `Outcome`.
@@ -775,6 +836,7 @@ impl SelfHandler for Orchestrator {
             {
                 t.push(graph_define_tool_def());
                 t.push(graph_patch_tool_def());
+                t.push(graph_run_tool_def());
             }
         }
         t
@@ -804,6 +866,8 @@ impl SelfHandler for Orchestrator {
             "graph.define" if self.parent_depth == 0 => Some(self.graph_define(args)),
             #[cfg(feature = "run-graph")]
             "graph.patch" if self.parent_depth == 0 => Some(self.graph_patch(args)),
+            #[cfg(feature = "run-graph")]
+            "graph.run" if self.parent_depth == 0 => Some(self.graph_run(args)),
             _ => None,
         }
     }
@@ -1073,6 +1137,25 @@ fn graph_define_tool_def() -> ToolDef {
                 }
             },
             "required": ["graph"]
+        }),
+    }
+}
+
+/// `graph.run` (pivot Phase 7 · P6) — drive a graph the agent defined to completion.
+#[cfg(feature = "run-graph")]
+fn graph_run_tool_def() -> ToolDef {
+    ToolDef {
+        name: "graph.run".into(),
+        description: "Run a run-graph you defined (by graph_id) to completion, and get back its \
+            final status + result. agentd drives the whole graph itself — running each agent/tool \
+            node, taking branches on the data or a judgement, and looping as the graph directs — \
+            so you orchestrate multi-step work by defining a graph once and running it, instead of \
+            steering every step. Runs synchronously and returns when the graph terminates."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"graph_id": {"type": "string", "description": "the id returned by graph.define"}},
+            "required": ["graph_id"]
         }),
     }
 }
@@ -1365,6 +1448,48 @@ mod tests {
             .unwrap()
             .1,
             "retarget refused"
+        );
+    }
+
+    #[cfg(feature = "run-graph")]
+    #[test]
+    fn graph_run_drives_a_defined_graph_and_refuses_unknown_ids() {
+        // Empty servers (no connect) + loopback-refused intel (`payload` sets a 1s
+        // deadline, so the agent node fails FAST without a live LLM): the agent node
+        // errors, the graph follows its `error` edge to the crashed halt, and
+        // graph.run returns a terminal graph summary — no hang, no panic.
+        let mut p = payload(0, 4);
+        p.mcp_servers = vec![];
+        p.intelligence.uri = "http://127.0.0.1:9".into(); // loopback, nothing listening
+        let mut root =
+            Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
+        assert!(
+            root.tools().iter().any(|t| t.name == "graph.run"),
+            "root advertises graph.run"
+        );
+        let g = json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "work", "writes": "out", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "out"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        });
+        let (obs, err) = root.handle("graph.define", &json!({"graph": g})).unwrap();
+        assert!(!err, "{obs}");
+        let id = obs.split_whitespace().nth(2).unwrap().to_string();
+        // Run it: the agent node fails on refused intel → error edge → crashed halt.
+        let (obs, err) = root.handle("graph.run", &json!({"graph_id": id})).unwrap();
+        assert!(err, "a graph that halts crashed is an error result: {obs}");
+        assert!(obs.contains("\"status\""), "graph.run returns a status summary: {obs}");
+        // An unknown / missing id is refused (never drives).
+        assert!(
+            root.handle("graph.run", &json!({"graph_id": "gX"})).unwrap().1,
+            "unknown id refused"
+        );
+        assert!(
+            root.handle("graph.run", &json!({})).unwrap().1,
+            "missing id refused"
         );
     }
 

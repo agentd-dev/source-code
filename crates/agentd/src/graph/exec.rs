@@ -16,12 +16,50 @@ use super::{drive, Blackboard, DriveResult, Graph, GraphExec, GraphStatus};
 use crate::agentloop::action::SelfHandler;
 use crate::agentloop::runner::{run_loop, LoopInput};
 use crate::agentloop::stop::TerminalStatus;
+use crate::config::McpServerSpec;
 use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
 use crate::wire::intel::{Message, Request, ToolDef};
 use serde_json::Value;
 use std::time::{Duration, Instant};
+
+/// The graph run's total node-visit cap (layer-1 backstop) — generous, since a graph
+/// is many node visits; the graph's own budget/validation/termination bound the walk.
+pub const GRAPH_MAX_STEPS: u32 = 10_000;
+
+/// Drive a pinned/stored graph SYNCHRONOUSLY to a [`DriveResult`] against
+/// freshly-connected intelligence + MCP servers (pivot Phase 7 · P6). The single
+/// execution path shared by BOTH the operator `--mode graph` entry and the
+/// agent-authored `graph.run` self-tool, so they behave identically. `Err` is a setup
+/// failure (unreachable intel / a failed MCP handshake) — surfaced by the caller as a
+/// usage/tool error; `Ok(Suspended)` means the graph hit a `Wait` (the caller decides
+/// what a suspend means in its context — one-shot `--mode graph` reports it as
+/// unsupported). The connected servers live for the whole drive, then drop.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_pinned(
+    graph: &Graph,
+    intel_uri: &str,
+    intel_token: Option<String>,
+    model: &str,
+    server_specs: &[McpServerSpec],
+    max_steps: u32,
+    max_tokens: u64,
+    node_timeout: Duration,
+    log: &Logger,
+) -> Result<DriveResult, String> {
+    let intel = IntelClient::from_parts(intel_uri, intel_token)
+        .map_err(|e| format!("intelligence: {e}"))?;
+    let mut servers: Vec<McpClient> = Vec::new();
+    for spec in server_specs {
+        let client = crate::mcp::from_spec(spec, Duration::from_secs(60))
+            .and_then(|mut c| c.initialize().map(|()| c))
+            .map_err(|e| format!("mcp server '{}': {e}", spec.name))?;
+        servers.push(client);
+    }
+    let mut exec = SessionExec::new(&intel, &servers, log, model, max_steps, max_tokens, node_timeout);
+    Ok(drive(graph, &mut exec, GRAPH_MAX_STEPS))
+}
 
 /// A self-handler that offers no self-tools: a graph `Agent` node is a LEAF worker —
 /// it runs its instruction against the MCP tools, it does not self-orchestrate (the

@@ -16,7 +16,7 @@ Where this overview simplifies, those win.
 > (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all four
 > run modes (once/loop/reactive/schedule), the reactive router, the
 > self-scheduling/self-subscribe self-tools, and the served self-MCP
-> (`--serve-mcp`), with the serve-https/a2a/cron/metrics/run-graph surfaces
+> (`--serve-mcp`), with the serve-https/a2a/cron/metrics/workflow surfaces
 > feature-gated. Every network surface is HTTPS (the default `tls` build); agentd
 > links no unix/vsock transport. The example runs below describe live behavior.
 
@@ -268,7 +268,7 @@ crates/agentd/src/
     health.rs          heartbeat, --health-file, /healthz+/readyz   [http surface opt-in]
     trace.rs           W3C context propagation (default) + OTLP export [feature: otel]
     metrics.rs         atomic counters → Prometheus text          [feature: metrics]
-  graph/             agent-authored run-graph: model + validation + driver [feature: run-graph]
+  graph/             agent-authored workflow: model + validation + driver [feature: workflow]
   sec/
     secret.rs          resolve(name) env/file front door; Debug=***
     scope.rs           tool-scope grant + Rule-of-Two tag check
@@ -280,7 +280,7 @@ framing) now live in the reusable **`crates/net`** and **`crates/mcp`** — they
 retain the unix/vsock capability for reuse, but **agentd itself uses only HTTP(S)**.
 There is **no `exec` module** — agentd runs no local code. The default build links
 `tls` (HTTPS is the transport); `serve-https`/`a2a`/`cron`/`metrics`/`otel`/`cluster`/
-`run-graph` are opt-in. The default Linux build is single-digit first-party crates —
+`workflow` are opt-in. The default Linux build is single-digit first-party crates —
 no async runtime, no C toolchain.
 
 Two boundaries are worth internalizing as a contributor:

@@ -1,14 +1,14 @@
-# Run-graphs
+# Workflows
 
-A **run-graph** lets an agent process work as an explicit graph of steps — with
+A **workflow** lets an agent process work as an explicit graph of steps — with
 branches, loops, and waits — instead of one flat ReAct loop. agentd already *is*
 an implicit single-node graph executor (the loop is a hard-coded cycle, the
-reactive router is an event→action edge set); a run-graph reifies that into an
+reactive router is an event→action edge set); a workflow reifies that into an
 explicit graph the agent (or an operator) authors and agentd drives. Think
 LangGraph, but the agent builds and runs the graph **by itself**, over the same
 subagents, MCP tools, and structured data it already uses.
 
-> **Feature-gated, opt-in.** Run-graphs compile only under `--features run-graph`
+> **Feature-gated, opt-in.** Workflows compile only under `--features workflow`
 > (default **off** — an agentd built without it is byte-for-byte unchanged). It is
 > dependency-free (serde + `serde_json` only). The degenerate single-`agent`-node
 > graph reproduces today's one-shot behavior, so the graph is a superset, never a
@@ -16,13 +16,13 @@ subagents, MCP tools, and structured data it already uses.
 
 ---
 
-## The two ways to run a graph
+## The two ways to run a workflow
 
 A graph is the same serde JSON object either way:
 
 - **Operator-pinned** — run a graph from a file to completion, then exit:
   ```bash
-  agentd --mode graph --graph ./pipeline.json --intelligence https://gw.example/v1
+  agentd --mode workflow --workflow ./pipeline.json --intelligence https://gw.example/v1
   ```
   No `--instruction` is needed (the nodes carry the work), but intelligence is
   still required for `agent` nodes. The projected result prints to stdout and the
@@ -30,10 +30,10 @@ A graph is the same serde JSON object either way:
 
 - **Agent-authored** — the agent defines and runs a graph itself, mid-reasoning,
   via three self-tools (a root agent only):
-  - `graph.define{graph}` — validate + store a graph, returns a `graph_id`.
-  - `graph.run{graph_id}` — drive the stored graph to completion, returns its
+  - `workflow.define{workflow}` — validate + store a graph, returns a `workflow_id`.
+  - `workflow.run{workflow_id}` — drive the stored graph to completion, returns its
     status + result as the tool result.
-  - `graph.patch{graph_id, patch}` — grow a stored graph **additively** (see
+  - `workflow.patch{workflow_id, patch}` — grow a stored graph **additively** (see
     [Patching](#patching-a-graph-additive)).
 
   This is the "agent orchestrates by itself" path: the agent decides the shape of
@@ -154,7 +154,7 @@ current content, notify-then-read) or the timeout elapses, and resumes on the
 loop that costs nothing while idle. The suspended run state is serializable, so a
 long wait survives across a process boundary.
 
-> **Scope.** `--mode graph` and `graph.run` resolve waits **in-process** (they
+> **Scope.** `--mode workflow` and `workflow.run` resolve waits **in-process** (they
 > block until the wait resolves). A fully asynchronous, non-blocking reactive-daemon
 > graph is a roadmap item.
 
@@ -177,7 +177,7 @@ graph status:
 
 The engine statuses are distinct from a node's `halt` status (which is one of the
 usual terminal statuses — `completed`, `refused`, …). Reaching a `halt` with
-`completed` is `Completed`; any other author status is `Halted`. Under `--mode graph`
+`completed` is `Completed`; any other author status is `Halted`. Under `--mode workflow`
 the status projects onto the exit table: `Completed` → 0, `Halted` → its terminal
 code, `Exhausted` → 7, `LoopDetected` / `Stalled` → 3, `Crashed` → 1.
 
@@ -185,7 +185,7 @@ code, `Exhausted` → 7, `LoopDetected` / `Stalled` → 3, `Crashed` → 1.
 
 ## Patching a graph (additive)
 
-`graph.patch` lets an agent elaborate its own plan at runtime — add nodes and edges
+`workflow.patch` lets an agent elaborate its own plan at runtime — add nodes and edges
 to a stored graph as it learns more, without redefining the whole thing:
 
 ```json
@@ -231,8 +231,8 @@ exit; the visit cap + progress guard stop a draft that never converges.
 ## See also
 
 - [modes-and-triggers.md](modes-and-triggers.md) — the four base modes and reactive
-  routing (a run-graph is the explicit form of the same event→action machinery).
+  routing (a workflow is the explicit form of the same event→action machinery).
 - [subagents.md](subagents.md) — the `agent` node runs a subagent turn; the spawn
   caps still apply.
-- [configuration.md](configuration.md) — `--graph` / `--mode graph` and the run
+- [configuration.md](configuration.md) — `--workflow` / `--mode workflow` and the run
   limits a graph inherits.

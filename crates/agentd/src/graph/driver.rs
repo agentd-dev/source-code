@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The run-graph driver (pivot Phase 7) — the thin walk that turns an authored
+//! The workflow driver (pivot Phase 7) — the thin walk that turns an authored
 //! [`Graph`](super::Graph) into work.
 //!
 //! The driver is deliberately transport-free + Session-free: it walks nodes, threads
@@ -10,7 +10,7 @@
 //! implemented over a real `Session` + intelligence client in production and a scripted
 //! mock in tests. So the control-flow logic is proven independently of the execution
 //! wiring (a later phase), and the same driver serves both the model-authored
-//! `graph.run` path and the operator `--graph <file>` path.
+//! `workflow.run` path and the operator `--workflow <file>` path.
 //!
 //! Handles `Agent`/`Tool`/`Branch`/`Halt` inline and `Wait` by SUSPENDING — [`drive`]
 //! returns [`DriveResult::Suspended`] with a serializable [`GraphState`] the daemon

@@ -25,8 +25,8 @@ status and the M1–M3 milestones.
 > served self-MCP, A2A, and operator control are all HTTP(S) with mTLS/bearer auth
 > (loopback `http://` allowed for dev); agentd links no unix/vsock transport.
 > Operator control is unified into the A2A method family. Agent-authored cyclic
-> **run-graphs** ship under `--features run-graph` (see
-> [run-graphs.md](run-graphs.md)). See [`design/00-target-vision-pivot.md`](design/00-target-vision-pivot.md)
+> **workflows** ship under `--features workflow` (see
+> [workflows.md](workflows.md)). See [`design/00-target-vision-pivot.md`](design/00-target-vision-pivot.md)
 > for the transport pivot and [`design/PLAN.md`](design/PLAN.md) for the base build.
 
 ## Pages
@@ -39,7 +39,7 @@ status and the M1–M3 milestones.
 | [mcp.md](mcp.md) | MCP as the universal interface: the client subset (tools/resources/subscribe, notify-then-read), the Streamable HTTP transport, and agentd's own self-MCP server. |
 | [intelligence.md](intelligence.md) | The single LLM endpoint — the HTTPS transport (loopback `http://` for dev), the OpenAI-compatible wire, native tool-calling, and credential handling. |
 | [modes-and-triggers.md](modes-and-triggers.md) | The four modes as exit predicates; reactive routing (exactly-one-owner, spawn-vs-continue, debounce/coalesce), self-subscribe, condition predicates, in-turn wait, and internal schedule/cron. |
-| [run-graphs.md](run-graphs.md) | Agent-authored cyclic graphs (`--features run-graph`): the node model, two-tier conditions, waits, termination, and the `--mode graph` / `graph.define`/`run`/`patch` entry points. |
+| [workflows.md](workflows.md) | Agent-authored cyclic graphs (`--features workflow`): the node model, two-tier conditions, waits, termination, and the `--mode workflow` / `workflow.define`/`run`/`patch` entry points. |
 | [subagents.md](subagents.md) | The same-binary re-exec subagent model, the rich spawn payload + output contract, narrowed seeds, the spawn chokepoint, and depth/breadth/rate caps. |
 | [observability.md](observability.md) | JSON-lines telemetry, the line schema + event vocabulary, the correlation tuple / `agent_path` subtree trick, health, and metrics-from-logs. |
 | [security.md](security.md) | The granted-MCP-subset trust budget (Rule-of-Two), untrusted-content stance, SSRF defenses, the no-local-execution posture, and secrets handling. |

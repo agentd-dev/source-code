@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Agent-authored cyclic run-graph (pivot Phase 7) — the serde model + validation.
+//! Agent-authored cyclic workflows (pivot Phase 7) — the serde graph model + validation.
 //!
 //! agentd already *is* an implicit single-node graph executor: the ReAct loop is a
 //! hard-coded cycle, the reactive router is an event→action edge set, self-schedule
 //! is a delayed self-loop, and self-subscribe is the agent adding an edge at
 //! runtime. This module reifies that into an explicit serde [`Graph`] the model
-//! self-authors (`graph.define`/`graph.run`/`graph.patch` self-tools) and — from
+//! self-authors (`workflow.define`/`workflow.run`/`workflow.patch` self-tools) and — from
 //! P1 on — a thin driver reuses `Session::run_turn`, `Budget`, `TerminalStatus`,
 //! and the `Router`. It adds exactly two genuinely-new node kinds over today's
 //! primitives: an explicit condition/[`Branch`](Node::Branch) and an explicit
@@ -49,7 +49,7 @@ pub const MAX_KEYS: usize = 64;
 /// Maximum `Subgraph` nesting depth.
 pub const MAX_SUBGRAPH_DEPTH: u32 = 4;
 
-/// The authored run-graph — PURE TOPOLOGY (pivot Phase 7). Serde-only.
+/// The authored workflow graph — PURE TOPOLOGY (pivot Phase 7). Serde-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     /// The entry node id.
@@ -58,7 +58,7 @@ pub struct Graph {
     pub nodes: BTreeMap<NodeId, Node>,
 }
 
-/// An ADDITIVE patch to a stored graph (pivot Phase 7 · P5 — the `graph.patch` self
+/// An ADDITIVE patch to a stored graph (pivot Phase 7 · P5 — the `workflow.patch` self
 /// tool): new nodes and new edges only. Never overwrites a node or retargets an edge,
 /// so applying it cannot break the reachability/termination a live run relies on.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

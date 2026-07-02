@@ -76,9 +76,9 @@ intelligence client, the agentic loop, all four run modes, the reactive router,
 subagents (sync + async/detach), and the served self-MCP all run today. Every
 network surface is HTTPS (intelligence, the MCP client, the served self-MCP, A2A,
 and operator control — mTLS/bearer auth, loopback `http://` for dev); agentd links
-no unix/vsock transport. Agent-authored cyclic **run-graphs** ship under
-`--features run-graph`. The default build holds a 3-dependency minimalism moat;
-`serve-https`/`a2a`/`cron`/`metrics`/`otel`/`cluster`/`run-graph` are feature-gated.
+no unix/vsock transport. Agent-authored cyclic **workflows** ship under
+`--features workflow`. The default build holds a 3-dependency minimalism moat;
+`serve-https`/`a2a`/`cron`/`metrics`/`otel`/`cluster`/`workflow` are feature-gated.
 See **[docs/design/00-target-vision-pivot.md](docs/design/00-target-vision-pivot.md)**.
 
 ## Links

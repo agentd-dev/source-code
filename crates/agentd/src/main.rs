@@ -218,10 +218,10 @@ fn run() -> i32 {
 
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
-        // Drive a pinned run-graph to a terminal graph status, then exit (pivot Phase
+        // Drive a pinned workflow to a terminal graph status, then exit (pivot Phase
         // 7 · P6) — a one-shot, in-process operator entry (no daemon).
-        #[cfg(feature = "run-graph")]
-        Mode::Graph => run_graph(&cfg, &log),
+        #[cfg(feature = "workflow")]
+        Mode::Workflow => run_workflow(&cfg, &log),
         // The long-lived modes all re-exec a root subagent, so they need our
         // own executable path.
         Mode::Reactive | Mode::Loop | Mode::Schedule => {
@@ -599,42 +599,42 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
     }
 }
 
-/// Drive a pinned run-graph (`--graph <file>`) to a terminal graph status, then exit
+/// Drive a pinned workflow (`--workflow <file>`) to a terminal graph status, then exit
 /// (pivot Phase 7 · P6). A one-shot, in-process operator entry for deterministic
-/// DAGs: load + validate the graph, connect the SAME intelligence + MCP servers a
+/// DAGs: load + validate the workflow graph, connect the SAME intelligence + MCP servers a
 /// normal run uses, and drive it with the real [`SessionExec`](agentd::graph::SessionExec).
 /// A `Wait` suspension is reported as unsupported — a pinned one-shot has no reactor
-/// to resume it (the reactive-graph daemon path is the follow-up). The graph status
+/// to resume it (the reactive-workflow daemon path is the follow-up). The graph status
 /// projects to the same exit table as a one-shot run.
-#[cfg(feature = "run-graph")]
-fn run_graph(cfg: &Config, log: &Logger) -> i32 {
+#[cfg(feature = "workflow")]
+fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
     use agentd::graph::{drive_pinned, GraphStatus};
     use std::time::Duration;
 
-    // Load + parse + validate the pinned graph (fail-closed at the operator boundary).
-    let path = cfg.graph_file.as_deref().unwrap_or_default();
+    // Load + parse + validate the pinned workflow (fail-closed at the operator boundary).
+    let path = cfg.workflow_file.as_deref().unwrap_or_default();
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            log.error("proc.exit", json!({"err": format!("read graph '{path}': {e}")}));
-            eprintln!("agentd: cannot read graph file '{path}': {e}");
+            log.error("proc.exit", json!({"err": format!("read workflow '{path}': {e}")}));
+            eprintln!("agentd: cannot read workflow file '{path}': {e}");
             return exit::USAGE;
         }
     };
     let graph: agentd::graph::Graph = match serde_json::from_str(&text) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("agentd: invalid graph JSON in '{path}': {e}");
+            eprintln!("agentd: invalid workflow JSON in '{path}': {e}");
             return exit::USAGE;
         }
     };
     if let Err(errs) = graph.validate() {
-        eprintln!("agentd: invalid graph '{path}': {}", errs.join("; "));
+        eprintln!("agentd: invalid workflow '{path}': {}", errs.join("; "));
         return exit::USAGE;
     }
 
     // Drive it against the SAME intelligence + MCP a normal run uses (the shared
-    // `drive_pinned` path — identical to the agent-authored `graph.run` self-tool).
+    // `drive_pinned` path — identical to the agent-authored `workflow.run` self-tool).
     let payload = root_payload(cfg);
     let model = payload.intelligence.model.clone().unwrap_or_default();
     let node_timeout = cfg.deadline.unwrap_or(Duration::from_secs(600));
@@ -676,7 +676,7 @@ fn run_graph(cfg: &Config, log: &Logger) -> i32 {
     };
     log.info(
         "proc.exit",
-        json!({"graph_status": format!("{:?}", outcome.status), "steps": outcome.steps, "code": code}),
+        json!({"workflow_status": format!("{:?}", outcome.status), "steps": outcome.steps, "code": code}),
     );
     code
 }

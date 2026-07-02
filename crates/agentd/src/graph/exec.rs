@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The real, Session-backed [`GraphExec`] (pivot Phase 7 · P6) — the adapter that
 //! runs a graph's effectful nodes against LIVE intelligence + MCP servers, as opposed
-//! to the scripted mock the driver's unit tests use. This is where the run-graph stops
+//! to the scripted mock the driver's unit tests use. This is where the workflow stops
 //! being a pure state machine and starts doing real work:
 //!   * an `Agent` node runs a full ReAct turn ([`run_loop`]) on its instruction, with
 //!     the requested blackboard `reads` folded into its context;
@@ -10,7 +10,7 @@
 //!   * a `Subgraph` runs inline (sync) with the same executor.
 //!
 //! It touches NO process-supervision code — it composes the existing loop + MCP client
-//! + intelligence client, so the run-graph inherits their transport/auth/resilience.
+//! + intelligence client, so a workflow inherits their transport/auth/resilience.
 
 use super::{drive, resume, Blackboard, DriveResult, Graph, GraphExec, GraphOutcome, GraphStatus, WaitOutcome};
 use crate::agentloop::action::SelfHandler;
@@ -31,7 +31,7 @@ pub const GRAPH_MAX_STEPS: u32 = 10_000;
 /// Drive a pinned/stored graph SYNCHRONOUSLY to a terminal [`GraphOutcome`] against
 /// freshly-connected intelligence + MCP servers (pivot Phase 7 · P6). The single
 /// execution path shared by BOTH the operator `--mode graph` entry and the
-/// agent-authored `graph.run` self-tool, so they behave identically. `Err` is a setup
+/// agent-authored `workflow.run` self-tool, so they behave identically. `Err` is a setup
 /// failure (unreachable intel / a failed MCP handshake), surfaced by the caller as a
 /// usage/tool error. A `Wait` node is handled IN-PROCESS here — subscribe to its uri,
 /// block until the resource updates or the timeout elapses (bounded by the graph
@@ -69,7 +69,7 @@ pub fn drive_pinned(
             DriveResult::Done(outcome) => return Ok(outcome),
             DriveResult::Suspended(s) => {
                 log.info(
-                    "graph.wait",
+                    "workflow.wait",
                     serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms}),
                 );
                 let outcome = wait_for_uri(&servers, &s.on_uri, Duration::from_millis(s.timeout_ms), log);
@@ -88,7 +88,7 @@ fn wait_for_uri(servers: &[McpClient], uri: &str, timeout: Duration, log: &Logge
         .iter()
         .find(|s| s.capabilities().supports_subscribe() && s.subscribe(uri).is_ok())
     else {
-        log.warn("graph.wait.unwatchable", serde_json::json!({"uri": uri}));
+        log.warn("workflow.wait.unwatchable", serde_json::json!({"uri": uri}));
         return WaitOutcome::TimedOut;
     };
     let deadline = Instant::now() + timeout;

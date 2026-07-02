@@ -609,7 +609,7 @@ pub fn run_reactive(
         // re-lists), so a changed tool set is picked up by the next reaction with no
         // extra wiring — the log makes the re-enumeration auditable. (Live refresh of
         // an already-running WARM continue-session's catalogue crosses the process
-        // boundary — it reuses the same daemon→child inject the run-graph Wait uses,
+        // boundary — it reuses the same daemon→child inject the workflow Wait uses,
         // Phase 7 — and is a documented follow-up, not a silent drop.)
         for s in servers.values() {
             for n in s.drain_notifications() {

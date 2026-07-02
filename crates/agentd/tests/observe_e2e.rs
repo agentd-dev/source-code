@@ -131,13 +131,13 @@ fn once_mode_runs_a_tool_call_react_cycle() {
     );
 }
 
-#[cfg(feature = "run-graph")]
+#[cfg(feature = "workflow")]
 #[test]
-fn graph_mode_drives_a_pinned_graph_to_completion() {
-    // A pinned run-graph (agent → halt) driven by `--mode graph` against the mock LLM:
+fn workflow_mode_drives_a_pinned_workflow_to_completion() {
+    // A pinned workflow (agent → halt) driven by `--mode workflow` against the mock LLM:
     // the agent node runs a REAL ReAct turn ("final" answers "mock-llm done"), its
     // result flows to the halt, and the run exits 0 (pivot Phase 7 · P6). No
-    // --instruction needed — the graph carries it.
+    // --instruction needed — the workflow carries it.
     let dir = tempfile::tempdir().unwrap();
     let addr_file = dir.path().join("llm.addr");
     let (mut llm, intel) = start_mock_llm(&addr_file, "final");
@@ -157,8 +157,8 @@ fn graph_mode_drives_a_pinned_graph_to_completion() {
 
     let (code, stdout, stderr) = run_once(&[
         "--mode",
-        "graph",
-        "--graph",
+        "workflow",
+        "--workflow",
         graph_path.to_str().unwrap(),
         "--intelligence",
         &intel,
@@ -169,30 +169,30 @@ fn graph_mode_drives_a_pinned_graph_to_completion() {
     sigterm(llm.id());
     let _ = llm.wait();
 
-    assert_eq!(code, 0, "pinned graph completes 0; stderr:\n{stderr}");
+    assert_eq!(code, 0, "pinned workflow completes 0; stderr:\n{stderr}");
     assert!(
         stdout.contains("mock-llm done"),
         "the agent node's result reached the halt: {stdout:?}"
     );
     assert!(
-        stderr.contains(r#""graph_status":"Completed""#),
-        "graph completed status logged:\n{stderr}"
+        stderr.contains(r#""workflow_status":"Completed""#),
+        "workflow completed status logged:\n{stderr}"
     );
 }
 
-#[cfg(feature = "run-graph")]
+#[cfg(feature = "workflow")]
 #[test]
-fn graph_mode_requires_a_graph_file() {
-    // `--mode graph` without `--graph` is a clear usage error (exit 2).
+fn workflow_mode_requires_a_workflow_file() {
+    // `--mode workflow` without `--workflow` is a clear usage error (exit 2).
     let (code, _out, stderr) =
-        run_once(&["--mode", "graph", "--intelligence", "http://127.0.0.1:9"]);
+        run_once(&["--mode", "workflow", "--intelligence", "http://127.0.0.1:9"]);
     assert_eq!(code, 2, "usage error; stderr:\n{stderr}");
-    assert!(stderr.contains("--mode graph requires --graph"), "{stderr}");
+    assert!(stderr.contains("--mode workflow requires --workflow"), "{stderr}");
 }
 
-#[cfg(feature = "run-graph")]
+#[cfg(feature = "workflow")]
 #[test]
-fn graph_mode_resolves_a_wait_node_in_process() {
+fn workflow_mode_resolves_a_wait_node_in_process() {
     // A pinned graph whose Wait node blocks on an MCP resource: the mock MCP pushes an
     // update after subscribe, so the wait resolves IN-PROCESS (no daemon) and the graph
     // completes 0 (pivot Phase 7 · P6). No Agent node → no LLM needed.
@@ -214,8 +214,8 @@ fn graph_mode_resolves_a_wait_node_in_process() {
 
     let (code, _stdout, stderr) = run_once(&[
         "--mode",
-        "graph",
-        "--graph",
+        "workflow",
+        "--workflow",
         graph_path.to_str().unwrap(),
         "--intelligence",
         "http://127.0.0.1:9",
@@ -227,11 +227,11 @@ fn graph_mode_resolves_a_wait_node_in_process() {
 
     assert_eq!(code, 0, "the wait resolved + the graph completed; stderr:\n{stderr}");
     assert!(
-        stderr.contains(r#""event":"graph.wait""#),
+        stderr.contains(r#""event":"workflow.wait""#),
         "the wait was logged:\n{stderr}"
     );
     assert!(
-        stderr.contains(r#""graph_status":"Completed""#),
+        stderr.contains(r#""workflow_status":"Completed""#),
         "the graph completed after the update:\n{stderr}"
     );
 }

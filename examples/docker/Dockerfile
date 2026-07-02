@@ -25,7 +25,7 @@ FROM rust:1.88-bookworm AS build
 
 # Capability surface is compile-time. The default build links `tls` (the
 # transport). Override to add opt-in surfaces, e.g.
-# --build-arg FEATURES=serve-https,a2a,cron,run-graph — or --no-default-features
+# --build-arg FEATURES=serve-https,a2a,cron,workflow — or --no-default-features
 # (empty FEATURES + the build below) for the TLS-free loopback-sidecar posture.
 ARG FEATURES=""
 

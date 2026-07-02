@@ -28,6 +28,10 @@ pub enum Mode {
     Reactive,
     /// Per-fire identical to `once`, driven by an internal interval/cron.
     Schedule,
+    /// Drive a pinned run-graph (`--graph <file>`) to a terminal graph status, then
+    /// exit — the operator entry for deterministic DAGs (pivot Phase 7 · P6).
+    #[cfg(feature = "run-graph")]
+    Graph,
 }
 
 impl Mode {
@@ -37,6 +41,8 @@ impl Mode {
             Mode::Loop => "loop",
             Mode::Reactive => "reactive",
             Mode::Schedule => "schedule",
+            #[cfg(feature = "run-graph")]
+            Mode::Graph => "graph",
         }
     }
     pub fn parse(s: &str) -> Option<Mode> {
@@ -45,6 +51,8 @@ impl Mode {
             "loop" => Some(Mode::Loop),
             "reactive" => Some(Mode::Reactive),
             "schedule" => Some(Mode::Schedule),
+            #[cfg(feature = "run-graph")]
+            "graph" => Some(Mode::Graph),
             _ => None,
         }
     }
@@ -578,6 +586,10 @@ pub struct Config {
     pub run_id: String,
     pub log_level: Level,
     pub drain_timeout: Duration,
+    /// Path to a pinned run-graph JSON file (`--graph`), driven by `--mode graph`
+    /// (pivot Phase 7 · P6). `None` unless a graph is pinned.
+    #[cfg(feature = "run-graph")]
+    pub graph_file: Option<String>,
     pub serve_mcp: Option<String>,
     /// TLS server cert / key PEM **file paths** for an `https://` serve target
     /// (pivot Phase 2). Required when serving TLS; the file *contents* (a private
@@ -740,6 +752,8 @@ impl Default for Config {
             run_id: String::new(), // filled in load() if unset
             log_level: Level::Info,
             drain_timeout: Duration::from_secs(25),
+            #[cfg(feature = "run-graph")]
+            graph_file: None,
             serve_mcp: None,
             serve_cert: None,
             serve_key: None,
@@ -1025,6 +1039,10 @@ impl Config {
                 .parse()
                 .map_err(|_| usage(format!("invalid AGENTD_EVENTS_RING: {v}")))?;
         }
+        #[cfg(feature = "run-graph")]
+        if let Some(v) = envmap.get("AGENTD_GRAPH") {
+            c.graph_file = Some((*v).to_string());
+        }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
@@ -1199,6 +1217,8 @@ impl Config {
                 "--cgroup" => c.cgroup = Some(take("--cgroup")?),
                 "--cgroup-memory-max" => c.cgroup_memory_max = Some(take("--cgroup-memory-max")?),
                 "--cgroup-pids-max" => c.cgroup_pids_max = Some(take("--cgroup-pids-max")?),
+                #[cfg(feature = "run-graph")]
+                "--graph" => c.graph_file = Some(take("--graph")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--serve-cert" => c.serve_cert = Some(take("--serve-cert")?),
                 "--serve-key" => c.serve_key = Some(take("--serve-key")?),
@@ -1499,12 +1519,19 @@ impl Config {
 
     /// Reject inconsistent config before any side effect (RFC 0011 §2).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self
-            .instruction
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
+        // A pinned graph run (`--mode graph`) carries its instructions in the graph
+        // nodes, so it needs no top-level `--instruction`; every other mode does.
+        #[cfg(feature = "run-graph")]
+        let needs_instruction = self.mode != Mode::Graph;
+        #[cfg(not(feature = "run-graph"))]
+        let needs_instruction = true;
+        if needs_instruction
+            && self
+                .instruction
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
         {
             return Err(usage(
                 "missing instruction (INSTRUCTION env or --instruction)".into(),
@@ -1612,6 +1639,17 @@ impl Config {
         }
         if self.cron.is_some() && self.mode != Mode::Schedule {
             return Err(usage("--cron is only valid with --mode schedule".into()));
+        }
+        // A pinned graph run needs a graph, and a graph needs graph mode (pivot Phase
+        // 7 · P6) — the two are inseparable, like --cron ⟺ --mode schedule.
+        #[cfg(feature = "run-graph")]
+        {
+            if self.mode == Mode::Graph && self.graph_file.is_none() {
+                return Err(usage("--mode graph requires --graph <file>".into()));
+            }
+            if self.graph_file.is_some() && self.mode != Mode::Graph {
+                return Err(usage("--graph is only valid with --mode graph".into()));
+            }
         }
         // The per-run limits do nothing without a cgroup to apply them to, so a
         // limit set alone is a misconfiguration (the operator believes the run is
@@ -2496,6 +2534,47 @@ mod tests {
         let c = Config::load(&args(&["--instruction", "from-flag"]), &env).unwrap();
         assert_eq!(c.instruction.as_deref(), Some("from-flag"));
         assert_eq!(c.intelligence.as_deref(), Some("https://intel.example"));
+    }
+
+    #[cfg(feature = "run-graph")]
+    #[test]
+    fn graph_mode_and_graph_file_are_inseparable() {
+        let intel_only = vec![(
+            "AGENTD_INTELLIGENCE".to_string(),
+            "https://intel.example".to_string(),
+        )];
+        // --mode graph without --graph → usage error.
+        let e = Config::load(
+            &args(&["--mode", "graph", "--instruction", "x"]),
+            &intel_only,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e}").contains("--mode graph requires --graph"),
+            "{e}"
+        );
+        // --graph without --mode graph → usage error.
+        let e = Config::load(&args(&["--graph", "/tmp/g.json"]), &base_env()).unwrap_err();
+        assert!(format!("{e}").contains("--graph is only valid"), "{e}");
+    }
+
+    #[cfg(feature = "run-graph")]
+    #[test]
+    fn graph_mode_does_not_require_an_instruction() {
+        // The graph carries its instructions, so `--mode graph` needs no
+        // `--instruction` (it still needs intelligence, for the Agent nodes).
+        let intel_only = vec![(
+            "AGENTD_INTELLIGENCE".to_string(),
+            "https://intel.example".to_string(),
+        )];
+        let c = Config::load(
+            &args(&["--mode", "graph", "--graph", "/tmp/g.json"]),
+            &intel_only,
+        )
+        .unwrap();
+        assert_eq!(c.mode, Mode::Graph);
+        assert_eq!(c.graph_file.as_deref(), Some("/tmp/g.json"));
+        assert!(c.instruction.as_deref().unwrap_or("").is_empty());
     }
 
     fn base_env() -> Vec<(String, String)> {

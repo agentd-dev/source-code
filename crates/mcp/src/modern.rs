@@ -93,6 +93,122 @@ fn is_header_safe(s: &str) -> bool {
         && !(s.starts_with("=?base64?") && s.ends_with("?="))
 }
 
+/// Extract the `Mcp-Param-*` headers for a `tools/call` from a tool's
+/// `input_schema` + the call `arguments` (transports §custom-headers-from-tool-
+/// parameters). Walks the schema's `properties` chains (the only statically-
+/// reachable path); for each property annotated with `x-mcp-header`, reads the
+/// value at that path from `arguments` (omitting when absent), stringifies the
+/// primitive, and value-encodes it. Assumes the schema passed
+/// [`validate_x_mcp_headers`] (a client rejects tools that don't).
+pub fn param_headers(input_schema: &Value, arguments: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_param_headers(input_schema, arguments, &mut out);
+    out
+}
+
+fn collect_param_headers(schema: &Value, instance: &Value, out: &mut Vec<(String, String)>) {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (key, sub) in props {
+        let value = instance.get(key);
+        if let Some(header_name) = sub.get("x-mcp-header").and_then(Value::as_str)
+            && let Some(v) = value
+            && let Some(s) = primitive_to_string(v)
+        {
+            out.push((format!("Mcp-Param-{header_name}"), header_value(&s)));
+        }
+        // Recurse into nested object properties (still statically reachable).
+        if let Some(v) = value
+            && sub.get("properties").is_some()
+        {
+            collect_param_headers(sub, v, out);
+        }
+    }
+}
+
+/// Stringify a primitive JSON value for a header (transports §value-encoding):
+/// string as-is, integer as decimal, boolean lowercase. A `number` (float),
+/// null, array, or object yields `None` — `number` is not header-permitted.
+fn primitive_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
+        Value::Number(n) if n.is_i64() || n.is_u64() => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Validate every `x-mcp-header` annotation in a tool `input_schema` (transports
+/// §schema-extension). `Err(reason)` if any is invalid — the client then excludes
+/// the tool from `tools/list`. Enforces: non-empty; HTTP token syntax (no CR/LF/
+/// controls); case-insensitively unique; a primitive type (string/integer/boolean,
+/// NOT number); and statically reachable (a chain of `properties` keys only — an
+/// annotation under items/composition/conditional/`$ref` is invalid).
+pub fn validate_x_mcp_headers(input_schema: &Value) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    validate_schema_node(input_schema, true, &mut seen)
+}
+
+fn validate_schema_node(
+    node: &Value,
+    reachable: bool,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let Some(obj) = node.as_object() else {
+        return Ok(());
+    };
+    if let Some(h) = obj.get("x-mcp-header") {
+        let name = h.as_str().ok_or("x-mcp-header must be a string")?;
+        if !reachable {
+            return Err(format!("x-mcp-header '{name}' is not statically reachable"));
+        }
+        validate_header_name(name)?;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(format!("duplicate x-mcp-header '{name}'"));
+        }
+        match obj.get("type").and_then(Value::as_str) {
+            Some("string") | Some("integer") | Some("boolean") => {}
+            Some("number") => return Err(format!("x-mcp-header '{name}' on a number type")),
+            _ => return Err(format!("x-mcp-header '{name}' on a non-primitive type")),
+        }
+    }
+    // `properties` children stay reachable; every other composite/conditional
+    // keyword breaks the static-reachability chain.
+    if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+        for sub in props.values() {
+            validate_schema_node(sub, reachable, seen)?;
+        }
+    }
+    for key in ["items", "additionalProperties", "not", "if", "then", "else"] {
+        if let Some(sub) = obj.get(key) {
+            validate_schema_node(sub, false, seen)?;
+        }
+    }
+    for key in ["oneOf", "anyOf", "allOf", "prefixItems"] {
+        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+            for sub in arr {
+                validate_schema_node(sub, false, seen)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An HTTP field-name token (RFC 9110 §5.1 `1*tchar`) — non-empty, no CR/LF or
+/// controls. `x-mcp-header` values must satisfy this to form `Mcp-Param-{name}`.
+fn validate_header_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty x-mcp-header".into());
+    }
+    let is_tchar =
+        |c: u8| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c);
+    if !name.bytes().all(is_tchar) {
+        return Err(format!("x-mcp-header '{name}' is not a valid HTTP token"));
+    }
+    Ok(())
+}
+
 /// Standard Base64 (RFC 4648, with `=` padding). Hand-rolled — no base64 crate
 /// (the minimalism moat); only used for the header sentinel above.
 fn base64_encode(input: &[u8]) -> String {
@@ -180,6 +296,66 @@ mod tests {
         assert_eq!(header_value("a b"), format!("=?base64?{}?=", base64_encode(b"a b")));
         // A value that looks like the sentinel is itself encoded.
         assert!(header_value("=?base64?x?=").starts_with("=?base64?"));
+    }
+
+    #[test]
+    fn param_headers_extracts_annotated_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "limit": {"type": "integer", "x-mcp-header": "Limit"},
+                "query": {"type": "string"}
+            }
+        });
+        let args = json!({"region": "us-west1", "limit": 42, "query": "SELECT 1"});
+        let mut h = param_headers(&schema, &args);
+        h.sort();
+        assert_eq!(
+            h,
+            vec![
+                ("Mcp-Param-Limit".to_string(), "42".to_string()),
+                ("Mcp-Param-Region".to_string(), "us-west1".to_string()),
+            ]
+        );
+        // A missing annotated value omits its header.
+        let h = param_headers(&schema, &json!({"query": "x"}));
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_valid_and_rejects_invalid() {
+        // Valid: primitive, reachable, unique.
+        assert!(validate_x_mcp_headers(&json!({
+            "type": "object",
+            "properties": {"r": {"type": "string", "x-mcp-header": "Region"}}
+        }))
+        .is_ok());
+        // number type is not permitted.
+        assert!(validate_x_mcp_headers(&json!({
+            "properties": {"n": {"type": "number", "x-mcp-header": "N"}}
+        }))
+        .is_err());
+        // Duplicate (case-insensitive) names.
+        assert!(validate_x_mcp_headers(&json!({
+            "properties": {
+                "a": {"type": "string", "x-mcp-header": "Dup"},
+                "b": {"type": "string", "x-mcp-header": "dup"}
+            }
+        }))
+        .is_err());
+        // Not statically reachable (under `items`).
+        assert!(validate_x_mcp_headers(&json!({
+            "properties": {"list": {"type": "array",
+                "items": {"type": "object", "properties": {
+                    "x": {"type": "string", "x-mcp-header": "X"}}}}}
+        }))
+        .is_err());
+        // Invalid HTTP token character.
+        assert!(validate_x_mcp_headers(&json!({
+            "properties": {"a": {"type": "string", "x-mcp-header": "bad name"}}
+        }))
+        .is_err());
     }
 
     #[test]

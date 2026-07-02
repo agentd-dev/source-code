@@ -1284,6 +1284,131 @@ impl ::mcp::server::Handler for ServeHandler {
     }
 }
 
+/// The resolved TLS material + auth for an HTTPS serve target (pivot Phase 2).
+/// Built by `main` from the validated config (cert/key/CA read from disk, the
+/// bearer resolved through `sec::secret`) and handed to [`serve_https`]. The
+/// key/bearer are held only long enough to build the acceptor + auth; never
+/// logged (RFC 0012 §3.7).
+#[cfg(feature = "serve-https")]
+pub struct HttpsServeConfig {
+    /// The `host:port` authority to bind.
+    pub bind: String,
+    /// TLS vs plaintext (plaintext is loopback-only, enforced at config).
+    pub tls: bool,
+    /// Server cert / key PEM bytes (empty when `!tls`).
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    /// Client-CA PEM enabling mutual TLS (the primary `Management` identity).
+    pub client_ca_pem: Option<Vec<u8>>,
+    /// Resolved bearer token (the alternative auth). `None` when unset.
+    pub bearer: Option<String>,
+}
+
+/// agentd's HTTP auth policy: a verified mTLS client certificate (the primary
+/// path) OR a matching `Authorization: Bearer <token>` mints the `Management`
+/// trust domain; anything else is refused. Transport is NEVER the boundary.
+#[cfg(feature = "serve-https")]
+struct AgentdHttpAuth {
+    bearer: Option<String>,
+}
+
+#[cfg(feature = "serve-https")]
+impl ::mcp::http_server::HttpAuth for AgentdHttpAuth {
+    fn authenticate(&self, parts: &::mcp::http_server::RequestParts) -> Option<PeerOrigin> {
+        // Primary: the TLS acceptor already verified the client cert against the
+        // pinned client CA, so a presented cert is a trusted identity.
+        if parts.peer_cert {
+            return Some(PeerOrigin::Management);
+        }
+        // Alternative: a bearer token, compared in constant time.
+        if let Some(expected) = &self.bearer
+            && let Some(hdr) = parts.header("authorization")
+            && let Some(tok) = hdr.strip_prefix("Bearer ")
+            && ct_eq(tok.as_bytes(), expected.as_bytes())
+        {
+            return Some(PeerOrigin::Management);
+        }
+        None
+    }
+}
+
+/// Constant-time byte-equality for the bearer compare (avoids a timing oracle on
+/// the token). Length is not secret for a bearer credential.
+#[cfg(feature = "serve-https")]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Bind an HTTP(S) listener and serve the self-MCP — the **target-vision control
+/// plane** (pivot Phase 2). Streamable HTTP + SSE via [`mcp::http_server`](::mcp::http_server),
+/// with trust classified per request by mTLS/bearer ([`AgentdHttpAuth`]) — never
+/// by transport. Returns a [`ServeHandle`] for shutdown drain, or the bind error.
+#[cfg(feature = "serve-https")]
+pub fn serve_https(
+    tls_cfg: HttpsServeConfig,
+    ctx: ServeCtx,
+    log: Logger,
+) -> std::io::Result<ServeHandle> {
+    let listener = ::mcp::http_server::bind_tcp(&tls_cfg.bind)?;
+    let acceptor = if tls_cfg.tls {
+        let id = crate::net::tls::ServerIdentity::from_pem(&tls_cfg.cert_pem, &tls_cfg.key_pem)?;
+        let acc = crate::net::tls::TlsAcceptor::new(id, tls_cfg.client_ca_pem.as_deref())?;
+        ::mcp::http_server::HttpAcceptor::Tls(acc)
+    } else {
+        ::mcp::http_server::HttpAcceptor::Plain
+    };
+    let mtls = tls_cfg.client_ca_pem.is_some();
+    log.info(
+        "mcp.serving",
+        json!({
+            "transport": if tls_cfg.tls { "https" } else { "http" },
+            "bind": tls_cfg.bind,
+            "auth": if mtls && tls_cfg.bearer.is_some() { "mtls+bearer" }
+                    else if mtls { "mtls" }
+                    else if tls_cfg.bearer.is_some() { "bearer" }
+                    else { "none(loopback)" },
+            "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"],
+            "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]
+        }),
+    );
+    // Loopback dev with no auth configured → allow all (config validation has
+    // already guaranteed the bind is loopback in that case). Otherwise gate.
+    let auth: Arc<dyn ::mcp::http_server::HttpAuth> = if !mtls && tls_cfg.bearer.is_none() {
+        Arc::new(::mcp::http_server::AllowAll)
+    } else {
+        Arc::new(AgentdHttpAuth {
+            bearer: tls_cfg.bearer,
+        })
+    };
+    let handle = serve_handle(&ctx);
+    #[cfg(feature = "events")]
+    spawn_events_notifier(Arc::clone(&ctx.subscriptions));
+    let subs = Arc::clone(&ctx.subscriptions);
+    let conn_counter = Arc::clone(&ctx.conn_counter);
+    let write_timeout = ctx.drain_timeout;
+    let handler: Arc<dyn ::mcp::server::Handler> = Arc::new(ServeHandler {
+        ctx: Arc::new(ctx),
+        log,
+    });
+    ::mcp::http_server::spawn_accept_http(
+        listener,
+        Arc::new(acceptor),
+        handler,
+        auth,
+        subs,
+        conn_counter,
+        write_timeout,
+    )?;
+    Ok(handle)
+}
+
 /// Route one JSON-RPC request to a response. `writer`/`conn` identify the calling
 /// connection so `resources/subscribe` can register a push target. `origin` is the
 /// caller's trust domain (RFC 0015 §3.4) — carried through so the next chunk's
@@ -2977,6 +3102,54 @@ fn cancel_tool_def() -> Value {
             "additionalProperties": false
         }
     })
+}
+
+#[cfg(all(test, feature = "serve-https"))]
+mod https_auth_tests {
+    use super::{AgentdHttpAuth, PeerOrigin, ct_eq};
+    use mcp::http_server::{HttpAuth, RequestParts};
+
+    fn parts<'a>(headers: &'a [(String, String)], peer_cert: bool) -> RequestParts<'a> {
+        RequestParts { headers, peer_cert }
+    }
+
+    #[test]
+    fn mtls_client_cert_mints_management() {
+        // A verified peer cert is trusted regardless of any bearer config.
+        let auth = AgentdHttpAuth { bearer: None };
+        assert_eq!(auth.authenticate(&parts(&[], true)), Some(PeerOrigin::Management));
+    }
+
+    #[test]
+    fn correct_bearer_mints_management_wrong_or_missing_is_refused() {
+        let auth = AgentdHttpAuth {
+            bearer: Some("s3cret-token".into()),
+        };
+        let ok = [("authorization".to_string(), "Bearer s3cret-token".to_string())];
+        assert_eq!(auth.authenticate(&parts(&ok, false)), Some(PeerOrigin::Management));
+        // Wrong token, wrong scheme, and no header are all refused.
+        let wrong = [("authorization".to_string(), "Bearer nope".to_string())];
+        assert_eq!(auth.authenticate(&parts(&wrong, false)), None);
+        let basic = [("authorization".to_string(), "Basic s3cret-token".to_string())];
+        assert_eq!(auth.authenticate(&parts(&basic, false)), None);
+        assert_eq!(auth.authenticate(&parts(&[], false)), None);
+    }
+
+    #[test]
+    fn no_bearer_configured_and_no_cert_is_refused() {
+        // The gate: an unauthenticated request never mints Management (the auth
+        // object is only built when mTLS or a bearer is configured).
+        let auth = AgentdHttpAuth { bearer: None };
+        assert_eq!(auth.authenticate(&parts(&[], false)), None);
+    }
+
+    #[test]
+    fn ct_eq_matches_only_equal_bytes() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
+    }
 }
 
 #[cfg(test)]

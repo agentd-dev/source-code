@@ -118,6 +118,21 @@ pub trait GraphExec {
     /// Run a `Tool` node: call `tool` on MCP `server` with `args`. Returns the tool
     /// result + whether it was an error result.
     fn call_tool(&mut self, server: &str, tool: &str, args: &Value) -> (Value, bool);
+
+    /// Judge a Tier-2 semantic branch: fold the `reads` blackboard values into
+    /// `prompt` and run ONE intelligence `complete()` with no tools, asking for one
+    /// of `choices`. Return the chosen label (the caller validates it ∈ `choices`) or
+    /// `None` to take the branch default. Default impl: `None` (a build/exec with no
+    /// intelligence always takes the default — a semantic branch degrades safely).
+    fn judge(
+        &mut self,
+        _prompt: &str,
+        _blackboard: &Blackboard,
+        _reads: &[String],
+        _choices: &[String],
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// The label an effectful node emits given whether it errored.
@@ -175,14 +190,24 @@ pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, budget: &mut GraphBudget) 
                 let result = bb_result(&bb, result_from.as_deref());
                 return GraphOutcome::halt(*status, result, budget.steps());
             }
-            // Branch: the first case whose predicate holds wins, else `default`. It
-            // writes nothing and emits no ok/error label — it transitions directly.
-            Node::Branch { cases, default, .. } => {
-                node_id = cases
-                    .iter()
-                    .find(|c| c.when.eval(&bb))
-                    .map_or(default, |c| &c.goto)
-                    .clone();
+            // Branch: the first deterministic case whose predicate holds wins (Tier 1,
+            // free). If none match and a Tier-2 semantic spec is present, ONE model
+            // judgement picks a labelled choice; an unrecognised answer (or no spec)
+            // takes `default`. A branch writes nothing and emits no ok/error label — it
+            // transitions directly.
+            Node::Branch { cases, default, semantic } => {
+                node_id = if let Some(c) = cases.iter().find(|c| c.when.eval(&bb)) {
+                    c.goto.clone()
+                } else if let Some(spec) = semantic {
+                    let labels: Vec<String> = spec.choices.keys().cloned().collect();
+                    match exec.judge(&spec.prompt, &bb, &spec.reads, &labels) {
+                        // Route to the chosen label's node; an unknown label → default.
+                        Some(label) => spec.choices.get(&label).unwrap_or(default).clone(),
+                        None => default.clone(),
+                    }
+                } else {
+                    default.clone()
+                };
                 continue;
             }
             Node::Agent {
@@ -283,6 +308,8 @@ mod tests {
         /// `{"n": k}` (a progressing loop body) instead of a scripted constant.
         counting: Option<String>,
         counter: i64,
+        /// The label `judge` returns for a Tier-2 semantic branch (`None` = default).
+        judge_answer: Option<String>,
     }
 
     impl GraphExec for MockExec {
@@ -309,6 +336,17 @@ mod tests {
             let key = format!("{server}.{tool}");
             self.calls.push(format!("tool:{key}"));
             self.tools.get(&key).cloned().unwrap_or((Value::Null, false))
+        }
+
+        fn judge(
+            &mut self,
+            prompt: &str,
+            _blackboard: &Blackboard,
+            _reads: &[String],
+            _choices: &[String],
+        ) -> Option<String> {
+            self.calls.push(format!("judge:{prompt}"));
+            self.judge_answer.clone()
         }
     }
 
@@ -544,5 +582,107 @@ mod tests {
             "loop-detected before budget exhaustion: {}",
             out.steps
         );
+    }
+
+    // ── P3: the Tier-2 semantic branch ───────────────────────────────────────
+
+    /// review (agent) → gate (branch: no Tier-1 case, a semantic {approve|reject}) →
+    /// approved | rejected halts.
+    fn review_graph() -> Graph {
+        serde_json::from_value(json!({
+            "start": "review",
+            "nodes": {
+                "review": {"kind": "agent", "instruction": "review", "writes": "doc", "edges": {"ok": "gate"}},
+                "gate": {
+                    "kind": "branch",
+                    "cases": [],
+                    "default": "rejected",
+                    "semantic": {
+                        "prompt": "Is the document acceptable?",
+                        "reads": ["doc"],
+                        "choices": {"approve": "approved", "reject": "rejected"}
+                    }
+                },
+                "approved": {"kind": "halt", "status": "completed", "result_from": "doc"},
+                "rejected": {"kind": "halt", "status": "refused"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_semantic_branch_routes_on_the_model_judgement() {
+        let g = review_graph();
+        assert!(g.validate().is_ok(), "semantic choice targets resolve");
+        let mut exec = MockExec {
+            judge_answer: Some("approve".into()),
+            ..MockExec::default()
+        };
+        exec.agents.insert("review".into(), (json!({"ok": true}), false));
+        let mut budget = GraphBudget::new(100);
+        let out = drive(&g, &mut exec, &mut budget);
+        assert_eq!(out.status, GraphStatus::Completed, "approve → approved halt");
+        assert_eq!(out.result, json!({"ok": true}));
+        // The model judgement was consulted (one complete() call).
+        assert!(exec.calls.iter().any(|c| c.starts_with("judge:")));
+    }
+
+    #[test]
+    fn an_unrecognised_semantic_answer_takes_the_default() {
+        let g = review_graph();
+        let mut exec = MockExec {
+            judge_answer: Some("maybe".into()), // not in {approve, reject}
+            ..MockExec::default()
+        };
+        exec.agents.insert("review".into(), (json!(1), false));
+        let mut budget = GraphBudget::new(100);
+        let out = drive(&g, &mut exec, &mut budget);
+        // default = "rejected" (status refused).
+        assert_eq!(out.terminal, Some(TerminalStatus::Refused));
+    }
+
+    #[test]
+    fn tier1_cases_take_priority_over_the_semantic_branch() {
+        // A deterministic case matches, so the model is NEVER consulted.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "review",
+            "nodes": {
+                "review": {"kind": "agent", "instruction": "review", "writes": "doc", "edges": {"ok": "gate"}},
+                "gate": {
+                    "kind": "branch",
+                    "cases": [{"when": {"op": "eq", "key": "doc", "pointer": "/flag", "value": true}, "goto": "approved"}],
+                    "default": "rejected",
+                    "semantic": {"prompt": "acceptable?", "choices": {"approve": "approved"}}
+                },
+                "approved": {"kind": "halt", "status": "completed"},
+                "rejected": {"kind": "halt", "status": "refused"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec {
+            judge_answer: Some("approve".into()),
+            ..MockExec::default()
+        };
+        exec.agents.insert("review".into(), (json!({"flag": true}), false));
+        let mut budget = GraphBudget::new(100);
+        let out = drive(&g, &mut exec, &mut budget);
+        assert_eq!(out.terminal, Some(TerminalStatus::Completed), "Tier-1 case won");
+        assert!(
+            !exec.calls.iter().any(|c| c.starts_with("judge:")),
+            "the model must NOT be consulted when a deterministic case matches"
+        );
+    }
+
+    #[test]
+    fn a_semantic_branch_degrades_to_default_without_intelligence() {
+        // The default GraphExec::judge returns None, so a semantic branch safely
+        // takes its default rather than wedging. Prove it with an exec that never
+        // answers (judge_answer = None).
+        let g = review_graph();
+        let mut exec = MockExec::default(); // judge_answer: None
+        exec.agents.insert("review".into(), (json!(0), false));
+        let mut budget = GraphBudget::new(100);
+        let out = drive(&g, &mut exec, &mut budget);
+        assert_eq!(out.terminal, Some(TerminalStatus::Refused), "None → default");
     }
 }

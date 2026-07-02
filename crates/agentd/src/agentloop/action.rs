@@ -11,6 +11,49 @@
 use crate::wire::intel::ToolDef;
 use serde_json::Value;
 
+/// The two classes of tool the agentic loop offers the model — the boundary that
+/// keeps agentd honest to target principle 1 (tools come ONLY from registered MCP
+/// servers) and principle 2 (no local code/command execution). EVERY tool in the
+/// loop's catalogue is exactly one of these; there is no third "general capability
+/// library".
+///   * [`Mcp`](ToolClass::Mcp) — a tool discovered from a connected MCP server
+///     (`tools/list`). Dispatched by routing the call BACK to its owning server
+///     ([`dispatch_tool`](crate::agentloop::runner)); agentd never runs it locally.
+///   * [`SelfControl`](ToolClass::SelfControl) — agentd's OWN orchestration
+///     primitives (see [`SELF_CONTROL_TOOLS`]): delegation (`subagent.*`,
+///     `a2a.delegate`), reactivity (root-only `schedule`/`subscribe`/`unsubscribe`),
+///     and resource attention (`resource.read`). These are handled in-process by a
+///     [`SelfHandler`] / the runner — NONE shells out. This is the named
+///     "self/control" class: the agent's own control surface, structurally distinct
+///     from the MCP task-tool catalogue (a different code path assembles each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolClass {
+    /// A tool from a connected MCP server; dispatched back to that server.
+    Mcp,
+    /// One of agentd's own self/control orchestration primitives; handled in-process.
+    SelfControl,
+}
+
+/// The authoritative membership of the [`ToolClass::SelfControl`] class: every
+/// self/control primitive name agentd may offer the model. The
+/// [`SelfHandler`] advertises a depth-/feature-conditioned SUBSET of this set
+/// (`a2a.delegate` only with peers; `schedule`/`subscribe`/`unsubscribe` only at
+/// the root; the `subagent.*` delegation tools only within the depth budget), and
+/// the runner adds `resource.read` when any resource is readable. A drift-guard
+/// test asserts everything a handler can advertise is listed here — so a new
+/// self-tool cannot silently escape the class boundary (and, by construction, this
+/// set contains NO local-exec primitive: principle 2).
+pub const SELF_CONTROL_TOOLS: &[&str] = &[
+    "subagent.spawn",
+    "subagent.status",
+    "subagent.await",
+    "schedule",
+    "subscribe",
+    "unsubscribe",
+    "a2a.delegate",
+    "resource.read",
+];
+
 /// Provides agentd's in-process self-tools to the loop. The loop tries the
 /// self-handler first; a `None` result means "not a self-tool — fall through to
 /// MCP".

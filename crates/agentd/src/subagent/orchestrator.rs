@@ -1197,6 +1197,45 @@ mod tests {
         assert_eq!(distill(&Value::String("short".into())), "short");
     }
 
+    #[test]
+    fn advertised_self_tools_are_all_members_of_the_named_class() {
+        use crate::agentloop::action::SELF_CONTROL_TOOLS;
+        // Drift guard (pivot Phase 5.1 — name the class): everything a handler can
+        // advertise must be a member of the named self/control class, so a newly
+        // added self-tool cannot silently escape the class boundary. A ROOT handler
+        // advertises the widest set (delegation + the root-only reactive tools).
+        let root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        let mut names: Vec<String> = root.tools().into_iter().map(|t| t.name).collect();
+        // resource.read is added by the runner (not the handler) but is a member of
+        // the class — include it so the guard covers the whole self/control surface.
+        names.push("resource.read".into());
+        for n in &names {
+            assert!(
+                SELF_CONTROL_TOOLS.contains(&n.as_str()),
+                "advertised self-tool {n} must be a member of the named class"
+            );
+        }
+        // Sanity: the guard is checking a non-trivial set (the root reactive +
+        // delegation primitives are actually present).
+        for expect in ["subagent.spawn", "schedule", "subscribe", "unsubscribe"] {
+            assert!(names.iter().any(|n| n == expect), "root advertises {expect}");
+        }
+        // Principle 2: no advertised self-tool is a local-exec primitive.
+        for n in &names {
+            for bad in ["exec", "shell", "bash", "command", "system"] {
+                assert!(
+                    !n.contains(bad),
+                    "self-tool {n} must not be a local-exec primitive"
+                );
+            }
+        }
+    }
+
     // ── a2a.delegate (RFC 0020 §3) ───────────────────────────────────────────
 
     #[cfg(feature = "a2a")]
@@ -1243,6 +1282,12 @@ mod tests {
             .find(|t| t.name == "a2a.delegate")
             .expect("a2a.delegate advertised with a peer");
         assert_eq!(def.input_schema["properties"]["peer"]["enum"][0], "mesh");
+        // Drift guard (Phase 5.1): the remote-delegation self-tool is a member of
+        // the named self/control class.
+        assert!(
+            crate::agentloop::action::SELF_CONTROL_TOOLS.contains(&"a2a.delegate"),
+            "a2a.delegate is a self/control class member"
+        );
     }
 
     #[cfg(feature = "a2a")]

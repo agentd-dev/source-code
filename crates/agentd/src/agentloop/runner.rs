@@ -14,7 +14,7 @@
 //! (spawned by `main::run_once` via `supervise_once`); the loop body here is
 //! identical whether driven by the root or a nested child.
 
-use crate::agentloop::action::SelfHandler;
+use crate::agentloop::action::{SelfHandler, ToolClass};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
@@ -127,6 +127,25 @@ impl<'a> Session<'a> {
             model: input.model.clone(),
             messages,
         })
+    }
+
+    /// Classify a catalogue tool by its seam (pivot Phase 5.1 — name the class): a
+    /// name routed to an MCP server is [`ToolClass::Mcp`] (dispatched back to that
+    /// server); every other catalogue entry is agentd's own
+    /// [`ToolClass::SelfControl`] surface (the self-tools + `resource.read`). The
+    /// routing map IS the MCP-tool set — the two classes are assembled by different
+    /// code paths ([`build_catalogue`] vs the [`SelfHandler`] merge) — so this is
+    /// the authoritative, testable boundary between "tools from a registered server"
+    /// and "agentd's own orchestration primitives". Callers pass a name from
+    /// [`Session::tools`]; a name absent from the catalogue still classifies as
+    /// `SelfControl` (it is, by definition, not a routed server tool), so classify
+    /// only names drawn from the catalogue.
+    pub fn tool_class(&self, name: &str) -> ToolClass {
+        if self.tool_to_server.contains_key(name) {
+            ToolClass::Mcp
+        } else {
+            ToolClass::SelfControl
+        }
     }
 
     /// Append the next event as a new user turn — the delivery point for a warm
@@ -630,6 +649,78 @@ mod tests {
         assert!(p.contains("Output contract:"));
         assert!(p.contains("Return JSON."));
         assert_eq!(system_prompt(None), SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn catalogue_partitions_into_mcp_and_self_control_classes() {
+        use crate::agentloop::action::SELF_CONTROL_TOOLS;
+        // A catalogue: two MCP-server tools (routed) + agentd's full self/control
+        // surface + resource.read. Every entry must classify into exactly one class
+        // (pivot Phase 5.1): the MCP side is precisely the routed set; the rest is
+        // agentd's own control surface — and no self/control tool is a local-exec
+        // primitive (principle 2).
+        let mcp = ["db.query", "http.get"];
+        let mut tool_to_server = HashMap::new();
+        let mut tools: Vec<ToolDef> = Vec::new();
+        for n in mcp {
+            tool_to_server.insert(n.to_string(), 0usize);
+            tools.push(ToolDef {
+                name: n.into(),
+                description: String::new(),
+                input_schema: json!({}),
+            });
+        }
+        // The full self/control surface a root handler with peers advertises, plus
+        // the runner-added resource.read — i.e. the whole named class.
+        for n in SELF_CONTROL_TOOLS {
+            tools.push(ToolDef {
+                name: (*n).into(),
+                description: String::new(),
+                input_schema: json!({}),
+            });
+        }
+        let sess = Session {
+            servers: &[],
+            tools,
+            tool_to_server,
+            resources: ResourceCatalogue {
+                owner: HashMap::new(),
+                entries: vec![],
+                truncated: false,
+            },
+            model: "m".into(),
+            messages: vec![],
+        };
+        // Routed names → Mcp; every self/control name → SelfControl.
+        for n in mcp {
+            assert_eq!(sess.tool_class(n), ToolClass::Mcp, "{n} is an MCP tool");
+        }
+        for n in SELF_CONTROL_TOOLS {
+            assert_eq!(
+                sess.tool_class(n),
+                ToolClass::SelfControl,
+                "{n} is self/control"
+            );
+        }
+        // The two classes EXACTLY cover the catalogue (no unclassified tool).
+        let (mut n_mcp, mut n_self) = (0usize, 0usize);
+        for t in &sess.tools {
+            match sess.tool_class(&t.name) {
+                ToolClass::Mcp => n_mcp += 1,
+                ToolClass::SelfControl => n_self += 1,
+            }
+        }
+        assert_eq!(n_mcp, mcp.len(), "every MCP tool classified");
+        assert_eq!(n_self, SELF_CONTROL_TOOLS.len(), "every self tool classified");
+        // Principle 2: the self/control class holds NO local-exec primitive.
+        for bad in [
+            "exec", "shell", "bash", "sh", "command", "system", "eval", "run",
+        ] {
+            assert!(
+                !SELF_CONTROL_TOOLS.contains(&bad),
+                "no local-exec self-tool: {bad}"
+            );
+        }
     }
 
     #[test]

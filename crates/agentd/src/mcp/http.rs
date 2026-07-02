@@ -367,6 +367,58 @@ impl HttpTransport {
         }
         Ok(resp.sse())
     }
+
+    /// Open the MODERN long-lived notification stream via a `subscriptions/listen`
+    /// POST (the stateless replacement for the removed GET stream). `body` is the
+    /// full pre-built JSON-RPC request (its `_meta` already injected); `routing`
+    /// are the Mcp-Method/Mcp-Name headers. The server answers with an SSE stream
+    /// that stays open, carrying the opted-in notifications; returns its reader.
+    pub fn open_listen(
+        &self,
+        read_timeout: Duration,
+        body: &[u8],
+        routing: &[(&str, &str)],
+    ) -> Result<EventStream, HttpError> {
+        let stream = self.connect(read_timeout)?;
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("Content-Type", "application/json"),
+            ("Accept", "text/event-stream"),
+        ];
+        let protocol = self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(v) = &protocol {
+            headers.push(("MCP-Protocol-Version", v));
+        }
+        for (k, v) in routing {
+            headers.push((k, v));
+        }
+        for (k, v) in &self.headers {
+            headers.push((k.as_str(), v.as_str()));
+        }
+        let resp = http::send_streaming(
+            stream,
+            self.endpoint.host_header(),
+            "POST",
+            self.endpoint.http_path(),
+            &headers,
+            body,
+        )
+        .map_err(HttpError::Http)?;
+        if !resp.is_success() {
+            let status = resp.status;
+            let body = resp.into_body().unwrap_or_default();
+            return Err(HttpError::Status(status, body));
+        }
+        if !resp.is_event_stream() {
+            return Err(HttpError::Unsupported(
+                "subscriptions/listen did not return an SSE stream".into(),
+            ));
+        }
+        Ok(resp.sse())
+    }
 }
 
 /// An owning SSE reader over the notification `GET` stream (a boxed transport

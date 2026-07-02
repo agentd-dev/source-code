@@ -34,6 +34,11 @@ vsock = ["net/vsock", "mcp/vsock", "dep:vsock"]
 # Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
 # (RFC 0005 §3.6) — no dep. (mio/epoll is a future high-fan-in optimisation.)
 serve-mcp = []
+# Served self-MCP over HTTP(S) — the target-vision control-plane transport (pivot
+# Phase 2): Streamable HTTP + SSE via `mcp::http_server`, with mTLS/bearer auth.
+# Rides serve-mcp (the served ctx/handler) + tls (the acceptor). Plaintext http://
+# serving is loopback-only (dev/tests).
+serve-https = ["serve-mcp", "tls", "mcp/tls", "net/tls"]
 # A2A (Agent2Agent) v1.0 unary method surface over the served self-MCP listener
 # (RFC 0020). A thin binding — a Task IS a served run — over the existing RFC 0004
 # JSON-RPC codec + the vsock/unix management transport; no dep. Rides serve-mcp.

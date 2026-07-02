@@ -393,6 +393,8 @@ fn serve_self_mcp(
         )
     };
     match target {
+        // The target-vision HTTP(S) control plane (pivot Phase 2).
+        ServeTarget::Http { bind, tls } => serve_self_mcp_https(bind, tls, cfg, new_ctx(), log),
         ServeTarget::Unix(path) => {
             let path = path.to_string_lossy().into_owned();
             // Capture the live-config handle BEFORE the ctx is moved into `serve`
@@ -412,6 +414,94 @@ fn serve_self_mcp(
         }
         ServeTarget::Vsock { cid, port } => serve_self_mcp_vsock(cid, port, new_ctx(), log),
     }
+}
+
+/// Bind the served self-MCP over HTTP(S) when this build has the `serve-https`
+/// feature: read the TLS material (cert/key/client-CA) from disk and resolve the
+/// bearer through `sec::secret`, then hand a [`HttpsServeConfig`] to `serve_https`.
+/// Config validation has already guaranteed cert/key exist for TLS + auth exists
+/// for a non-loopback bind, so a failure here is unexpected — log + stay inert.
+#[cfg(feature = "serve-https")]
+fn serve_self_mcp_https(
+    bind: String,
+    tls: bool,
+    cfg: &Config,
+    ctx: agentd::mcp::server::ServeCtx,
+    log: &Logger,
+) -> Option<ServeWiring> {
+    use agentd::mcp::server::HttpsServeConfig;
+    let read_pem = |what: &str, path: &Option<String>| -> Option<Vec<u8>> {
+        let p = path.as_ref()?;
+        match std::fs::read(p) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log.error("mcp.serve_fail", json!({"read": what, "path": p, "err": e.to_string()}));
+                None
+            }
+        }
+    };
+    let (cert_pem, key_pem) = if tls {
+        match (
+            read_pem("cert", &cfg.serve_cert),
+            read_pem("key", &cfg.serve_key),
+        ) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return None,
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let client_ca_pem = match &cfg.serve_client_ca {
+        Some(_) => match read_pem("client-ca", &cfg.serve_client_ca) {
+            Some(b) => Some(b),
+            None => return None,
+        },
+        None => None,
+    };
+    let bearer = match &cfg.serve_bearer {
+        Some(tmpl) => match agentd::sec::secret::resolve(tmpl, &|k| std::env::var(k).ok()) {
+            Ok(tok) => Some(tok),
+            Err(e) => {
+                log.error("mcp.serve_fail", json!({"resolve": "serve-bearer", "err": e}));
+                return None;
+            }
+        },
+        None => None,
+    };
+    let tls_cfg = HttpsServeConfig {
+        bind,
+        tls,
+        cert_pem,
+        key_pem,
+        client_ca_pem,
+        bearer,
+    };
+    let live_config = ctx.live_config();
+    match agentd::mcp::server::serve_https(tls_cfg, ctx, log.clone()) {
+        Ok(handle) => Some((handle, live_config)),
+        Err(e) => {
+            log.error("mcp.serve_fail", json!({"transport": "https", "err": e.to_string()}));
+            None
+        }
+    }
+}
+
+/// Without the `serve-https` feature an `https://`/`http://` serve target can't be
+/// bound — config validation admits the scheme (it's build-agnostic, like
+/// `vsock:`), so this build stays inert on that target rather than panicking.
+#[cfg(all(feature = "serve-mcp", not(feature = "serve-https")))]
+fn serve_self_mcp_https(
+    bind: String,
+    _tls: bool,
+    _cfg: &Config,
+    _ctx: agentd::mcp::server::ServeCtx,
+    log: &Logger,
+) -> Option<ServeWiring> {
+    log.error(
+        "mcp.serve_fail",
+        json!({"transport": "https", "bind": bind, "err": "build lacks the 'serve-https' feature"}),
+    );
+    None
 }
 
 /// Bind the served self-MCP over vsock when this build has the `vsock` feature;

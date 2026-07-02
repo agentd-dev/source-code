@@ -284,12 +284,18 @@ impl ShardCfg {
 }
 
 /// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
-/// implicit default (no `--serve-mcp`); the explicit targets are a unix socket or
-/// — `--features vsock` — an AF_VSOCK port. The string forms are
-/// `unix:PATH` | `vsock:PORT` | `vsock:CID:PORT`; `vsock:PORT` binds the wildcard
-/// context id `VMADDR_CID_ANY`.
+/// implicit default (no `--serve-mcp`). The target-vision transport is
+/// [`Http`](ServeTarget::Http) — `https://HOST:PORT` (TLS, the control plane) or
+/// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests). The legacy
+/// [`Unix`](ServeTarget::Unix) / [`Vsock`](ServeTarget::Vsock) socket targets
+/// still parse (removed in pivot Phase 3). String forms: `https://host:port` |
+/// `http://127.0.0.1:port` | `unix:PATH` | `vsock:PORT` | `vsock:CID:PORT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeTarget {
+    /// Bind an HTTP(S) listener at `bind` (a `host:port` authority). `tls` is the
+    /// production control plane (`https://`); plaintext (`http://`) is admitted
+    /// only for a loopback host (dev/tests).
+    Http { bind: String, tls: bool },
     /// Bind a unix-domain socket at this path.
     Unix(std::path::PathBuf),
     /// Bind AF_VSOCK `(cid, port)`. `cid` is the wildcard `VMADDR_CID_ANY` for
@@ -308,6 +314,38 @@ impl ServeTarget {
     /// `https`-needs-`tls` scheme check). Returns a [`ConfigError::Usage`] (exit 2,
     /// before any side effect) on any problem.
     pub fn parse(spec: &str) -> Result<ServeTarget, ConfigError> {
+        // The target-vision transport: `https://HOST:PORT` (TLS control plane) or
+        // `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests). The bind is
+        // the `host:port` authority (path/query rejected — this is a listener, not
+        // a URL to fetch).
+        if let Some(tls) = spec
+            .strip_prefix("https://")
+            .map(|_| true)
+            .or_else(|| spec.strip_prefix("http://").map(|_| false))
+        {
+            let authority = spec.split("://").nth(1).unwrap_or("");
+            if authority.is_empty() || authority.contains('/') {
+                return Err(usage(format!(
+                    "--serve-mcp: want http(s)://HOST:PORT with no path (got: {spec})"
+                )));
+            }
+            let host = serve_host_of(authority);
+            let port_ok = serve_port_of(authority).is_some();
+            if host.is_empty() || !port_ok {
+                return Err(usage(format!(
+                    "--serve-mcp: HTTP(S) target needs an explicit host:port (got: {spec})"
+                )));
+            }
+            if !tls && !crate::net::http::is_loopback_host(host) {
+                return Err(usage(format!(
+                    "--serve-mcp: plaintext http:// is allowed for loopback only; use https:// (got: {spec})"
+                )));
+            }
+            return Ok(ServeTarget::Http {
+                bind: authority.to_string(),
+                tls,
+            });
+        }
         if let Some(path) = spec.strip_prefix("unix:") {
             if path.is_empty() {
                 return Err(usage("--serve-mcp: unix path is empty".into()));
@@ -345,9 +383,99 @@ impl ServeTarget {
             return Ok(ServeTarget::Vsock { cid, port });
         }
         Err(usage(format!(
-            "--serve-mcp: scheme unsupported (want unix:PATH | vsock:PORT | vsock:CID:PORT): {spec}"
+            "--serve-mcp: scheme unsupported (want https://host:port | http://loopback:port | unix:PATH | vsock:PORT | vsock:CID:PORT): {spec}"
         )))
     }
+}
+
+impl Config {
+    /// Validate the TLS material + auth for a `--serve-mcp` target (pivot Phase 2).
+    /// The cert/key/CA/bearer fields apply ONLY to an `https://` target; TLS needs
+    /// `--serve-cert`+`--serve-key`; and a **non-loopback** listener MUST
+    /// authenticate (mTLS via `--serve-client-ca` and/or a `--serve-bearer` token)
+    /// — the pivot removes the "reached the listener = trusted" posture, so an
+    /// open control plane is refused at startup (exit 2).
+    fn validate_serve_auth(
+        &self,
+        target: &ServeTarget,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
+        let (bind, tls) = match target {
+            ServeTarget::Http { bind, tls } => (bind.as_str(), *tls),
+            // The legacy socket targets take no TLS material / bearer.
+            _ => {
+                if self.serve_cert.is_some()
+                    || self.serve_key.is_some()
+                    || self.serve_client_ca.is_some()
+                    || self.serve_bearer.is_some()
+                {
+                    return Err(usage(
+                        "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer apply only to an https:// serve target".into(),
+                    ));
+                }
+                return Ok(());
+            }
+        };
+        if tls {
+            match (&self.serve_cert, &self.serve_key) {
+                (Some(cert), Some(key)) => {
+                    check_readable("--serve-cert", cert)?;
+                    check_readable("--serve-key", key)?;
+                }
+                _ => {
+                    return Err(usage(
+                        "--serve-mcp https:// requires --serve-cert and --serve-key (PEM file paths)".into(),
+                    ));
+                }
+            }
+        } else if self.serve_cert.is_some() || self.serve_key.is_some() {
+            return Err(usage(
+                "--serve-cert/--serve-key need an https:// serve target (plaintext http:// is loopback dev only)".into(),
+            ));
+        }
+        if let Some(ca) = &self.serve_client_ca {
+            check_readable("--serve-client-ca", ca)?;
+        }
+        if let Some(bearer) = &self.serve_bearer {
+            crate::sec::secret::refs_resolvable(bearer, env)
+                .map_err(|e| usage(format!("--serve-bearer: {e}")))?;
+        }
+        // Never an open control plane: a listener reachable off-box must gate trust.
+        let loopback = crate::net::http::is_loopback_host(serve_host_of(bind));
+        if !loopback && self.serve_client_ca.is_none() && self.serve_bearer.is_none() {
+            return Err(usage(
+                "a non-loopback --serve-mcp needs auth: set --serve-client-ca (mTLS) and/or --serve-bearer".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Confirm a file is present + readable (open checks read permission) without
+/// retaining its contents — for cert/key/CA PEM paths, checked at startup so a
+/// missing/unreadable file is exit 2, not a bind-time surprise.
+fn check_readable(flag: &str, path: &str) -> Result<(), ConfigError> {
+    std::fs::File::open(path).map_err(|e| usage(format!("{flag}: cannot read {path}: {e}")))?;
+    Ok(())
+}
+
+/// The host part of a `host:port` authority, unbracketing an IPv6 literal
+/// (`[::1]:8443` → `::1`). Never resolves — classifies the written form.
+fn serve_host_of(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+}
+
+/// The port of a `host:port` authority (`Some` iff a non-zero `u16` is present).
+fn serve_port_of(authority: &str) -> Option<u16> {
+    let port_str = if authority.starts_with('[') {
+        authority.rsplit_once("]:").map(|(_, p)| p)?
+    } else {
+        authority.rsplit_once(':').map(|(_, p)| p)?
+    };
+    port_str.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
 /// A declared **A2A peer**: a name and a client transport endpoint to reach a
@@ -505,6 +633,20 @@ pub struct Config {
     pub log_level: Level,
     pub drain_timeout: Duration,
     pub serve_mcp: Option<String>,
+    /// TLS server cert / key PEM **file paths** for an `https://` serve target
+    /// (pivot Phase 2). Required when serving TLS; the file *contents* (a private
+    /// key) are read at bind time and never logged (RFC 0012 §3.7).
+    pub serve_cert: Option<String>,
+    pub serve_key: Option<String>,
+    /// Client-CA PEM **file path** enabling mutual TLS on the serve target: peers
+    /// must present a certificate chaining to it (the PRIMARY way the `Management`
+    /// trust domain is minted — RFC 0015 §3.4, pivot decision).
+    pub serve_client_ca: Option<String>,
+    /// Bearer-token secret for the serve target — the ALTERNATIVE auth to mTLS
+    /// (`Authorization: Bearer <token>` mints `Management`). A `sec::secret`
+    /// template (`{{secret-file:PATH}}` / `{{secret:ENV}}`) or a literal; resolved
+    /// at bind time, never logged.
+    pub serve_bearer: Option<String>,
     pub health_file: Option<String>,
     /// Inbound W3C `traceparent` to continue (else a trace is minted from the
     /// run id). RFC 0010 §context-propagation.
@@ -653,6 +795,10 @@ impl Default for Config {
             log_level: Level::Info,
             drain_timeout: Duration::from_secs(25),
             serve_mcp: None,
+            serve_cert: None,
+            serve_key: None,
+            serve_client_ca: None,
+            serve_bearer: None,
             health_file: None,
             traceparent: None,
             log_content: false,
@@ -718,6 +864,12 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("drain_timeout", &self.drain_timeout)
             .field("serve_mcp", &self.serve_mcp)
+            // Cert/key/CA are file PATHS (not secrets), safe to show; the bearer
+            // is a credential — presence only, never the value (RFC 0012 §3.7).
+            .field("serve_cert", &self.serve_cert)
+            .field("serve_key", &self.serve_key)
+            .field("serve_client_ca", &self.serve_client_ca)
+            .field("serve_bearer", &self.serve_bearer.as_ref().map(|_| "<redacted>"))
             .field("health_file", &self.health_file)
             .field("traceparent", &self.traceparent)
             .field("log_content", &self.log_content)
@@ -930,6 +1082,19 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
+        // TLS material + auth for an `https://` serve target (pivot Phase 2).
+        if let Some(v) = envmap.get("AGENTD_SERVE_CERT") {
+            c.serve_cert = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_SERVE_KEY") {
+            c.serve_key = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_SERVE_CLIENT_CA") {
+            c.serve_client_ca = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_SERVE_BEARER") {
+            c.serve_bearer = Some((*v).to_string());
+        }
         // Shard identity (RFC 0019 §4.2): agentctl injects `AGENTD_SHARD=K/N`
         // from the StatefulSet ordinal; a `--shard` flag below overrides it.
         if let Some(v) = envmap.get("AGENTD_SHARD") {
@@ -1089,6 +1254,10 @@ impl Config {
                 "--cgroup-memory-max" => c.cgroup_memory_max = Some(take("--cgroup-memory-max")?),
                 "--cgroup-pids-max" => c.cgroup_pids_max = Some(take("--cgroup-pids-max")?),
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
+                "--serve-cert" => c.serve_cert = Some(take("--serve-cert")?),
+                "--serve-key" => c.serve_key = Some(take("--serve-key")?),
+                "--serve-client-ca" => c.serve_client_ca = Some(take("--serve-client-ca")?),
+                "--serve-bearer" => c.serve_bearer = Some(take("--serve-bearer")?),
                 // Shard identity (RFC 0019 §4): `--shard K/N` overrides AGENTD_SHARD.
                 "--shard" => {
                     let v = take("--shard")?;
@@ -1519,7 +1688,16 @@ impl Config {
         // a vsock target on a non-vsock build, or a zero/non-numeric port exits 2
         // before any listener is bound — mirroring the intelligence-URI check.
         if let Some(spec) = &self.serve_mcp {
-            ServeTarget::parse(spec)?;
+            let target = ServeTarget::parse(spec)?;
+            self.validate_serve_auth(&target, &|k: &str| std::env::var(k).ok())?;
+        } else if self.serve_cert.is_some()
+            || self.serve_key.is_some()
+            || self.serve_client_ca.is_some()
+            || self.serve_bearer.is_some()
+        {
+            return Err(usage(
+                "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer require --serve-mcp".into(),
+            ));
         }
         // Sharding (`--shard K/N`, RFC 0019 §4) needs the `cluster` build feature.
         // A requested `N > 1` without it is rejected at startup (exit 2) — NOT
@@ -3240,6 +3418,61 @@ mod tests {
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(&args(&["--intelligence", " , , "]), &env).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
+    }
+
+    #[test]
+    fn serve_target_http_parses() {
+        assert_eq!(
+            ServeTarget::parse("https://0.0.0.0:8443").unwrap(),
+            ServeTarget::Http {
+                bind: "0.0.0.0:8443".into(),
+                tls: true
+            }
+        );
+        // loopback plaintext is allowed (dev); a bracketed IPv6 loopback too.
+        assert_eq!(
+            ServeTarget::parse("http://127.0.0.1:9000").unwrap(),
+            ServeTarget::Http {
+                bind: "127.0.0.1:9000".into(),
+                tls: false
+            }
+        );
+        assert!(matches!(
+            ServeTarget::parse("http://[::1]:9000"),
+            Ok(ServeTarget::Http { tls: false, .. })
+        ));
+        // non-loopback plaintext, a path, or a missing port → usage error
+        for bad in [
+            "http://10.0.0.5:9000",
+            "https://host:8443/mcp",
+            "https://host",
+        ] {
+            assert!(
+                matches!(ServeTarget::parse(bad), Err(ConfigError::Usage(_))),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_auth_gates_the_control_plane() {
+        let base = |extra: &[&str]| {
+            let mut a = vec!["--instruction", "x", "--intelligence", "https://i.example"];
+            a.extend_from_slice(extra);
+            let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            Config::load(&args, &[]).and_then(|c| c.validate().map(|_| c))
+        };
+        // A non-loopback https target with no auth is refused (open control plane).
+        assert!(base(&["--serve-mcp", "https://0.0.0.0:8443"]).is_err());
+        // https:// with no cert/key is refused even on loopback.
+        assert!(base(&["--serve-mcp", "https://127.0.0.1:8443"]).is_err());
+        // Loopback plaintext needs no auth (dev).
+        assert!(base(&["--serve-mcp", "http://127.0.0.1:9000"]).is_ok());
+        // TLS material on a socket / plaintext target is rejected.
+        assert!(base(&["--serve-mcp", "unix:/x.sock", "--serve-bearer", "t"]).is_err());
+        assert!(base(&["--serve-mcp", "http://127.0.0.1:9000", "--serve-cert", "/x"]).is_err());
+        // Serve auth flags without --serve-mcp is a misconfig.
+        assert!(base(&["--serve-bearer", "t"]).is_err());
     }
 
     #[test]

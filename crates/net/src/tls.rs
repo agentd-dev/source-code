@@ -187,7 +187,16 @@ fn connect_with_config(
     host: &str,
     config: Arc<ClientConfig>,
 ) -> io::Result<TlsStream> {
-    let server_name = ServerName::try_from(host)
+    // An ABSOLUTE DNS name (trailing root dot — used by cluster deployments so
+    // no resolver search list can capture the FQDN) is a resolver-level form:
+    // certificates carry the name WITHOUT the root dot, and rustls's ServerName
+    // rejects the dotted spelling. Strip it for SNI + verification; the caller
+    // already resolved the socket address from the absolute form.
+    let sni = host
+        .strip_suffix('.')
+        .filter(|h| !h.is_empty())
+        .unwrap_or(host);
+    let server_name = ServerName::try_from(sni)
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

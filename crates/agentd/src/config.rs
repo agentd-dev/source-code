@@ -434,6 +434,19 @@ fn serve_port_of(authority: &str) -> Option<u16> {
 pub struct A2aPeerSpec {
     pub name: String,
     pub endpoint: String,
+    /// Secret-FREE auth header templates presented TO the peer (e.g.
+    /// `("authorization", "Bearer {{secret:PEER_TOKEN}}")`), resolved at dial
+    /// time exactly like an MCP server's (RFC 0012 §3.7 — no credential in the
+    /// spec/manifest/payload/logs). This is the bearer leg of peer client-auth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// Client-certificate PEM **file paths** for mutual TLS to the peer (the
+    /// mTLS leg of peer client-auth). Both or neither; contents are loaded at
+    /// dial time and never inlined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
 }
 
 impl A2aPeerSpec {
@@ -1564,6 +1577,14 @@ impl Config {
             // secret on first use).
             ::mcp::http::McpEndpoint::parse(&s.endpoint)
                 .map_err(|e| usage(format!("mcp server '{}': {e}", s.name)))?;
+            for (name, value) in &s.headers {
+                if is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
+                    return Err(usage(format!(
+                        "mcp server '{}' header '{name}' looks like a credential but has an                          inline value; use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}}",
+                        s.name
+                    )));
+                }
+            }
             crate::mcp::auth::headers_resolvable(&s.headers)
                 .map_err(|e| usage(format!("mcp server '{}' header: {e}", s.name)))?;
         }
@@ -1747,6 +1768,39 @@ impl Config {
                 )));
             }
             A2aEndpoint::parse(&peer.endpoint)?;
+            // Peer client-auth (both legs) fails FAST at startup: header
+            // templates must be secret-free + resolvable (bearer leg, same rule
+            // as MCP servers), and mTLS material must come in a cert+key PAIR of
+            // readable files (loaded at dial time, never inlined).
+            for (name, value) in &peer.headers {
+                if is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
+                    return Err(usage(format!(
+                        "a2a peer '{}' header '{name}' looks like a credential but has an                          inline value; use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}}",
+                        peer.name
+                    )));
+                }
+            }
+            crate::mcp::auth::headers_resolvable(&peer.headers)
+                .map_err(|e| usage(format!("a2a peer '{}' header: {e}", peer.name)))?;
+            match (&peer.client_cert, &peer.client_key) {
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(usage(format!(
+                        "a2a peer '{}': client_cert and client_key must be set together",
+                        peer.name
+                    )));
+                }
+                (Some(cert), Some(key)) => {
+                    for path in [cert, key] {
+                        if let Err(e) = std::fs::metadata(path) {
+                            return Err(usage(format!(
+                                "a2a peer '{}': cannot read '{path}': {e}",
+                                peer.name
+                            )));
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
         }
         // Declared intelligence headers (RFC 0017 §3.1/§6): reject an inline
         // secret-shaped value, and require every {{secret…}} ref to resolve. The
@@ -2258,6 +2312,9 @@ fn parse_a2a_peer_spec(spec: &str) -> Result<A2aPeerSpec, ConfigError> {
     Ok(A2aPeerSpec {
         name: name.to_string(),
         endpoint: endpoint.to_string(),
+        headers: Vec::new(),
+        client_cert: None,
+        client_key: None,
     })
 }
 
@@ -2399,6 +2456,9 @@ fn apply_config_file(
         c.a2a_peers.push(A2aPeerSpec {
             name: p.name,
             endpoint: p.endpoint,
+            headers: p.headers.into_iter().collect(),
+            client_cert: p.client_cert,
+            client_key: p.client_key,
         });
     }
     // Declared intelligence headers (templates; secret-shaped values validated).
@@ -3620,6 +3680,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(dup, ConfigError::Usage(_)));
+    }
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a2a_peer_client_auth_is_validated_at_startup() {
+        // A secret-shaped INLINE header value on a peer is rejected (RFC 0012
+        // §3.7 — templates only), same rule as MCP servers.
+        let file = write_tmp(
+            r#"{ "a2a_peers": [{ "name": "mesh", "endpoint": "https://peer.example/a2a",
+                 "headers": { "authorization": "Bearer sk-live-inline-oops" } }] }"#,
+        );
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)), "{e}");
+        assert!(format!("{e}").contains("a2a peer 'mesh' header"), "{e}");
+
+        // A resolvable {{secret:…}} template passes (the PROCESS env carries the
+        // secret — the resolver reads std::env, like the MCP header resolver).
+        let file = write_tmp(
+            r#"{ "a2a_peers": [{ "name": "mesh", "endpoint": "https://peer.example/a2a",
+                 "headers": { "authorization": "Bearer {{secret:A2A_PEER_AUTH_TEST_TOKEN}}" } }] }"#,
+        );
+        // SAFETY: single-threaded test; unique var name avoids cross-test races.
+        unsafe { std::env::set_var("A2A_PEER_AUTH_TEST_TOKEN", "tok") };
+        let c = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("A2A_PEER_AUTH_TEST_TOKEN") };
+        assert_eq!(c.a2a_peers[0].headers.len(), 1, "template stored, not resolved");
+        assert!(
+            c.a2a_peers[0].headers[0].1.contains("{{secret:"),
+            "the SPEC keeps the template, never the material"
+        );
+
+        // client_cert without client_key (and vice versa) is a pairing error.
+        let file = write_tmp(
+            r#"{ "a2a_peers": [{ "name": "mesh", "endpoint": "https://peer.example/a2a",
+                 "client_cert": "/tls/cert.pem" }] }"#,
+        );
+        let e = Config::load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e}").contains("client_cert and client_key must be set together"),
+            "{e}"
+        );
     }
 
     #[cfg(not(feature = "a2a"))]

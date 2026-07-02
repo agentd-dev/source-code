@@ -63,18 +63,33 @@ pub enum DelegateOutcome {
 /// hangs (the deadline is the hard backstop). RFC 0020 §3.
 pub fn delegate(
     endpoint: &A2aEndpoint,
+    auth: PeerAuth,
     objective: &str,
     output_contract: Option<&str>,
     deadline: Instant,
 ) -> DelegateOutcome {
     // The sole transport: dial the peer's A2A method surface over HTTP(S), one
-    // POST per unary call (SendMessage + GetTask polls).
+    // POST per unary call (SendMessage + GetTask polls), presenting the peer
+    // client-auth material (bearer headers and/or an mTLS identity) on each.
     match endpoint {
         A2aEndpoint::Https(url) => match HttpEp::parse(url) {
-            Ok(ep) => drive(HttpConn::new(ep), objective, output_contract, deadline),
+            Ok(ep) => drive(HttpConn::new(ep, auth), objective, output_contract, deadline),
             Err(e) => DelegateOutcome::Error(e),
         },
     }
+}
+
+/// The client credential presented TO a peer (RFC 0020 §auth): resolved bearer/
+/// framing headers (secrets ALREADY materialized — never logged; this struct has
+/// no Debug) and/or an mTLS client identity. Both empty = anonymous dial (a
+/// loopback dev peer).
+#[derive(Default)]
+pub struct PeerAuth {
+    /// Resolved header (name, value) pairs sent on every request.
+    pub headers: Vec<(String, String)>,
+    /// The mutual-TLS client identity presented during the handshake.
+    #[cfg(feature = "tls")]
+    pub identity: Option<crate::net::tls::ClientIdentity>,
 }
 
 /// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
@@ -182,12 +197,13 @@ impl HttpEp {
 /// mTLS/bearer — is a follow-up; today agentd dials peers it already trusts.)
 struct HttpConn {
     ep: HttpEp,
+    auth: PeerAuth,
     next_id: i64,
 }
 
 impl HttpConn {
-    fn new(ep: HttpEp) -> HttpConn {
-        HttpConn { ep, next_id: 1 }
+    fn new(ep: HttpEp, auth: PeerAuth) -> HttpConn {
+        HttpConn { ep, auth, next_id: 1 }
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
@@ -196,8 +212,9 @@ impl HttpConn {
         if self.ep.tls {
             #[cfg(feature = "tls")]
             {
-                let tls = crate::net::tls::connect(tcp, &self.ep.host, None)
-                    .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.host))?;
+                let tls =
+                    crate::net::tls::connect(tcp, &self.ep.host, self.auth.identity.as_ref())
+                        .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.host))?;
                 Ok(Box::new(tls))
             }
             #[cfg(not(feature = "tls"))]
@@ -218,12 +235,16 @@ impl Caller for HttpConn {
         let req = Request::new(Id::Num(id), method, Some(params));
         let body = serde_json::to_vec(&req).map_err(|e| format!("a2a: encode {method}: {e}"))?;
         let mut stream = self.connect(timeout)?;
+        let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+        for (name, value) in &self.auth.headers {
+            headers.push((name.as_str(), value.as_str()));
+        }
         let resp = crate::net::http::send(
             &mut *stream,
             &self.ep.host_header,
             "POST",
             &self.ep.path,
-            &[("Content-Type", "application/json")],
+            &headers,
             &body,
         )
         .map_err(|e| format!("a2a: {method}: {e}"))?;
@@ -361,10 +382,62 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).expect("parse https endpoint");
         assert!(matches!(ep, A2aEndpoint::Https(_)));
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, "do the work", Some("one line"), deadline) {
+        match delegate(&ep, PeerAuth::default(), "do the work", Some("one line"), deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "http distilled answer"),
             DelegateOutcome::Error(e) => panic!("expected distillate, got error: {e}"),
         }
+    }
+
+    #[test]
+    fn delegate_presents_the_peer_auth_headers() {
+        // The fixture captures the request head of the FIRST call; the resolved
+        // bearer header must be on the wire.
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<String>> = Arc::default();
+        let cap = Arc::clone(&captured);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                *cap.lock().unwrap() = head;
+                // Reply terminal immediately so the client stops after one call.
+                let result = task("h-a", TaskState::Completed, Some("authed"));
+                let payload =
+                    json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let ep = A2aEndpoint::parse(&format!("http://{addr}")).unwrap();
+        let auth = PeerAuth {
+            headers: vec![("authorization".into(), "Bearer sekrit-token".into())],
+            ..Default::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match delegate(&ep, auth, "obj", None, deadline) {
+            DelegateOutcome::Distillate(s) => assert_eq!(s, "authed"),
+            DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
+        }
+        let head = captured.lock().unwrap().clone();
+        assert!(
+            head.to_lowercase().contains("authorization: bearer sekrit-token"),
+            "the bearer header was presented to the peer:\n{head}"
+        );
     }
 
     #[test]
@@ -373,7 +446,7 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-t", TaskState::Completed, Some("immediate"))]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "immediate"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -385,7 +458,7 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            delegate(&ep, "obj", None, deadline),
+            delegate(&ep, PeerAuth::default(), "obj", None, deadline),
             DelegateOutcome::Error(_)
         ));
     }
@@ -396,7 +469,7 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-w", TaskState::Working, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
-        match delegate(&ep, "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
         }
@@ -407,7 +480,7 @@ mod tests {
         let url = serve_http_error_fixture();
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        match delegate(&ep, "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("rpc error"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }

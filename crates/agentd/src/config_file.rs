@@ -114,6 +114,16 @@ pub struct McpServerFile {
 pub struct A2aPeerFile {
     pub name: String,
     pub endpoint: String,
+    /// Secret-free auth header templates presented TO the peer (bearer leg),
+    /// e.g. `"authorization": "Bearer {{secret:PEER_TOKEN}}"`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Client-certificate PEM file paths for mutual TLS to the peer (both or
+    /// neither).
+    #[serde(default)]
+    pub client_cert: Option<String>,
+    #[serde(default)]
+    pub client_key: Option<String>,
 }
 
 /// The list of `ConfigFile` field names, in declaration order — the single
@@ -294,7 +304,14 @@ pub fn config_schema() -> Value {
                 "required": ["name", "endpoint"],
                 "properties": {
                     "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-                    "endpoint": { "type": "string" }
+                    "endpoint": { "type": "string" },
+                    "headers": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "secret-free auth header templates presented to the peer ({{secret:NAME}} references)"
+                    },
+                    "client_cert": { "type": "string", "description": "client certificate PEM file path (mutual TLS to the peer; requires client_key)" },
+                    "client_key": { "type": "string", "description": "client private-key PEM file path" }
                 }
             }
         }

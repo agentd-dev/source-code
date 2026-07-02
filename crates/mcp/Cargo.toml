@@ -21,11 +21,15 @@ path = "src/lib.rs"
 default = []
 # Direct https:// MCP (TCP+TLS) + mutual-TLS client identities — maps to net/tls.
 tls = ["net/tls"]
-# AF_VSOCK MCP transport — maps to net/vsock.
-vsock = ["net/vsock"]
+# AF_VSOCK MCP transport — maps to net/vsock for the client (outbound connect) and
+# pulls the `vsock` crate directly for the server's inbound `VsockListener`.
+vsock = ["net/vsock", "dep:vsock"]
 
 [dependencies]
 # Shared transport primitives (the HTTP/1.1+SSE client, unix/tls/vsock connects).
 net = { path = "../net" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The served-MCP vsock listener (`server::ServeStream::Vsock`). The client's vsock
+# *connect* lives in `net`; the server *listens*, so it needs `VsockListener` here.
+vsock = { version = "0.5", optional = true }

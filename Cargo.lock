@@ -197,6 +197,7 @@ dependencies = [
  "net",
  "serde",
  "serde_json",
+ "vsock",
 ]
 
 [[package]]

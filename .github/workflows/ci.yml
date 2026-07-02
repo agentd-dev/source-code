@@ -86,9 +86,9 @@ jobs:
           # count is charset-independent (cargo tree emits ASCII art off a TTY, so
           # a `├`/`└` grep counts 0 in CI). First line is the agent root; drop it.
           # Workspace path crates (net, mcp — they print with a `(/…)` path suffix)
-# are OUR OWN code, not third-party surface; only EXTERNAL crates count
-# against the moat.
-deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/' | grep -c .)
+          # are OUR OWN code, not third-party surface; only EXTERNAL crates count
+          # against the moat.
+          deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/' | grep -c .)
           echo "direct deps: $deps"
           if [ "$deps" -ne 3 ]; then
             echo "::error::default build must have exactly 3 direct deps (serde, serde_json, libc); found $deps"

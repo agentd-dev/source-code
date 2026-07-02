@@ -203,6 +203,17 @@ pub trait GraphExec {
     ) -> Option<String> {
         None
     }
+
+    /// Run a `Subgraph` node: execute the nested `graph` — synchronously inline, or
+    /// `async` as a detached subtree — and return its result + whether it errored
+    /// (selecting the node's `ok`/`error` edge). The production impl runs it via the
+    /// supervisor's spawn machinery so the nested run inherits the depth/breadth/token
+    /// caps (it crosses a process boundary). Default impl: `(Null, true)` — a build
+    /// without that wiring degrades SAFELY to the Subgraph's `error` edge rather than
+    /// silently skipping it.
+    fn run_subgraph(&mut self, _graph: &Graph, _async_: bool, _blackboard: &Blackboard) -> (Value, bool) {
+        (Value::Null, true)
+    }
 }
 
 /// The label an effectful node emits given whether it errored.
@@ -377,13 +388,12 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
-            // Subgraph lands in P5; fail closed until then.
-            Node::Subgraph { .. } => {
-                return DriveResult::Done(GraphOutcome::engine(
-                    GraphStatus::Crashed,
-                    Value::Null,
-                    state.steps(),
-                ));
+            // Subgraph: run the nested graph through the exec seam (the real impl
+            // spawns a capped subtree), write its result, follow ok/error.
+            Node::Subgraph { graph: sub, async_, writes, edges } => {
+                let (val, is_err) = exec.run_subgraph(sub, *async_, &state.blackboard);
+                write(&mut state.blackboard, writes, val);
+                (edge_for(is_err), edges)
             }
         };
 
@@ -501,6 +511,16 @@ mod tests {
             self.calls.push(format!("judge:{prompt}"));
             self.judge_answer.clone()
         }
+
+        fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _bb: &Blackboard) -> (Value, bool) {
+            self.calls.push("subgraph".to_string());
+            // Drive the nested graph inline (the real impl spawns a capped subtree);
+            // its result + whether it completed select the parent's ok/error edge.
+            match drive(graph, self, 1000) {
+                DriveResult::Done(o) => (o.result, o.status != GraphStatus::Completed),
+                DriveResult::Suspended(_) => (json!("subgraph suspended"), true),
+            }
+        }
     }
 
     /// Drive a graph that is expected to run to completion (no `Wait`) and return its
@@ -613,26 +633,6 @@ mod tests {
         .unwrap();
         // (This graph is valid — every EDGE has a target — but at run time the `ok`
         // label is unhandled, which must fail closed rather than wedge.)
-        let mut exec = MockExec::default();
-        let out = run(&g, &mut exec, 10);
-        assert_eq!(out.status, GraphStatus::Crashed);
-    }
-
-    #[test]
-    fn an_unsupported_node_kind_fails_closed() {
-        // A Subgraph node is a P5 feature; until then the driver must fail closed on it.
-        let g: Graph = serde_json::from_value(json!({
-            "start": "sg",
-            "nodes": {
-                "sg": {
-                    "kind": "subgraph",
-                    "graph": {"start": "x", "nodes": {"x": {"kind": "halt", "status": "completed"}}},
-                    "edges": {"ok": "h"}
-                },
-                "h": {"kind": "halt", "status": "completed"}
-            }
-        }))
-        .unwrap();
         let mut exec = MockExec::default();
         let out = run(&g, &mut exec, 10);
         assert_eq!(out.status, GraphStatus::Crashed);
@@ -952,5 +952,73 @@ mod tests {
             matches!(result, DriveResult::Suspended(_)),
             "a reactive Wait loop runs long past the visit cap: {result:?}"
         );
+    }
+
+    // ── P5: Subgraph ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_sync_subgraph_runs_and_its_result_flows_into_the_parent() {
+        // sg (subgraph: sub-work → halt) → done(result_from = sub_out).
+        let g: Graph = serde_json::from_value(json!({
+            "start": "sg",
+            "nodes": {
+                "sg": {
+                    "kind": "subgraph",
+                    "graph": {
+                        "start": "s",
+                        "nodes": {
+                            "s": {"kind": "agent", "instruction": "sub-work", "writes": "r", "edges": {"ok": "sh"}},
+                            "sh": {"kind": "halt", "status": "completed", "result_from": "r"}
+                        }
+                    },
+                    "writes": "sub_out",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "sub_out"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok(), "a graph with a nested subgraph validates");
+        let mut exec = MockExec::default();
+        exec.agents.insert("sub-work".into(), (json!({"did": "it"}), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        // The nested graph's result flowed up into `sub_out` and was projected.
+        assert_eq!(out.result, json!({"did": "it"}));
+        assert!(exec.calls.iter().any(|c| c == "subgraph"));
+    }
+
+    #[test]
+    fn a_subgraph_without_execution_support_takes_the_error_edge() {
+        // An exec that uses the DEFAULT run_subgraph (no spawn wiring) → error edge.
+        struct NoSubgraph;
+        impl GraphExec for NoSubgraph {
+            fn run_agent(&mut self, _: &str, _: Option<&str>, _: &Blackboard, _: &[String]) -> (Value, bool) {
+                (Value::Null, false)
+            }
+            fn call_tool(&mut self, _: &str, _: &str, _: &Value) -> (Value, bool) {
+                (Value::Null, false)
+            }
+        }
+        let g: Graph = serde_json::from_value(json!({
+            "start": "sg",
+            "nodes": {
+                "sg": {
+                    "kind": "subgraph",
+                    "graph": {"start": "x", "nodes": {"x": {"kind": "halt", "status": "completed"}}},
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        let mut exec = NoSubgraph;
+        let DriveResult::Done(out) = drive(&g, &mut exec, 100) else {
+            panic!("no wait, should complete");
+        };
+        // Default run_subgraph → (Null, true) → the error edge → the crashed halt.
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
     }
 }

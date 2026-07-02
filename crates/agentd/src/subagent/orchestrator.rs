@@ -266,6 +266,35 @@ impl Orchestrator {
         )
     }
 
+    /// `graph.patch` (pivot Phase 7 · P5, `--features run-graph`) — grow a stored graph
+    /// ADDITIVELY (new nodes/edges only; no overwrite, no retarget), so the model can
+    /// extend its own plan at runtime without breaking a live run's reachability or
+    /// termination. The patch is applied to a clone + re-validated; a rejected patch
+    /// leaves the stored graph UNCHANGED and is refused as a tool result.
+    #[cfg(feature = "run-graph")]
+    fn graph_patch(&mut self, args: &Value) -> (String, bool) {
+        let id = args.get("graph_id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            return ("error: graph.patch requires 'graph_id'".into(), true);
+        }
+        if !self.graphs.contains_key(id) {
+            return (format!("error: no such graph '{id}'"), true);
+        }
+        let patch: crate::graph::GraphPatch =
+            match serde_json::from_value(args.get("patch").cloned().unwrap_or_else(|| json!({}))) {
+                Ok(p) => p,
+                Err(e) => return (format!("error: malformed patch: {e}"), true),
+            };
+        let mut patched = self.graphs[id].clone();
+        if let Err(errs) = patched.apply_patch(patch) {
+            return (format!("error: patch rejected: {}", errs.join("; ")), true);
+        }
+        let n = patched.nodes.len();
+        self.graphs.insert(id.to_string(), patched);
+        self.log.info("graph.patch", json!({"graph_id": id, "nodes": n}));
+        (format!("graph {id} patched ({n} nodes)"), false)
+    }
+
     /// Queue a future self-wake-up (RFC 0008 §self-scheduling). Bounded; refused
     /// as a tool result (never crashes). Effective only under a daemon — the
     /// requests ride out on the run's `Outcome`.
@@ -743,7 +772,10 @@ impl SelfHandler for Orchestrator {
             // like the reactive self-tools — a nested child distils a result, it does
             // not drive a graph.
             #[cfg(feature = "run-graph")]
-            t.push(graph_define_tool_def());
+            {
+                t.push(graph_define_tool_def());
+                t.push(graph_patch_tool_def());
+            }
         }
         t
     }
@@ -770,6 +802,8 @@ impl SelfHandler for Orchestrator {
             "await_resource" if self.parent_depth == 0 => Some(self.await_resource(args)),
             #[cfg(feature = "run-graph")]
             "graph.define" if self.parent_depth == 0 => Some(self.graph_define(args)),
+            #[cfg(feature = "run-graph")]
+            "graph.patch" if self.parent_depth == 0 => Some(self.graph_patch(args)),
             _ => None,
         }
     }
@@ -1043,6 +1077,35 @@ fn graph_define_tool_def() -> ToolDef {
     }
 }
 
+/// `graph.patch` (pivot Phase 7 · P5) — grow a stored graph additively.
+#[cfg(feature = "run-graph")]
+fn graph_patch_tool_def() -> ToolDef {
+    ToolDef {
+        name: "graph.patch".into(),
+        description: "Extend a run-graph you defined, additively: add new nodes and/or new edges \
+            to existing nodes (never overwrite a node or retarget an edge). Give the graph_id and \
+            a patch {add_nodes, add_edges}; agentd re-validates the grown graph and rejects the \
+            patch if it would break termination. Use this to elaborate your plan as you learn more, \
+            without redefining the whole graph."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "graph_id": {"type": "string", "description": "the id returned by graph.define"},
+                "patch": {
+                    "type": "object",
+                    "description": "additive changes",
+                    "properties": {
+                        "add_nodes": {"type": "object", "description": "new nodes {id: {kind, ...}}"},
+                        "add_edges": {"type": "array", "description": "new edges [{from, label, to}]"}
+                    }
+                }
+            },
+            "required": ["graph_id", "patch"]
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1255,6 +1318,53 @@ mod tests {
         assert_eq!(
             drained[0].condition.as_ref().expect("carries a condition")["op"],
             "eq"
+        );
+    }
+
+    #[cfg(feature = "run-graph")]
+    #[test]
+    fn graph_patch_grows_a_defined_graph_additively() {
+        let mut root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(root.tools().iter().any(|t| t.name == "graph.patch"));
+        // Define a graph, then patch it additively.
+        let g = json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "do", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        });
+        let (obs, err) = root.handle("graph.define", &json!({"graph": g})).unwrap();
+        assert!(!err, "{obs}");
+        let id = obs.split_whitespace().nth(2).unwrap().to_string(); // "graph defined: g1 (...)"
+        // A valid additive patch is accepted.
+        let (obs, err) = root
+            .handle(
+                "graph.patch",
+                &json!({"graph_id": id, "patch": {"add_edges": [{"from": "a", "label": "error", "to": "h"}]}}),
+            )
+            .unwrap();
+        assert!(!err, "additive patch accepted: {obs}");
+        // Unknown graph id + a retargeting patch are refused.
+        assert!(
+            root.handle("graph.patch", &json!({"graph_id": "gX", "patch": {}}))
+                .unwrap()
+                .1,
+            "unknown id refused"
+        );
+        assert!(
+            root.handle(
+                "graph.patch",
+                &json!({"graph_id": id, "patch": {"add_edges": [{"from": "a", "label": "ok", "to": "a"}]}})
+            )
+            .unwrap()
+            .1,
+            "retarget refused"
         );
     }
 

@@ -55,6 +55,27 @@ pub struct Graph {
     pub nodes: BTreeMap<NodeId, Node>,
 }
 
+/// An ADDITIVE patch to a stored graph (pivot Phase 7 · P5 — the `graph.patch` self
+/// tool): new nodes and new edges only. Never overwrites a node or retargets an edge,
+/// so applying it cannot break the reachability/termination a live run relies on.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GraphPatch {
+    /// New nodes to add, keyed by id (rejected if the id already exists).
+    #[serde(default)]
+    pub add_nodes: BTreeMap<NodeId, Node>,
+    /// New out-edges to add to existing edge-bearing nodes.
+    #[serde(default)]
+    pub add_edges: Vec<PatchEdge>,
+}
+
+/// One additive out-edge: attach `label → to` to the existing node `from`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchEdge {
+    pub from: NodeId,
+    pub label: EdgeLabel,
+    pub to: NodeId,
+}
+
 /// Optional per-`Agent`-node budget override (a slice of the run budget). Absent
 /// fields inherit the graph/run budget.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -289,6 +310,27 @@ impl Node {
         matches!(self, Node::Halt { .. })
     }
 
+    /// Add an out-edge to an edge-bearing node (pivot Phase 7 · P5, additive patch):
+    /// errs if the label already exists (no retarget) or the node carries no edge map
+    /// (`Branch` routes via cases; `Halt` terminates).
+    fn add_edge(&mut self, label: EdgeLabel, target: NodeId) -> Result<(), String> {
+        let edges = match self {
+            Node::Agent { edges, .. }
+            | Node::Tool { edges, .. }
+            | Node::Wait { edges, .. }
+            | Node::Subgraph { edges, .. } => edges,
+            Node::Branch { .. } => return Err("cannot add an edge to a Branch (use cases)".into()),
+            Node::Halt { .. } => return Err("cannot add an edge to a Halt (it terminates)".into()),
+        };
+        if edges.contains_key(&label) {
+            return Err(format!(
+                "edge label {label:?} already exists (additive-only: no retarget)"
+            ));
+        }
+        edges.insert(label, target);
+        Ok(())
+    }
+
     /// The blackboard key this node writes, if any (for the key-count cap).
     fn writes_key(&self) -> Option<&str> {
         match self {
@@ -379,6 +421,45 @@ impl Graph {
                 "no Halt node is reachable from start (the graph can never terminate)".into(),
             );
         }
+    }
+
+    /// Apply an ADDITIVE patch (pivot Phase 7 · P5): new nodes + new edges ONLY — no
+    /// node overwrite, no edge retarget — so a graph can grow at runtime (like
+    /// `Router::add_route`) without a live run losing reachability or a termination
+    /// guarantee. Applied to a CLONE and re-validated; the graph is swapped in only on
+    /// success, so a rejected patch leaves it UNCHANGED. Returns every error at once.
+    pub fn apply_patch(&mut self, patch: GraphPatch) -> Result<(), Vec<String>> {
+        let mut next = self.clone();
+        let mut errs = Vec::new();
+        for (id, node) in patch.add_nodes {
+            match next.nodes.entry(id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(node);
+                }
+                std::collections::btree_map::Entry::Occupied(e) => {
+                    errs.push(format!(
+                        "node {:?} already exists (additive-only: no overwrite)",
+                        e.key()
+                    ));
+                }
+            }
+        }
+        for e in patch.add_edges {
+            match next.nodes.get_mut(&e.from) {
+                Some(node) => {
+                    if let Err(msg) = node.add_edge(e.label, e.to) {
+                        errs.push(format!("add_edge on node {:?}: {msg}", e.from));
+                    }
+                }
+                None => errs.push(format!("add_edge from unknown node {:?}", e.from)),
+            }
+        }
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        next.validate()?; // the grown graph must still be structurally valid
+        *self = next;
+        Ok(())
     }
 
     /// BFS/DFS from `start`; true if any reachable node is a `Halt`.
@@ -560,6 +641,74 @@ mod tests {
         };
         assert!(!missing.eval(&bb));
         assert!(Pred::Not { pred: Box::new(missing) }.eval(&bb));
+    }
+
+    #[test]
+    fn an_additive_patch_grows_a_graph_and_stays_valid() {
+        // Start: a → h. Patch: add a node `b` and an edge a→b (on a fresh label),
+        // plus b → h. The grown graph must validate.
+        let mut g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "x", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let patch: GraphPatch = serde_json::from_value(json!({
+            "add_nodes": {"b": {"kind": "agent", "instruction": "y", "edges": {"ok": "h"}}},
+            "add_edges": [{"from": "a", "label": "error", "to": "b"}]
+        }))
+        .unwrap();
+        g.apply_patch(patch).expect("additive patch applies");
+        assert!(g.nodes.contains_key("b"));
+        assert_eq!(g.nodes["a"].targets().len(), 2, "a now has ok + error edges");
+        assert!(g.validate().is_ok());
+    }
+
+    #[test]
+    fn a_patch_that_overwrites_or_retargets_is_rejected() {
+        let mut g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "x", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        // Overwrite an existing node.
+        let overwrite: GraphPatch = serde_json::from_value(json!({
+            "add_nodes": {"a": {"kind": "halt", "status": "completed"}}
+        }))
+        .unwrap();
+        assert!(g.apply_patch(overwrite).is_err(), "no node overwrite");
+        // Retarget an existing edge label.
+        let retarget: GraphPatch = serde_json::from_value(json!({
+            "add_edges": [{"from": "a", "label": "ok", "to": "a"}]
+        }))
+        .unwrap();
+        assert!(g.apply_patch(retarget).is_err(), "no edge retarget");
+        // The graph is UNCHANGED after a rejected patch.
+        assert_eq!(g.nodes["a"].targets(), vec!["h"], "rejected patch left it intact");
+    }
+
+    #[test]
+    fn a_patch_that_breaks_validation_is_rejected_and_reverts() {
+        let mut g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "x", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        // An edge to a node that isn't added → dangling → validation rejects the patch.
+        let bad: GraphPatch = serde_json::from_value(json!({
+            "add_edges": [{"from": "a", "label": "error", "to": "ghost"}]
+        }))
+        .unwrap();
+        assert!(g.apply_patch(bad).is_err());
+        assert_eq!(g.nodes.len(), 2, "graph unchanged after a rejected patch");
     }
 
     #[test]

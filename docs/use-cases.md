@@ -5,7 +5,7 @@ hand it three things and it runs the agentic loop:
 
 1. an **instruction** (what to do, ending in an explicit output contract),
 2. an **intelligence** endpoint (`--intelligence`, the one LLM it talks to),
-3. **tools and resources over MCP** (`--mcp name=command …`),
+3. **tools and resources over MCP** (`--mcp name=<endpoint> …`),
 
 and a **mode** that decides *when* the loop runs. Everything below is the same
 binary with those four knobs turned differently. No plugins, no SDK, no

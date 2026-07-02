@@ -25,31 +25,32 @@ fn main() {
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
 
-    // Hidden built-in Streamable HTTP mock MCP server (v2.0.0 tests/dev):
-    // `--internal-mock-mcp-http <unix-socket> <uri> [--no-emit]`. Same gating as
-    // the stdio mock; serves the reactive one-resource MCP over the socket.
+    // Hidden built-in Streamable HTTP mock MCP server (tests/dev):
+    // `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]`. Binds loopback
+    // TCP (127.0.0.1:0) and announces the bound address through <addr-file>;
+    // serves the reactive one-resource MCP over `http://<addr>`.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if argv.get(1).map(String::as_str) == Some("--internal-mock-mcp-http") {
-        let socket = argv
+        let addr_file = argv
             .get(2)
             .map(String::as_str)
-            .unwrap_or("/tmp/agentd-mock-mcp.sock");
+            .unwrap_or("/tmp/agentd-mock-mcp.addr");
         let uri = argv.get(3).map(String::as_str).unwrap_or("mock://resource");
         let emit = !argv.iter().any(|a| a == "--no-emit");
-        return agentd::mcp::mock_http::run(socket, uri, emit);
+        return agentd::mcp::mock_http::run(addr_file, uri, emit);
     }
 
     // Hidden built-in mock LLM (tests / observe-suite):
-    // `--internal-mock-llm <socket> [final|read|schedule]`. Same gating as the
-    // mock MCP dispatch above.
+    // `--internal-mock-llm <addr-file> [final|read|schedule]`. Same loopback-TCP
+    // + addr-file handshake as the mock MCP dispatch above.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if argv.get(1).map(String::as_str) == Some("--internal-mock-llm") {
-        let socket = argv
+        let addr_file = argv
             .get(2)
             .map(String::as_str)
-            .unwrap_or("/tmp/agentd-mock-llm.sock");
+            .unwrap_or("/tmp/agentd-mock-llm.addr");
         let script = argv.get(3).map(String::as_str).unwrap_or("final");
-        return agentd::intel::mock::run(socket, script);
+        return agentd::intel::mock::run(addr_file, script);
     }
 
     // Subagent re-exec dispatch. The supervisor sets this in the child's

@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A minimal built-in **Streamable HTTP** MCP server, for tests and for operators
 //! kicking the tyres on reactive setups. Hidden mode:
-//! `agentd --internal-mock-mcp-http <unix-socket> <uri> [--no-emit]`.
+//! `agentd --internal-mock-mcp-http <addr-file> <uri> [--no-emit]`.
 //!
-//! The v2.0.0 counterpart of the stdio [`super::mock`]: it serves the same one
-//! resource at `<uri>` — `initialize` (advertising `resources.subscribe`),
-//! `resources/list`, `resources/read`, `resources/subscribe` — over the RFC 0004
-//! Streamable HTTP transport on a unix socket (thread-per-connection, blocking,
-//! no dep). After a subscribe it pushes one `notifications/resources/updated`
-//! on the long-lived `GET` SSE stream (unless `emit` is off), so a reactive agent
-//! reached over HTTP has something to react to.
+//! Binds a **loopback TCP** listener on `127.0.0.1:0` and writes the bound
+//! `host:port` into `<addr-file>` (atomically: tmp + rename;
+//! [`crate::announce_addr`]) so the launching harness discovers the endpoint by
+//! waiting for the file, then hands agentd `--mcp name=http://<addr>`.
+//!
+//! It serves one resource at `<uri>` — `initialize` (advertising
+//! `resources.subscribe`), `resources/list`, `resources/read`,
+//! `resources/subscribe` — over the RFC 0004 Streamable HTTP transport
+//! (thread-per-connection, blocking, no dep). After a subscribe it pushes one
+//! `notifications/resources/updated` on the long-lived `GET` SSE stream (unless
+//! `emit` is off), so a reactive agent reached over HTTP has something to react
+//! to.
 
 use crate::json::{self, Incoming, Request, Response};
 use crate::wire::mcp::{PROTOCOL_VERSION, method};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,18 +33,20 @@ struct State {
     pending_emit: AtomicBool,
 }
 
-/// Serve the mock over the unix socket at `socket` (a bare path or `unix:PATH`)
-/// until the process is killed. Returns the process exit code.
-pub fn run(socket: &str, uri: &str, emit: bool) -> i32 {
-    let path = socket.strip_prefix("unix:").unwrap_or(socket);
-    let _ = std::fs::remove_file(path); // clear a stale socket
-    let listener = match UnixListener::bind(path) {
+/// Serve the mock on loopback TCP until the process is killed, announcing the
+/// bound address through `addr_file`. Returns the process exit code.
+pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("internal-mock-mcp-http: bind {path}: {e}");
+            eprintln!("internal-mock-mcp-http: bind 127.0.0.1:0: {e}");
             return 1;
         }
     };
+    if let Err(e) = crate::announce_addr(addr_file, &listener) {
+        eprintln!("internal-mock-mcp-http: write {addr_file}: {e}");
+        return 1;
+    }
     let state = Arc::new(State {
         uri: uri.to_string(),
         emit,
@@ -55,7 +62,7 @@ pub fn run(socket: &str, uri: &str, emit: bool) -> i32 {
 
 /// One HTTP request per connection (the client sends `Connection: close`). A
 /// `GET` is the notification SSE stream; a `POST` is one JSON-RPC frame.
-fn handle_conn(mut stream: UnixStream, state: Arc<State>) {
+fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let Some((method_line, body)) = read_http(&stream) else {
         return;
     };
@@ -128,7 +135,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
 /// comments — the client polls its stop flag via a read timeout between events,
 /// and a stream of comments would keep its SSE reader busy and defeat that. The
 /// thread loops until the process exits (a test mock; the harness reaps it).
-fn serve_notifications(stream: &mut UnixStream, state: &State) {
+fn serve_notifications(stream: &mut TcpStream, state: &State) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
         return;
@@ -156,7 +163,7 @@ fn serve_notifications(stream: &mut UnixStream, state: &State) {
 /// Read one HTTP request (request line, headers, Content-Length body) off a
 /// clone of `stream`. Returns `(request_line, body)` — headers beyond
 /// Content-Length are unused by the mock.
-fn read_http(stream: &UnixStream) -> Option<(String, Vec<u8>)> {
+fn read_http(stream: &TcpStream) -> Option<(String, Vec<u8>)> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).ok()? == 0 {
@@ -185,7 +192,7 @@ fn read_http(stream: &UnixStream) -> Option<(String, Vec<u8>)> {
 
 /// Write an `application/json` HTTP response carrying `payload`, optionally
 /// stamping the `Mcp-Session-Id` header.
-fn write_json(stream: &mut UnixStream, payload: serde_json::Value, session: bool) {
+fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: bool) {
     let body = serde_json::to_vec(&payload).unwrap_or_default();
     let session_hdr = if session { "Mcp-Session-Id: mock\r\n" } else { "" };
     let head = format!(

@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A minimal built-in mock LLM for the observe-to-validate E2E suite (M7).
-//! Hidden mode: `agentd --internal-mock-llm <socket> [script]`.
+//! Hidden mode: `agentd --internal-mock-llm <addr-file> [script]`.
 //!
-//! Speaks just enough OpenAI-compatible `/chat/completions` over a unix socket
+//! Binds a **loopback TCP** listener on `127.0.0.1:0` and writes the bound
+//! `host:port` into `<addr-file>` (atomically: tmp + rename) so the launching
+//! harness discovers the endpoint by waiting for the file — the same
+//! wait-for-path handshake the old unix-socket form had, except the file now
+//! *carries* the address instead of being the socket. The harness then hands
+//! agentd `--intelligence http://<addr>` (loopback plaintext is the dev/test
+//! carve-out; production intelligence is HTTPS-only).
+//!
+//! Speaks just enough OpenAI-compatible `/chat/completions` over that listener
 //! to drive a *real* agentic loop without a live model: it reads the request and
 //! returns a scripted assistant turn — a final answer or a tool call — switching
 //! to a final answer once a tool result appears in the transcript (so the ReAct
@@ -15,18 +23,22 @@
 //! Small enough to ship; it makes the loop + self-* tools observable end to end.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::{TcpListener, TcpStream};
 
-/// Serve the mock LLM until the process is killed. Returns the exit code.
-pub fn run(socket: &str, script: &str) -> i32 {
-    let _ = std::fs::remove_file(socket);
-    let listener = match UnixListener::bind(socket) {
+/// Serve the mock LLM until the process is killed, announcing the bound
+/// loopback address through `addr_file`. Returns the exit code.
+pub fn run(addr_file: &str, script: &str) -> i32 {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("mock-llm: bind {socket}: {e}");
+            eprintln!("mock-llm: bind 127.0.0.1:0: {e}");
             return crate::exit::GENERIC;
         }
     };
+    if let Err(e) = crate::announce_addr(addr_file, &listener) {
+        eprintln!("mock-llm: write {addr_file}: {e}");
+        return crate::exit::GENERIC;
+    }
     // One request per connection (the intel client uses Connection: close).
     for stream in listener.incoming().flatten() {
         handle(stream, script);
@@ -34,7 +46,7 @@ pub fn run(socket: &str, script: &str) -> i32 {
     0
 }
 
-fn handle(mut stream: UnixStream, script: &str) {
+fn handle(mut stream: TcpStream, script: &str) {
     let Some(body) = read_request_body(&mut stream) else {
         return;
     };
@@ -71,7 +83,7 @@ fn handle(mut stream: UnixStream, script: &str) {
 
 /// Read an HTTP/1.1 request: headers up to the blank line, then `Content-Length`
 /// body bytes. Returns the request body (the chat-completions JSON).
-fn read_request_body(stream: &mut UnixStream) -> Option<String> {
+fn read_request_body(stream: &mut TcpStream) -> Option<String> {
     let mut reader = BufReader::new(stream);
     let mut content_length = 0usize;
     loop {

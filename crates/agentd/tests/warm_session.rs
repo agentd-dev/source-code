@@ -17,7 +17,7 @@ fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_agentd")
 }
 
-fn start_mock_llm(socket: &Path) -> Child {
+fn start_mock_llm(socket: &Path) -> (Child, String) {
     let child = Command::new(exe())
         .args(["--internal-mock-llm", socket.to_str().unwrap(), "final"])
         .stdout(Stdio::null())
@@ -26,10 +26,11 @@ fn start_mock_llm(socket: &Path) -> Child {
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !socket.exists() {
-        assert!(Instant::now() < deadline, "mock-llm never bound");
+        assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    let addr = std::fs::read_to_string(socket).expect("read mock-llm addr-file");
+    (child, format!("http://{}", addr.trim()))
 }
 
 fn logger() -> Logger {
@@ -46,13 +47,13 @@ fn logger() -> Logger {
     )
 }
 
-fn payload(sock: &Path) -> SpawnPayload {
+fn payload(intel_url: &str) -> SpawnPayload {
     SpawnPayload {
         instruction: "react to the event".into(),
         output_contract: None,
         context_seed: Vec::new(),
         intelligence: IntelConfig {
-            uri: format!("unix:{}", sock.display()),
+            uri: intel_url.to_string(),
             token: None,
             model: Some("m".into()),
         },
@@ -96,15 +97,15 @@ fn drain_until(
 #[test]
 fn continue_route_spawns_once_then_injects_into_the_same_session() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock);
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&sock);
     let log = logger();
     let mut reg = WarmRegistry::default();
     let deadline = Instant::now() + Duration::from_secs(20);
 
     // First event → spawns the warm session.
     let spawned = reg
-        .deliver(Path::new(exe()), "s1", payload(&sock), "first event", &log)
+        .deliver(Path::new(exe()), "s1", payload(&intel), "first event", &log)
         .expect("deliver 1");
     assert!(spawned, "the first delivery should spawn a warm session");
     assert_eq!(reg.len(), 1);
@@ -114,7 +115,7 @@ fn continue_route_spawns_once_then_injects_into_the_same_session() {
 
     // Second event on the same route → injected into the SAME live session.
     let spawned2 = reg
-        .deliver(Path::new(exe()), "s1", payload(&sock), "second event", &log)
+        .deliver(Path::new(exe()), "s1", payload(&intel), "second event", &log)
         .expect("deliver 2");
     assert!(
         !spawned2,

@@ -80,7 +80,7 @@ fn poll_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
 
 /// Start the mock LLM in its `slow` script (holds each response ~5s), waiting
 /// until it binds the socket.
-fn start_slow_llm(socket: &Path) -> Child {
+fn start_slow_llm(socket: &Path) -> (Child, String) {
     let c = Command::new(exe())
         .args(["--internal-mock-llm", socket.to_str().unwrap(), "slow"])
         .stdout(Stdio::null())
@@ -89,18 +89,17 @@ fn start_slow_llm(socket: &Path) -> Child {
         .expect("spawn slow mock-llm");
     assert!(
         poll_until(Duration::from_secs(3), || socket.exists()),
-        "mock-llm never bound"
+        "mock-llm never announced"
     );
-    c
+    let addr = std::fs::read_to_string(socket).expect("read mock-llm addr-file");
+    (c, format!("http://{}", addr.trim()))
 }
 
 #[test]
 fn killing_the_supervisor_collapses_the_subagent_no_orphan() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_slow_llm(&sock);
-
-    let intel = format!("unix:{}", sock.display());
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_slow_llm(&sock);
     // once-mode: the root subagent connects intelligence and then blocks ~5s
     // reading the slow model response — alive and supervised the whole time.
     let mut sup = Command::new(exe())
@@ -159,10 +158,8 @@ fn a_wedged_subagent_is_detected_stuck_and_force_killed_within_budget() {
     // model call; SIGSTOP then freezes its control thread too, so it stops
     // answering pings — the genuine "wedged, not busy" condition.
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_slow_llm(&sock);
-
-    let intel = format!("unix:{}", sock.display());
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_slow_llm(&sock);
     let mut sup = Command::new(exe())
         .args([
             "--mode",

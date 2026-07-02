@@ -44,3 +44,15 @@ pub mod wire; // MCP + intelligence wire types // sigaction + self-pipe; SIGTERM
 
 /// Crate version, surfaced in logs (`agentd_build_info`) and `--version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Announce a bound loopback listener's address through `addr_file` — the
+/// discovery handshake for the built-in test mocks (`--internal-mock-llm`,
+/// `--internal-mock-mcp-http`): the harness passes a fresh path, waits for the
+/// file to exist, then reads `host:port` from it. Written atomically (tmp +
+/// rename) so a waiter never observes a half-written address.
+pub fn announce_addr(addr_file: &str, listener: &std::net::TcpListener) -> std::io::Result<()> {
+    let addr = listener.local_addr()?;
+    let tmp = format!("{addr_file}.tmp");
+    std::fs::write(&tmp, addr.to_string())?;
+    std::fs::rename(&tmp, addr_file)
+}

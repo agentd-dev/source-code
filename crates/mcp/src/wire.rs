@@ -28,10 +28,20 @@ pub mod method {
     pub const RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
     pub const RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
 
+    // Modern (2026-07-28+, stateless) methods.
+    /// Query a server's supported versions + capabilities + identity in one call
+    /// (the stateless replacement for the `initialize` capability exchange).
+    pub const SERVER_DISCOVER: &str = "server/discover";
+    /// Open the long-lived notification stream (its SSE response carries the
+    /// change notifications the client opted in to — the stateless replacement
+    /// for the removed GET SSE stream).
+    pub const SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
+
     // Notifications (no id, no response).
     pub const NOTIFY_RESOURCES_UPDATED: &str = "notifications/resources/updated";
     pub const NOTIFY_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
     pub const NOTIFY_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+    pub const NOTIFY_SUBSCRIPTIONS_ACK: &str = "notifications/subscriptions/acknowledged";
     pub const NOTIFY_CANCELLED: &str = "notifications/cancelled";
     pub const NOTIFY_PROGRESS: &str = "notifications/progress";
     pub const NOTIFY_MESSAGE: &str = "notifications/message";
@@ -73,6 +83,29 @@ pub struct InitializeResult {
     pub server_info: Option<Implementation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+}
+
+/// Result of `server/discover` (modern era): the server's supported protocol
+/// versions, capabilities, and identity in a single call — the stateless
+/// replacement for the legacy `initialize` capability exchange. `resultType` and
+/// the caching fields (`ttlMs`/`cacheScope`) are carried for forward-compat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_type: Option<String>,
+    #[serde(default)]
+    pub supported_versions: Vec<String>,
+    #[serde(default)]
+    pub capabilities: ServerCapabilities,
+    #[serde(default)]
+    pub server_info: Option<Implementation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 }
 
 /// What a server says it can do. We gate every call on these (RFC 0004

@@ -106,7 +106,10 @@ impl McpEndpoint {
 pub enum HttpError {
     Connect(io::Error),
     Http(io::Error),
-    Status(u16),
+    /// A non-2xx HTTP status, with the (capped) response body — carried so the
+    /// caller can classify a modern JSON-RPC error (era detection, `-32022`
+    /// version retry) from the body rather than just the status code.
+    Status(u16, Vec<u8>),
     /// The build lacks the feature this endpoint needs (e.g. `vsock`).
     Unsupported(String),
     /// No JSON-RPC response matched the request id before the stream ended.
@@ -118,7 +121,7 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::Connect(e) => write!(f, "mcp-http: connect: {e}"),
             HttpError::Http(e) => write!(f, "mcp-http: {e}"),
-            HttpError::Status(s) => write!(f, "mcp-http: server returned HTTP {s}"),
+            HttpError::Status(s, _) => write!(f, "mcp-http: server returned HTTP {s}"),
             HttpError::Unsupported(m) => write!(f, "mcp-http: {m}"),
             HttpError::NoResponse => write!(f, "mcp-http: no JSON-RPC response before stream end"),
         }
@@ -237,6 +240,7 @@ impl HttpTransport {
         request_id: Option<i64>,
         body: &[u8],
         timeout: Duration,
+        extra_headers: &[(&str, &str)],
         mut on_notification: F,
     ) -> Result<Option<Value>, HttpError> {
         let mut stream = self.connect(timeout)?;
@@ -258,6 +262,11 @@ impl HttpTransport {
         if let Some(v) = &protocol {
             headers.push(("MCP-Protocol-Version", v));
         }
+        // Caller-supplied per-request headers (the modern era's Mcp-Method /
+        // Mcp-Name routing headers).
+        for (k, v) in extra_headers {
+            headers.push((k, v));
+        }
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
@@ -277,7 +286,10 @@ impl HttpTransport {
             *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
         if !resp.is_success() {
-            return Err(HttpError::Status(resp.status));
+            // Capture the body so the caller can classify a modern JSON-RPC error.
+            let status = resp.status;
+            let body = resp.into_body().unwrap_or_default();
+            return Err(HttpError::Status(status, body));
         }
 
         // A notification POST is acknowledged with an empty body (often 202).
@@ -337,7 +349,9 @@ impl HttpTransport {
         )
         .map_err(HttpError::Http)?;
         if !resp.is_success() {
-            return Err(HttpError::Status(resp.status));
+            let status = resp.status;
+            let body = resp.into_body().unwrap_or_default();
+            return Err(HttpError::Status(status, body));
         }
         if !resp.is_event_stream() {
             return Err(HttpError::Unsupported(

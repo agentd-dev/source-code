@@ -142,6 +142,16 @@ pub fn best_mutual_version(server_supported: &[String]) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+/// Is `code` a JSON-RPC error code only a **modern** server emits? Used for era
+/// detection (versioning §backward-compatibility): a `-32022`
+/// (UnsupportedProtocolVersion) or `-32020` (HeaderMismatch) in the body of a
+/// failed modern probe identifies a modern server, so the client retries rather
+/// than falling back to `initialize`. Generic codes (e.g. `-32601` method-not-
+/// found) are ambiguous across eras and are NOT modern-defining.
+pub fn is_modern_error_code(code: i64) -> bool {
+    code == UNSUPPORTED_PROTOCOL_VERSION_CODE || code == HEADER_MISMATCH_CODE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +211,16 @@ mod tests {
         // No overlap at all.
         let supported = vec!["1900-01-01".to_string()];
         assert_eq!(best_mutual_version(&supported), None);
+    }
+
+    #[test]
+    fn modern_error_codes_are_recognized() {
+        assert!(is_modern_error_code(UNSUPPORTED_PROTOCOL_VERSION_CODE));
+        assert!(is_modern_error_code(HEADER_MISMATCH_CODE));
+        // Generic JSON-RPC codes are ambiguous across eras, not modern-defining.
+        assert!(!is_modern_error_code(-32601)); // method not found
+        assert!(!is_modern_error_code(-32602)); // invalid params
+        assert!(!is_modern_error_code(-32000));
     }
 
     #[test]

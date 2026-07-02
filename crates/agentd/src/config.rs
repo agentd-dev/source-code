@@ -1534,11 +1534,17 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         // A pinned workflow run (`--mode workflow`) carries its instructions in the
         // graph nodes, so it needs no top-level `--instruction` — and neither does
-        // a reactive WORKFLOW daemon (`--mode reactive --workflow`, whose reactions
-        // are the workflow's own suspend/resume steps).
+        // a PURE reactive WORKFLOW daemon (`--mode reactive --workflow` with no
+        // subscription routes: its only reactions are the workflow's own
+        // suspend/resume steps). A daemon that ALSO has --subscribe/--continue
+        // routes spawns instruction reactions, so those still require one — an
+        // empty-instruction reaction would hand the model a blank task.
         #[cfg(feature = "workflow")]
         let needs_instruction = self.mode != Mode::Workflow
-            && !(self.mode == Mode::Reactive && self.workflow_file.is_some());
+            && !(self.mode == Mode::Reactive
+                && self.workflow_file.is_some()
+                && self.subscribe.is_empty()
+                && self.continue_subscribe.is_empty());
         #[cfg(not(feature = "workflow"))]
         let needs_instruction = true;
         if needs_instruction
@@ -1687,6 +1693,26 @@ impl Config {
                 return Err(usage(
                     "--workflow is only valid with --mode workflow or --mode reactive".into(),
                 ));
+            }
+            // A reactive WORKFLOW daemon is a single-instance shape: its wait uris
+            // are its OWN dependencies, not a partitioned work stream. `--shard`
+            // would silently drop out-of-shard wait updates at notification intake
+            // (the workflow would limp along on timeouts), and standby/assignment
+            // is a different operating identity — both are wiring mistakes, so
+            // they exit 2 like every other incoherent combo.
+            if self.mode == Mode::Reactive && self.workflow_file.is_some() {
+                if self.shard.n > 1 {
+                    return Err(usage(
+                        "--shard cannot be combined with a reactive --workflow (the workflow's                          wait updates would be shard-filtered; run one unsharded instance)"
+                            .into(),
+                    ));
+                }
+                if self.standby || self.assign_from.is_some() {
+                    return Err(usage(
+                        "--standby / --assign-from cannot be combined with a reactive --workflow                          (assignment-driven and workflow-driven daemons are different shapes)"
+                            .into(),
+                    ));
+                }
             }
         }
         // The per-run limits do nothing without a cgroup to apply them to, so a
@@ -2658,6 +2684,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("--workflow is only valid"), "{e}");
+    }
+
+    #[cfg(all(feature = "workflow", feature = "cluster"))]
+    #[test]
+    fn a_reactive_workflow_rejects_cluster_partitioning_combos() {
+        // --shard would silently filter the workflow's own wait updates.
+        let e = Config::load(
+            &args(&["--mode", "reactive", "--workflow", "/tmp/wf.json", "--shard", "1/4"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("--shard cannot be combined"), "{e}");
+        // standby/assignment is a different daemon identity.
+        let e = Config::load(
+            &args(&["--mode", "reactive", "--workflow", "/tmp/wf.json", "--standby"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("--standby / --assign-from cannot"), "{e}");
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_reactive_workflow_with_subscriptions_still_requires_an_instruction() {
+        // Subscription routes spawn instruction reactions — a blank task is a
+        // wiring mistake even when a workflow also rides the daemon.
+        let intel_only = vec![(
+            "AGENTD_INTELLIGENCE".to_string(),
+            "https://intel.example".to_string(),
+        )];
+        let e = Config::load(
+            &args(&[
+                "--mode", "reactive", "--workflow", "/tmp/wf.json",
+                "--subscribe", "file:///inbox",
+            ]),
+            &intel_only,
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("missing instruction"), "{e}");
+        // A PURE workflow daemon (no routes) still needs none.
+        let c = Config::load(
+            &args(&["--mode", "reactive", "--workflow", "/tmp/wf.json"]),
+            &intel_only,
+        )
+        .unwrap();
+        assert!(c.instruction.as_deref().unwrap_or("").is_empty());
+        // With an instruction the combo is fine.
+        let c = Config::load(
+            &args(&[
+                "--mode", "reactive", "--workflow", "/tmp/wf.json",
+                "--subscribe", "file:///inbox", "--instruction", "triage it",
+            ]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.subscribe.len(), 1);
+        assert!(c.workflow_file.is_some());
     }
 
     #[cfg(feature = "workflow")]

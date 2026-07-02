@@ -340,7 +340,13 @@ pub enum Node {
     /// downstream `Tool.args`/`Branch` predicates get exactly the shape they need.
     /// Emits `ok`/`error` (error only on an unresolvable reference).
     Assign {
+        #[serde(default)]
         value: Value,
+        /// COMPUTED alternative to `value` (feature `cel`): a CEL expression
+        /// over the blackboard — filter/map/aggregate/assemble without a model
+        /// call or a tool round-trip. Exactly one of `value`/`expr`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expr: Option<String>,
         writes: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
@@ -357,6 +363,12 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reads: Vec<String>,
         schema: BTreeMap<String, FieldType>,
+        /// A CEL VALUE constraint over the answer (feature `cel`): the answer's
+        /// fields are top-level identifiers (e.g. `score >= 0.0 && score <= 1.0`).
+        /// A type-correct answer failing the check is re-asked with the
+        /// constraint named, like a schema miss.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
         /// Validation-feedback re-asks (default 1, capped at [`MAX_INFER_RETRIES`]).
@@ -563,6 +575,13 @@ pub enum Pred {
         pointer: String,
         value: Value,
     },
+    /// A CEL expression over the blackboard (feature `cel`): every blackboard
+    /// key is a top-level identifier — arithmetic, string functions, and
+    /// collection macros (`exists`/`filter`/`map`) the structural ops can't
+    /// express. Must return a BOOL; a non-bool result, an eval error, or an
+    /// unresolvable reference is `false` (fail-closed). Compile-checked at
+    /// define time; a build without the feature REJECTS it there.
+    Cel { expr: String },
     /// Every sub-predicate holds.
     All { preds: Vec<Pred> },
     /// Any sub-predicate holds.
@@ -655,6 +674,9 @@ impl Pred {
                     _ => false,
                 }
             }
+            Pred::Cel { expr } => {
+                crate::cel::eval_bool(expr, &crate::cel::vars_of(blackboard)).unwrap_or(false)
+            }
             Pred::All { preds } => preds.iter().all(|p| p.eval(blackboard)),
             Pred::Any { preds } => preds.iter().any(|p| p.eval(blackboard)),
             Pred::Not { pred } => !pred.eval(blackboard),
@@ -674,6 +696,9 @@ impl Pred {
             Pred::Len { min: Some(lo), max: Some(hi), .. } if lo > hi => {
                 Some(format!("`len` bounds are inverted (min {lo} > max {hi})"))
             }
+            Pred::Cel { expr } => crate::cel::compile_check(expr)
+                .err()
+                .map(|e| format!("`cel` predicate: {e}")),
             Pred::All { preds } | Pred::Any { preds } => {
                 preds.iter().find_map(|p| p.check())
             }
@@ -853,10 +878,30 @@ impl Graph {
                         errs.push(format!("Wait node {id:?} has an empty on_uri"));
                     }
                 }
-                Node::Assign { writes, .. } if writes.trim().is_empty() => {
-                    errs.push(format!("Assign node {id:?} has an empty writes key"));
+                Node::Assign { writes, value, expr, .. } => {
+                    if writes.trim().is_empty() {
+                        errs.push(format!("Assign node {id:?} has an empty writes key"));
+                    }
+                    match expr {
+                        Some(e) => {
+                            if !value.is_null() {
+                                errs.push(format!(
+                                    "Assign node {id:?} has both value and expr (choose one)"
+                                ));
+                            }
+                            if let Err(m) = crate::cel::compile_check(e) {
+                                errs.push(format!("Assign node {id:?} expr: {m}"));
+                            }
+                        }
+                        None if value.is_null() => {
+                            errs.push(format!(
+                                "Assign node {id:?} needs a value or (cel builds) an expr"
+                            ));
+                        }
+                        None => {}
+                    }
                 }
-                Node::Infer { schema, retries, .. } => {
+                Node::Infer { schema, retries, check, .. } => {
                     if schema.is_empty() {
                         errs.push(format!("Infer node {id:?} has an empty schema"));
                     }
@@ -864,6 +909,11 @@ impl Graph {
                         errs.push(format!(
                             "Infer node {id:?} retries must be <= {MAX_INFER_RETRIES} (got {retries})"
                         ));
+                    }
+                    if let Some(c) = check
+                        && let Err(m) = crate::cel::compile_check(c)
+                    {
+                        errs.push(format!("Infer node {id:?} check: {m}"));
                     }
                 }
                 Node::Branch { cases, .. } => {
@@ -1433,6 +1483,74 @@ mod tests {
         let errs = bad.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("parallel must be")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("unknown node \"ghost\"")), "{errs:?}");
+    }
+
+    #[cfg(feature = "cel")]
+    #[test]
+    fn cel_predicates_and_assign_exprs_evaluate_and_validate() {
+        let mut bb = BTreeMap::new();
+        bb.insert("scan".to_string(), json!({"items": [{"ok": true}, {"ok": false}]}));
+        bb.insert("limit".to_string(), json!(1));
+        let p: Pred = serde_json::from_value(
+            json!({"op": "cel", "expr": "scan.items.filter(i, i.ok).size() >= limit"}),
+        )
+        .unwrap();
+        assert!(p.eval(&bb));
+        // Non-bool / undeclared references are fail-closed false.
+        let p: Pred =
+            serde_json::from_value(json!({"op": "cel", "expr": "scan.items.size()"})).unwrap();
+        assert!(!p.eval(&bb));
+        let p: Pred = serde_json::from_value(json!({"op": "cel", "expr": "ghost > 1"})).unwrap();
+        assert!(!p.eval(&bb));
+        // A parse error is caught at DEFINE time via validation.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "b",
+            "nodes": {
+                "b": {"kind": "branch", "cases": [{"when": {"op": "cel", "expr": "a >=< 1"}, "goto": "h"}], "default": "h"},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("cel") && e.contains("parse")), "{errs:?}");
+        // Assign: value XOR expr, expr compile-checked.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "assign", "value": 1, "expr": "1 + 1", "writes": "x", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("both value and expr")), "{errs:?}");
+    }
+
+    #[cfg(all(feature = "workflow", not(feature = "cel")))]
+    #[test]
+    fn without_the_cel_feature_cel_surfaces_are_rejected_at_define_time() {
+        // A cel predicate parses on the wire but validation names the feature.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "b",
+            "nodes": {
+                "b": {"kind": "branch", "cases": [{"when": {"op": "cel", "expr": "a > 1"}, "goto": "h"}], "default": "h"},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("'cel' build feature")), "{errs:?}");
+        // And an assign expr likewise.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "assign", "expr": "1 + 1", "writes": "x", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("'cel' build feature")), "{errs:?}");
     }
 
     #[test]

@@ -647,8 +647,15 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             }
             // Pure data shaping: resolve the value template against the blackboard.
             // No model, no tool — deterministic and cheap.
-            Node::Assign { value, writes, edges } => {
-                let (val, is_err) = match super::resolve_refs(value, &state.blackboard) {
+            Node::Assign { value, expr, writes, edges } => {
+                let computed = match expr {
+                    // Computed path (feature `cel`): the blackboard's keys are the
+                    // expression's identifiers — filter/map/aggregate/assemble
+                    // deterministically, zero model tokens.
+                    Some(e) => crate::cel::eval_value(e, &crate::cel::vars_of(&state.blackboard)),
+                    None => super::resolve_refs(value, &state.blackboard),
+                };
+                let (val, is_err) = match computed {
                     Ok(v) => clamp_value(v, false),
                     Err(e) => (Value::String(format!("assign error: {e}")), true),
                 };
@@ -658,14 +665,16 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // One structured intelligence ask, schema-checked, with bounded
             // validation-feedback re-asks INSIDE the attempt (≤ MAX_INFER_RETRIES,
             // cheap) and the generic in-node retry policy around it.
-            Node::Infer { prompt, reads, schema, writes, retries, retry, edges } => {
+            Node::Infer { prompt, reads, schema, check, writes, retries, retry, edges } => {
                 let GraphState { blackboard, budget, .. } = state;
                 let attempt = with_retry(retry.as_ref(), budget, || {
                     let mut feedback: Option<String> = None;
                     for _ in 0..=*retries {
                         match exec.infer(prompt, blackboard, reads, schema, feedback.as_deref()) {
                             Err(e) => return (Value::String(format!("infer error: {e}")), true),
-                            Ok(v) => match super::check_schema(schema, &v) {
+                            Ok(v) => match super::check_schema(schema, &v)
+                                .and_then(|()| infer_check(check.as_deref(), &v))
+                            {
                                 Ok(()) => return (v, false),
                                 Err(e) => feedback = Some(e),
                             },
@@ -845,6 +854,22 @@ fn kind_of(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+/// Run an `Infer` node's optional CEL VALUE constraint over the (schema-valid)
+/// answer object: its fields become the expression's identifiers. A violation —
+/// or an eval error — reads like a schema miss, so the same re-ask loop carries
+/// it back to the model with the constraint named.
+fn infer_check(check: Option<&str>, answer: &Value) -> Result<(), String> {
+    let Some(expr) = check else { return Ok(()) };
+    let obj = answer.as_object().expect("schema-checked answers are objects");
+    let fields: BTreeMap<String, Value> =
+        obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    match crate::cel::eval_bool(expr, &crate::cel::vars_of(&fields)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("the answer failed the check: {expr}")),
+        Err(e) => Err(format!("the answer failed the check ({e}): {expr}")),
     }
 }
 
@@ -1991,6 +2016,63 @@ mod tests {
             out.reason.as_deref().unwrap().contains("foreach"),
             "{:?}",
             out.reason
+        );
+    }
+
+    #[cfg(feature = "cel")]
+    #[test]
+    fn a_computed_assign_shapes_data_with_zero_model_calls() {
+        // scan (tool) → pick (assign expr: filter+map) → done. Deterministic
+        // aggregation that previously needed an infer node (model tokens).
+        let g: Graph = serde_json::from_value(json!({
+            "start": "scan",
+            "nodes": {
+                "scan": {"kind": "tool", "server": "q", "tool": "scan", "writes": "scan", "edges": {"ok": "pick", "error": "fail"}},
+                "pick": {"kind": "assign", "expr": "{'ids': scan.items.filter(i, i.ok).map(i, i.id), 'total': scan.items.size()}", "writes": "picked", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "picked"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "picked"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.tools.insert(
+            "q.scan".into(),
+            (json!({"items": [{"id": 1, "ok": true}, {"id": 2, "ok": false}, {"id": 3, "ok": true}]}), false),
+        );
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.result);
+        assert_eq!(out.result, json!({"ids": [1, 3], "total": 3}));
+        assert!(
+            !exec.calls.iter().any(|c| c.starts_with("agent:") || c.starts_with("infer:")),
+            "no model involvement: {:?}",
+            exec.calls
+        );
+    }
+
+    #[cfg(feature = "cel")]
+    #[test]
+    fn an_infer_check_reasks_a_type_correct_but_out_of_bounds_answer() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "c",
+            "nodes": {
+                "c": {"kind": "infer", "prompt": "score it", "schema": {"score": "number"}, "check": "score >= 0.0 && score <= 1.0", "retries": 2, "writes": "s", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "s"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.infers.push_back(Ok(json!({"score": 7.5}))); // type-correct, out of bounds
+        exec.infers.push_back(Ok(json!({"score": 0.75})));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(out.result, json!({"score": 0.75}));
+        assert!(
+            exec.infer_feedbacks[1].as_deref().unwrap().contains("failed the check"),
+            "{:?}",
+            exec.infer_feedbacks[1]
         );
     }
 

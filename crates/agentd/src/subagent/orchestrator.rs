@@ -1206,7 +1206,8 @@ fn await_resource_tool_def() -> ToolDef {
 /// `workflow.define` (pivot Phase 7) — author + store a workflow for `workflow.run`.
 #[cfg(feature = "workflow")]
 fn workflow_define_tool_def() -> ToolDef {
-    ToolDef {
+    #[allow(unused_mut)]
+    let mut def = ToolDef {
         name: "workflow.define".into(),
         description: "Define a workflow: a graph of nodes connected by labelled edges — cycles and \
             conditional branches allowed — that agentd drives to process work items by itself. \
@@ -1234,7 +1235,18 @@ fn workflow_define_tool_def() -> ToolDef {
             },
             "required": ["workflow"]
         }),
+    };
+    // CEL builds add expression power the model should know about.
+    #[cfg(feature = "cel")]
+    {
+        def.description.push_str(
+            " This build supports CEL: branch predicates may be {\"op\":\"cel\",\"expr\":\"...\"} \
+             (blackboard keys are identifiers; arithmetic, string functions, exists/filter/map \
+             macros), assign nodes may compute with \"expr\" instead of \"value\", and infer \
+             nodes accept a \"check\" value constraint over the answer's fields.",
+        );
     }
+    def
 }
 
 /// `workflow.run` (pivot Phase 7 · P6) — drive a workflow the agent defined to completion.

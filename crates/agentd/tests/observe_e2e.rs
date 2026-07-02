@@ -132,6 +132,43 @@ fn once_mode_runs_a_tool_call_react_cycle() {
 }
 
 #[test]
+fn once_mode_documents_dropped_deferred_effects() {
+    // A one-shot run whose model calls the `schedule` deferred-effect self-tool has
+    // no reactor to arm the wake — so the effect is DROPPED, but LOUDLY (pivot Phase
+    // 5.2 acceptance): the run still completes 0, and both the telemetry and stderr
+    // say the deferred effect needs a daemon mode. This is the "document the drop"
+    // contract for schedule/subscribe/await_resource under `--mode once`.
+    let dir = tempfile::tempdir().unwrap();
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "schedule");
+
+    let (code, _stdout, stderr) = run_once(&[
+        "--mode",
+        "once",
+        "--instruction",
+        "schedule a follow-up",
+        "--intelligence",
+        &intel,
+        "--log-level",
+        "info",
+    ]);
+
+    sigterm(llm.id());
+    let _ = llm.wait();
+
+    assert_eq!(code, 0, "one-shot still completes 0; stderr:\n{stderr}");
+    // The documented drop: a telemetry event + a human-readable stderr notice.
+    assert!(
+        stderr.contains(r#""event":"once.deferred_effects_dropped""#),
+        "no dropped-effects telemetry event:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("daemon mode"),
+        "no human-readable drop notice on stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn reactive_self_scheduling_fires_a_wake() {
     // A reaction's model calls the `schedule` self-tool; the daemon arms the wake
     // and fires it ~1s later — a self-sustaining agent, observed end to end.

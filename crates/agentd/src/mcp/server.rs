@@ -1403,23 +1403,20 @@ fn dispatch(
         return resp;
     }
     match req.method.as_str() {
-        // The work tools are listed to every peer; the operator tools
-        // (drain/lame-duck/cancel) only to a `Management` peer (RFC 0015 §3.4) —
-        // a stdio-spawned subagent must never see, much less call, them.
+        // The self/control task tools (status + subagent.*) — the same on every
+        // origin. Operator control is NOT a tool: it is the A2A admin method
+        // family (pivot Phase 4), reached over the authenticated A2A surface.
         "tools/list" => {
-            let mut tools = vec![
+            let tools = vec![
                 status_tool_def(),
                 spawn_tool_def(),
                 send_tool_def(),
                 session_status_tool_def(),
                 session_cancel_tool_def(),
             ];
-            if origin == PeerOrigin::Management {
-                tools.extend(operator_tool_defs());
-            }
             Response::ok(req.id, json!({ "tools": tools }))
         }
-        "tools/call" => tools_call(req, ctx, origin, log),
+        "tools/call" => tools_call(req, ctx, log),
         "resources/list" => Response::ok(req.id, json!({"resources": resource_list(ctx, origin)})),
         "resources/read" => resources_read(req, ctx, origin),
         "resources/subscribe" => subscribe_resource(req, ctx, origin, writer, conn),
@@ -1971,49 +1968,17 @@ fn events_read(
     }
 }
 
-fn tools_call(req: Request, ctx: &ServeCtx, origin: PeerOrigin, log: &Logger) -> Response {
+fn tools_call(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
     let name = req
         .params
         .as_ref()
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    // The operator tools are gated by transport origin, not an in-band flag
-    // (RFC 0015 §3.4). A `Stdio` peer never reaches the operator arms — they
-    // fall through to the `-32601`-style unknown-tool error below, so a spawned
-    // subagent can neither see (tools/list) nor invoke (tools/call) them. Bare
-    // `match` arms with a `Management` guard keep the gate structural.
-    if origin == PeerOrigin::Management {
-        let args = || {
-            req.params
-                .as_ref()
-                .and_then(|p| p.get("arguments"))
-                .cloned()
-                .unwrap_or(json!({}))
-        };
-        match name {
-            "drain" => return handle_drain(req.id, ctx, &args(), log),
-            "lame-duck" => return handle_lame_duck(req.id, ctx, &args(), log),
-            "pause" => return handle_pause(req.id, ctx, log),
-            "resume" => return handle_resume(req.id, ctx, log),
-            "cancel" => return handle_cancel(req.id, ctx, &args(), log),
-            _ => {}
-        }
-    }
-    // A non-Management peer naming an operator tool: the tool is invisible on this
-    // transport (RFC 0015 §3.4 / ACC management-profile.json `gating`, SPEC L7).
-    // Reaching here with an operator-tool name implies a non-Management origin (a
-    // Management peer already returned above), so refuse with METHOD_NOT_FOUND
-    // (-32601) — NOT INVALID_PARAMS — so a stdio peer can't even confirm the
-    // operator surface exists. A genuinely-unknown tool name still falls through to
-    // the INVALID_PARAMS arm below (unchanged — scoped to the origin gate).
-    if crate::capabilities::OPERATOR_TOOLS.contains(&name) {
-        return Response::err(
-            req.id,
-            json::METHOD_NOT_FOUND,
-            format!("method not found: {name}"),
-        );
-    }
+    // Operator control (drain/lame-duck/pause/resume/cancel) is NOT a tool — it
+    // is unified into the A2A method family (pivot Phase 4: `a2a.Drain`, …), so an
+    // operator drives one control protocol over the authenticated A2A surface.
+    // A `tools/call` naming an operator verb is just an unknown tool here.
     match name {
         "status" => {
             let body = ctx.status_body();
@@ -2054,17 +2019,54 @@ fn tools_call(req: Request, ctx: &ServeCtx, origin: PeerOrigin, log: &Logger) ->
     }
 }
 
-/// The operator tool defs listed to a `Management` peer (RFC 0015 §4). The names
-/// MIRROR `capabilities::OPERATOR_TOOLS` — the manifest's `surfaces.operator_tools`
-/// and this `tools/list` set are the same const, so they cannot drift (§5.2).
-fn operator_tool_defs() -> Vec<Value> {
-    vec![
-        drain_tool_def(),
-        lame_duck_tool_def(),
-        pause_tool_def(),
-        resume_tool_def(),
-        cancel_tool_def(),
-    ]
+/// The unified operator/admin control surface over the **A2A method family**
+/// (pivot Phase 4 — operators drive ONE control protocol, `a2a.<Admin>`).
+/// Management-gated by the caller ([`crate::mcp::a2a::dispatch_a2a`], only reached
+/// for a `Management` peer). Maps an admin method to its handler; returns `None`
+/// if `method` is not an admin method (the a2a dispatcher then tries its task
+/// methods). The A2A result is the handler's structured body — the tool-result
+/// envelope is unwrapped, since these are A2A methods, not tools. Params ARE the
+/// args (no nested `arguments`), e.g. `a2a.Drain{deadline_ms}`,
+/// `a2a.LameDuck{ready}`, `a2a.Cancel{handle, reason}`.
+#[cfg(feature = "a2a")]
+pub(crate) fn dispatch_operator(
+    method: &str,
+    req: &Request,
+    ctx: &ServeCtx,
+    log: &Logger,
+) -> Option<Response> {
+    let id = req.id.clone();
+    let args = req.params.clone().unwrap_or_else(|| json!({}));
+    let resp = match method {
+        "a2a.Drain" => handle_drain(id, ctx, &args, log),
+        "a2a.LameDuck" => handle_lame_duck(id, ctx, &args, log),
+        "a2a.Pause" => handle_pause(id, ctx, log),
+        "a2a.Resume" => handle_resume(id, ctx, log),
+        "a2a.Cancel" => handle_cancel(id, ctx, &args, log),
+        _ => return None,
+    };
+    Some(admin_result(resp))
+}
+
+/// Unwrap the tool-result envelope (`content`/`structuredContent`/`isError`) the
+/// operator handlers return into a clean A2A result: the structured body on
+/// success, or a JSON-RPC error carrying the handler's message on `isError`.
+#[cfg(feature = "a2a")]
+fn admin_result(resp: Response) -> Response {
+    match &resp.result {
+        Some(r) if r.get("isError") == Some(&Value::Bool(true)) => {
+            let msg = r["content"][0]["text"]
+                .as_str()
+                .unwrap_or("operator control refused")
+                .to_string();
+            Response::err(resp.id, json::INVALID_PARAMS, msg)
+        }
+        Some(r) => {
+            let body = r.get("structuredContent").cloned().unwrap_or_else(|| json!({}));
+            Response::ok(resp.id, body)
+        }
+        None => resp,
+    }
 }
 
 /// `drain` (RFC 0015 §4.1) — trigger the SAME graceful-drain choreography
@@ -2072,7 +2074,7 @@ fn operator_tool_defs() -> Vec<Value> {
 /// return immediately with a snapshot. Idempotent/monotonic: a second `drain`
 /// (or a SIGTERM after this) re-reports; it never escalates to the second-signal
 /// FORCE path. `deadline_ms` is accepted and clamped to the configured drain
-/// timeout (never above it, so a tool call can't push drain past the pod grace,
+/// timeout (never above it, so an admin call can't push drain past the pod grace,
 /// RFC 0015 §8) — the latch itself carries no deadline, so the clamp only shapes
 /// the reported `eta_ms`.
 fn handle_drain(id: Id, ctx: &ServeCtx, args: &Value, log: &Logger) -> Response {
@@ -2971,86 +2973,6 @@ fn session_cancel_tool_def() -> Value {
     })
 }
 
-fn drain_tool_def() -> Value {
-    json!({
-        "name": "drain",
-        "description": "Begin a graceful drain of this instance — identical to a SIGTERM: flip \
-            readiness to NotReady, stop accepting new work, wind down in-flight subagents at turn \
-            boundaries, then exit 0. Returns IMMEDIATELY with a snapshot (it does not block until \
-            exit). Idempotent: a second call re-reports. Management transport only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "deadline_ms": {"type": "integer", "description": "optional drain budget; clamped to the configured drain timeout"}
-            },
-            "additionalProperties": false
-        }
-    })
-}
-
-fn lame_duck_tool_def() -> Value {
-    json!({
-        "name": "lame-duck",
-        "description": "Flip /readyz to NotReady WITHOUT draining or exiting (the rolling-update \
-            primitive): the instance keeps running and serving in-flight work but advertises \
-            'don't send me new work'. Reversible: ready=true clears the override (readiness then \
-            reflects the genuine computed state). Management transport only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ready": {"type": "boolean", "default": false, "description": "false ⇒ NotReady (default); true ⇒ clear the override"}
-            },
-            "additionalProperties": false
-        }
-    })
-}
-
-fn pause_tool_def() -> Value {
-    json!({
-        "name": "pause",
-        "description": "Suspend the whole agentic tree at turn boundaries (RFC 0015 §4.3): every \
-            in-flight root subagent finishes its current turn, then waits. NOT a drain and NOT a \
-            lame-duck — the tree freezes but stays intact, readiness is unchanged, the instance \
-            keeps answering ping / serving management / bumping liveness. Reversible with resume. \
-            Useful for live debugging or holding a tree while the model service is swapped. \
-            Management transport only.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": false
-        }
-    })
-}
-
-fn resume_tool_def() -> Value {
-    json!({
-        "name": "resume",
-        "description": "Clear a prior pause (RFC 0015 §4.3): every paused root subagent continues \
-            at its next turn. Management transport only.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": false
-        }
-    })
-}
-
-fn cancel_tool_def() -> Value {
-    json!({
-        "name": "cancel",
-        "description": "Cancel a run or subtree in THIS instance by handle (the management-transport, \
-            instance-scoped wrapper over subagent.cancel) — kills the work, keeps the pod (unlike \
-            drain, which also exits). handle \"0\" or OMITTED targets the root subtree (the whole \
-            run): every live subtree is cancelled. An unknown handle is reported as an error result, \
-            not a failure. Management transport only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "handle": {"type": "string", "description": "the run/subtree handle to cancel; \"0\" or omitted = the whole run (root subtree)"},
-                "reason": {"type": "string", "description": "surfaced in logs + ctrl/cancel"}
-            },
-            "additionalProperties": false
-        }
-    })
-}
 
 #[cfg(all(test, feature = "serve-https"))]
 mod https_auth_tests {
@@ -4072,87 +3994,67 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
-    fn management_peer_sees_operator_tools_stdio_does_not() {
-        let mgmt = dispatch(
-            req("tools/list", None),
-            &ctx(),
-            PeerOrigin::Management,
-            &writer(),
-            0,
-            &log(),
-        );
-        let names = tool_names(&mgmt);
-        for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
-            assert!(
-                names.contains(&t.to_string()),
-                "management sees {t}: {names:?}"
-            );
+    fn operator_control_is_not_listed_as_tools_on_any_origin() {
+        // Pivot Phase 4: operator control is the A2A admin method family
+        // (`a2a.Drain`/`a2a.LameDuck`/…), NOT a tool. So no operator surface
+        // appears in `tools/list` — on either origin — and `OPERATOR_TOOLS`
+        // now names A2A methods, none of which is a tool.
+        for origin in [PeerOrigin::Management, PeerOrigin::Stdio] {
+            let listed = dispatch(req("tools/list", None), &ctx(), origin, &writer(), 0, &log());
+            let names = tool_names(&listed);
+            for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
+                assert!(
+                    !names.contains(&t.to_string()),
+                    "{origin:?} must not see operator tool {t}: {names:?}"
+                );
+            }
+            // The manifest's operator entries are A2A method names now — never tools.
+            for m in crate::capabilities::OPERATOR_TOOLS {
+                assert!(
+                    !names.contains(&m.to_string()),
+                    "operator method {m} must not be a tool: {names:?}"
+                );
+            }
+            // …but the self/work tools ARE present on every origin.
+            assert!(names.contains(&"status".to_string()));
+            assert!(names.contains(&"subagent.spawn".to_string()));
         }
-        // The operator-tool set matches the manifest's authoritative list (§5.2).
-        for t in crate::capabilities::OPERATOR_TOOLS {
-            assert!(names.contains(&t.to_string()), "manifest tool {t} listed");
-        }
-        // pause/resume are PRESENT now (RFC 0015 §4.3 — shipped).
-        assert!(names.contains(&"pause".to_string()), "pause is listed");
-        assert!(names.contains(&"resume".to_string()), "resume is listed");
-
-        let stdio = dispatch(
-            req("tools/list", None),
-            &ctx(),
-            PeerOrigin::Stdio,
-            &writer(),
-            0,
-            &log(),
-        );
-        let names = tool_names(&stdio);
-        // No operator tool — INCLUDING pause/resume — is visible to a stdio peer
-        // (a spawned subagent must not pause/drain its supervisor, RFC 0015 §3.4).
-        for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
-            assert!(
-                !names.contains(&t.to_string()),
-                "stdio must NOT see {t}: {names:?}"
-            );
-        }
-        // …but the work tools are still there for a stdio peer.
-        assert!(names.contains(&"status".to_string()));
-        assert!(names.contains(&"subagent.spawn".to_string()));
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
-    fn stdio_call_of_an_operator_tool_is_refused() {
-        // A stdio peer can't even call drain — it falls through to unknown-tool
-        // (JSON-RPC error), so it can neither see nor invoke the operator surface.
-        // (DRAINING is a one-way process-global latch another test may have set;
-        // assert the refused call doesn't CHANGE it rather than asserting absolute.)
+    fn stdio_call_of_an_operator_method_is_refused() {
+        // A stdio peer can't drive operator control: the `a2a.*` dispatch arm is
+        // Management-gated, so a stdio `a2a.Drain` falls through to the catch-all
+        // (-32601), invisible AND uninvokable. (DRAINING is a one-way process-global
+        // latch another test may have set; assert the refused call doesn't CHANGE it
+        // rather than asserting an absolute.)
         let before = crate::signals::draining();
         let r = dispatch(
-            req("tools/call", Some(json!({"name": "drain"}))),
+            req("a2a.Drain", None),
             &ctx(),
             PeerOrigin::Stdio,
             &writer(),
             0,
             &log(),
         );
-        // ACC SPEC L7 / management-profile.json gating: a non-Management caller of
-        // an operator tool gets METHOD_NOT_FOUND (-32601), not INVALID_PARAMS.
+        // A non-Management caller of an admin method gets METHOD_NOT_FOUND (-32601).
         assert_eq!(
-            r.error.as_ref().expect("stdio drain → JSON-RPC error").code,
+            r.error.as_ref().expect("stdio a2a.Drain → JSON-RPC error").code,
             json::METHOD_NOT_FOUND,
-            "stdio drain → -32601 METHOD_NOT_FOUND"
+            "stdio a2a.Drain → -32601 METHOD_NOT_FOUND"
         );
         assert_eq!(
             crate::signals::draining(),
             before,
             "a refused stdio drain must not change the latch"
         );
-        // lame-duck and cancel are equally invisible to stdio — same -32601 gate.
-        for tool in ["lame-duck", "cancel"] {
+        // a2a.LameDuck and a2a.Cancel are equally out of reach for stdio — same gate.
+        for method in ["a2a.LameDuck", "a2a.Cancel"] {
             let r = dispatch(
-                req(
-                    "tools/call",
-                    Some(json!({"name": tool, "arguments": {"handle": "0"}})),
-                ),
+                req(method, Some(json!({"handle": "0"}))),
                 &ctx(),
                 PeerOrigin::Stdio,
                 &writer(),
@@ -4160,20 +4062,21 @@ mod tests {
                 &log(),
             );
             assert_eq!(
-                r.error.as_ref().expect("stdio op tool → error").code,
+                r.error.as_ref().expect("stdio admin method → error").code,
                 json::METHOD_NOT_FOUND,
-                "stdio {tool} → -32601 METHOD_NOT_FOUND"
+                "stdio {method} → -32601 METHOD_NOT_FOUND"
             );
         }
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn drain_latches_draining_and_returns_a_snapshot_idempotently() {
         let _g = crate::signals::test_guard();
         let ctx = ctx();
         let call = || {
             dispatch(
-                req("tools/call", Some(json!({"name": "drain"}))),
+                req("a2a.Drain", None),
                 &ctx,
                 PeerOrigin::Management,
                 &writer(),
@@ -4181,9 +4084,9 @@ mod tests {
                 &log(),
             )
         };
-        let v = call().result.expect("drain ok");
-        assert_eq!(v["isError"], false);
-        let body = &v["structuredContent"];
+        // The admin methods return the structured body directly (the tool-result
+        // envelope is unwrapped — they are A2A methods, not tools).
+        let body = call().result.expect("drain ok");
         assert_eq!(body["draining"], true);
         assert!(body["in_flight"].is_u64());
         assert!(body["eta_ms"].is_u64());
@@ -4195,8 +4098,8 @@ mod tests {
             "drain set the global DRAINING latch"
         );
         // Idempotent/monotonic: a second drain re-reports, never escalates to FORCE.
-        let v2 = call().result.expect("second drain ok");
-        assert_eq!(v2["structuredContent"]["draining"], true);
+        let body2 = call().result.expect("second drain ok");
+        assert_eq!(body2["draining"], true);
         assert!(
             !crate::signals::force(),
             "drain never maps to the FORCE path"
@@ -4204,10 +4107,7 @@ mod tests {
 
         // deadline_ms is clamped to the configured drain timeout (5s here).
         let clamped = dispatch(
-            req(
-                "tools/call",
-                Some(json!({"name": "drain", "arguments": {"deadline_ms": 999_999}})),
-            ),
+            req("a2a.Drain", Some(json!({"deadline_ms": 999_999}))),
             &ctx,
             PeerOrigin::Management,
             &writer(),
@@ -4216,16 +4116,17 @@ mod tests {
         )
         .result
         .expect("ok");
-        assert_eq!(clamped["structuredContent"]["eta_ms"], json!(5000));
+        assert_eq!(clamped["eta_ms"], json!(5000));
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn lame_duck_flips_the_readiness_override_and_clears() {
         let _g = crate::signals::test_guard();
         let ctx = ctx();
         crate::signals::set_lame_duck(false); // clean baseline (process-global)
         let on = dispatch(
-            req("tools/call", Some(json!({"name": "lame-duck"}))),
+            req("a2a.LameDuck", None),
             &ctx,
             PeerOrigin::Management,
             &writer(),
@@ -4234,34 +4135,34 @@ mod tests {
         )
         .result
         .expect("ok");
-        assert_eq!(on["isError"], false);
-        assert_eq!(on["structuredContent"]["ready"], false);
+        assert_eq!(on["ready"], false);
         assert!(crate::signals::lame_duck(), "lame-duck override set");
         // ready:true clears the override — but only when no drain holds readiness
         // down. (DRAINING is a one-way process-global latch another test may have
         // set; guard so this stays order-independent.)
         let off = dispatch(
-            req(
-                "tools/call",
-                Some(json!({"name": "lame-duck", "arguments": {"ready": true}})),
-            ),
+            req("a2a.LameDuck", Some(json!({"ready": true}))),
             &ctx,
             PeerOrigin::Management,
             &writer(),
             0,
             &log(),
-        )
-        .result
-        .expect("ok");
+        );
         if crate::signals::draining() {
-            // §4.2: can't assert Ready over a draining supervisor → isError refusal.
-            assert_eq!(off["isError"], true);
+            // §4.2: can't assert Ready over a draining supervisor. The admin family
+            // reports a refusal as a JSON-RPC error (INVALID_PARAMS), not a result.
+            assert_eq!(
+                off.error.as_ref().expect("refusal is a protocol error").code,
+                json::INVALID_PARAMS,
+                "clearing lame-duck under drain → INVALID_PARAMS"
+            );
         } else {
-            assert_eq!(off["structuredContent"]["ready"], true);
+            assert_eq!(off.result.expect("ok")["ready"], true);
             assert!(!crate::signals::lame_duck(), "override cleared");
         }
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn pause_resume_fans_to_async_sessions_and_sets_the_flag() {
         let _g = crate::signals::test_guard();
@@ -4273,7 +4174,7 @@ mod tests {
         let one = Arc::clone(&ctx.sessions.lock().unwrap().get("served.0").unwrap().paused);
 
         let on = dispatch(
-            req("tools/call", Some(json!({"name": "pause"}))),
+            req("a2a.Pause", None),
             &ctx,
             PeerOrigin::Management,
             &writer(),
@@ -4282,10 +4183,9 @@ mod tests {
         )
         .result
         .expect("ok");
-        assert_eq!(on["isError"], false);
-        assert_eq!(on["structuredContent"]["paused"], true);
+        assert_eq!(on["paused"], true);
         // Two live async subtrees took the message.
-        assert_eq!(on["structuredContent"]["affected"], 2);
+        assert_eq!(on["affected"], 2);
         assert!(crate::signals::paused(), "instance-wide pause flag set");
         assert!(one.load(Ordering::Relaxed), "session pause channel flipped");
 
@@ -4302,7 +4202,7 @@ mod tests {
         );
 
         let off = dispatch(
-            req("tools/call", Some(json!({"name": "resume"}))),
+            req("a2a.Resume", None),
             &ctx,
             PeerOrigin::Management,
             &writer(),
@@ -4311,8 +4211,8 @@ mod tests {
         )
         .result
         .expect("ok");
-        assert_eq!(off["structuredContent"]["paused"], false);
-        assert_eq!(off["structuredContent"]["affected"], 2);
+        assert_eq!(off["paused"], false);
+        assert_eq!(off["affected"], 2);
         assert!(!crate::signals::paused(), "instance-wide pause cleared");
         assert!(
             !one.load(Ordering::Relaxed),
@@ -4364,6 +4264,7 @@ mod tests {
         assert_eq!(got.uri, "https://gw.example:9000");
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn pause_is_not_drain_or_lame_duck_readiness_unchanged() {
         let _g = crate::signals::test_guard();
@@ -4376,7 +4277,7 @@ mod tests {
         let before = ctx.inventory_body();
         let ready_before = before["ready"].as_bool().unwrap();
         dispatch(
-            req("tools/call", Some(json!({"name": "pause"}))),
+            req("a2a.Pause", None),
             &ctx,
             PeerOrigin::Management,
             &writer(),
@@ -4401,39 +4302,31 @@ mod tests {
         crate::signals::set_paused(false); // restore
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
-    fn cancel_unknown_handle_is_an_iserror_result_not_a_protocol_error() {
+    fn cancel_unknown_handle_is_a_protocol_error() {
+        // Unwrapped into the A2A family, a refused admin op is a JSON-RPC error
+        // (INVALID_PARAMS) carrying the handler's message — not an isError result.
         let r = dispatch(
-            req(
-                "tools/call",
-                Some(json!({"name": "cancel", "arguments": {"handle": "0.2.9"}})),
-            ),
+            req("a2a.Cancel", Some(json!({"handle": "0.2.9"}))),
             &ctx(),
             PeerOrigin::Management,
             &writer(),
             0,
             &log(),
         );
-        let v = r.result.expect("cancel returns a result, not an error");
-        assert_eq!(v["isError"], true);
-        assert!(
-            v["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("no such handle"),
-            "{v}"
-        );
+        let e = r.error.as_ref().expect("cancel of an unknown handle → error");
+        assert_eq!(e.code, json::INVALID_PARAMS);
+        assert!(e.message.contains("no such handle"), "{}", e.message);
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn cancel_of_a_running_async_run_requests_cancel() {
         let ctx = ctx();
         insert_running(&ctx, "served.7");
         let r = dispatch(
-            req(
-                "tools/call",
-                Some(json!({"name": "cancel", "arguments": {"handle": "served.7"}})),
-            ),
+            req("a2a.Cancel", Some(json!({"handle": "served.7"}))),
             &ctx,
             PeerOrigin::Management,
             &writer(),
@@ -4441,8 +4334,7 @@ mod tests {
             &log(),
         );
         let v = r.result.expect("ok");
-        assert_eq!(v["isError"], false);
-        assert_eq!(v["structuredContent"]["cancelled"], true);
+        assert_eq!(v["cancelled"], true);
         // The run's cancel flag is now set.
         assert!(
             ctx.sessions.lock().unwrap()["served.7"]
@@ -4451,6 +4343,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "a2a")]
     #[test]
     fn cancel_handle_zero_or_omitted_cancels_the_whole_run() {
         // ACC management-profile.json: cancel{handle:"0"} (or an omitted handle) is
@@ -4460,10 +4353,7 @@ mod tests {
         insert_running(&ctx_a, "served.1");
         insert_running(&ctx_a, "served.2");
         let r = dispatch(
-            req(
-                "tools/call",
-                Some(json!({"name": "cancel", "arguments": {"handle": "0"}})),
-            ),
+            req("a2a.Cancel", Some(json!({"handle": "0"}))),
             &ctx_a,
             PeerOrigin::Management,
             &writer(),
@@ -4471,9 +4361,8 @@ mod tests {
             &log(),
         );
         let v = r.result.expect("ok");
-        assert_eq!(v["isError"], false);
-        assert_eq!(v["structuredContent"]["handle"], "0");
-        assert_eq!(v["structuredContent"]["subtree_size"], 2);
+        assert_eq!(v["handle"], "0");
+        assert_eq!(v["subtree_size"], 2);
         for h in ["served.1", "served.2"] {
             assert!(
                 ctx_a.sessions.lock().unwrap()[h]
@@ -4487,10 +4376,7 @@ mod tests {
         let ctx2 = ctx();
         insert_running(&ctx2, "served.3");
         let r = dispatch(
-            req(
-                "tools/call",
-                Some(json!({"name": "cancel", "arguments": {}})),
-            ),
+            req("a2a.Cancel", Some(json!({}))),
             &ctx2,
             PeerOrigin::Management,
             &writer(),
@@ -4498,8 +4384,7 @@ mod tests {
             &log(),
         );
         let v = r.result.expect("ok (omitted handle == whole run)");
-        assert_eq!(v["isError"], false);
-        assert_eq!(v["structuredContent"]["subtree_size"], 1);
+        assert_eq!(v["subtree_size"], 1);
         assert!(
             ctx2.sessions.lock().unwrap()["served.3"]
                 .cancel

@@ -631,9 +631,12 @@ fn cancel_drains_a_live_async_run() {
     let _ = child.wait();
 }
 
-/// RFC 0015 chunk 3: the operator surface over the unix MANAGEMENT transport.
-/// A unix peer is `PeerOrigin::Management`, so it sees + can call the operator
-/// tools (drain / lame-duck / cancel) and read `agentd://inventory`.
+/// Pivot Phase 4: the operator surface is the A2A admin method family
+/// (`a2a.Drain`/`a2a.LameDuck`/`a2a.Pause`/`a2a.Resume`/`a2a.Cancel`) over the
+/// authenticated HTTP management transport. A loopback peer authenticates as
+/// `PeerOrigin::Management`, so it can drive that family + read
+/// `agentd://inventory`; operator control is NOT exposed as tools.
+#[cfg(feature = "a2a")]
 #[test]
 fn management_peer_drives_the_operator_surface() {
     let exe = env!("CARGO_BIN_EXE_agentd");
@@ -645,7 +648,8 @@ fn management_peer_drives_the_operator_surface() {
     peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
 
-    // tools/list to a management peer includes the operator tools.
+    // Operator control is the A2A admin family now — NOT tools. tools/list to a
+    // management peer carries the self/work tools but none of the operator surface.
     let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
     let names: Vec<&str> = list["result"]["tools"]
@@ -655,8 +659,9 @@ fn management_peer_drives_the_operator_surface() {
         .filter_map(|t| t["name"].as_str())
         .collect();
     for t in ["drain", "lame-duck", "pause", "resume", "cancel"] {
-        assert!(names.contains(&t), "management sees {t}: {names:?}");
+        assert!(!names.contains(&t), "operator control is not a tool: {names:?}");
     }
+    assert!(names.contains(&"status"), "self tools present: {names:?}");
 
     // agentd://inventory is readable + carries the lifecycle flags.
     let inv = peer.rpc(r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
@@ -668,14 +673,15 @@ fn management_peer_drives_the_operator_surface() {
     assert_eq!(body["ready"], true);
     assert!(body["totals"]["total_spawned"].is_number());
 
-    // pause flips the instance-wide pause flag in the projection (no in-flight
+    // a2a.Pause flips the instance-wide pause flag in the projection (no in-flight
     // subagents on this idle daemon → affected:0) and is reversible. NOT a drain
-    // and NOT a lame-duck: readiness is unchanged by pause (RFC 0015 §4.3).
-    let pause = peer.rpc(r#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"pause"}}"#,
+    // and NOT a lame-duck: readiness is unchanged by pause (RFC 0015 §4.3). The
+    // admin methods return the structured body directly (no tool-result envelope).
+    let pause = peer.rpc(r#"{"jsonrpc":"2.0","id":31,"method":"a2a.Pause"}"#,
     );
-    assert_eq!(pause["result"]["isError"], false, "pause: {pause}");
-    assert_eq!(pause["result"]["structuredContent"]["paused"], true);
-    assert_eq!(pause["result"]["structuredContent"]["affected"], 0);
+    assert!(pause["error"].is_null(), "pause: {pause}");
+    assert_eq!(pause["result"]["paused"], true);
+    assert_eq!(pause["result"]["affected"], 0);
     let inv_p: serde_json::Value = serde_json::from_str(
         peer.rpc(r#"{"jsonrpc":"2.0","id":32,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
         )["result"]["contents"][0]["text"]
@@ -689,10 +695,10 @@ fn management_peer_drives_the_operator_surface() {
     );
     assert_eq!(inv_p["ready"], true, "pause is not lame-duck → still ready");
     assert_eq!(inv_p["draining"], false, "pause is not drain");
-    // resume clears it.
-    let resume = peer.rpc(r#"{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"resume"}}"#,
+    // a2a.Resume clears it.
+    let resume = peer.rpc(r#"{"jsonrpc":"2.0","id":33,"method":"a2a.Resume"}"#,
     );
-    assert_eq!(resume["result"]["structuredContent"]["paused"], false);
+    assert_eq!(resume["result"]["paused"], false);
     let inv_r: serde_json::Value = serde_json::from_str(
         peer.rpc(r#"{"jsonrpc":"2.0","id":34,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
         )["result"]["contents"][0]["text"]
@@ -702,11 +708,11 @@ fn management_peer_drives_the_operator_surface() {
     .unwrap();
     assert_eq!(inv_r["paused"], false, "resume cleared the flag: {inv_r}");
 
-    // lame-duck flips readiness in the projection (no exit, no drain).
-    let ld = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"lame-duck"}}"#,
+    // a2a.LameDuck flips readiness in the projection (no exit, no drain).
+    let ld = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"a2a.LameDuck"}"#,
     );
-    assert_eq!(ld["result"]["isError"], false, "lame-duck: {ld}");
-    assert_eq!(ld["result"]["structuredContent"]["ready"], false);
+    assert!(ld["error"].is_null(), "lame-duck: {ld}");
+    assert_eq!(ld["result"]["ready"], false);
     let inv2 = peer.rpc(r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
     );
     let body2: serde_json::Value =
@@ -716,22 +722,27 @@ fn management_peer_drives_the_operator_surface() {
         "lame-duck reflected in inventory: {body2}"
     );
 
-    // cancel of an unknown handle is an isError result, not a protocol error.
-    let bad = peer.rpc(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"cancel","arguments":{"handle":"0.9.9"}}}"#,
+    // a2a.Cancel of an unknown handle is a JSON-RPC error (the admin family reports
+    // a refusal as INVALID_PARAMS, not an isError result).
+    let bad = peer.rpc(r#"{"jsonrpc":"2.0","id":6,"method":"a2a.Cancel","params":{"handle":"0.9.9"}}"#,
     );
+    assert!(bad["result"].is_null(), "cancel refusal is an error: {bad}");
+    assert_eq!(bad["error"]["code"], -32602, "INVALID_PARAMS: {bad}");
     assert!(
-        bad["error"].is_null(),
-        "cancel is a result, not an error: {bad}"
+        bad["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no such handle"),
+        "{bad}"
     );
-    assert_eq!(bad["result"]["isError"], true);
 
-    // drain returns a snapshot immediately and latches draining; the daemon then
-    // winds down and exits clean. (Tested last so the daemon can exit.)
-    let drain = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"drain"}}"#,
+    // a2a.Drain returns a snapshot immediately and latches draining; the daemon
+    // then winds down and exits clean. (Tested last so the daemon can exit.)
+    let drain = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"a2a.Drain"}"#,
     );
-    assert_eq!(drain["result"]["isError"], false, "drain: {drain}");
-    assert_eq!(drain["result"]["structuredContent"]["draining"], true);
-    assert!(drain["result"]["structuredContent"]["drain_timeout_ms"].is_number());
+    assert!(drain["error"].is_null(), "drain: {drain}");
+    assert_eq!(drain["result"]["draining"], true);
+    assert!(drain["result"]["drain_timeout_ms"].is_number());
 
     // The drain drove a graceful shutdown — the daemon exits 0 on its own (no
     // SIGTERM needed), proving `drain` reuses the SIGTERM choreography.

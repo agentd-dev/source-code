@@ -16,11 +16,15 @@
 use crate::json::{self, RpcError};
 use crate::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
 use crate::wire::mcp::{
-    CallToolResult, ClientCapabilities, Implementation, InitializeParams, InitializeResult,
-    ListResourcesResult, ListToolsResult, PROTOCOL_VERSION, ReadResourceParams, ReadResourceResult,
-    Resource, SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Tool, method,
+    CallToolResult, ClientCapabilities, DiscoverResult, Era, Implementation, InitializeParams,
+    InitializeResult, LATEST_MODERN_VERSION, ListResourcesResult, ListToolsResult, PROTOCOL_VERSION,
+    ReadResourceParams, ReadResourceResult, Resource, SUPPORTED_PROTOCOL_VERSIONS,
+    ServerCapabilities, SubscribeParams, Tool, UnsupportedProtocolVersion,
+    UNSUPPORTED_PROTOCOL_VERSION_CODE, best_mutual_version, is_modern_error_code, method,
     negotiate_version,
 };
+// The modern (stateless) request builders live alongside `wire` in the mcp crate.
+use ::mcp::modern;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -69,9 +73,11 @@ pub struct McpClient {
     events: Mutex<Option<EventStreamHandle>>,
     next_id: AtomicI64,
     caps: ServerCapabilities,
-    /// The protocol version negotiated at `initialize` (RFC 0004 lifecycle
-    /// §version-negotiation); `None` until then.
+    /// The protocol version negotiated at `initialize`/discovery; `None` until then.
     protocol_version: Option<String>,
+    /// The protocol era established on connect: legacy (`initialize` handshake) or
+    /// modern (stateless per-request `_meta`). Governs how every request is built.
+    era: Era,
     timeout: Duration,
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
     /// `{"agent/run_id": …}`) so backing services can dedupe retries
@@ -112,6 +118,8 @@ impl McpClient {
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
             protocol_version: None,
+            // Established on connect; legacy is the safe default until then.
+            era: Era::Legacy,
             timeout,
             tool_meta: None,
         })
@@ -175,14 +183,120 @@ impl McpClient {
     /// liveness heartbeat) for the full ~60s — a timeout is a contained
     /// `mcp.connect.fail` (the server is simply absent, RFC 0007 / RFC 0017 §5.3).
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
+        // Detect the server's ERA (versioning §backward-compatibility): attempt a
+        // MODERN `server/discover`; a modern JSON-RPC error body identifies a
+        // modern server (retry with a mutual version), otherwise fall back to the
+        // legacy `initialize` handshake.
+        match self.probe_modern(timeout)? {
+            Probe::Modern(discover) => self.establish_modern(*discover),
+            Probe::ModernRetry(supported) => {
+                let v = best_mutual_version(&supported).ok_or_else(|| {
+                    McpError::Transport(format!(
+                        "server '{}' shares no MCP protocol version with agentd \
+                         (server offered {supported:?}, agentd speaks {SUPPORTED_PROTOCOL_VERSIONS:?})",
+                        self.name
+                    ))
+                })?;
+                self.http.set_protocol_version(v.clone());
+                self.protocol_version = Some(v);
+                match self.probe_modern(timeout)? {
+                    Probe::Modern(discover) => self.establish_modern(*discover),
+                    _ => Err(McpError::Transport(format!(
+                        "server '{}' rejected the negotiated MCP protocol version",
+                        self.name
+                    ))),
+                }
+            }
+            Probe::Legacy => self.legacy_initialize(timeout),
+        }
+    }
+
+    /// Probe the server with a MODERN `server/discover` and classify the era. The
+    /// discover request carries the per-request `_meta` + routing headers; the raw
+    /// transport outcome (a discover result, a modern JSON-RPC error, or anything
+    /// else) tells us whether the server is modern or legacy.
+    fn probe_modern(&mut self, timeout: Duration) -> Result<Probe, McpError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let version = self
+            .protocol_version
+            .clone()
+            .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
+        let mut params = json!({});
+        modern::inject_client_meta(&mut params, &version, &client_info());
+        self.http.set_protocol_version(version);
+        let routing = modern::routing_headers(method::SERVER_DISCOVER, &params);
+        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        let req = json::Request::new(id, method::SERVER_DISCOVER, Some(params));
+        let body = serde_json::to_vec(&req)
+            .map_err(|e| McpError::Transport(format!("encode server/discover: {e}")))?;
+        let notifications = &self.notifications;
+        let outcome = self.http.send(Some(id), &body, timeout, &refs, |n| {
+            queue_notification(notifications, n)
+        });
+
+        match outcome {
+            // HTTP 2xx: a discover result, or a JSON-RPC error (a legacy server that
+            // doesn't know server/discover answers with a generic error).
+            Ok(Some(msg)) => {
+                let resp: json::Response = serde_json::from_value(msg).map_err(|e| {
+                    McpError::Transport(format!("bad server/discover reply on '{}': {e}", self.name))
+                })?;
+                if let Some(err) = resp.error {
+                    return Ok(if is_modern_error_code(err.code) {
+                        classify_modern_error(&err)
+                    } else {
+                        Probe::Legacy
+                    });
+                }
+                let discover: DiscoverResult =
+                    serde_json::from_value(resp.result.unwrap_or(Value::Null)).map_err(|e| {
+                        McpError::Transport(format!(
+                            "bad server/discover result on '{}': {e}",
+                            self.name
+                        ))
+                    })?;
+                Ok(Probe::Modern(Box::new(discover)))
+            }
+            Ok(None) => Ok(Probe::Legacy),
+            // A non-2xx: a recognized MODERN error body ⇒ modern; else legacy.
+            Err(HttpError::Status(_, body)) => Ok(rpc_error_from_body(&body)
+                .filter(|e| is_modern_error_code(e.code))
+                .map(|e| classify_modern_error(&e))
+                .unwrap_or(Probe::Legacy)),
+            // A connect/transport failure is not an era signal — propagate it.
+            Err(e) => Err(http_err(&self.name, method::SERVER_DISCOVER, e)),
+        }
+    }
+
+    /// Adopt the MODERN (stateless) era from a `server/discover` result: no
+    /// session, no `notifications/initialized`; every subsequent request carries
+    /// `_meta` + routing headers (see [`Self::request_with_timeout`]).
+    fn establish_modern(&mut self, discover: DiscoverResult) -> Result<(), McpError> {
+        self.era = Era::Modern;
+        // The version we probed with was accepted (we got a result); prefer the
+        // newest we share with the server's advertised list, else keep it.
+        let version = best_mutual_version(&discover.supported_versions)
+            .or_else(|| self.protocol_version.clone())
+            .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
+        self.http.set_protocol_version(version.clone());
+        self.protocol_version = Some(version);
+        self.caps = discover.capabilities;
+        Ok(())
+    }
+
+    /// The LEGACY `initialize` handshake (lifecycle §initialization): advertise our
+    /// latest legacy version, adopt the server's negotiated version, store caps,
+    /// send `notifications/initialized`.
+    fn legacy_initialize(&mut self, timeout: Duration) -> Result<(), McpError> {
+        self.era = Era::Legacy;
+        // The modern probe set a version header; clear it so the initialize request
+        // carries none (nothing negotiated yet — legacy sends the header only after).
+        self.http.clear_protocol_version();
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "agentd".into(),
-                version: crate::VERSION.into(),
-                title: None,
-            },
+            client_info: client_info(),
         };
         let result =
             self.request_with_timeout(method::INITIALIZE, Some(to_value(&params)), timeout)?;
@@ -210,9 +324,14 @@ impl McpClient {
         Ok(())
     }
 
-    /// The protocol version negotiated with the server at `initialize`, once the
-    /// handshake has run (`None` before). Sent as `MCP-Protocol-Version` on every
-    /// subsequent request.
+    /// The protocol era established on connect (legacy handshake vs modern
+    /// stateless). Governs how each request is built.
+    pub fn era(&self) -> Era {
+        self.era
+    }
+
+    /// The protocol version negotiated with the server (`None` before connect).
+    /// Sent as `MCP-Protocol-Version` on every subsequent request.
     pub fn protocol_version(&self) -> Option<&str> {
         self.protocol_version.as_deref()
     }
@@ -456,13 +575,25 @@ impl McpClient {
         timeout: Duration,
     ) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // In the MODERN era, every request carries per-request `_meta` and the
+        // Mcp-Method / Mcp-Name routing headers; legacy sends plain params.
+        let (params, routing) = if self.era == Era::Modern {
+            let mut p = params.unwrap_or_else(|| json!({}));
+            let version = self.protocol_version.as_deref().unwrap_or(LATEST_MODERN_VERSION);
+            modern::inject_client_meta(&mut p, version, &client_info());
+            let routing = modern::routing_headers(method, &p);
+            (Some(p), routing)
+        } else {
+            (params, Vec::new())
+        };
+        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let req = json::Request::new(id, method, params);
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
         let notifications = &self.notifications;
         let msg = self
             .http
-            .send(Some(id), &body, timeout, &[], |n| {
+            .send(Some(id), &body, timeout, &refs, |n| {
                 queue_notification(notifications, n)
             })
             .map_err(|e| http_err(&self.name, method, e))?
@@ -506,6 +637,55 @@ impl Drop for McpClient {
             ev.stop.store(true, Ordering::SeqCst);
             let _ = ev.handle.join();
         }
+    }
+}
+
+/// The era-detection outcome of a modern `server/discover` probe.
+enum Probe {
+    /// The server is modern and returned its capabilities (boxed — much larger
+    /// than the other variants).
+    Modern(Box<DiscoverResult>),
+    /// The server is modern but did not support our version — the versions it does
+    /// support (from a `-32022` error); retry with a mutual one.
+    ModernRetry(Vec<String>),
+    /// The server is not modern — fall back to the legacy `initialize` handshake.
+    Legacy,
+}
+
+/// agentd's client identity — sent in every request's `_meta` (modern) or in the
+/// `initialize` handshake (legacy).
+fn client_info() -> Implementation {
+    Implementation {
+        name: "agentd".into(),
+        version: crate::VERSION.into(),
+        title: None,
+    }
+}
+
+/// Parse a JSON-RPC error object out of a raw HTTP error-response body (a modern
+/// server returns one for an unsupported version / header mismatch).
+fn rpc_error_from_body(body: &[u8]) -> Option<RpcError> {
+    serde_json::from_slice::<json::Response>(body)
+        .ok()
+        .and_then(|r| r.error)
+}
+
+/// Classify a modern JSON-RPC error into a probe outcome: a `-32022`
+/// unsupported-version error yields the server's `supported` list to retry with;
+/// any other modern error (e.g. header mismatch) can't be proceeded with.
+fn classify_modern_error(err: &RpcError) -> Probe {
+    if err.code == UNSUPPORTED_PROTOCOL_VERSION_CODE {
+        let supported = err
+            .data
+            .as_ref()
+            .and_then(|d| serde_json::from_value::<UnsupportedProtocolVersion>(d.clone()).ok())
+            .map(|u| u.supported)
+            .unwrap_or_default();
+        Probe::ModernRetry(supported)
+    } else {
+        // A header mismatch (-32020) is our own request bug against a modern server;
+        // ModernRetry with no list ⇒ best_mutual returns None ⇒ a clear error.
+        Probe::ModernRetry(Vec::new())
     }
 }
 

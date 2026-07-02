@@ -169,9 +169,16 @@ impl HttpTransport {
     }
 
     /// Record the negotiated protocol version, sent as `MCP-Protocol-Version` on
-    /// every subsequent request (called by the client after `initialize`).
+    /// every subsequent request (called by the client after `initialize`/discovery).
     pub fn set_protocol_version(&self, version: String) {
         *self.protocol_version.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
+    }
+
+    /// Clear the negotiated version — the legacy `initialize` request must carry no
+    /// `MCP-Protocol-Version` header (nothing agreed yet), so this resets what a
+    /// prior modern probe set.
+    pub fn clear_protocol_version(&self) {
+        *self.protocol_version.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn scheme(&self) -> &'static str {

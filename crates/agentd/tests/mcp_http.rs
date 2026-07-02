@@ -23,11 +23,13 @@ struct Seen {
     methods: Vec<String>,
 }
 
-/// One parsed HTTP request: the JSON-RPC body + the `Mcp-Session-Id` /
-/// `MCP-Protocol-Version` headers.
+/// One parsed HTTP request: the JSON-RPC body + the routing/framing headers.
+#[derive(Clone)]
 struct HttpReq {
     session_id: Option<String>,
     protocol_version: Option<String>,
+    mcp_method: Option<String>,
+    mcp_name: Option<String>,
     body: Value,
 }
 
@@ -41,6 +43,8 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
     let mut content_length = 0usize;
     let mut session_id = None;
     let mut protocol_version = None;
+    let mut mcp_method = None;
+    let mut mcp_name = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -53,12 +57,13 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
         if let Some((k, v)) = h.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim().to_string();
-            if key == "content-length" {
-                content_length = val.parse().unwrap_or(0);
-            } else if key == "mcp-session-id" {
-                session_id = Some(val);
-            } else if key == "mcp-protocol-version" {
-                protocol_version = Some(val);
+            match key.as_str() {
+                "content-length" => content_length = val.parse().unwrap_or(0),
+                "mcp-session-id" => session_id = Some(val),
+                "mcp-protocol-version" => protocol_version = Some(val),
+                "mcp-method" => mcp_method = Some(val),
+                "mcp-name" => mcp_name = Some(val),
+                _ => {}
             }
         }
     }
@@ -68,6 +73,8 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
     Some(HttpReq {
         session_id,
         protocol_version,
+        mcp_method,
+        mcp_name,
         body,
     })
 }
@@ -306,8 +313,10 @@ fn notification_get_stream_delivers_server_pushes() {
     let _ = std::fs::remove_file(&sock);
 }
 
-/// A one-shot mock that answers `initialize` with a fixed `protocolVersion`, to
-/// drive the negotiation edge cases. Returns its endpoint.
+/// A LEGACY mock that answers `initialize` with a fixed `protocolVersion` (to
+/// drive the legacy negotiation edge cases). It rejects the client's modern
+/// `server/discover` probe with method-not-found (as a legacy server does), so
+/// the client falls back to `initialize`. Returns its endpoint.
 fn spawn_fixed_version_mock(version: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -318,14 +327,23 @@ fn spawn_fixed_version_mock(version: &'static str) -> String {
                 continue;
             };
             let id = req.body.get("id").cloned().unwrap_or(Value::Null);
-            let payload = json!({
-                "jsonrpc": "2.0", "id": id,
-                "result": {
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "fixed", "version": "0"}
-                }
-            });
+            let method = req.body["method"].as_str().unwrap_or("");
+            let payload = if method == "initialize" {
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": version,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fixed", "version": "0"}
+                    }
+                })
+            } else {
+                // A legacy server doesn't know server/discover → generic error.
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}
+                })
+            };
             write_json(&mut stream, "", &payload);
         }
     });
@@ -357,6 +375,87 @@ fn initialize_accepts_a_future_protocol_version_forward_compat() {
         .expect("connect");
     client.initialize().expect("a newer revision is accepted");
     assert_eq!(client.protocol_version(), Some("2099-01-01"));
+}
+
+#[test]
+fn streamable_http_modern_stateless_lifecycle() {
+    // A MODERN (2026-07-28 stateless) server: answers `server/discover` with a
+    // DiscoverResult and serves stateless tool calls. Proves agentd detects the
+    // modern era, sends NO `initialize`, carries `_meta` + `Mcp-Method` /
+    // `Mcp-Name` / `MCP-Protocol-Version` on every request, and sends no session.
+    let observed: Arc<Mutex<Vec<HttpReq>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let obs = Arc::clone(&observed);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let Some(req) = read_http_request(&stream) else {
+                continue;
+            };
+            obs.lock().unwrap().push(req.clone());
+            let method = req.body["method"].as_str().unwrap_or("");
+            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+            let payload = match method {
+                "server/discover" => json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tools": {}, "resources": {"subscribe": true}},
+                    "serverInfo": {"name": "modern", "version": "0"}
+                }}),
+                "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result":
+                    {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}}),
+                "tools/call" => json!({"jsonrpc": "2.0", "id": id, "result":
+                    {"content": [{"type": "text", "text": "ok"}], "isError": false}}),
+                _ => json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "method not found"}}),
+            };
+            write_json(&mut stream, "", &payload);
+        }
+    });
+
+    let mut client =
+        McpClient::connect("modern", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
+    client.initialize().expect("establish (via server/discover)");
+
+    // Detected the modern era + adopted its version + parsed discover capabilities.
+    assert_eq!(client.era(), agentd::wire::mcp::Era::Modern);
+    assert_eq!(client.protocol_version(), Some("2026-07-28"));
+    assert!(client.capabilities().supports_tools());
+    assert!(client.capabilities().supports_subscribe());
+
+    let tools = client.list_tools().expect("tools/list");
+    assert_eq!(tools[0].name, "echo");
+    let r = client
+        .call_tool("echo", Some(json!({"msg": "hi"})))
+        .expect("tools/call");
+    assert!(!r.is_error());
+
+    let obs = observed.lock().unwrap();
+    assert!(
+        obs.iter().all(|r| r.body["method"] != "initialize"),
+        "modern era never sends initialize"
+    );
+    assert_eq!(obs[0].body["method"], "server/discover", "discover is first");
+    for r in obs.iter() {
+        let m = r.body["method"].as_str().unwrap();
+        assert_eq!(
+            r.body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
+            Some("2026-07-28"),
+            "{m} carries the per-request _meta version"
+        );
+        assert_eq!(
+            r.protocol_version.as_deref(),
+            Some("2026-07-28"),
+            "{m} carries the MCP-Protocol-Version header"
+        );
+        assert_eq!(r.mcp_method.as_deref(), Some(m), "{m} carries Mcp-Method");
+        assert!(r.session_id.is_none(), "modern sends no Mcp-Session-Id ({m})");
+    }
+    // tools/call carries the Mcp-Name routing header.
+    let call = obs.iter().find(|r| r.body["method"] == "tools/call").unwrap();
+    assert_eq!(call.mcp_name.as_deref(), Some("echo"));
 }
 
 #[test]

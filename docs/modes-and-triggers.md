@@ -64,10 +64,10 @@ self-terminate, not a terminal-status mapping)
 ```
 agentd \
   --instruction "Summarize today's open PRs and post to #eng." \
-  --intelligence unix:/run/intelligence.sock \
+  --intelligence https://gw.example/v1 \
   --model claude-opus-4-8 \
-  --mcp github=mcp-server-github \
-  --mcp slack=mcp-server-slack
+  --mcp github=https://mcp-github.internal/mcp \
+  --mcp slack=https://mcp-slack.internal/mcp
 ```
 
 Mode is omitted because `once` is the default. This is the shape an external
@@ -103,8 +103,8 @@ agentd \
   --mode loop \
   --interval 30s \
   --instruction "Drain the review queue: triage each new item." \
-  --intelligence unix:/run/intelligence.sock \
-  --mcp queue=mcp-server-queue \
+  --intelligence https://gw.example/v1 \
+  --mcp queue=https://mcp-queue.internal/mcp \
   --deadline 4h \
   --max-tokens 2000000
 ```
@@ -141,8 +141,8 @@ agentd \
   --mode reactive \
   --subscribe "file:///inbox/*.json" \
   --instruction "When an inbox file appears, validate it and file an issue." \
-  --intelligence unix:/run/intelligence.sock \
-  --mcp fs=mcp-server-fs --mcp github=mcp-server-github
+  --intelligence https://gw.example/v1 \
+  --mcp fs=https://mcp-fs.internal/mcp --mcp github=https://mcp-github.internal/mcp
 ```
 
 `--subscribe` is repeatable — declare as many resource URIs as you watch:
@@ -308,11 +308,11 @@ child subagent's completion-as-self-resource is just an `updated` that the
 parent's self-subscribe route delivers, which is how async subagents (RFC 0009)
 report back. `unsubscribe(uri)` removes the route and subscription.
 
-> **Transport scope.** Reactivity is **stdio-only in v1.** The router is
-> transport-agnostic by construction, but only stdio MCP servers deliver
-> notifications in v1; reactivity-over-HTTP (an SSE GET stream) is **(roadmap)**
-> (RFC 0004 §3.11, RFC 0013). Self-MCP serving is **stdio/unix only** in v1; HTTP
-> serving is **(roadmap)**.
+> **Transport scope.** Reactivity rides the MCP servers' **Streamable-HTTP**
+> subscriptions — the client subscribes and reads pushed
+> `notifications/resources/updated` over the HTTP/SSE stream (RFC 0004). The router
+> is transport-agnostic by construction. Self-MCP serving is over HTTP(S) with
+> mTLS/bearer auth (loopback `http://` for dev).
 
 ---
 
@@ -350,8 +350,8 @@ spec:
               args:
                 - --mode=once
                 - --instruction=Compile the nightly digest and email it.
-                - --intelligence=unix:/run/intelligence.sock
-                - --mcp=mail=mcp-server-mail
+                - --intelligence=https://gw.example/v1
+                - --mcp=mail=https://mcp-mail.internal/mcp
 ```
 
 ### Internal `--interval`
@@ -366,8 +366,8 @@ agentd \
   --mode schedule \
   --interval 15m \
   --instruction "Check the status page; alert on any red." \
-  --intelligence unix:/run/intelligence.sock \
-  --mcp status=mcp-server-status
+  --intelligence https://gw.example/v1 \
+  --mcp status=https://mcp-status.internal/mcp
 ```
 
 `--interval` accepts a duration with a unit suffix — `500ms`, `30s`, `15m`, `2h`
@@ -397,16 +397,16 @@ side effect** (a bad config exits `2` in milliseconds, RFC 0011).
 | Continue | `--continue <uri>` (repeatable) | — | none | subscribe an MCP resource, routed to one warm `continue` session |
 | Interval | `--interval <dur>` | — | unset | `loop`/`schedule`; required for `schedule` |
 | Instruction | `--instruction <TEXT>` / `--instruction-file <PATH>` | `INSTRUCTION` | — | required |
-| Intelligence | `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `unix:` / `https://` / `vsock:` |
+| Intelligence | `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `https://` (loopback `http://` for dev) |
 | Model | `--model <NAME>` | `AGENT_MODEL` | — | model id |
-| MCP server | `--mcp name=command` (repeatable) | — | none | stdio transport |
+| MCP server | `--mcp name=<endpoint>` (repeatable) | — | none | Streamable HTTP (`https://`, loopback `http://`) |
 | Max steps | `--max-steps <N>` | `AGENT_MAX_STEPS` | 50 | per-run step cap |
 | Max tokens | `--max-tokens <N>` | `AGENT_MAX_TOKENS` | 200000 | token budget |
 | Deadline | `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
 | Max depth | `--max-depth <N>` | — | 4 | subagent tree depth cap |
 | Run id | `--run-id <ID>` | `AGENT_RUN_ID` | generated | idempotency key |
 | Drain | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | 25s | graceful drain budget |
-| Serve MCP | `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | off | stdio/unix only in v1 |
+| Serve MCP | `--serve-mcp <https://host:port>` | `AGENT_SERVE_MCP` | off | HTTP(S), mTLS/bearer auth |
 | Health file | `--health-file <PATH>` | — | off | liveness heartbeat |
 | Log level | `--log-level <L>` | `AGENT_LOG_LEVEL` | info | trace…error |
 

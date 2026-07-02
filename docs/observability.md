@@ -43,8 +43,8 @@ so telemetry still goes to **stderr** — never mixed into the channel.
 ```sh
 # result on stdout, telemetry on stderr — cleanly separable
 agentd --instruction "summarise /data/report.md" \
-       --intelligence unix:/run/intel.sock \
-       --mcp fs="mcp-server-fs --root /data" \
+       --intelligence https://gw.example/v1 \
+       --mcp fs=https://mcp-fs.internal/mcp \
   > result.json 2> telemetry.ndjson
 ```
 

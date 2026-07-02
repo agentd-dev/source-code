@@ -267,6 +267,30 @@ impl ReadResourceResult {
     }
 }
 
+/// A resource **template** (a parameterized `uriTemplate`, RFC 6570) a server
+/// offers via `resources/templates/list` — distinct from a concrete [`Resource`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceTemplate {
+    pub uri_template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResourceTemplatesResult {
+    pub resource_templates: Vec<ResourceTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// `resources/subscribe` / `resources/unsubscribe` params (per-URI only —
 /// templates are NOT subscribable, RFC 0004 §item-vs-list).
 #[derive(Debug, Clone, Serialize, Deserialize)]

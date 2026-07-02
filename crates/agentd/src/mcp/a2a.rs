@@ -347,7 +347,9 @@ fn artifact_update_frame(task_id: &str, context_id: &str, distillate: &Value) ->
 fn write_stream_frame(writer: &SharedWriter, id: &Id, stream_response: Value) {
     let frame = Response::ok(id.clone(), stream_response);
     if let Ok(mut w) = writer.lock() {
-        let _ = crate::json::frame::write_line(&mut *w, &frame);
+        // Per-transport framing: an HTTP (SSE) peer gets a `data:` event, a
+        // socket peer an NDJSON line — one handler, every transport.
+        let _ = w.write_response(&frame);
     }
 }
 

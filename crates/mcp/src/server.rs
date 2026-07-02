@@ -112,6 +112,20 @@ impl ServeStream {
         }
         frame::write_line(self, note)
     }
+
+    /// Write one JSON-RPC RESPONSE frame with per-transport framing — the
+    /// server-streaming twin of [`write_notification`]: an HTTP (SSE) sink gets
+    /// a `data:` event, a socket peer gets an NDJSON line. Streaming method
+    /// handlers (A2A `StreamResponse` frames) push through this so one handler
+    /// serves every transport.
+    pub fn write_response(&mut self, resp: &Response) -> io::Result<()> {
+        if let ServeStream::Http(sink) = self {
+            let json = serde_json::to_string(resp).map_err(io::Error::other)?;
+            sink.write_all(format!("data: {json}\n\n").as_bytes())?;
+            return sink.flush();
+        }
+        frame::write_line(self, resp)
+    }
 }
 
 impl Read for ServeStream {
@@ -299,6 +313,15 @@ pub trait Handler: Send + Sync + 'static {
     /// Called once when a connection is accepted (before its first request), for
     /// logging/metrics. Default: nothing.
     fn on_connect(&self, _origin: PeerOrigin, _conn: u64) {}
+
+    /// Whether `method` responds as a SERVER STREAM (several frames pushed
+    /// through the dispatch `writer`, the returned `Response` being the final
+    /// frame). The HTTP transport upgrades such a request to a `text/event-stream`
+    /// response instead of a unary `application/json` one. Default: nothing
+    /// streams.
+    fn streams(&self, _method: &str) -> bool {
+        false
+    }
 
     /// Called once when a connection's reader loop ends. The framework has already
     /// dropped the connection's subscriptions; this is for logging/metrics or any

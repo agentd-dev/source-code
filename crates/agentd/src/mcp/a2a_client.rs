@@ -8,7 +8,7 @@
 //! is the remote backend. It connects to a declared peer (an [`A2aEndpoint`] —
 //! `https://host[:port]`, or loopback `http://` for dev) and drives the A2A unary
 //! surface as a client with one `POST` per call (the [`HttpConn`] caller), through
-//! the [`drive`] loop:
+//! the streaming consumer / recovery loop:
 //!
 //!   1. `a2a.SendMessage` with the objective as one text `Part` (role `ROLE_USER`,
 //!      a minted `messageId`) → a Task whose `id` comes back,
@@ -68,14 +68,56 @@ pub fn delegate(
     output_contract: Option<&str>,
     deadline: Instant,
 ) -> DelegateOutcome {
-    // The sole transport: dial the peer's A2A method surface over HTTP(S), one
-    // POST per unary call (SendMessage + GetTask polls), presenting the peer
-    // client-auth material (bearer headers and/or an mTLS identity) on each.
+    // The sole transport is HTTP(S), presenting the peer client-auth material
+    // (bearer headers and/or an mTLS identity) on every request. STREAMING
+    // FIRST: one `a2a.SendStreamingMessage` SSE round trip carries the whole
+    // lifecycle (working → artifact → final) with no polling; an older peer
+    // that degrades it to a unary final frame is recovered via `a2a.GetTask`
+    // (the run happened either way — never re-sent).
     match endpoint {
         A2aEndpoint::Https(url) => match HttpEp::parse(url) {
-            Ok(ep) => drive(HttpConn::new(ep, auth), objective, output_contract, deadline),
+            Ok(ep) => {
+                let mut conn = HttpConn::new(ep, auth);
+                match conn.call_streaming(objective, output_contract, deadline) {
+                    Err(e) => DelegateOutcome::Error(e),
+                    Ok(StreamOutcome::Done(outcome)) => outcome,
+                    Ok(StreamOutcome::Recover(task_id)) => {
+                        poll_task(&mut conn, &task_id, deadline)
+                    }
+                }
+            }
             Err(e) => DelegateOutcome::Error(e),
         },
+    }
+}
+
+/// How a streaming attempt resolved: a terminal outcome, or a task id whose
+/// terminal state must be RECOVERED over unary `a2a.GetTask` (an older peer's
+/// unary-final degradation, or a stream that broke after the run started —
+/// the run exists server-side either way, so it is polled, never re-sent).
+enum StreamOutcome {
+    Done(DelegateOutcome),
+    Recover(String),
+}
+
+/// Poll `a2a.GetTask` until the task is terminal or the deadline passes — the
+/// shared tail of the unary path and stream recovery.
+fn poll_task<C: Caller>(conn: &mut C, task_id: &str, deadline: Instant) -> DelegateOutcome {
+    let get_params = json!({ "id": task_id });
+    loop {
+        if Instant::now() >= deadline {
+            return DelegateOutcome::Error(format!(
+                "a2a: delegation to peer timed out (task {task_id} still running)"
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+        let task = match conn.call("a2a.GetTask", get_params.clone(), deadline) {
+            Ok(t) => t,
+            Err(e) => return DelegateOutcome::Error(e),
+        };
+        if let Some(outcome) = terminal_outcome(&task) {
+            return outcome;
+        }
     }
 }
 
@@ -94,54 +136,9 @@ pub struct PeerAuth {
 
 /// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
 /// `result` Task value or an error string. Implemented by [`HttpConn`] (one HTTP
-/// POST per call); the trait keeps [`drive`] testable against a fixture.
+/// POST per call); the trait keeps [`poll_task`] testable against a fixture.
 trait Caller {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String>;
-}
-
-/// Drive the A2A unary exchange over any [`Caller`]: SendMessage → poll GetTask to
-/// terminal. Split out from [`delegate`] so it is caller-agnostic and directly
-/// unit-testable against a fixture.
-fn drive<C: Caller>(
-    mut conn: C,
-    objective: &str,
-    output_contract: Option<&str>,
-    deadline: Instant,
-) -> DelegateOutcome {
-    // 1) a2a.SendMessage → a Task; capture its id.
-    let message_id = mint_message_id();
-    let params = a2a::send_message_params(objective, output_contract, &message_id);
-    let task = match conn.call("a2a.SendMessage", params, deadline) {
-        Ok(t) => t,
-        Err(e) => return DelegateOutcome::Error(e),
-    };
-    let task_id = a2a::task_id_of(&task);
-    if task_id.is_empty() {
-        return DelegateOutcome::Error("a2a: peer SendMessage returned no task id".to_string());
-    }
-    // A SendMessage that already came back terminal (e.g. a blocking peer) needs
-    // no polling.
-    if let Some(outcome) = terminal_outcome(&task) {
-        return outcome;
-    }
-
-    // 2) poll a2a.GetTask until terminal or the deadline.
-    let get_params = json!({ "id": task_id });
-    loop {
-        if Instant::now() >= deadline {
-            return DelegateOutcome::Error(format!(
-                "a2a: delegation to peer timed out (task {task_id} still running)"
-            ));
-        }
-        std::thread::sleep(POLL_INTERVAL);
-        let task = match conn.call("a2a.GetTask", get_params.clone(), deadline) {
-            Ok(t) => t,
-            Err(e) => return DelegateOutcome::Error(e),
-        };
-        if let Some(outcome) = terminal_outcome(&task) {
-            return outcome;
-        }
-    }
 }
 
 /// Map a `Task` value to a terminal [`DelegateOutcome`], or `None` if it is still
@@ -223,6 +220,181 @@ impl HttpConn {
             }
         } else {
             Ok(Box::new(tcp))
+        }
+    }
+}
+
+impl HttpConn {
+    /// One `a2a.SendStreamingMessage` round trip: POST with
+    /// `Accept: text/event-stream`, then consume the SSE frames — working →
+    /// (artifact) → final — to a terminal outcome. Returns `Recover(task_id)`
+    /// when the terminal state must be fetched over unary GetTask instead: an
+    /// older peer answered `application/json` (its unary-final degradation —
+    /// the final frame names the task, the artifact rode a discarded frame), or
+    /// the stream broke after the run started. `Err` only when nothing was
+    /// started (safe for the caller to surface — the run is NOT duplicated).
+    fn call_streaming(
+        &mut self,
+        objective: &str,
+        output_contract: Option<&str>,
+        deadline: Instant,
+    ) -> Result<StreamOutcome, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message_id = mint_message_id();
+        let params = a2a::send_message_params(objective, output_contract, &message_id);
+        let req = Request::new(Id::Num(id), "a2a.SendStreamingMessage", Some(params));
+        let body =
+            serde_json::to_vec(&req).map_err(|e| format!("a2a: encode streaming send: {e}"))?;
+        // The read timeout must span the QUIET stretches of a long run; the
+        // server writes a keep-alive comment every ~15s, so 45s means three
+        // missed beats before the stream is declared dead.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = remaining
+            .min(Duration::from_secs(45))
+            .max(Duration::from_millis(1));
+        let stream = self.connect(timeout)?;
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("Content-Type", "application/json"),
+            ("Accept", "text/event-stream"),
+        ];
+        for (name, value) in &self.auth.headers {
+            headers.push((name.as_str(), value.as_str()));
+        }
+        let resp = crate::net::http::send_streaming(
+            stream,
+            &self.ep.host_header,
+            "POST",
+            &self.ep.path,
+            &headers,
+            &body,
+        )
+        .map_err(|e| format!("a2a: streaming send: {e}"))?;
+        if resp.status != 200 {
+            return Err(format!("a2a: SendStreamingMessage HTTP {}", resp.status));
+        }
+        let sse = resp
+            .header("content-type")
+            .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+        if !sse {
+            // An older peer's unary-final degradation: the whole body is ONE
+            // JSON-RPC response whose result is the final status frame. The run
+            // already happened — recover its artifacts via GetTask.
+            use std::io::Read as _;
+            let mut text = String::new();
+            let _ = resp
+                .into_reader()
+                .take(1 << 20)
+                .read_to_string(&mut text);
+            let frame: crate::json::Response = serde_json::from_str(text.trim())
+                .map_err(|e| format!("a2a: bad unary streaming reply: {e}"))?;
+            if let Some(err) = frame.error {
+                return Err(format!("a2a: streaming rpc error {}: {}", err.code, err.message));
+            }
+            let result = frame.result.unwrap_or(Value::Null);
+            // A Task-shaped reply that is already TERMINAL carries its artifacts —
+            // resolve it directly (no recovery round trip). Anything else that
+            // names a task (a working Task, a final statusUpdate frame whose
+            // artifact rode a discarded stream frame) is recovered via GetTask.
+            if let Some(outcome) = terminal_outcome(&result) {
+                return Ok(StreamOutcome::Done(outcome));
+            }
+            let task_id = result
+                .pointer("/statusUpdate/taskId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some(a2a::task_id_of(&result)).filter(|s| !s.is_empty()));
+            return match task_id {
+                Some(tid) => Ok(StreamOutcome::Recover(tid)),
+                None => Err("a2a: unary streaming reply named no task".into()),
+            };
+        }
+
+        // Consume the stream: statusUpdate frames carry the lifecycle (the one
+        // with final:true ends it), a completed run's artifactUpdate carries the
+        // distillate just before.
+        let mut events = resp.sse();
+        let mut task_id: Option<String> = None;
+        let mut distillate: Option<String> = None;
+        loop {
+            if Instant::now() >= deadline {
+                return match task_id {
+                    Some(tid) => Ok(StreamOutcome::Recover(tid)),
+                    None => Err("a2a: deadline while streaming".into()),
+                };
+            }
+            let ev = match events.next_event() {
+                Ok(Some(ev)) => ev,
+                // EOF / a broken stream: the run may well be alive server-side —
+                // recover over GetTask when we know which task it is.
+                Ok(None) => {
+                    return match task_id {
+                        Some(tid) => Ok(StreamOutcome::Recover(tid)),
+                        None => Err("a2a: stream ended before any frame".into()),
+                    };
+                }
+                Err(e) => {
+                    return match task_id {
+                        Some(tid) => Ok(StreamOutcome::Recover(tid)),
+                        None => Err(format!("a2a: stream read: {e}")),
+                    };
+                }
+            };
+            if ev.data.trim().is_empty() {
+                continue;
+            }
+            let Ok(frame) = serde_json::from_str::<crate::json::Response>(ev.data.trim()) else {
+                continue; // an unparseable frame is skipped, not fatal
+            };
+            if let Some(err) = frame.error {
+                return Ok(StreamOutcome::Done(DelegateOutcome::Error(format!(
+                    "a2a: streaming rpc error {}: {}",
+                    err.code, err.message
+                ))));
+            }
+            let result = frame.result.unwrap_or(Value::Null);
+            if let Some(update) = result.get("statusUpdate") {
+                if let Some(tid) = update.get("taskId").and_then(Value::as_str) {
+                    task_id = Some(tid.to_string());
+                }
+                let state = update
+                    .pointer("/status/state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let is_final = update.get("final").and_then(Value::as_bool).unwrap_or(false);
+                if is_final {
+                    let outcome = match state {
+                        "TASK_STATE_COMPLETED" => match distillate {
+                            Some(text) => DelegateOutcome::Distillate(text),
+                            None => DelegateOutcome::Error(
+                                "a2a: remote completed without a distillate artifact".into(),
+                            ),
+                        },
+                        "TASK_STATE_REJECTED" => DelegateOutcome::Error(
+                            "a2a: remote agent rejected the objective".into(),
+                        ),
+                        "TASK_STATE_CANCELLED" | "TASK_STATE_CANCELED" => {
+                            DelegateOutcome::Error("a2a: remote task was canceled".into())
+                        }
+                        other => DelegateOutcome::Error(format!(
+                            "a2a: remote task ended {other}"
+                        )),
+                    };
+                    return Ok(StreamOutcome::Done(outcome));
+                }
+            } else if let Some(update) = result.get("artifactUpdate") {
+                if let Some(text) = update
+                    .pointer("/artifact/parts/0/text")
+                    .and_then(Value::as_str)
+                {
+                    distillate = Some(text.to_string());
+                }
+            }
+            // A full-Task frame (some peers stream the initial Task) is benign:
+            // capture its id and keep reading.
+            else if !a2a::task_id_of(&result).is_empty() {
+                task_id = Some(a2a::task_id_of(&result));
+            }
         }
     }
 }
@@ -369,6 +541,128 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// An SSE A2A fixture: answers the FIRST connection with a `text/event-stream`
+    /// of the given frames (each a StreamResponse result; wrapped in JSON-RPC
+    /// envelopes here), then — for recovery tests — answers every LATER
+    /// connection with unary JSON replies from `unary` (clamp-repeating the last).
+    fn serve_sse_fixture(frames: Vec<Value>, unary: Vec<Value>) -> String {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut first = true;
+            let mut uidx = 0usize;
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { continue };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                let mut req_id = json!(1);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).is_ok()
+                    && let Ok(rpc) = serde_json::from_slice::<Value>(&body)
+                {
+                    req_id = rpc["id"].clone();
+                }
+                if first {
+                    first = false;
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    );
+                    // A comment first — the client must skip keep-alives.
+                    let _ = stream.write_all(b": keep-alive\n\n");
+                    for f in &frames {
+                        let env = json!({"jsonrpc": "2.0", "id": req_id, "result": f});
+                        let _ = stream.write_all(format!("data: {env}\n\n").as_bytes());
+                    }
+                    let _ = stream.flush();
+                    continue; // close (drop) the stream after the frames
+                }
+                if unary.is_empty() {
+                    break;
+                }
+                let result = unary[uidx.min(unary.len() - 1)].clone();
+                uidx += 1;
+                let payload =
+                    json!({"jsonrpc": "2.0", "id": req_id, "result": result}).to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn status_frame(id: &str, state: &str, is_final: bool) -> Value {
+        json!({"statusUpdate": {"taskId": id, "contextId": "ctx", "status": {"state": state}, "final": is_final}})
+    }
+
+    #[test]
+    fn delegate_consumes_an_sse_stream_to_the_distillate_without_polling() {
+        let url = serve_sse_fixture(
+            vec![
+                status_frame("s-1", "TASK_STATE_WORKING", false),
+                json!({"artifactUpdate": {"taskId": "s-1", "contextId": "ctx", "artifact": {"artifactId": "s-1.distillate", "parts": [{"text": "streamed answer"}]}, "lastChunk": true}}),
+                status_frame("s-1", "TASK_STATE_COMPLETED", true),
+            ],
+            Vec::new(), // NO unary replies — any poll would hang up and fail
+        );
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+            DelegateOutcome::Distillate(s) => assert_eq!(s, "streamed answer"),
+            DelegateOutcome::Error(e) => panic!("expected streamed distillate: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_broken_stream_recovers_over_get_task() {
+        // The stream dies after WORKING (no final frame); the client recovers the
+        // terminal Task over unary GetTask instead of erroring or re-sending.
+        let url = serve_sse_fixture(
+            vec![status_frame("s-2", "TASK_STATE_WORKING", false)],
+            vec![task("s-2", TaskState::Completed, Some("recovered answer"))],
+        );
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+            DelegateOutcome::Distillate(s) => assert_eq!(s, "recovered answer"),
+            DelegateOutcome::Error(e) => panic!("expected recovery: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_final_failed_stream_frame_is_a_terminal_error() {
+        let url = serve_sse_fixture(
+            vec![
+                status_frame("s-3", "TASK_STATE_WORKING", false),
+                status_frame("s-3", "TASK_STATE_FAILED", true),
+            ],
+            Vec::new(),
+        );
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+            DelegateOutcome::Error(e) => assert!(e.contains("FAILED"), "{e}"),
+            DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
+        }
     }
 
     #[test]

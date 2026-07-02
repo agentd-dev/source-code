@@ -12,6 +12,7 @@
 //! [`Assign`](Node::Assign) (pure data shaping), [`Infer`](Node::Infer) (one
 //! schema-checked structured intelligence call), [`Branch`](Node::Branch)
 //! (deterministic predicates + an optional semantic judgement),
+//! [`Foreach`](Node::Foreach) (deterministic fan-out over an array),
 //! [`Wait`](Node::Wait) (suspend on a resource), [`Subgraph`](Node::Subgraph),
 //! and [`Halt`](Node::Halt).
 //!
@@ -27,12 +28,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod driver;
 pub use driver::{
-    drive, drive_budgeted, resume, Blackboard, DriveResult, GraphBudget, GraphExec,
-    GraphOutcome, GraphState, GraphStatus, Suspension, WaitOutcome, MAX_VALUE_BYTES,
+    drive, drive_budgeted, drive_seeded, resume, Blackboard, DriveResult, GraphBudget,
+    GraphExec, GraphOutcome, GraphState, GraphStatus, Suspension, WaitOutcome,
+    MAX_VALUE_BYTES,
 };
 
 mod exec;
-pub use exec::{drive_connected, drive_pinned, SessionExec, GRAPH_MAX_STEPS};
+pub use exec::{drive_connected, drive_pinned, ExecFactory, SessionExec, GRAPH_MAX_STEPS};
 
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;
@@ -102,6 +104,13 @@ pub const MAX_RETRY: u32 = 5;
 pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 /// `Infer` re-ask cap: at most this many validation-feedback re-asks.
 pub const MAX_INFER_RETRIES: u32 = 3;
+/// `Foreach` item ceiling — the fan-out primitive is for work batches, not
+/// unbounded datasets; an oversized array is an error edge, never a surprise
+/// month-long walk.
+pub const MAX_FOREACH_ITEMS: usize = 1024;
+/// `Foreach` parallel-lane ceiling (each lane is a worker with its own
+/// intelligence + MCP connections).
+pub const MAX_FOREACH_PARALLEL: u32 = 8;
 
 /// An in-node retry policy for the effectful kinds (`Agent`/`Tool`/`Infer`): on an
 /// error result, re-run the SAME node up to `max` more times (each attempt charges
@@ -116,6 +125,18 @@ pub struct Retry {
     /// Sleep between attempts, in ms (0..=MAX_RETRY_BACKOFF_MS).
     #[serde(default)]
     pub backoff_ms: u64,
+}
+
+/// How a [`Node::Foreach`] treats a failing item: stop at the first failure
+/// (the default — the error edge fires with the partial results), or keep
+/// going and record a per-item error marker in the results array (the `ok`
+/// edge fires; the author branches on the results content).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnError {
+    #[default]
+    FailFast,
+    Continue,
 }
 
 /// The primitive type an [`Node::Infer`] schema field must satisfy. Deliberately a
@@ -192,8 +213,12 @@ pub fn resolve_refs(
                         return Err(format!("unknown key {k:?} in a $from reference"));
                     }
                 }
-                let pointer = map.get("pointer").and_then(Value::as_str).unwrap_or("");
-                match blackboard.get(key).and_then(|v| v.pointer(pointer)) {
+                let raw_pointer = map.get("pointer").and_then(Value::as_str).unwrap_or("");
+                // Computed segments: `{bbkey}` inside the pointer expands to the
+                // stringified SCALAR at blackboard[bbkey] — so a loop-carried
+                // index addresses `/items/{index}` dynamically.
+                let pointer = expand_pointer(raw_pointer, blackboard)?;
+                match blackboard.get(key).and_then(|v| v.pointer(&pointer)) {
                     Some(v) => Ok(v.clone()),
                     None => match map.get("default") {
                         Some(d) => Ok(d.clone()),
@@ -219,6 +244,50 @@ pub fn resolve_refs(
         }
         v => Ok(v.clone()),
     }
+}
+
+/// Expand `{bbkey}` placeholders inside an RFC 6901 pointer with the
+/// stringified SCALAR (string/number/bool) at `blackboard[bbkey]` — the
+/// computed-index primitive (`/items/{index}`). A placeholder whose key is
+/// missing or non-scalar is an error (the node takes its `error` edge). RFC
+/// 6901 escaping is applied to expanded STRING values (`~` → `~0`, `/` → `~1`)
+/// so a key containing a slash cannot smuggle in extra path segments.
+fn expand_pointer(
+    pointer: &str,
+    blackboard: &BTreeMap<String, Value>,
+) -> Result<String, String> {
+    if !pointer.contains('{') {
+        return Ok(pointer.to_string());
+    }
+    let mut out = String::with_capacity(pointer.len());
+    let mut rest = pointer;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            return Err(format!("unclosed '{{' in pointer {pointer:?}"));
+        };
+        let key = &after[..close];
+        let seg = match blackboard.get(key) {
+            Some(Value::String(s)) => s.replace('~', "~0").replace('/', "~1"),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::Bool(b)) => b.to_string(),
+            Some(_) => {
+                return Err(format!(
+                    "pointer placeholder {{{key}}} is not a scalar blackboard value"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "pointer placeholder {{{key}}} has no blackboard value"
+                ));
+            }
+        };
+        out.push_str(&seg);
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// A graph node. Internally tagged by `kind` so the author writes
@@ -298,6 +367,29 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
+    /// Fan OUT over an array — the deterministic map primitive: resolve `items`
+    /// (a `{"$from": …}` reference or a literal array), then run the `body`
+    /// subgraph once per element. Each iteration gets a SCOPED blackboard: a
+    /// clone of the parent board with `item` (the element) and `index` (its
+    /// position) seeded — body writes do NOT flow back; only each body's halt
+    /// result does, collected POSITIONALLY into `writes` (a failed item's slot
+    /// carries `{"index", "error"}`). `parallel` > 1 runs items on that many
+    /// worker lanes, each with its own intelligence/MCP connections. A body of
+    /// pure tool/assign/branch nodes costs ZERO model tokens per item — this is
+    /// how a big array is processed without exhausting the LLM. Emits
+    /// `ok`/`error` per [`OnError`].
+    Foreach {
+        items: Value,
+        body: Box<Graph>,
+        #[serde(default = "default_parallel")]
+        parallel: u32,
+        #[serde(default)]
+        on_error: OnError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writes: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        edges: BTreeMap<EdgeLabel, NodeId>,
+    },
     /// Branch on the blackboard: the first deterministic `case` whose predicate holds
     /// wins (Tier 1, free). If NONE match and an opt-in [`SemanticSpec`] is present, a
     /// single model judgement (Tier 2) picks a labelled choice; otherwise `default`.
@@ -340,6 +432,10 @@ pub enum Node {
 }
 
 fn default_infer_retries() -> u32 {
+    1
+}
+
+fn default_parallel() -> u32 {
     1
 }
 
@@ -392,33 +488,35 @@ pub enum Pred {
         pointer: String,
         value: Value,
     },
-    /// Numerically less-than `value`.
+    /// Numerically less-than `value` (a literal number, or a `{"$from": …}`
+    /// reference to compare against another blackboard value).
     Lt {
         key: String,
         #[serde(default)]
         pointer: String,
-        value: f64,
+        value: Value,
     },
-    /// Numerically greater-than `value`.
+    /// Numerically greater-than `value` (a literal number, or a `{"$from": …}`
+    /// reference to compare against another blackboard value).
     Gt {
         key: String,
         #[serde(default)]
         pointer: String,
-        value: f64,
+        value: Value,
     },
-    /// Numerically less-than-or-equal `value`.
+    /// Numerically less-than-or-equal `value` (literal or `$from` reference).
     Lte {
         key: String,
         #[serde(default)]
         pointer: String,
-        value: f64,
+        value: Value,
     },
-    /// Numerically greater-than-or-equal `value`.
+    /// Numerically greater-than-or-equal `value` (literal or `$from` reference).
     Gte {
         key: String,
         #[serde(default)]
         pointer: String,
-        value: f64,
+        value: Value,
     },
     /// The value deep-equals ONE of `values` (set membership).
     In {
@@ -473,27 +571,57 @@ pub enum Pred {
     Not { pred: Box<Pred> },
 }
 
+/// Resolve a predicate's comparison VALUE: a `{"$from": key[, "pointer": p]}`
+/// object reads the blackboard (CROSS-KEY comparison — branch on one value
+/// against another); anything else is the literal itself. `None` when a
+/// reference does not resolve — the enclosing predicate is then `false`
+/// (fail-closed, even for `ne`: an unknown right-hand side compares to nothing).
+fn pred_value<'a>(
+    value: &'a Value,
+    blackboard: &'a BTreeMap<String, Value>,
+) -> Option<&'a Value> {
+    match value {
+        Value::Object(m) if m.contains_key("$from") => {
+            let key = m.get("$from")?.as_str()?;
+            let pointer = m.get("pointer").and_then(Value::as_str).unwrap_or("");
+            let pointer = expand_pointer(pointer, blackboard).ok()?;
+            blackboard.get(key)?.pointer(&pointer)
+        }
+        v => Some(v),
+    }
+}
+
 impl Pred {
     /// Evaluate against the blackboard. Total — a missing key/pointer is `false`
     /// (never panics), so an incomplete blackboard just fails the predicate.
     pub fn eval(&self, blackboard: &BTreeMap<String, Value>) -> bool {
         match self {
-            Pred::Eq { key, pointer, value } => at(blackboard, key, pointer) == Some(value),
-            Pred::Ne { key, pointer, value } => at(blackboard, key, pointer) != Some(value),
-            Pred::Lt { key, pointer, value } => at(blackboard, key, pointer)
-                .and_then(Value::as_f64)
-                .is_some_and(|x| x < *value),
-            Pred::Gt { key, pointer, value } => at(blackboard, key, pointer)
-                .and_then(Value::as_f64)
-                .is_some_and(|x| x > *value),
-            Pred::Lte { key, pointer, value } => at(blackboard, key, pointer)
-                .and_then(Value::as_f64)
-                .is_some_and(|x| x <= *value),
-            Pred::Gte { key, pointer, value } => at(blackboard, key, pointer)
-                .and_then(Value::as_f64)
-                .is_some_and(|x| x >= *value),
+            Pred::Eq { key, pointer, value } => {
+                match (at(blackboard, key, pointer), pred_value(value, blackboard)) {
+                    (Some(l), Some(r)) => l == r,
+                    _ => false,
+                }
+            }
+            Pred::Ne { key, pointer, value } => match pred_value(value, blackboard) {
+                // An absent LEFT side is "not equal" (as before); an unresolvable
+                // RIGHT-side reference is fail-closed false.
+                Some(r) => at(blackboard, key, pointer) != Some(r),
+                None => false,
+            },
+            Pred::Lt { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
+                .is_some_and(|(l, r)| l < r),
+            Pred::Gt { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
+                .is_some_and(|(l, r)| l > r),
+            Pred::Lte { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
+                .is_some_and(|(l, r)| l <= r),
+            Pred::Gte { key, pointer, value } => num_cmp(blackboard, key, pointer, value)
+                .is_some_and(|(l, r)| l >= r),
             Pred::In { key, pointer, values } => {
-                at(blackboard, key, pointer).is_some_and(|v| values.contains(v))
+                at(blackboard, key, pointer).is_some_and(|l| {
+                    values
+                        .iter()
+                        .any(|v| pred_value(v, blackboard).is_some_and(|r| r == l))
+                })
             }
             Pred::StartsWith { key, pointer, value } => at(blackboard, key, pointer)
                 .and_then(Value::as_str)
@@ -515,11 +643,18 @@ impl Pred {
             Pred::Exists { key, pointer } => {
                 at(blackboard, key, pointer).is_some_and(|v| !v.is_null())
             }
-            Pred::Contains { key, pointer, value } => match at(blackboard, key, pointer) {
-                Some(Value::String(s)) => value.as_str().is_some_and(|needle| s.contains(needle)),
-                Some(Value::Array(a)) => a.contains(value),
-                _ => false,
-            },
+            Pred::Contains { key, pointer, value } => {
+                let Some(needle) = pred_value(value, blackboard) else {
+                    return false;
+                };
+                match at(blackboard, key, pointer) {
+                    Some(Value::String(s)) => {
+                        needle.as_str().is_some_and(|n| s.contains(n))
+                    }
+                    Some(Value::Array(a)) => a.contains(needle),
+                    _ => false,
+                }
+            }
             Pred::All { preds } => preds.iter().all(|p| p.eval(blackboard)),
             Pred::Any { preds } => preds.iter().any(|p| p.eval(blackboard)),
             Pred::Not { pred } => !pred.eval(blackboard),
@@ -554,6 +689,20 @@ fn at<'a>(blackboard: &'a BTreeMap<String, Value>, key: &str, pointer: &str) -> 
     blackboard.get(key)?.pointer(pointer)
 }
 
+/// Resolve both sides of a numeric comparison: the left path and the right
+/// literal-or-reference, as f64s. `None` (→ predicate false) when either side
+/// is absent or non-numeric.
+fn num_cmp(
+    blackboard: &BTreeMap<String, Value>,
+    key: &str,
+    pointer: &str,
+    value: &Value,
+) -> Option<(f64, f64)> {
+    let l = at(blackboard, key, pointer).and_then(Value::as_f64)?;
+    let r = pred_value(value, blackboard).and_then(Value::as_f64)?;
+    Some((l, r))
+}
+
 impl Node {
     /// Every node id this node can transfer control to — for reachability + dangling
     /// validation, regardless of node kind. A `Halt` has none (it terminates).
@@ -563,6 +712,7 @@ impl Node {
             | Node::Tool { edges, .. }
             | Node::Assign { edges, .. }
             | Node::Infer { edges, .. }
+            | Node::Foreach { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges.values().collect(),
             Node::Branch { cases, default, semantic } => {
@@ -591,6 +741,7 @@ impl Node {
             | Node::Tool { edges, .. }
             | Node::Assign { edges, .. }
             | Node::Infer { edges, .. }
+            | Node::Foreach { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges,
             Node::Branch { .. } => return Err("cannot add an edge to a Branch (use cases)".into()),
@@ -611,6 +762,7 @@ impl Node {
             Node::Agent { writes, .. }
             | Node::Tool { writes, .. }
             | Node::Infer { writes, .. }
+            | Node::Foreach { writes, .. }
             | Node::Wait { writes, .. }
             | Node::Subgraph { writes, .. } => writes.as_deref(),
             Node::Assign { writes, .. } => Some(writes),
@@ -720,6 +872,16 @@ impl Graph {
                             errs.push(format!("Branch node {id:?} case {i}: {msg}"));
                         }
                     }
+                }
+                Node::Foreach { body, parallel, .. } => {
+                    if *parallel == 0 || *parallel > MAX_FOREACH_PARALLEL {
+                        errs.push(format!(
+                            "Foreach node {id:?} parallel must be 1..={MAX_FOREACH_PARALLEL} (got {parallel})"
+                        ));
+                    }
+                    // The body is a nested workflow — it counts against the same
+                    // nesting depth Subgraph does.
+                    body.validate_into(depth + 1, errs);
                 }
                 Node::Subgraph { graph, .. } => graph.validate_into(depth + 1, errs),
                 _ => {}
@@ -950,7 +1112,7 @@ mod tests {
         let gt = Pred::Gt {
             key: "item".into(),
             pointer: "/n".into(),
-            value: 5.0,
+            value: json!(5.0),
         };
         assert!(gt.eval(&bb));
         // Composition + missing paths are false, never panics.
@@ -1181,6 +1343,96 @@ mod tests {
         assert_eq!(g, back);
         assert!(matches!(g.nodes["a"], Node::Assign { .. }));
         assert!(matches!(g.nodes["i"], Node::Infer { .. }));
+    }
+
+    #[test]
+    fn computed_pointer_segments_expand_from_the_blackboard() {
+        let mut bb = BTreeMap::new();
+        bb.insert("scan".to_string(), json!({"items": [10, 20, 30]}));
+        bb.insert("index".to_string(), json!(2));
+        bb.insert("field".to_string(), json!("a/b"));
+        bb.insert("obj".to_string(), json!({"a/b": "slashed"}));
+        // {index} expands to the scalar → /items/2.
+        let v = resolve_refs(
+            &json!({"$from": "scan", "pointer": "/items/{index}"}),
+            &bb,
+        )
+        .unwrap();
+        assert_eq!(v, json!(30));
+        // A string segment is RFC-6901-escaped (a slash can't add path levels).
+        let v = resolve_refs(&json!({"$from": "obj", "pointer": "/{field}"}), &bb).unwrap();
+        assert_eq!(v, json!("slashed"));
+        // Missing placeholder key / non-scalar / unclosed brace → errors.
+        assert!(resolve_refs(&json!({"$from": "scan", "pointer": "/items/{ghost}"}), &bb).is_err());
+        assert!(resolve_refs(&json!({"$from": "scan", "pointer": "/items/{scan}"}), &bb).is_err());
+        assert!(resolve_refs(&json!({"$from": "scan", "pointer": "/items/{index"}), &bb).is_err());
+    }
+
+    #[test]
+    fn predicates_compare_across_blackboard_keys() {
+        let mut bb = BTreeMap::new();
+        bb.insert("a".to_string(), json!({"n": 7, "tag": "x"}));
+        bb.insert("b".to_string(), json!({"n": 7, "limit": 5}));
+        let p = |v: serde_json::Value| -> Pred { serde_json::from_value(v).unwrap() };
+        // eq across two keys.
+        assert!(p(json!({"op":"eq","key":"a","pointer":"/n","value":{"$from":"b","pointer":"/n"}})).eval(&bb));
+        // numeric compare against a referenced value.
+        assert!(p(json!({"op":"gt","key":"a","pointer":"/n","value":{"$from":"b","pointer":"/limit"}})).eval(&bb));
+        // in with a referenced element.
+        assert!(p(json!({"op":"in","key":"a","pointer":"/tag","values":[{"$from":"a","pointer":"/tag"}]})).eval(&bb));
+        // An unresolvable REFERENCE is fail-closed false — even for ne.
+        assert!(!p(json!({"op":"ne","key":"a","pointer":"/n","value":{"$from":"ghost"}})).eval(&bb));
+        assert!(!p(json!({"op":"eq","key":"a","pointer":"/n","value":{"$from":"ghost"}})).eval(&bb));
+        // Literals still work exactly as before.
+        assert!(p(json!({"op":"gte","key":"a","pointer":"/n","value":7})).eval(&bb));
+    }
+
+    #[test]
+    fn foreach_round_trips_and_validates_caps() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "fan",
+            "nodes": {
+                "fan": {
+                    "kind": "foreach",
+                    "items": {"$from": "scan", "pointer": "/items"},
+                    "body": {
+                        "start": "work",
+                        "nodes": {
+                            "work": {"kind": "assign", "value": {"$from": "item"}, "writes": "out", "edges": {"ok": "h"}},
+                            "h": {"kind": "halt", "status": "completed", "result_from": "out"}
+                        }
+                    },
+                    "parallel": 4,
+                    "on_error": "continue",
+                    "writes": "results",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "results"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let wire = serde_json::to_value(&g).unwrap();
+        let back: Graph = serde_json::from_value(wire).unwrap();
+        assert_eq!(g, back);
+        // parallel out of range is rejected; a bad BODY is caught recursively.
+        let bad: Graph = serde_json::from_value(json!({
+            "start": "fan",
+            "nodes": {
+                "fan": {
+                    "kind": "foreach", "items": [],
+                    "body": {"start": "x", "nodes": {"x": {"kind": "assign", "value": 1, "writes": "o", "edges": {"ok": "ghost"}}}},
+                    "parallel": 99,
+                    "edges": {"ok": "done"}
+                },
+                "done": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = bad.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("parallel must be")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("unknown node \"ghost\"")), "{errs:?}");
     }
 
     #[test]

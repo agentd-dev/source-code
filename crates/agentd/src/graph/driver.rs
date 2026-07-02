@@ -17,7 +17,7 @@
 //! persists, watches, and hands back to [`resume`]. `Subgraph` (P5), a dangling edge,
 //! or an unhandled label fail CLOSED (`Crashed`) rather than panicking.
 
-use super::{FieldType, Graph, Node, NodeId, Retry};
+use super::{FieldType, Graph, Node, NodeId, OnError, Retry};
 use crate::agentloop::stop::TerminalStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -286,6 +286,46 @@ pub trait GraphExec {
     fn deadline_exceeded(&self) -> bool {
         false
     }
+
+    /// Run ONE `Foreach` body iteration on its scoped, pre-seeded blackboard,
+    /// returning the body's projected result + whether it failed to complete.
+    /// The production impl drives it inline (waits resolved); the default errs —
+    /// an executor without body support degrades to the Foreach `error` edge.
+    fn run_body(&mut self, _body: &Graph, _seed: Blackboard) -> (Value, bool) {
+        (
+            Value::String("this executor cannot run a foreach body".into()),
+            true,
+        )
+    }
+
+    /// Run a batch of `Foreach` iterations, up to `parallel` at a time. Returns
+    /// one `(index, result, is_error)` per seed, ANY order (the driver restores
+    /// positions). Default: sequential over [`GraphExec::run_body`] — a correct
+    /// fallback for any executor; the production impl overrides with worker
+    /// lanes that own their own connections.
+    fn run_body_parallel(
+        &mut self,
+        body: &Graph,
+        seeds: Vec<(usize, Blackboard)>,
+        _parallel: u32,
+    ) -> Vec<(usize, Value, bool)> {
+        seeds
+            .into_iter()
+            .map(|(i, seed)| {
+                let (v, e) = self.run_body(body, seed);
+                (i, v, e)
+            })
+            .collect()
+    }
+}
+
+/// Build one `Foreach` iteration's scoped blackboard: the parent board (cloned —
+/// body writes never flow back) + the reserved `item` / `index` keys.
+fn foreach_seed(parent: &Blackboard, index: usize, item: &Value) -> Blackboard {
+    let mut seed = parent.clone();
+    seed.insert("item".to_string(), item.clone());
+    seed.insert("index".to_string(), Value::from(index as u64));
+    seed
 }
 
 /// Per-blackboard-value size cap (serialized bytes). The blackboard is shared
@@ -379,6 +419,19 @@ pub fn drive_budgeted(
     max_tokens: u64,
 ) -> DriveResult {
     let mut state = GraphState::new(graph.start.clone(), max_steps, max_tokens);
+    drive_state(graph, &mut state, exec)
+}
+
+/// [`drive`] starting from a PRE-SEEDED blackboard — the `Foreach` body entry
+/// (each iteration's scoped board carries the parent values + `item`/`index`).
+pub fn drive_seeded(
+    graph: &Graph,
+    exec: &mut dyn GraphExec,
+    max_steps: u32,
+    seed: Blackboard,
+) -> DriveResult {
+    let mut state = GraphState::new(graph.start.clone(), max_steps, u64::MAX);
+    state.blackboard = seed;
     drive_state(graph, &mut state, exec)
 }
 
@@ -634,6 +687,40 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
+            // Fan OUT over an array (the deterministic map primitive): resolve the
+            // items, run the body per element on a scoped board, collect results
+            // positionally. Every ITEM charges a budget step; the wall deadline is
+            // honoured between items; body model usage lands on the shared token
+            // pool. A tool/assign-only body costs zero model tokens per item.
+            Node::Foreach { items, body, parallel, on_error, writes, edges } => {
+                let (val, is_err) = match super::resolve_refs(items, &state.blackboard) {
+                    Err(e) => (Value::String(format!("foreach items: {e}")), true),
+                    Ok(Value::Array(arr)) if arr.len() > super::MAX_FOREACH_ITEMS => (
+                        Value::String(format!(
+                            "foreach: {} items exceeds the cap of {}",
+                            arr.len(),
+                            super::MAX_FOREACH_ITEMS
+                        )),
+                        true,
+                    ),
+                    Ok(Value::Array(arr)) => {
+                        match run_foreach(arr, body, *parallel, *on_error, state, exec) {
+                            Ok(r) => r,
+                            Err(done) => return *done,
+                        }
+                    }
+                    Ok(other) => (
+                        Value::String(format!(
+                            "foreach: items must resolve to an array (got {})",
+                            kind_of(&other)
+                        )),
+                        true,
+                    ),
+                };
+                let (val, is_err) = clamp_value(val, is_err);
+                write(&mut state.blackboard, writes, val);
+                (edge_for(is_err), edges)
+            }
             // Subgraph: run the nested graph through the exec seam (the real impl
             // spawns a capped subtree), write its result, follow ok/error.
             Node::Subgraph { graph: sub, async_, writes, edges } => {
@@ -666,6 +753,98 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 ));
             }
         }
+    }
+}
+
+/// Execute a `Foreach`'s items: sequentially (per-item budget/deadline checks)
+/// or as a parallel batch (steps pre-charged; the exec owns the lanes). Returns
+/// the positional results value + whether the node errs, or `Err(done)` when a
+/// budget/deadline guard terminates the whole walk mid-iteration.
+fn run_foreach(
+    arr: Vec<Value>,
+    body: &Graph,
+    parallel: u32,
+    on_error: OnError,
+    state: &mut GraphState,
+    exec: &mut dyn GraphExec,
+) -> Result<(Value, bool), Box<DriveResult>> {
+    let total = arr.len();
+    let mut results: Vec<Value> = Vec::with_capacity(total);
+    let mut any_failed = false;
+
+    if parallel > 1 && total > 1 {
+        // Parallel batch: pre-charge one step per item (refuse before running
+        // anything the budget can't cover), then hand the lanes to the exec.
+        for _ in 0..total {
+            if !state.budget.step() {
+                return Err(Box::new(exhausted(state, "step budget exhausted (foreach pre-charge)")));
+            }
+        }
+        let seeds: Vec<(usize, Blackboard)> = arr
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (i, foreach_seed(&state.blackboard, i, item)))
+            .collect();
+        let mut batch = exec.run_body_parallel(body, seeds, parallel);
+        batch.sort_by_key(|(i, _, _)| *i);
+        results = vec![Value::Null; total];
+        for (i, v, e) in batch {
+            if e {
+                any_failed = true;
+                results[i] = serde_json::json!({"index": i, "error": v});
+            } else {
+                results[i] = v;
+            }
+        }
+        if let Some(done) = charge(state, exec) {
+            return Err(Box::new(done));
+        }
+        if any_failed && on_error == OnError::FailFast {
+            return Ok((Value::Array(results), true));
+        }
+    } else {
+        for (i, item) in arr.iter().enumerate() {
+            if exec.deadline_exceeded() {
+                // Mark the unprocessed tail rather than silently shortening the
+                // array — positional integrity for downstream consumers.
+                for j in i..total {
+                    results.push(serde_json::json!({"index": j, "error": "workflow deadline exceeded"}));
+                }
+                return Ok((Value::Array(results), true));
+            }
+            if !state.budget.step() {
+                return Err(Box::new(exhausted(state, "step budget exhausted mid-foreach")));
+            }
+            let seed = foreach_seed(&state.blackboard, i, item);
+            let (v, e) = exec.run_body(body, seed);
+            if let Some(done) = charge(state, exec) {
+                return Err(Box::new(done));
+            }
+            if e {
+                any_failed = true;
+                results.push(serde_json::json!({"index": i, "error": v}));
+                if on_error == OnError::FailFast {
+                    return Ok((Value::Array(results), true));
+                }
+            } else {
+                results.push(v);
+            }
+        }
+    }
+    // `continue` reports ok with per-item markers in place; `fail_fast` only
+    // reaches here failure-free.
+    Ok((Value::Array(results), any_failed && on_error == OnError::FailFast))
+}
+
+/// The JSON kind name (for the foreach items type error).
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -859,6 +1038,14 @@ mod tests {
         fn deadline_exceeded(&self) -> bool {
             self.deadline_after_calls
                 .is_some_and(|n| self.calls.len() >= n)
+        }
+
+        fn run_body(&mut self, body: &Graph, seed: Blackboard) -> (Value, bool) {
+            self.calls.push("body".to_string());
+            match drive_seeded(body, self, 1000, seed) {
+                DriveResult::Done(o) => (o.result, o.status != GraphStatus::Completed),
+                DriveResult::Suspended(_) => (json!("body suspended"), true),
+            }
         }
 
         fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _bb: &Blackboard) -> (Value, bool) {
@@ -1643,6 +1830,168 @@ mod tests {
         );
         let stored = serde_json::to_string(&out.result).unwrap();
         assert!(stored.len() < 1024, "the marker is small: {} bytes", stored.len());
+    }
+
+    // ── W6: foreach — the deterministic fan-out primitive ────────────────────
+
+    /// scan (tool: returns an items array) → fan (foreach: tool body per item,
+    /// args computed from the scoped `item`) → done. NO agent nodes anywhere —
+    /// the whole fan-out costs zero model calls.
+    fn fanout_graph(on_error: &str, parallel: u32) -> Graph {
+        serde_json::from_value(json!({
+            "start": "scan",
+            "nodes": {
+                "scan": {"kind": "tool", "server": "q", "tool": "scan", "writes": "scan", "edges": {"ok": "fan", "error": "fail"}},
+                "fan": {
+                    "kind": "foreach",
+                    "items": {"$from": "scan", "pointer": "/items"},
+                    "body": {
+                        "start": "handle",
+                        "nodes": {
+                            "handle": {"kind": "tool", "server": "q", "tool": "handle", "args": {"id": {"$from": "item", "pointer": "/id"}, "pos": {"$from": "index"}}, "writes": "out", "edges": {"ok": "bh", "error": "bf"}},
+                            "bh": {"kind": "halt", "status": "completed", "result_from": "out"},
+                            "bf": {"kind": "halt", "status": "crashed", "result_from": "out"}
+                        }
+                    },
+                    "parallel": parallel,
+                    "on_error": on_error,
+                    "writes": "results",
+                    "edges": {"ok": "done", "error": "fail"}
+                },
+                "done": {"kind": "halt", "status": "completed", "result_from": "results"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "results"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn foreach_fans_out_over_an_array_without_any_model_call() {
+        let g = fanout_graph("fail_fast", 1);
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.tools.insert(
+            "q.scan".into(),
+            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}), false),
+        );
+        exec.tools.insert("q.handle".into(), (json!("handled"), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.reason);
+        assert_eq!(out.result, json!(["handled", "handled", "handled"]));
+        // The per-item tool calls received the SCOPED item/index via $from.
+        let handle_args: Vec<&Value> =
+            exec.tool_args.iter().filter(|a| a.get("id").is_some()).collect();
+        assert_eq!(handle_args.len(), 3);
+        assert_eq!(handle_args[0], &json!({"id": "a", "pos": 0}));
+        assert_eq!(handle_args[2], &json!({"id": "c", "pos": 2}));
+        // ZERO model involvement: no agent/infer/judge calls anywhere.
+        assert!(
+            !exec.calls.iter().any(|c| c.starts_with("agent:")
+                || c.starts_with("infer:")
+                || c.starts_with("judge:")),
+            "{:?}",
+            exec.calls
+        );
+        // Steps: scan + fan visit + 3 items + (body nodes are inner budget) + done.
+        assert!(out.steps >= 5, "items charged: {}", out.steps);
+    }
+
+    #[test]
+    fn foreach_continue_records_per_item_errors_positionally() {
+        let g = fanout_graph("continue", 1);
+        let mut exec = MockExec::default();
+        exec.tools.insert(
+            "q.scan".into(),
+            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}), false),
+        );
+        // b fails, a and c succeed.
+        exec.tool_seq.insert(
+            "q.handle".into(),
+            vec![
+                (json!("ok-a"), false),
+                (json!("boom-b"), true),
+                (json!("ok-c"), false),
+            ]
+            .into(),
+        );
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed, "continue → ok edge");
+        let arr = out.result.as_array().unwrap();
+        assert_eq!(arr.len(), 3, "positional integrity");
+        assert_eq!(arr[0], json!("ok-a"));
+        assert_eq!(arr[1]["index"], json!(1), "failed slot carries the marker");
+        assert!(arr[1]["error"].as_str().unwrap().contains("boom-b"));
+        assert_eq!(arr[2], json!("ok-c"));
+    }
+
+    #[test]
+    fn foreach_fail_fast_stops_at_the_first_failure() {
+        let g = fanout_graph("fail_fast", 1);
+        let mut exec = MockExec::default();
+        exec.tools.insert(
+            "q.scan".into(),
+            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}), false),
+        );
+        exec.tool_seq.insert(
+            "q.handle".into(),
+            vec![(json!("ok-a"), false), (json!("boom"), true)].into(),
+        );
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge");
+        let arr = out.result.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "stopped after the failure — c never ran");
+    }
+
+    #[test]
+    fn foreach_parallel_batch_restores_positions() {
+        // parallel=3 through the DEFAULT (sequential fallback) batch hook: the
+        // pre-charge + index restoration paths are exercised regardless of lanes.
+        let g = fanout_graph("continue", 3);
+        let mut exec = MockExec::default();
+        exec.tools.insert(
+            "q.scan".into(),
+            (json!({"items": [{"id": "a"}, {"id": "b"}]}), false),
+        );
+        exec.tool_seq.insert(
+            "q.handle".into(),
+            vec![(json!("first"), false), (json!("second"), false)].into(),
+        );
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(out.result, json!(["first", "second"]));
+    }
+
+    #[test]
+    fn foreach_guards_items_shape_and_budget() {
+        // Non-array items → error edge with the kind named.
+        let g = fanout_graph("fail_fast", 1);
+        let mut exec = MockExec::default();
+        exec.tools
+            .insert("q.scan".into(), (json!({"items": "not-an-array"}), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
+        assert!(
+            out.result.as_str().unwrap().contains("must resolve to an array"),
+            "{:?}",
+            out.result
+        );
+        // Step budget exhausts MID-foreach (budget 4: scan + fan + 2 items).
+        let g = fanout_graph("fail_fast", 1);
+        let mut exec = MockExec::default();
+        exec.tools.insert(
+            "q.scan".into(),
+            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}]}), false),
+        );
+        exec.tools.insert("q.handle".into(), (json!("x"), false));
+        let DriveResult::Done(out) = drive(&g, &mut exec, 4) else {
+            panic!("terminates");
+        };
+        assert_eq!(out.status, GraphStatus::Exhausted);
+        assert!(
+            out.reason.as_deref().unwrap().contains("foreach"),
+            "{:?}",
+            out.reason
+        );
     }
 
     #[test]

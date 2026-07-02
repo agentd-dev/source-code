@@ -112,9 +112,15 @@ RFC 6901 pointer `/id`. `pointer` and `default` are optional; a missing path
 node's `error` edge before any tool is called. An unknown extra key in a
 reference object is rejected (a typo shield).
 
+Pointers support **computed segments**: `{bbkey}` expands to the stringified
+scalar at `blackboard[bbkey]`, so `"pointer": "/items/{index}"` addresses a
+loop-carried position dynamically. Expanded string values are RFC-6901-escaped
+(a value containing `/` cannot smuggle in extra path levels); a missing or
+non-scalar placeholder takes the `error` edge.
+
 ### Node kinds
 
-Every node has a `kind`. There are eight:
+Every node has a `kind`. There are nine:
 
 | Kind | Does | Key fields | Emits |
 |---|---|---|---|
@@ -123,6 +129,7 @@ Every node has a `kind`. There are eight:
 | `assign` | Pure data shaping — resolves a `value` template (with `$from` references) and writes it. No model, no tool. | `value`, `writes`, `edges` | `ok` / `error` |
 | `infer` | ONE structured intelligence call: the model answers `prompt` as a JSON object satisfying `schema` (field → type); invalid answers are automatically re-asked with the validation errors, up to `retries` times. | `prompt`, `schema`, `reads?`, `writes?`, `retries?`, `retry?`, `edges` | `ok` / `error` |
 | `branch` | Routes on the blackboard (see [Conditions](#conditions)). | `cases`, `default`, `semantic?` | (per-case goto) |
+| `foreach` | Fans out over an array (see [Fan-out](#foreach--deterministic-fan-out-over-an-array)): runs `body` once per item on a scoped board, collecting results positionally. | `items`, `body`, `parallel?`, `on_error?`, `writes?`, `edges` | `ok` / `error` |
 | `wait` | Suspends until `on_uri` updates or `timeout_ms` elapses, writing the read content. | `on_uri`, `timeout_ms`, `writes?`, `edges` | `updated` / `timeout` |
 | `subgraph` | Runs a nested workflow inline (waits included); writes its result. | `graph`, `writes?`, `edges` | `ok` / `error` |
 | `halt` | Terminates the workflow with an author-chosen status, projecting a result. | `status`, `result_from?` | — |
@@ -169,6 +176,56 @@ use `retry` for "try again", edges for "make progress".)
 
 ---
 
+## `foreach` — deterministic fan-out over an array
+
+The map primitive: a tool returns `{"items": [...]}` with hundreds of entries,
+and each needs the same processing — **without** feeding the array through the
+model (a big array through an `agent` node burns tokens per item and can blow
+the context):
+
+```json
+{ "kind": "foreach",
+  "items": { "$from": "scan", "pointer": "/items" },
+  "body": {
+    "start": "handle",
+    "nodes": {
+      "handle": { "kind": "tool", "server": "q", "tool": "process",
+                  "args": { "id": { "$from": "item", "pointer": "/id" } },
+                  "writes": "out", "edges": { "ok": "done", "error": "failed" } },
+      "done":   { "kind": "halt", "status": "completed", "result_from": "out" },
+      "failed": { "kind": "halt", "status": "crashed", "result_from": "out" }
+    }
+  },
+  "parallel": 4,
+  "on_error": "continue",
+  "writes": "results",
+  "edges": { "ok": "summarize", "error": "triage" } }
+```
+
+- `items` resolves against the blackboard (a `$from` reference or a literal
+  array; cap 1024 items). Each iteration runs `body` — a full nested workflow
+  (waits included) — on a **scoped** blackboard: a clone of the parent board
+  with the reserved keys `item` (the element) and `index` (its position)
+  seeded. Body writes never flow back; only each body's halt result does,
+  collected **positionally** into `writes`. A failed item's slot carries
+  `{"index", "error"}` so downstream consumers keep alignment.
+- `on_error: "fail_fast"` (default) stops at the first failing item and takes
+  the `error` edge with the partial results; `"continue"` processes everything,
+  records per-item markers in place, and takes `ok` — branch on the results
+  content (e.g. a `len`/`contains` predicate) to decide what failure means.
+- `parallel: N` (cap 8) runs items on N worker **lanes, each with its own
+  intelligence + MCP connections** — no client is shared across threads, and
+  every lane's model usage still lands on the workflow's shared token pool.
+  Default 1 = inline sequential (per-item budget/deadline checks between
+  items).
+- **Cost model**: every item charges one budget step; a body of pure
+  `tool`/`assign`/`branch` nodes makes **zero model calls per item** — the
+  whole fan-out is deterministic. Put an `infer`/`agent` node in the body only
+  where an item genuinely needs intelligence, and the shared pool still bounds
+  the total.
+
+---
+
 ## Conditions
 
 A `branch` decides where to go next. Conditions are **two-tier**:
@@ -203,6 +260,13 @@ simply `false`), and never call the model:
   { "op": "in",  "key": "triage", "pointer": "/category", "values": ["ops", "security"] }
 ] }
 ```
+
+**Cross-key comparison**: the comparison `value` of `eq`/`ne`/`lt`/`lte`/`gt`/
+`gte`/`contains` (and elements of `in`) may itself be a `{"$from": key,
+"pointer": "/p"}` reference — branch on one blackboard value against another
+(`"is the retry count below the configured limit?"`) with no model call. An
+unresolvable reference makes the predicate `false` (fail-closed, even for
+`ne`).
 
 A predicate that can never hold (an empty `in` set, inverted `len` bounds) is
 rejected at define time, not silently routed around.

@@ -87,23 +87,49 @@ pub fn drive_pinned(
             .map_err(|e| format!("mcp server '{}': {e}", spec.name))?;
         servers.push(client);
     }
-    let mut exec = SessionExec::new(&intel, &servers, log, model, max_steps, max_tokens, node_timeout)
-        .with_deadline(deadline);
+    Ok(drive_connected(
+        graph,
+        &intel,
+        &servers,
+        model,
+        max_steps,
+        max_tokens,
+        node_timeout,
+        deadline,
+        log,
+    ))
+}
 
-    // Drive to a terminal outcome, resolving each `Wait` in-process (block-until-update
-    // -or-timeout). The graph's step budget accumulates across resumes, so even a Wait
-    // loop is bounded — and `max_tokens` is the WHOLE-WORKFLOW intelligence pool
-    // (charged via take_tokens), not a per-node grant multiplied by the walk.
+/// Drive `graph` against ALREADY-CONNECTED intelligence + MCP clients, resolving
+/// each `Wait` in-process (block-until-update-or-timeout) — the shared engine tail
+/// behind [`drive_pinned`] and the payload-workflow child path (a supervised
+/// subagent handed a workflow drives it here with the connections its runner
+/// already made). `max_tokens` is the WHOLE-WORKFLOW intelligence pool.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_connected(
+    graph: &Graph,
+    intel: &IntelClient,
+    servers: &[McpClient],
+    model: &str,
+    max_steps: u32,
+    max_tokens: u64,
+    node_timeout: Duration,
+    deadline: Option<Instant>,
+    log: &Logger,
+) -> GraphOutcome {
+    let mut exec = SessionExec::new(intel, servers, log, model, max_steps, max_tokens, node_timeout)
+        .with_deadline(deadline);
     let mut result = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
     loop {
         match result {
-            DriveResult::Done(outcome) => return Ok(outcome),
+            DriveResult::Done(outcome) => return outcome,
             DriveResult::Suspended(s) => {
                 log.info(
                     "workflow.wait",
                     serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms}),
                 );
-                let outcome = wait_for_uri(&servers, &s.on_uri, Duration::from_millis(s.timeout_ms), log);
+                let outcome =
+                    wait_for_uri(servers, &s.on_uri, Duration::from_millis(s.timeout_ms), log);
                 result = resume(graph, s.state, &mut exec, outcome);
             }
         }

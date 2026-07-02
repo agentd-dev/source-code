@@ -149,6 +149,15 @@ pub fn run() -> i32 {
         }
     }
 
+    // A payload carrying a WORKFLOW is driven by the graph engine instead of the
+    // ReAct loop (pivot Phase 7 · W4): same connections, same supervision, same
+    // exit contract — the parent handed this child a whole workflow. One-shot by
+    // construction (`warm` is ignored: a workflow terminates via its own graph).
+    #[cfg(feature = "workflow")]
+    if let Some(wf) = payload.workflow.clone() {
+        return run_workflow_child(&wf, &intel, &servers, &payload, &up, &log);
+    }
+
     let mut input = LoopInput {
         instruction: payload.instruction.clone(),
         output_contract: payload.output_contract.clone(),
@@ -536,6 +545,101 @@ fn restart_turn_pending(pending: &PendingSwap, current_model: &str) -> bool {
 fn fail(up: &Up, log: &Logger, error: String, code: i32) -> i32 {
     log.error("loop.error", serde_json::json!({"err": error}));
     send_up(up, &AgentMsg::Failed { error });
+    code
+}
+
+/// Drive a payload-carried workflow to its terminal outcome and map it onto the
+/// child result contract (pivot Phase 7 · W4): GraphStatus → TerminalStatus →
+/// the RFC 0011 exit table, the graph detail (status/reason/steps/tokens)
+/// carried in the result body, and the intelligence cost rolled up as Usage.
+#[cfg(feature = "workflow")]
+fn run_workflow_child(
+    graph: &crate::graph::Graph,
+    intel: &IntelClient,
+    servers: &[McpClient],
+    payload: &SpawnPayload,
+    up: &Up,
+    log: &Logger,
+) -> i32 {
+    use crate::agentloop::stop::{Outcome, TerminalStatus};
+    use crate::graph::{drive_connected, GraphStatus};
+
+    // The graph crossed a process boundary — re-validate fail-closed (cheap, pure)
+    // even though the parent validated at the authoring boundary.
+    if let Err(errs) = graph.validate() {
+        return fail(
+            up,
+            log,
+            format!("workflow: invalid graph: {}", errs.join("; ")),
+            crate::exit::USAGE,
+        );
+    }
+    let wall = Duration::from_millis(payload.limits.deadline_ms.max(1));
+    let deadline = Some(Instant::now() + wall);
+    let model = payload.intelligence.model.clone().unwrap_or_default();
+    let o = drive_connected(
+        graph,
+        intel,
+        servers,
+        &model,
+        payload.limits.max_steps,
+        payload.limits.max_tokens,
+        wall,
+        deadline,
+        log,
+    );
+
+    let status = match o.status {
+        GraphStatus::Completed => TerminalStatus::Completed,
+        GraphStatus::Halted => o.terminal.unwrap_or(TerminalStatus::Crashed),
+        GraphStatus::Exhausted => {
+            let r = o.reason.as_deref().unwrap_or("");
+            if r.contains("deadline") {
+                TerminalStatus::Deadline
+            } else if r.contains("token") {
+                TerminalStatus::ExhaustedTokens
+            } else {
+                TerminalStatus::ExhaustedSteps
+            }
+        }
+        GraphStatus::LoopDetected => TerminalStatus::LoopDetected,
+        GraphStatus::Stalled => TerminalStatus::Stalled,
+        GraphStatus::Crashed => TerminalStatus::Crashed,
+    };
+    log.info(
+        "workflow.exit",
+        serde_json::json!({
+            "workflow_status": format!("{:?}", o.status),
+            "reason": o.reason,
+            "steps": o.steps,
+            "tokens": o.tokens,
+        }),
+    );
+    // Roll the workflow's intelligence cost up for hierarchical accounting
+    // (`agentd_tokens_total`) BEFORE the terminal Result — the input/output split
+    // is unknown at this layer, so the total rides output_tokens.
+    send_up(
+        up,
+        &AgentMsg::Usage(crate::wire::intel::Usage {
+            input_tokens: 0,
+            output_tokens: o.tokens,
+        }),
+    );
+    let code = crate::exit::once_exit(status, false);
+    let outcome = Outcome {
+        status,
+        partial: false,
+        result: serde_json::json!({
+            "workflow_status": format!("{:?}", o.status),
+            "reason": o.reason,
+            "steps": o.steps,
+            "tokens": o.tokens,
+            "result": o.result,
+        }),
+        scheduled: Vec::new(),
+        subscriptions: Vec::new(),
+    };
+    send_up(up, &AgentMsg::Result { outcome });
     code
 }
 

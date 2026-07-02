@@ -175,6 +175,14 @@ pub struct SpawnPayload {
     /// parseable.
     #[serde(default)]
     pub warm: bool,
+    /// Drive this WORKFLOW instead of the ReAct loop on `instruction` (pivot
+    /// Phase 7 · W4): the child validates the graph and drives it with the same
+    /// engine `--mode workflow` uses — so a parent can hand a whole workflow to a
+    /// supervised subagent. One-shot by construction (`warm` is ignored). The
+    /// graph is TRUSTED parent config, validated on both sides of the boundary.
+    #[cfg(feature = "workflow")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<crate::graph::Graph>,
 }
 
 /// A single seed message — a minimal {role, content} pair. Roles mirror the
@@ -265,6 +273,8 @@ mod tests {
             },
             depth: 1,
             warm: false,
+            #[cfg(feature = "workflow")]
+            workflow: None,
         }
     }
 

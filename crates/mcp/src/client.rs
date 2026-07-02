@@ -21,9 +21,9 @@ use crate::wire::{
     LATEST_MODERN_VERSION, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
     ListToolsResult, PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Resource,
     ResourceTemplate,
-    SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Tool,
-    UnsupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION_CODE, best_mutual_version,
-    is_modern_error_code, method, negotiate_version,
+    SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Task, Tool,
+    UnsupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION_CODE, as_task_result,
+    best_mutual_version, is_modern_error_code, method, negotiate_version,
 };
 // The modern (stateless) request builders live alongside `wire` in the mcp crate.
 use crate::modern;
@@ -99,6 +99,9 @@ pub struct McpClient {
     /// (modern). Defaults to this crate's identity; the host overrides it via
     /// [`Self::with_client_info`] (agentd sets its own name + version).
     client_info: Implementation,
+    /// The client capabilities advertised in the modern per-request `_meta` (e.g.
+    /// the tasks extension). Defaults to `{}` (none); [`Self::with_tasks`] opts in.
+    client_capabilities: Value,
 }
 
 /// The background notification-stream thread + its stop flag (RFC 0004 §GET SSE).
@@ -145,6 +148,7 @@ impl McpClient {
                 version: env!("CARGO_PKG_VERSION").into(),
                 title: None,
             },
+            client_capabilities: json!({}),
         })
     }
 
@@ -152,6 +156,16 @@ impl McpClient {
     /// its own; other hosts of the `mcp` crate set theirs.
     pub fn with_client_info(mut self, info: Implementation) -> Self {
         self.client_info = info;
+        self
+    }
+
+    /// Advertise support for the **tasks extension** (`io.modelcontextprotocol/
+    /// tasks`) — a server may then return an async task handle from a supported
+    /// request instead of blocking (poll it with [`Self::get_task`]).
+    pub fn with_tasks(mut self) -> Self {
+        self.client_capabilities = json!({
+            "extensions": { crate::wire::TASKS_EXTENSION: {} }
+        });
         self
     }
 
@@ -234,7 +248,7 @@ impl McpClient {
             .clone()
             .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
         let mut params = json!({});
-        modern::inject_client_meta(&mut params, &version, &self.client_info);
+        modern::inject_client_meta(&mut params, &version, &self.client_info, &self.client_capabilities);
         self.http.set_protocol_version(version);
         let routing = modern::routing_headers(method::SERVER_DISCOVER, &params);
         let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -559,6 +573,71 @@ impl McpClient {
         Ok(())
     }
 
+    // ---- tasks extension (io.modelcontextprotocol/tasks) ----
+
+    /// If `result` is a task handle (`resultType: "task"`, the async shape a
+    /// task-augmented request returns instead of blocking), parse it. Enable the
+    /// extension with [`Self::with_tasks`]; poll the handle with [`Self::get_task`].
+    pub fn as_task(&self, result: &Value) -> Option<Task> {
+        as_task_result(result)
+    }
+
+    /// `tasks/get` — poll one async task's current state (the tasks extension).
+    pub fn get_task(&self, task_id: &str) -> Result<Task, McpError> {
+        self.request_as(method::TASKS_GET, Some(json!({ "taskId": task_id })))
+    }
+
+    /// `tasks/update` — supply `inputResponses` for a task in `input_required`
+    /// (the MRTR fulfilment path). Acknowledged with an empty result.
+    pub fn update_task(&self, task_id: &str, input_responses: Value) -> Result<(), McpError> {
+        self.request_with_timeout(
+            method::TASKS_UPDATE,
+            Some(json!({ "taskId": task_id, "inputResponses": input_responses })),
+            self.timeout,
+        )?;
+        Ok(())
+    }
+
+    /// `tasks/cancel` — request cancellation of a task (cooperative; the server may
+    /// still reach a non-`cancelled` terminal state). Acknowledged with an empty
+    /// result.
+    pub fn cancel_task(&self, task_id: &str) -> Result<(), McpError> {
+        self.request_with_timeout(
+            method::TASKS_CANCEL,
+            Some(json!({ "taskId": task_id })),
+            self.timeout,
+        )?;
+        Ok(())
+    }
+
+    /// Poll `tasks/get` until the task reaches a terminal status or `deadline`,
+    /// honoring the server's `pollIntervalMs` (bounded to a sane window). Returns
+    /// the terminal [`Task`] (the caller reads `result`/`error`); a task that stops
+    /// on `input_required` is returned so the caller can drive the MRTR loop.
+    pub fn await_task(
+        &self,
+        task_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Task, McpError> {
+        loop {
+            let task = self.get_task(task_id)?;
+            if task.is_terminal() || task.needs_input() {
+                return Ok(task);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(McpError::Timeout(format!(
+                    "task '{task_id}' on '{}' did not finish before the deadline",
+                    self.name
+                )));
+            }
+            let poll = task
+                .poll_interval_ms
+                .unwrap_or(500)
+                .clamp(50, 5_000);
+            std::thread::sleep(Duration::from_millis(poll));
+        }
+    }
+
     pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         self.read_resource_within(uri, self.timeout)
     }
@@ -660,7 +739,7 @@ impl McpClient {
             .clone()
             .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
         let mut params = json!({ "notifications": { "resourceSubscriptions": uris } });
-        modern::inject_client_meta(&mut params, &version, &self.client_info);
+        modern::inject_client_meta(&mut params, &version, &self.client_info, &self.client_capabilities);
         let routing: Vec<(String, String)> = modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
@@ -771,7 +850,7 @@ impl McpClient {
         let (params, routing) = if self.era == Era::Modern {
             let mut p = params.unwrap_or_else(|| json!({}));
             let version = self.protocol_version.as_deref().unwrap_or(LATEST_MODERN_VERSION);
-            modern::inject_client_meta(&mut p, version, &self.client_info);
+            modern::inject_client_meta(&mut p, version, &self.client_info, &self.client_capabilities);
             let mut routing: Vec<(String, String)> = modern::routing_headers(method, &p)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))

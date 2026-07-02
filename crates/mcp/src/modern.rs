@@ -22,10 +22,15 @@ use crate::wire::Implementation;
 use serde_json::{Value, json};
 
 /// Add the per-request `io.modelcontextprotocol/*` metadata to a request's params
-/// (modern era): protocol version, client identity, client capabilities. Creates
-/// `params._meta` if absent; a non-object `params` is left untouched (all MCP
-/// method params are objects, so this is a no-op guard).
-pub fn inject_client_meta(params: &mut Value, protocol_version: &str, client: &Implementation) {
+/// (modern era): protocol version, client identity, and the client's declared
+/// `capabilities` (e.g. the tasks extension). Creates `params._meta` if absent; a
+/// non-object `params` is left untouched (all MCP method params are objects).
+pub fn inject_client_meta(
+    params: &mut Value,
+    protocol_version: &str,
+    client: &Implementation,
+    capabilities: &Value,
+) {
     let Some(obj) = params.as_object_mut() else {
         return;
     };
@@ -43,10 +48,7 @@ pub fn inject_client_meta(params: &mut Value, protocol_version: &str, client: &I
         format!("{META_NS}clientInfo"),
         json!({"name": client.name, "version": client.version}),
     );
-    m.insert(
-        format!("{META_NS}clientCapabilities"),
-        Value::Object(Default::default()),
-    );
+    m.insert(format!("{META_NS}clientCapabilities"), capabilities.clone());
 }
 
 /// The `Mcp-Name` header source for a method: `params.name` (`tools/call`,
@@ -251,7 +253,8 @@ mod tests {
     #[test]
     fn injects_the_three_meta_fields() {
         let mut params = json!({"name": "echo", "arguments": {"x": 1}});
-        inject_client_meta(&mut params, "2026-07-28", &client());
+        let caps = json!({"extensions": {"io.modelcontextprotocol/tasks": {}}});
+        inject_client_meta(&mut params, "2026-07-28", &client(), &caps);
         let meta = &params["_meta"];
         assert_eq!(meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
         assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], "agentd");
@@ -259,7 +262,12 @@ mod tests {
             meta["io.modelcontextprotocol/clientInfo"]["version"],
             "1.0.0"
         );
-        assert!(meta["io.modelcontextprotocol/clientCapabilities"].is_object());
+        // The declared capabilities ride along (e.g. the tasks extension).
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                ["io.modelcontextprotocol/tasks"],
+            json!({})
+        );
         // The original params are preserved.
         assert_eq!(params["name"], "echo");
         assert_eq!(params["arguments"]["x"], 1);

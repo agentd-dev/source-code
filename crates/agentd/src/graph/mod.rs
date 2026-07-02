@@ -22,7 +22,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod driver;
-pub use driver::{drive, Blackboard, GraphBudget, GraphExec, GraphOutcome, GraphStatus};
+pub use driver::{
+    drive, resume, Blackboard, DriveResult, GraphBudget, GraphExec, GraphOutcome, GraphState,
+    GraphStatus, Suspension, WaitOutcome,
+};
 
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;

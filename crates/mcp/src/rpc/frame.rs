@@ -128,7 +128,7 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json::{Id, Response};
+    use crate::rpc::{Id, Response};
     use std::io::Cursor;
 
     #[test]

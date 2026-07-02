@@ -26,7 +26,9 @@ pub mod config_watch; // inotify file-watch reload trigger (RFC 0017 §5.2)
 pub mod exit; // the public exit-code table + terminal-status -> code map
 pub mod identity; // instance identity from the k8s downward API (env-only, RFC 0015 §6)
 pub mod intel; // intelligence client + provider adapters
-pub mod json; // shared JSON-RPC 2.0 codec + framing (NDJSON + length-prefix)
+// JSON-RPC 2.0 codec + framing now lives in the reusable `mcp` crate; re-export
+// so `crate::json::*` keeps resolving (MCP + the supervisor↔subagent channel).
+pub use ::mcp::rpc as json;
 pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
 pub mod net; // hand-rolled HTTP/1.1 (non-streaming), unix-socket, (tls/vsock gated)
 pub mod obs; // logging, health, tracing, metrics

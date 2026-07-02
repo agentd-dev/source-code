@@ -274,7 +274,7 @@ The endpoint **list** and the `model`/`model-swap` knobs are file-settable and
 
 ---
 
-## 5. Declaring MCP servers — `--mcp name=command`
+## 5. Declaring MCP servers — `--mcp name=<endpoint>`
 
 All task tools come from MCP servers; agentd ships none of its own and never runs
 local code. Declare each server with `--mcp`, repeatable — each names a **remote

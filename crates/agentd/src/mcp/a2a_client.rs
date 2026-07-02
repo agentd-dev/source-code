@@ -10,9 +10,9 @@
 //! surface as a client with one `POST` per call (the [`HttpConn`] caller), through
 //! the streaming consumer / recovery loop:
 //!
-//!   1. `a2a.SendMessage` with the objective as one text `Part` (role `ROLE_USER`,
+//!   1. `SendMessage` with the objective as one text `Part` (role `ROLE_USER`,
 //!      a minted `messageId`) → a Task whose `id` comes back,
-//!   2. **poll `a2a.GetTask`** (~[`POLL_INTERVAL`] between polls) until the Task
+//!   2. **poll `GetTask`** (~[`POLL_INTERVAL`] between polls) until the Task
 //!      reaches a terminal `TASK_STATE_*` OR a per-delegation deadline elapses
 //!      (so it never hangs),
 //!   3. return the result: on COMPLETED, the concatenated text of the Task's
@@ -33,7 +33,7 @@ use crate::mcp::a2a::{self, TaskState};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-/// Poll cadence between `a2a.GetTask` reads while a remote Task is in flight
+/// Poll cadence between `GetTask` reads while a remote Task is in flight
 /// (RFC 0020 §3: "sleep ~100ms between polls"). Bounded above by the
 /// per-delegation deadline the caller passes in.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -70,9 +70,9 @@ pub fn delegate(
 ) -> DelegateOutcome {
     // The sole transport is HTTP(S), presenting the peer client-auth material
     // (bearer headers and/or an mTLS identity) on every request. STREAMING
-    // FIRST: one `a2a.SendStreamingMessage` SSE round trip carries the whole
+    // FIRST: one `SendStreamingMessage` SSE round trip carries the whole
     // lifecycle (working → artifact → final) with no polling; an older peer
-    // that degrades it to a unary final frame is recovered via `a2a.GetTask`
+    // that degrades it to a unary final frame is recovered via `GetTask`
     // (the run happened either way — never re-sent).
     match endpoint {
         A2aEndpoint::Https(url) => match HttpEp::parse(url) {
@@ -90,7 +90,7 @@ pub fn delegate(
 }
 
 /// How a streaming attempt resolved: a terminal outcome, or a task id whose
-/// terminal state must be RECOVERED over unary `a2a.GetTask` (an older peer's
+/// terminal state must be RECOVERED over unary `GetTask` (an older peer's
 /// unary-final degradation, or a stream that broke after the run started —
 /// the run exists server-side either way, so it is polled, never re-sent).
 enum StreamOutcome {
@@ -98,7 +98,7 @@ enum StreamOutcome {
     Recover(String),
 }
 
-/// Poll `a2a.GetTask` until the task is terminal or the deadline passes — the
+/// Poll `GetTask` until the task is terminal or the deadline passes — the
 /// shared tail of the unary path and stream recovery.
 fn poll_task<C: Caller>(conn: &mut C, task_id: &str, deadline: Instant) -> DelegateOutcome {
     let get_params = json!({ "id": task_id });
@@ -109,7 +109,7 @@ fn poll_task<C: Caller>(conn: &mut C, task_id: &str, deadline: Instant) -> Deleg
             ));
         }
         std::thread::sleep(POLL_INTERVAL);
-        let task = match conn.call("a2a.GetTask", get_params.clone(), deadline) {
+        let task = match conn.call("GetTask", get_params.clone(), deadline) {
             Ok(t) => t,
             Err(e) => return DelegateOutcome::Error(e),
         };
@@ -227,7 +227,7 @@ impl HttpConn {
 }
 
 impl HttpConn {
-    /// One `a2a.SendStreamingMessage` round trip: POST with
+    /// One `SendStreamingMessage` round trip: POST with
     /// `Accept: text/event-stream`, then consume the SSE frames — working →
     /// (artifact) → final — to a terminal outcome. Returns `Recover(task_id)`
     /// when the terminal state must be fetched over unary GetTask instead: an
@@ -245,7 +245,7 @@ impl HttpConn {
         self.next_id += 1;
         let message_id = mint_message_id();
         let params = a2a::send_message_params(objective, output_contract, &message_id);
-        let req = Request::new(Id::Num(id), "a2a.SendStreamingMessage", Some(params));
+        let req = Request::new(Id::Num(id), "SendStreamingMessage", Some(params));
         let body =
             serde_json::to_vec(&req).map_err(|e| format!("a2a: encode streaming send: {e}"))?;
         // The read timeout must span the QUIET stretches of a long run; the
@@ -363,11 +363,10 @@ impl HttpConn {
                     .pointer("/status/state")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let is_final = update
-                    .get("final")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if is_final {
+                // Terminate on a terminal task STATE (A2A spec §3.5.2 — the stream
+                // closes on terminal). agentd emits no non-spec `final` flag, and a
+                // conformant peer signals termination by the state + closing.
+                if crate::mcp::a2a::TaskState::from_wire(state).is_terminal() {
                     let outcome = match state {
                         "TASK_STATE_COMPLETED" => match distillate {
                             Some(text) => DelegateOutcome::Distillate(text),
@@ -612,8 +611,11 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn status_frame(id: &str, state: &str, is_final: bool) -> Value {
-        json!({"statusUpdate": {"taskId": id, "contextId": "ctx", "status": {"state": state}, "final": is_final}})
+    fn status_frame(id: &str, state: &str, _is_final: bool) -> Value {
+        // agentd emits no `final` flag (not in the A2A proto); the client
+        // terminates on the terminal task STATE. The bool arg is retained only so
+        // the existing call sites read naturally.
+        json!({"statusUpdate": {"taskId": id, "contextId": "ctx", "status": {"state": state}}})
     }
 
     #[test]

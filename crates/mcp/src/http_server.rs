@@ -178,6 +178,23 @@ fn serve_conn<S: Read + Write + Send + 'static>(
         return; // malformed / EOF before a full request
     };
 
+    // DNS-rebinding defense (Streamable HTTP security MUST / RFC 0005): a browser
+    // always sends `Origin`, so a page tricked into POSTing to a local agentd
+    // carries its own site there. Reject any request whose `Origin` is present and
+    // NOT a loopback origin — a non-browser control-plane / mesh caller sends no
+    // `Origin` and is unaffected. This is a transport-level guard, applied BEFORE
+    // auth (a rebind presents no credential either, but defense-in-depth covers the
+    // loopback `AllowAll` dev path where auth alone would let it through).
+    if !origin_allowed(&req.headers) {
+        let _ = write_simple(
+            reader.get_mut(),
+            403,
+            "Forbidden",
+            b"cross-origin request rejected",
+        );
+        return;
+    }
+
     // Trust classification — the transport is never the boundary.
     let origin = {
         let parts = RequestParts {
@@ -312,9 +329,9 @@ fn serve_unary<S: Write>(
     let resp = handler.dispatch(req, origin, &sink, conn);
     let body = serde_json::to_vec(&resp).unwrap_or_default();
     let session = if is_initialize {
-        "Mcp-Session-Id: srv\r\n"
+        format!("Mcp-Session-Id: {}\r\n", next_session_id())
     } else {
-        ""
+        String::new()
     };
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -427,6 +444,45 @@ struct HttpRequest {
 
 /// Read one HTTP/1.1 request (request line, headers, `Content-Length` body).
 /// Returns `None` on EOF-before-request or a malformed head.
+/// Whether a request's `Origin` (if any) is acceptable — the DNS-rebinding gate.
+/// No `Origin` header → allowed (a non-browser caller). Present → it must name a
+/// loopback origin.
+fn origin_allowed(headers: &[(String, String)]) -> bool {
+    match headers.iter().find(|(k, _)| k == "origin") {
+        None => true,
+        Some((_, origin)) => origin_is_loopback(origin),
+    }
+}
+
+/// Whether an `Origin` value (`scheme://host[:port]`) names a loopback host. The
+/// opaque `"null"` origin (sandboxed iframe / `file://`) is treated as untrusted.
+fn origin_is_loopback(origin: &str) -> bool {
+    let after_scheme = origin.split_once("://").map(|(_, r)| r).unwrap_or(origin);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip the optional port, keeping a bracketed IPv6 literal intact.
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or(v6)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// A process-unique `Mcp-Session-Id` for `initialize`. It is a correlation
+/// HANDLE, not a credential (auth is mTLS/bearer, orthogonal), and each
+/// connection is a single `Connection: close` request — so uniqueness, not
+/// unguessability, is what matters. Time-millis + a monotone counter guarantees
+/// uniqueness with no `rand` dependency (the minimalism moat).
+fn next_session_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("s-{millis:x}-{n:x}")
+}
+
 fn read_request<S: Read>(reader: &mut BufReader<S>) -> Option<HttpRequest> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).ok()? == 0 {
@@ -583,17 +639,72 @@ mod tests {
         assert_eq!(v["result"]["ok"], true);
     }
 
+    /// POST with an explicit `Origin` header; returns the HTTP status code.
+    fn http_post_origin(addr: &str, origin: Option<&str>, body: &str) -> u16 {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let origin_line = origin
+            .map(|o| format!("Origin: {o}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: x\r\n{origin_line}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut status = String::new();
+        BufReader::new(s).read_line(&mut status).unwrap();
+        status
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
     #[test]
-    fn initialize_stamps_a_session_header() {
+    fn initialize_stamps_a_unique_session_header() {
         let (addr, _subs) = spawn_server();
-        let (headers, _body) = http_post(
-            &addr,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#;
+        let sid = |addr: &str| {
+            let (headers, _) = http_post(addr, init);
+            headers
+                .into_iter()
+                .find(|(k, _)| k == "mcp-session-id")
+                .map(|(_, v)| v)
+        };
+        let a = sid(&addr).expect("initialize stamps a session id");
+        let b = sid(&addr).expect("second initialize stamps a session id");
+        assert_ne!(a, "srv", "the session id is not the old constant");
+        assert_ne!(a, b, "each initialize mints a distinct session id");
+    }
+
+    #[test]
+    fn a_cross_origin_request_is_rejected_403() {
+        let (addr, _subs) = spawn_server();
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x"}}"#;
+        // A browser cross-site Origin → 403 (DNS-rebinding defense).
+        assert_eq!(
+            http_post_origin(&addr, Some("https://evil.example"), call),
+            403
         );
-        assert!(
-            headers.iter().any(|(k, _)| k == "mcp-session-id"),
-            "initialize must stamp a session id: {headers:?}"
+        // No Origin (the normal non-browser caller) → served (200).
+        assert_eq!(http_post_origin(&addr, None, call), 200);
+        // A loopback Origin (a local dev tool) → served.
+        assert_eq!(
+            http_post_origin(&addr, Some("http://localhost:3000"), call),
+            200
         );
+        assert_eq!(http_post_origin(&addr, Some("http://127.0.0.1"), call), 200);
+    }
+
+    #[test]
+    fn origin_loopback_classification() {
+        assert!(origin_is_loopback("http://localhost"));
+        assert!(origin_is_loopback("http://localhost:8080"));
+        assert!(origin_is_loopback("https://127.0.0.1:443"));
+        assert!(origin_is_loopback("http://[::1]:9000"));
+        assert!(!origin_is_loopback("https://evil.example"));
+        assert!(!origin_is_loopback("http://169.254.1.1")); // link-local, not loopback
+        assert!(!origin_is_loopback("null")); // opaque origin → untrusted
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! `webpki-roots` (so a scratch container has trust anchors without a system
 //! cert store). Returns a `StreamOwned` that is `Read + Write` — it drops
 //! straight into the transport-agnostic hand-rolled HTTP client
-//! ([`crate::net::http`]). The recommended container shape still terminates TLS
+//! ([`crate::http`]). The recommended container shape still terminates TLS
 //! at a sidecar (unix transport), so most builds link none of this.
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// A blocking TLS stream over TCP. `Read + Write`, so it satisfies
-/// [`crate::net::http::Stream`].
+/// [`crate::http::Stream`].
 pub type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
 /// A resolved client identity for mutual TLS: a cert chain + private key, parsed

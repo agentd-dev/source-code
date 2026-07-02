@@ -8,13 +8,11 @@ version = "1.0.0"
 dependencies = [
  "libc",
  "mcp",
- "rustls",
- "rustls-pemfile",
+ "net",
  "serde",
  "serde_json",
  "tempfile",
  "vsock",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -213,6 +211,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "rustls-pemfile",
+ "vsock",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

@@ -1,0 +1,31 @@
+# Hand-rolled transport primitives shared by the `mcp` crate and agentd's intel
+# client: a minimal blocking HTTP/1.1 client over any `Read + Write` (+ SSE),
+# unix-socket + feature-gated TLS/vsock connects, and an SSRF egress classifier.
+# The single highest-leverage minimalism decision (RFC 0002): no url→IDNA→ICU,
+# no async runtime. serde-free; TLS/vsock are the only (optional) deps.
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Minimal blocking HTTP/1.1 + SSE over Read+Write, unix/tls/vsock connects, SSRF guard"
+license = "Apache-2.0"
+repository = "https://github.com/agentd-dev/source-code"
+publish = false
+
+[lib]
+name = "net"
+path = "src/lib.rs"
+
+[features]
+default = []
+# rustls with the ring provider (no cmake/C build dep) + bundled webpki roots.
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+# AF_VSOCK transport (enclave/microVM).
+vsock = ["dep:vsock"]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+vsock = { version = "0.5", optional = true }

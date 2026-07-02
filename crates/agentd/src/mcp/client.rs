@@ -462,7 +462,7 @@ impl McpClient {
         let notifications = &self.notifications;
         let msg = self
             .http
-            .send(Some(id), &body, timeout, |n| {
+            .send(Some(id), &body, timeout, &[], |n| {
                 queue_notification(notifications, n)
             })
             .map_err(|e| http_err(&self.name, method, e))?
@@ -484,7 +484,7 @@ impl McpClient {
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
         let notifications = &self.notifications;
         self.http
-            .send(None, &body, self.timeout, |n| {
+            .send(None, &body, self.timeout, &[], |n| {
                 queue_notification(notifications, n)
             })
             .map_err(|e| http_err(&self.name, method, e))?;
@@ -521,7 +521,7 @@ fn http_err(name: &str, method: &str, e: HttpError) -> McpError {
             }
             _ => McpError::Transport(format!("{method} on '{name}': {io}")),
         },
-        HttpError::Status(code) => {
+        HttpError::Status(code, _) => {
             McpError::Transport(format!("{method} on '{name}': server returned HTTP {code}"))
         }
         HttpError::Unsupported(m) => McpError::Transport(m),
@@ -553,7 +553,7 @@ fn event_loop(http: Arc<HttpTransport>, queue: NotifQueue, stop: Arc<AtomicBool>
         let mut sse = match http.open_events(EVENT_READ_TIMEOUT) {
             Ok(s) => s,
             // No usable push channel — stop trying (don't spin).
-            Err(HttpError::Status(_)) | Err(HttpError::Unsupported(_)) => return,
+            Err(HttpError::Status(_, _)) | Err(HttpError::Unsupported(_)) => return,
             // Transient (connect/HTTP) — back off, then retry unless stopping.
             Err(_) => {
                 for _ in 0..20 {
@@ -689,7 +689,7 @@ mod tests {
         );
         assert!(matches!(e, McpError::Timeout(_)), "got {e:?}");
         // A non-2xx HTTP status is a transport error, not a timeout.
-        let e = http_err("fs", "initialize", HttpError::Status(503));
+        let e = http_err("fs", "initialize", HttpError::Status(503, Vec::new()));
         assert!(matches!(e, McpError::Transport(_)), "got {e:?}");
     }
 

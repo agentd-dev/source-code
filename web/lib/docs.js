@@ -12,6 +12,7 @@ export const DOCS = [
   { slug: "architecture", file: "docs/architecture.md", title: "architecture" },
   { slug: "mcp", file: "docs/mcp.md", title: "mcp surface" },
   { slug: "modes-and-triggers", file: "docs/modes-and-triggers.md", title: "modes & triggers" },
+  { slug: "workflows", file: "docs/workflows.md", title: "workflows" },
   { slug: "subagents", file: "docs/subagents.md", title: "subagents" },
   { slug: "intelligence", file: "docs/intelligence.md", title: "intelligence" },
   { slug: "configuration", file: "docs/configuration.md", title: "configuration" },

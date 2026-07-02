@@ -5,25 +5,29 @@ export const metadata = {
   metadataBase: new URL("https://agentd.dev"),
   title: "agentd — a small, cloud-native AI agent runtime, MCP-native",
   description:
-    "agentd is a minimal, MCP-native, reactive agent runtime: one static binary " +
-    "that takes an instruction and tools from MCP servers and runs the agentic " +
-    "loop — as a one-shot, a daemon, or a reactive service. Supervised, bounded, " +
-    "observable. ~1.3 MB, 3 dependencies, k8s-ready.",
+    "agentd is a minimal, MCP-native agent runtime: one static binary that takes " +
+    "an instruction and tools from remote MCP servers (over HTTPS) and runs the " +
+    "agentic loop — as a one-shot, a daemon, a reactive service, or an " +
+    "agent-authored workflow. It runs no code of its own, speaks A2A to other " +
+    "agents, and is supervised, bounded, and observable. Three first-party " +
+    "dependencies, k8s-ready.",
   keywords: [
     "agentd",
     "MCP",
     "Model Context Protocol",
+    "A2A",
+    "Agent2Agent",
     "AI agent",
     "agent runtime",
+    "agentic workflow",
     "cloud native",
     "kubernetes",
-    "daemon",
     "Rust",
   ],
   openGraph: {
     title: "agentd — a small, cloud-native AI agent runtime",
     description:
-      "An instruction + tools from MCP + one static binary. Run the agentic loop as a one-shot, a daemon, or a reactive service.",
+      "An instruction + tools from remote MCP servers over HTTPS + one static binary. Run the agentic loop as a one-shot, a daemon, a reactive service, or an agent-authored workflow. Speaks A2A. Runs no code of its own.",
     type: "website",
     url: "https://agentd.dev",
   },

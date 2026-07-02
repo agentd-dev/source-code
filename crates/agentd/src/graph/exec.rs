@@ -14,9 +14,10 @@
 
 use super::{
     drive, drive_budgeted, drive_seeded, resume, Blackboard, DriveResult, FieldType, Graph,
-    GraphExec, GraphOutcome, GraphStatus, WaitOutcome,
+    GraphExec, GraphOutcome, GraphStatus, JoinWait, WaitOutcome,
 };
 use crate::agentloop::action::SelfHandler;
+use crate::subagent::orchestrator::Orchestrator;
 use crate::agentloop::runner::{run_loop, LoopInput};
 use crate::agentloop::stop::TerminalStatus;
 use crate::config::McpServerSpec;
@@ -91,6 +92,7 @@ pub fn drive_pinned(
     max_tokens: u64,
     node_timeout: Duration,
     deadline: Option<Instant>,
+    spawner: Option<&mut Orchestrator>,
     log: &Logger,
 ) -> Result<GraphOutcome, String> {
     let intel = IntelClient::from_parts(intel_uri, intel_token.clone())
@@ -121,6 +123,7 @@ pub fn drive_pinned(
         node_timeout,
         deadline,
         Some(factory),
+        spawner,
         log,
     ))
 }
@@ -141,11 +144,13 @@ pub fn drive_connected(
     node_timeout: Duration,
     deadline: Option<Instant>,
     factory: Option<ExecFactory>,
+    spawner: Option<&mut Orchestrator>,
     log: &Logger,
 ) -> GraphOutcome {
     let mut exec = SessionExec::new(intel, servers, log, model, max_steps, max_tokens, node_timeout)
         .with_deadline(deadline)
-        .with_factory(factory);
+        .with_factory(factory)
+        .with_spawner(spawner);
     let mut result = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
     loop {
         match result {
@@ -160,6 +165,38 @@ pub fn drive_connected(
                 result = resume(graph, s.state, &mut exec, outcome);
             }
         }
+    }
+}
+
+/// Drive (or RESUME) one reactive step against already-connected clients,
+/// WITHOUT resolving waits in-process: a `Wait` returns
+/// [`DriveResult::Suspended`] to the caller — the daemon persists the slice,
+/// arms the watch, and a fresh child resumes later (the reactive-daemon
+/// workflow). `resume_from` carries the persisted slice + how its wait resolved.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_connected_once(
+    graph: &Graph,
+    resume_from: Option<(super::GraphState, WaitOutcome)>,
+    intel: &IntelClient,
+    servers: &[McpClient],
+    model: &str,
+    max_steps: u32,
+    max_tokens: u64,
+    node_timeout: Duration,
+    deadline: Option<Instant>,
+    factory: Option<ExecFactory>,
+    spawner: Option<&mut Orchestrator>,
+    log: &Logger,
+) -> DriveResult {
+    let mut exec = SessionExec::new(intel, servers, log, model, max_steps, max_tokens, node_timeout)
+        .with_deadline(deadline)
+        .with_factory(factory)
+        .with_spawner(spawner);
+    match resume_from {
+        // A fresh slice mints the budget; a resumed one CARRIES it (steps and the
+        // token pool accumulate across suspensions — serialized in the state).
+        None => drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens),
+        Some((state, outcome)) => resume(graph, state, &mut exec, outcome),
     }
 }
 
@@ -233,6 +270,11 @@ pub struct SessionExec<'a> {
     /// The per-lane connection recipe for parallel `Foreach` (absent → the
     /// parallel hook degrades to sequential on THIS exec's connections).
     factory: Option<std::sync::Arc<ExecFactory>>,
+    /// The spawn/await machinery for `Subgraph { async: true }` + `Join` — the
+    /// same Orchestrator that backs `subagent.*`, so async subgraphs are
+    /// supervised child processes under the normal depth/breadth/rate caps.
+    /// Absent (e.g. inside a parallel foreach lane) → those nodes error-edge.
+    spawner: Option<&'a mut Orchestrator>,
 }
 
 impl<'a> SessionExec<'a> {
@@ -257,6 +299,7 @@ impl<'a> SessionExec<'a> {
             deadline: None,
             pending_tokens: 0,
             factory: None,
+            spawner: None,
         }
     }
 
@@ -269,6 +312,12 @@ impl<'a> SessionExec<'a> {
     /// Attach the per-lane connection recipe enabling parallel `Foreach` lanes.
     pub fn with_factory(mut self, factory: Option<ExecFactory>) -> Self {
         self.factory = factory.map(std::sync::Arc::new);
+        self
+    }
+
+    /// Attach the spawn/await machinery enabling async subgraphs + joins.
+    pub fn with_spawner(mut self, spawner: Option<&'a mut Orchestrator>) -> Self {
+        self.spawner = spawner;
         self
     }
 
@@ -490,6 +539,68 @@ impl GraphExec for SessionExec<'_> {
 
     fn deadline_exceeded(&self) -> bool {
         self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    fn spawn_subgraph(&mut self, graph: &Graph) -> Result<String, String> {
+        let Some(orch) = self.spawner.as_mut() else {
+            return Err("no orchestrator wired (async subgraphs need the spawn machinery)".into());
+        };
+        let wf = serde_json::to_value(graph).map_err(|e| format!("serialize subgraph: {e}"))?;
+        // The SAME subagent.spawn path a model delegation takes — child payload
+        // carries the workflow, and every cap (depth/breadth/rate/memory) applies.
+        let args = serde_json::json!({
+            "instruction": "drive the attached workflow subgraph",
+            "async": true,
+            "workflow": wf,
+        });
+        let Some((obs, is_err)) = orch.handle("subagent.spawn", &args) else {
+            return Err("spawn was not handled".into());
+        };
+        if is_err {
+            return Err(obs);
+        }
+        obs.split("handle=")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .map(str::to_string)
+            .ok_or_else(|| format!("spawn returned no handle: {obs}"))
+    }
+
+    fn await_handle(&mut self, handle: &str, timeout_ms: u64) -> JoinWait {
+        let Some(orch) = self.spawner.as_mut() else {
+            return JoinWait::Ready(
+                Value::String("no orchestrator wired (join needs the spawn machinery)".into()),
+                true,
+            );
+        };
+        // Poll the idempotent non-blocking status peek on OUR clock — the
+        // blocking subagent.await waits in coarse slices, which would overshoot a
+        // tight join timeout.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        loop {
+            let Some((obs, is_err)) = orch.handle("subagent.status", &serde_json::json!({"handle": handle})) else {
+                return JoinWait::Ready(Value::String("status was not handled".into()), true);
+            };
+            if !is_err && obs.contains("is still running") {
+                if Instant::now() >= deadline {
+                    return JoinWait::Pending;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            if is_err {
+                return JoinWait::Ready(Value::String(obs), true);
+            }
+            // Terminal: the child-workflow result envelope (JSON) — unwrap it so
+            // a join collects the subgraph RESULTS, like a sync subgraph does.
+            let parsed = serde_json::from_str::<Value>(obs.trim()).unwrap_or(Value::String(obs));
+            if let Some(status) = parsed.get("workflow_status").and_then(Value::as_str) {
+                let failed = status != "Completed";
+                let result = parsed.get("result").cloned().unwrap_or(parsed.clone());
+                return JoinWait::Ready(result, failed);
+            }
+            return JoinWait::Ready(parsed, false);
+        }
     }
 
     fn run_body(&mut self, body: &Graph, seed: Blackboard) -> (Value, bool) {

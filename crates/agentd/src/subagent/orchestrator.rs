@@ -337,19 +337,27 @@ impl Orchestrator {
         let node_timeout = Duration::from_millis(self.child_limits.deadline_ms);
         // The whole workflow shares the child's wall budget: each node may use up
         // to the child deadline, and the WALK stops at that same wall (checked per
-        // node entry) — plus the shared token pool below.
+        // node entry) — plus the shared token pool below. Fields are pre-copied so
+        // `self` can ride along as the async-subgraph SPAWNER.
         let deadline = Some(std::time::Instant::now() + node_timeout);
+        let uri = self.intelligence.uri.clone();
+        let token = self.intelligence.token.clone();
+        let specs = self.mcp_servers.clone();
+        let max_steps = self.child_limits.max_steps;
+        let max_tokens = self.child_limits.max_tokens;
+        let log = self.log.clone();
         let result = crate::graph::drive_pinned(
             &graph,
-            &self.intelligence.uri,
-            self.intelligence.token.clone(),
+            &uri,
+            token,
             &model,
-            &self.mcp_servers,
-            self.child_limits.max_steps,
-            self.child_limits.max_tokens,
+            &specs,
+            max_steps,
+            max_tokens,
             node_timeout,
             deadline,
-            &self.log,
+            Some(self),
+            &log,
         );
         match result {
             Ok(o) => {
@@ -546,6 +554,10 @@ impl Orchestrator {
             warm: false, // a delegated subagent is a one-shot distilled subtask
             #[cfg(feature = "workflow")]
             workflow,
+            #[cfg(feature = "workflow")]
+            workflow_reactive: false,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
         };
         let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
         let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
@@ -1362,6 +1374,10 @@ mod tests {
             warm: false,
             #[cfg(feature = "workflow")]
             workflow: None,
+            #[cfg(feature = "workflow")]
+            workflow_reactive: false,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
         }
     }
 

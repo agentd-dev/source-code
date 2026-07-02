@@ -183,6 +183,34 @@ pub struct SpawnPayload {
     #[cfg(feature = "workflow")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<crate::graph::Graph>,
+    /// REACTIVE workflow semantics (the daemon path): a `Wait` node SUSPENDS —
+    /// the child exits carrying the serialized run slice in its result, the
+    /// DAEMON arms the watch, and a fresh child resumes on the update/timeout.
+    /// `false` (one-shot semantics) blocks on waits in-process.
+    #[cfg(feature = "workflow")]
+    #[serde(default)]
+    pub workflow_reactive: bool,
+    /// Resume a previously-suspended reactive workflow: the persisted run slice
+    /// plus how its `Wait` resolved. Minted ONLY by the daemon.
+    #[cfg(feature = "workflow")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_resume: Option<WorkflowResume>,
+}
+
+/// How a suspended reactive workflow's `Wait` resolved — the daemon→child resume
+/// input (pivot Phase 7 follow-up: the reactive-daemon workflow).
+#[cfg(feature = "workflow")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowResume {
+    /// The suspended run slice (cursor + blackboard + budget), exactly as the
+    /// suspending child serialized it.
+    pub state: crate::graph::GraphState,
+    /// `true` = the wait timed out (the `timeout` edge); `false` = the resource
+    /// updated (the `updated` edge, with `content` freshly read).
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
 }
 
 /// A single seed message — a minimal {role, content} pair. Roles mirror the
@@ -275,6 +303,10 @@ mod tests {
             warm: false,
             #[cfg(feature = "workflow")]
             workflow: None,
+            #[cfg(feature = "workflow")]
+            workflow_reactive: false,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
         }
     }
 

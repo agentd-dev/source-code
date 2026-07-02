@@ -601,8 +601,7 @@ fn run_workflow_child(
     up: &Up,
     log: &Logger,
 ) -> i32 {
-    use crate::agentloop::stop::{Outcome, TerminalStatus};
-    use crate::graph::{drive_connected, GraphStatus};
+    use crate::graph::drive_connected;
 
     // The graph crossed a process boundary — re-validate fail-closed (cheap, pure)
     // even though the parent validated at the authoring boundary.
@@ -626,6 +625,92 @@ fn run_workflow_child(
         max_tokens: payload.limits.max_tokens,
         node_timeout: wall,
     };
+    // Async subgraphs spawn through the SAME orchestrator machinery a model's
+    // subagent.spawn uses — supervised children under this payload's caps.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentd"));
+    let mut orch = Orchestrator::from_payload(exe, payload, Duration::from_secs(25), log.clone());
+
+    // REACTIVE semantics (the daemon path): drive ONE step — a `Wait` suspends
+    // and this child EXITS with the serialized slice in its result; the daemon
+    // arms the watch and resumes a fresh child on the update/timeout. Token
+    // roll-up is the PER-CHILD delta (the cumulative pool rides the slice).
+    if payload.workflow_reactive {
+        let entry_tokens = payload
+            .workflow_resume
+            .as_ref()
+            .map(|r| r.state.tokens())
+            .unwrap_or(0);
+        let resume_from = payload.workflow_resume.clone().map(|r| {
+            let outcome = if r.timed_out {
+                crate::graph::WaitOutcome::TimedOut
+            } else {
+                crate::graph::WaitOutcome::Updated(r.content.unwrap_or(serde_json::Value::Null))
+            };
+            (r.state, outcome)
+        });
+        let factory = crate::graph::ExecFactory {
+            intel_uri: payload.intelligence.uri.clone(),
+            intel_token: payload.intelligence.token.clone(),
+            model: model.clone(),
+            server_specs: payload.mcp_servers.clone(),
+            max_steps: payload.limits.max_steps,
+            max_tokens: payload.limits.max_tokens,
+            node_timeout: wall,
+        };
+        let result = crate::graph::drive_connected_once(
+            graph,
+            resume_from,
+            intel,
+            servers,
+            &model,
+            payload.limits.max_steps,
+            payload.limits.max_tokens,
+            wall,
+            deadline,
+            Some(factory),
+            Some(&mut orch),
+            log,
+        );
+        return match result {
+            crate::graph::DriveResult::Done(o) => {
+                finish_workflow_child(o, entry_tokens, up, log)
+            }
+            crate::graph::DriveResult::Suspended(s) => {
+                log.info(
+                    "workflow.suspended",
+                    serde_json::json!({
+                        "on_uri": s.on_uri,
+                        "timeout_ms": s.timeout_ms,
+                        "steps": s.state.steps(),
+                        "tokens": s.state.tokens(),
+                    }),
+                );
+                send_up(
+                    up,
+                    &AgentMsg::Usage(crate::wire::intel::Usage {
+                        input_tokens: 0,
+                        output_tokens: s.state.tokens().saturating_sub(entry_tokens),
+                    }),
+                );
+                let outcome = crate::agentloop::stop::Outcome {
+                    status: crate::agentloop::stop::TerminalStatus::Completed,
+                    partial: false,
+                    result: serde_json::json!({
+                        "$workflow": { "suspended": {
+                            "on_uri": s.on_uri,
+                            "timeout_ms": s.timeout_ms,
+                            "state": s.state,
+                        }}
+                    }),
+                    scheduled: Vec::new(),
+                    subscriptions: Vec::new(),
+                };
+                send_up(up, &AgentMsg::Result { outcome });
+                crate::exit::SUCCESS
+            }
+        };
+    }
+
     let o = drive_connected(
         graph,
         intel,
@@ -636,9 +721,26 @@ fn run_workflow_child(
         wall,
         deadline,
         Some(factory),
+        Some(&mut orch),
         log,
     );
 
+    finish_workflow_child(o, 0, up, log)
+}
+
+/// Map a terminal [`GraphOutcome`] onto the child result contract: GraphStatus →
+/// TerminalStatus → the exit table, the workflow detail in the result body, and
+/// the intelligence cost (LESS `entry_tokens` — a resumed reactive child rolls
+/// only ITS delta; the cumulative pool rides the persisted slice) as Usage.
+#[cfg(feature = "workflow")]
+fn finish_workflow_child(
+    o: crate::graph::GraphOutcome,
+    entry_tokens: u64,
+    up: &Up,
+    log: &Logger,
+) -> i32 {
+    use crate::agentloop::stop::{Outcome, TerminalStatus};
+    use crate::graph::GraphStatus;
     let status = match o.status {
         GraphStatus::Completed => TerminalStatus::Completed,
         GraphStatus::Halted => o.terminal.unwrap_or(TerminalStatus::Crashed),
@@ -672,7 +774,7 @@ fn run_workflow_child(
         up,
         &AgentMsg::Usage(crate::wire::intel::Usage {
             input_tokens: 0,
-            output_tokens: o.tokens,
+            output_tokens: o.tokens.saturating_sub(entry_tokens),
         }),
     );
     let code = crate::exit::once_exit(status, false);

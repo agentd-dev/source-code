@@ -60,6 +60,11 @@ pub enum AgentdResource {
     /// which is active, and each one's health (up/broken/last-latency).
     /// Management-only, subscribable; fires on breaker/active/all-down transitions.
     Intelligence,
+    /// `agentd://workflow` — the live reactive-workflow snapshot (pivot Phase 7
+    /// follow-up): driving / suspended (with the watched uri + spent budget) /
+    /// terminal. Management-only; present only in `workflow` builds and only
+    /// once a reactive workflow has run.
+    Workflow,
     /// `agentd://capacity` — the live capacity/placement view (RFC 0019 §7.2/§9):
     /// instance identity, shard `K/N`, free slots, active subagents, intelligence
     /// warmth/health, and saturation. Management-only. The read surface agentctl
@@ -162,6 +167,9 @@ impl AgentdResource {
         if rest == "capacity" {
             return Some(AgentdResource::Capacity);
         }
+        if rest == "workflow" {
+            return Some(AgentdResource::Workflow);
+        }
         if rest == "config/effective" {
             return Some(AgentdResource::ConfigEffective);
         }
@@ -225,6 +233,8 @@ pub const CONFIG_EFFECTIVE_URI: &str = "agent://config/effective";
 /// bare base URI (subscribe/list/notify use it); a read appends `?after=<seq>`
 /// and the optional `?level=`/`?event=` filters.
 pub const EVENTS_URI: &str = "agent://events";
+/// The reactive-workflow live-state resource uri (neutral spelling).
+pub const WORKFLOW_URI: &str = "agent://workflow";
 
 #[cfg(test)]
 mod tests {

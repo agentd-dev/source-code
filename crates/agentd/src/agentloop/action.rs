@@ -53,6 +53,7 @@ pub const SELF_CONTROL_TOOLS: &[&str] = &[
     "await_resource",
     "graph.define",
     "graph.patch",
+    "graph.run",
     "a2a.delegate",
     "resource.read",
 ];

@@ -33,6 +33,12 @@ pub mod method {
     pub const COMPLETION_COMPLETE: &str = "completion/complete";
     pub const LOGGING_SET_LEVEL: &str = "logging/setLevel";
 
+    // Tasks extension (io.modelcontextprotocol/tasks): async long-running requests.
+    pub const TASKS_GET: &str = "tasks/get";
+    pub const TASKS_UPDATE: &str = "tasks/update";
+    pub const TASKS_CANCEL: &str = "tasks/cancel";
+    pub const NOTIFY_TASKS: &str = "notifications/tasks";
+
     // Modern (2026-07-28+, stateless) methods.
     /// Query a server's supported versions + capabilities + identity in one call
     /// (the stateless replacement for the `initialize` capability exchange).
@@ -307,6 +313,59 @@ pub struct ResourceUpdatedParams {
     pub title: Option<String>,
 }
 
+// ---- tasks extension (io.modelcontextprotocol/tasks) ----
+
+/// The tasks extension identifier — advertised in `capabilities.extensions` to
+/// opt into task-augmented (async long-running) requests.
+pub const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
+
+/// A durable async-task handle (the tasks extension). A supported request (e.g.
+/// `tools/call`) may return one (`resultType: "task"`) instead of blocking; the
+/// client polls [`method::TASKS_GET`] until a terminal `status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub task_id: String,
+    /// `working` | `input_required` | `completed` | `failed` | `cancelled`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    /// On `completed`: what the original request would have returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// On `failed`: the JSON-RPC error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    /// On `input_required`: the server's outstanding input requests (MRTR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_requests: Option<Value>,
+}
+
+impl Task {
+    /// A terminal status (`completed`/`failed`/`cancelled`) — polling stops.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed" | "cancelled")
+    }
+    pub fn needs_input(&self) -> bool {
+        self.status == "input_required"
+    }
+}
+
+/// If a result value is a task handle (`resultType: "task"`), parse it — the
+/// polymorphic shape a task-augmented request returns instead of its normal result.
+pub fn as_task_result(result: &Value) -> Option<Task> {
+    if result.get("resultType").and_then(Value::as_str) == Some("task") {
+        serde_json::from_value(result.clone()).ok()
+    } else {
+        None
+    }
+}
+
 // ---- prompts ----
 
 /// A prompt template a server offers (RFC 0004 §prompts). `arguments` describe
@@ -415,6 +474,7 @@ fn content_text(items: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn initialize_result_parses_capabilities() {
@@ -481,6 +541,30 @@ mod tests {
         assert!(d.capabilities.supports_subscribe());
         assert!(d.capabilities.supports_prompts());
         assert_eq!(d.ttl_ms, Some(3_600_000));
+    }
+
+    #[test]
+    fn task_result_detected_and_lifecycle() {
+        // A tools/call result that is actually a task handle.
+        let create = json!({"resultType": "task", "taskId": "t-1", "status": "working",
+            "pollIntervalMs": 250, "ttlMs": 60000});
+        let t = as_task_result(&create).expect("is a task result");
+        assert_eq!(t.task_id, "t-1");
+        assert_eq!(t.poll_interval_ms, Some(250));
+        assert!(!t.is_terminal());
+        // A normal (non-task) result is not a task.
+        assert!(as_task_result(&json!({"content": []})).is_none());
+        // Terminal / input states.
+        let done: Task = serde_json::from_value(
+            json!({"taskId": "t-1", "status": "completed", "result": {"content": []}}),
+        )
+        .unwrap();
+        assert!(done.is_terminal() && !done.needs_input());
+        let ask: Task = serde_json::from_value(
+            json!({"taskId": "t-1", "status": "input_required", "inputRequests": {}}),
+        )
+        .unwrap();
+        assert!(ask.needs_input() && !ask.is_terminal());
     }
 
     #[test]

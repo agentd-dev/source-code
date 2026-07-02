@@ -120,7 +120,7 @@ non-scalar placeholder takes the `error` edge.
 
 ### Node kinds
 
-Every node has a `kind`. There are nine:
+Every node has a `kind`. There are ten:
 
 | Kind | Does | Key fields | Emits |
 |---|---|---|---|
@@ -131,7 +131,8 @@ Every node has a `kind`. There are nine:
 | `branch` | Routes on the blackboard (see [Conditions](#conditions)). | `cases`, `default`, `semantic?` | (per-case goto) |
 | `foreach` | Fans out over an array (see [Fan-out](#foreach--deterministic-fan-out-over-an-array)): runs `body` once per item on a scoped board, collecting results positionally. | `items`, `body`, `parallel?`, `on_error?`, `writes?`, `edges` | `ok` / `error` |
 | `wait` | Suspends until `on_uri` updates or `timeout_ms` elapses, writing the read content. | `on_uri`, `timeout_ms`, `writes?`, `edges` | `updated` / `timeout` |
-| `subgraph` | Runs a nested workflow inline (waits included); writes its result. | `graph`, `writes?`, `edges` | `ok` / `error` |
+| `subgraph` | Runs a nested workflow inline (waits included) — or `async: true`: SPAWNS it as a supervised child process and writes `{"handle"}` immediately. | `graph`, `async?`, `writes?`, `edges` | `ok` / `error` |
+| `join` | Fans IN: awaits async-subgraph handles (a handle, a `{"handle"}` object, or an array), collecting results positionally. | `handles`, `timeout_ms`, `writes?`, `edges` | `ok` / `error` / `timeout` |
 | `halt` | Terminates the workflow with an author-chosen status, projecting a result. | `status`, `result_from?` | — |
 
 A node that emits a label with no matching edge, an unhandled node, or a dangling
@@ -353,6 +354,61 @@ long wait survives across a process boundary. Waits work inside `subgraph`s too.
 > **Scope.** All current paths resolve waits **in-process** (they block until the
 > wait resolves, inside the supervised child). A fully asynchronous, non-blocking
 > reactive-daemon workflow is a roadmap item.
+
+---
+
+## Async subgraphs + `join` — parallel phases as supervised children
+
+`subgraph { async: true }` spawns the nested workflow as a **child process**
+through the same machinery `subagent.spawn` uses — the depth, breadth, and
+spawn-rate caps all apply — and writes `{"handle": …}` immediately. A later
+`join` collects:
+
+```json
+{ "start": "s1",
+  "nodes": {
+    "s1":     { "kind": "subgraph", "async": true, "graph": { "…": "phase A" },
+                "writes": "h1", "edges": { "ok": "s2", "error": "fail" } },
+    "s2":     { "kind": "subgraph", "async": true, "graph": { "…": "phase B" },
+                "writes": "h2", "edges": { "ok": "gather", "error": "fail" } },
+    "gather": { "kind": "assign", "value": [{ "$from": "h1" }, { "$from": "h2" }],
+                "writes": "hs", "edges": { "ok": "join" } },
+    "join":   { "kind": "join", "handles": { "$from": "hs" }, "timeout_ms": 60000,
+                "writes": "results", "edges": { "ok": "done", "error": "triage", "timeout": "late" } },
+    "…":      {}
+  } }
+```
+
+Both phases run **concurrently** while the parent workflow proceeds to the
+join. Results collect positionally (a failed child's slot carries
+`{"handle", "error"}`); stragglers at the timeout take the `timeout` edge with
+the partials written — they keep running and may be joined again. An async
+subgraph starts with an EMPTY blackboard (data flows OUT via its halt result,
+not in); use `foreach` when items must flow into parallel work.
+
+---
+
+## The reactive-daemon workflow (`--mode reactive --workflow`)
+
+A long-lived workflow whose `wait` nodes hold **no process at all**:
+
+```bash
+agentd --mode reactive --workflow ./pipeline.json   --intelligence https://gw.example/v1 --mcp inbox=https://mcp-inbox.internal/mcp
+```
+
+The daemon drives the workflow in a supervised child; when it reaches a `wait`,
+the child **suspends** — it exits, serializing the run slice (cursor +
+blackboard + budget) into its result — and the DAEMON arms the subscription and
+the timeout clock. On the resource update (or the timeout) a fresh child
+resumes on the `updated`/`timeout` edge, budget continuing where it left off.
+No `--subscribe` or `--instruction` is needed: the workflow's waits are the
+subscriptions and its nodes are the work.
+
+The daemon's lifetime is the workflow's: a terminal workflow exits with its
+projected code, while an event-loop workflow (a back-edge into a `wait`) runs
+indefinitely — idling between events with zero child processes alive. The live
+state is observable at the Management-only **`agent://workflow`** resource:
+`driving`, `suspended` (with the watched uri and spent budget), or `terminal`.
 
 ---
 

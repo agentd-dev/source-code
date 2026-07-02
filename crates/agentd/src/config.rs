@@ -1532,10 +1532,13 @@ impl Config {
 
     /// Reject inconsistent config before any side effect (RFC 0011 §2).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // A pinned workflow run (`--mode workflow`) carries its instructions in the graph
-        // nodes, so it needs no top-level `--instruction`; every other mode does.
+        // A pinned workflow run (`--mode workflow`) carries its instructions in the
+        // graph nodes, so it needs no top-level `--instruction` — and neither does
+        // a reactive WORKFLOW daemon (`--mode reactive --workflow`, whose reactions
+        // are the workflow's own suspend/resume steps).
         #[cfg(feature = "workflow")]
-        let needs_instruction = self.mode != Mode::Workflow;
+        let needs_instruction = self.mode != Mode::Workflow
+            && !(self.mode == Mode::Reactive && self.workflow_file.is_some());
         #[cfg(not(feature = "workflow"))]
         let needs_instruction = true;
         if needs_instruction
@@ -1640,13 +1643,22 @@ impl Config {
                 a.server
             )));
         }
-        if self.mode == Mode::Reactive
-            && self.subscribe.is_empty()
-            && self.continue_subscribe.is_empty()
         {
-            return Err(usage(
-                "--mode reactive requires at least one --subscribe or --continue <uri>".into(),
-            ));
+            #[cfg(feature = "workflow")]
+            let wait_driven = self.workflow_file.is_some();
+            #[cfg(not(feature = "workflow"))]
+            let wait_driven = false;
+            // A reactive WORKFLOW daemon's subscriptions come from its Wait nodes
+            // dynamically — the workflow file stands in for a static --subscribe.
+            if self.mode == Mode::Reactive
+                && self.subscribe.is_empty()
+                && self.continue_subscribe.is_empty()
+                && !wait_driven
+            {
+                return Err(usage(
+                    "--mode reactive requires at least one --subscribe or --continue <uri> (or --workflow on a workflow build)".into(),
+                ));
+            }
         }
         if !self.continue_subscribe.is_empty() && self.mode != Mode::Reactive {
             return Err(usage(
@@ -1668,8 +1680,13 @@ impl Config {
             if self.mode == Mode::Workflow && self.workflow_file.is_none() {
                 return Err(usage("--mode workflow requires --workflow <file>".into()));
             }
-            if self.workflow_file.is_some() && self.mode != Mode::Workflow {
-                return Err(usage("--workflow is only valid with --mode workflow".into()));
+            if self.workflow_file.is_some()
+                && self.mode != Mode::Workflow
+                && self.mode != Mode::Reactive
+            {
+                return Err(usage(
+                    "--workflow is only valid with --mode workflow or --mode reactive".into(),
+                ));
             }
         }
         // The per-run limits do nothing without a cgroup to apply them to, so a
@@ -2616,6 +2633,30 @@ mod tests {
         );
         // --workflow without --mode workflow → usage error.
         let e = Config::load(&args(&["--workflow", "/tmp/g.json"]), &base_env()).unwrap_err();
+        assert!(format!("{e}").contains("--workflow is only valid"), "{e}");
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_reactive_workflow_daemon_needs_no_subscribe_or_instruction() {
+        // The workflow's Wait nodes ARE the subscriptions, and its nodes carry
+        // the work — `--mode reactive --workflow <file>` stands alone.
+        let c = Config::load(
+            &args(&["--mode", "reactive", "--workflow", "/tmp/wf.json"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(c.mode, Mode::Reactive);
+        assert_eq!(c.workflow_file.as_deref(), Some("/tmp/wf.json"));
+        // A plain reactive daemon still requires a subscription.
+        let e = Config::load(&args(&["--mode", "reactive"]), &base_env()).unwrap_err();
+        assert!(matches!(e, ConfigError::Usage(_)));
+        // And --workflow still refuses the modes it means nothing in.
+        let e = Config::load(
+            &args(&["--mode", "loop", "--interval", "5m", "--workflow", "/tmp/wf.json", "--instruction", "x"]),
+            &base_env(),
+        )
+        .unwrap_err();
         assert!(format!("{e}").contains("--workflow is only valid"), "{e}");
     }
 

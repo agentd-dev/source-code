@@ -277,16 +277,33 @@ fn run() -> i32 {
                 // env/flag layers; only the FILE can change between loads). These
                 // are inert without the `hot-reload` feature (the loop never
                 // consults the reload latch), so the no-reload path is unchanged.
-                Mode::Reactive => run_reactive(
-                    exe,
-                    root_payload(&cfg),
-                    &cfg,
-                    &argv[1..],
-                    &env,
-                    &log,
-                    #[cfg(feature = "serve-mcp")]
-                    live_config,
-                ),
+                Mode::Reactive => {
+                    let mut payload = root_payload(&cfg);
+                    // A reactive WORKFLOW daemon (pivot Phase 7 follow-up): the
+                    // pinned workflow rides the base payload with REACTIVE
+                    // semantics — a Wait suspends the child and the daemon owns
+                    // the watch/resume choreography.
+                    #[cfg(feature = "workflow")]
+                    if let Some(path) = cfg.workflow_file.as_deref() {
+                        match load_workflow(path, &log) {
+                            Ok(graph) => {
+                                payload.workflow = Some(graph);
+                                payload.workflow_reactive = true;
+                            }
+                            Err(code) => return code,
+                        }
+                    }
+                    run_reactive(
+                        exe,
+                        payload,
+                        &cfg,
+                        &argv[1..],
+                        &env,
+                        &log,
+                        #[cfg(feature = "serve-mcp")]
+                        live_config,
+                    )
+                }
                 _ => run_scheduled(exe, root_payload(&cfg), &cfg, &log), // Loop | Schedule
             };
             // On shutdown, let in-flight served runs drain before we exit (their
@@ -613,30 +630,39 @@ fn run_supervised_once(cfg: &Config, log: &Logger, payload: SpawnPayload) -> i32
 /// A `Wait` suspension is reported as unsupported — a pinned one-shot has no reactor
 /// to resume it (the reactive-workflow daemon path is the follow-up). The graph status
 /// projects to the same exit table as a one-shot run.
+/// Load + parse + validate a pinned workflow file (fail-closed at the operator
+/// boundary — `Err` carries the usage exit code, printed before any side effect).
 #[cfg(feature = "workflow")]
-fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
-    // Load + parse + validate the pinned workflow (fail-closed at the operator
-    // boundary, exit 2 before any side effect).
-    let path = cfg.workflow_file.as_deref().unwrap_or_default();
+fn load_workflow(path: &str, log: &Logger) -> Result<agentd::graph::Graph, i32> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
             log.error("proc.exit", json!({"err": format!("read workflow '{path}': {e}")}));
             eprintln!("agentd: cannot read workflow file '{path}': {e}");
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
     };
     let graph: agentd::graph::Graph = match serde_json::from_str(&text) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("agentd: invalid workflow JSON in '{path}': {e}");
-            return exit::USAGE;
+            return Err(exit::USAGE);
         }
     };
     if let Err(errs) = graph.validate() {
         eprintln!("agentd: invalid workflow '{path}': {}", errs.join("; "));
-        return exit::USAGE;
+        return Err(exit::USAGE);
     }
+    Ok(graph)
+}
+
+#[cfg(feature = "workflow")]
+fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
+    let path = cfg.workflow_file.as_deref().unwrap_or_default();
+    let graph = match load_workflow(path, log) {
+        Ok(g) => g,
+        Err(code) => return code,
+    };
 
     // Run it SUPERVISED like any one-shot (pivot Phase 7 · W4): the root child
     // drives the workflow (the driver lives in the child process) while the
@@ -743,6 +769,10 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         warm: false, // root runs are one-shot; warm continue-sessions are daemon-minted
         #[cfg(feature = "workflow")]
         workflow: None,
+        #[cfg(feature = "workflow")]
+        workflow_reactive: false,
+        #[cfg(feature = "workflow")]
+        workflow_resume: None,
     }
 }
 

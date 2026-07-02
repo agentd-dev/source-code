@@ -317,6 +317,35 @@ pub trait GraphExec {
             })
             .collect()
     }
+
+    /// Spawn `graph` as a DETACHED CHILD WORKFLOW (a supervised subagent process
+    /// drives it; depth/breadth/rate caps apply), returning its handle at once —
+    /// the `Subgraph { async: true }` seam. Default: no spawn machinery wired —
+    /// the node degrades to its `error` edge.
+    fn spawn_subgraph(&mut self, _graph: &Graph) -> Result<String, String> {
+        Err("this executor cannot spawn an async subgraph (no orchestrator wired)".into())
+    }
+
+    /// Await one previously-spawned child workflow up to `timeout_ms`: its
+    /// terminal `(result, is_error)`, or [`JoinWait::Pending`] when it is still
+    /// running at the deadline (the child keeps running; a later Join may catch
+    /// it). Default: an error result (no spawn machinery, nothing to await).
+    fn await_handle(&mut self, handle: &str, _timeout_ms: u64) -> JoinWait {
+        JoinWait::Ready(
+            Value::String(format!(
+                "this executor cannot await '{handle}' (no orchestrator wired)"
+            )),
+            true,
+        )
+    }
+}
+
+/// One [`GraphExec::await_handle`] resolution.
+pub enum JoinWait {
+    /// The child reached a terminal result (`is_error` selects the edge/mark).
+    Ready(Value, bool),
+    /// Still running at the timeout — the Join takes its `timeout` edge.
+    Pending,
 }
 
 /// Build one `Foreach` iteration's scoped blackboard: the parent board (cloned —
@@ -326,6 +355,23 @@ fn foreach_seed(parent: &Blackboard, index: usize, item: &Value) -> Blackboard {
     seed.insert("item".to_string(), item.clone());
     seed.insert("index".to_string(), Value::from(index as u64));
     seed
+}
+
+/// Extract the handle strings a `Join` awaits from its resolved `handles`
+/// value: a bare string, the `{"handle": …}` object an async Subgraph wrote, or
+/// an array of either. `None` for any other shape.
+fn handle_list(resolved: &Value) -> Option<Vec<String>> {
+    fn one(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            Value::Object(o) => o.get("handle").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        }
+    }
+    match resolved {
+        Value::Array(items) => items.iter().map(one).collect(),
+        v => one(v).map(|h| vec![h]),
+    }
 }
 
 /// Per-blackboard-value size cap (serialized bytes). The blackboard is shared
@@ -730,13 +776,82 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
-            // Subgraph: run the nested graph through the exec seam (the real impl
-            // spawns a capped subtree), write its result, follow ok/error.
+            // Subgraph: inline (sync) through the exec seam — or `async: true`,
+            // SPAWNED as a supervised child workflow whose handle is written for
+            // a later Join (the fan-out half of the spawn/join pair).
             Node::Subgraph { graph: sub, async_, writes, edges } => {
-                let (val, is_err) = exec.run_subgraph(sub, *async_, &state.blackboard);
+                let (val, is_err) = if *async_ {
+                    match exec.spawn_subgraph(sub) {
+                        Ok(handle) => (serde_json::json!({ "handle": handle }), false),
+                        Err(e) => (Value::String(format!("async subgraph: {e}")), true),
+                    }
+                } else {
+                    exec.run_subgraph(sub, false, &state.blackboard)
+                };
                 let (val, is_err) = clamp_value(val, is_err);
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
+            }
+            // Join: fan IN — await async-subgraph handles, collecting results
+            // positionally; stragglers at the timeout take the `timeout` edge
+            // (they keep running and may be joined again).
+            Node::Join { handles, timeout_ms, writes, edges } => {
+                let started = std::time::Instant::now();
+                let (val, label) = match super::resolve_refs(handles, &state.blackboard)
+                    .map_err(|e| format!("join handles: {e}"))
+                    .and_then(|resolved| {
+                        handle_list(&resolved).ok_or_else(|| {
+                            format!("join: handles must be a handle, {{\"handle\"}} object, or array of them (got {resolved})")
+                        })
+                    }) {
+                    Err(e) => (Value::String(e), "error"),
+                    Ok(list) => {
+                        let mut results: Vec<Value> = Vec::with_capacity(list.len());
+                        let mut label = "ok";
+                        for handle in &list {
+                            let elapsed = started.elapsed().as_millis() as u64;
+                            let left = timeout_ms.saturating_sub(elapsed);
+                            if left == 0 || exec.deadline_exceeded() {
+                                label = "timeout";
+                                break;
+                            }
+                            match exec.await_handle(handle, left) {
+                                JoinWait::Ready(v, false) => results.push(v),
+                                JoinWait::Ready(v, true) => {
+                                    results.push(serde_json::json!({"handle": handle, "error": v}));
+                                    if label == "ok" {
+                                        label = "error";
+                                    }
+                                }
+                                JoinWait::Pending => {
+                                    label = "timeout";
+                                    break;
+                                }
+                            }
+                        }
+                        (Value::Array(results), label)
+                    }
+                };
+                let (val, _) = clamp_value(val, false);
+                write(&mut state.blackboard, writes, val);
+                match edges.get(label) {
+                    Some(next) => {
+                        state.at = next.clone();
+                        continue;
+                    }
+                    None => {
+                        let reason =
+                            format!("node {:?} emitted unhandled label {label:?}", state.at);
+                        let result = bb_result(&state.blackboard, None);
+                        return DriveResult::Done(GraphOutcome::engine(
+                            GraphStatus::Crashed,
+                            reason,
+                            result,
+                            state.steps(),
+                            state.tokens(),
+                        ));
+                    }
+                }
             }
         };
 
@@ -987,6 +1102,12 @@ mod tests {
         counter: i64,
         /// The label `judge` returns for a Tier-2 semantic branch (`None` = default).
         judge_answer: Option<String>,
+        /// Async subgraphs spawned (handle = "m.<n>").
+        spawned_subgraphs: Vec<Graph>,
+        /// Scripted join results by handle; a handle in `join_pending` never
+        /// resolves (drives the timeout edge).
+        join_results: BTreeMap<String, (Value, bool)>,
+        join_pending: std::collections::BTreeSet<String>,
         /// Every effectful call "costs" this many tokens (drained by take_tokens).
         tokens_per_call: u64,
         pending_tokens: u64,
@@ -1070,6 +1191,23 @@ mod tests {
             match drive_seeded(body, self, 1000, seed) {
                 DriveResult::Done(o) => (o.result, o.status != GraphStatus::Completed),
                 DriveResult::Suspended(_) => (json!("body suspended"), true),
+            }
+        }
+
+        fn spawn_subgraph(&mut self, graph: &Graph) -> Result<String, String> {
+            self.calls.push("spawn_subgraph".to_string());
+            self.spawned_subgraphs.push(graph.clone());
+            Ok(format!("m.{}", self.spawned_subgraphs.len()))
+        }
+
+        fn await_handle(&mut self, handle: &str, _timeout_ms: u64) -> JoinWait {
+            self.calls.push(format!("await:{handle}"));
+            if self.join_pending.contains(handle) {
+                return JoinWait::Pending;
+            }
+            match self.join_results.get(handle) {
+                Some((v, e)) => JoinWait::Ready(v.clone(), *e),
+                None => JoinWait::Ready(json!("no such child"), true),
             }
         }
 
@@ -2073,6 +2211,121 @@ mod tests {
             exec.infer_feedbacks[1].as_deref().unwrap().contains("failed the check"),
             "{:?}",
             exec.infer_feedbacks[1]
+        );
+    }
+
+    // ── async subgraph + join — the spawn/join pair ──────────────────────────
+
+    /// Two async subgraphs fanned out, handles gathered, then joined.
+    fn spawn_join_graph(timeout_ms: u64) -> Graph {
+        serde_json::from_value(json!({
+            "start": "s1",
+            "nodes": {
+                "s1": {"kind": "subgraph", "async": true,
+                       "graph": {"start": "h", "nodes": {"h": {"kind": "halt", "status": "completed"}}},
+                       "writes": "h1", "edges": {"ok": "s2", "error": "fail"}},
+                "s2": {"kind": "subgraph", "async": true,
+                       "graph": {"start": "h", "nodes": {"h": {"kind": "halt", "status": "completed"}}},
+                       "writes": "h2", "edges": {"ok": "gather", "error": "fail"}},
+                "gather": {"kind": "assign", "value": [{"$from": "h1"}, {"$from": "h2"}], "writes": "hs", "edges": {"ok": "join", "error": "fail"}},
+                "join": {"kind": "join", "handles": {"$from": "hs"}, "timeout_ms": timeout_ms, "writes": "results",
+                         "edges": {"ok": "done", "error": "fail", "timeout": "late"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "results"},
+                "late": {"kind": "halt", "status": "deadline", "result_from": "results"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "results"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn async_subgraphs_spawn_and_join_collects_positionally() {
+        let g = spawn_join_graph(5000);
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.join_results.insert("m.1".into(), (json!("first done"), false));
+        exec.join_results.insert("m.2".into(), (json!("second done"), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.result);
+        assert_eq!(out.result, json!(["first done", "second done"]));
+        assert_eq!(exec.spawned_subgraphs.len(), 2, "both spawned");
+        assert_eq!(
+            exec.calls.iter().filter(|c| c.starts_with("await:")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_failed_child_marks_its_slot_and_takes_the_error_edge() {
+        let g = spawn_join_graph(5000);
+        let mut exec = MockExec::default();
+        exec.join_results.insert("m.1".into(), (json!("ok"), false));
+        exec.join_results.insert("m.2".into(), (json!("boom"), true));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge");
+        let arr = out.result.as_array().unwrap();
+        assert_eq!(arr[0], json!("ok"));
+        assert_eq!(arr[1]["handle"], json!("m.2"));
+    }
+
+    #[test]
+    fn a_straggler_takes_the_timeout_edge_with_partials() {
+        let g = spawn_join_graph(200);
+        let mut exec = MockExec::default();
+        exec.join_results.insert("m.1".into(), (json!("ok"), false));
+        exec.join_pending.insert("m.2".into());
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Deadline), "timeout edge");
+        assert_eq!(out.result, json!(["ok"]), "partials written");
+    }
+
+    #[test]
+    fn an_executor_without_spawn_machinery_degrades_to_the_error_edge() {
+        struct NoSpawn;
+        impl GraphExec for NoSpawn {
+            fn run_agent(&mut self, _: &str, _: Option<&str>, _: &Blackboard, _: &[String]) -> (Value, bool) {
+                (Value::Null, false)
+            }
+            fn call_tool(&mut self, _: &str, _: &str, _: &Value) -> (Value, bool) {
+                (Value::Null, false)
+            }
+        }
+        let g: Graph = serde_json::from_value(json!({
+            "start": "s",
+            "nodes": {
+                "s": {"kind": "subgraph", "async": true,
+                      "graph": {"start": "h", "nodes": {"h": {"kind": "halt", "status": "completed"}}},
+                      "writes": "h1", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "h1"}
+            }
+        }))
+        .unwrap();
+        let mut exec = NoSpawn;
+        let DriveResult::Done(out) = drive(&g, &mut exec, 10) else { panic!() };
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
+        assert!(out.result.as_str().unwrap().contains("cannot spawn"), "{:?}", out.result);
+    }
+
+    #[test]
+    fn a_bad_handles_shape_takes_the_error_edge() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "j",
+            "nodes": {
+                "j": {"kind": "join", "handles": 42, "timeout_ms": 1000, "writes": "r",
+                      "edges": {"ok": "done", "error": "fail", "timeout": "done"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "r"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        let out = run(&g, &mut exec, 10);
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
+        assert!(
+            out.result.as_str().unwrap().contains("handles must be"),
+            "{:?}",
+            out.result
         );
     }
 

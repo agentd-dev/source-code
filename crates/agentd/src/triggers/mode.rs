@@ -386,6 +386,33 @@ pub fn run_reactive(
         crate::config_watch::spawn_config_watcher(Path::new(&path), log);
     }
 
+    // ── Reactive WORKFLOW (pivot Phase 7 follow-up) ──────────────────────────
+    // The base payload may carry a workflow with REACTIVE semantics: drive it
+    // now; a Wait SUSPENDS the child, whose serialized slice we hold while the
+    // watch is armed through the normal subscription machinery. The daemon's
+    // lifetime becomes the workflow's lifetime: terminal workflow → exit with
+    // its projected code (an event-loop workflow — a back-edge into a Wait —
+    // runs indefinitely).
+    #[cfg(feature = "workflow")]
+    let mut wf_suspended: Option<(crate::graph::GraphState, String, Instant)> = None;
+    #[cfg(feature = "workflow")]
+    if base.workflow.is_some() && base.workflow_reactive {
+        log.info("workflow.reactive.start", json!({}));
+        crate::graph::live::publish(json!({"status": "driving"}));
+        let o = react(&exe, &base, cfg.drain_timeout, log);
+        if let Some(code) = handle_workflow_outcome(
+            o,
+            &mut wf_suspended,
+            &mut router,
+            &mut owner,
+            &servers,
+            &server_order,
+            log,
+        ) {
+            return code;
+        }
+    }
+
     loop {
         crate::obs::health::tick();
 
@@ -629,6 +656,28 @@ pub fn run_reactive(
         // Fire due (debounced) deliveries: notify-then-read, then react.
         for delivery in router.due(now) {
             let content = read_current(&servers, &owner, &delivery.uri).unwrap_or_default();
+            // A suspended reactive WORKFLOW's wait resolving: consume this
+            // delivery as the resume trigger (never a normal reaction).
+            #[cfg(feature = "workflow")]
+            if wf_suspended.as_ref().is_some_and(|(_, uri, _)| *uri == delivery.uri) {
+                let (state, uri, _) = wf_suspended.take().expect("checked");
+                disarm_workflow_wait(&uri, &mut router, &mut owner, &servers, log);
+                let value = serde_json::from_str::<serde_json::Value>(&content)
+                    .unwrap_or(serde_json::Value::String(content.clone()));
+                let o = resume_workflow(&exe, &base, state, false, Some(value), cfg.drain_timeout, log);
+                match handle_workflow_outcome(
+                    o,
+                    &mut wf_suspended,
+                    &mut router,
+                    &mut owner,
+                    &servers,
+                    &server_order,
+                    log,
+                ) {
+                    Some(code) => return code,
+                    None => continue,
+                }
+            }
             // Condition predicate (pivot Phase 5.2): a conditional route/subscription
             // fires ONLY when the freshly-read content satisfies the predicate.
             // Notify-then-read means the content is authoritative here (not the stale
@@ -892,6 +941,27 @@ pub fn run_reactive(
         #[cfg(feature = "cluster")]
         if !held_claims.is_empty() {
             renew_held_claims(&servers, &mut held_claims, log);
+        }
+
+        // A suspended reactive WORKFLOW whose wait timed out: resume it on the
+        // `timeout` edge (the wait's own clock, independent of any update).
+        #[cfg(feature = "workflow")]
+        if wf_suspended.as_ref().is_some_and(|(_, _, deadline)| now >= *deadline) {
+            let (state, uri, _) = wf_suspended.take().expect("checked");
+            disarm_workflow_wait(&uri, &mut router, &mut owner, &servers, log);
+            log.info("workflow.wait.timeout", json!({"on_uri": uri}));
+            let o = resume_workflow(&exe, &base, state, true, None, cfg.drain_timeout, log);
+            if let Some(code) = handle_workflow_outcome(
+                o,
+                &mut wf_suspended,
+                &mut router,
+                &mut owner,
+                &servers,
+                &server_order,
+                log,
+            ) {
+                return code;
+            }
         }
 
         // Fire due self-scheduled wake-ups: each runs its own instruction as a
@@ -2019,6 +2089,121 @@ fn renew_held_claims(
 }
 
 /// Spawn + supervise one reaction synchronously, logging the outcome and
+/// Spawn a RESUME child for a suspended reactive workflow: the base payload
+/// (which carries the graph) plus the persisted slice + how the wait resolved.
+#[cfg(feature = "workflow")]
+fn resume_workflow(
+    exe: &Path,
+    base: &SpawnPayload,
+    state: crate::graph::GraphState,
+    timed_out: bool,
+    content: Option<serde_json::Value>,
+    drain: Duration,
+    log: &Logger,
+) -> Option<Outcome> {
+    let mut payload = base.clone();
+    payload.workflow_resume = Some(crate::subagent::protocol::WorkflowResume {
+        state,
+        timed_out,
+        content,
+    });
+    crate::graph::live::publish(json!({"status": "driving"}));
+    react(exe, &payload, drain, log)
+}
+
+/// Digest one reactive-workflow child's outcome: a SUSPENSION arms the watch
+/// (subscription + exact route + the timeout clock) and parks the slice;
+/// anything else is the workflow's terminal — `Some(exit code)` ends the daemon
+/// (its lifetime IS the workflow's). A failed/killed child (no outcome) is a
+/// broken workflow run → exit generic.
+#[cfg(feature = "workflow")]
+#[allow(clippy::too_many_arguments)]
+fn handle_workflow_outcome(
+    o: Option<Outcome>,
+    wf_suspended: &mut Option<(crate::graph::GraphState, String, Instant)>,
+    router: &mut Router,
+    owner: &mut HashMap<String, String>,
+    servers: &BTreeMap<String, McpClient>,
+    server_order: &[String],
+    log: &Logger,
+) -> Option<i32> {
+    let Some(o) = o else {
+        crate::graph::live::publish(json!({"status": "failed"}));
+        return Some(crate::exit::GENERIC);
+    };
+    let suspended = o
+        .result
+        .get("$workflow")
+        .and_then(|w| w.get("suspended"))
+        .cloned();
+    if let Some(susp) = suspended {
+        let on_uri = susp.get("on_uri").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let timeout_ms = susp.get("timeout_ms").and_then(serde_json::Value::as_u64).unwrap_or(1);
+        let state: crate::graph::GraphState =
+            match serde_json::from_value(susp.get("state").cloned().unwrap_or_default()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log.error("workflow.suspend.bad_state", json!({"err": e.to_string()}));
+                    crate::graph::live::publish(json!({"status": "failed"}));
+                    return Some(crate::exit::GENERIC);
+                }
+            };
+        // Arm the watch through the NORMAL subscription machinery; a uri no
+        // server can watch still resumes via the timeout (fail open, like the
+        // in-process wait).
+        if arm_uri_on_first_supporting(servers, server_order, owner, &on_uri).is_some() {
+            router.add_route(Route::new(&on_uri, Disposition::Spawn, DEBOUNCE));
+        } else {
+            log.warn("workflow.wait.unwatchable", json!({"uri": on_uri}));
+        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        log.info(
+            "workflow.suspended",
+            json!({"on_uri": on_uri, "timeout_ms": timeout_ms, "steps": state.steps(), "tokens": state.tokens()}),
+        );
+        crate::graph::live::publish(json!({
+            "status": "suspended",
+            "on_uri": on_uri,
+            "timeout_ms": timeout_ms,
+            "steps": state.steps(),
+            "tokens": state.tokens(),
+        }));
+        *wf_suspended = Some((state, on_uri, deadline));
+        return None;
+    }
+    // Terminal: the child already mapped the graph outcome onto TerminalStatus;
+    // project it exactly like a one-shot (the daemon's lifetime = the workflow's).
+    let code = crate::exit::once_exit(o.status, o.partial);
+    log.info(
+        "workflow.reactive.exit",
+        json!({"status": o.status.as_str(), "code": code}),
+    );
+    crate::graph::live::publish(json!({
+        "status": "terminal",
+        "terminal": o.status.as_str(),
+        "result": o.result,
+    }));
+    Some(code)
+}
+
+/// Tear down a suspended workflow's watch (subscription + exact route) before a
+/// resume — whichever of update/timeout fires first wins, the other is disarmed.
+#[cfg(feature = "workflow")]
+fn disarm_workflow_wait(
+    uri: &str,
+    router: &mut Router,
+    owner: &mut HashMap<String, String>,
+    servers: &BTreeMap<String, McpClient>,
+    _log: &Logger,
+) {
+    if let Some(name) = owner.remove(uri)
+        && let Some(s) = servers.get(&name)
+    {
+        let _ = s.unsubscribe_within(uri, crate::obs::health::management_timeout());
+    }
+    let _ = router.remove_exact(uri);
+}
+
 /// returning its `Outcome` (only when it completed) so the daemon can apply the
 /// agent's self-scheduling / self-subscription requests (RFC 0008).
 fn react(exe: &Path, payload: &SpawnPayload, drain: Duration, log: &Logger) -> Option<Outcome> {
@@ -2407,6 +2592,10 @@ mod tests {
             warm: false,
             #[cfg(feature = "workflow")]
             workflow: None,
+            #[cfg(feature = "workflow")]
+            workflow_reactive: false,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
         }
     }
 

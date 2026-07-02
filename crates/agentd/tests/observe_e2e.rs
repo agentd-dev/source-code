@@ -192,6 +192,117 @@ fn workflow_mode_requires_a_workflow_file() {
 
 #[cfg(feature = "workflow")]
 #[test]
+fn a_reactive_workflow_daemon_suspends_and_resumes_across_children() {
+    // The reactive-daemon workflow (pivot Phase 7 follow-up): the FIRST child
+    // drives to the Wait and SUSPENDS (exits, serializing its slice); the DAEMON
+    // arms the subscription; the mock MCP pushes an update; a SECOND child
+    // resumes on the `updated` edge and completes — and the daemon's lifetime
+    // ends with the workflow's, exit 0. No process blocks on the wait.
+    let dir = tempfile::tempdir().unwrap();
+    let mock = spawn_mock_mcp("file:///in.json", true); // emit=true → pushes an update
+    let wf_path = dir.path().join("reactive-wait.json");
+    std::fs::write(
+        &wf_path,
+        r#"{
+            "start": "w",
+            "nodes": {
+                "w": {"kind": "wait", "on_uri": "file:///in.json", "writes": "evt", "timeout_ms": 15000, "edges": {"updated": "done", "timeout": "expired"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "evt"},
+                "expired": {"kind": "halt", "status": "deadline"}
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let (code, _stdout, stderr) = run_once(&[
+        "--mode",
+        "reactive",
+        "--workflow",
+        wf_path.to_str().unwrap(),
+        "--intelligence",
+        "http://127.0.0.1:9",
+        "--mcp",
+        &mock.mcp_arg("mock"),
+        "--log-level",
+        "info",
+    ]);
+
+    assert_eq!(code, 0, "the resumed workflow completed; stderr:
+{stderr}");
+    assert!(
+        stderr.contains(r#""event":"workflow.suspended""#),
+        "the first child suspended on the wait:
+{stderr}"
+    );
+    assert!(
+        stderr.contains(r#""event":"workflow.reactive.exit""#)
+            && stderr.contains(r#""status":"completed""#),
+        "the daemon ended with the workflow's terminal:
+{stderr}"
+    );
+}
+
+#[cfg(feature = "workflow")]
+#[test]
+fn an_async_subgraph_spawns_a_real_child_and_join_collects_it() {
+    // The full spawn/join chain through REAL processes: the supervised workflow
+    // child spawns a GRANDCHILD subagent to drive the async subgraph (an agent
+    // node against the mock LLM), then a join node collects its distillate.
+    let dir = tempfile::tempdir().unwrap();
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "final");
+
+    let wf_path = dir.path().join("spawnjoin.json");
+    std::fs::write(
+        &wf_path,
+        r#"{
+            "start": "fan",
+            "nodes": {
+                "fan": {"kind": "subgraph", "async": true,
+                        "graph": {"start": "work", "nodes": {
+                            "work": {"kind": "agent", "instruction": "do the parallel piece", "writes": "out", "edges": {"ok": "h", "error": "f"}},
+                            "h": {"kind": "halt", "status": "completed", "result_from": "out"},
+                            "f": {"kind": "halt", "status": "crashed"}
+                        }},
+                        "writes": "h1", "edges": {"ok": "join", "error": "fail"}},
+                "join": {"kind": "join", "handles": {"$from": "h1"}, "timeout_ms": 30000, "writes": "results",
+                         "edges": {"ok": "done", "error": "fail", "timeout": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "results"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "results"}
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_once(&[
+        "--mode",
+        "workflow",
+        "--workflow",
+        wf_path.to_str().unwrap(),
+        "--intelligence",
+        &intel,
+        "--log-level",
+        "info",
+    ]);
+
+    sigterm(llm.id());
+    let _ = llm.wait();
+
+    assert_eq!(code, 0, "spawn/join workflow completes 0; stderr:
+{stderr}");
+    assert!(
+        stdout.contains("mock-llm done"),
+        "the grandchild's distillate flowed through the join: {stdout:?}"
+    );
+    assert!(
+        stderr.contains(r#""event":"subagent.spawn_async""#),
+        "a real async child was spawned:
+{stderr}"
+    );
+}
+
+#[cfg(feature = "workflow")]
+#[test]
 fn workflow_mode_resolves_a_wait_node_in_process() {
     // A pinned graph whose Wait node blocks on an MCP resource: the mock MCP pushes an
     // update after subscribe, so the wait resolves IN-PROCESS (no daemon) and the graph

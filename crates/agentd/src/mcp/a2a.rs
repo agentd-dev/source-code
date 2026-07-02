@@ -837,6 +837,10 @@ mod tests {
             warm: false,
             #[cfg(feature = "workflow")]
             workflow: None,
+            #[cfg(feature = "workflow")]
+            workflow_reactive: false,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
         }
     }
 

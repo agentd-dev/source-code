@@ -77,6 +77,10 @@ fn payload(intel_url: &str) -> SpawnPayload {
         warm: false, // the registry forces warm = true
         #[cfg(feature = "workflow")]
         workflow: None,
+        #[cfg(feature = "workflow")]
+        workflow_reactive: false,
+        #[cfg(feature = "workflow")]
+        workflow_resume: None,
     }
 }
 

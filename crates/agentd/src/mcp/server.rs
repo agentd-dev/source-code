@@ -1687,6 +1687,17 @@ fn resource_list(ctx: &ServeCtx, origin: PeerOrigin) -> Value {
             "description": "The live subagent-tree projection: lifecycle flags (draining/paused/ready), totals, and per-node status/usage. Subscribable — pushed on each spawn / exit / status change.",
             "mimeType": "application/json"
         }));
+        // agent://workflow — the live reactive-workflow snapshot, listed only
+        // once one has run (a stable list never 404s on read).
+        #[cfg(feature = "workflow")]
+        if crate::graph::live::snapshot().is_some() {
+            list.push(json!({
+                "uri": crate::agentd_uri::WORKFLOW_URI,
+                "name": "workflow",
+                "description": "The live reactive-workflow snapshot: driving / suspended (watched uri, spent budget) / terminal.",
+                "mimeType": "application/json"
+            }));
+        }
         // agentd://intelligence — operator-facing intelligence-endpoint health
         // (RFC 0018 §4.4), Management-only. The endpoint list (transport + index),
         // which is active, and per-endpoint breaker/latency — never the URL/creds.
@@ -1768,6 +1779,40 @@ fn resources_read(req: Request, ctx: &ServeCtx, origin: PeerOrigin) -> Response 
                 json!({
                     "contents": [{"uri": uri, "mimeType": "application/json", "text": ctx.inventory_body().to_string()}]
                 }),
+            )
+        }
+        // agentd://workflow — the live reactive-workflow snapshot (pivot Phase 7
+        // follow-up). Management-only, same gate shape as inventory.
+        Some(crate::agentd_uri::AgentdResource::Workflow) => {
+            if origin != PeerOrigin::Management {
+                return Response::err(
+                    req.id,
+                    json::METHOD_NOT_FOUND,
+                    format!("resource not found: {uri}"),
+                );
+            }
+            #[cfg(feature = "workflow")]
+            {
+                match crate::graph::live::snapshot() {
+                    Some(body) => Response::ok(
+                        req.id,
+                        json!({
+                            "contents": [{"uri": uri, "mimeType": "application/json", "text": body.to_string()}]
+                        }),
+                    ),
+                    None => Response::err(
+                        req.id,
+                        json::RESOURCE_NOT_FOUND,
+                        "agent://workflow not served (no reactive workflow has run)".to_string(),
+                    ),
+                }
+            }
+            #[cfg(not(feature = "workflow"))]
+            Response::err(
+                req.id,
+                json::RESOURCE_NOT_FOUND,
+                "resource not found: agent://workflow (built without --features workflow)"
+                    .to_string(),
             )
         }
         // agentd://intelligence — operator-facing intelligence-endpoint health
@@ -3080,6 +3125,10 @@ mod tests {
             warm: false,
             #[cfg(feature = "workflow")]
             workflow: None,
+            #[cfg(feature = "workflow")]
+            workflow_reactive: false,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
         }
     }
 
@@ -3329,6 +3378,35 @@ mod tests {
         let body: Value = serde_json::from_str(entry["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["run_id"], "r1");
         assert_eq!(body["mode"], "reactive");
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn resources_read_workflow_serves_the_live_snapshot() {
+        // Non-Management can't even confirm it exists (gate first — the publish
+        // below is process-global and other assertions depend on ordering).
+        let c = ctx();
+        let gated = dispatch(
+            req("resources/read", Some(json!({"uri": "agent://workflow"}))),
+            &c,
+            PeerOrigin::Stdio,
+            &writer(),
+            0,
+            &log(),
+        );
+        assert!(gated.error.is_some(), "management-gated");
+        crate::graph::live::publish(json!({"status": "suspended", "on_uri": "file:///x"}));
+        let hit = dispatch(
+            req("resources/read", Some(json!({"uri": "agent://workflow"}))),
+            &c,
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let v = hit.result.expect("published snapshot serves");
+        let text = v["contents"][0]["text"].as_str().unwrap().to_string();
+        assert!(text.contains("suspended"), "{text}");
     }
 
     #[test]

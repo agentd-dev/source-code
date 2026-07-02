@@ -29,12 +29,38 @@ use std::collections::{BTreeMap, BTreeSet};
 mod driver;
 pub use driver::{
     drive, drive_budgeted, drive_seeded, resume, Blackboard, DriveResult, GraphBudget,
-    GraphExec, GraphOutcome, GraphState, GraphStatus, Suspension, WaitOutcome,
+    GraphExec, GraphOutcome, GraphState, GraphStatus, JoinWait, Suspension, WaitOutcome,
     MAX_VALUE_BYTES,
 };
 
+/// The LIVE reactive-workflow snapshot (`agent://workflow`): the daemon
+/// publishes each transition (driving / suspended / terminal) into a process-
+/// global slot the served self-MCP reads — observability for a workflow that
+/// lives across many child processes. Absent until a reactive workflow runs.
+pub mod live {
+    use serde_json::Value;
+    use std::sync::{Mutex, OnceLock};
+
+    fn slot() -> &'static Mutex<Option<Value>> {
+        static SLOT: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Publish the current reactive-workflow state (replaces the prior snapshot).
+    pub fn publish(v: Value) {
+        if let Ok(mut s) = slot().lock() {
+            *s = Some(v);
+        }
+    }
+
+    /// The last-published snapshot, if any.
+    pub fn snapshot() -> Option<Value> {
+        slot().lock().ok().and_then(|s| s.clone())
+    }
+}
+
 mod exec;
-pub use exec::{drive_connected, drive_pinned, ExecFactory, SessionExec, GRAPH_MAX_STEPS};
+pub use exec::{drive_connected, drive_connected_once, drive_pinned, ExecFactory, SessionExec, GRAPH_MAX_STEPS};
 
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;
@@ -402,6 +428,24 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
+    /// Fan IN: await previously-spawned ASYNC subgraphs. `handles` resolves
+    /// against the blackboard (a handle string, the `{"handle": …}` object an
+    /// async [`Subgraph`](Node::Subgraph) wrote, or an array of either); each is
+    /// awaited up to the node's shared `timeout_ms`, results collected
+    /// POSITIONALLY into `writes` (a failed child's slot carries
+    /// `{"handle","error"}`). Emits `ok` (all completed), `error` (some child
+    /// failed), or `timeout` (some child still running when the clock ran out —
+    /// the collected-so-far results are written; the stragglers keep running and
+    /// may be joined again). The spawn/join pair is how one workflow runs
+    /// subgraphs in PARALLEL as supervised child processes.
+    Join {
+        handles: Value,
+        timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writes: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        edges: BTreeMap<EdgeLabel, NodeId>,
+    },
     /// Branch on the blackboard: the first deterministic `case` whose predicate holds
     /// wins (Tier 1, free). If NONE match and an opt-in [`SemanticSpec`] is present, a
     /// single model judgement (Tier 2) picks a labelled choice; otherwise `default`.
@@ -421,9 +465,13 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
-    /// Run a nested `graph` (synchronously, or `async` as a detached subtree); write
-    /// its result to `writes`. Emits `ok`/`error`. Caps are inherited by the
-    /// supervisor at run time.
+    /// Run a nested `graph`: synchronously inline (the default — its halt result
+    /// lands in `writes`), or `async: true` as a SPAWNED CHILD WORKFLOW — a
+    /// supervised subagent process drives it (depth/breadth/rate caps apply) and
+    /// `writes` receives `{"handle": …}` immediately; collect later with a
+    /// [`Join`](Node::Join) node. Either way the nested graph starts with an
+    /// EMPTY blackboard (data flows OUT via its halt result, not in). Emits
+    /// `ok`/`error`.
     Subgraph {
         graph: Box<Graph>,
         #[serde(default, rename = "async")]
@@ -738,6 +786,7 @@ impl Node {
             | Node::Assign { edges, .. }
             | Node::Infer { edges, .. }
             | Node::Foreach { edges, .. }
+            | Node::Join { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges.values().collect(),
             Node::Branch { cases, default, semantic } => {
@@ -767,6 +816,7 @@ impl Node {
             | Node::Assign { edges, .. }
             | Node::Infer { edges, .. }
             | Node::Foreach { edges, .. }
+            | Node::Join { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges,
             Node::Branch { .. } => return Err("cannot add an edge to a Branch (use cases)".into()),
@@ -788,6 +838,7 @@ impl Node {
             | Node::Tool { writes, .. }
             | Node::Infer { writes, .. }
             | Node::Foreach { writes, .. }
+            | Node::Join { writes, .. }
             | Node::Wait { writes, .. }
             | Node::Subgraph { writes, .. } => writes.as_deref(),
             Node::Assign { writes, .. } => Some(writes),
@@ -922,6 +973,9 @@ impl Graph {
                             errs.push(format!("Branch node {id:?} case {i}: {msg}"));
                         }
                     }
+                }
+                Node::Join { timeout_ms, .. } if *timeout_ms == 0 => {
+                    errs.push(format!("Join node {id:?} has timeout_ms=0 (must be > 0)"));
                 }
                 Node::Foreach { body, parallel, .. } => {
                     if *parallel == 0 || *parallel > MAX_FOREACH_PARALLEL {

@@ -4,12 +4,9 @@ A multi-stage build that produces a tiny, nonroot `agentd` image: a musl
 static binary on `gcr.io/distroless/static-debian12:nonroot` (no shell, no
 package manager, UID 65532).
 
-> **Status:** the binary currently validates config, sets up logging, and
-> exits with a scaffold notice for the run modes — the supervisor, agentic
-> loop, and MCP client land across milestones M1–M3. See
-> [`docs/design/PLAN.md`](../../docs/design/PLAN.md). The commands below are
-> the intended v1 behavior; today they will validate config and print the
-> scaffold notice rather than run an agent.
+> **Status:** implemented and released (v2.0.1). The supervisor, agentic loop,
+> MCP client, and served self-MCP over HTTP(S) all ship; the commands below run
+> real agent runs given an intelligence endpoint + MCP servers.
 
 ## Build
 
@@ -28,12 +25,12 @@ docker build -f examples/docker/Dockerfile \
 
 # multiple features
 docker build -f examples/docker/Dockerfile \
-  --build-arg FEATURES=tls,vsock,cron -t agentd:full .
+  --build-arg FEATURES=serve-https,a2a,cron,run-graph -t agentd:full .
 ```
 
 Feature flags map to the crate's `[features]` (see `crates/agentd/Cargo.toml`):
-`tls` (rustls+ring, bundled roots), `vsock`, `serve-mcp`, `cron`, `metrics`,
-`otel`. The default build has none of these on.
+`tls` (rustls+ring, bundled roots — **on by default**, it is the transport),
+`serve-https`, `a2a`, `cron`, `metrics`, `otel`, `cluster`, `run-graph`.
 
 ## Run — one-shot (`once`)
 
@@ -53,50 +50,40 @@ docker run --rm \
 redacted in any debug output (see `crates/agentd/src/config.rs`). Pass it via
 env or `--intelligence-token`, never via a config file.
 
-With the default (no-TLS) image, point at a plaintext-terminating endpoint:
+The default image (no `FEATURES`) already keeps TLS out — point it at a
+**same-host sidecar over loopback** that terminates TLS:
 
 ```sh
 docker run --rm \
   -e INSTRUCTION="…" \
-  -e AGENT_INTELLIGENCE="unix:/run/intel.sock" \
-  -v /run/intel.sock:/run/intel.sock \
-  agentd:latest
+  -e AGENT_INTELLIGENCE="http://127.0.0.1:4000/v1" \
+  agentd:no-tls
 ```
 
-## MCP servers are stdio — bundle or co-locate
+## MCP servers are remote HTTP endpoints
 
-agentd ships no tools of its own except a gated `exec` (off by default;
-`--enable-exec` / `AGENT_ENABLE_EXEC`). **All** other tools come from MCP
-servers that agentd spawns over **stdio**:
+agentd ships no tools of its own and runs no local code. **All** tools come from
+MCP servers that agentd reaches over **Streamable HTTP** — it connects to a URL, it
+spawns no process:
 
 ```sh
 agentd \
-  --mcp fs=/usr/local/bin/mcp-server-fs --root /data \
-  --mcp queue=/usr/local/bin/mcp-server-queue
+  --mcp fs=https://mcp-fs.internal/mcp \
+  --mcp queue=https://mcp-queue.internal/mcp
 ```
 
-Because stdio is a child process (not a network call), each server binary must
-be reachable **inside the container's process namespace**. So either:
+Because a server is a remote HTTP endpoint (not a child process), **nothing
+MCP-related is bundled into the agentd image**. Deploy each MCP server as its own
+service and point `--mcp` at its URL; per-server auth headers go in the config file.
 
-1. **Bundle** the MCP server binaries into the image (extend the runtime stage
-   with `COPY` lines) and reference them by absolute path in `--mcp`; or
-2. **Co-locate** them in the same pod. stdio does not cross a container
-   boundary on its own, so this needs `shareProcessNamespace: true` (and a way
-   to exec the sidecar's binary), which is more involved — bundling is the
-   simpler v1 path.
+## Scope notes
 
-The example `Dockerfile` bundles nothing; add `COPY` lines for the servers you
-need, or build a downstream image `FROM agentd:latest`.
-
-## v1 scope notes
-
-- **Reactivity is stdio-only in v1** (no reactive-over-HTTP). The
-  `reactive`-mode subscriptions ride stdio MCP servers. *(roadmap: reactive
-  over HTTP.)*
-- **Serving agentd's own MCP** (`--serve-mcp unix:/path`, requires the
-  `serve-mcp` feature) is **stdio/unix only** in v1. *(roadmap: HTTP serving.)*
-- **Async subagents** land in M3; v1 spawn is synchronous. *(roadmap.)*
-- MCP **tasks / sampling / roots** are deferred (rfcs/0013). *(roadmap.)*
+- **Reactivity rides the MCP servers' Streamable-HTTP subscriptions** — agentd
+  subscribes and reacts to pushed `notifications/resources/updated` over HTTP/SSE.
+- **Serving agentd's own MCP** (`--serve-mcp https://host:port`, `serve-https`
+  feature) is over HTTP(S) with mTLS/bearer auth (loopback `http://` for dev).
+- **Agent-authored cyclic run-graphs** ship under `--features run-graph`.
+- MCP **tasks / sampling / roots** are deferred (rfcs/0013).
 
 ## Exit codes
 

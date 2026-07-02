@@ -303,12 +303,11 @@ fixed inputs, so a flag still overrides the new file. The partition is owned by
 | `model` | `mode` |
 | `max_tokens` | `run_id` |
 | `intelligence_headers` | `serve_mcp` (transport) |
-| `limits` (`max_steps` / `max_depth` / `deadline`) | `enable_exec` |
-| `log_level` | `drain_timeout` |
-| `subscribe` (the reactive subscription set) | `shard` |
-| **`mcp_servers`** (live re-handshake) | `claim_routes` |
-| **`intelligence`** (endpoint list + token + swap policy) | `standby` |
-| | `assign_from` |
+| `limits` (`max_steps` / `max_depth` / `deadline`) | `drain_timeout` |
+| `log_level` | `shard` |
+| `subscribe` (the reactive subscription set) | `claim_routes` |
+| **`mcp_servers`** (live re-handshake) | `standby` |
+| **`intelligence`** (endpoint list + token + swap policy) | `assign_from` |
 | | `continue_subscribe` |
 
 `mcp_servers` reloads via a live re-handshake at the quiesce boundary (add /

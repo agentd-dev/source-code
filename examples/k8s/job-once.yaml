@@ -78,9 +78,9 @@ spec:
           # digest) in production rather than :latest.
           image: ghcr.io/agentd-dev/agentd:latest
           args:
-            # MCP servers are stdio child processes — bundled in the image.
+            # Tools come from remote MCP servers (Streamable HTTP endpoints).
             - --mcp
-            - fs=/usr/local/bin/mcp-server-fs --root /data
+            - fs=https://mcp-fs.internal/mcp
           env:
             # The instruction (the unit of work). Often projected from a
             # ConfigMap; inline here for clarity.
@@ -89,10 +89,11 @@ spec:
                 Read /data/report.txt, produce a one-paragraph digest, and
                 write it back via the fs MCP server. If the digest already
                 exists and is current, exit without rewriting.
-            # Intelligence endpoint. unix: here so the default (no-TLS) image
-            # works; a TLS-terminating sidecar owns the upstream connection.
+            # Intelligence endpoint over HTTPS (the tls-feature image). For a
+            # no-TLS image, point at a loopback sidecar (http://127.0.0.1:PORT)
+            # that owns the upstream TLS connection.
             - name: AGENT_INTELLIGENCE
-              value: unix:/run/intel/intel.sock
+              value: https://gw.example/v1
             - name: AGENT_INTELLIGENCE_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -121,13 +122,10 @@ spec:
               # OOM kill => exit 137 => "raise memory limit" (rfcs/0011 §5).
               memory: 512Mi
           volumeMounts:
-            - name: intel
-              mountPath: /run/intel
             - name: data
               mountPath: /data
       volumes:
-        # The TLS-terminating intelligence sidecar's unix socket, shared in.
-        - name: intel
-          emptyDir: {}
+        # Intelligence is reached directly over HTTPS (a same-pod TLS-terminating
+        # sidecar would instead be a loopback http:// URL) — no shared socket needed.
         - name: data
           emptyDir: {}

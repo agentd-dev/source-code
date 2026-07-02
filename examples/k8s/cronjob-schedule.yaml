@@ -59,7 +59,7 @@ spec:
                 - --mode
                 - once
                 - --mcp
-                - fs=/usr/local/bin/mcp-server-fs --root /data
+                - fs=https://mcp-fs.internal/mcp
               env:
                 - name: INSTRUCTION
                   value: >-
@@ -67,7 +67,7 @@ spec:
                     fs MCP server. If this hour's digest already exists, exit 0
                     without redoing the work.
                 - name: AGENT_INTELLIGENCE
-                  value: unix:/run/intel/intel.sock
+                  value: https://gw.example/v1
                 - name: AGENT_INTELLIGENCE_TOKEN
                   valueFrom:
                     secretKeyRef:

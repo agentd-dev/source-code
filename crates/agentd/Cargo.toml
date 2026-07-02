@@ -27,10 +27,10 @@ default = ["tls"]
 # provider (no cmake/C build dep) + bundled webpki roots — so a scratch container
 # has trust anchors with no system CA bundle. On by default; opt out with
 # `--no-default-features` to reach https only via a TLS-terminating sidecar.
-tls = ["net/tls"]
-# Enclave / microVM intelligence transport (AF_VSOCK). Enables the `net` crate's
-# vsock connects AND agentd's own direct use (the served vsock listener + a2a).
-vsock = ["net/vsock", "dep:vsock"]
+tls = ["net/tls", "mcp/tls"]
+# Enclave / microVM intelligence transport (AF_VSOCK). Enables the net + mcp
+# crates' vsock connects AND agentd's own direct use (served vsock listener + a2a).
+vsock = ["net/vsock", "mcp/vsock", "dep:vsock"]
 # Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
 # (RFC 0005 §3.6) — no dep. (mio/epoll is a future high-fan-in optimisation.)
 serve-mcp = []

@@ -1415,7 +1415,7 @@ impl Config {
             // Validate the endpoint parses and its auth header templates resolve at
             // startup (RFC 0012 §3.7 — fail fast, don't discover an unreadable
             // secret on first use).
-            crate::mcp::http::McpEndpoint::parse(&s.endpoint)
+            ::mcp::http::McpEndpoint::parse(&s.endpoint)
                 .map_err(|e| usage(format!("mcp server '{}': {e}", s.name)))?;
             crate::mcp::auth::headers_resolvable(&s.headers)
                 .map_err(|e| usage(format!("mcp server '{}' header: {e}", s.name)))?;

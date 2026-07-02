@@ -8,14 +8,14 @@
 //! subsequent request. Server→client notifications ride an optional long-lived
 //! `GET` SSE stream.
 //!
-//! The transport is stream-agnostic (it reuses the hand-rolled [`crate::net::http`]
+//! The transport is stream-agnostic (it reuses the hand-rolled [`net::http`]
 //! client): `https://` runs over TCP+TLS (optionally mutual TLS), `http://` over
 //! plain TCP (a local sidecar), `unix:` over a unix socket, and `vsock:` over
 //! AF_VSOCK — none of which spawns a process (RFC 0012: no local exec surface).
 
-use crate::net::http::{self, SseEvent, Url};
+use net::http::{self, SseEvent, Url};
 #[cfg(feature = "tls")]
-use crate::net::tls::ClientIdentity;
+use net::tls::ClientIdentity;
 use serde_json::Value;
 use std::io;
 use std::sync::Mutex;
@@ -197,7 +197,7 @@ impl HttpTransport {
                 if *tls {
                     #[cfg(feature = "tls")]
                     {
-                        let s = crate::net::tls::connect(tcp, host, self.identity.as_ref())
+                        let s = net::tls::connect(tcp, host, self.identity.as_ref())
                             .map_err(HttpError::Connect)?;
                         Ok(Box::new(s))
                     }
@@ -215,13 +215,13 @@ impl HttpTransport {
                 // `net::unixsock::connect` exists on every platform (a non-unix
                 // build returns an Unsupported error), matching the intel path.
                 let s =
-                    crate::net::unixsock::connect(socket, timeout).map_err(HttpError::Connect)?;
+                    net::unixsock::connect(socket, timeout).map_err(HttpError::Connect)?;
                 Ok(Box::new(s))
             }
             McpEndpoint::Vsock { cid, port, .. } => {
                 #[cfg(feature = "vsock")]
                 {
-                    let s = crate::net::vsock::connect(*cid, *port, timeout)
+                    let s = net::vsock::connect(*cid, *port, timeout)
                         .map_err(HttpError::Connect)?;
                     Ok(Box::new(s))
                 }

@@ -14,7 +14,7 @@
 //! background thread pumps them into a queue [`Self::drain_notifications`] serves.
 
 use crate::json::{self, RpcError};
-use crate::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
+use ::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
 use crate::wire::mcp::{
     CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
     GetPromptParams, GetPromptResult, Implementation, InitializeParams, InitializeResult,

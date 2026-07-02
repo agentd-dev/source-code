@@ -20,6 +20,7 @@
 //!
 //! Dependency budget: `serde` + `serde_json` only (the agentd minimalism moat).
 
+pub mod http;
 pub mod modern;
 pub mod rpc;
 pub mod version;

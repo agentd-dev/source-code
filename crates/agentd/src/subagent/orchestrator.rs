@@ -301,12 +301,12 @@ impl Orchestrator {
     /// SYNCHRONOUS — it runs in the agent's own (child) process (per the design:
     /// the driver is NOT in the daemon), bounded by the graph's budget + termination
     /// layers. Reuses [`drive_pinned`](crate::graph::drive_pinned), so it behaves
-    /// identically to the operator `--mode graph`. A `Wait` node is unsupported here
-    /// (no reactor to resume it — that is the reactive-daemon path); the call blocks
-    /// until the graph terminates (uncancellable mid-run — a documented v1 limit).
+    /// identically to the operator `--mode graph`: a `Wait` node blocks in-process
+    /// until its resource updates or the timeout elapses, then resumes. The whole call
+    /// blocks until the graph terminates (uncancellable mid-run — a documented v1 limit).
     #[cfg(feature = "run-graph")]
     fn graph_run(&mut self, args: &Value) -> (String, bool) {
-        use crate::graph::{DriveResult, GraphStatus};
+        use crate::graph::GraphStatus;
         let id = args.get("graph_id").and_then(Value::as_str).unwrap_or("");
         if id.is_empty() {
             return ("error: graph.run requires 'graph_id'".into(), true);
@@ -331,7 +331,7 @@ impl Orchestrator {
             &self.log,
         );
         match result {
-            Ok(DriveResult::Done(o)) => {
+            Ok(o) => {
                 let is_err = o.status != GraphStatus::Completed;
                 self.log.info(
                     "graph.run",
@@ -345,13 +345,6 @@ impl Orchestrator {
                 });
                 (summary.to_string(), is_err)
             }
-            Ok(DriveResult::Suspended(s)) => (
-                format!(
-                    "graph '{id}' suspended on a Wait ({}) — graph.run is synchronous; a Wait needs the reactive daemon path",
-                    s.on_uri
-                ),
-                true,
-            ),
             Err(e) => (format!("error: graph.run setup failed: {e}"), true),
         }
     }

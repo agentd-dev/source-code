@@ -12,7 +12,7 @@
 //! It touches NO process-supervision code — it composes the existing loop + MCP client
 //! + intelligence client, so the run-graph inherits their transport/auth/resilience.
 
-use super::{drive, Blackboard, DriveResult, Graph, GraphExec, GraphStatus};
+use super::{drive, resume, Blackboard, DriveResult, Graph, GraphExec, GraphOutcome, GraphStatus, WaitOutcome};
 use crate::agentloop::action::SelfHandler;
 use crate::agentloop::runner::{run_loop, LoopInput};
 use crate::agentloop::stop::TerminalStatus;
@@ -28,14 +28,15 @@ use std::time::{Duration, Instant};
 /// is many node visits; the graph's own budget/validation/termination bound the walk.
 pub const GRAPH_MAX_STEPS: u32 = 10_000;
 
-/// Drive a pinned/stored graph SYNCHRONOUSLY to a [`DriveResult`] against
+/// Drive a pinned/stored graph SYNCHRONOUSLY to a terminal [`GraphOutcome`] against
 /// freshly-connected intelligence + MCP servers (pivot Phase 7 · P6). The single
 /// execution path shared by BOTH the operator `--mode graph` entry and the
 /// agent-authored `graph.run` self-tool, so they behave identically. `Err` is a setup
-/// failure (unreachable intel / a failed MCP handshake) — surfaced by the caller as a
-/// usage/tool error; `Ok(Suspended)` means the graph hit a `Wait` (the caller decides
-/// what a suspend means in its context — one-shot `--mode graph` reports it as
-/// unsupported). The connected servers live for the whole drive, then drop.
+/// failure (unreachable intel / a failed MCP handshake), surfaced by the caller as a
+/// usage/tool error. A `Wait` node is handled IN-PROCESS here — subscribe to its uri,
+/// block until the resource updates or the timeout elapses (bounded by the graph
+/// budget across all waits), then read + resume — so a synchronous graph can pause on
+/// a dependency without a daemon. The connected servers live for the whole drive.
 #[allow(clippy::too_many_arguments)]
 pub fn drive_pinned(
     graph: &Graph,
@@ -47,7 +48,7 @@ pub fn drive_pinned(
     max_tokens: u64,
     node_timeout: Duration,
     log: &Logger,
-) -> Result<DriveResult, String> {
+) -> Result<GraphOutcome, String> {
     let intel = IntelClient::from_parts(intel_uri, intel_token)
         .map_err(|e| format!("intelligence: {e}"))?;
     let mut servers: Vec<McpClient> = Vec::new();
@@ -58,7 +59,62 @@ pub fn drive_pinned(
         servers.push(client);
     }
     let mut exec = SessionExec::new(&intel, &servers, log, model, max_steps, max_tokens, node_timeout);
-    Ok(drive(graph, &mut exec, GRAPH_MAX_STEPS))
+
+    // Drive to a terminal outcome, resolving each `Wait` in-process (block-until-update
+    // -or-timeout). The graph's step budget accumulates across resumes, so even a Wait
+    // loop is bounded.
+    let mut result = drive(graph, &mut exec, GRAPH_MAX_STEPS);
+    loop {
+        match result {
+            DriveResult::Done(outcome) => return Ok(outcome),
+            DriveResult::Suspended(s) => {
+                log.info(
+                    "graph.wait",
+                    serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms}),
+                );
+                let outcome = wait_for_uri(&servers, &s.on_uri, Duration::from_millis(s.timeout_ms), log);
+                result = resume(graph, s.state, &mut exec, outcome);
+            }
+        }
+    }
+}
+
+/// Block until `uri` updates on some subscribing server (returning its freshly-read
+/// content as [`WaitOutcome::Updated`]) or `timeout` elapses ([`WaitOutcome::TimedOut`]).
+/// A uri no server can watch fails OPEN to the timeout edge rather than hanging.
+fn wait_for_uri(servers: &[McpClient], uri: &str, timeout: Duration, log: &Logger) -> WaitOutcome {
+    use crate::wire::mcp::method;
+    let Some(server) = servers
+        .iter()
+        .find(|s| s.capabilities().supports_subscribe() && s.subscribe(uri).is_ok())
+    else {
+        log.warn("graph.wait.unwatchable", serde_json::json!({"uri": uri}));
+        return WaitOutcome::TimedOut;
+    };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        for n in server.drain_notifications() {
+            let hit = n.method == method::NOTIFY_RESOURCES_UPDATED
+                && n.params
+                    .as_ref()
+                    .and_then(|p| p.get("uri"))
+                    .and_then(Value::as_str)
+                    == Some(uri);
+            if hit {
+                let _ = server.unsubscribe(uri);
+                // notify-then-read: the current read is authoritative, not the note.
+                let content = server
+                    .read_resource_within(uri, Duration::from_secs(5))
+                    .map(|r| r.text())
+                    .unwrap_or_default();
+                let val = serde_json::from_str::<Value>(&content).unwrap_or(Value::String(content));
+                return WaitOutcome::Updated(val);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = server.unsubscribe(uri);
+    WaitOutcome::TimedOut
 }
 
 /// A self-handler that offers no self-tools: a graph `Agent` node is a LEAF worker —

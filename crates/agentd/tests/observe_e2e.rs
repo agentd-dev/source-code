@@ -190,6 +190,52 @@ fn graph_mode_requires_a_graph_file() {
     assert!(stderr.contains("--mode graph requires --graph"), "{stderr}");
 }
 
+#[cfg(feature = "run-graph")]
+#[test]
+fn graph_mode_resolves_a_wait_node_in_process() {
+    // A pinned graph whose Wait node blocks on an MCP resource: the mock MCP pushes an
+    // update after subscribe, so the wait resolves IN-PROCESS (no daemon) and the graph
+    // completes 0 (pivot Phase 7 · P6). No Agent node → no LLM needed.
+    let dir = tempfile::tempdir().unwrap();
+    let mock = spawn_mock_mcp("file:///in.json", true); // emit=true → pushes an update
+    let graph_path = dir.path().join("wait.json");
+    std::fs::write(
+        &graph_path,
+        r#"{
+            "start": "w",
+            "nodes": {
+                "w": {"kind": "wait", "on_uri": "file:///in.json", "writes": "evt", "timeout_ms": 8000, "edges": {"updated": "done", "timeout": "expired"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "evt"},
+                "expired": {"kind": "halt", "status": "deadline"}
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let (code, _stdout, stderr) = run_once(&[
+        "--mode",
+        "graph",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--intelligence",
+        "http://127.0.0.1:9",
+        "--mcp",
+        &mock.mcp_arg("mock"),
+        "--log-level",
+        "info",
+    ]);
+
+    assert_eq!(code, 0, "the wait resolved + the graph completed; stderr:\n{stderr}");
+    assert!(
+        stderr.contains(r#""event":"graph.wait""#),
+        "the wait was logged:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(r#""graph_status":"Completed""#),
+        "the graph completed after the update:\n{stderr}"
+    );
+}
+
 #[test]
 fn once_mode_documents_dropped_deferred_effects() {
     // A one-shot run whose model calls the `schedule` deferred-effect self-tool has

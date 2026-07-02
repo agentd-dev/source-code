@@ -58,8 +58,8 @@ agentd \
   --mode once \
   --instruction-file instructions/research.md \
   --intelligence https://gw.example/v1 \
-  --mcp "search=mcp-server-websearch" \
-  --mcp "fs=mcp-server-fs --root /data --read-only" \
+  --mcp search=https://mcp-search.internal/mcp \
+  --mcp fs=https://mcp-fs.internal/mcp \
   --max-steps 40 --max-tokens 150000 --deadline 5m \
   --run-id "research-2026-06-27"
 ```
@@ -93,8 +93,8 @@ agentd \
   --mode reactive \
   --instruction-file instructions/triage.md \
   --intelligence https://gw.example/v1 \
-  --mcp "inbox=mcp-server-inbox --queue /var/run/inbox" \
-  --mcp "tickets=mcp-server-tickets --project OPS" \
+  --mcp inbox=https://mcp-inbox.internal/mcp \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --subscribe "inbox:///items/new" \
   --max-steps 25 --max-tokens 2000000 \
   --metrics-addr :9090 --drain-timeout 25s
@@ -113,7 +113,7 @@ outside world).
 backpressure under a flood. `--metrics-addr` adds `/healthz`+`/readyz`+`/metrics`
 for k8s probes; `--drain-timeout` (kept under the pod's
 `terminationGracePeriodSeconds`) bounds graceful shutdown so in-flight triage
-finishes before the pod dies. (Reactivity is stdio-MCP in v1 — see
+finishes before the pod dies.(Reactivity rides the MCP servers' Streamable-HTTP subscriptions — see
 [`modes-and-triggers.md`](modes-and-triggers.md).)
 
 ## 3. Scheduled audit / watcher
@@ -133,8 +133,8 @@ agentd \
   --mode once \
   --instruction-file /etc/agentd/audit.md \
   --intelligence https://gw.example/v1 \
-  --mcp "fs=mcp-server-fs --root /data --read-only" \
-  --mcp "tickets=mcp-server-tickets --project SEC" \
+  --mcp fs=https://mcp-fs.internal/mcp \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --max-steps 30 --deadline 10m \
   --run-id "audit-$(date +%Y%m%dT%H%M)"
 ```
@@ -186,8 +186,8 @@ agentd \
   --mode once \
   --instruction-file /etc/agentd/repo-audit.md \
   --intelligence https://gw.example/v1 \
-  --mcp "fs=mcp-server-fs --root /src --read-only" \
-  --mcp "tickets=mcp-server-tickets --project ENG" \
+  --mcp fs=https://mcp-fs.internal/mcp \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --max-depth 2 --max-tokens 4000000 --deadline 20m
 ```
 
@@ -232,8 +232,8 @@ agentd \
   --instruction-file /etc/agentd/handle-ticket.md \
   --intelligence https://gw.example/v1 \
   --subscribe "tickets:///incoming" \
-  --mcp "tickets=mcp-server-tickets --project SUP" --mcp-tags "tickets=untrusted_input" \
-  --mcp "crm=mcp-server-crm"                       --mcp-tags "crm=sensitive"
+  --mcp tickets=https://mcp-tickets.internal/mcp --mcp-tags "tickets=untrusted_input" \
+  --mcp crm=https://mcp-crm.internal/mcp                       --mcp-tags "crm=sensitive"
 ```
 
 The coordinator **delegates reading** the (untrusted) ticket to a child scoped to
@@ -253,24 +253,30 @@ process stays within the Rule-of-Two; no single agent ever holds all three.
 
 **Why agentd.** The trust boundary is the **process boundary** plus the
 spawn-time scope intersection — not a convention you hope the model follows. An
-untagged server is treated conservatively as `untrusted_input`, and
-`--enable-exec` counts as `egress`, so the check fails *closed*.
+untagged server is treated conservatively as `untrusted_input`, so the check fails
+*closed*. (agentd has no `exec` tool — it runs no local code; the trifecta budget is
+entirely over the granted MCP servers' tags.)
 
 ## 6. A served worker an orchestrator drives and steers
 
-**Pattern:** run agentd as a long-lived **MCP server** (`--serve-mcp unix:/path`)
-that exposes `subagent.spawn` / `subagent.send` / `subagent.status` /
-`subagent.cancel` and the subscribable `agent://` state resources. Any MCP
-client — a control plane, a workflow engine, **or another agent** — drives it.
-Because agentd is symmetric, composition needs no new protocol: the parent just
-declares the worker as one more `--mcp` server.
+**Pattern:** run agentd as a long-lived **MCP server** (`--serve-mcp https://host:port`,
+mTLS/bearer auth) that exposes `subagent.spawn` / `subagent.send` / `subagent.status` /
+`subagent.cancel` and the subscribable `agent://` state resources. Any MCP client — a
+control plane, a workflow engine, **or another agent** — drives it. Because agentd is
+symmetric, composition needs no new protocol: the parent declares the worker (a
+separately-deployed HTTPS service) as one more `--mcp` server.
 
 ```bash
-# An orchestrator agent driving a worker agent, both on one node:
+# A reusable reviewer service:
+agentd --instruction "Be a reusable reviewer" --intelligence https://gw.example/v1 \
+  --mode reactive --subscribe file:///nowhere \
+  --serve-mcp https://0.0.0.0:8443 --serve-bearer "$REVIEWER_TOKEN"
+
+# An orchestrator agent that delegates to it:
 agentd \
   --instruction "Run the nightly review; delegate each PR to the reviewer service." \
   --intelligence https://gw.example/v1 \
-  --mcp reviewer="agentd --instruction worker --intelligence https://gw.example/v1 --serve-mcp unix:/run/rev.sock"
+  --mcp reviewer=https://reviewer.internal:8443
 ```
 
 Two patterns fall out ([`mcp.md`](mcp.md) §3):

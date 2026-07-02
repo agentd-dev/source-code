@@ -639,6 +639,35 @@ impl Orchestrator {
             Err(msg) => return (format!("error: a2a peer '{peer_name}': {msg}"), true),
         };
 
+        // Resolve the peer client-auth material at dial time (RFC 0012 §3.7):
+        // bearer/framing header templates → real values (never logged), and an
+        // mTLS identity loaded from the configured PEM pair. A resolution failure
+        // is an observation the model adapts to, not a crash.
+        let mut auth = crate::mcp::a2a_client::PeerAuth {
+            headers: match crate::mcp::auth::resolve_headers(&peer.headers) {
+                Ok(h) => h,
+                Err(e) => return (format!("error: a2a peer '{peer_name}' header: {e}"), true),
+            },
+            ..Default::default()
+        };
+        #[cfg(feature = "tls")]
+        if let (Some(cert), Some(key)) = (&peer.client_cert, &peer.client_key) {
+            let material = std::fs::read(cert)
+                .map_err(|e| format!("read '{cert}': {e}"))
+                .and_then(|c| {
+                    std::fs::read(key)
+                        .map_err(|e| format!("read '{key}': {e}"))
+                        .map(|k| (c, k))
+                })
+                .and_then(|(c, k)| {
+                    crate::net::tls::ClientIdentity::from_pem(&c, &k).map_err(|e| e.to_string())
+                });
+            match material {
+                Ok(id) => auth.identity = Some(id),
+                Err(e) => return (format!("error: a2a peer '{peer_name}' mtls: {e}"), true),
+            }
+        }
+
         // Count this delegation against the breadth cap (like a spawned child).
         self.child_count += 1;
         let deadline = Instant::now() + A2A_DELEGATE_DEADLINE;
@@ -648,6 +677,7 @@ impl Orchestrator {
         );
         match crate::mcp::a2a_client::delegate(
             &endpoint,
+            auth,
             objective,
             output_contract.as_deref(),
             deadline,
@@ -1920,6 +1950,9 @@ mod tests {
         let peers = vec![crate::config::A2aPeerSpec {
             name: "mesh".into(),
             endpoint: "unix:/run/peer.sock".into(),
+            headers: Vec::new(),
+            client_cert: None,
+            client_key: None,
         }];
         let with = Orchestrator::from_payload(
             "agentd".into(),
@@ -1947,6 +1980,9 @@ mod tests {
         let peers = vec![crate::config::A2aPeerSpec {
             name: "mesh".into(),
             endpoint: "unix:/run/peer.sock".into(),
+            headers: Vec::new(),
+            client_cert: None,
+            client_key: None,
         }];
         let mut o = Orchestrator::from_payload(
             "agentd".into(),
@@ -1972,6 +2008,9 @@ mod tests {
         let peers = vec![crate::config::A2aPeerSpec {
             name: "mesh".into(),
             endpoint: "unix:/run/peer.sock".into(),
+            headers: Vec::new(),
+            client_cert: None,
+            client_key: None,
         }];
         let mut o = Orchestrator::from_payload(
             "agentd".into(),
@@ -1998,6 +2037,9 @@ mod tests {
         let peers = vec![crate::config::A2aPeerSpec {
             name: "mesh".into(),
             endpoint: "unix:/run/peer.sock".into(),
+            headers: Vec::new(),
+            client_cert: None,
+            client_key: None,
         }];
         let mut o = Orchestrator::from_payload(
             "agentd".into(),

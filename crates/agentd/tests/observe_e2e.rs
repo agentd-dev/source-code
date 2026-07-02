@@ -23,22 +23,24 @@ fn sigterm(pid: u32) {
     }
 }
 
-/// Start the mock LLM on `socket` with `script`, waiting until it binds.
-fn start_mock_llm(socket: &Path, script: &str) -> Child {
+/// Start the mock LLM with `script`, announcing its loopback address through
+/// `addr_file`. Returns the child and the `http://<addr>` intelligence URL.
+fn start_mock_llm(addr_file: &Path, script: &str) -> (Child, String) {
     let child = Command::new(exe())
-        .args(["--internal-mock-llm", socket.to_str().unwrap(), script])
+        .args(["--internal-mock-llm", addr_file.to_str().unwrap(), script])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !socket.exists() {
+    while !addr_file.exists() {
         if Instant::now() >= deadline {
-            panic!("mock-llm never bound its socket");
+            panic!("mock-llm never announced its address");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    let addr = std::fs::read_to_string(addr_file).expect("read mock-llm addr-file");
+    (child, format!("http://{}", addr.trim()))
 }
 
 /// Run `agentd <args>` to completion; return (exit_code, stdout, stderr).
@@ -54,10 +56,9 @@ fn run_once(args: &[&str]) -> (i32, String, String) {
 #[test]
 fn once_mode_runs_the_real_loop_to_a_completed_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock, "final");
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "final");
 
-    let intel = format!("unix:{}", sock.display());
     let (code, stdout, stderr) = run_once(&[
         "--mode",
         "once",
@@ -90,10 +91,9 @@ fn once_mode_runs_the_real_loop_to_a_completed_answer() {
 #[test]
 fn once_mode_runs_a_tool_call_react_cycle() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock, "read");
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "read");
 
-    let intel = format!("unix:{}", sock.display());
     let mock = spawn_mock_mcp("file:///in.json", false);
     let (code, stdout, stderr) = run_once(&[
         "--mode",
@@ -136,10 +136,8 @@ fn reactive_self_scheduling_fires_a_wake() {
     // A reaction's model calls the `schedule` self-tool; the daemon arms the wake
     // and fires it ~1s later — a self-sustaining agent, observed end to end.
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock, "schedule");
-
-    let intel = format!("unix:{}", sock.display());
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "schedule");
     let mock = spawn_mock_mcp("file:///in.json", false);
     let mut child = Command::new(exe())
         .args([
@@ -196,10 +194,8 @@ fn reactive_self_subscribe_arms_a_warm_continue_route() {
     // must arm it as a WARM continue route (RFC 0008 §self-subscribe = continue),
     // not a fresh-spawn route — so future events re-enter one live session.
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock, "subscribe");
-
-    let intel = format!("unix:{}", sock.display());
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "subscribe");
     let mock = spawn_mock_mcp("file:///in.json", false);
     let mut child = Command::new(exe())
         .args([
@@ -305,10 +301,8 @@ fn token_total(body: &str, ty: &str) -> u64 {
 #[test]
 fn reactive_run_rolls_token_usage_up_to_agent_tokens_total() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock, "final");
-
-    let intel = format!("unix:{}", sock.display());
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "final");
     // The HTTP mock (emit=true) pushes one resources/updated on the GET SSE stream
     // after the subscribe, firing exactly one reaction — one real subagent run.
     let mock = spawn_mock_mcp("file:///in.json", true);

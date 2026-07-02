@@ -16,7 +16,7 @@ fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_agentd")
 }
 
-fn start_mock_llm(socket: &std::path::Path, script: &str) -> Child {
+fn start_mock_llm(socket: &std::path::Path, script: &str) -> (Child, String) {
     let c = Command::new(exe())
         .args(["--internal-mock-llm", socket.to_str().unwrap(), script])
         .stdout(Stdio::null())
@@ -25,10 +25,11 @@ fn start_mock_llm(socket: &std::path::Path, script: &str) -> Child {
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !socket.exists() {
-        assert!(Instant::now() < deadline, "mock-llm never bound");
+        assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    c
+    let addr = std::fs::read_to_string(socket).expect("read mock-llm addr-file");
+    (c, format!("http://{}", addr.trim()))
 }
 
 #[test]
@@ -63,12 +64,10 @@ fn a_run_exports_invoke_agent_chat_and_execute_tool_spans() {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
+    let sock = dir.path().join("llm.addr");
     // `read`: the model calls `resource.read` then answers — a full ReAct cycle,
     // so the run exports a `chat` span per turn + an `execute_tool` span.
-    let mut llm = start_mock_llm(&sock, "read");
-
-    let intel = format!("unix:{}", sock.display());
+    let (mut llm, intel) = start_mock_llm(&sock, "read");
     let mock = spawn_mock_mcp("file:///in.json", false);
     let status = Command::new(exe())
         .args([

@@ -35,7 +35,7 @@ fn cgroup_writable() -> bool {
     }
 }
 
-fn start_mock_llm(exe: &str, sock: &Path) -> Child {
+fn start_mock_llm(exe: &str, sock: &Path) -> (Child, String) {
     let child = Command::new(exe)
         .args(["--internal-mock-llm", sock.to_str().unwrap(), "final"])
         .stdout(Stdio::null())
@@ -44,10 +44,11 @@ fn start_mock_llm(exe: &str, sock: &Path) -> Child {
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !sock.exists() {
-        assert!(Instant::now() < deadline, "mock-llm never bound");
+        assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    let addr = std::fs::read_to_string(sock).expect("read mock-llm addr-file");
+    (child, format!("http://{}", addr.trim()))
 }
 
 #[test]
@@ -58,15 +59,15 @@ fn once_mode_places_the_root_in_a_cgroup_and_removes_it_on_exit() {
     }
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
-    let llm_sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(exe, &llm_sock);
+    let llm_sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(exe, &llm_sock);
 
     let out = Command::new(exe)
         .args([
             "--instruction",
             "do a thing",
             "--intelligence",
-            &format!("unix:{}", llm_sock.display()),
+            &intel,
             "--model",
             "m",
             "--cgroup",
@@ -145,15 +146,15 @@ fn once_mode_applies_hard_limits_when_the_parent_delegates_controllers() {
 
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
-    let llm_sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(exe, &llm_sock);
+    let llm_sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(exe, &llm_sock);
 
     let out = Command::new(exe)
         .args([
             "--instruction",
             "do a thing",
             "--intelligence",
-            &format!("unix:{}", llm_sock.display()),
+            &intel,
             "--model",
             "m",
             "--cgroup",

@@ -41,7 +41,7 @@ fn start_idle_daemon(exe: &str, intel: &str, sock: &Path) -> Child {
 }
 
 /// Start the built-in mock LLM on a unix socket; wait until it binds.
-fn start_mock_llm(exe: &str, sock: &Path, script: &str) -> Child {
+fn start_mock_llm(exe: &str, sock: &Path, script: &str) -> (Child, String) {
     let child = Command::new(exe)
         .args(["--internal-mock-llm", sock.to_str().unwrap(), script])
         .stdout(Stdio::null())
@@ -50,10 +50,11 @@ fn start_mock_llm(exe: &str, sock: &Path, script: &str) -> Child {
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !sock.exists() {
-        assert!(Instant::now() < deadline, "mock-llm never bound");
+        assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    let addr = std::fs::read_to_string(sock).expect("read mock-llm addr-file");
+    (child, format!("http://{}", addr.trim()))
 }
 
 /// Poll `subagent.status` for `handle` until the run is `done`, or the deadline.
@@ -353,10 +354,10 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
     // no polling. (We cancel a hanging run to make it terminate on cue.)
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
-    let llm_sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(exe, &llm_sock, "hang");
+    let llm_sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "hang");
     let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+    let mut child = start_idle_daemon(exe, &intel, &sock);
 
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
@@ -444,10 +445,10 @@ fn a_warm_session_runs_a_turn_per_send() {
     // each subagent.send runs another turn over the SAME conversation.
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
-    let llm_sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(exe, &llm_sock, "final"); // each turn completes at once
+    let llm_sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "final"); // each turn completes at once
     let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+    let mut child = start_idle_daemon(exe, &intel, &sock);
 
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
@@ -557,10 +558,10 @@ fn concurrent_async_runs_do_not_serialize() {
     // supervisors run concurrently.
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
-    let llm_sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(exe, &llm_sock, "hang");
+    let llm_sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "hang");
     let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+    let mut child = start_idle_daemon(exe, &intel, &sock);
 
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
@@ -633,13 +634,13 @@ fn concurrent_async_runs_do_not_serialize() {
 fn cancel_drains_a_live_async_run() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
-    let llm_sock = dir.path().join("llm.sock");
+    let llm_sock = dir.path().join("llm.addr");
     // `hang`: the run's child blocks ~30s in the model call, so reaching a
     // terminal state quickly proves the cancel/drain torn it down (not natural
     // completion).
-    let mut llm = start_mock_llm(exe, &llm_sock, "hang");
+    let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "hang");
     let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &format!("unix:{}", llm_sock.display()), &sock);
+    let mut child = start_idle_daemon(exe, &intel, &sock);
 
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
@@ -859,8 +860,8 @@ fn one_agentd_delegates_to_another_over_a2a() {
 
     // The server agentd: a mock LLM it can reach, and its A2A surface served on a
     // unix socket. A loop-mode daemon stays up and keeps serving while idle.
-    let srv_llm = dir.path().join("srv-llm.sock");
-    let mut srv_llm_proc = start_mock_llm(exe, &srv_llm, "final");
+    let srv_llm = dir.path().join("srv-llm.addr");
+    let (mut srv_llm_proc, srv_intel) = start_mock_llm(exe, &srv_llm, "final");
     let srv_sock = dir.path().join("server-a2a.sock");
     let mut server = Command::new(exe)
         .args([
@@ -872,7 +873,7 @@ fn one_agentd_delegates_to_another_over_a2a() {
             "serve a2a",
             "--intelligence",
         ])
-        .arg(format!("unix:{}", srv_llm.display()))
+        .arg(&srv_intel)
         .arg("--serve-mcp")
         .arg(format!("unix:{}", srv_sock.display()))
         .args(["--log-level", "warn"])
@@ -894,12 +895,12 @@ fn one_agentd_delegates_to_another_over_a2a() {
     // The client agentd: a one-shot run whose mock LLM script calls a2a.delegate
     // against a peer that points at the server's A2A socket. Its own intelligence
     // is the `a2a-delegate` mock; the peer is the server.
-    let cli_llm = dir.path().join("cli-llm.sock");
-    let mut cli_llm_proc = start_mock_llm(exe, &cli_llm, "a2a-delegate");
+    let cli_llm = dir.path().join("cli-llm.addr");
+    let (mut cli_llm_proc, cli_intel) = start_mock_llm(exe, &cli_llm, "a2a-delegate");
     let client = Command::new(exe)
         .args(["--mode", "once", "--instruction", "delegate the work"])
         .arg("--intelligence")
-        .arg(format!("unix:{}", cli_llm.display()))
+        .arg(&cli_intel)
         .arg("--a2a-peer")
         .arg(format!("peer=unix:{}", srv_sock.display()))
         .args(["--log-level", "warn"])

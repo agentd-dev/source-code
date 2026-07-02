@@ -270,28 +270,33 @@ fn streamable_http_full_lifecycle() {
 #[test]
 fn notification_get_stream_delivers_server_pushes() {
     // The built-in HTTP mock (debug/internal-mocks) serves the reactive
-    // one-resource MCP over a unix socket and pushes a resources/updated on the
-    // GET SSE stream after a subscribe. Prove agentd's notification thread
-    // receives it (the reactive-over-HTTP push channel).
-    let sock = format!(
-        "/tmp/agentd-mcp-notify-{}-{}.sock",
+    // one-resource MCP over loopback TCP (announcing through an addr-file) and
+    // pushes a resources/updated on the GET SSE stream after a subscribe. Prove
+    // agentd's notification thread receives it (the reactive-over-HTTP push
+    // channel).
+    let addr_file = format!(
+        "/tmp/agentd-mcp-notify-{}-{}.addr",
         std::process::id(),
         line!()
     );
-    let sock_thread = sock.clone();
+    let addr_file_thread = addr_file.clone();
     std::thread::spawn(move || {
-        agentd::mcp::mock_http::run(&sock_thread, "mock://res", true);
+        agentd::mcp::mock_http::run(&addr_file_thread, "mock://res", true);
     });
-    // Wait for the socket to appear.
+    // Wait for the address announcement.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(std::time::Instant::now() < deadline, "mock socket never bound");
+    while !std::path::Path::new(&addr_file).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mock never announced its address"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
+    let addr = std::fs::read_to_string(&addr_file).expect("read mock addr-file");
 
     let mut client = McpClient::connect(
         "mock",
-        &format!("unix:{sock}"),
+        &format!("http://{}", addr.trim()),
         Vec::new(),
         Duration::from_secs(5),
     )
@@ -314,7 +319,7 @@ fn notification_get_stream_delivers_server_pushes() {
 
     // Dropping the client stops the notification thread cleanly.
     drop(client);
-    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&addr_file);
 }
 
 /// A LEGACY mock that answers `initialize` with a fixed `protocolVersion` (to
@@ -352,6 +357,69 @@ fn spawn_fixed_version_mock(version: &'static str) -> String {
         }
     });
     format!("http://127.0.0.1:{port}/mcp")
+}
+
+#[test]
+fn hung_discover_probe_falls_back_to_legacy_quickly() {
+    // A pathological legacy server: answers `initialize` immediately but HANGS
+    // on unknown methods (never replies to the modern `server/discover` probe)
+    // instead of erroring. Era detection must give up on the probe within its
+    // own short cap — NOT the caller's full per-request timeout — and complete
+    // the legacy handshake. Regression: the cluster release_within test hung
+    // for the full 60s default here.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let Some(req) = read_http_request(&stream) else {
+                continue;
+            };
+            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+            match req.body["method"].as_str().unwrap_or("") {
+                "initialize" => write_json(
+                    &mut stream,
+                    "",
+                    &json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "hung", "version": "0"}
+                        }
+                    }),
+                ),
+                "notifications/initialized" => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                // Anything else (the server/discover probe): hold the connection
+                // open and never answer.
+                _ => {
+                    let mut sink = [0u8; 256];
+                    while stream.read(&mut sink).map(|n| n > 0).unwrap_or(false) {}
+                }
+            }
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut client = McpClient::connect(
+        "hung-discover",
+        &endpoint,
+        Vec::new(),
+        Duration::from_secs(60), // the DEFAULT bound the probe must NOT consume
+    )
+    .expect("connect");
+    client.initialize().expect("legacy fallback completes");
+    let elapsed = started.elapsed();
+    assert_eq!(client.protocol_version(), Some("2025-11-25"));
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "era probe must give up within its own cap, not the 60s default (took {elapsed:?})"
+    );
 }
 
 #[test]

@@ -707,16 +707,20 @@ mod tests {
 
         /// Spawn the built-in mock LLM on `socket` with `script`, blocking until it
         /// binds (so the first `complete()` connects, not races).
-        fn start_mock_llm(socket: &std::path::Path, script: &'static str) {
-            let s = socket.to_str().unwrap().to_string();
+        /// Run the in-process mock LLM, announcing through `addr_file`; returns
+        /// the `http://<addr>` intelligence URL once announced.
+        fn start_mock_llm(addr_file: &std::path::Path, script: &'static str) -> String {
+            let s = addr_file.to_str().unwrap().to_string();
             std::thread::spawn(move || {
                 crate::intel::mock::run(&s, script);
             });
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !socket.exists() {
-                assert!(Instant::now() < deadline, "mock-llm never bound");
+            while !addr_file.exists() {
+                assert!(Instant::now() < deadline, "mock-llm never announced");
                 std::thread::sleep(Duration::from_millis(10));
             }
+            let addr = std::fs::read_to_string(addr_file).expect("read mock-llm addr-file");
+            format!("http://{}", addr.trim())
         }
 
         fn input(instruction: &str) -> LoopInput {
@@ -738,10 +742,10 @@ mod tests {
             // usage{prompt_tokens: 11, completion_tokens: 5} (intel::mock). The turn
             // surfaces exactly that split, NON-zero — the value control.rs emits up.
             let dir = tempfile::tempdir().unwrap();
-            let sock = dir.path().join("llm.sock");
-            start_mock_llm(&sock, "final");
+            let sock = dir.path().join("llm.addr");
+            let url = start_mock_llm(&sock, "final");
 
-            let intel = IntelClient::from_parts(&format!("unix:{}", sock.display()), None).unwrap();
+            let intel = IntelClient::from_parts(&url, None).unwrap();
             let inp = input("do the thing");
             let mut handler = NoopHandler;
             let mut session = Session::prepare(&[], &inp, &mut handler).unwrap();
@@ -772,10 +776,10 @@ mod tests {
             // script makes a tool call then answers: two model calls, so the run
             // total SUMS both turns' tokens (each reports 11 in; 7 then 5 out).
             let dir = tempfile::tempdir().unwrap();
-            let sock = dir.path().join("llm.sock");
-            start_mock_llm(&sock, "read");
+            let sock = dir.path().join("llm.addr");
+            let url = start_mock_llm(&sock, "read");
 
-            let intel = IntelClient::from_parts(&format!("unix:{}", sock.display()), None).unwrap();
+            let intel = IntelClient::from_parts(&url, None).unwrap();
             let inp = input("read the resource");
             let mut handler = NoopHandler;
 

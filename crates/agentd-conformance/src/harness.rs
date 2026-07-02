@@ -200,16 +200,20 @@ impl Harness {
         &self.workmcp
     }
 
-    /// Launch the built-in agentd Streamable HTTP mock MCP server on `socket`,
-    /// serving one resource at `uri` (`emit` pushes a resources/updated after
-    /// subscribe). Blocks until the socket binds; the guard kills it on drop.
-    pub fn spawn_mock_mcp(&self, socket: &Path, uri: &str, emit: bool) -> ConfServer {
-        let mut args: Vec<&Path> =
-            vec![Path::new("--internal-mock-mcp-http"), socket, Path::new(uri)];
+    /// Launch the built-in agentd Streamable HTTP mock MCP server, serving one
+    /// resource at `uri` (`emit` pushes a resources/updated after subscribe). The
+    /// mock binds loopback TCP and announces its address through `addr_file`;
+    /// blocks until announced. The guard kills it on drop.
+    pub fn spawn_mock_mcp(&self, addr_file: &Path, uri: &str, emit: bool) -> ConfServer {
+        let mut args: Vec<&Path> = vec![
+            Path::new("--internal-mock-mcp-http"),
+            addr_file,
+            Path::new(uri),
+        ];
         if !emit {
             args.push(Path::new("--no-emit"));
         }
-        ConfServer::spawn(&self.agentd, &args, socket)
+        ConfServer::spawn_http(&self.agentd, &args, addr_file)
     }
 
     /// Launch `confmcp` as a Streamable HTTP MCP server on `socket`, recording
@@ -243,20 +247,22 @@ impl Harness {
         }
     }
 
-    /// Start the built-in mock LLM on a fresh unix socket (intelligence endpoint).
+    /// Start the built-in mock LLM on loopback TCP (intelligence endpoint),
+    /// discovering the bound address through a fresh addr-file.
     pub fn mock_llm(&self, script: &str) -> MockLlm {
         let tmp = TempDir::new();
-        let sock = tmp.path().join("llm.sock");
+        let addr_file = tmp.path().join("llm.addr");
         let child = Command::new(&self.agentd)
-            .args(["--internal-mock-llm", sock.to_str().unwrap(), script])
+            .args(["--internal-mock-llm", addr_file.to_str().unwrap(), script])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn mock-llm");
-        wait_for(&sock, Duration::from_secs(5));
+        wait_for(&addr_file, Duration::from_secs(5));
+        let addr = std::fs::read_to_string(&addr_file).expect("read mock-llm addr-file");
         MockLlm {
             child,
-            uri: format!("unix:{}", sock.display()),
+            uri: format!("http://{}", addr.trim()),
             _tmp: tmp,
         }
     }
@@ -318,17 +324,45 @@ impl Harness {
     }
 }
 
-/// A spawned conformance MCP server (`confmcp`/`workmcp`) serving Streamable HTTP
-/// over a unix socket. agentd (or a probe) dials [`ConfServer::endpoint`]. Killed
-/// and its socket removed on drop.
+/// A spawned conformance MCP server serving Streamable HTTP. agentd (or a
+/// probe) dials [`ConfServer::endpoint`]. Killed (and its socket/addr-file
+/// removed) on drop. Two spawn shapes: `confmcp`/`workmcp` still bind a unix
+/// socket ([`spawn`](ConfServer::spawn)); the built-in agentd mock binds
+/// loopback TCP and announces through an addr-file
+/// ([`spawn_http`](ConfServer::spawn_http)).
 pub struct ConfServer {
     child: Child,
-    socket: PathBuf,
+    /// The socket path (unix) or addr-file (http) — removed on drop.
+    path: PathBuf,
+    endpoint: String,
 }
 
 impl ConfServer {
     fn spawn(bin: &Path, args: &[&Path], socket: &Path) -> ConfServer {
         let _ = std::fs::remove_file(socket);
+        let child = Self::launch(bin, args, socket);
+        ConfServer {
+            child,
+            path: socket.to_path_buf(),
+            endpoint: format!("unix:{}", socket.display()),
+        }
+    }
+
+    fn spawn_http(bin: &Path, args: &[&Path], addr_file: &Path) -> ConfServer {
+        let _ = std::fs::remove_file(addr_file);
+        let child = Self::launch(bin, args, addr_file);
+        let addr = std::fs::read_to_string(addr_file)
+            .unwrap_or_else(|e| panic!("read mock addr-file {}: {e}", addr_file.display()));
+        ConfServer {
+            child,
+            path: addr_file.to_path_buf(),
+            endpoint: format!("http://{}", addr.trim()),
+        }
+    }
+
+    /// Spawn `bin` and block until `ready_path` exists (the unix socket bound /
+    /// the loopback address announced).
+    fn launch(bin: &Path, args: &[&Path], ready_path: &Path) -> Child {
         let child = Command::new(bin)
             .args(args)
             .stdout(Stdio::null())
@@ -336,23 +370,20 @@ impl ConfServer {
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
+        while !ready_path.exists() {
             assert!(
                 Instant::now() < deadline,
-                "conformance mcp server socket never bound: {}",
-                socket.display()
+                "conformance mcp server never became ready: {}",
+                ready_path.display()
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        ConfServer {
-            child,
-            socket: socket.to_path_buf(),
-        }
+        child
     }
 
-    /// The `unix:<socket>` endpoint agentd connects to.
+    /// The endpoint agentd connects to (`unix:<socket>` or `http://<addr>`).
     pub fn endpoint(&self) -> String {
-        format!("unix:{}", self.socket.display())
+        self.endpoint.clone()
     }
 }
 
@@ -360,7 +391,7 @@ impl Drop for ConfServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 

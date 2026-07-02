@@ -62,7 +62,7 @@ fn parent_payload() -> SpawnPayload {
     }
 }
 
-fn start_mock_llm(socket: &Path) -> Child {
+fn start_mock_llm(socket: &Path) -> (Child, String) {
     let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--internal-mock-llm", socket.to_str().unwrap(), "final"])
         .stdout(Stdio::null())
@@ -71,20 +71,21 @@ fn start_mock_llm(socket: &Path) -> Child {
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !socket.exists() {
-        assert!(Instant::now() < deadline, "mock-llm never bound");
+        assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    let addr = std::fs::read_to_string(socket).expect("read mock-llm addr-file");
+    (child, format!("http://{}", addr.trim()))
 }
 
 #[test]
 fn async_spawn_returns_a_handle_then_await_collects_the_result() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock);
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&sock);
 
     let mut payload = parent_payload();
-    payload.intelligence.uri = format!("unix:{}", sock.display());
+    payload.intelligence.uri = intel;
 
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
@@ -140,11 +141,11 @@ fn async_spawn_returns_a_handle_then_await_collects_the_result() {
 #[test]
 fn a_detached_child_is_not_collectable() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock);
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&sock);
 
     let mut payload = parent_payload();
-    payload.intelligence.uri = format!("unix:{}", sock.display());
+    payload.intelligence.uri = intel;
 
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());
@@ -187,11 +188,11 @@ fn a_detached_child_is_not_collectable() {
 #[test]
 fn async_completion_is_readable_as_an_agentd_resource() {
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(&sock);
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&sock);
 
     let mut payload = parent_payload();
-    payload.intelligence.uri = format!("unix:{}", sock.display());
+    payload.intelligence.uri = intel;
 
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_agentd"));
     let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(15), logger());

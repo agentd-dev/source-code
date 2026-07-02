@@ -69,7 +69,7 @@ fn drain_to_terminal(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, deadline: Instant)
 
 /// Start the built-in mock LLM (`final` script) on a unix socket; wait until it
 /// binds. The subagent's intel calls then succeed without a live model.
-fn start_mock_llm(exe: &str, socket: &Path) -> Child {
+fn start_mock_llm(exe: &str, socket: &Path) -> (Child, String) {
     let child = Command::new(exe)
         .args(["--internal-mock-llm", socket.to_str().unwrap(), "final"])
         .stdout(Stdio::null())
@@ -78,10 +78,11 @@ fn start_mock_llm(exe: &str, socket: &Path) -> Child {
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !socket.exists() {
-        assert!(Instant::now() < deadline, "mock-llm never bound");
+        assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    let addr = std::fs::read_to_string(socket).expect("read mock-llm addr-file");
+    (child, format!("http://{}", addr.trim()))
 }
 
 /// Scan upward frames (ignoring Ready/Pong/Event/Usage) until one of `kind`
@@ -118,11 +119,11 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
 fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("llm.sock");
-    let mut llm = start_mock_llm(exe, &sock);
+    let sock = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(exe, &sock);
 
     let mut payload = bogus_payload();
-    payload.intelligence.uri = format!("unix:{}", sock.display());
+    payload.intelligence.uri = intel;
     payload.warm = true;
 
     let mut tree = Tree::new(Caps::default());

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Composability E2E: a peer drives agentd's served self-MCP. RFC 0005. Runs
-//! only under `cargo test --features serve-mcp`.
-#![cfg(all(unix, feature = "serve-mcp"))]
+//! Composability E2E: a peer drives agentd's served self-MCP over the HTTP
+//! control plane (pivot Phase 3). RFC 0005. Runs only under
+//! `cargo test --features serve-https`.
+#![cfg(all(unix, feature = "serve-https"))]
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 fn sigterm(pid: u32) {
@@ -15,12 +17,23 @@ fn sigterm(pid: u32) {
     }
 }
 
-/// A daemon that just **idles and serves MCP**: reactive mode subscribed to a URI
-/// no MCP server owns, so there are no reactions / read-after-subscribe runs —
-/// nothing contends for the process-wide supervise lock, so a served async run
-/// starts immediately.
-fn start_idle_daemon(exe: &str, intel: &str, sock: &Path) -> Child {
-    Command::new(exe)
+/// Grab a free loopback port (bind :0 then drop). agentd rebinds within ms.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A daemon that just **idles and serves MCP** over loopback HTTP: reactive mode
+/// subscribed to a URI no MCP server owns, so nothing contends for the
+/// process-wide supervise lock and a served async run starts immediately.
+/// Returns the child and the `host:port` the peer dials.
+fn start_idle_daemon(exe: &str, intel: &str) -> (Child, String) {
+    let port = free_port();
+    let bind = format!("http://127.0.0.1:{port}");
+    let child = Command::new(exe)
         .args([
             "--mode",
             "reactive",
@@ -31,44 +44,134 @@ fn start_idle_daemon(exe: &str, intel: &str, sock: &Path) -> Child {
             "--intelligence",
             intel,
             "--serve-mcp",
+            &bind,
+            "--log-level",
+            "warn",
         ])
-        .arg(format!("unix:{}", sock.display()))
-        .args(["--log-level", "warn"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn idle daemon")
+        .expect("spawn idle daemon");
+    (child, format!("127.0.0.1:{port}"))
 }
 
-/// Start the built-in mock LLM on a unix socket; wait until it binds.
-fn start_mock_llm(exe: &str, sock: &Path, script: &str) -> (Child, String) {
+/// Start the built-in mock LLM on loopback TCP (addr-file handshake).
+fn start_mock_llm(exe: &str, addr_file: &Path, script: &str) -> (Child, String) {
     let child = Command::new(exe)
-        .args(["--internal-mock-llm", sock.to_str().unwrap(), script])
+        .args(["--internal-mock-llm", addr_file.to_str().unwrap(), script])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn mock-llm");
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !sock.exists() {
+    while !addr_file.exists() {
         assert!(Instant::now() < deadline, "mock-llm never announced");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let addr = std::fs::read_to_string(sock).expect("read mock-llm addr-file");
+    let addr = std::fs::read_to_string(addr_file).expect("read mock-llm addr-file");
     (child, format!("http://{}", addr.trim()))
 }
 
+/// A served-MCP peer over HTTP: each JSON-RPC call is one `POST /mcp`
+/// (Connection: close), and `listen` opens a `subscriptions/listen` SSE stream.
+struct Peer {
+    addr: String,
+}
+
+impl Peer {
+    /// Connect once the daemon's HTTP port accepts (poll up to ~3s).
+    fn connect(addr: &str) -> Peer {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if TcpStream::connect(addr).is_ok() {
+                return Peer {
+                    addr: addr.to_string(),
+                };
+            }
+            assert!(Instant::now() < deadline, "served HTTP port never accepted: {addr}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// One JSON-RPC call over a fresh HTTP POST; returns the parsed reply.
+    fn rpc(&self, body: &str) -> serde_json::Value {
+        let mut s = TcpStream::connect(&self.addr).expect("connect peer");
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).expect("write rpc");
+        s.flush().ok();
+        let mut reader = BufReader::new(s);
+        // Skip the status line + headers.
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
+                break;
+            }
+        }
+        let mut payload = String::new();
+        reader.read_to_string(&mut payload).expect("read rpc body");
+        serde_json::from_str(&payload).unwrap_or_else(|e| panic!("reply not json ({e}): {payload:?}"))
+    }
+
+    /// Open a modern `subscriptions/listen` SSE stream for `uris`; returns a
+    /// channel of the pushed notification JSON values. The reader thread runs
+    /// until the connection closes.
+    fn listen(&self, uris: &[&str]) -> Receiver<serde_json::Value> {
+        let subs: Vec<String> = uris.iter().map(|u| (*u).to_string()).collect();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+            "params": { "notifications": { "resourceSubscriptions": subs } }
+        })
+        .to_string();
+        let mut s = TcpStream::connect(&self.addr).expect("connect listen");
+        s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).expect("write listen");
+        s.flush().ok();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(s);
+            // Skip headers.
+            loop {
+                let mut l = String::new();
+                if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
+                    break;
+                }
+            }
+            // Read SSE `data:` lines.
+            loop {
+                let mut l = String::new();
+                match reader.read_line(&mut l) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Some(data) = l.strip_prefix("data:")
+                            && let Ok(v) = serde_json::from_str::<serde_json::Value>(data.trim())
+                            && tx.send(v).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        rx
+    }
+}
+
 /// Poll `subagent.status` for `handle` until the run is `done`, or the deadline.
-fn poll_until_done(
-    reader: &mut BufReader<UnixStream>,
-    write: &mut UnixStream,
-    handle: &str,
-    deadline: Instant,
-) -> serde_json::Value {
+fn poll_until_done(peer: &Peer, handle: &str, deadline: Instant) -> serde_json::Value {
     let line = format!(
         r#"{{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
     );
     loop {
-        let v = rpc(reader, write, &line);
+        let v = peer.rpc(&line);
         let body = v["result"]["structuredContent"].clone();
         if body["done"] == true {
             return body;
@@ -78,44 +181,15 @@ fn poll_until_done(
     }
 }
 
-/// Connect once the daemon has bound the socket (poll up to ~3s).
-fn connect(path: &std::path::Path) -> UnixStream {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if let Ok(s) = UnixStream::connect(path) {
-            return s;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "served MCP socket never became connectable: {}",
-                path.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// Send one JSON-RPC line and read the one-line response.
-fn rpc(
-    reader: &mut BufReader<UnixStream>,
-    write: &mut UnixStream,
-    line: &str,
-) -> serde_json::Value {
-    writeln!(write, "{line}").expect("write rpc");
-    write.flush().ok();
-    let mut buf = String::new();
-    reader.read_line(&mut buf).expect("read rpc reply");
-    serde_json::from_str(&buf).expect("reply is json")
-}
-
 #[test]
 fn a_peer_initializes_lists_and_calls_status() {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let sock = dir.path().join("agentd.sock");
 
-    // A loop-mode daemon serves the self-MCP while it runs (intel is unreachable,
-    // but the daemon stays up and keeps serving the socket).
+    // A loop-mode daemon serves the self-MCP over loopback HTTP while it runs
+    // (intel is unreachable, but the daemon stays up and keeps serving).
+    let port = free_port();
+    let bind = format!("http://127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{port}");
     let mut child = Command::new(exe)
         .args([
             "--mode",
@@ -127,23 +201,19 @@ fn a_peer_initializes_lists_and_calls_status() {
             "--intelligence",
             "http://127.0.0.1:9",
             "--serve-mcp",
+            &bind,
+            "--log-level",
+            "warn",
         ])
-        .arg(format!("unix:{}", sock.display()))
-        .args(["--log-level", "warn"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn agentd loop --serve-mcp");
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone stream");
-    let mut reader = BufReader::new(stream);
+    let peer = Peer::connect(&addr);
 
     // initialize
-    let init = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
+    let init = peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
     );
     assert_eq!(
         init["result"]["serverInfo"]["name"], "agentd",
@@ -156,38 +226,26 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // tools/list advertises `status`
-    let list = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
     assert_eq!(list["result"]["tools"][0]["name"], "status", "list: {list}");
 
     // tools/call status returns this daemon's live state
-    let status = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status"}}"#,
+    let status = peer.rpc(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status"}}"#,
     );
     assert_eq!(status["result"]["isError"], false, "status: {status}");
     assert_eq!(status["result"]["structuredContent"]["mode"], "loop");
     assert!(status["result"]["structuredContent"]["uptime_ms"].is_number());
 
     // an unknown tool is a JSON-RPC error, not a panic
-    let bad = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ghost"}}"#,
+    let bad = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ghost"}}"#,
     );
     assert!(bad["error"].is_object(), "bad tool should error: {bad}");
 
     // subagent.spawn delegates a real run. The spawned agent fails on the
     // unreachable intel → a tool-domain error (isError:true), not a JSON-RPC
     // error — proving delegation reaches supervise_once + the result mapping.
-    let spawn = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing"}}}"#,
+    let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing"}}}"#,
     );
     assert_eq!(
         spawn["result"]["isError"], true,
@@ -202,10 +260,7 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // a malformed subagent.spawn (no instruction) is a JSON-RPC error
-    let bad_spawn = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{}}}"#,
+    let bad_spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{}}}"#,
     );
     assert!(
         bad_spawn["error"].is_object(),
@@ -213,10 +268,7 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // resources/list advertises the agentd:// surface
-    let res_list = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#,
+    let res_list = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"resources/list"}"#,
     );
     assert_eq!(
         res_list["result"]["resources"][0]["uri"], "agent://status",
@@ -224,10 +276,7 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // resources/read agentd://status returns a contents body with the live state
-    let res_read = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"agentd://status"}}"#,
+    let res_read = peer.rpc(r#"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"agentd://status"}}"#,
     );
     let entry = &res_read["result"]["contents"][0];
     assert_eq!(
@@ -243,10 +292,7 @@ fn a_peer_initializes_lists_and_calls_status() {
     );
 
     // an unknown agentd:// uri is a JSON-RPC error
-    let bad_read = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"agentd://ghost"}}"#,
+    let bad_read = peer.rpc(r#"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"agentd://ghost"}}"#,
     );
     assert!(
         bad_read["error"].is_object(),
@@ -260,26 +306,16 @@ fn a_peer_initializes_lists_and_calls_status() {
 #[test]
 fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let sock = dir.path().join("agentd.sock");
     // intel unreachable → the served async run fails fast; we observe the
     // lifecycle (handle → running → failed) via the registry.
-    let mut child = start_idle_daemon(exe, "http://127.0.0.1:9", &sock);
+    let (mut child, addr) = start_idle_daemon(exe, "http://127.0.0.1:9");
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let peer = Peer::connect(&addr);
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
 
     // async spawn → a handle immediately, status running (NON-blocking).
-    let spawn = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing","async":true}}}"#,
+    let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a thing","async":true}}}"#,
     );
     assert_eq!(spawn["result"]["isError"], false, "async spawn ok: {spawn}");
     let sc = &spawn["result"]["structuredContent"];
@@ -287,10 +323,7 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let handle = sc["handle"].as_str().expect("handle").to_string();
 
     // poll the registry until the run terminates → failed (intel unreachable)
-    let body = poll_until_done(
-        &mut reader,
-        &mut write,
-        &handle,
+    let body = poll_until_done(&peer, &handle,
         Instant::now() + Duration::from_secs(20),
     );
     assert_eq!(
@@ -299,10 +332,7 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     );
 
     // the same run is readable as an agentd:// resource
-    let read = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    let read = peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{{"uri":"agentd://subagent/{handle}"}}}}"#
         ),
     );
@@ -322,26 +352,18 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let _ = child.wait();
 }
 
-/// Read lines until a `notifications/resources/updated` for `uri` arrives (or the
-/// deadline). Skips replies/other notifications interleaved on the stream.
-fn read_until_resource_updated(
-    reader: &mut BufReader<UnixStream>,
-    uri: &str,
-    deadline: Instant,
-) -> bool {
+/// Block until a `notifications/resources/updated` for `uri` arrives on the SSE
+/// channel (or the deadline). Skips other notifications.
+fn recv_resource_updated(rx: &Receiver<serde_json::Value>, uri: &str, deadline: Instant) -> bool {
     while Instant::now() < deadline {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return false, // peer closed
-            Ok(_) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
-                    && v["method"] == "notifications/resources/updated"
-                    && v["params"]["uri"] == uri
-                {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(v) => {
+                if v["method"] == "notifications/resources/updated" && v["params"]["uri"] == uri {
                     return true;
                 }
             }
-            Err(_) => return false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => return false, // stream closed
         }
     }
     false
@@ -349,60 +371,38 @@ fn read_until_resource_updated(
 
 #[test]
 fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
-    // The reactive loop closed: a peer subscribes to agentd://subagent/<handle>
-    // and is PUSHED notifications/resources/updated when that run terminates —
-    // no polling. (We cancel a hanging run to make it terminate on cue.)
+    // The reactive loop closed: a peer opens a subscriptions/listen SSE stream for
+    // agentd://subagent/<handle> and is PUSHED notifications/resources/updated when
+    // that run terminates — no polling. (We cancel a hanging run to terminate it.)
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.addr");
     let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "hang");
-    let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &intel, &sock);
+    let (mut child, addr) = start_idle_daemon(exe, &intel);
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    let init = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-    );
+    let peer = Peer::connect(&addr);
+    let init = peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
     assert_eq!(
         init["result"]["capabilities"]["resources"]["subscribe"], true,
         "subscribe advertised: {init}"
     );
 
-    let spawn = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"slow","async":true}}}"#,
-    );
+    let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"slow","async":true}}}"#);
     let handle = spawn["result"]["structuredContent"]["handle"]
         .as_str()
         .expect("handle")
         .to_string();
     let uri = format!("agent://subagent/{handle}");
 
-    // subscribe to the run's resource, then cancel it so it terminates.
-    let sub = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"resources/subscribe","params":{{"uri":"{uri}"}}}}"#
-        ),
-    );
-    assert!(sub["error"].is_null(), "subscribe ok: {sub}");
-    rpc(
-        &mut reader,
-        &mut write,
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
-        ),
-    );
+    // Open the SSE notification stream for the run's resource, then cancel it.
+    let rx = peer.listen(&[&uri]);
+    peer.rpc(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
+    ));
 
     // The run drains (~5-7s) → its resource changed → we are pushed an update.
     assert!(
-        read_until_resource_updated(&mut reader, &uri, Instant::now() + Duration::from_secs(20)),
+        recv_resource_updated(&rx, &uri, Instant::now() + Duration::from_secs(20)),
         "expected a pushed notifications/resources/updated for {uri}"
     );
 
@@ -413,18 +413,12 @@ fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
 }
 
 /// Poll `subagent.status` until the warm session has run at least `target` turns.
-fn poll_warm_turns(
-    reader: &mut BufReader<UnixStream>,
-    write: &mut UnixStream,
-    handle: &str,
-    target: u64,
-    deadline: Instant,
-) -> u64 {
+fn poll_warm_turns(peer: &Peer, handle: &str, target: u64, deadline: Instant) -> u64 {
     let line = format!(
         r#"{{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
     );
     loop {
-        let v = rpc(reader, write, &line);
+        let v = peer.rpc(&line);
         let turns = v["result"]["structuredContent"]["turns"]
             .as_u64()
             .unwrap_or(0);
@@ -447,23 +441,14 @@ fn a_warm_session_runs_a_turn_per_send() {
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.addr");
     let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "final"); // each turn completes at once
-    let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &intel, &sock);
+    let (mut child, addr) = start_idle_daemon(exe, &intel);
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let peer = Peer::connect(&addr);
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
 
     // warm spawn → a live session (turn 1 runs from the instruction).
-    let spawn = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"hello","warm":true}}}"#,
+    let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"hello","warm":true}}}"#,
     );
     assert_eq!(
         spawn["result"]["structuredContent"]["warm"], true,
@@ -474,20 +459,14 @@ fn a_warm_session_runs_a_turn_per_send() {
         .expect("handle")
         .to_string();
 
-    let t1 = poll_warm_turns(
-        &mut reader,
-        &mut write,
-        &handle,
+    let t1 = poll_warm_turns(&peer, &handle,
         1,
         Instant::now() + Duration::from_secs(15),
     );
     assert!(t1 >= 1, "the warm session runs turn 1 from the instruction");
 
     // send another message → a SECOND turn over the same live session.
-    let sent = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    let sent = peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.send","arguments":{{"handle":"{handle}","message":"and again"}}}}}}"#
         ),
     );
@@ -502,10 +481,7 @@ fn a_warm_session_runs_a_turn_per_send() {
         "send reports the awaited turn: {sent}"
     );
 
-    let t2 = poll_warm_turns(
-        &mut reader,
-        &mut write,
-        &handle,
+    let t2 = poll_warm_turns(&peer, &handle,
         2,
         Instant::now() + Duration::from_secs(15),
     );
@@ -516,10 +492,7 @@ fn a_warm_session_runs_a_turn_per_send() {
 
     // Once the turn completes the session reads idle (not busy) — the peer's signal
     // that last_result is fresh and it is safe to send again.
-    let status = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    let status = peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{handle}"}}}}}}"#
         ),
     );
@@ -529,10 +502,7 @@ fn a_warm_session_runs_a_turn_per_send() {
     );
 
     // end it.
-    let cancel = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    let cancel = peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
         ),
     );
@@ -560,62 +530,44 @@ fn concurrent_async_runs_do_not_serialize() {
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.addr");
     let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "hang");
-    let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &intel, &sock);
+    let (mut child, addr) = start_idle_daemon(exe, &intel);
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let peer = Peer::connect(&addr);
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
 
-    let spawn_async = |reader: &mut BufReader<UnixStream>,
-                       write: &mut UnixStream,
-                       id: u32|
-     -> String {
+    let spawn_async = |id: u32| -> String {
         let line = format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"subagent.spawn","arguments":{{"instruction":"slow","async":true}}}}}}"#
         );
-        let v = rpc(reader, write, &line);
+        let v = peer.rpc(&line);
         v["result"]["structuredContent"]["handle"]
             .as_str()
             .expect("handle")
             .to_string()
     };
 
-    let h1 = spawn_async(&mut reader, &mut write, 2);
-    let h2 = spawn_async(&mut reader, &mut write, 3);
+    let h1 = spawn_async(2);
+    let h2 = spawn_async(3);
     assert_ne!(h1, h2);
 
     // Let both runs reach their hanging model call, then cancel only run 2.
     std::thread::sleep(Duration::from_millis(400));
-    rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{h2}"}}}}}}"#
         ),
     );
 
     // Run 2 reaches a terminal "cancelled" promptly (drain ladder ~5-7s) —
     // well inside the 12s hang of run 1.
-    let body2 = poll_until_done(
-        &mut reader,
-        &mut write,
-        &h2,
+    let body2 = poll_until_done(&peer, &h2,
         Instant::now() + Duration::from_secs(15),
     );
     assert_eq!(body2["status"], "cancelled", "run 2 drained: {body2}");
 
     // ...and run 1 is STILL running at that moment (not blocked, not finished) —
     // the two supervisors ran concurrently.
-    let status1 = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    let status1 = peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"subagent.status","arguments":{{"handle":"{h1}"}}}}}}"#
         ),
     );
@@ -639,22 +591,13 @@ fn cancel_drains_a_live_async_run() {
     // terminal state quickly proves the cancel/drain torn it down (not natural
     // completion).
     let (mut llm, intel) = start_mock_llm(exe, &llm_sock, "hang");
-    let sock = dir.path().join("agentd.sock");
-    let mut child = start_idle_daemon(exe, &intel, &sock);
+    let (mut child, addr) = start_idle_daemon(exe, &intel);
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let peer = Peer::connect(&addr);
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
 
-    let spawn = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a slow thing","async":true}}}"#,
+    let spawn = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"subagent.spawn","arguments":{"instruction":"do a slow thing","async":true}}}"#,
     );
     let handle = spawn["result"]["structuredContent"]["handle"]
         .as_str()
@@ -663,10 +606,7 @@ fn cancel_drains_a_live_async_run() {
 
     // Let the run reach its (hanging) model call, then cancel it.
     std::thread::sleep(Duration::from_millis(400));
-    let cancel = rpc(
-        &mut reader,
-        &mut write,
-        &format!(
+    let cancel = peer.rpc(&format!(
             r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subagent.cancel","arguments":{{"handle":"{handle}"}}}}}}"#
         ),
     );
@@ -677,10 +617,7 @@ fn cancel_drains_a_live_async_run() {
 
     // It reaches a terminal "cancelled" state well before the 30s hang → the
     // reactor's per-run cancel token drained the live subtree.
-    let body = poll_until_done(
-        &mut reader,
-        &mut write,
-        &handle,
+    let body = poll_until_done(&peer, &handle,
         Instant::now() + Duration::from_secs(20),
     );
     assert_eq!(
@@ -700,26 +637,16 @@ fn cancel_drains_a_live_async_run() {
 #[test]
 fn management_peer_drives_the_operator_surface() {
     let exe = env!("CARGO_BIN_EXE_agentd");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let sock = dir.path().join("agentd.sock");
     // An idle reactive daemon that just serves the socket (intel unreachable; it
     // never reacts, so nothing contends with the management calls).
-    let mut child = start_idle_daemon(exe, "http://127.0.0.1:9", &sock);
+    let (mut child, addr) = start_idle_daemon(exe, "http://127.0.0.1:9");
 
-    let stream = connect(&sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let peer = Peer::connect(&addr);
+    peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     );
 
     // tools/list to a management peer includes the operator tools.
-    let list = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
     let names: Vec<&str> = list["result"]["tools"]
         .as_array()
@@ -732,10 +659,7 @@ fn management_peer_drives_the_operator_surface() {
     }
 
     // agentd://inventory is readable + carries the lifecycle flags.
-    let inv = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+    let inv = peer.rpc(r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
     );
     let body: serde_json::Value =
         serde_json::from_str(inv["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
@@ -747,19 +671,13 @@ fn management_peer_drives_the_operator_surface() {
     // pause flips the instance-wide pause flag in the projection (no in-flight
     // subagents on this idle daemon → affected:0) and is reversible. NOT a drain
     // and NOT a lame-duck: readiness is unchanged by pause (RFC 0015 §4.3).
-    let pause = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"pause"}}"#,
+    let pause = peer.rpc(r#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"pause"}}"#,
     );
     assert_eq!(pause["result"]["isError"], false, "pause: {pause}");
     assert_eq!(pause["result"]["structuredContent"]["paused"], true);
     assert_eq!(pause["result"]["structuredContent"]["affected"], 0);
     let inv_p: serde_json::Value = serde_json::from_str(
-        rpc(
-            &mut reader,
-            &mut write,
-            r#"{"jsonrpc":"2.0","id":32,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+        peer.rpc(r#"{"jsonrpc":"2.0","id":32,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
         )["result"]["contents"][0]["text"]
             .as_str()
             .unwrap(),
@@ -772,17 +690,11 @@ fn management_peer_drives_the_operator_surface() {
     assert_eq!(inv_p["ready"], true, "pause is not lame-duck → still ready");
     assert_eq!(inv_p["draining"], false, "pause is not drain");
     // resume clears it.
-    let resume = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"resume"}}"#,
+    let resume = peer.rpc(r#"{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"resume"}}"#,
     );
     assert_eq!(resume["result"]["structuredContent"]["paused"], false);
     let inv_r: serde_json::Value = serde_json::from_str(
-        rpc(
-            &mut reader,
-            &mut write,
-            r#"{"jsonrpc":"2.0","id":34,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+        peer.rpc(r#"{"jsonrpc":"2.0","id":34,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
         )["result"]["contents"][0]["text"]
             .as_str()
             .unwrap(),
@@ -791,17 +703,11 @@ fn management_peer_drives_the_operator_surface() {
     assert_eq!(inv_r["paused"], false, "resume cleared the flag: {inv_r}");
 
     // lame-duck flips readiness in the projection (no exit, no drain).
-    let ld = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"lame-duck"}}"#,
+    let ld = peer.rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"lame-duck"}}"#,
     );
     assert_eq!(ld["result"]["isError"], false, "lame-duck: {ld}");
     assert_eq!(ld["result"]["structuredContent"]["ready"], false);
-    let inv2 = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
+    let inv2 = peer.rpc(r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"agentd://inventory"}}"#,
     );
     let body2: serde_json::Value =
         serde_json::from_str(inv2["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
@@ -811,10 +717,7 @@ fn management_peer_drives_the_operator_surface() {
     );
 
     // cancel of an unknown handle is an isError result, not a protocol error.
-    let bad = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"cancel","arguments":{"handle":"0.9.9"}}}"#,
+    let bad = peer.rpc(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"cancel","arguments":{"handle":"0.9.9"}}}"#,
     );
     assert!(
         bad["error"].is_null(),
@@ -824,10 +727,7 @@ fn management_peer_drives_the_operator_surface() {
 
     // drain returns a snapshot immediately and latches draining; the daemon then
     // winds down and exits clean. (Tested last so the daemon can exit.)
-    let drain = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"drain"}}"#,
+    let drain = peer.rpc(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"drain"}}"#,
     );
     assert_eq!(drain["result"]["isError"], false, "drain: {drain}");
     assert_eq!(drain["result"]["structuredContent"]["draining"], true);
@@ -858,11 +758,13 @@ fn one_agentd_delegates_to_another_over_a2a() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // The server agentd: a mock LLM it can reach, and its A2A surface served on a
-    // unix socket. A loop-mode daemon stays up and keeps serving while idle.
+    // The server agentd: a mock LLM it can reach, and its A2A surface served over
+    // loopback HTTP. A loop-mode daemon stays up and keeps serving while idle.
     let srv_llm = dir.path().join("srv-llm.addr");
     let (mut srv_llm_proc, srv_intel) = start_mock_llm(exe, &srv_llm, "final");
-    let srv_sock = dir.path().join("server-a2a.sock");
+    let srv_port = free_port();
+    let srv_bind = format!("http://127.0.0.1:{srv_port}");
+    let srv_addr = format!("127.0.0.1:{srv_port}");
     let mut server = Command::new(exe)
         .args([
             "--mode",
@@ -875,26 +777,18 @@ fn one_agentd_delegates_to_another_over_a2a() {
         ])
         .arg(&srv_intel)
         .arg("--serve-mcp")
-        .arg(format!("unix:{}", srv_sock.display()))
+        .arg(&srv_bind)
         .args(["--log-level", "warn"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn server agentd");
-    // Wait until the server has bound its A2A socket.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !srv_sock.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "server never bound its a2a socket"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let _ = connect(&srv_sock); // ensure it's connectable before the client dials
+    // Ensure the server's HTTP port accepts before the client dials.
+    let peer = Peer::connect(&srv_addr);
 
     // The client agentd: a one-shot run whose mock LLM script calls a2a.delegate
-    // against a peer that points at the server's A2A socket. Its own intelligence
-    // is the `a2a-delegate` mock; the peer is the server.
+    // against a peer that points at the server's A2A HTTP surface. Its own
+    // intelligence is the `a2a-delegate` mock; the peer is the server.
     let cli_llm = dir.path().join("cli-llm.addr");
     let (mut cli_llm_proc, cli_intel) = start_mock_llm(exe, &cli_llm, "a2a-delegate");
     let client = Command::new(exe)
@@ -902,7 +796,7 @@ fn one_agentd_delegates_to_another_over_a2a() {
         .arg("--intelligence")
         .arg(&cli_intel)
         .arg("--a2a-peer")
-        .arg(format!("peer=unix:{}", srv_sock.display()))
+        .arg(format!("peer={srv_bind}"))
         .args(["--log-level", "warn"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -922,14 +816,7 @@ fn one_agentd_delegates_to_another_over_a2a() {
 
     // Confirm the delegation actually reached the SERVER: its A2A task registry
     // now holds a COMPLETED task (the served run the client's SendMessage started).
-    let stream = connect(&srv_sock);
-    let mut write = stream.try_clone().expect("clone");
-    let mut reader = BufReader::new(stream);
-    let list = rpc(
-        &mut reader,
-        &mut write,
-        r#"{"jsonrpc":"2.0","id":1,"method":"a2a.ListTasks"}"#,
-    );
+    let list = peer.rpc(r#"{"jsonrpc":"2.0","id":1,"method":"a2a.ListTasks"}"#);
     let tasks = list["result"]["tasks"]
         .as_array()
         .cloned()

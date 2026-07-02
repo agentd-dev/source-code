@@ -2992,7 +2992,7 @@ mod tests {
             output_contract: None,
             context_seed: Vec::new(),
             intelligence: IntelConfig {
-                uri: "unix:/x".into(),
+                uri: "https://intel.example".into(),
                 token: None,
                 model: None,
             },
@@ -3034,7 +3034,7 @@ mod tests {
         let cfg = crate::config::Config {
             run_id: "r1".into(),
             mode: crate::config::Mode::Reactive,
-            intelligence: Some("unix:/x".into()),
+            intelligence: Some("https://intel.example".into()),
             ..crate::config::Config::default()
         };
         ServeCtx::new(
@@ -4519,7 +4519,7 @@ mod tests {
         let cfg = crate::config::Config {
             run_id: "r1".into(),
             mode: crate::config::Mode::Reactive,
-            intelligence: Some("vsock:3:8080,unix:/run/intel.sock".into()),
+            intelligence: Some("https://gw-a.example:8443,https://gw-b.example/v1/secret-path".into()),
             intelligence_token: Some("super-secret-tok".into()),
             model: Some("claude-opus-4".into()),
             ..crate::config::Config::default()
@@ -4563,18 +4563,18 @@ mod tests {
         let eps = body["endpoints"].as_array().unwrap();
         assert_eq!(eps.len(), 2);
         assert_eq!(eps[0]["index"], 0);
-        assert_eq!(eps[0]["transport"], "vsock");
-        assert_eq!(eps[0]["addr"], "3:8080");
+        assert_eq!(eps[0]["transport"], "https");
+        assert_eq!(eps[0]["addr"], "gw-a.example:8443");
         // The per-endpoint breaker state is reported `unknown` (not a fabricated
         // `closed`/0) because it genuinely isn't aggregated here (RFC 0018 §6).
         assert_eq!(eps[0]["state"], "unknown");
         assert!(eps[0].get("ewma_latency_ms").is_none());
         assert!(eps[0].get("error_rate").is_none());
-        assert_eq!(eps[1]["transport"], "unix");
-        // RFC 0012 §3.7: NEVER the token, NEVER a full URL with its scheme.
+        assert_eq!(eps[1]["transport"], "https");
+        // RFC 0012 §3.7: NEVER the token, NEVER a full URL (scheme or path).
         assert!(!text.contains("super-secret-tok"), "token leaked: {text}");
-        assert!(!text.contains("vsock:3:8080"), "full URI leaked: {text}");
-        assert!(!text.contains("unix:/run"), "full URI leaked: {text}");
+        assert!(!text.contains("https://"), "full URI leaked: {text}");
+        assert!(!text.contains("secret-path"), "URL path leaked: {text}");
 
         // A stdio peer must NOT read it — 404, as if it didn't exist.
         let denied = dispatch(
@@ -4684,7 +4684,7 @@ mod tests {
         assert_eq!(body["intelligence"]["models"], json!(["claude-opus-4"]));
         // The structural fields the manifest already carried are untouched.
         assert_eq!(body["intelligence"]["endpoints"], json!(2));
-        assert_eq!(body["intelligence"]["transport"], json!("vsock"));
+        assert_eq!(body["intelligence"]["transport"], json!("https"));
     }
 
     #[test]
@@ -4775,7 +4775,7 @@ mod tests {
         let mut cfg = crate::config::Config {
             run_id: "r1".into(),
             mode: crate::config::Mode::Reactive,
-            intelligence: Some("unix:/x".into()),
+            intelligence: Some("https://intel.example".into()),
             model: Some("claude-opus-4".into()),
             ..crate::config::Config::default()
         };
@@ -4817,7 +4817,7 @@ mod tests {
         let reloaded = crate::config::Config {
             run_id: "r1".into(),
             mode: crate::config::Mode::Reactive,
-            intelligence: Some("unix:/x".into()),
+            intelligence: Some("https://intel.example".into()),
             model: Some("claude-sonnet-9".into()),
             ..crate::config::Config::default()
         };

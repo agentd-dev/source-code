@@ -70,7 +70,7 @@ mod tests {
 
     fn swap(model: &str) -> SwapIntel {
         SwapIntel {
-            uri: "unix:/a".into(),
+            uri: "https://a.example".into(),
             token: None,
             model: Some(model.into()),
             policy: SwapPolicy::FinishOnOld,

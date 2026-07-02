@@ -2,11 +2,12 @@
 //! The intelligence endpoint *list* and per-endpoint credentials. RFC 0018 §3.1/§3.2.
 //!
 //! `--intelligence` / `AGENTD_INTELLIGENCE` is an **ordered, comma-separated
-//! list** (`vsock:3:8080,vsock:3:8081,unix:/run/intel.sock`); list order IS
-//! failover priority (`eps[0]` is the primary). Each element is parsed by the
-//! RFC 0006 transport resolver (unchanged), may mix transports, and resolves its
-//! **own** credential by env name (§3.2). A single-element list is exactly RFC
-//! 0006 — the failover/breaker machinery is inert with one endpoint.
+//! list** (`https://gw-a.example,https://gw-b.example`); list order IS failover
+//! priority (`eps[0]` is the primary). Each element is parsed by the HTTPS-only
+//! transport resolver (target-vision pivot; plaintext `http://` is loopback-only
+//! for dev/tests) and resolves its **own** credential by env name (§3.2). A
+//! single-element list is exactly RFC 0006 — the failover/breaker machinery is
+//! inert with one endpoint.
 //!
 //! Per-endpoint credential naming (RFC 0014 §6.4 / §3.2): the default
 //! `AGENTD_INTELLIGENCE_TOKEN` (≡ endpoint 1), then `_2`, `_3`, … (1-indexed by
@@ -33,18 +34,18 @@ const TOKEN_ENV_NEUTRAL: &str = "AGENT_INTELLIGENCE_TOKEN";
 /// A single resolved endpoint: its transport + the per-request HTTP framing +
 /// its resolved credential + live health/breaker state.
 pub struct Endpoint {
-    /// The dialer-ready transport (unix / tcp+tls / vsock), RFC 0006 verbatim.
+    /// The dialer-ready transport (tcp+tls; plaintext only for loopback dev).
     pub(super) transport: Transport,
     pub(super) http_path: String,
     pub(super) host_header: String,
     /// The resolved bearer credential for THIS endpoint (never logged/serialized).
     pub(super) token: Option<String>,
     pub(super) provider: Provider,
-    /// Structural transport scheme for the §4.4 resource body (`unix`/`vsock`/
-    /// `https`) — never the URL/cid (RFC 0012 §3.7).
+    /// Structural transport scheme for the §4.4 resource body (`https`, or
+    /// `http` for the loopback dev carve-out) — never the URL (RFC 0012 §3.7).
     pub(super) scheme: &'static str,
-    /// Structural address for the §4.4 resource body (`3:8080`, `localhost`) —
-    /// the cid:port / host only, no secret, no scheme.
+    /// Structural address for the §4.4 resource body (`host[:port]`) — the host
+    /// only, no secret, no scheme, no path.
     pub(super) addr: String,
     /// Live health + circuit breaker (RFC 0018 §4).
     pub health: HealthRecord,
@@ -296,13 +297,11 @@ fn resolve_token(
 }
 
 /// The structural `(scheme, addr)` for the §4.4 resource body — the bounded
-/// transport identity only, never the URL or any secret (RFC 0012 §3.7).
+/// transport identity only, never the URL path or any secret (RFC 0012 §3.7).
+/// HTTPS-only (pivot Phase 1): `http` appears only for the loopback dev
+/// carve-out; [`resolve`](super::client) already rejected everything else.
 fn scheme_and_addr(uri: &str) -> (&'static str, String) {
-    if let Some(path) = uri.strip_prefix("unix:") {
-        ("unix", path.to_string())
-    } else if let Some(rest) = uri.strip_prefix("vsock:") {
-        ("vsock", rest.to_string())
-    } else if let Some(rest) = uri.strip_prefix("https://") {
+    if let Some(rest) = uri.strip_prefix("https://") {
         ("https", host_only(rest))
     } else if let Some(rest) = uri.strip_prefix("http://") {
         ("http", host_only(rest))
@@ -374,8 +373,8 @@ impl Endpoint {
 
     /// RFC 0018 §5.4 model-discovery probe: one hand-rolled HTTP **GET** to the
     /// `/v1/models` sibling of this endpoint's chat path, over the SAME transport
-    /// (unix / tcp+tls / vsock) + the SAME bearer auth the chat call uses — no new
-    /// client, no streaming. Returns the discovered model `id`s.
+    /// (tcp+tls) + the SAME bearer auth the chat call uses — no new client, no
+    /// streaming. Returns the discovered model `id`s.
     ///
     /// **Best-effort, silent-degrade (§5.4):** the `anthropic` dialect has no list
     /// endpoint → `vec![]`; for OpenAI-compatible, a connection/transport failure,
@@ -443,26 +442,28 @@ mod tests {
     fn comma_list_parses_to_n_endpoints_in_order() {
         let env = env_of(&[]);
         let list = EndpointList::parse_with_env(
-            "vsock:3:8080,vsock:3:8081,unix:/run/intel.sock",
+            "https://gw-a.example:8443,https://gw-b.example:8444,https://intel.example",
             None,
             &env,
         )
         .unwrap();
         assert_eq!(list.len(), 3);
-        assert_eq!(list.ep(0).scheme, "vsock");
-        assert_eq!(list.ep(0).addr, "3:8080");
-        assert_eq!(list.ep(1).addr, "3:8081");
-        assert_eq!(list.ep(2).scheme, "unix");
+        assert_eq!(list.ep(0).scheme, "https");
+        assert_eq!(list.ep(0).addr, "gw-a.example:8443");
+        assert_eq!(list.ep(1).addr, "gw-b.example:8444");
+        assert_eq!(list.ep(2).scheme, "https");
         assert_eq!(list.active(), 0);
     }
 
     #[test]
     fn whitespace_around_elements_is_trimmed() {
         let env = env_of(&[]);
-        let list = EndpointList::parse_with_env(" unix:/a , unix:/b ", None, &env).unwrap();
+        let list =
+            EndpointList::parse_with_env(" https://a.example , https://b.example ", None, &env)
+                .unwrap();
         assert_eq!(list.len(), 2);
-        assert_eq!(list.ep(0).addr, "/a");
-        assert_eq!(list.ep(1).addr, "/b");
+        assert_eq!(list.ep(0).addr, "a.example");
+        assert_eq!(list.ep(1).addr, "b.example");
     }
 
     #[test]
@@ -475,8 +476,13 @@ mod tests {
     #[test]
     fn bad_element_scheme_is_an_error() {
         let env = env_of(&[]);
-        let r = EndpointList::parse_with_env("unix:/a,ftp://nope", None, &env);
+        let r = EndpointList::parse_with_env("https://a.example,ftp://nope", None, &env);
         assert!(matches!(r, Err(IntelError::Unsupported(_))));
+        // The retired transports are rejected at the same chokepoint.
+        for uri in ["unix:/a", "vsock:3:8080", "http://not-loopback.example"] {
+            let r = EndpointList::parse_with_env(uri, None, &env);
+            assert!(matches!(r, Err(IntelError::Unsupported(_))), "{uri}");
+        }
     }
 
     #[test]
@@ -486,7 +492,7 @@ mod tests {
             ("AGENTD_INTELLIGENCE_TOKEN", "tok-a"),
             ("AGENTD_INTELLIGENCE_TOKEN_2", "tok-b"),
         ]);
-        let list = EndpointList::parse_with_env("unix:/a,unix:/b", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("tok-a"));
         assert_eq!(list.ep(1).token.as_deref(), Some("tok-b"));
     }
@@ -495,7 +501,7 @@ mod tests {
     fn endpoint_0_falls_back_to_default_token_when_env_unset() {
         let env = env_of(&[]);
         let list =
-            EndpointList::parse_with_env("unix:/a,unix:/b", Some("default".into()), &env).unwrap();
+            EndpointList::parse_with_env("https://a.example,https://b.example", Some("default".into()), &env).unwrap();
         // endpoint 0 inherits the resolved default; endpoint 1 has none.
         assert_eq!(list.ep(0).token.as_deref(), Some("default"));
         assert_eq!(list.ep(1).token, None);
@@ -504,7 +510,7 @@ mod tests {
     #[test]
     fn per_endpoint_env_override_wins_over_default() {
         let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "from-env")]);
-        let list = EndpointList::parse_with_env("unix:/a", Some("default".into()), &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example", Some("default".into()), &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("from-env"));
     }
 
@@ -516,7 +522,7 @@ mod tests {
             ("AGENT_INTELLIGENCE_TOKEN", "neutral-a"),
             ("AGENT_INTELLIGENCE_TOKEN_2", "neutral-b"),
         ]);
-        let list = EndpointList::parse_with_env("unix:/a,unix:/b", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("neutral-a"));
         assert_eq!(list.ep(1).token.as_deref(), Some("neutral-b"));
     }
@@ -529,12 +535,12 @@ mod tests {
             ("AGENT_INTELLIGENCE_TOKEN", "neutral"),
             ("AGENTD_INTELLIGENCE_TOKEN", "branded"),
         ]);
-        let list = EndpointList::parse_with_env("unix:/a", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example", None, &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("neutral"));
 
         // Branded-only still resolves (back-compat).
         let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "branded")]);
-        let list = EndpointList::parse_with_env("unix:/a", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example", None, &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("branded"));
     }
 
@@ -546,14 +552,14 @@ mod tests {
         let path = f.path().to_str().unwrap().to_string();
         let pairs = [("AGENTD_INTELLIGENCE_TOKEN_2_FILE", path.as_str())];
         let env = env_of(&pairs);
-        let list = EndpointList::parse_with_env("unix:/a,unix:/b", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
         assert_eq!(list.ep(1).token.as_deref(), Some("file-secret"));
     }
 
     #[test]
     fn single_element_list_is_rfc_0006() {
         let env = env_of(&[]);
-        let list = EndpointList::parse_with_env("unix:/run/intel.sock", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://intel.example", None, &env).unwrap();
         assert_eq!(list.len(), 1);
         // the failover machinery is inert: attempt order is just [0].
         assert_eq!(list.attempt_order(), vec![0]);
@@ -564,7 +570,7 @@ mod tests {
     fn attempt_order_skips_open_endpoint_and_snaps_back() {
         use super::super::health::ErrKind;
         let env = env_of(&[]);
-        let mut list = EndpointList::parse_with_env("unix:/a,unix:/b", None, &env).unwrap();
+        let mut list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
         let cfg = *list.breaker_config();
         // open endpoint 0's breaker (threshold 3)
         for _ in 0..3 {
@@ -585,8 +591,12 @@ mod tests {
     fn resource_body_has_health_and_no_url_or_token() {
         use super::super::health::ErrKind;
         let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "super-secret-tok")]);
-        let list =
-            EndpointList::parse_with_env("vsock:3:8080,unix:/run/intel.sock", None, &env).unwrap();
+        let list = EndpointList::parse_with_env(
+            "https://gw-a.example:8443,https://gw-b.example/v1/secret-path",
+            None,
+            &env,
+        )
+        .unwrap();
         // make endpoint 1 broken, endpoint 0 healthy + active
         list.ep(0).health.record_success(Duration::from_millis(41));
         let cfg = *list.breaker_config();
@@ -598,24 +608,24 @@ mod tests {
         // schema: active/all_down/model/endpoints[]
         assert_eq!(body["active"], 0);
         assert_eq!(body["model"], "claude-opus-4");
-        assert_eq!(body["endpoints"][0]["transport"], "vsock");
-        assert_eq!(body["endpoints"][0]["addr"], "3:8080");
+        assert_eq!(body["endpoints"][0]["transport"], "https");
+        assert_eq!(body["endpoints"][0]["addr"], "gw-a.example:8443");
         assert_eq!(body["endpoints"][0]["state"], "closed");
         assert_eq!(body["endpoints"][0]["active"], true);
         assert_eq!(body["endpoints"][0]["ewma_latency_ms"], 41);
         assert_eq!(body["endpoints"][1]["state"], "open");
         assert_eq!(body["endpoints"][1]["last_err"], "refused");
-        // RFC 0012 §3.7: NEVER the token, NEVER a full URL/scheme prefix
+        // RFC 0012 §3.7: NEVER the token, NEVER a full URL (scheme prefix or path)
         assert!(!text.contains("super-secret-tok"), "token leaked: {text}");
-        assert!(!text.contains("vsock:3:8080"), "full URI leaked: {text}");
-        assert!(!text.contains("unix:/run"), "full URI leaked: {text}");
+        assert!(!text.contains("https://"), "full URI leaked: {text}");
+        assert!(!text.contains("secret-path"), "URL path leaked: {text}");
     }
 
     #[test]
     fn all_down_when_every_breaker_open() {
         use super::super::health::ErrKind;
         let env = env_of(&[]);
-        let list = EndpointList::parse_with_env("unix:/a,unix:/b", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
         let cfg = *list.breaker_config();
         for ep in list.iter() {
             for _ in 0..3 {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Intelligence client — endpoint *list* selection + one round-trip. RFC 0006 + RFC 0018.
 //!
-//! The transport (unix / https / vsock) is chosen by each `AGENTD_INTELLIGENCE`
-//! list element; the wire is always HTTP/1.1 (the gateway/provider speaks
+//! The transport is **HTTPS** (target-vision pivot; plaintext `http://` is a
+//! loopback-only dev carve-out) — each `AGENTD_INTELLIGENCE` list element is an
+//! `https://` URL; the wire is HTTP/1.1 (the gateway/provider speaks
 //! OpenAI-compatible `/chat/completions`). One request opens one connection
 //! (`Connection: close`) — simple and robust; pooling is a non-goal (RFC 0018 §10).
 //!
@@ -143,11 +144,14 @@ impl Default for AllDownPolicy {
     }
 }
 
-/// Per-endpoint dial transport — RFC 0006 verbatim, now owned by [`super::endpoints`].
+/// Per-endpoint dial transport, owned by [`super::endpoints`]. Intelligence is
+/// **HTTPS-only** (target-vision pivot, Phase 1): one TCP shape, `tls: true` in
+/// production; `tls: false` exists solely for the loopback dev/test carve-out
+/// (the built-in mock LLM) and is rejected for non-loopback hosts at
+/// [`resolve`] — so the enum-of-transports (unix/vsock) is gone, not gated.
+#[derive(Debug)]
 pub enum Transport {
-    Unix(String),
     Tcp { host: String, port: u16, tls: bool },
-    Vsock { cid: u32, port: u32 },
 }
 
 impl IntelClient {
@@ -325,40 +329,33 @@ fn error_reason(e: &IntelError) -> &'static str {
 }
 
 /// Parse one intelligence URI element into (transport, http-path, host-header).
-/// Shared by [`super::endpoints`] (the list parser); unchanged from RFC 0006.
+/// Shared by [`super::endpoints`] (the list parser). HTTPS-only (target-vision
+/// pivot): `https://host[:port][/path]` is the transport; plaintext `http://`
+/// is admitted ONLY for a loopback host (the dev/test carve-out — the built-in
+/// mock LLM). Everything else — `unix:`, `vsock:`, non-loopback `http://` — is
+/// rejected here, the single chokepoint every construction path (CLI config,
+/// spawn payload, hot reload) flows through.
 pub(super) fn resolve(
     uri: &str,
     provider: Provider,
 ) -> Result<(Transport, String, String), IntelError> {
-    if let Some(path) = uri.strip_prefix("unix:") {
-        return Ok((
-            Transport::Unix(path.to_string()),
-            provider.default_path().into(),
-            "localhost".into(),
-        ));
+    let url = Url::parse(uri).map_err(|_| {
+        IntelError::Unsupported(format!(
+            "intelligence endpoint must be https://host[:port][/path] (got: {uri})"
+        ))
+    })?;
+    let tls = url.is_tls();
+    if !tls && !crate::net::http::is_loopback_host(&url.host) {
+        return Err(IntelError::Unsupported(format!(
+            "plaintext http:// intelligence is allowed for loopback only (dev); use https:// (got: {uri})"
+        )));
     }
-    if let Some(rest) = uri.strip_prefix("vsock:") {
-        let (cid, port) = rest
-            .split_once(':')
-            .and_then(|(c, p)| Some((c.parse().ok()?, p.parse().ok()?)))
-            .ok_or_else(|| {
-                IntelError::Unsupported(format!("bad vsock URI (want vsock:cid:port): {uri}"))
-            })?;
-        return Ok((
-            Transport::Vsock { cid, port },
-            provider.default_path().into(),
-            "localhost".into(),
-        ));
-    }
-    // http(s)
-    let url = Url::parse(uri).map_err(IntelError::Unsupported)?;
     let http_path = if url.path == "/" {
         provider.default_path().to_string()
     } else {
         url.path.clone()
     };
     let host_header = url.host_header();
-    let tls = url.is_tls();
     Ok((
         Transport::Tcp {
             host: url.host,
@@ -374,7 +371,6 @@ impl Transport {
     pub(super) fn connect(&self, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
         use crate::net::http;
         match self {
-            Transport::Unix(path) => Ok(Box::new(crate::net::unixsock::connect(path, timeout)?)),
             Transport::Tcp {
                 host,
                 port,
@@ -385,7 +381,6 @@ impl Transport {
                 port,
                 tls: true,
             } => connect_tls(host, *port, timeout),
-            Transport::Vsock { cid, port } => connect_vsock(*cid, *port, timeout),
         }
     }
 }
@@ -403,21 +398,7 @@ fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<Box<dyn Strea
 #[cfg(not(feature = "tls"))]
 fn connect_tls(_host: &str, _port: u16, _timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
     Err(IntelError::Unsupported(
-        "https:// intelligence requires building with --features tls (or use unix: to a sidecar that terminates TLS)".into(),
-    ))
-}
-
-#[cfg(feature = "vsock")]
-fn connect_vsock(cid: u32, port: u32, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
-    Ok(Box::new(
-        crate::net::vsock::connect(cid, port, timeout).map_err(IntelError::Transport)?,
-    ))
-}
-
-#[cfg(not(feature = "vsock"))]
-fn connect_vsock(_cid: u32, _port: u32, _timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
-    Err(IntelError::Unsupported(
-        "vsock:// intelligence requires building with --features vsock".into(),
+        "https:// intelligence requires building with --features tls".into(),
     ))
 }
 
@@ -426,11 +407,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_unix() {
-        let (t, path, host) = resolve("unix:/run/intel.sock", Provider::OpenAiCompatible).unwrap();
-        assert!(matches!(t, Transport::Unix(p) if p == "/run/intel.sock"));
-        assert_eq!(path, "/v1/chat/completions");
-        assert_eq!(host, "localhost");
+    fn resolve_rejects_non_https_transports() {
+        // HTTPS-only (pivot Phase 1): the old unix:/vsock: transports are gone —
+        // rejected at the single resolve() chokepoint, not feature-gated away.
+        for uri in ["unix:/run/intel.sock", "vsock:2:8080", "not-a-url"] {
+            let err = resolve(uri, Provider::OpenAiCompatible).unwrap_err();
+            assert!(
+                matches!(err, IntelError::Unsupported(_)),
+                "{uri} must be rejected, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_allows_plaintext_http_for_loopback_only() {
+        // The dev/test carve-out: the built-in mock LLM binds 127.0.0.1.
+        for uri in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            let (t, _p, _h) = resolve(uri, Provider::OpenAiCompatible).unwrap();
+            assert!(matches!(t, Transport::Tcp { tls: false, .. }), "{uri}");
+        }
+        let err = resolve("http://intel.example:8080", Provider::OpenAiCompatible).unwrap_err();
+        assert!(
+            matches!(err, IntelError::Unsupported(m) if m.contains("loopback")),
+            "non-loopback plaintext must be rejected"
+        );
     }
 
     #[test]
@@ -460,20 +464,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vsock() {
-        let (t, _p, _h) = resolve("vsock:2:8080", Provider::OpenAiCompatible).unwrap();
-        assert!(matches!(t, Transport::Vsock { cid: 2, port: 8080 }));
-    }
-
-    #[test]
     fn single_endpoint_client_builds() {
-        let c = IntelClient::from_parts("unix:/run/intel.sock", None).unwrap();
+        let c = IntelClient::from_parts("https://intel.example", None).unwrap();
         assert_eq!(c.endpoint_count(), 1);
     }
 
     #[test]
     fn comma_list_client_builds_with_all_endpoints() {
-        let c = IntelClient::from_parts("unix:/a,unix:/b,unix:/c", None).unwrap();
+        let c = IntelClient::from_parts(
+            "https://a.example,https://b.example,https://c.example",
+            None,
+        )
+        .unwrap();
         assert_eq!(c.endpoint_count(), 3);
     }
 
@@ -496,7 +498,7 @@ mod tests {
     fn trace_header_propagates_to_endpoint_dialect() {
         // Construction does not connect; we only assert the trace id is held and
         // would be applied per endpoint (the per-endpoint dial appends it).
-        let mut c = IntelClient::from_parts("unix:/run/intel.sock", None).unwrap();
+        let mut c = IntelClient::from_parts("https://intel.example", None).unwrap();
         assert!(c.trace_id.is_none());
         c.set_trace_id(Some("1234567890abcdef1234567890abcdef".into()));
         assert!(c.trace_id.is_some());

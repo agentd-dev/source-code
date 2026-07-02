@@ -122,6 +122,21 @@ impl Response {
     }
 }
 
+/// Whether `host` names the local loopback — the dev/test carve-out for
+/// plaintext `http://` (production transports are TLS-only). Accepts the IPv4
+/// loopback block (`127.0.0.0/8`), the IPv6 loopback (`::1`, bare or
+/// bracketed), and the literal name `localhost`. A resolvable-but-unresolved
+/// name is NOT loopback — this classifies the written form, without DNS.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Connect a plain TCP stream with connect + read/write timeouts. Intentionally
 /// unguarded — the only caller dials the operator-configured endpoint; the SSRF
 /// classifier (`net::ssrf`) is composed at any model/agent-supplied URL surface.

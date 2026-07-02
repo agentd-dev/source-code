@@ -914,7 +914,7 @@ mod tests {
             output_contract: None,
             context_seed: Vec::new(),
             intelligence: IntelConfig {
-                uri: "unix:/x".into(),
+                uri: "https://intel.example".into(),
                 token: None,
                 model: None,
             },

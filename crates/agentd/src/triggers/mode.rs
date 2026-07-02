@@ -2268,7 +2268,7 @@ mod tests {
         ];
         let env = vec![
             ("INSTRUCTION".to_string(), "x".to_string()),
-            ("AGENTD_INTELLIGENCE".to_string(), "unix:/x".to_string()),
+            ("AGENTD_INTELLIGENCE".to_string(), "https://intel.example".to_string()),
         ];
         // The candidate fails to load (the trifecta gate in validate() refuses it).
         let err = Config::reload(&args, &env).unwrap_err();
@@ -2293,7 +2293,7 @@ mod tests {
             output_contract: None,
             context_seed: Vec::new(),
             intelligence: IntelConfig {
-                uri: "unix:/x".into(),
+                uri: "https://intel.example".into(),
                 token: None,
                 model: None,
             },

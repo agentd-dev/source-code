@@ -802,10 +802,10 @@ mod tests {
         // adopted. The new endpoint list starts with FRESH health (every endpoint
         // CLOSED — `from_parts` builds a new HealthRecord, no stale breaker).
         let pending: PendingSwap = Arc::new(Mutex::new(None));
-        let mut intel = IntelClient::from_parts("unix:/old.sock", None).unwrap();
+        let mut intel = IntelClient::from_parts("https://old.example", None).unwrap();
         let mut model = "old-model".to_string();
         *pending.lock().unwrap() = Some(swap_to(
-            "unix:/a.sock,unix:/b.sock",
+            "https://a.example,https://b.example",
             Some("new-model"),
             SwapPolicy::FinishOnOld,
         ));
@@ -826,7 +826,7 @@ mod tests {
     fn apply_pending_swap_is_a_noop_when_nothing_pending() {
         // The no-swap path: the model + endpoint count are byte-for-byte unchanged.
         let pending: PendingSwap = Arc::new(Mutex::new(None));
-        let mut intel = IntelClient::from_parts("unix:/only.sock", None).unwrap();
+        let mut intel = IntelClient::from_parts("https://only.example", None).unwrap();
         let mut model = "m".to_string();
         apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());
         assert_eq!(model, "m");
@@ -839,14 +839,14 @@ mod tests {
         // No swap pending → never a restart.
         assert!(!restart_turn_pending(&pending, "m"));
         // A finish-on-old swap (even a model change) → never a restart.
-        *pending.lock().unwrap() = Some(swap_to("unix:/a", Some("big"), SwapPolicy::FinishOnOld));
+        *pending.lock().unwrap() = Some(swap_to("https://a.example", Some("big"), SwapPolicy::FinishOnOld));
         assert!(!restart_turn_pending(&pending, "small"));
         // A restart-turn swap that does NOT change the model (endpoint repoint) →
         // never a restart (a repoint is always finish-on-old / invisible, §5.1).
-        *pending.lock().unwrap() = Some(swap_to("unix:/a", Some("small"), SwapPolicy::RestartTurn));
+        *pending.lock().unwrap() = Some(swap_to("https://a.example", Some("small"), SwapPolicy::RestartTurn));
         assert!(!restart_turn_pending(&pending, "small"));
         // A restart-turn swap that DOES change the model → a restart.
-        *pending.lock().unwrap() = Some(swap_to("unix:/a", Some("big"), SwapPolicy::RestartTurn));
+        *pending.lock().unwrap() = Some(swap_to("https://a.example", Some("big"), SwapPolicy::RestartTurn));
         assert!(restart_turn_pending(&pending, "small"));
     }
 
@@ -856,7 +856,7 @@ mod tests {
         // only the variant LABEL — never `{other:?}`, which would Debug-print a
         // plaintext token / injected instruction to stderr ("token NEVER logged").
         let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
-            uri: "unix:/secret.sock".into(),
+            uri: "https://secret-host.example/secret-path".into(),
             token: Some("super-secret-token".into()),
             model: Some("m".into()),
             policy: SwapPolicy::FinishOnOld,
@@ -872,7 +872,7 @@ mod tests {
         );
         assert_eq!(err, "first frame was not Spawn (got swap_intel)");
         assert!(!err.contains("super-secret-token"), "token leaked: {err}");
-        assert!(!err.contains("unix:/secret.sock"), "uri leaked: {err}");
+        assert!(!err.contains("secret-host.example"), "uri leaked: {err}");
         // The label helper covers every variant tag, payload-free.
         assert_eq!(
             control_msg_label(&ControlMsg::Inject {
@@ -888,7 +888,7 @@ mod tests {
         // RFC 0018 §5.2: an unparseable new list never tears a working run — the
         // old client is kept; only the model (a plain string) is still adopted.
         let pending: PendingSwap = Arc::new(Mutex::new(None));
-        let mut intel = IntelClient::from_parts("unix:/old.sock,unix:/old2.sock", None).unwrap();
+        let mut intel = IntelClient::from_parts("https://old.example,https://old2.example", None).unwrap();
         let mut model = "old".to_string();
         *pending.lock().unwrap() = Some(swap_to("", Some("new"), SwapPolicy::FinishOnOld));
         apply_pending_swap(&pending, &mut intel, &mut model, &test_up(), &test_log());

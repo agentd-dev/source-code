@@ -357,9 +357,9 @@ the pod is not "ready", so an orchestrator won't route work to it.
      periodSeconds: 5
    ```
 
-3. **Unix-socket health line (opt-in, roadmap).** When `--serve-mcp unix:…` is
-   already on, expose a trivial `health` / `ready` line on a sibling unix
-   socket — reuses existing socket machinery, no new TCP surface.
+3. **Served-MCP readiness (when `--serve-mcp` is on).** A Management peer reads
+   `agent://status` / `agent://inventory` over the HTTP(S) management transport to
+   learn liveness + readiness — no separate health socket.
 
 4. **HTTP `/healthz` + `/readyz` (opt-in, `--features metrics`).** When an orchestrator
    wants real HTTP probes, served on `--metrics-addr` by the same hand-rolled blocking HTTP code on

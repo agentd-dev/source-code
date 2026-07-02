@@ -842,7 +842,10 @@ impl fmt::Debug for Config {
             .field("serve_cert", &self.serve_cert)
             .field("serve_key", &self.serve_key)
             .field("serve_client_ca", &self.serve_client_ca)
-            .field("serve_bearer", &self.serve_bearer.as_ref().map(|_| "<redacted>"))
+            .field(
+                "serve_bearer",
+                &self.serve_bearer.as_ref().map(|_| "<redacted>"),
+            )
             .field("health_file", &self.health_file)
             .field("traceparent", &self.traceparent)
             .field("log_content", &self.log_content)
@@ -1749,7 +1752,8 @@ impl Config {
             || self.serve_bearer.is_some()
         {
             return Err(usage(
-                "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer require --serve-mcp".into(),
+                "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer require --serve-mcp"
+                    .into(),
             ));
         }
         // Sharding (`--shard K/N`, RFC 0019 §4) needs the `cluster` build feature.
@@ -2679,7 +2683,16 @@ mod tests {
         assert!(matches!(e, ConfigError::Usage(_)));
         // And --workflow still refuses the modes it means nothing in.
         let e = Config::load(
-            &args(&["--mode", "loop", "--interval", "5m", "--workflow", "/tmp/wf.json", "--instruction", "x"]),
+            &args(&[
+                "--mode",
+                "loop",
+                "--interval",
+                "5m",
+                "--workflow",
+                "/tmp/wf.json",
+                "--instruction",
+                "x",
+            ]),
             &base_env(),
         )
         .unwrap_err();
@@ -2691,18 +2704,34 @@ mod tests {
     fn a_reactive_workflow_rejects_cluster_partitioning_combos() {
         // --shard would silently filter the workflow's own wait updates.
         let e = Config::load(
-            &args(&["--mode", "reactive", "--workflow", "/tmp/wf.json", "--shard", "1/4"]),
+            &args(&[
+                "--mode",
+                "reactive",
+                "--workflow",
+                "/tmp/wf.json",
+                "--shard",
+                "1/4",
+            ]),
             &base_env(),
         )
         .unwrap_err();
         assert!(format!("{e}").contains("--shard cannot be combined"), "{e}");
         // standby/assignment is a different daemon identity.
         let e = Config::load(
-            &args(&["--mode", "reactive", "--workflow", "/tmp/wf.json", "--standby"]),
+            &args(&[
+                "--mode",
+                "reactive",
+                "--workflow",
+                "/tmp/wf.json",
+                "--standby",
+            ]),
             &base_env(),
         )
         .unwrap_err();
-        assert!(format!("{e}").contains("--standby / --assign-from cannot"), "{e}");
+        assert!(
+            format!("{e}").contains("--standby / --assign-from cannot"),
+            "{e}"
+        );
     }
 
     #[cfg(feature = "workflow")]
@@ -2716,8 +2745,12 @@ mod tests {
         )];
         let e = Config::load(
             &args(&[
-                "--mode", "reactive", "--workflow", "/tmp/wf.json",
-                "--subscribe", "file:///inbox",
+                "--mode",
+                "reactive",
+                "--workflow",
+                "/tmp/wf.json",
+                "--subscribe",
+                "file:///inbox",
             ]),
             &intel_only,
         )
@@ -2733,8 +2766,14 @@ mod tests {
         // With an instruction the combo is fine.
         let c = Config::load(
             &args(&[
-                "--mode", "reactive", "--workflow", "/tmp/wf.json",
-                "--subscribe", "file:///inbox", "--instruction", "triage it",
+                "--mode",
+                "reactive",
+                "--workflow",
+                "/tmp/wf.json",
+                "--subscribe",
+                "file:///inbox",
+                "--instruction",
+                "triage it",
             ]),
             &base_env(),
         )
@@ -2775,7 +2814,10 @@ mod tests {
         // the branded `AGENTD_*` one is — fed through the single envmap normalization.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENT_INTELLIGENCE".into(), "https://neutral.example".into()),
+            (
+                "AGENT_INTELLIGENCE".into(),
+                "https://neutral.example".into(),
+            ),
             ("AGENT_RUN_ID".into(), "run-neutral".into()),
             ("AGENT_MAX_STEPS".into(), "42".into()),
         ];
@@ -2791,8 +2833,14 @@ mod tests {
         // and the branded-only path still works (neutral merely also accepted).
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://branded.example".into()),
-            ("AGENT_INTELLIGENCE".into(), "https://neutral.example".into()),
+            (
+                "AGENTD_INTELLIGENCE".into(),
+                "https://branded.example".into(),
+            ),
+            (
+                "AGENT_INTELLIGENCE".into(),
+                "https://neutral.example".into(),
+            ),
         ];
         let c = Config::load(&args(&[]), &env).unwrap();
         assert_eq!(c.intelligence.as_deref(), Some("https://branded.example"));
@@ -2880,7 +2928,12 @@ mod tests {
     fn mcp_tags_attach_to_their_server_order_independent() {
         // --mcp-tags before its --mcp still resolves.
         let c = Config::load(
-            &args(&["--mcp-tags", "fs=sensitive,egress", "--mcp", "fs=https://fs.example"]),
+            &args(&[
+                "--mcp-tags",
+                "fs=sensitive,egress",
+                "--mcp",
+                "fs=https://fs.example",
+            ]),
             &base_env(),
         )
         .unwrap();
@@ -2893,7 +2946,12 @@ mod tests {
     #[test]
     fn mcp_tags_unknown_server_or_tag_is_usage_error() {
         let bad_server = Config::load(
-            &args(&["--mcp", "fs=https://fs.example", "--mcp-tags", "ghost=egress"]),
+            &args(&[
+                "--mcp",
+                "fs=https://fs.example",
+                "--mcp-tags",
+                "ghost=egress",
+            ]),
             &base_env(),
         )
         .unwrap_err();
@@ -3272,7 +3330,10 @@ mod tests {
         let mcp_env = || {
             vec![
                 ("INSTRUCTION".to_string(), "x".to_string()),
-                ("AGENTD_INTELLIGENCE".to_string(), "https://intel.example".to_string()),
+                (
+                    "AGENTD_INTELLIGENCE".to_string(),
+                    "https://intel.example".to_string(),
+                ),
             ]
         };
         let reactive = |extra: &[&str]| -> Vec<String> {
@@ -3502,7 +3563,10 @@ mod tests {
     #[test]
     fn capabilities_reflects_present_config() {
         // With config present, the manifest reflects it (no validation needed).
-        let c = Config::load(&args(&["--capabilities", "--mcp", "fs=https://fs.example"]), &base_env());
+        let c = Config::load(
+            &args(&["--capabilities", "--mcp", "fs=https://fs.example"]),
+            &base_env(),
+        );
         let json = match c.unwrap_err() {
             ConfigError::Capabilities(s) => s,
             other => panic!("expected Capabilities, got {other:?}"),
@@ -3570,7 +3634,10 @@ mod tests {
             "vsock:3:5000",
             "http://mcp.example:8080/mcp",
         ] {
-            assert!(mcp_endpoint_scheme_ok(bad).is_err(), "{bad} must be rejected");
+            assert!(
+                mcp_endpoint_scheme_ok(bad).is_err(),
+                "{bad} must be rejected"
+            );
         }
     }
 
@@ -3636,7 +3703,10 @@ mod tests {
         // A bad scheme on ANY element rejects the whole list (RFC 0018 §3.1).
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(
-            &args(&["--intelligence", "https://a.example,ftp://nope,https://c.example"]),
+            &args(&[
+                "--intelligence",
+                "https://a.example,ftp://nope,https://c.example",
+            ]),
             &env,
         )
         .unwrap_err();
@@ -3709,7 +3779,12 @@ mod tests {
     #[test]
     fn serve_target_retired_socket_schemes_are_rejected() {
         // The unix:/vsock: serve targets are gone (pivot Phase 3) — exit 2.
-        for bad in ["unix:/run/agentd.sock", "vsock:5005", "vsock:2:5005", "tcp:1234"] {
+        for bad in [
+            "unix:/run/agentd.sock",
+            "vsock:5005",
+            "vsock:2:5005",
+            "tcp:1234",
+        ] {
             assert!(
                 matches!(ServeTarget::parse(bad), Err(ConfigError::Usage(_))),
                 "{bad} must be a usage error"
@@ -3720,8 +3795,11 @@ mod tests {
     #[test]
     fn serve_mcp_validation_runs_at_load() {
         // a loopback http serve target parses through full load().
-        let c =
-            Config::load(&args(&["--serve-mcp", "http://127.0.0.1:9000"]), &base_env()).unwrap();
+        let c = Config::load(
+            &args(&["--serve-mcp", "http://127.0.0.1:9000"]),
+            &base_env(),
+        )
+        .unwrap();
         assert_eq!(c.serve_mcp.as_deref(), Some("http://127.0.0.1:9000"));
         // a retired/foreign scheme is rejected at load (exit 2) before any side effect.
         let e = Config::load(&args(&["--serve-mcp", "tcp:9000"]), &base_env()).unwrap_err();
@@ -3837,7 +3915,11 @@ mod tests {
         )
         .unwrap();
         unsafe { std::env::remove_var("A2A_PEER_AUTH_TEST_TOKEN") };
-        assert_eq!(c.a2a_peers[0].headers.len(), 1, "template stored, not resolved");
+        assert_eq!(
+            c.a2a_peers[0].headers.len(),
+            1,
+            "template stored, not resolved"
+        );
         assert!(
             c.a2a_peers[0].headers[0].1.contains("{{secret:"),
             "the SPEC keeps the template, never the material"
@@ -4637,11 +4719,8 @@ mod tests {
             "AGENTD_INTELLIGENCE".into(),
             "https://user:embedded-cred@api.example/v1".into(),
         ));
-        let mut cfg = Config::load(
-            &args(&["--mcp", "vault=https://vault.example/mcp"]),
-            &env,
-        )
-        .unwrap();
+        let mut cfg =
+            Config::load(&args(&["--mcp", "vault=https://vault.example/mcp"]), &env).unwrap();
         cfg.intelligence_headers
             .insert("x-api-key".into(), "{{secret:SOME_NAME}}".into());
         let view = cfg.effective_view();

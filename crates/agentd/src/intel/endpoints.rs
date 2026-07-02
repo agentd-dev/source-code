@@ -492,7 +492,8 @@ mod tests {
             ("AGENTD_INTELLIGENCE_TOKEN", "tok-a"),
             ("AGENTD_INTELLIGENCE_TOKEN_2", "tok-b"),
         ]);
-        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env)
+            .unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("tok-a"));
         assert_eq!(list.ep(1).token.as_deref(), Some("tok-b"));
     }
@@ -500,8 +501,12 @@ mod tests {
     #[test]
     fn endpoint_0_falls_back_to_default_token_when_env_unset() {
         let env = env_of(&[]);
-        let list =
-            EndpointList::parse_with_env("https://a.example,https://b.example", Some("default".into()), &env).unwrap();
+        let list = EndpointList::parse_with_env(
+            "https://a.example,https://b.example",
+            Some("default".into()),
+            &env,
+        )
+        .unwrap();
         // endpoint 0 inherits the resolved default; endpoint 1 has none.
         assert_eq!(list.ep(0).token.as_deref(), Some("default"));
         assert_eq!(list.ep(1).token, None);
@@ -510,7 +515,8 @@ mod tests {
     #[test]
     fn per_endpoint_env_override_wins_over_default() {
         let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "from-env")]);
-        let list = EndpointList::parse_with_env("https://a.example", Some("default".into()), &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example", Some("default".into()), &env)
+            .unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("from-env"));
     }
 
@@ -522,7 +528,8 @@ mod tests {
             ("AGENT_INTELLIGENCE_TOKEN", "neutral-a"),
             ("AGENT_INTELLIGENCE_TOKEN_2", "neutral-b"),
         ]);
-        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env)
+            .unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("neutral-a"));
         assert_eq!(list.ep(1).token.as_deref(), Some("neutral-b"));
     }
@@ -552,7 +559,8 @@ mod tests {
         let path = f.path().to_str().unwrap().to_string();
         let pairs = [("AGENTD_INTELLIGENCE_TOKEN_2_FILE", path.as_str())];
         let env = env_of(&pairs);
-        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env)
+            .unwrap();
         assert_eq!(list.ep(1).token.as_deref(), Some("file-secret"));
     }
 
@@ -570,7 +578,9 @@ mod tests {
     fn attempt_order_skips_open_endpoint_and_snaps_back() {
         use super::super::health::ErrKind;
         let env = env_of(&[]);
-        let mut list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
+        let mut list =
+            EndpointList::parse_with_env("https://a.example,https://b.example", None, &env)
+                .unwrap();
         let cfg = *list.breaker_config();
         // open endpoint 0's breaker (threshold 3)
         for _ in 0..3 {
@@ -625,7 +635,8 @@ mod tests {
     fn all_down_when_every_breaker_open() {
         use super::super::health::ErrKind;
         let env = env_of(&[]);
-        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env).unwrap();
+        let list = EndpointList::parse_with_env("https://a.example,https://b.example", None, &env)
+            .unwrap();
         let cfg = *list.breaker_config();
         for ep in list.iter() {
             for _ in 0..3 {

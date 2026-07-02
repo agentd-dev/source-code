@@ -228,7 +228,11 @@ impl Harness {
     /// through the `addr_file`), backed by the shared lease `state` file and
     /// serving item `uri`. Blocks until announced; the guard kills it on drop.
     pub fn spawn_workmcp(&self, addr_file: &Path, state: &Path, uri: &str) -> ConfServer {
-        ConfServer::spawn_http(&self.workmcp, &[addr_file, state, Path::new(uri)], addr_file)
+        ConfServer::spawn_http(
+            &self.workmcp,
+            &[addr_file, state, Path::new(uri)],
+            addr_file,
+        )
     }
 
     pub fn tempdir(&self) -> TempDir {
@@ -267,7 +271,6 @@ impl Harness {
             _tmp: tmp,
         }
     }
-
 
     /// Spawn agentd as a long-lived daemon with `args`; returns a guard that
     /// SIGTERMs it on drop (or via [`Daemon::sigterm`] / [`Daemon::wait`]).
@@ -341,7 +344,6 @@ pub struct ConfServer {
 }
 
 impl ConfServer {
-
     fn spawn_http(bin: &Path, args: &[&Path], addr_file: &Path) -> ConfServer {
         let _ = std::fs::remove_file(addr_file);
         let child = Self::launch(bin, args, addr_file);

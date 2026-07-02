@@ -227,7 +227,12 @@ fn serve_conn<S: Read + Write + Send + 'static>(
             remove_and_disconnect(subs, conn, origin, handler);
         }
         Err(_) => {
-            let _ = write_simple(reader.get_mut(), 400, "Bad Request", b"invalid JSON-RPC frame");
+            let _ = write_simple(
+                reader.get_mut(),
+                400,
+                "Bad Request",
+                b"invalid JSON-RPC frame",
+            );
             remove_and_disconnect(subs, conn, origin, handler);
         }
     }
@@ -247,7 +252,11 @@ fn serve_stream<S: Read + Write + Send + 'static>(
 ) {
     let mut stream = reader.into_inner();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-    if stream.write_all(head.as_bytes()).and_then(|_| stream.flush()).is_err() {
+    if stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
         return;
     }
     let writer: SharedWriter = Arc::new(Mutex::new(ServeStream::Http(Box::new(stream))));
@@ -266,7 +275,11 @@ fn serve_stream<S: Read + Write + Send + 'static>(
                 }
                 let alive = writer
                     .lock()
-                    .map(|mut w| w.write_all(b": keep-alive\n\n").and_then(|_| w.flush()).is_ok())
+                    .map(|mut w| {
+                        w.write_all(b": keep-alive\n\n")
+                            .and_then(|_| w.flush())
+                            .is_ok()
+                    })
                     .unwrap_or(false);
                 if !alive {
                     break;
@@ -329,7 +342,11 @@ fn serve_listen<S: Read + Write + Send + 'static>(
     let mut stream = reader.into_inner();
     // SSE response head.
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
-    if stream.write_all(head.as_bytes()).and_then(|_| stream.flush()).is_err() {
+    if stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
         remove_and_disconnect(subs, conn, origin, handler);
         return;
     }
@@ -339,11 +356,7 @@ fn serve_listen<S: Read + Write + Send + 'static>(
     // per uri), so this reuses the embedder's subscribability rules verbatim.
     let writer: SharedWriter = Arc::new(Mutex::new(ServeStream::Http(Box::new(stream))));
     for uri in &uris {
-        let sub_req = Request::new(
-            0,
-            method::RESOURCES_SUBSCRIBE,
-            Some(json!({ "uri": uri })),
-        );
+        let sub_req = Request::new(0, method::RESOURCES_SUBSCRIBE, Some(json!({ "uri": uri })));
         let _ = handler.dispatch(sub_req, origin, &writer, conn);
     }
 
@@ -352,7 +365,11 @@ fn serve_listen<S: Read + Write + Send + 'static>(
         thread::sleep(SSE_KEEPALIVE);
         let alive = writer
             .lock()
-            .map(|mut w| w.write_all(b": keep-alive\n\n").and_then(|_| w.flush()).is_ok())
+            .map(|mut w| {
+                w.write_all(b": keep-alive\n\n")
+                    .and_then(|_| w.flush())
+                    .is_ok()
+            })
             .unwrap_or(false);
         if !alive {
             break;
@@ -485,7 +502,11 @@ mod tests {
             match req.method.as_str() {
                 "tools/call" => Response::ok(req.id, json!({"ok": true})),
                 "resources/subscribe" => {
-                    let uri = req.params.as_ref().and_then(|p| p["uri"].as_str()).unwrap_or("");
+                    let uri = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p["uri"].as_str())
+                        .unwrap_or("");
                     // The gate: only `res://ok` is subscribable here.
                     if uri == "res://ok" {
                         register_subscriber(&self.subs, uri, conn, writer);

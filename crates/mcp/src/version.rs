@@ -195,7 +195,10 @@ mod tests {
         for v in SUPPORTED_PROTOCOL_VERSIONS {
             assert_eq!(negotiate_version(v).as_deref(), Some(*v));
         }
-        assert_eq!(negotiate_version("2099-01-01").as_deref(), Some("2099-01-01"));
+        assert_eq!(
+            negotiate_version("2099-01-01").as_deref(),
+            Some("2099-01-01")
+        );
         assert_eq!(negotiate_version("2020-01-01"), None);
         assert_eq!(negotiate_version("1.0.0"), None);
     }
@@ -204,10 +207,16 @@ mod tests {
     fn modern_best_mutual_picks_our_newest_common() {
         // Server supports two versions; we pick our newest that overlaps.
         let supported = vec!["2025-11-25".to_string(), "2026-07-28".to_string()];
-        assert_eq!(best_mutual_version(&supported).as_deref(), Some("2026-07-28"));
+        assert_eq!(
+            best_mutual_version(&supported).as_deref(),
+            Some("2026-07-28")
+        );
         // Only an older overlap.
         let supported = vec!["2025-06-18".to_string()];
-        assert_eq!(best_mutual_version(&supported).as_deref(), Some("2025-06-18"));
+        assert_eq!(
+            best_mutual_version(&supported).as_deref(),
+            Some("2025-06-18")
+        );
         // No overlap at all.
         let supported = vec!["1900-01-01".to_string()];
         assert_eq!(best_mutual_version(&supported), None);

@@ -41,22 +41,23 @@ jobs:
       fail-fast: false
       matrix:
         features:
-          - "" # default (the 3-dep minimalism build)
-          - "--features serve-mcp"
+          - "" # default (tls only — the 3-external-dep minimalism build)
+          - "--features serve-https" # the served surface (serve-mcp is its internal base; post-pivot the HTTP(S) listener is the ONLY transport)
           - "--features cron"
           - "--features metrics"
           - "--features otel"
-          - "--features tls"
-          - "--features vsock"
+          - "--features oauth"
           - "--features a2a"
           - "--features events"
           - "--features cluster"
           - "--features hot-reload"
           - "--features config-watch"
-          - "--features serve-mcp,hot-reload" # the combo that latently broke once
+          - "--features workflow"
+          - "--features cel"
+          - "--features serve-https,hot-reload" # the combo that latently broke once
           - "--features cluster,metrics" # the scaling-signal cross combo
           - "--release --features internal-mocks" # debug auto-enables it; --release exercises the opt-in path
-          - "--features metrics,serve-mcp,cron,otel" # the image's cloud-native set
+          - "--features serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow" # the release-artifact set
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +85,10 @@ jobs:
           # `--prefix none` lists one package per line with no tree glyphs, so the
           # count is charset-independent (cargo tree emits ASCII art off a TTY, so
           # a `├`/`└` grep counts 0 in CI). First line is the agent root; drop it.
-          deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -c .)
+          # Workspace path crates (net, mcp — they print with a `(/…)` path suffix)
+# are OUR OWN code, not third-party surface; only EXTERNAL crates count
+# against the moat.
+deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/' | grep -c .)
           echo "direct deps: $deps"
           if [ "$deps" -ne 3 ]; then
             echo "::error::default build must have exactly 3 direct deps (serde, serde_json, libc); found $deps"

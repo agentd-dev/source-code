@@ -252,7 +252,12 @@ pub trait GraphExec {
     /// caps (it crosses a process boundary). Default impl: `(Null, true)` — a build
     /// without that wiring degrades SAFELY to the Subgraph's `error` edge rather than
     /// silently skipping it.
-    fn run_subgraph(&mut self, _graph: &Graph, _async_: bool, _blackboard: &Blackboard) -> (Value, bool) {
+    fn run_subgraph(
+        &mut self,
+        _graph: &Graph,
+        _async_: bool,
+        _blackboard: &Blackboard,
+    ) -> (Value, bool) {
         (Value::Null, true)
     }
 
@@ -394,7 +399,9 @@ fn clamp_value(val: Value, is_err: bool) -> (Value, bool) {
     if approx_small {
         return (val, is_err);
     }
-    let bytes = serde_json::to_string(&val).map(|s| s.len()).unwrap_or(usize::MAX);
+    let bytes = serde_json::to_string(&val)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
     if bytes <= MAX_VALUE_BYTES {
         return (val, is_err);
     }
@@ -410,11 +417,7 @@ fn clamp_value(val: Value, is_err: bool) -> (Value, bool) {
 
 /// The label an effectful node emits given whether it errored.
 fn edge_for(is_error: bool) -> &'static str {
-    if is_error {
-        "error"
-    } else {
-        "ok"
-    }
+    if is_error { "error" } else { "ok" }
 }
 
 /// Run one effectful attempt, honouring an in-node [`Retry`] policy: on an error
@@ -498,7 +501,7 @@ pub fn resume(
             format!("resume at {:?}, which is not a Wait node", state.at),
             Value::Null,
             state.steps(),
-                state.tokens(),
+            state.tokens(),
         ));
     };
     let label = match outcome {
@@ -512,8 +515,10 @@ pub fn resume(
     match edges.get(label) {
         Some(next) => state.at = next.clone(),
         None => {
-            let reason =
-                format!("Wait node {:?} has no {label:?} edge for its outcome", state.at);
+            let reason = format!(
+                "Wait node {:?} has no {label:?} edge for its outcome",
+                state.at
+            );
             let result = bb_result(&state.blackboard, None);
             return DriveResult::Done(GraphOutcome::engine(
                 GraphStatus::Crashed,
@@ -591,7 +596,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                     reason,
                     result,
                     state.steps(),
-                state.tokens(),
+                    state.tokens(),
                 ));
             }
             let h = bb_hash(&state.blackboard);
@@ -606,7 +611,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                     reason,
                     result,
                     state.steps(),
-                state.tokens(),
+                    state.tokens(),
                 ));
             }
             state.entry_hash.insert(state.at.clone(), h);
@@ -615,14 +620,24 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
         // Effectful nodes produce `(label, edges)` and fall through to edge-follow;
         // Halt/Wait return; Branch transitions directly; Subgraph fails closed (P5).
         let (label, edges) = match node {
-            Node::Halt { status, result_from } => {
+            Node::Halt {
+                status,
+                result_from,
+            } => {
                 let result = bb_result(&state.blackboard, result_from.as_deref());
-                return DriveResult::Done(GraphOutcome::halt(*status, result, state.steps(), state.tokens()));
+                return DriveResult::Done(GraphOutcome::halt(
+                    *status,
+                    result,
+                    state.steps(),
+                    state.tokens(),
+                ));
             }
             // A Wait SUSPENDS: hand the daemon the watch (uri + timeout) and the state
             // to resume with. The current node stays `state.at` so `resume` knows which
             // Wait resolved.
-            Node::Wait { on_uri, timeout_ms, .. } => {
+            Node::Wait {
+                on_uri, timeout_ms, ..
+            } => {
                 return DriveResult::Suspended(Suspension {
                     on_uri: on_uri.clone(),
                     timeout_ms: *timeout_ms,
@@ -632,7 +647,11 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // Branch: the first deterministic case whose predicate holds wins (Tier 1,
             // free); else a Tier-2 semantic judgement; else `default`. It writes nothing
             // and emits no ok/error label — it transitions directly.
-            Node::Branch { cases, default, semantic } => {
+            Node::Branch {
+                cases,
+                default,
+                semantic,
+            } => {
                 state.at = if let Some(c) = cases.iter().find(|c| c.when.eval(&state.blackboard)) {
                     c.goto.clone()
                 } else if let Some(spec) = semantic {
@@ -659,7 +678,9 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 edges,
                 ..
             } => {
-                let GraphState { blackboard, budget, .. } = state;
+                let GraphState {
+                    blackboard, budget, ..
+                } = state;
                 let attempt = with_retry(retry.as_ref(), budget, || {
                     exec.run_agent(instruction, output_contract.as_deref(), blackboard, reads)
                 });
@@ -670,7 +691,14 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
-            Node::Tool { server, tool, args, writes, retry, edges } => {
+            Node::Tool {
+                server,
+                tool,
+                args,
+                writes,
+                retry,
+                edges,
+            } => {
                 // Resolve `$from` references against the CURRENT blackboard once;
                 // retries re-call with the same resolved args (nothing can change
                 // the board between in-node attempts). An unresolvable reference
@@ -693,7 +721,12 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             }
             // Pure data shaping: resolve the value template against the blackboard.
             // No model, no tool — deterministic and cheap.
-            Node::Assign { value, expr, writes, edges } => {
+            Node::Assign {
+                value,
+                expr,
+                writes,
+                edges,
+            } => {
                 let computed = match expr {
                     // Computed path (feature `cel`): the blackboard's keys are the
                     // expression's identifiers — filter/map/aggregate/assemble
@@ -711,8 +744,19 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // One structured intelligence ask, schema-checked, with bounded
             // validation-feedback re-asks INSIDE the attempt (≤ MAX_INFER_RETRIES,
             // cheap) and the generic in-node retry policy around it.
-            Node::Infer { prompt, reads, schema, check, writes, retries, retry, edges } => {
-                let GraphState { blackboard, budget, .. } = state;
+            Node::Infer {
+                prompt,
+                reads,
+                schema,
+                check,
+                writes,
+                retries,
+                retry,
+                edges,
+            } => {
+                let GraphState {
+                    blackboard, budget, ..
+                } = state;
                 let attempt = with_retry(retry.as_ref(), budget, || {
                     let mut feedback: Option<String> = None;
                     for _ in 0..=*retries {
@@ -747,7 +791,14 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // positionally. Every ITEM charges a budget step; the wall deadline is
             // honoured between items; body model usage lands on the shared token
             // pool. A tool/assign-only body costs zero model tokens per item.
-            Node::Foreach { items, body, parallel, on_error, writes, edges } => {
+            Node::Foreach {
+                items,
+                body,
+                parallel,
+                on_error,
+                writes,
+                edges,
+            } => {
                 let (val, is_err) = match super::resolve_refs(items, &state.blackboard) {
                     Err(e) => (Value::String(format!("foreach items: {e}")), true),
                     Ok(Value::Array(arr)) if arr.len() > super::MAX_FOREACH_ITEMS => (
@@ -779,7 +830,12 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // Subgraph: inline (sync) through the exec seam — or `async: true`,
             // SPAWNED as a supervised child workflow whose handle is written for
             // a later Join (the fan-out half of the spawn/join pair).
-            Node::Subgraph { graph: sub, async_, writes, edges } => {
+            Node::Subgraph {
+                graph: sub,
+                async_,
+                writes,
+                edges,
+            } => {
                 let (val, is_err) = if *async_ {
                     match exec.spawn_subgraph(sub) {
                         Ok(handle) => (serde_json::json!({ "handle": handle }), false),
@@ -795,7 +851,12 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // Join: fan IN — await async-subgraph handles, collecting results
             // positionally; stragglers at the timeout take the `timeout` edge
             // (they keep running and may be joined again).
-            Node::Join { handles, timeout_ms, writes, edges } => {
+            Node::Join {
+                handles,
+                timeout_ms,
+                writes,
+                edges,
+            } => {
                 let started = std::time::Instant::now();
                 let (val, label) = match super::resolve_refs(handles, &state.blackboard)
                     .map_err(|e| format!("join handles: {e}"))
@@ -865,15 +926,14 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             Some(next) => state.at = next.clone(),
             // Unhandled label → the implicit Halt(Crashed) safety sink.
             None => {
-                let reason =
-                    format!("node {:?} emitted unhandled label {label:?}", state.at);
+                let reason = format!("node {:?} emitted unhandled label {label:?}", state.at);
                 let result = bb_result(&state.blackboard, None);
                 return DriveResult::Done(GraphOutcome::engine(
                     GraphStatus::Crashed,
                     reason,
                     result,
                     state.steps(),
-                state.tokens(),
+                    state.tokens(),
                 ));
             }
         }
@@ -901,7 +961,10 @@ fn run_foreach(
         // anything the budget can't cover), then hand the lanes to the exec.
         for _ in 0..total {
             if !state.budget.step() {
-                return Err(Box::new(exhausted(state, "step budget exhausted (foreach pre-charge)")));
+                return Err(Box::new(exhausted(
+                    state,
+                    "step budget exhausted (foreach pre-charge)",
+                )));
             }
         }
         let seeds: Vec<(usize, Blackboard)> = arr
@@ -932,12 +995,17 @@ fn run_foreach(
                 // Mark the unprocessed tail rather than silently shortening the
                 // array — positional integrity for downstream consumers.
                 for j in i..total {
-                    results.push(serde_json::json!({"index": j, "error": "workflow deadline exceeded"}));
+                    results.push(
+                        serde_json::json!({"index": j, "error": "workflow deadline exceeded"}),
+                    );
                 }
                 return Ok((Value::Array(results), true));
             }
             if !state.budget.step() {
-                return Err(Box::new(exhausted(state, "step budget exhausted mid-foreach")));
+                return Err(Box::new(exhausted(
+                    state,
+                    "step budget exhausted mid-foreach",
+                )));
             }
             let seed = foreach_seed(&state.blackboard, i, item);
             let (v, e) = exec.run_body(body, seed);
@@ -957,7 +1025,10 @@ fn run_foreach(
     }
     // `continue` reports ok with per-item markers in place; `fail_fast` only
     // reaches here failure-free.
-    Ok((Value::Array(results), any_failed && on_error == OnError::FailFast))
+    Ok((
+        Value::Array(results),
+        any_failed && on_error == OnError::FailFast,
+    ))
 }
 
 /// The JSON kind name (for the foreach items type error).
@@ -978,9 +1049,10 @@ fn kind_of(v: &Value) -> &'static str {
 /// it back to the model with the constraint named.
 fn infer_check(check: Option<&str>, answer: &Value) -> Result<(), String> {
     let Some(expr) = check else { return Ok(()) };
-    let obj = answer.as_object().expect("schema-checked answers are objects");
-    let fields: BTreeMap<String, Value> =
-        obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let obj = answer
+        .as_object()
+        .expect("schema-checked answers are objects");
+    let fields: BTreeMap<String, Value> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     match crate::cel::eval_bool(expr, &crate::cel::vars_of(&fields)) {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("the answer failed the check: {expr}")),
@@ -997,7 +1069,7 @@ fn exhausted(state: &GraphState, reason: &str) -> DriveResult {
         reason.to_string(),
         result,
         state.steps(),
-                state.tokens(),
+        state.tokens(),
     ))
 }
 
@@ -1018,7 +1090,7 @@ fn charge(state: &mut GraphState, exec: &mut dyn GraphExec) -> Option<DriveResul
         reason,
         result,
         state.steps(),
-                state.tokens(),
+        state.tokens(),
     )))
 }
 
@@ -1146,7 +1218,10 @@ mod tests {
             {
                 return next;
             }
-            self.tools.get(&key).cloned().unwrap_or((Value::Null, false))
+            self.tools
+                .get(&key)
+                .cloned()
+                .unwrap_or((Value::Null, false))
         }
 
         fn infer(
@@ -1211,7 +1286,12 @@ mod tests {
             }
         }
 
-        fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _bb: &Blackboard) -> (Value, bool) {
+        fn run_subgraph(
+            &mut self,
+            graph: &Graph,
+            _async_: bool,
+            _bb: &Blackboard,
+        ) -> (Value, bool) {
             self.calls.push("subgraph".to_string());
             // Drive the nested graph inline (the real impl spawns a capped subtree);
             // its result + whether it completed select the parent's ok/error edge.
@@ -1274,7 +1354,8 @@ mod tests {
             .insert("extract".into(), (json!({"rows": 3}), false));
         exec.tools
             .insert("fs.transform".into(), (json!({"clean": true}), false));
-        exec.agents.insert("load".into(), (json!({"loaded": 3}), false));
+        exec.agents
+            .insert("load".into(), (json!({"loaded": 3}), false));
         let out = run(&g, &mut exec, 100);
 
         assert_eq!(out.status, GraphStatus::Completed);
@@ -1290,7 +1371,10 @@ mod tests {
         // Blackboard threading: the `load` agent (last run_agent) saw BOTH the
         // earlier agent's write (`raw`) and the earlier tool's write (`mid`).
         assert_eq!(exec.last_blackboard.get("raw"), Some(&json!({"rows": 3})));
-        assert_eq!(exec.last_blackboard.get("mid"), Some(&json!({"clean": true})));
+        assert_eq!(
+            exec.last_blackboard.get("mid"),
+            Some(&json!({"clean": true}))
+        );
     }
 
     #[test]
@@ -1298,8 +1382,7 @@ mod tests {
         let g = etl();
         let mut exec = MockExec::default();
         // The extract agent ERRORS → the `error` edge → the crashed Halt.
-        exec.agents
-            .insert("extract".into(), (json!("boom"), true));
+        exec.agents.insert("extract".into(), (json!("boom"), true));
         let out = run(&g, &mut exec, 100);
         assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
         assert_eq!(out.status, GraphStatus::Halted);
@@ -1363,14 +1446,21 @@ mod tests {
     fn a_branch_routes_on_the_blackboard() {
         // The gate exits once the counter passes 2 (n=3): tick,gate,tick,gate,tick,gate,done.
         let g = counter_loop(2);
-        assert!(g.validate().is_ok(), "a cyclic graph with a reachable halt is valid");
+        assert!(
+            g.validate().is_ok(),
+            "a cyclic graph with a reachable halt is valid"
+        );
         let mut exec = MockExec {
             counting: Some("tick".into()),
             ..MockExec::default()
         };
         let out = run(&g, &mut exec, 1000);
         assert_eq!(out.status, GraphStatus::Completed);
-        assert_eq!(out.result, json!({"n": 3}), "exited when the counter passed 2");
+        assert_eq!(
+            out.result,
+            json!({"n": 3}),
+            "exited when the counter passed 2"
+        );
         // Three loop iterations: (tick,gate) × 3 then done.
         assert_eq!(out.steps, 7);
     }
@@ -1417,7 +1507,11 @@ mod tests {
         exec.agents.insert("const".into(), (json!(1), false));
         let out = run(&g, &mut exec, 1000);
         assert_eq!(out.status, GraphStatus::Stalled);
-        assert!(out.steps < 10, "stalls fast, not at the budget: {}", out.steps);
+        assert!(
+            out.steps < 10,
+            "stalls fast, not at the budget: {}",
+            out.steps
+        );
     }
 
     #[test]
@@ -1474,9 +1568,14 @@ mod tests {
             judge_answer: Some("approve".into()),
             ..MockExec::default()
         };
-        exec.agents.insert("review".into(), (json!({"ok": true}), false));
+        exec.agents
+            .insert("review".into(), (json!({"ok": true}), false));
         let out = run(&g, &mut exec, 100);
-        assert_eq!(out.status, GraphStatus::Completed, "approve → approved halt");
+        assert_eq!(
+            out.status,
+            GraphStatus::Completed,
+            "approve → approved halt"
+        );
         assert_eq!(out.result, json!({"ok": true}));
         // The model judgement was consulted (one complete() call).
         assert!(exec.calls.iter().any(|c| c.starts_with("judge:")));
@@ -1517,9 +1616,14 @@ mod tests {
             judge_answer: Some("approve".into()),
             ..MockExec::default()
         };
-        exec.agents.insert("review".into(), (json!({"flag": true}), false));
+        exec.agents
+            .insert("review".into(), (json!({"flag": true}), false));
         let out = run(&g, &mut exec, 100);
-        assert_eq!(out.terminal, Some(TerminalStatus::Completed), "Tier-1 case won");
+        assert_eq!(
+            out.terminal,
+            Some(TerminalStatus::Completed),
+            "Tier-1 case won"
+        );
         assert!(
             !exec.calls.iter().any(|c| c.starts_with("judge:")),
             "the model must NOT be consulted when a deterministic case matches"
@@ -1535,7 +1639,11 @@ mod tests {
         let mut exec = MockExec::default(); // judge_answer: None
         exec.agents.insert("review".into(), (json!(0), false));
         let out = run(&g, &mut exec, 100);
-        assert_eq!(out.terminal, Some(TerminalStatus::Refused), "None → default");
+        assert_eq!(
+            out.terminal,
+            Some(TerminalStatus::Refused),
+            "None → default"
+        );
     }
 
     // ── P4: Wait — suspend / resume / durable state ──────────────────────────
@@ -1574,9 +1682,12 @@ mod tests {
         let DriveResult::Suspended(s) = drive(&g, &mut exec, 100) else {
             panic!("suspend");
         };
-        let DriveResult::Done(out) =
-            resume(&g, s.state, &mut exec, WaitOutcome::Updated(json!({"msg": "hi"})))
-        else {
+        let DriveResult::Done(out) = resume(
+            &g,
+            s.state,
+            &mut exec,
+            WaitOutcome::Updated(json!({"msg": "hi"})),
+        ) else {
             panic!("resume should complete the graph");
         };
         assert_eq!(out.status, GraphStatus::Completed);
@@ -1594,7 +1705,11 @@ mod tests {
         let DriveResult::Done(out) = resume(&g, s.state, &mut exec, WaitOutcome::TimedOut) else {
             panic!("resume should complete");
         };
-        assert_eq!(out.terminal, Some(TerminalStatus::Deadline), "timeout edge → expired");
+        assert_eq!(
+            out.terminal,
+            Some(TerminalStatus::Deadline),
+            "timeout edge → expired"
+        );
     }
 
     #[test]
@@ -1678,9 +1793,13 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(g.validate().is_ok(), "a graph with a nested subgraph validates");
+        assert!(
+            g.validate().is_ok(),
+            "a graph with a nested subgraph validates"
+        );
         let mut exec = MockExec::default();
-        exec.agents.insert("sub-work".into(), (json!({"did": "it"}), false));
+        exec.agents
+            .insert("sub-work".into(), (json!({"did": "it"}), false));
         let out = run(&g, &mut exec, 100);
         assert_eq!(out.status, GraphStatus::Completed);
         // The nested graph's result flowed up into `sub_out` and was projected.
@@ -1693,7 +1812,13 @@ mod tests {
         // An exec that uses the DEFAULT run_subgraph (no spawn wiring) → error edge.
         struct NoSubgraph;
         impl GraphExec for NoSubgraph {
-            fn run_agent(&mut self, _: &str, _: Option<&str>, _: &Blackboard, _: &[String]) -> (Value, bool) {
+            fn run_agent(
+                &mut self,
+                _: &str,
+                _: Option<&str>,
+                _: &Blackboard,
+                _: &[String],
+            ) -> (Value, bool) {
                 (Value::Null, false)
             }
             fn call_tool(&mut self, _: &str, _: &str, _: &Value) -> (Value, bool) {
@@ -1777,7 +1902,11 @@ mod tests {
         .unwrap();
         let mut exec = MockExec::default();
         let out = run(&g, &mut exec, 100);
-        assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge taken");
+        assert_eq!(
+            out.terminal,
+            Some(TerminalStatus::Crashed),
+            "error edge taken"
+        );
         // The tool itself was NEVER called (no bad-shape call), and the error names
         // the missing key.
         assert!(exec.tool_args.is_empty(), "no tool call on a bad ref");
@@ -1818,7 +1947,10 @@ mod tests {
         assert_eq!(exec.infer_feedbacks.len(), 2);
         assert!(exec.infer_feedbacks[0].is_none());
         assert!(
-            exec.infer_feedbacks[1].as_deref().unwrap().contains("verdict"),
+            exec.infer_feedbacks[1]
+                .as_deref()
+                .unwrap()
+                .contains("verdict"),
             "{:?}",
             exec.infer_feedbacks[1]
         );
@@ -1904,7 +2036,11 @@ mod tests {
             "{:?}",
             out.reason
         );
-        assert!(out.tokens >= 350, "the spent pool is reported: {}", out.tokens);
+        assert!(
+            out.tokens >= 350,
+            "the spent pool is reported: {}",
+            out.tokens
+        );
     }
 
     #[test]
@@ -1944,7 +2080,11 @@ mod tests {
         assert_eq!(out.status, GraphStatus::Stalled);
         // The guard fires at the first node RE-ENTERED with an unchanged board —
         // the branch "b" (a → b → a → b: b sees the same board first).
-        assert!(out.reason.as_deref().unwrap().contains("\"b\""), "{:?}", out.reason);
+        assert!(
+            out.reason.as_deref().unwrap().contains("\"b\""),
+            "{:?}",
+            out.reason
+        );
         // Unhandled label: the reason names the node and the label.
         let g2: Graph = serde_json::from_value(json!({
             "start": "a",
@@ -1985,14 +2125,22 @@ mod tests {
             (Value::String("x".repeat(2 * 1024 * 1024)), false),
         );
         let out = run(&g, &mut exec, 100);
-        assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge taken");
+        assert_eq!(
+            out.terminal,
+            Some(TerminalStatus::Crashed),
+            "error edge taken"
+        );
         assert!(
             out.result.get("error").is_some(),
             "a small marker replaced the blob: {:?}",
             out.result
         );
         let stored = serde_json::to_string(&out.result).unwrap();
-        assert!(stored.len() < 1024, "the marker is small: {} bytes", stored.len());
+        assert!(
+            stored.len() < 1024,
+            "the marker is small: {} bytes",
+            stored.len()
+        );
     }
 
     // ── W6: foreach — the deterministic fan-out primitive ────────────────────
@@ -2035,15 +2183,22 @@ mod tests {
         let mut exec = MockExec::default();
         exec.tools.insert(
             "q.scan".into(),
-            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}), false),
+            (
+                json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}),
+                false,
+            ),
         );
-        exec.tools.insert("q.handle".into(), (json!("handled"), false));
+        exec.tools
+            .insert("q.handle".into(), (json!("handled"), false));
         let out = run(&g, &mut exec, 100);
         assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.reason);
         assert_eq!(out.result, json!(["handled", "handled", "handled"]));
         // The per-item tool calls received the SCOPED item/index via $from.
-        let handle_args: Vec<&Value> =
-            exec.tool_args.iter().filter(|a| a.get("id").is_some()).collect();
+        let handle_args: Vec<&Value> = exec
+            .tool_args
+            .iter()
+            .filter(|a| a.get("id").is_some())
+            .collect();
         assert_eq!(handle_args.len(), 3);
         assert_eq!(handle_args[0], &json!({"id": "a", "pos": 0}));
         assert_eq!(handle_args[2], &json!({"id": "c", "pos": 2}));
@@ -2065,7 +2220,10 @@ mod tests {
         let mut exec = MockExec::default();
         exec.tools.insert(
             "q.scan".into(),
-            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}), false),
+            (
+                json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}),
+                false,
+            ),
         );
         // b fails, a and c succeed.
         exec.tool_seq.insert(
@@ -2093,7 +2251,10 @@ mod tests {
         let mut exec = MockExec::default();
         exec.tools.insert(
             "q.scan".into(),
-            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}), false),
+            (
+                json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}),
+                false,
+            ),
         );
         exec.tool_seq.insert(
             "q.handle".into(),
@@ -2134,7 +2295,10 @@ mod tests {
         let out = run(&g, &mut exec, 100);
         assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
         assert!(
-            out.result.as_str().unwrap().contains("must resolve to an array"),
+            out.result
+                .as_str()
+                .unwrap()
+                .contains("must resolve to an array"),
             "{:?}",
             out.result
         );
@@ -2143,7 +2307,10 @@ mod tests {
         let mut exec = MockExec::default();
         exec.tools.insert(
             "q.scan".into(),
-            (json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}]}), false),
+            (
+                json!({"items": [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}]}),
+                false,
+            ),
         );
         exec.tools.insert("q.handle".into(), (json!("x"), false));
         let DriveResult::Done(out) = drive(&g, &mut exec, 4) else {
@@ -2182,7 +2349,10 @@ mod tests {
         assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.result);
         assert_eq!(out.result, json!({"ids": [1, 3], "total": 3}));
         assert!(
-            !exec.calls.iter().any(|c| c.starts_with("agent:") || c.starts_with("infer:")),
+            !exec
+                .calls
+                .iter()
+                .any(|c| c.starts_with("agent:") || c.starts_with("infer:")),
             "no model involvement: {:?}",
             exec.calls
         );
@@ -2208,7 +2378,10 @@ mod tests {
         assert_eq!(out.status, GraphStatus::Completed);
         assert_eq!(out.result, json!({"score": 0.75}));
         assert!(
-            exec.infer_feedbacks[1].as_deref().unwrap().contains("failed the check"),
+            exec.infer_feedbacks[1]
+                .as_deref()
+                .unwrap()
+                .contains("failed the check"),
             "{:?}",
             exec.infer_feedbacks[1]
         );
@@ -2243,14 +2416,19 @@ mod tests {
         let g = spawn_join_graph(5000);
         assert!(g.validate().is_ok());
         let mut exec = MockExec::default();
-        exec.join_results.insert("m.1".into(), (json!("first done"), false));
-        exec.join_results.insert("m.2".into(), (json!("second done"), false));
+        exec.join_results
+            .insert("m.1".into(), (json!("first done"), false));
+        exec.join_results
+            .insert("m.2".into(), (json!("second done"), false));
         let out = run(&g, &mut exec, 100);
         assert_eq!(out.status, GraphStatus::Completed, "{:?}", out.result);
         assert_eq!(out.result, json!(["first done", "second done"]));
         assert_eq!(exec.spawned_subgraphs.len(), 2, "both spawned");
         assert_eq!(
-            exec.calls.iter().filter(|c| c.starts_with("await:")).count(),
+            exec.calls
+                .iter()
+                .filter(|c| c.starts_with("await:"))
+                .count(),
             2
         );
     }
@@ -2260,7 +2438,8 @@ mod tests {
         let g = spawn_join_graph(5000);
         let mut exec = MockExec::default();
         exec.join_results.insert("m.1".into(), (json!("ok"), false));
-        exec.join_results.insert("m.2".into(), (json!("boom"), true));
+        exec.join_results
+            .insert("m.2".into(), (json!("boom"), true));
         let out = run(&g, &mut exec, 100);
         assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge");
         let arr = out.result.as_array().unwrap();
@@ -2283,7 +2462,13 @@ mod tests {
     fn an_executor_without_spawn_machinery_degrades_to_the_error_edge() {
         struct NoSpawn;
         impl GraphExec for NoSpawn {
-            fn run_agent(&mut self, _: &str, _: Option<&str>, _: &Blackboard, _: &[String]) -> (Value, bool) {
+            fn run_agent(
+                &mut self,
+                _: &str,
+                _: Option<&str>,
+                _: &Blackboard,
+                _: &[String],
+            ) -> (Value, bool) {
                 (Value::Null, false)
             }
             fn call_tool(&mut self, _: &str, _: &str, _: &Value) -> (Value, bool) {
@@ -2302,9 +2487,15 @@ mod tests {
         }))
         .unwrap();
         let mut exec = NoSpawn;
-        let DriveResult::Done(out) = drive(&g, &mut exec, 10) else { panic!() };
+        let DriveResult::Done(out) = drive(&g, &mut exec, 10) else {
+            panic!()
+        };
         assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
-        assert!(out.result.as_str().unwrap().contains("cannot spawn"), "{:?}", out.result);
+        assert!(
+            out.result.as_str().unwrap().contains("cannot spawn"),
+            "{:?}",
+            out.result
+        );
     }
 
     #[test]

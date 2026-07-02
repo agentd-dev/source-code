@@ -59,8 +59,7 @@ mod tests {
 
     #[test]
     fn plain_header_passes_through() {
-        let headers =
-            resolve_headers(&[("Accept".into(), "application/json".into())]).unwrap();
+        let headers = resolve_headers(&[("Accept".into(), "application/json".into())]).unwrap();
         assert_eq!(headers[0].1, "application/json");
     }
 

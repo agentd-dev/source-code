@@ -121,7 +121,13 @@ fn continue_route_spawns_once_then_injects_into_the_same_session() {
 
     // Second event on the same route → injected into the SAME live session.
     let spawned2 = reg
-        .deliver(Path::new(exe()), "s1", payload(&intel), "second event", &log)
+        .deliver(
+            Path::new(exe()),
+            "s1",
+            payload(&intel),
+            "second event",
+            &log,
+        )
         .expect("deliver 2");
     assert!(
         !spawned2,

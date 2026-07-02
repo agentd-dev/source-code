@@ -104,8 +104,8 @@ impl OAuthClient {
         }
 
         let body = self.post_form(&self.config.token_url, form.as_bytes())?;
-        let parsed: TokenResponse = serde_json::from_slice(&body)
-            .map_err(|e| format!("oauth: bad token response: {e}"))?;
+        let parsed: TokenResponse =
+            serde_json::from_slice(&body).map_err(|e| format!("oauth: bad token response: {e}"))?;
         let ttl = parsed
             .expires_in
             .map(Duration::from_secs)
@@ -201,14 +201,14 @@ mod tests {
 
     #[test]
     fn token_response_parses_minimal_and_full() {
-        let full: TokenResponse =
-            serde_json::from_str(r#"{"access_token":"tok","token_type":"Bearer","expires_in":3600}"#)
-                .unwrap();
+        let full: TokenResponse = serde_json::from_str(
+            r#"{"access_token":"tok","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .unwrap();
         assert_eq!(full.access_token, "tok");
         assert_eq!(full.expires_in, Some(3600));
         // expires_in is optional (falls back to DEFAULT_TTL at the call site).
-        let minimal: TokenResponse =
-            serde_json::from_str(r#"{"access_token":"tok2"}"#).unwrap();
+        let minimal: TokenResponse = serde_json::from_str(r#"{"access_token":"tok2"}"#).unwrap();
         assert_eq!(minimal.access_token, "tok2");
         assert_eq!(minimal.expires_in, None);
     }

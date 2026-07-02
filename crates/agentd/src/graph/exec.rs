@@ -13,17 +13,17 @@
 //! + intelligence client, so a workflow inherits their transport/auth/resilience.
 
 use super::{
-    drive, drive_budgeted, drive_seeded, resume, Blackboard, DriveResult, FieldType, Graph,
-    GraphExec, GraphOutcome, GraphStatus, JoinWait, WaitOutcome,
+    Blackboard, DriveResult, FieldType, Graph, GraphExec, GraphOutcome, GraphStatus, JoinWait,
+    WaitOutcome, drive, drive_budgeted, drive_seeded, resume,
 };
 use crate::agentloop::action::SelfHandler;
-use crate::subagent::orchestrator::Orchestrator;
-use crate::agentloop::runner::{run_loop, LoopInput};
+use crate::agentloop::runner::{LoopInput, run_loop};
 use crate::agentloop::stop::TerminalStatus;
 use crate::config::McpServerSpec;
 use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
+use crate::subagent::orchestrator::Orchestrator;
 use crate::wire::intel::{Message, Request, ToolDef};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -147,10 +147,18 @@ pub fn drive_connected(
     spawner: Option<&mut Orchestrator>,
     log: &Logger,
 ) -> GraphOutcome {
-    let mut exec = SessionExec::new(intel, servers, log, model, max_steps, max_tokens, node_timeout)
-        .with_deadline(deadline)
-        .with_factory(factory)
-        .with_spawner(spawner);
+    let mut exec = SessionExec::new(
+        intel,
+        servers,
+        log,
+        model,
+        max_steps,
+        max_tokens,
+        node_timeout,
+    )
+    .with_deadline(deadline)
+    .with_factory(factory)
+    .with_spawner(spawner);
     let mut result = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
     loop {
         match result {
@@ -188,10 +196,18 @@ pub fn drive_connected_once(
     spawner: Option<&mut Orchestrator>,
     log: &Logger,
 ) -> DriveResult {
-    let mut exec = SessionExec::new(intel, servers, log, model, max_steps, max_tokens, node_timeout)
-        .with_deadline(deadline)
-        .with_factory(factory)
-        .with_spawner(spawner);
+    let mut exec = SessionExec::new(
+        intel,
+        servers,
+        log,
+        model,
+        max_steps,
+        max_tokens,
+        node_timeout,
+    )
+    .with_deadline(deadline)
+    .with_factory(factory)
+    .with_spawner(spawner);
     match resume_from {
         // A fresh slice mints the budget; a resumed one CARRIES it (steps and the
         // token pool accumulate across suspensions — serialized in the state).
@@ -371,7 +387,11 @@ impl GraphExec for SessionExec<'_> {
         // §spawn-payload — narrowed context, not the whole board).
         let seed = reads
             .iter()
-            .filter_map(|k| blackboard.get(k).map(|v| ("user".to_string(), format!("{k} = {v}"))))
+            .filter_map(|k| {
+                blackboard
+                    .get(k)
+                    .map(|v| ("user".to_string(), format!("{k} = {v}")))
+            })
             .collect();
         let input = LoopInput {
             instruction: instruction.to_string(),
@@ -397,7 +417,10 @@ impl GraphExec for SessionExec<'_> {
         // A graph Tool node names its (server, tool) explicitly, so route straight to
         // that server's client (not the loop's tool-name catalogue).
         let Some(client) = self.servers.iter().find(|s| s.name() == server) else {
-            return (Value::String(format!("no such MCP server '{server}'")), true);
+            return (
+                Value::String(format!("no such MCP server '{server}'")),
+                true,
+            );
         };
         match client.call_tool(tool, Some(args.clone())) {
             Ok(res) => {
@@ -426,7 +449,10 @@ impl GraphExec for SessionExec<'_> {
                 ctx.push_str(&format!("{k} = {v}\n"));
             }
         }
-        let question = format!("{ctx}\n{prompt}\n\nAnswer with exactly one of: {}", choices.join(", "));
+        let question = format!(
+            "{ctx}\n{prompt}\n\nAnswer with exactly one of: {}",
+            choices.join(", ")
+        );
         let req = Request {
             model: self.model.clone(),
             messages: vec![
@@ -504,7 +530,12 @@ impl GraphExec for SessionExec<'_> {
         parse_json_answer(&answer)
     }
 
-    fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _blackboard: &Blackboard) -> (Value, bool) {
+    fn run_subgraph(
+        &mut self,
+        graph: &Graph,
+        _async_: bool,
+        _blackboard: &Blackboard,
+    ) -> (Value, bool) {
         // Sync: drive the nested graph inline with this same executor, resolving a
         // nested `Wait` the same way the top level does (subscribe + block until
         // update-or-timeout) — a subgraph is a full workflow, waits included. (An
@@ -578,7 +609,9 @@ impl GraphExec for SessionExec<'_> {
         // tight join timeout.
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
-            let Some((obs, is_err)) = orch.handle("subagent.status", &serde_json::json!({"handle": handle})) else {
+            let Some((obs, is_err)) =
+                orch.handle("subagent.status", &serde_json::json!({"handle": handle}))
+            else {
                 return JoinWait::Ready(Value::String("status was not handled".into()), true);
             };
             if !is_err && obs.contains("is still running") {
@@ -631,8 +664,8 @@ impl GraphExec for SessionExec<'_> {
                 .collect();
         };
         use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         let lanes = (parallel as usize).min(seeds.len()).max(1);
         let queue: Mutex<VecDeque<(usize, Blackboard)>> = Mutex::new(seeds.into());
@@ -754,7 +787,10 @@ mod tests {
             assert!(Instant::now() < deadline, "mock-llm never announced");
             std::thread::sleep(Duration::from_millis(10));
         }
-        format!("http://{}", std::fs::read_to_string(addr_file).unwrap().trim())
+        format!(
+            "http://{}",
+            std::fs::read_to_string(addr_file).unwrap().trim()
+        )
     }
 
     #[test]
@@ -765,7 +801,15 @@ mod tests {
         let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
         let intel = IntelClient::from_parts(&url, None).unwrap();
         let lg = log();
-        let mut exec = SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            8,
+            100_000,
+            Duration::from_secs(10),
+        );
         let g: Graph = serde_json::from_value(json!({
             "start": "a",
             "nodes": {
@@ -779,7 +823,10 @@ mod tests {
         };
         assert_eq!(out.status, GraphStatus::Completed);
         assert!(
-            out.result.as_str().unwrap_or_default().contains("mock-llm done"),
+            out.result
+                .as_str()
+                .unwrap_or_default()
+                .contains("mock-llm done"),
             "real agent result: {:?}",
             out.result
         );
@@ -793,7 +840,15 @@ mod tests {
         let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
         let intel = IntelClient::from_parts(&url, None).unwrap();
         let lg = log();
-        let mut exec = SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            8,
+            100_000,
+            Duration::from_secs(10),
+        );
         let bb = Blackboard::new();
         let choice = exec.judge(
             "Is the task done?",
@@ -801,7 +856,11 @@ mod tests {
             &[],
             &["done".to_string(), "pending".to_string()],
         );
-        assert_eq!(choice.as_deref(), Some("done"), "judge picked the matching label");
+        assert_eq!(
+            choice.as_deref(),
+            Some("done"),
+            "judge picked the matching label"
+        );
     }
 
     #[test]
@@ -812,8 +871,15 @@ mod tests {
         let url = start_mock_llm(&dir.path().join("llm.addr"), "json");
         let intel = IntelClient::from_parts(&url, None).unwrap();
         let lg = log();
-        let mut exec =
-            SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            8,
+            100_000,
+            Duration::from_secs(10),
+        );
         let g: Graph = serde_json::from_value(json!({
             "start": "i",
             "nodes": {
@@ -859,8 +925,15 @@ mod tests {
         let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
         let intel = IntelClient::from_parts(&url, None).unwrap();
         let lg = log();
-        let mut exec =
-            SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            8,
+            100_000,
+            Duration::from_secs(10),
+        );
         let bb = Blackboard::new();
         let choice = exec.judge(
             "state?",
@@ -868,7 +941,11 @@ mod tests {
             &[],
             &["done".to_string(), "llm done".to_string()],
         );
-        assert_eq!(choice.as_deref(), Some("llm done"), "longest contained label");
+        assert_eq!(
+            choice.as_deref(),
+            Some("llm done"),
+            "longest contained label"
+        );
     }
 
     #[test]
@@ -879,8 +956,15 @@ mod tests {
         let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
         let intel = IntelClient::from_parts(&url, None).unwrap();
         let lg = log();
-        let mut exec =
-            SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            8,
+            100_000,
+            Duration::from_secs(10),
+        );
         assert!(!exec.deadline_exceeded(), "no deadline set");
         let _ = exec.judge("q?", &Blackboard::new(), &[], &["done".to_string()]);
         assert!(exec.take_tokens() > 0, "judge usage accumulated");
@@ -908,9 +992,16 @@ mod tests {
             max_tokens: 100_000,
             node_timeout: Duration::from_secs(10),
         };
-        let mut exec =
-            SessionExec::new(&intel, &[], &lg, "mock", 50, 100_000, Duration::from_secs(10))
-                .with_factory(Some(factory));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            50,
+            100_000,
+            Duration::from_secs(10),
+        )
+        .with_factory(Some(factory));
         let items: Vec<Value> = (0..10).map(|i| json!({"n": i})).collect();
         let g: Graph = serde_json::from_value(json!({
             "start": "fan",
@@ -954,7 +1045,15 @@ mod tests {
         let url = start_mock_llm(&dir.path().join("llm.addr"), "final");
         let intel = IntelClient::from_parts(&url, None).unwrap();
         let lg = log();
-        let mut exec = SessionExec::new(&intel, &[], &lg, "mock", 8, 100_000, Duration::from_secs(10));
+        let mut exec = SessionExec::new(
+            &intel,
+            &[],
+            &lg,
+            "mock",
+            8,
+            100_000,
+            Duration::from_secs(10),
+        );
         let (val, is_err) = exec.call_tool("ghost", "do", &json!({}));
         assert!(is_err);
         assert!(val.as_str().unwrap().contains("no such MCP server"));

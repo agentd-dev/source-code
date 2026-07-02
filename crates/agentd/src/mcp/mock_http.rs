@@ -80,8 +80,9 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         }
         // A notification POST (e.g. notifications/initialized) → 202, no body.
         Ok(Incoming::Notification(_)) | Ok(Incoming::Response(_)) | Err(_) => {
-            let _ = stream
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
         }
     }
 }
@@ -124,7 +125,11 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
             (Response::ok(req.id, json!({})), false)
         }
         other => (
-            Response::err(req.id, json::METHOD_NOT_FOUND, format!("unsupported: {other}")),
+            Response::err(
+                req.id,
+                json::METHOD_NOT_FOUND,
+                format!("unsupported: {other}"),
+            ),
             false,
         ),
     }
@@ -194,7 +199,11 @@ fn read_http(stream: &TcpStream) -> Option<(String, Vec<u8>)> {
 /// stamping the `Mcp-Session-Id` header.
 fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: bool) {
     let body = serde_json::to_vec(&payload).unwrap_or_default();
-    let session_hdr = if session { "Mcp-Session-Id: mock\r\n" } else { "" };
+    let session_hdr = if session {
+        "Mcp-Session-Id: mock\r\n"
+    } else {
+        ""
+    };
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()

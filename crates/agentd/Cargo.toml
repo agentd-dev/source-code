@@ -39,8 +39,9 @@ serve-mcp = []
 serve-https = ["serve-mcp", "tls", "mcp/tls", "net/tls"]
 # A2A (Agent2Agent) v1.0 method surface over the served self-MCP (RFC 0020). A thin
 # binding — a Task IS a served run — over the RFC 0004 JSON-RPC codec + the HTTP(S)
-# transport; no dep. Rides serve-mcp.
-a2a = ["serve-mcp"]
+# transport; no dep. Rides serve-https: post-pivot the HTTP(S) listener is the ONLY
+# transport, so an a2a build without it would compile an unreachable surface.
+a2a = ["serve-https"]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
@@ -54,7 +55,7 @@ oauth = []
 # ring of the RFC 0010 §3.2 JSON lines, served over the self-MCP with the RFC
 # 0005 notify-then-read cursor. Rides serve-mcp (it's a served resource); no dep
 # — reuses the existing serde_json serializer + the served listener.
-events = ["serve-mcp"]
+events = ["serve-https"]
 # Horizontal scaling (RFC 0019): `--shard K/N` partitioning + the autoscaling
 # signal set + the agent://capacity read surface. Dependency-free — the shard
 # predicate is a hand-rolled FNV-1a (no hashbrown/siphash/sha2), pure CPU; the
@@ -98,8 +99,10 @@ otel = []
 # four-layer cycle termination with distinct graph statuses. Dependency-free (serde
 # + serde_json::Value::pointer only — the minimalism moat). Default OFF: an absent
 # build is byte-for-byte today; the degenerate single-Agent-node workflow reproduces
-# today's behaviour. Rides `serve-mcp` (the workflow self-resource + served surface).
-workflow = ["serve-mcp"]
+# today's behaviour. The ENGINE is transport-free (self-tools + the driver need no
+# listener); the `agent://workflow` served resource lights up only when a serving
+# feature is also built (its read arm lives behind `serve-mcp`).
+workflow = []
 # Built-in mock intelligence + mock MCP server (the hidden `--internal-mock-llm`
 # / `--internal-mock-mcp` re-exec modes) that the test + conformance suites drive.
 # Test scaffolding, never a shippable capability — so it's OFF in release and the

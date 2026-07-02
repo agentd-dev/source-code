@@ -187,7 +187,10 @@ fn workflow_mode_requires_a_workflow_file() {
     let (code, _out, stderr) =
         run_once(&["--mode", "workflow", "--intelligence", "http://127.0.0.1:9"]);
     assert_eq!(code, 2, "usage error; stderr:\n{stderr}");
-    assert!(stderr.contains("--mode workflow requires --workflow"), "{stderr}");
+    assert!(
+        stderr.contains("--mode workflow requires --workflow"),
+        "{stderr}"
+    );
 }
 
 #[cfg(feature = "workflow")]
@@ -227,8 +230,11 @@ fn a_reactive_workflow_daemon_suspends_and_resumes_across_children() {
         "info",
     ]);
 
-    assert_eq!(code, 0, "the resumed workflow completed; stderr:
-{stderr}");
+    assert_eq!(
+        code, 0,
+        "the resumed workflow completed; stderr:
+{stderr}"
+    );
     assert!(
         stderr.contains(r#""event":"workflow.suspended""#),
         "the first child suspended on the wait:
@@ -288,8 +294,11 @@ fn an_async_subgraph_spawns_a_real_child_and_join_collects_it() {
     sigterm(llm.id());
     let _ = llm.wait();
 
-    assert_eq!(code, 0, "spawn/join workflow completes 0; stderr:
-{stderr}");
+    assert_eq!(
+        code, 0,
+        "spawn/join workflow completes 0; stderr:
+{stderr}"
+    );
     assert!(
         stdout.contains("mock-llm done"),
         "the grandchild's distillate flowed through the join: {stdout:?}"
@@ -336,7 +345,10 @@ fn workflow_mode_resolves_a_wait_node_in_process() {
         "info",
     ]);
 
-    assert_eq!(code, 0, "the wait resolved + the graph completed; stderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "the wait resolved + the graph completed; stderr:\n{stderr}"
+    );
     assert!(
         stderr.contains(r#""event":"workflow.wait""#),
         "the wait was logged:\n{stderr}"

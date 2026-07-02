@@ -13,16 +13,15 @@
 //! long-lived `GET` SSE stream, opened lazily on the first subscribe — a
 //! background thread pumps them into a queue [`Self::drain_notifications`] serves.
 
-use crate::rpc::{self, RpcError};
 use crate::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
+use crate::rpc::{self, RpcError};
 use crate::wire::{
     CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
     GetPromptParams, GetPromptResult, Implementation, InitializeParams, InitializeResult,
     LATEST_MODERN_VERSION, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
     ListToolsResult, PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Resource,
-    ResourceTemplate,
-    SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Task, Tool,
-    UnsupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION_CODE, as_task_result,
+    ResourceTemplate, SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Task, Tool,
+    UNSUPPORTED_PROTOCOL_VERSION_CODE, UnsupportedProtocolVersion, as_task_result,
     best_mutual_version, is_modern_error_code, method, negotiate_version,
 };
 // The modern (stateless) request builders live alongside `wire` in the mcp crate.
@@ -257,7 +256,12 @@ impl McpClient {
             .clone()
             .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
         let mut params = json!({});
-        modern::inject_client_meta(&mut params, &version, &self.client_info, &self.client_capabilities);
+        modern::inject_client_meta(
+            &mut params,
+            &version,
+            &self.client_info,
+            &self.client_capabilities,
+        );
         self.http.set_protocol_version(version);
         let routing = modern::routing_headers(method::SERVER_DISCOVER, &params);
         let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -275,7 +279,10 @@ impl McpClient {
             // doesn't know server/discover answers with a generic error).
             Ok(Some(msg)) => {
                 let resp: rpc::Response = serde_json::from_value(msg).map_err(|e| {
-                    McpError::Transport(format!("bad server/discover reply on '{}': {e}", self.name))
+                    McpError::Transport(format!(
+                        "bad server/discover reply on '{}': {e}",
+                        self.name
+                    ))
                 })?;
                 if let Some(err) = resp.error {
                     return Ok(if is_modern_error_code(err.code) {
@@ -544,11 +551,7 @@ impl McpClient {
 
     /// `completion/complete` — argument autocompletion for a prompt / resource-
     /// template `reference`. Gated on the server advertising `completions`.
-    pub fn complete(
-        &self,
-        reference: Value,
-        argument: Value,
-    ) -> Result<CompleteResult, McpError> {
+    pub fn complete(&self, reference: Value, argument: Value) -> Result<CompleteResult, McpError> {
         if !self.caps.supports_completions() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no completions",
@@ -648,10 +651,7 @@ impl McpClient {
                     self.name
                 )));
             }
-            let poll = task
-                .poll_interval_ms
-                .unwrap_or(500)
-                .clamp(50, 5_000);
+            let poll = task.poll_interval_ms.unwrap_or(500).clamp(50, 5_000);
             std::thread::sleep(Duration::from_millis(poll));
         }
     }
@@ -757,11 +757,17 @@ impl McpClient {
             .clone()
             .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
         let mut params = json!({ "notifications": { "resourceSubscriptions": uris } });
-        modern::inject_client_meta(&mut params, &version, &self.client_info, &self.client_capabilities);
-        let routing: Vec<(String, String)> = modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
+        modern::inject_client_meta(
+            &mut params,
+            &version,
+            &self.client_info,
+            &self.client_capabilities,
+        );
+        let routing: Vec<(String, String)> =
+            modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
         let req = rpc::Request::new(id, method::SUBSCRIPTIONS_LISTEN, Some(params));
         let body = match serde_json::to_vec(&req) {
             Ok(b) => b,
@@ -784,12 +790,7 @@ impl McpClient {
 
     /// Stop the background notification thread (either era) if one is running.
     fn stop_event_stream(&self) {
-        if let Some(ev) = self
-            .events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(ev) = self.events.lock().unwrap_or_else(|e| e.into_inner()).take() {
             ev.stop.store(true, Ordering::SeqCst);
             let _ = ev.handle.join();
         }
@@ -867,8 +868,16 @@ impl McpClient {
         // Mcp-Method / Mcp-Name routing headers; legacy sends plain params.
         let (params, routing) = if self.era == Era::Modern {
             let mut p = params.unwrap_or_else(|| json!({}));
-            let version = self.protocol_version.as_deref().unwrap_or(LATEST_MODERN_VERSION);
-            modern::inject_client_meta(&mut p, version, &self.client_info, &self.client_capabilities);
+            let version = self
+                .protocol_version
+                .as_deref()
+                .unwrap_or(LATEST_MODERN_VERSION);
+            modern::inject_client_meta(
+                &mut p,
+                version,
+                &self.client_info,
+                &self.client_capabilities,
+            );
             let mut routing: Vec<(String, String)> = modern::routing_headers(method, &p)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
@@ -893,7 +902,10 @@ impl McpClient {
         } else {
             (params, Vec::new())
         };
-        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let refs: Vec<(&str, &str)> = routing
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let req = rpc::Request::new(id, method, params);
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
@@ -1059,7 +1071,10 @@ fn modern_listen_loop(
     routing: Vec<(String, String)>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let refs: Vec<(&str, &str)> = routing
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let mut sse = match http.open_listen(EVENT_READ_TIMEOUT, &body, &refs) {
             Ok(s) => s,
             Err(HttpError::Status(_, _)) | Err(HttpError::Unsupported(_)) => return,

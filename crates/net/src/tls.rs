@@ -191,7 +191,10 @@ impl ServerIdentity {
         let key = rustls_pemfile::private_key(&mut io::Cursor::new(key_pem))
             .map_err(|e| io::Error::other(format!("tls: bad server key PEM: {e}")))?
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "tls: no PRIVATE KEY in key PEM")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tls: no PRIVATE KEY in key PEM",
+                )
             })?;
         Ok(ServerIdentity { certs, key })
     }
@@ -230,12 +233,10 @@ impl TlsAcceptor {
         let builder = match client_ca_pem {
             Some(ca) => {
                 let roots = roots_from_pem(ca)?;
-                let verifier = WebPkiClientVerifier::builder_with_provider(
-                    Arc::new(roots),
-                    provider,
-                )
-                .build()
-                .map_err(|e| io::Error::other(format!("tls: bad client CA: {e}")))?;
+                let verifier =
+                    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                        .build()
+                        .map_err(|e| io::Error::other(format!("tls: bad client CA: {e}")))?;
                 builder.with_client_cert_verifier(verifier)
             }
             None => builder.with_no_client_auth(),

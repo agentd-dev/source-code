@@ -314,7 +314,11 @@ fn notification_get_stream_delivers_server_pushes() {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    assert_eq!(got.len(), 1, "one resources/updated pushed over the GET stream");
+    assert_eq!(
+        got.len(),
+        1,
+        "one resources/updated pushed over the GET stream"
+    );
     assert_eq!(got[0].method, "notifications/resources/updated");
 
     // Dropping the client stops the notification thread cleanly.
@@ -487,9 +491,11 @@ fn streamable_http_modern_stateless_lifecycle() {
         }
     });
 
-    let mut client =
-        McpClient::connect("modern", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
-    client.initialize().expect("establish (via server/discover)");
+    let mut client = McpClient::connect("modern", &endpoint, Vec::new(), Duration::from_secs(5))
+        .expect("connect");
+    client
+        .initialize()
+        .expect("establish (via server/discover)");
 
     // Detected the modern era + adopted its version + parsed discover capabilities.
     assert_eq!(client.era(), agentd::wire::mcp::Era::Modern);
@@ -509,7 +515,10 @@ fn streamable_http_modern_stateless_lifecycle() {
         obs.iter().all(|r| r.body["method"] != "initialize"),
         "modern era never sends initialize"
     );
-    assert_eq!(obs[0].body["method"], "server/discover", "discover is first");
+    assert_eq!(
+        obs[0].body["method"], "server/discover",
+        "discover is first"
+    );
     for r in obs.iter() {
         let m = r.body["method"].as_str().unwrap();
         assert_eq!(
@@ -523,10 +532,16 @@ fn streamable_http_modern_stateless_lifecycle() {
             "{m} carries the MCP-Protocol-Version header"
         );
         assert_eq!(r.mcp_method.as_deref(), Some(m), "{m} carries Mcp-Method");
-        assert!(r.session_id.is_none(), "modern sends no Mcp-Session-Id ({m})");
+        assert!(
+            r.session_id.is_none(),
+            "modern sends no Mcp-Session-Id ({m})"
+        );
     }
     // tools/call carries the Mcp-Name routing header.
-    let call = obs.iter().find(|r| r.body["method"] == "tools/call").unwrap();
+    let call = obs
+        .iter()
+        .find(|r| r.body["method"] == "tools/call")
+        .unwrap();
     assert_eq!(call.mcp_name.as_deref(), Some("echo"));
 }
 
@@ -570,17 +585,23 @@ fn modern_subscriptions_listen_delivers_pushes() {
                     // Hold the stream open so the client doesn't reconnect+dup.
                     std::thread::sleep(Duration::from_secs(30));
                 }
-                _ => write_json(&mut stream, "", &json!({"jsonrpc":"2.0","id":id,"result":{}})),
+                _ => write_json(
+                    &mut stream,
+                    "",
+                    &json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                ),
             }
         }
     });
 
-    let mut client =
-        McpClient::connect("modern", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
+    let mut client = McpClient::connect("modern", &endpoint, Vec::new(), Duration::from_secs(5))
+        .expect("connect");
     client.initialize().expect("establish");
     assert_eq!(client.era(), agentd::wire::mcp::Era::Modern);
     assert!(client.capabilities().supports_subscribe());
-    client.subscribe("mock://res").expect("subscribe (opens listen)");
+    client
+        .subscribe("mock://res")
+        .expect("subscribe (opens listen)");
 
     // The resources/updated push arrives on the listen stream.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -596,7 +617,11 @@ fn modern_subscriptions_listen_delivers_pushes() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(updated.len(), 1, "one resources/updated over subscriptions/listen");
+    assert_eq!(
+        updated.len(),
+        1,
+        "one resources/updated over subscriptions/listen"
+    );
 
     // The listen request carried the resourceSubscriptions filter + modern _meta.
     let b = listen_bodies.lock().unwrap();
@@ -661,7 +686,10 @@ fn modern_tools_call_mirrors_x_mcp_header_params() {
     assert!(!r.is_error());
 
     let obs = observed.lock().unwrap();
-    let call = obs.iter().find(|r| r.body["method"] == "tools/call").unwrap();
+    let call = obs
+        .iter()
+        .find(|r| r.body["method"] == "tools/call")
+        .unwrap();
     assert!(
         call.mcp_params
             .iter()
@@ -726,7 +754,9 @@ fn tasks_extension_flow() {
     assert_eq!(client.era(), agentd::wire::mcp::Era::Modern);
     let _ = client.list_tools().expect("tools/list");
 
-    let call = client.call_tool("slow", Some(json!({}))).expect("tools/call");
+    let call = client
+        .call_tool("slow", Some(json!({})))
+        .expect("tools/call");
     // The raw result carried the task handle; recover it and await completion.
     // (call_tool parsed it as a CallToolResult; the task handle is detected from
     // the underlying result value here via a fresh raw call path.)
@@ -742,10 +772,13 @@ fn tasks_extension_flow() {
 
     // The client advertised the tasks extension in every modern request's _meta.
     let obs = observed.lock().unwrap();
-    let discover = obs.iter().find(|r| r.body["method"] == "server/discover").unwrap();
+    let discover = obs
+        .iter()
+        .find(|r| r.body["method"] == "server/discover")
+        .unwrap();
     assert_eq!(
-        discover.body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
-            ["extensions"]["io.modelcontextprotocol/tasks"],
+        discover.body["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+            ["io.modelcontextprotocol/tasks"],
         json!({})
     );
 }
@@ -801,7 +834,10 @@ fn client_prompts_and_completions() {
     assert_eq!(got.description.as_deref(), Some("greeting"));
 
     let comp = client
-        .complete(json!({"type": "ref/prompt", "name": "greet"}), json!({"name": "who", "value": "al"}))
+        .complete(
+            json!({"type": "ref/prompt", "name": "greet"}),
+            json!({"name": "who", "value": "al"}),
+        )
         .expect("completion/complete");
     assert_eq!(comp.completion.values, ["alice", "alan"]);
 }
@@ -817,5 +853,8 @@ fn connect_to_dead_endpoint_surfaces_transport_error() {
     )
     .expect("connect is lazy — no dial yet");
     let err = client.initialize();
-    assert!(err.is_err(), "initialize against a dead endpoint must error");
+    assert!(
+        err.is_err(),
+        "initialize against a dead endpoint must error"
+    );
 }

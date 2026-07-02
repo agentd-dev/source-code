@@ -30,7 +30,11 @@ fn free_port() -> u16 {
 
 /// One HTTP POST /mcp with a JSON-RPC body; returns the (status_line, headers,
 /// body) once the connection closes.
-fn post(addr: &str, extra_headers: &[(&str, &str)], body: &str) -> (String, Vec<(String, String)>, String) {
+fn post(
+    addr: &str,
+    extra_headers: &[(&str, &str)],
+    body: &str,
+) -> (String, Vec<(String, String)>, String) {
     let mut s = TcpStream::connect(addr).expect("connect served http");
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut head = format!(
@@ -70,7 +74,10 @@ fn wait_ready(addr: &str) {
         if TcpStream::connect(addr).is_ok() {
             return;
         }
-        assert!(Instant::now() < deadline, "served http never became connectable");
+        assert!(
+            Instant::now() < deadline,
+            "served http never became connectable"
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -120,7 +127,10 @@ fn a_peer_initializes_lists_and_calls_status_over_http() {
         "initialize must stamp a session id: {headers:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["result"]["serverInfo"]["name"], "agentd", "init body: {body}");
+    assert_eq!(
+        v["result"]["serverInfo"]["name"], "agentd",
+        "init body: {body}"
+    );
 
     // tools/list advertises `status` (one request per connection, Connection: close).
     let (_s, _h, body) = post(
@@ -129,7 +139,10 @@ fn a_peer_initializes_lists_and_calls_status_over_http() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
     );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["result"]["tools"][0]["name"], "status", "tools/list: {body}");
+    assert_eq!(
+        v["result"]["tools"][0]["name"], "status",
+        "tools/list: {body}"
+    );
 
     // tools/call status returns this daemon's live state.
     let (_s, _h, body) = post(
@@ -168,7 +181,10 @@ fn bearer_auth_gates_the_http_control_plane() {
     );
     assert!(status.contains("200"), "authed status: {status}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["result"]["tools"][0]["name"], "status", "authed body: {body}");
+    assert_eq!(
+        v["result"]["tools"][0]["name"], "status",
+        "authed body: {body}"
+    );
 
     sigterm(child.id());
     let _ = child.wait();

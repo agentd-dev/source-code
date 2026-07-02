@@ -81,9 +81,7 @@ pub fn delegate(
                 match conn.call_streaming(objective, output_contract, deadline) {
                     Err(e) => DelegateOutcome::Error(e),
                     Ok(StreamOutcome::Done(outcome)) => outcome,
-                    Ok(StreamOutcome::Recover(task_id)) => {
-                        poll_task(&mut conn, &task_id, deadline)
-                    }
+                    Ok(StreamOutcome::Recover(task_id)) => poll_task(&mut conn, &task_id, deadline),
                 }
             }
             Err(e) => DelegateOutcome::Error(e),
@@ -172,7 +170,8 @@ struct HttpEp {
 
 impl HttpEp {
     fn parse(url: &str) -> Result<HttpEp, String> {
-        let u = crate::net::http::Url::parse(url).map_err(|e| format!("a2a: bad peer url {url}: {e}"))?;
+        let u = crate::net::http::Url::parse(url)
+            .map_err(|e| format!("a2a: bad peer url {url}: {e}"))?;
         let path = if u.path.is_empty() || u.path == "/" {
             "/".to_string()
         } else {
@@ -200,7 +199,11 @@ struct HttpConn {
 
 impl HttpConn {
     fn new(ep: HttpEp, auth: PeerAuth) -> HttpConn {
-        HttpConn { ep, auth, next_id: 1 }
+        HttpConn {
+            ep,
+            auth,
+            next_id: 1,
+        }
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
@@ -209,9 +212,8 @@ impl HttpConn {
         if self.ep.tls {
             #[cfg(feature = "tls")]
             {
-                let tls =
-                    crate::net::tls::connect(tcp, &self.ep.host, self.auth.identity.as_ref())
-                        .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.host))?;
+                let tls = crate::net::tls::connect(tcp, &self.ep.host, self.auth.identity.as_ref())
+                    .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.host))?;
                 Ok(Box::new(tls))
             }
             #[cfg(not(feature = "tls"))]
@@ -282,14 +284,14 @@ impl HttpConn {
             // already happened — recover its artifacts via GetTask.
             use std::io::Read as _;
             let mut text = String::new();
-            let _ = resp
-                .into_reader()
-                .take(1 << 20)
-                .read_to_string(&mut text);
+            let _ = resp.into_reader().take(1 << 20).read_to_string(&mut text);
             let frame: crate::json::Response = serde_json::from_str(text.trim())
                 .map_err(|e| format!("a2a: bad unary streaming reply: {e}"))?;
             if let Some(err) = frame.error {
-                return Err(format!("a2a: streaming rpc error {}: {}", err.code, err.message));
+                return Err(format!(
+                    "a2a: streaming rpc error {}: {}",
+                    err.code, err.message
+                ));
             }
             let result = frame.result.unwrap_or(Value::Null);
             // A Task-shaped reply that is already TERMINAL carries its artifacts —
@@ -361,7 +363,10 @@ impl HttpConn {
                     .pointer("/status/state")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let is_final = update.get("final").and_then(Value::as_bool).unwrap_or(false);
+                let is_final = update
+                    .get("final")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if is_final {
                     let outcome = match state {
                         "TASK_STATE_COMPLETED" => match distillate {
@@ -376,9 +381,7 @@ impl HttpConn {
                         "TASK_STATE_CANCELLED" | "TASK_STATE_CANCELED" => {
                             DelegateOutcome::Error("a2a: remote task was canceled".into())
                         }
-                        other => DelegateOutcome::Error(format!(
-                            "a2a: remote task ended {other}"
-                        )),
+                        other => DelegateOutcome::Error(format!("a2a: remote task ended {other}")),
                     };
                     return Ok(StreamOutcome::Done(outcome));
                 }
@@ -596,8 +599,7 @@ mod tests {
                 }
                 let result = unary[uidx.min(unary.len() - 1)].clone();
                 uidx += 1;
-                let payload =
-                    json!({"jsonrpc": "2.0", "id": req_id, "result": result}).to_string();
+                let payload = json!({"jsonrpc": "2.0", "id": req_id, "result": result}).to_string();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     payload.len()
@@ -676,7 +678,13 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).expect("parse https endpoint");
         assert!(matches!(ep, A2aEndpoint::Https(_)));
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "do the work", Some("one line"), deadline) {
+        match delegate(
+            &ep,
+            PeerAuth::default(),
+            "do the work",
+            Some("one line"),
+            deadline,
+        ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "http distilled answer"),
             DelegateOutcome::Error(e) => panic!("expected distillate, got error: {e}"),
         }
@@ -706,8 +714,7 @@ mod tests {
                 *cap.lock().unwrap() = head;
                 // Reply terminal immediately so the client stops after one call.
                 let result = task("h-a", TaskState::Completed, Some("authed"));
-                let payload =
-                    json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+                let payload = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     payload.len()
@@ -729,7 +736,8 @@ mod tests {
         }
         let head = captured.lock().unwrap().clone();
         assert!(
-            head.to_lowercase().contains("authorization: bearer sekrit-token"),
+            head.to_lowercase()
+                .contains("authorization: bearer sekrit-token"),
             "the bearer header was presented to the peer:\n{head}"
         );
     }

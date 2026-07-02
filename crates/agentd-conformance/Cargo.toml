@@ -11,7 +11,7 @@
 #   cargo run  -p agentd-conformance      # the same checks → a PASS/FAIL report
 [package]
 name = "agentd-conformance"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Black-box conformance suite for the agent runtime (MCP client/server + supervisor + agent loop)"

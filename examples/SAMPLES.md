@@ -4,7 +4,7 @@ Runnable samples for the three operational shapes of **agentd** — a one-shot
 run, an event-reactive daemon, and a polling/work-until-done loop — plus the
 instruction files and MCP server config they use.
 
-> **Status.** Implemented and released (v2.0.1). The agentic ReAct loop, the
+> **Status.** Implemented and released (v2.0.0). The agentic ReAct loop, the
 > supervisor + subagent process tree, the MCP client, served self-MCP over
 > HTTP(S), and all four run modes ship; the commands below run real agent runs
 > (given an intelligence endpoint + MCP servers). Every flag and env var used

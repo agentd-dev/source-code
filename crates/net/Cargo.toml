@@ -5,7 +5,7 @@
 # no async runtime. serde-free; TLS/vsock are the only (optional) deps.
 [package]
 name = "net"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Minimal blocking HTTP/1.1 + SSE over Read+Write, unix/tls/vsock connects, SSRF guard"

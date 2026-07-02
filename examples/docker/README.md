@@ -4,7 +4,7 @@ A multi-stage build that produces a tiny, nonroot `agentd` image: a musl
 static binary on `gcr.io/distroless/static-debian12:nonroot` (no shell, no
 package manager, UID 65532).
 
-> **Status:** implemented and released (v2.0.1). The supervisor, agentic loop,
+> **Status:** implemented and released (v2.0.0). The supervisor, agentic loop,
 > MCP client, and served self-MCP over HTTP(S) all ship; the commands below run
 > real agent runs given an intelligence endpoint + MCP servers.
 

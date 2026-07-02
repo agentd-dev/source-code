@@ -375,7 +375,7 @@ stalled · loop_detected · cancelled · crashed
 ```console
 $ agentd \
     --instruction "Summarize the open TODOs under /work and write SUMMARY.md" \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --mcp fs="mcp-server-fs --root /work" \
     --max-steps 40 --deadline 600s
 ```

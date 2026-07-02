@@ -116,7 +116,7 @@ Because stdout is the result and stderr is telemetry, you compose with ordinary
 shell tooling:
 
 ```bash
-agentd --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock \
+agentd --instruction "$(cat task.md)" --intelligence https://gw.example/v1 \
   2> >(jq -c 'select(.level=="error")') \
   | tee result.txt
 ```
@@ -132,7 +132,7 @@ services can dedupe the side effect (RFC 0011 §6):
 
 ```bash
 agentd --run-id "nightly-digest-2026-06-25" \
-  --instruction "$(cat task.md)" --intelligence unix:/run/intel.sock --mcp …
+  --instruction "$(cat task.md)" --intelligence https://gw.example/v1 --mcp …
 ```
 
 The key rides in the `_meta` of every outbound MCP `tools/call`; a backing

@@ -131,6 +131,65 @@ fn once_mode_runs_a_tool_call_react_cycle() {
     );
 }
 
+#[cfg(feature = "run-graph")]
+#[test]
+fn graph_mode_drives_a_pinned_graph_to_completion() {
+    // A pinned run-graph (agent → halt) driven by `--mode graph` against the mock LLM:
+    // the agent node runs a REAL ReAct turn ("final" answers "mock-llm done"), its
+    // result flows to the halt, and the run exits 0 (pivot Phase 7 · P6). No
+    // --instruction needed — the graph carries it.
+    let dir = tempfile::tempdir().unwrap();
+    let addr_file = dir.path().join("llm.addr");
+    let (mut llm, intel) = start_mock_llm(&addr_file, "final");
+
+    let graph_path = dir.path().join("g.json");
+    std::fs::write(
+        &graph_path,
+        r#"{
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "do the thing", "writes": "out", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed", "result_from": "out"}
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_once(&[
+        "--mode",
+        "graph",
+        "--graph",
+        graph_path.to_str().unwrap(),
+        "--intelligence",
+        &intel,
+        "--log-level",
+        "info",
+    ]);
+
+    sigterm(llm.id());
+    let _ = llm.wait();
+
+    assert_eq!(code, 0, "pinned graph completes 0; stderr:\n{stderr}");
+    assert!(
+        stdout.contains("mock-llm done"),
+        "the agent node's result reached the halt: {stdout:?}"
+    );
+    assert!(
+        stderr.contains(r#""graph_status":"Completed""#),
+        "graph completed status logged:\n{stderr}"
+    );
+}
+
+#[cfg(feature = "run-graph")]
+#[test]
+fn graph_mode_requires_a_graph_file() {
+    // `--mode graph` without `--graph` is a clear usage error (exit 2).
+    let (code, _out, stderr) =
+        run_once(&["--mode", "graph", "--intelligence", "http://127.0.0.1:9"]);
+    assert_eq!(code, 2, "usage error; stderr:\n{stderr}");
+    assert!(stderr.contains("--mode graph requires --graph"), "{stderr}");
+}
+
 #[test]
 fn once_mode_documents_dropped_deferred_effects() {
     // A one-shot run whose model calls the `schedule` deferred-effect self-tool has

@@ -218,6 +218,10 @@ fn run() -> i32 {
 
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
+        // Drive a pinned run-graph to a terminal graph status, then exit (pivot Phase
+        // 7 · P6) — a one-shot, in-process operator entry (no daemon).
+        #[cfg(feature = "run-graph")]
+        Mode::Graph => run_graph(&cfg, &log),
         // The long-lived modes all re-exec a root subagent, so they need our
         // own executable path.
         Mode::Reactive | Mode::Loop | Mode::Schedule => {
@@ -593,6 +597,114 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
             proc_code
         }
     }
+}
+
+/// Drive a pinned run-graph (`--graph <file>`) to a terminal graph status, then exit
+/// (pivot Phase 7 · P6). A one-shot, in-process operator entry for deterministic
+/// DAGs: load + validate the graph, connect the SAME intelligence + MCP servers a
+/// normal run uses, and drive it with the real [`SessionExec`](agentd::graph::SessionExec).
+/// A `Wait` suspension is reported as unsupported — a pinned one-shot has no reactor
+/// to resume it (the reactive-graph daemon path is the follow-up). The graph status
+/// projects to the same exit table as a one-shot run.
+#[cfg(feature = "run-graph")]
+fn run_graph(cfg: &Config, log: &Logger) -> i32 {
+    use agentd::graph::{drive, DriveResult, GraphStatus, SessionExec};
+    use agentd::intel::client::IntelClient;
+    use agentd::mcp::client::McpClient;
+    use std::time::Duration;
+
+    // Load + parse + validate the pinned graph (fail-closed at the operator boundary).
+    let path = cfg.graph_file.as_deref().unwrap_or_default();
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            log.error("proc.exit", json!({"err": format!("read graph '{path}': {e}")}));
+            eprintln!("agentd: cannot read graph file '{path}': {e}");
+            return exit::USAGE;
+        }
+    };
+    let graph: agentd::graph::Graph = match serde_json::from_str(&text) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("agentd: invalid graph JSON in '{path}': {e}");
+            return exit::USAGE;
+        }
+    };
+    if let Err(errs) = graph.validate() {
+        eprintln!("agentd: invalid graph '{path}': {}", errs.join("; "));
+        return exit::USAGE;
+    }
+
+    // The SAME intelligence + MCP a normal run uses (reuse the resolved payload).
+    let payload = root_payload(cfg);
+    let intel = match IntelClient::from_parts(
+        &payload.intelligence.uri,
+        payload.intelligence.token.clone(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            log.error("proc.exit", json!({"err": format!("intel: {e}")}));
+            eprintln!("agentd: intelligence: {e}");
+            return exit::INTEL_UNAVAILABLE;
+        }
+    };
+    let mut servers: Vec<McpClient> = Vec::new();
+    for spec in &cfg.mcp_servers {
+        match agentd::mcp::from_spec(spec, Duration::from_secs(60))
+            .and_then(|mut c| c.initialize().map(|()| c))
+        {
+            Ok(c) => servers.push(c),
+            Err(e) => {
+                log.error("mcp.connect.fail", json!({"server": spec.name, "err": e.to_string()}));
+                eprintln!("agentd: MCP server '{}' failed: {e}", spec.name);
+                return exit::MCP_REQUIRED_DOWN;
+            }
+        }
+    }
+
+    // Drive it. Each Agent node runs a ReAct turn under the run's per-node limits; the
+    // graph step cap is generous (a graph is many node visits) — the graph's own
+    // validation + termination layers bound the walk.
+    let model = payload.intelligence.model.clone().unwrap_or_default();
+    let node_timeout = cfg.deadline.unwrap_or(Duration::from_secs(600));
+    let mut exec = SessionExec::new(
+        &intel,
+        &servers,
+        log,
+        &model,
+        cfg.max_steps,
+        cfg.max_tokens,
+        node_timeout,
+    );
+    const GRAPH_MAX_STEPS: u32 = 10_000;
+    let outcome = match drive(&graph, &mut exec, GRAPH_MAX_STEPS) {
+        DriveResult::Done(o) => o,
+        DriveResult::Suspended(s) => {
+            log.error("graph.suspended", json!({"on_uri": s.on_uri}));
+            eprintln!(
+                "agentd: graph suspended on a Wait ({}) — `--mode graph` is one-shot; a Wait needs a reactive daemon",
+                s.on_uri
+            );
+            return exit::GENERIC;
+        }
+    };
+
+    print_result(&outcome.result);
+    let code = match outcome.status {
+        GraphStatus::Completed => exit::SUCCESS,
+        GraphStatus::Halted => outcome
+            .terminal
+            .map(|t| exit::once_exit(t, false))
+            .unwrap_or(exit::GENERIC),
+        GraphStatus::Exhausted => exit::BUDGET,
+        GraphStatus::LoopDetected | GraphStatus::Stalled => exit::PARTIAL,
+        GraphStatus::Crashed => exit::GENERIC,
+    };
+    log.info(
+        "proc.exit",
+        json!({"graph_status": format!("{:?}", outcome.status), "steps": outcome.steps, "code": code}),
+    );
+    code
 }
 
 /// Project a supervisor [`KillReason`] to a `(report status, has_usable_partial,

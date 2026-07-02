@@ -28,7 +28,7 @@ use crate::wire::mcp::{
 use ::mcp::modern;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,11 @@ pub struct McpClient {
     /// `subscriptions/listen` stream is (re)opened with; legacy subscribes
     /// per-URI over `resources/subscribe` and doesn't need it.
     subscribed_uris: Mutex<BTreeSet<String>>,
+    /// Cached tool `inputSchema`s (name → schema) from the last `tools/list`, so a
+    /// modern `tools/call` can mirror `x-mcp-header`-annotated params into
+    /// `Mcp-Param-*` headers (transports §custom-headers). Populated only with
+    /// tools whose annotations validate.
+    tool_schemas: Mutex<HashMap<String, Value>>,
     next_id: AtomicI64,
     caps: ServerCapabilities,
     /// The protocol version negotiated at `initialize`/discovery; `None` until then.
@@ -122,6 +127,7 @@ impl McpClient {
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             events: Mutex::new(None),
             subscribed_uris: Mutex::new(BTreeSet::new()),
+            tool_schemas: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
             protocol_version: None,
@@ -367,7 +373,18 @@ impl McpClient {
             let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
             let page: ListToolsResult =
                 self.request_as_within(method::TOOLS_LIST, params, timeout)?;
-            tools.extend(page.tools);
+            // A tool whose `x-mcp-header` annotations are invalid MUST be excluded
+            // (transports §schema-extension) so one bad definition can't break the
+            // rest; a valid tool's schema is cached for modern Mcp-Param-* mirroring.
+            let mut schemas = self.tool_schemas.lock().unwrap_or_else(|e| e.into_inner());
+            for tool in page.tools {
+                if modern::validate_x_mcp_headers(&tool.input_schema).is_err() {
+                    continue;
+                }
+                schemas.insert(tool.name.clone(), tool.input_schema.clone());
+                tools.push(tool);
+            }
+            drop(schemas);
             match page.next_cursor {
                 Some(c) => cursor = Some(c),
                 None => break,
@@ -728,12 +745,31 @@ impl McpClient {
             let mut p = params.unwrap_or_else(|| json!({}));
             let version = self.protocol_version.as_deref().unwrap_or(LATEST_MODERN_VERSION);
             modern::inject_client_meta(&mut p, version, &client_info());
-            let routing = modern::routing_headers(method, &p);
+            let mut routing: Vec<(String, String)> = modern::routing_headers(method, &p)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+            // x-mcp-header (transports §custom-headers): mirror `tools/call` params
+            // annotated in the tool's cached inputSchema into `Mcp-Param-*` headers.
+            if method == method::TOOLS_CALL
+                && let Some(name) = p.get("name").and_then(Value::as_str)
+            {
+                let schema = self
+                    .tool_schemas
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(name)
+                    .cloned();
+                if let Some(schema) = schema {
+                    let args = p.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    routing.extend(modern::param_headers(&schema, &args));
+                }
+            }
             (Some(p), routing)
         } else {
             (params, Vec::new())
         };
-        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let req = json::Request::new(id, method, params);
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;

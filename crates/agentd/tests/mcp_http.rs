@@ -30,6 +30,7 @@ struct HttpReq {
     protocol_version: Option<String>,
     mcp_method: Option<String>,
     mcp_name: Option<String>,
+    mcp_params: Vec<(String, String)>,
     body: Value,
 }
 
@@ -45,6 +46,7 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
     let mut protocol_version = None;
     let mut mcp_method = None;
     let mut mcp_name = None;
+    let mut mcp_params = Vec::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -63,6 +65,7 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
                 "mcp-protocol-version" => protocol_version = Some(val),
                 "mcp-method" => mcp_method = Some(val),
                 "mcp-name" => mcp_name = Some(val),
+                k if k.starts_with("mcp-param-") => mcp_params.push((key, val)),
                 _ => {}
             }
         }
@@ -75,6 +78,7 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
         protocol_version,
         mcp_method,
         mcp_name,
+        mcp_params,
         body,
     })
 }
@@ -537,6 +541,66 @@ fn modern_subscriptions_listen_delivers_pushes() {
         "2026-07-28"
     );
     drop(client);
+}
+
+#[test]
+fn modern_tools_call_mirrors_x_mcp_header_params() {
+    // A modern server whose tool annotates a param with x-mcp-header. Prove the
+    // client caches the schema at tools/list and mirrors the annotated arg into
+    // an Mcp-Param-* header on tools/call (transports §custom-headers).
+    let observed: Arc<Mutex<Vec<HttpReq>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let obs = Arc::clone(&observed);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let Some(req) = read_http_request(&stream) else {
+                continue;
+            };
+            obs.lock().unwrap().push(req.clone());
+            let method = req.body["method"].as_str().unwrap_or("");
+            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
+            let payload = match method {
+                "server/discover" => json!({"jsonrpc":"2.0","id":id,"result":{
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{"tools":{}},"serverInfo":{"name":"m","version":"0"}}}),
+                "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[{
+                    "name":"execute_sql",
+                    "inputSchema":{"type":"object","properties":{
+                        "region":{"type":"string","x-mcp-header":"Region"},
+                        "query":{"type":"string"}}}}]}}),
+                "tools/call" => json!({"jsonrpc":"2.0","id":id,"result":{
+                    "content":[{"type":"text","text":"ok"}],"isError":false}}),
+                _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"nope"}}),
+            };
+            write_json(&mut stream, "", &payload);
+        }
+    });
+
+    let mut client =
+        McpClient::connect("m", &endpoint, Vec::new(), Duration::from_secs(5)).expect("connect");
+    client.initialize().expect("establish");
+    assert_eq!(client.era(), agentd::wire::mcp::Era::Modern);
+    let _ = client.list_tools().expect("tools/list (caches schema)");
+    let r = client
+        .call_tool(
+            "execute_sql",
+            Some(json!({"region": "us-west1", "query": "SELECT 1"})),
+        )
+        .expect("tools/call");
+    assert!(!r.is_error());
+
+    let obs = observed.lock().unwrap();
+    let call = obs.iter().find(|r| r.body["method"] == "tools/call").unwrap();
+    assert!(
+        call.mcp_params
+            .iter()
+            .any(|(k, v)| k == "mcp-param-region" && v == "us-west1"),
+        "tools/call must mirror the x-mcp-header param: {:?}",
+        call.mcp_params
+    );
 }
 
 #[test]

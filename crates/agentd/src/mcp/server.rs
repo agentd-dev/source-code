@@ -21,8 +21,12 @@ use crate::supervisor::tree::NodeId;
 use crate::wire::mcp::{PROTOCOL_VERSION, method};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{self, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::BufReader;
+use std::os::unix::net::UnixListener;
+// `UnixStream` is only named in the test seam now that `ServeStream` moved to the
+// crate (the accept loop wraps the listener's streams without naming the type).
+#[cfg(test)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -30,89 +34,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Which transport a connection arrived on, and therefore its trust domain
-/// (RFC 0015 §3.3-§3.4). `Stdio` is the agent's own driving harness (the
-/// process's stdio); `Management` is a peer that connected to a `--serve-mcp`
-/// listener (unix socket / vsock). This chunk only *plumbs* it — it is logged on
-/// connect and carried in the per-connection context; the operator-tool gate that
-/// reads it lands in the next chunk (RFC 0015 §3.4). Stored so it isn't dead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerOrigin {
-    /// The process's own stdio (the driving harness).
-    Stdio,
-    /// A peer on a `--serve-mcp` listener (unix / vsock) — the management domain.
-    Management,
-}
-
-impl PeerOrigin {
-    fn as_str(self) -> &'static str {
-        match self {
-            PeerOrigin::Stdio => "stdio",
-            PeerOrigin::Management => "management",
-        }
-    }
-}
-
-/// The served-MCP transport, type-erased to one concrete enum so the connection
-/// registry (`SharedWriter`, `Subscriber`) stays monomorphic across transports
-/// while the *same* [`handle_conn`] code serves each. Both variants are
-/// `Read + Write` with a `try_clone` (the connection's write half is shared with
-/// the run threads that push notifications), so the NDJSON framing, threading,
-/// and dispatch are entirely transport-agnostic (RFC 0015 §3.2 — "the unix server
-/// with the socket type swapped").
-pub enum ServeStream {
-    Unix(UnixStream),
-    #[cfg(feature = "vsock")]
-    Vsock(vsock::VsockStream),
-}
-
-impl ServeStream {
-    /// Clone the handle (a second fd onto the same connection) for the shared
-    /// write half. Mirrors `UnixStream::try_clone`.
-    fn try_clone(&self) -> io::Result<ServeStream> {
-        match self {
-            ServeStream::Unix(s) => s.try_clone().map(ServeStream::Unix),
-            #[cfg(feature = "vsock")]
-            ServeStream::Vsock(s) => s.try_clone().map(ServeStream::Vsock),
-        }
-    }
-
-    /// Bound a stalled-but-alive peer so it can't pin the writer Mutex forever.
-    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        match self {
-            ServeStream::Unix(s) => s.set_write_timeout(dur),
-            #[cfg(feature = "vsock")]
-            ServeStream::Vsock(s) => s.set_write_timeout(dur),
-        }
-    }
-}
-
-impl Read for ServeStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            ServeStream::Unix(s) => s.read(buf),
-            #[cfg(feature = "vsock")]
-            ServeStream::Vsock(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for ServeStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            ServeStream::Unix(s) => s.write(buf),
-            #[cfg(feature = "vsock")]
-            ServeStream::Vsock(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            ServeStream::Unix(s) => s.flush(),
-            #[cfg(feature = "vsock")]
-            ServeStream::Vsock(s) => s.flush(),
-        }
-    }
-}
+// The reusable protocol/transport base lives in the `mcp` crate's `server` module
+// (RFC 0015 §3.6 transport + the subscription registry). agentd re-exports the
+// transport types so `crate::mcp::server::{PeerOrigin, ServeStream, SharedWriter}`
+// keep resolving for the sibling `a2a` module and tests, and imports the
+// subscription-registry helpers (identical signatures) so this module's many
+// notify call sites read unchanged.
+pub use ::mcp::server::{PeerOrigin, ServeStream};
+pub(crate) use ::mcp::server::SharedWriter;
+use ::mcp::server::{
+    SubRegistry, notify_resource_updated, notify_resource_updated_keep, register_subscriber,
+};
 
 /// Cap on concurrent peer-driven `subagent.spawn` runs in flight (bounds a peer
 /// spamming the socket; each run is also bounded by the base payload's limits).
@@ -288,23 +220,10 @@ struct ServedSession {
 /// threads and each async run's background thread.
 type Registry = Arc<Mutex<HashMap<String, ServedSession>>>;
 
-/// A connection's shared write half — both replies and pushed notifications go
-/// through it, serialized by the Mutex (a reply and a notification can't interleave
-/// bytes). The [`ServeStream`] enum keeps this one type across unix + vsock peers.
-/// `pub(crate)` so the A2A streaming handlers ([`crate::mcp::a2a`]) can write their
-/// intermediate `StreamResponse` frames directly to the calling connection.
-pub(crate) type SharedWriter = Arc<Mutex<ServeStream>>;
-
-/// A peer subscribed to an `agentd://` resource: which connection, and the writer
-/// to push a `notifications/resources/updated` to.
-struct Subscriber {
-    conn: u64,
-    writer: SharedWriter,
-}
-
-/// uri → its subscribers. Pushed when a served session's resource changes (a run
-/// reaches a terminal status). Arc-shared with each async run's background thread.
-type SubRegistry = Arc<Mutex<HashMap<String, Vec<Subscriber>>>>;
+// `SharedWriter`, `Subscriber`, and `SubRegistry` now live in `mcp::server` (the
+// reusable subscription registry) and are imported/re-exported at the top of this
+// module. The `notifications/resources/updated` push helpers (`notify_resource_*`)
+// and the connection-scoped `broadcast_distinct` come from there too.
 
 /// The live, hot-reloadable config plus the served subscription registry, shared
 /// between the served self-MCP and the reactive supervisor's reload path (RFC 0017
@@ -390,27 +309,12 @@ impl LiveConfig {
     /// must re-read the tool catalogue. Best-effort; a dead writer is pruned by its
     /// own reader loop. No payload (the peer re-lists on receipt).
     pub fn notify_tools_list_changed(&self) {
-        let writers: Vec<SharedWriter> = {
-            let g = self.subs.lock().unwrap_or_else(|e| e.into_inner());
-            let mut seen: Vec<*const Mutex<ServeStream>> = Vec::new();
-            let mut out: Vec<SharedWriter> = Vec::new();
-            for list in g.values() {
-                for s in list {
-                    let ptr = Arc::as_ptr(&s.writer);
-                    if !seen.contains(&ptr) {
-                        seen.push(ptr);
-                        out.push(Arc::clone(&s.writer));
-                    }
-                }
-            }
-            out
-        };
+        // Broadcast to every DISTINCT connection in the subscription registry — a
+        // peer that subscribed to any agentd:// resource is exactly the one that
+        // must re-list the tool catalogue (the served self-MCP has no separate
+        // connection registry). Best-effort; dead writers are pruned by their loops.
         let note = Notification::new(method::NOTIFY_TOOLS_LIST_CHANGED, None);
-        for w in writers {
-            if let Ok(mut wl) = w.lock() {
-                let _ = frame::write_line(&mut *wl, &note);
-            }
-        }
+        ::mcp::server::broadcast_distinct(&self.subs, &note);
     }
 
     /// Fan an intelligence hot-swap (RFC 0018 §5.2) into every live SERVED run —
@@ -1410,7 +1314,7 @@ fn handle_conn(stream: ServeStream, origin: PeerOrigin, ctx: &ServeCtx, log: &Lo
             }
         }
     }
-    remove_conn_subscriptions(ctx, conn); // don't push to a dead socket
+    ::mcp::server::remove_conn_subscriptions(&ctx.subscriptions, conn); // don't push to a dead socket
     log.debug(
         "mcp.disconnect",
         json!({"origin": origin.as_str(), "conn": conn}),
@@ -1680,15 +1584,10 @@ fn subscribe_resource(
                 format!("not a subscribable resource: {uri}"),
             );
         }
-    } // release the sessions / warm lock before taking the subscriptions lock
-    let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-    let list = subs.entry(uri.to_string()).or_default();
-    if !list.iter().any(|s| s.conn == conn) {
-        list.push(Subscriber {
-            conn,
-            writer: Arc::clone(writer),
-        });
-    }
+    } // release the sessions / warm lock before registering the push target
+    // The agentd gate above decides *whether* this uri is subscribable for this
+    // origin; the crate's registry does the idempotent bookkeeping.
+    register_subscriber(&ctx.subscriptions, uri, conn, writer);
     Response::ok(req.id, json!({}))
 }
 
@@ -1700,68 +1599,8 @@ fn unsubscribe_resource(req: Request, ctx: &ServeCtx, conn: u64) -> Response {
         .and_then(|p| p.get("uri"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(list) = subs.get_mut(uri) {
-        list.retain(|s| s.conn != conn);
-        if list.is_empty() {
-            subs.remove(uri);
-        }
-    }
+    ::mcp::server::drop_subscription(&ctx.subscriptions, uri, conn);
     Response::ok(req.id, json!({}))
-}
-
-/// Drop every subscription held by a (now-closed) connection.
-fn remove_conn_subscriptions(ctx: &ServeCtx, conn: u64) {
-    let mut subs = ctx.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-    subs.retain(|_uri, list| {
-        list.retain(|s| s.conn != conn);
-        !list.is_empty()
-    });
-}
-
-/// Push `notifications/resources/updated{uri}` to every current subscriber of
-/// `uri`. Best-effort: a write to a dead peer fails and is cleaned up when that
-/// connection's reader loop ends. The subscriptions lock is released before
-/// writing, so a slow/blocked peer can't stall other notifications.
-fn notify_resource_updated(subs: &SubRegistry, uri: &str) {
-    let writers: Vec<SharedWriter> = {
-        let mut g = subs.lock().unwrap_or_else(|e| e.into_inner());
-        // A subagent resource changes exactly once (terminal), so CONSUME the
-        // subscriptions as we fire them — no entry lingers after its one event.
-        match g.remove(uri) {
-            Some(list) => list.into_iter().map(|s| s.writer).collect(),
-            None => return,
-        }
-    };
-    let note = Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({"uri": uri})));
-    for w in writers {
-        if let Ok(mut wl) = w.lock() {
-            let _ = frame::write_line(&mut *wl, &note);
-        }
-    }
-}
-
-/// Like [`notify_resource_updated`] but **keeps** the subscriber list — the
-/// `agentd://run/<run_id>` and `agentd://session/<handle>` resources change
-/// REPEATEDLY (each spawn / each warm-turn boundary), so a single subscribe must
-/// keep receiving updates rather than fire once and be consumed. Cloning the
-/// writers under the lock (then releasing it before writing) keeps the entry
-/// intact for the next emission. Dead peers are pruned when their reader loop ends
-/// (`remove_conn_subscriptions`).
-fn notify_resource_updated_keep(subs: &SubRegistry, uri: &str) {
-    let writers: Vec<SharedWriter> = {
-        let g = subs.lock().unwrap_or_else(|e| e.into_inner());
-        match g.get(uri) {
-            Some(list) => list.iter().map(|s| Arc::clone(&s.writer)).collect(),
-            None => return,
-        }
-    };
-    let note = Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({"uri": uri})));
-    for w in writers {
-        if let Ok(mut wl) = w.lock() {
-            let _ = frame::write_line(&mut *wl, &note);
-        }
-    }
 }
 
 /// Spawn the `agentd://events` coalescing notifier (RFC 0016 §7.2). The event
@@ -4052,7 +3891,7 @@ mod tests {
         assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 2);
         unsubscribe_resource(req("unsub", Some(json!({"uri": uri}))), &ctx, 3);
         assert_eq!(ctx.subscriptions.lock().unwrap().get(uri).unwrap().len(), 1);
-        remove_conn_subscriptions(&ctx, 4); // conn 4 disconnects
+        ::mcp::server::remove_conn_subscriptions(&ctx.subscriptions, 4); // conn 4 disconnects
         assert!(
             ctx.subscriptions.lock().unwrap().get(uri).is_none(),
             "uri pruned when empty"

@@ -15,8 +15,8 @@
 //!
 //! This crate keeps that era logic in one place so a client or server built on it
 //! can be **dual-era** without branching everywhere. Phase 1 provides the
-//! [`wire`] types and the [`version`] model; the transport dialects, client, and
-//! server move in over subsequent phases.
+//! [`wire`] types and the [`version`] model; the [`client`], [`http`] transport,
+//! and [`server`] base build on them.
 //!
 //! Dependency budget: `serde` + `serde_json` only (the agentd minimalism moat).
 
@@ -24,5 +24,6 @@ pub mod client;
 pub mod http;
 pub mod modern;
 pub mod rpc;
+pub mod server;
 pub mod version;
 pub mod wire;

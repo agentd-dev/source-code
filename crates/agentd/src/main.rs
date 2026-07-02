@@ -549,6 +549,27 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
 
     match result {
         Ok(SuperviseResult::Completed(outcome)) => {
+            // Deferred effects (schedule / subscribe / await_resource) need a daemon
+            // to honour — a one-shot run has no reactor to arm a wake-up or re-enter
+            // a wait, so they are DROPPED. Say so loudly (RFC 0008 §self-scheduling;
+            // pivot Phase 5.2) rather than swallowing them silently, so an operator
+            // who wanted a wait/schedule knows to run a daemon mode instead.
+            let deferred = outcome.scheduled.len() + outcome.subscriptions.len();
+            if deferred > 0 {
+                log.warn(
+                    "once.deferred_effects_dropped",
+                    json!({
+                        "scheduled": outcome.scheduled.len(),
+                        "subscriptions": outcome.subscriptions.len(),
+                        "hint": "schedule/subscribe/await_resource need a daemon mode (reactive|loop|schedule)",
+                    }),
+                );
+                eprintln!(
+                    "agentd: {deferred} deferred effect(s) (schedule/subscribe/await_resource) \
+                     were dropped — they require a daemon mode (--mode reactive|loop|schedule), \
+                     not --mode once"
+                );
+            }
             print_result(&outcome.result);
             log.info(
                 "proc.exit",

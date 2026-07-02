@@ -602,8 +602,15 @@ pub fn run_reactive(
         }
         let now = Instant::now();
 
-        // Drain inbound notifications → feed the router. (list_changed
-        // re-enumeration for templated subscriptions lands later.)
+        // Drain inbound notifications → feed the router. A `resources/updated`
+        // arms its route (notify-then-read fires the reaction below). A backing
+        // server's `tools/list_changed` is OBSERVED (pivot Phase 5.2): every fresh
+        // SPAWN reaction already re-enumerates tools per run (`Session::prepare`
+        // re-lists), so a changed tool set is picked up by the next reaction with no
+        // extra wiring — the log makes the re-enumeration auditable. (Live refresh of
+        // an already-running WARM continue-session's catalogue crosses the process
+        // boundary — it reuses the same daemon→child inject the run-graph Wait uses,
+        // Phase 7 — and is a documented follow-up, not a silent drop.)
         for s in servers.values() {
             for n in s.drain_notifications() {
                 if n.method == method::NOTIFY_RESOURCES_UPDATED
@@ -612,6 +619,9 @@ pub fn run_reactive(
                     && router.on_updated(&uri, now)
                 {
                     log.info("resource.updated", json!({"uri": uri}));
+                } else if n.method == method::NOTIFY_TOOLS_LIST_CHANGED {
+                    // Next reaction re-lists; warm-session live refresh is Phase 7.
+                    log.info("mcp.tools_list_changed", json!({}));
                 }
             }
         }

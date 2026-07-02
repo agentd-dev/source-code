@@ -1472,6 +1472,20 @@ fn dispatch(
                 }),
             )
         }
+        // Modern (2026-07-28+, stateless) discovery: a peer that opens with
+        // `server/discover` instead of `initialize` learns our versions +
+        // capabilities in one stateless call (RFC 0004 §discover). Answering it
+        // makes agentd a dual-era SERVER (a modern client no longer has to fall
+        // back to the legacy handshake against us).
+        "server/discover" => Response::ok(
+            req.id,
+            json!({
+                "resultType": "complete",
+                "supportedVersions": crate::wire::mcp::SUPPORTED_PROTOCOL_VERSIONS,
+                "capabilities": {"tools": {}, "resources": {"subscribe": true}},
+                "serverInfo": {"name": "agentd", "version": crate::VERSION}
+            }),
+        ),
         "ping" => Response::ok(req.id, json!({})),
         // The work tools are listed to every peer; the operator tools
         // (drain/lame-duck/cancel) only to a `Management` peer (RFC 0015 §3.4) —
@@ -3308,6 +3322,28 @@ mod tests {
         assert_eq!(v["protocolVersion"], PROTOCOL_VERSION);
         assert!(v["capabilities"]["tools"].is_object());
         assert_eq!(v["serverInfo"]["name"], "agentd");
+    }
+
+    #[test]
+    fn server_discover_answers_modern_probe() {
+        // A modern (2026-07-28) client probes server/discover instead of
+        // initialize; agentd answers with a DiscoverResult listing its supported
+        // versions + capabilities, so the peer stays modern (no legacy fallback).
+        let r = dispatch(
+            req("server/discover", None),
+            &ctx(),
+            PeerOrigin::Management,
+            &writer(),
+            0,
+            &log(),
+        );
+        let d: crate::wire::mcp::DiscoverResult =
+            serde_json::from_value(r.result.expect("ok")).expect("parses as DiscoverResult");
+        assert!(d.supported_versions.contains(&"2026-07-28".to_string()));
+        assert!(d.supported_versions.contains(&PROTOCOL_VERSION.to_string()));
+        assert!(d.capabilities.supports_tools());
+        assert!(d.capabilities.supports_subscribe());
+        assert_eq!(d.server_info.unwrap().name, "agentd");
     }
 
     #[test]

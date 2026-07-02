@@ -367,6 +367,14 @@ pub fn dispatch_a2a(
     writer: &SharedWriter,
     log: &Logger,
 ) -> Response {
+    // Operator/admin control (drain/lame-duck/pause/resume/cancel) is unified into
+    // the A2A family (pivot Phase 4): a2a.Drain / a2a.LameDuck / a2a.Pause /
+    // a2a.Resume / a2a.Cancel — one control protocol for operators. Management-gated
+    // (dispatch_a2a is only reached for a Management peer). Tried first so an admin
+    // method never falls through to the task-method arms.
+    if let Some(resp) = crate::mcp::server::dispatch_operator(method, &req, ctx, log) {
+        return resp;
+    }
     match method {
         "a2a.SendMessage" => send_message(req, ctx, log),
         "a2a.GetTask" => get_task(req, ctx),
@@ -1045,5 +1053,67 @@ mod tests {
                 "{method} from a Stdio origin → -32601"
             );
         }
+    }
+
+    #[test]
+    fn operator_admin_methods_route_through_the_a2a_family() {
+        // Pivot Phase 4: operator control is unified INTO the A2A family. A
+        // Management-origin `a2a.Pause` routes server::dispatch → dispatch_a2a →
+        // dispatch_operator and returns the structured body directly (unwrapped, no
+        // tool-result envelope) — while a Stdio origin never reaches it (-32601).
+        let _g = crate::signals::test_guard();
+        let ctx = ctx();
+        let ok = crate::mcp::server::dispatch_for_test(
+            req("a2a.Pause", None),
+            &ctx,
+            PeerOrigin::Management,
+            &log(),
+        );
+        let body = ok.result.expect("a2a.Pause ok for management");
+        assert_eq!(body["paused"], true, "unwrapped admin body: {body}");
+        assert_eq!(body["affected"], 0, "no live sessions on this ctx");
+        assert!(
+            body.get("structuredContent").is_none(),
+            "the tool-result envelope is unwrapped: {body}"
+        );
+
+        let denied = crate::mcp::server::dispatch_for_test(
+            req("a2a.Pause", None),
+            &ctx,
+            PeerOrigin::Stdio,
+            &log(),
+        );
+        assert_eq!(
+            denied.error.expect("err").code,
+            json::METHOD_NOT_FOUND,
+            "a Stdio a2a.Pause → -32601"
+        );
+    }
+
+    #[test]
+    fn operator_tools_manifest_matches_the_dispatch_arms() {
+        // Drift guard (promised by `capabilities::OPERATOR_TOOLS`): every method the
+        // manifest advertises is routed by `dispatch_operator` (Some), and a
+        // non-admin a2a method is NOT (None) — so the manifest and the live surface
+        // cannot diverge. Signal side effects (drain latch, lame-duck/pause flags)
+        // are isolated by the test guard.
+        let _g = crate::signals::test_guard();
+        let ctx = ctx();
+        for method in crate::capabilities::OPERATOR_TOOLS {
+            let routed =
+                crate::mcp::server::dispatch_operator(method, &req(method, None), &ctx, &log());
+            assert!(routed.is_some(), "manifest method {method} is routed");
+        }
+        // A task method (not an admin op) is NOT claimed by the operator router.
+        assert!(
+            crate::mcp::server::dispatch_operator(
+                "a2a.SendMessage",
+                &req("a2a.SendMessage", None),
+                &ctx,
+                &log(),
+            )
+            .is_none(),
+            "a2a.SendMessage is a task method, not an operator op"
+        );
     }
 }

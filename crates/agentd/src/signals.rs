@@ -45,14 +45,14 @@ mod imp {
     // it is only ever SET by the `hot-reload` reactive apply step.
     static RELOADING: AtomicBool = AtomicBool::new(false);
     // Lame-duck override (RFC 0015 §4.2): a one-way-per-call readiness override
-    // toward NotReady, flipped by the `lame-duck` operator tool — NOT a signal.
+    // toward NotReady, flipped by the `a2a.LameDuck` admin method — NOT a signal.
     // It rides here (not in a feature-gated module) so it is one process-global
     // truth consulted by BOTH the `/readyz` probe (obs::serve, `metrics`) and the
-    // served operator tool (mcp::server, `serve-mcp`), with neither feature
-    // depending on the other. Distinct from `DRAINING`: lame-duck never exits.
+    // served control surface (mcp::server, `a2a`), with neither feature depending
+    // on the other. Distinct from `DRAINING`: lame-duck never exits.
     static LAME_DUCK: AtomicBool = AtomicBool::new(false);
-    // Tree-wide pause state (RFC 0015 §4.3): set by the `pause` operator tool,
-    // cleared by `resume`. Like `LAME_DUCK`, it rides here (not a feature-gated
+    // Tree-wide pause state (RFC 0015 §4.3): set by the `a2a.Pause` admin method,
+    // cleared by `a2a.Resume`. Like `LAME_DUCK`, it rides here (not a feature-gated
     // module) so it is one process-global truth read by BOTH the served operator
     // surface (`agentd://inventory`, `serve-mcp`) and the `agentd_paused` gauge
     // (`metrics`), with neither feature depending on the other. Distinct from

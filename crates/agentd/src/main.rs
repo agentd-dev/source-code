@@ -245,12 +245,13 @@ fn run() -> i32 {
             }
             // Opt-in served self-MCP for composability (RFC 0005) + the operator
             // profile (RFC 0015 §4). Built only with `--features serve-mcp`;
-            // otherwise `--serve-mcp` warns + is inert. The operator tools share
-            // the daemon's lifecycle state through process-global latches in
-            // `signals` (no flag threading): `drain` flips the SAME one-way
+            // otherwise `--serve-mcp` warns + is inert. Operator control is the A2A
+            // admin method family (`a2a.Drain`/`a2a.LameDuck`/… — pivot Phase 4);
+            // it shares the daemon's lifecycle state through process-global latches
+            // in `signals` (no flag threading): `a2a.Drain` flips the SAME one-way
             // DRAINING latch SIGTERM sets — so the metrics `/readyz` probe above,
             // the reactor's drain choreography, and the served inventory all read
-            // one truth — and `lame-duck` flips the readiness override that both
+            // one truth — and `a2a.LameDuck` flips the readiness override that both
             // `/readyz` and `agentd://inventory.ready` consult.
             let serve_wiring = cfg
                 .serve_mcp

@@ -27,13 +27,15 @@ use serde_json::{Value, json};
 /// not understand.
 const CONTRACT_VERSION: &str = "2.0";
 
-/// The operator tools this build actually serves on the management transport
-/// (RFC 0015 §4) — the authoritative `surfaces.operator_tools` list, which
-/// MIRRORS what `tools/list` returns to a `Management` peer (the served gate
-/// reads this same const, so the manifest and the live surface cannot drift,
-/// RFC 0015 §5.2). `pause`/`resume` fan `ctrl/pause`/`ctrl/resume` to suspend the
-/// agentic tree at turn boundaries (RFC 0015 §4.3).
-pub const OPERATOR_TOOLS: &[&str] = &["drain", "lame-duck", "pause", "resume", "cancel"];
+/// The operator/admin control methods this build serves — the authoritative
+/// `surfaces.operator_tools` list agentctl drives. Operator control is unified
+/// into the **A2A method family** (pivot Phase 4): one authenticated control
+/// protocol, `a2a.<Admin>`. The served [`dispatch_operator`](crate::mcp::server)
+/// routes exactly this set (a drift-guard test enforces the 1:1), so the manifest
+/// and the live surface cannot diverge (RFC 0015 §5.2). `a2a.Pause`/`a2a.Resume`
+/// fan `ctrl/pause`/`ctrl/resume` to suspend the tree at turn boundaries (§4.3).
+pub const OPERATOR_TOOLS: &[&str] =
+    &["a2a.Drain", "a2a.LameDuck", "a2a.Pause", "a2a.Resume", "a2a.Cancel"];
 
 /// Build the capabilities manifest from resolved config + identity.
 ///
@@ -353,23 +355,28 @@ fn surfaces(cfg: &Config) -> Value {
     s
 }
 
-/// The operator tools this build advertises (RFC 0015 §4 / §5.2). Non-empty only
-/// with the `serve-mcp` feature — without the management transport there is
-/// nothing to serve them on, so the surface is honestly empty.
+/// The operator/admin control methods this build advertises (RFC 0015 §4 / §5.2).
+/// Non-empty only with the `a2a` feature — operator control IS the A2A admin
+/// method family (pivot Phase 4), so without it there is nothing to serve and the
+/// surface is honestly empty.
 fn operator_tools() -> Vec<&'static str> {
-    if cfg!(feature = "serve-mcp") {
+    if cfg!(feature = "a2a") {
         OPERATOR_TOOLS.to_vec()
     } else {
         Vec::new()
     }
 }
 
-/// The A2A surface advertisement (RFC 0020). The `a2a` build serves the four unary
-/// methods plus the status-level streaming pair over the management transport with
+/// The A2A surface advertisement (RFC 0020) — the EXTERNAL-agent methods (what the
+/// gateway bridges for agent↔agent). The `a2a` build serves the four unary methods
+/// plus the status-level streaming pair over the management transport with
 /// `streaming:true` (A2A-2); without the feature the surface is honestly `false`
 /// (capability-absence-not-error, RFC 0015 §2.5). The method names here MIRROR the
-/// `a2a.*` dispatch in [`crate::mcp::server`] / [`crate::mcp::a2a`] — the gateway
-/// reads this to build the Agent Card and to know which methods to bridge.
+/// `a2a.*` task/streaming dispatch in [`crate::mcp::server`] / [`crate::mcp::a2a`] —
+/// the gateway reads this to build the Agent Card and to know which methods to
+/// bridge. The operator admin methods (`a2a.Drain`/… — pivot Phase 4) also ride the
+/// `a2a.*` family but are advertised SEPARATELY under `surfaces.operator_tools`
+/// (they are operator control agentctl drives, not the external-agent surface).
 fn a2a_surface() -> Value {
     if cfg!(feature = "a2a") {
         json!({
@@ -561,13 +568,13 @@ mod tests {
         // Not configured ⇒ false.
         assert_eq!(s["management"], json!(false));
         assert_eq!(s["metrics"], json!(false));
-        // operator_tools mirrors the built management surface (RFC 0015 §5.2):
-        // the full drain/lame-duck/pause/resume/cancel set with `serve-mcp`,
-        // empty without it. pause/resume are PRESENT (RFC 0015 §4.3 — shipped).
-        if cfg!(feature = "serve-mcp") {
+        // operator_tools mirrors the built control surface (pivot Phase 4): operator
+        // control IS the A2A admin method family, so the full set is advertised with
+        // the `a2a` feature and the surface is honestly empty without it.
+        if cfg!(feature = "a2a") {
             assert_eq!(
                 s["operator_tools"],
-                json!(["drain", "lame-duck", "pause", "resume", "cancel"])
+                json!(["a2a.Drain", "a2a.LameDuck", "a2a.Pause", "a2a.Resume", "a2a.Cancel"])
             );
         } else {
             assert_eq!(s["operator_tools"], json!([]));

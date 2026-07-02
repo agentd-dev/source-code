@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 /// The agentctl↔agentd contract version (major.minor) this binary speaks
 /// (RFC 0014 §3.4 / §6.3). agentctl refuses an instance whose *major* it does
 /// not understand.
-const CONTRACT_VERSION: &str = "1.0";
+const CONTRACT_VERSION: &str = "2.0";
 
 /// The operator tools this build actually serves on the management transport
 /// (RFC 0015 §4) — the authoritative `surfaces.operator_tools` list, which
@@ -72,11 +72,11 @@ fn build_features() -> Vec<&'static str> {
     if cfg!(feature = "tls") {
         f.push("tls");
     }
-    if cfg!(feature = "vsock") {
-        f.push("vsock");
-    }
     if cfg!(feature = "serve-mcp") {
         f.push("serve-mcp");
+    }
+    if cfg!(feature = "serve-https") {
+        f.push("serve-https");
     }
     if cfg!(feature = "a2a") {
         f.push("a2a");
@@ -436,7 +436,7 @@ mod tests {
         ] {
             assert!(m.get(key).is_some(), "manifest missing top-level key {key}");
         }
-        assert_eq!(m["contract_version"], json!("1.0"));
+        assert_eq!(m["contract_version"], json!("2.0"));
         // De-branded (ACC SPEC L4): only the neutral `agent_version` is emitted;
         // the legacy `agentd_version` key is gone (the root anyOf is satisfied by
         // `agent_version` alone).
@@ -456,8 +456,8 @@ mod tests {
         for f in &feats {
             let present = match *f {
                 "tls" => cfg!(feature = "tls"),
-                "vsock" => cfg!(feature = "vsock"),
                 "serve-mcp" => cfg!(feature = "serve-mcp"),
+                "serve-https" => cfg!(feature = "serve-https"),
                 "a2a" => cfg!(feature = "a2a"),
                 "cron" => cfg!(feature = "cron"),
                 "metrics" => cfg!(feature = "metrics"),

@@ -1636,8 +1636,8 @@ impl Config {
             return Err(usage("--cgroup-memory-max must be > 0 or 'max'".into()));
         }
         // Validate the served-MCP target up front (RFC 0015 §3.1): a bad scheme,
-        // a vsock target on a non-vsock build, or a zero/non-numeric port exits 2
-        // before any listener is bound — mirroring the intelligence-URI check.
+        // a missing port, or a non-loopback plaintext bind exits 2 before any
+        // listener is bound — mirroring the intelligence-URI check.
         if let Some(spec) = &self.serve_mcp {
             let target = ServeTarget::parse(spec)?;
             self.validate_serve_auth(&target, &|k: &str| std::env::var(k).ok())?;
@@ -3226,7 +3226,7 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&json).expect("manifest must be valid JSON");
         // It reflects the resolved config (a minted run id is always present).
-        assert_eq!(v["contract_version"], serde_json::json!("1.0"));
+        assert_eq!(v["contract_version"], serde_json::json!("2.0"));
         assert!(
             v["identity"]["run_id"]
                 .as_str()
@@ -3519,7 +3519,7 @@ mod tests {
         // The retired socket schemes and non-loopback plaintext are rejected at
         // load (exit 2) before any side effect.
         for bad in [
-            "mesh=https://mesh.example",
+            "mesh=unix:/run/peer.sock",
             "mesh=vsock:2:5005",
             "mesh=http://peer.example:9000",
             "mesh=tcp:9000",
@@ -4210,7 +4210,7 @@ mod tests {
         );
         let running = reactive_base();
         let mut new = running.clone();
-        new.intelligence = Some("vsock:9:1234".into());
+        new.intelligence = Some("https://gw-b.example:1234".into());
         assert!(
             Config::reload_coherence_check(&new, Some(&running), true).is_ok(),
             "an endpoint repoint must pass the coherence check (it is reloadable)"

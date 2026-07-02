@@ -2206,14 +2206,14 @@ mod tests {
         };
         let running = Config {
             mode: Mode::Reactive,
-            mcp_servers: vec![srv("a", "unix:/a.sock"), srv("b", "unix:/b.sock")],
+            mcp_servers: vec![srv("a", "https://a.example"), srv("b", "https://b.example")],
             ..Config::default()
         };
         // ADD c, REMOVE b, CHANGE a's endpoint, KEEP nothing identical to a.
         let mut new = running.clone();
         new.mcp_servers = vec![
-            srv("a", "unix:/a-v2.sock"), // changed (endpoint differs)
-            srv("c", "unix:/c.sock"),    // added
+            srv("a", "https://a-v2.example"), // changed (endpoint differs)
+            srv("c", "https://c.example"),    // added
                                          // b removed
         ];
         // reloadable_changes must flag mcp_servers as changed.
@@ -2254,7 +2254,7 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(
             f,
-            r#"{{"mcp_servers":[{{"name":"s","endpoint":"unix:/s.sock","tags":{{"*":["untrusted_input","sensitive","egress"]}}}}]}}"#
+            r#"{{"mcp_servers":[{{"name":"s","endpoint":"https://s.example","tags":{{"*":["untrusted_input","sensitive","egress"]}}}}]}}"#
         )
         .unwrap();
         f.flush().unwrap();

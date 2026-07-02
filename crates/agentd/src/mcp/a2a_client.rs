@@ -6,11 +6,9 @@
 //! objective to a LOCAL supervised subagent (`subagent.spawn`, unchanged) OR to a
 //! REMOTE A2A agent. Same abstraction (objective → distilled result); this module
 //! is the remote backend. It connects to a declared peer (an [`A2aEndpoint`] —
-//! `https://host[:port]` over HTTP(S), the target-vision transport; or the legacy
-//! `unix:/path` / `vsock:CID:PORT` sockets) and drives the A2A unary surface as a
-//! client. HTTP peers use one `POST` per call (the [`HttpConn`] caller); socket
-//! peers speak the RFC 0004 JSON-RPC NDJSON codec ([`crate::json::frame`]). Both
-//! flow through the same transport-agnostic [`drive`] loop:
+//! `https://host[:port]`, or loopback `http://` for dev) and drives the A2A unary
+//! surface as a client with one `POST` per call (the [`HttpConn`] caller), through
+//! the [`drive`] loop:
 //!
 //!   1. `a2a.SendMessage` with the objective as one text `Part` (role `ROLE_USER`,
 //!      a minted `messageId`) → a Task whose `id` comes back,
@@ -25,8 +23,9 @@
 //! the client just calls `a2a.*`. The wire (de)serialization is shared with the
 //! served side ([`crate::mcp::a2a`]) — one A2A vocabulary, no duplication.
 //!
-//! Trust: agentd dials the peer over a transport it already trusts (the gateway is
-//! the PEP / the vsock peer is in-domain, RFC 0012 §3.8) — no network auth here.
+//! Trust: agentd dials the peer over HTTP(S). (Presenting a client credential TO an
+//! authenticated peer — mTLS/bearer — is a follow-up; today it dials peers it
+//! already trusts, RFC 0012 §3.8.)
 
 use crate::config::A2aEndpoint;
 use crate::json::{Id, Request};
@@ -79,15 +78,15 @@ pub fn delegate(
 }
 
 /// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
-/// `result` Task value or an error string. Implemented by [`Conn`] (NDJSON over a
-/// socket) and [`HttpConn`] (HTTP POST). Lets [`drive`] be transport-agnostic.
+/// `result` Task value or an error string. Implemented by [`HttpConn`] (one HTTP
+/// POST per call); the trait keeps [`drive`] testable against a fixture.
 trait Caller {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String>;
 }
 
 /// Drive the A2A unary exchange over any [`Caller`]: SendMessage → poll GetTask to
-/// terminal. Split out from [`delegate`] so it is transport-agnostic (unix / vsock
-/// NDJSON and HTTP alike) and directly unit-testable against a fixture.
+/// terminal. Split out from [`delegate`] so it is caller-agnostic and directly
+/// unit-testable against a fixture.
 fn drive<C: Caller>(
     mut conn: C,
     objective: &str,

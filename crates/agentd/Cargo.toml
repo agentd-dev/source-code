@@ -28,20 +28,18 @@ default = ["tls"]
 # has trust anchors with no system CA bundle. On by default; opt out with
 # `--no-default-features` to reach https only via a TLS-terminating sidecar.
 tls = ["net/tls", "mcp/tls"]
-# Enclave / microVM intelligence transport (AF_VSOCK). Enables the net + mcp
-# crates' vsock connects AND agentd's own direct use (served vsock listener + a2a).
-vsock = ["net/vsock", "mcp/vsock", "dep:vsock"]
-# Served self-MCP over a unix socket. Blocking UnixListener, thread-per-conn
-# (RFC 0005 §3.6) — no dep. (mio/epoll is a future high-fan-in optimisation.)
+# Served self-MCP: the request/dispatch machinery (ServeCtx, the domain handler,
+# the a2a surface) — no dep. The only transport is HTTP(S) (`serve-https`); this
+# base carries the served ctx/handler the transport plugs into.
 serve-mcp = []
 # Served self-MCP over HTTP(S) — the target-vision control-plane transport (pivot
 # Phase 2): Streamable HTTP + SSE via `mcp::http_server`, with mTLS/bearer auth.
 # Rides serve-mcp (the served ctx/handler) + tls (the acceptor). Plaintext http://
 # serving is loopback-only (dev/tests).
 serve-https = ["serve-mcp", "tls", "mcp/tls", "net/tls"]
-# A2A (Agent2Agent) v1.0 unary method surface over the served self-MCP listener
-# (RFC 0020). A thin binding — a Task IS a served run — over the existing RFC 0004
-# JSON-RPC codec + the vsock/unix management transport; no dep. Rides serve-mcp.
+# A2A (Agent2Agent) v1.0 method surface over the served self-MCP (RFC 0020). A thin
+# binding — a Task IS a served run — over the RFC 0004 JSON-RPC codec + the HTTP(S)
+# transport; no dep. Rides serve-mcp.
 a2a = ["serve-mcp"]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
@@ -114,10 +112,8 @@ net = { path = "../net" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# --- feature: vsock --- agentd uses the vsock crate directly (served listener +
-# a2a) in addition to `net/vsock`.
-vsock = { version = "0.5", optional = true }
-# --- feature: serve-mcp --- blocking std UnixListener; no dependency.
+# The reusable `net`/`mcp` crates keep their `vsock` features (agentd no longer
+# enables them — the pivot removed agentd's unix/vsock use). No direct `vsock` dep.
 # --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.
 
 # Unix-only: signals (sigaction), process control (setpgid/killpg/waitpid),

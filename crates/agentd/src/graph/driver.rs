@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The run-graph driver (pivot Phase 7 · P1) — the thin walk that turns an authored
+//! The run-graph driver (pivot Phase 7) — the thin walk that turns an authored
 //! [`Graph`](super::Graph) into work.
 //!
 //! The driver is deliberately transport-free + Session-free: it walks nodes, threads
 //! a blackboard, follows labelled edges (a missing label fails CLOSED to the implicit
-//! `Halt(Crashed)` safety sink), and enforces the run budget. The two effectful node
-//! kinds — `Agent` (run a turn) and `Tool` (call an MCP tool) — are dispatched through
-//! the [`GraphExec`] seam, implemented over a real `Session` + intelligence client in
-//! production and a scripted mock in tests. So the control-flow logic (P1) is proven
-//! independently of the execution wiring (a later phase), and the same driver serves
-//! both the model-authored `graph.run` path and the operator `--graph <file>` path.
+//! `Halt(Crashed)` safety sink), and enforces the run budget + cycle-termination
+//! guards. The effectful node kinds — `Agent` (run a turn), `Tool` (call an MCP tool),
+//! and the Tier-2 `Branch` judgement — are dispatched through the [`GraphExec`] seam,
+//! implemented over a real `Session` + intelligence client in production and a scripted
+//! mock in tests. So the control-flow logic is proven independently of the execution
+//! wiring (a later phase), and the same driver serves both the model-authored
+//! `graph.run` path and the operator `--graph <file>` path.
 //!
-//! P1 handles `Agent`/`Tool`/`Halt`; `Branch`/`Wait`/`Subgraph` are later phases and,
-//! until then, fail CLOSED (a `Crashed` outcome) rather than panicking.
+//! Handles `Agent`/`Tool`/`Branch`/`Halt` inline and `Wait` by SUSPENDING — [`drive`]
+//! returns [`DriveResult::Suspended`] with a serializable [`GraphState`] the daemon
+//! persists, watches, and hands back to [`resume`]. `Subgraph` (P5), a dangling edge,
+//! or an unhandled label fail CLOSED (`Crashed`) rather than panicking.
 
-use super::{Graph, Node};
+use super::{Graph, Node, NodeId};
 use crate::agentloop::stop::TerminalStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,8 +67,9 @@ pub enum GraphStatus {
 pub const MAX_VISITS_PER_NODE: u32 = 100;
 
 /// The graph run budget → the layer-1 termination guard (a total node-visit cap).
+/// Serde-serializable so it rides the persisted [`GraphState`] across a long Wait.
 /// Layers 2 (per-node visit cap) and 3 (progress guard) are enforced by the driver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphBudget {
     max_steps: u32,
     steps: u32,
@@ -88,6 +92,72 @@ impl GraphBudget {
     pub fn steps(&self) -> u32 {
         self.steps
     }
+}
+
+/// The persisted, resumable run slice (pivot Phase 7 · P4) — everything a suspended
+/// graph needs to continue: where it is, its blackboard, the cycle-termination
+/// bookkeeping, and its budget. Kept OFF the frozen `Graph` (which stays pure
+/// topology) and serde-serializable, so a long `Wait` survives across the process
+/// boundary and even a restart — the durable-state decision: the daemon writes this
+/// slice to an `agentd://graph/<id>` state file on suspend and reads it on resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphState {
+    /// The node to (re-)enter.
+    pub at: NodeId,
+    /// The shared, keyed graph state.
+    pub blackboard: Blackboard,
+    /// Per-node visit counts (layer 2), preserved across suspends.
+    visits: BTreeMap<NodeId, u32>,
+    /// Blackboard hash last seen on entry to each node (layer 3).
+    entry_hash: BTreeMap<NodeId, u64>,
+    budget: GraphBudget,
+}
+
+impl GraphState {
+    /// A fresh run slice entering `start` with a total step cap.
+    pub fn new(start: NodeId, max_steps: u32) -> GraphState {
+        GraphState {
+            at: start,
+            blackboard: BTreeMap::new(),
+            visits: BTreeMap::new(),
+            entry_hash: BTreeMap::new(),
+            budget: GraphBudget::new(max_steps),
+        }
+    }
+
+    pub fn steps(&self) -> u32 {
+        self.budget.steps()
+    }
+}
+
+/// What the daemon must arm when a graph suspends on a `Wait`, plus the persisted
+/// state to resume it with. The daemon installs an ephemeral exact route on `on_uri`
+/// + a `timeout_ms` timer; whichever fires first, it calls [`resume`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Suspension {
+    pub on_uri: String,
+    pub timeout_ms: u64,
+    pub state: GraphState,
+}
+
+/// How a `Wait` resolved — supplied by the daemon on [`resume`].
+#[derive(Debug, Clone)]
+pub enum WaitOutcome {
+    /// The watched resource updated; carries its freshly-read content (written to the
+    /// Wait node's `writes` key) and takes the `updated` edge.
+    Updated(Value),
+    /// The timeout elapsed first; takes the `timeout` edge.
+    TimedOut,
+}
+
+/// The result of driving (or resuming) a graph: it terminated, or it suspended on a
+/// `Wait` and must be resumed once the daemon's watch fires.
+#[derive(Debug, Clone)]
+pub enum DriveResult {
+    /// The graph reached a terminal outcome.
+    Done(GraphOutcome),
+    /// The graph suspended on a `Wait`; resume with [`resume`] once it resolves.
+    Suspended(Suspension),
 }
 
 /// A deterministic hash of the blackboard (the `BTreeMap` serializes in a stable key
@@ -144,64 +214,139 @@ fn edge_for(is_error: bool) -> &'static str {
     }
 }
 
-/// Drive `graph` to a terminal [`GraphOutcome`], threading a fresh blackboard through
-/// the node walk. P1 executes `Agent`/`Tool`/`Halt`; any other node kind, a dangling
-/// edge, or an unhandled emitted label fails CLOSED (`Crashed`) — the implicit
-/// `Halt(Crashed)` safety sink, so a mis-authored graph never runs away or panics.
-pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, budget: &mut GraphBudget) -> GraphOutcome {
-    let mut bb: Blackboard = BTreeMap::new();
-    let mut node_id = graph.start.clone();
-    // Termination bookkeeping: per-node visit count (layer 2) and the blackboard hash
-    // last seen ON ENTRY to each node (layer 3 — a revisit with an unchanged board).
-    let mut visits: BTreeMap<String, u32> = BTreeMap::new();
-    let mut entry_hash: BTreeMap<String, u64> = BTreeMap::new();
-    loop {
-        // Layer 1 — total step budget.
-        if !budget.step() {
-            let result = bb_result(&bb, None);
-            return GraphOutcome::engine(GraphStatus::Exhausted, result, budget.steps());
-        }
-        // Layer 2 — per-node visit cap (a runaway cycle, even under a large budget).
-        let v = visits.entry(node_id.clone()).or_insert(0);
-        *v += 1;
-        if *v > MAX_VISITS_PER_NODE {
-            let result = bb_result(&bb, None);
-            return GraphOutcome::engine(GraphStatus::LoopDetected, result, budget.steps());
-        }
-        // Layer 3 — progress guard: re-entering a node with an unchanged blackboard
-        // means the cycle back to here made no progress → stalled.
-        let h = bb_hash(&bb);
-        if entry_hash.get(&node_id) == Some(&h) {
-            let result = bb_result(&bb, None);
-            return GraphOutcome::engine(GraphStatus::Stalled, result, budget.steps());
-        }
-        entry_hash.insert(node_id.clone(), h);
+/// Start a fresh graph run: enter `start` with a total step cap of `max_steps`.
+/// Returns [`DriveResult::Done`] on termination, or [`DriveResult::Suspended`] when a
+/// `Wait` is reached (the daemon then arms the watch and calls [`resume`]). P1–P4
+/// execute `Agent`/`Tool`/`Branch`/`Wait`/`Halt`; `Subgraph` (P5), a dangling edge, or
+/// an unhandled emitted label fails CLOSED (`Crashed`) — the implicit `Halt(Crashed)`
+/// safety sink, so a mis-authored graph never runs away or panics.
+pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, max_steps: u32) -> DriveResult {
+    let mut state = GraphState::new(graph.start.clone(), max_steps);
+    drive_state(graph, &mut state, exec)
+}
 
-        let Some(node) = graph.nodes.get(&node_id) else {
+/// Resume a suspended graph once its `Wait` resolved: apply the [`WaitOutcome`] (write
+/// the updated value + take the `updated` edge, or take the `timeout` edge), then keep
+/// driving. Resuming a state whose `at` is not a `Wait`, or a `Wait` missing the
+/// resolved edge, fails CLOSED (`Crashed`) — the daemon's contract is to resume with
+/// the same `(graph, state)` it suspended.
+pub fn resume(
+    graph: &Graph,
+    mut state: GraphState,
+    exec: &mut dyn GraphExec,
+    outcome: WaitOutcome,
+) -> DriveResult {
+    let Some(Node::Wait { writes, edges, .. }) = graph.nodes.get(&state.at) else {
+        return DriveResult::Done(GraphOutcome::engine(
+            GraphStatus::Crashed,
+            Value::Null,
+            state.steps(),
+        ));
+    };
+    let label = match &outcome {
+        WaitOutcome::Updated(v) => {
+            write(&mut state.blackboard, writes, v.clone());
+            "updated"
+        }
+        WaitOutcome::TimedOut => "timeout",
+    };
+    match edges.get(label) {
+        Some(next) => state.at = next.clone(),
+        None => {
+            let result = bb_result(&state.blackboard, None);
+            return DriveResult::Done(GraphOutcome::engine(
+                GraphStatus::Crashed,
+                result,
+                state.steps(),
+            ));
+        }
+    }
+    // Crossing a Wait is a real-world checkpoint (an external event arrived, time
+    // passed), so the per-node visit + progress bookkeeping resets: a compute loop is
+    // bounded PER EVENT, not across the whole reactive lifetime. A tight runaway loop
+    // BETWEEN waits is still caught; a long-lived event loop (a back-edge into a Wait)
+    // runs indefinitely — bounded only by the total step budget (the operator's cap).
+    state.visits.clear();
+    state.entry_hash.clear();
+    drive_state(graph, &mut state, exec)
+}
+
+/// The core walk from `state.at`, mutating the run slice in place until it terminates
+/// (`Done`) or hits a `Wait` (`Suspended`).
+fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) -> DriveResult {
+    loop {
+        let Some(node) = graph.nodes.get(&state.at) else {
             // A dangling edge slipped past validation → fail closed.
-            return GraphOutcome::engine(GraphStatus::Crashed, Value::Null, budget.steps());
+            return DriveResult::Done(GraphOutcome::engine(
+                GraphStatus::Crashed,
+                Value::Null,
+                state.steps(),
+            ));
         };
 
+        // Layer 1 — total step budget (every node visit is charged).
+        if !state.budget.step() {
+            let result = bb_result(&state.blackboard, None);
+            return DriveResult::Done(GraphOutcome::engine(
+                GraphStatus::Exhausted,
+                result,
+                state.steps(),
+            ));
+        }
+
+        // Layers 2 + 3 apply to COMPUTE nodes only. A `Wait` suspends (it does not
+        // spin), so a back-edge into a Wait is a long-lived reactive loop that must
+        // NOT trip loop-detection/stall — it costs nothing idle. The step budget is
+        // the backstop even for a Wait loop.
+        if !matches!(node, Node::Wait { .. }) {
+            let v = state.visits.entry(state.at.clone()).or_insert(0);
+            *v += 1;
+            if *v > MAX_VISITS_PER_NODE {
+                let result = bb_result(&state.blackboard, None);
+                return DriveResult::Done(GraphOutcome::engine(
+                    GraphStatus::LoopDetected,
+                    result,
+                    state.steps(),
+                ));
+            }
+            let h = bb_hash(&state.blackboard);
+            if state.entry_hash.get(&state.at) == Some(&h) {
+                let result = bb_result(&state.blackboard, None);
+                return DriveResult::Done(GraphOutcome::engine(
+                    GraphStatus::Stalled,
+                    result,
+                    state.steps(),
+                ));
+            }
+            state.entry_hash.insert(state.at.clone(), h);
+        }
+
         // Effectful nodes produce `(label, edges)` and fall through to edge-follow;
-        // Halt returns; Branch + the unsupported kinds transition/return directly.
+        // Halt/Wait return; Branch transitions directly; Subgraph fails closed (P5).
         let (label, edges) = match node {
-            // Halt terminates immediately, projecting `result_from`.
             Node::Halt { status, result_from } => {
-                let result = bb_result(&bb, result_from.as_deref());
-                return GraphOutcome::halt(*status, result, budget.steps());
+                let result = bb_result(&state.blackboard, result_from.as_deref());
+                return DriveResult::Done(GraphOutcome::halt(*status, result, state.steps()));
+            }
+            // A Wait SUSPENDS: hand the daemon the watch (uri + timeout) and the state
+            // to resume with. The current node stays `state.at` so `resume` knows which
+            // Wait resolved.
+            Node::Wait { on_uri, timeout_ms, .. } => {
+                return DriveResult::Suspended(Suspension {
+                    on_uri: on_uri.clone(),
+                    timeout_ms: *timeout_ms,
+                    state: state.clone(),
+                });
             }
             // Branch: the first deterministic case whose predicate holds wins (Tier 1,
-            // free). If none match and a Tier-2 semantic spec is present, ONE model
-            // judgement picks a labelled choice; an unrecognised answer (or no spec)
-            // takes `default`. A branch writes nothing and emits no ok/error label — it
-            // transitions directly.
+            // free); else a Tier-2 semantic judgement; else `default`. It writes nothing
+            // and emits no ok/error label — it transitions directly.
             Node::Branch { cases, default, semantic } => {
-                node_id = if let Some(c) = cases.iter().find(|c| c.when.eval(&bb)) {
+                state.at = if let Some(c) = cases.iter().find(|c| c.when.eval(&state.blackboard)) {
                     c.goto.clone()
                 } else if let Some(spec) = semantic {
                     let labels: Vec<String> = spec.choices.keys().cloned().collect();
-                    match exec.judge(&spec.prompt, &bb, &spec.reads, &labels) {
-                        // Route to the chosen label's node; an unknown label → default.
+                    match exec.judge(&spec.prompt, &state.blackboard, &spec.reads, &labels) {
                         Some(label) => spec.choices.get(&label).unwrap_or(default).clone(),
                         None => default.clone(),
                     }
@@ -218,32 +363,40 @@ pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, budget: &mut GraphBudget) 
                 edges,
                 ..
             } => {
-                let (val, is_err) =
-                    exec.run_agent(instruction, output_contract.as_deref(), &bb, reads);
-                write(&mut bb, writes, val);
+                let (val, is_err) = exec.run_agent(
+                    instruction,
+                    output_contract.as_deref(),
+                    &state.blackboard,
+                    reads,
+                );
+                write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
-            Node::Tool {
-                server,
-                tool,
-                args,
-                writes,
-                edges,
-            } => {
+            Node::Tool { server, tool, args, writes, edges } => {
                 let (val, is_err) = exec.call_tool(server, tool, args);
-                write(&mut bb, writes, val);
+                write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
-            // Wait/Subgraph land in later phases; fail closed until then.
-            _ => return GraphOutcome::engine(GraphStatus::Crashed, Value::Null, budget.steps()),
+            // Subgraph lands in P5; fail closed until then.
+            Node::Subgraph { .. } => {
+                return DriveResult::Done(GraphOutcome::engine(
+                    GraphStatus::Crashed,
+                    Value::Null,
+                    state.steps(),
+                ));
+            }
         };
 
         match edges.get(label) {
-            Some(next) => node_id = next.clone(),
+            Some(next) => state.at = next.clone(),
             // Unhandled label → the implicit Halt(Crashed) safety sink.
             None => {
-                let result = bb_result(&bb, None);
-                return GraphOutcome::engine(GraphStatus::Crashed, result, budget.steps());
+                let result = bb_result(&state.blackboard, None);
+                return DriveResult::Done(GraphOutcome::engine(
+                    GraphStatus::Crashed,
+                    result,
+                    state.steps(),
+                ));
             }
         }
     }
@@ -350,6 +503,15 @@ mod tests {
         }
     }
 
+    /// Drive a graph that is expected to run to completion (no `Wait`) and return its
+    /// terminal outcome — the common shape for the non-suspending tests.
+    fn run(g: &Graph, exec: &mut dyn GraphExec, max_steps: u32) -> GraphOutcome {
+        match drive(g, exec, max_steps) {
+            DriveResult::Done(o) => o,
+            DriveResult::Suspended(s) => panic!("unexpected suspend on {}", s.on_uri),
+        }
+    }
+
     /// extract (agent) → transform (tool) → load (agent) → halt(result_from = "out").
     /// Four effectful steps so a DOWNSTREAM agent (`load`) genuinely receives the
     /// blackboard written by both an earlier agent and an earlier tool.
@@ -394,8 +556,7 @@ mod tests {
         exec.tools
             .insert("fs.transform".into(), (json!({"clean": true}), false));
         exec.agents.insert("load".into(), (json!({"loaded": 3}), false));
-        let mut budget = GraphBudget::new(100);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100);
 
         assert_eq!(out.status, GraphStatus::Completed);
         assert_eq!(out.terminal, Some(TerminalStatus::Completed));
@@ -420,8 +581,7 @@ mod tests {
         // The extract agent ERRORS → the `error` edge → the crashed Halt.
         exec.agents
             .insert("extract".into(), (json!("boom"), true));
-        let mut budget = GraphBudget::new(100);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100);
         assert_eq!(out.terminal, Some(TerminalStatus::Crashed));
         assert_eq!(out.status, GraphStatus::Halted);
         // The transform tool was never reached.
@@ -435,8 +595,7 @@ mod tests {
         let mut exec = MockExec::default();
         exec.agents.insert("extract".into(), (json!(1), false));
         exec.tools.insert("fs.load".into(), (json!(2), false));
-        let mut budget = GraphBudget::new(1);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 1);
         assert_eq!(out.status, GraphStatus::Exhausted);
         assert_eq!(out.terminal, None);
     }
@@ -455,25 +614,27 @@ mod tests {
         // (This graph is valid — every EDGE has a target — but at run time the `ok`
         // label is unhandled, which must fail closed rather than wedge.)
         let mut exec = MockExec::default();
-        let mut budget = GraphBudget::new(10);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 10);
         assert_eq!(out.status, GraphStatus::Crashed);
     }
 
     #[test]
     fn an_unsupported_node_kind_fails_closed() {
-        // A Wait node is a P4 feature; until then the driver must fail closed on it.
+        // A Subgraph node is a P5 feature; until then the driver must fail closed on it.
         let g: Graph = serde_json::from_value(json!({
-            "start": "w",
+            "start": "sg",
             "nodes": {
-                "w": {"kind": "wait", "on_uri": "file:///x", "timeout_ms": 1000, "edges": {"updated": "h"}},
+                "sg": {
+                    "kind": "subgraph",
+                    "graph": {"start": "x", "nodes": {"x": {"kind": "halt", "status": "completed"}}},
+                    "edges": {"ok": "h"}
+                },
                 "h": {"kind": "halt", "status": "completed"}
             }
         }))
         .unwrap();
         let mut exec = MockExec::default();
-        let mut budget = GraphBudget::new(10);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 10);
         assert_eq!(out.status, GraphStatus::Crashed);
     }
 
@@ -508,8 +669,7 @@ mod tests {
             counting: Some("tick".into()),
             ..MockExec::default()
         };
-        let mut budget = GraphBudget::new(1000);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 1000);
         assert_eq!(out.status, GraphStatus::Completed);
         assert_eq!(out.result, json!({"n": 3}), "exited when the counter passed 2");
         // Three loop iterations: (tick,gate) × 3 then done.
@@ -535,8 +695,7 @@ mod tests {
         .unwrap();
         let mut exec = MockExec::default();
         exec.agents.insert("const".into(), (json!("always"), false));
-        let mut budget = GraphBudget::new(1000);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 1000);
         // The default keeps looping with no progress → Stalled (layer 3).
         assert_eq!(out.status, GraphStatus::Stalled);
     }
@@ -557,8 +716,7 @@ mod tests {
         // runtime guard independent of author-time validation.)
         let mut exec = MockExec::default();
         exec.agents.insert("const".into(), (json!(1), false));
-        let mut budget = GraphBudget::new(1000);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 1000);
         assert_eq!(out.status, GraphStatus::Stalled);
         assert!(out.steps < 10, "stalls fast, not at the budget: {}", out.steps);
     }
@@ -573,8 +731,7 @@ mod tests {
             counting: Some("tick".into()),
             ..MockExec::default()
         };
-        let mut budget = GraphBudget::new(100_000);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100_000);
         assert_eq!(out.status, GraphStatus::LoopDetected);
         // Tripped at the per-node cap (~2 visits/iteration), well under the budget.
         assert!(
@@ -619,8 +776,7 @@ mod tests {
             ..MockExec::default()
         };
         exec.agents.insert("review".into(), (json!({"ok": true}), false));
-        let mut budget = GraphBudget::new(100);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100);
         assert_eq!(out.status, GraphStatus::Completed, "approve → approved halt");
         assert_eq!(out.result, json!({"ok": true}));
         // The model judgement was consulted (one complete() call).
@@ -635,8 +791,7 @@ mod tests {
             ..MockExec::default()
         };
         exec.agents.insert("review".into(), (json!(1), false));
-        let mut budget = GraphBudget::new(100);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100);
         // default = "rejected" (status refused).
         assert_eq!(out.terminal, Some(TerminalStatus::Refused));
     }
@@ -664,8 +819,7 @@ mod tests {
             ..MockExec::default()
         };
         exec.agents.insert("review".into(), (json!({"flag": true}), false));
-        let mut budget = GraphBudget::new(100);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100);
         assert_eq!(out.terminal, Some(TerminalStatus::Completed), "Tier-1 case won");
         assert!(
             !exec.calls.iter().any(|c| c.starts_with("judge:")),
@@ -681,8 +835,122 @@ mod tests {
         let g = review_graph();
         let mut exec = MockExec::default(); // judge_answer: None
         exec.agents.insert("review".into(), (json!(0), false));
-        let mut budget = GraphBudget::new(100);
-        let out = drive(&g, &mut exec, &mut budget);
+        let out = run(&g, &mut exec, 100);
         assert_eq!(out.terminal, Some(TerminalStatus::Refused), "None → default");
+    }
+
+    // ── P4: Wait — suspend / resume / durable state ──────────────────────────
+
+    /// A bare Wait: suspend on `mcp://inbox`, `updated` → done(result_from evt),
+    /// `timeout` → expired(deadline).
+    fn wait_graph() -> Graph {
+        serde_json::from_value(json!({
+            "start": "w",
+            "nodes": {
+                "w": {"kind": "wait", "on_uri": "mcp://inbox", "writes": "evt", "timeout_ms": 5000, "edges": {"updated": "done", "timeout": "expired"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "evt"},
+                "expired": {"kind": "halt", "status": "deadline"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_wait_node_suspends_with_the_watch() {
+        let g = wait_graph();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        let DriveResult::Suspended(s) = drive(&g, &mut exec, 100) else {
+            panic!("a Wait must suspend, not run to completion");
+        };
+        assert_eq!(s.on_uri, "mcp://inbox");
+        assert_eq!(s.timeout_ms, 5000);
+        assert_eq!(s.state.at, "w", "suspends AT the wait node");
+    }
+
+    #[test]
+    fn resume_with_an_update_writes_the_value_and_takes_the_updated_edge() {
+        let g = wait_graph();
+        let mut exec = MockExec::default();
+        let DriveResult::Suspended(s) = drive(&g, &mut exec, 100) else {
+            panic!("suspend");
+        };
+        let DriveResult::Done(out) =
+            resume(&g, s.state, &mut exec, WaitOutcome::Updated(json!({"msg": "hi"})))
+        else {
+            panic!("resume should complete the graph");
+        };
+        assert_eq!(out.status, GraphStatus::Completed);
+        // The updated value was written to `evt` and projected as the result.
+        assert_eq!(out.result, json!({"msg": "hi"}));
+    }
+
+    #[test]
+    fn resume_on_timeout_takes_the_timeout_edge() {
+        let g = wait_graph();
+        let mut exec = MockExec::default();
+        let DriveResult::Suspended(s) = drive(&g, &mut exec, 100) else {
+            panic!("suspend");
+        };
+        let DriveResult::Done(out) = resume(&g, s.state, &mut exec, WaitOutcome::TimedOut) else {
+            panic!("resume should complete");
+        };
+        assert_eq!(out.terminal, Some(TerminalStatus::Deadline), "timeout edge → expired");
+    }
+
+    #[test]
+    fn a_suspended_graph_state_round_trips_through_serde() {
+        // Durability (the state-file decision): the suspended slice survives a
+        // serialize→deserialize (a process restart) and resumes correctly.
+        let g = wait_graph();
+        let mut exec = MockExec::default();
+        let DriveResult::Suspended(s) = drive(&g, &mut exec, 100) else {
+            panic!("suspend");
+        };
+        let json = serde_json::to_string(&s.state).expect("state serializes");
+        let restored: GraphState = serde_json::from_str(&json).expect("state restores");
+        assert_eq!(restored.at, "w");
+        let DriveResult::Done(out) =
+            resume(&g, restored, &mut exec, WaitOutcome::Updated(json!(42)))
+        else {
+            panic!("a restored state resumes");
+        };
+        assert_eq!(out.result, json!(42), "resumed from the persisted slice");
+    }
+
+    #[test]
+    fn a_reactive_wait_loop_survives_far_past_the_visit_cap() {
+        // tick (agent, writes n) → w (wait, updated → tick [back-edge], timeout → done).
+        // A back-edge into a Wait is a long-lived reactive loop: resuming it far more
+        // than MAX_VISITS_PER_NODE times must NOT trip LoopDetected/Stalled, because a
+        // Wait is a checkpoint that resets per-event bookkeeping.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "tick",
+            "nodes": {
+                "tick": {"kind": "agent", "instruction": "tick", "writes": "n", "edges": {"ok": "w"}},
+                "w": {"kind": "wait", "on_uri": "mcp://inbox", "writes": "evt", "timeout_ms": 60000, "edges": {"updated": "tick", "timeout": "done"}},
+                "done": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec {
+            counting: Some("tick".into()),
+            ..MockExec::default()
+        };
+        let mut result = drive(&g, &mut exec, 1_000_000);
+        let events = MAX_VISITS_PER_NODE as usize + 50;
+        for i in 0..events {
+            let DriveResult::Suspended(s) = result else {
+                panic!("iteration {i}: reactive loop must still be waiting, got {result:?}");
+            };
+            assert_eq!(s.on_uri, "mcp://inbox");
+            result = resume(&g, s.state, &mut exec, WaitOutcome::Updated(json!(i)));
+        }
+        // Alive after 150 events — neither LoopDetected nor Stalled nor Exhausted.
+        assert!(
+            matches!(result, DriveResult::Suspended(_)),
+            "a reactive Wait loop runs long past the visit cap: {result:?}"
+        );
     }
 }

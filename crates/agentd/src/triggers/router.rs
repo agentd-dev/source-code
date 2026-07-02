@@ -64,6 +64,11 @@ enum CondOp {
     Lt(f64),
     /// A string that contains the substring, or an array containing the string.
     Contains(String),
+    /// A CEL expression over the WHOLE content, exposed as `content` (feature
+    /// `cel`): richer wake predicates (`content.items.exists(i, i.urgent)`)
+    /// mean fewer spurious agent wake-ups. Compile-checked at parse; a build
+    /// without the feature refuses to arm it.
+    Cel(String),
 }
 
 impl Condition {
@@ -105,6 +110,17 @@ impl Condition {
                     .and_then(|x| x.as_str().map(str::to_string))
                     .ok_or_else(|| "condition op 'contains' requires a string 'value'".to_string())?,
             ),
+            "cel" => {
+                let expr = v
+                    .get("expr")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "condition op 'cel' requires a string 'expr'".to_string())?;
+                // Compile-checked NOW — a malformed (or feature-less) predicate
+                // must refuse to arm, never mis-evaluate later.
+                crate::cel::compile_check(expr)
+                    .map_err(|e| format!("condition 'cel': {e}"))?;
+                CondOp::Cel(expr.to_string())
+            }
             other => return Err(format!("unknown condition op: {other:?}")),
         };
         Ok(Condition { pointer, op })
@@ -126,6 +142,11 @@ impl Condition {
                 Some(Value::Array(arr)) => arr.iter().any(|e| e.as_str() == Some(s.as_str())),
                 _ => false,
             },
+            // The expression sees the value AT the pointer (default: the whole
+            // document) as `content`. Errors/non-bool are a non-match.
+            CondOp::Cel(expr) => at.is_some_and(|v| {
+                crate::cel::eval_bool(expr, &[("content", v)]).unwrap_or(false)
+            }),
         }
     }
 }
@@ -482,6 +503,33 @@ mod tests {
         assert!(Condition::from_json(&json!({"op": "eq"})).is_err());
         assert!(Condition::from_json(&json!({"op": "nope"})).is_err());
         assert!(Condition::from_json(&json!({"op": "gt", "value": "x"})).is_err());
+    }
+
+    #[cfg(feature = "cel")]
+    #[test]
+    fn a_cel_condition_gates_on_rich_content_predicates() {
+        let c = Condition::from_json(
+            &serde_json::json!({"op": "cel", "expr": "content.items.exists(i, i.urgent)"}),
+        )
+        .unwrap();
+        assert!(c.eval(&serde_json::json!({"items": [{"urgent": false}, {"urgent": true}]})));
+        assert!(!c.eval(&serde_json::json!({"items": [{"urgent": false}]})));
+        // With a pointer, the expression sees the value AT the pointer.
+        let c = Condition::from_json(
+            &serde_json::json!({"pointer": "/stats", "op": "cel", "expr": "content.done * 2 >= content.total"}),
+        )
+        .unwrap();
+        assert!(c.eval(&serde_json::json!({"stats": {"done": 5, "total": 9}})));
+        // A malformed expression refuses to ARM (parse error, not a dud route).
+        assert!(Condition::from_json(&serde_json::json!({"op": "cel", "expr": "a >=< 1"})).is_err());
+    }
+
+    #[cfg(not(feature = "cel"))]
+    #[test]
+    fn a_cel_condition_is_refused_without_the_feature() {
+        let e = Condition::from_json(&serde_json::json!({"op": "cel", "expr": "content.x"}))
+            .unwrap_err();
+        assert!(e.contains("'cel' build feature"), "{e}");
     }
 
     #[test]

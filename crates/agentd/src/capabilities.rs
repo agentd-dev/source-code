@@ -110,6 +110,9 @@ fn build_features() -> Vec<&'static str> {
     if cfg!(feature = "workflow") {
         f.push("workflow");
     }
+    if cfg!(feature = "cel") {
+        f.push("cel");
+    }
     f
 }
 
@@ -493,6 +496,7 @@ mod tests {
                 "metrics" => cfg!(feature = "metrics"),
                 "otel" => cfg!(feature = "otel"),
                 "workflow" => cfg!(feature = "workflow"),
+                "cel" => cfg!(feature = "cel"),
                 other => panic!("unexpected build feature {other}"),
             };
             assert!(present, "reported feature {f} is not compiled in");

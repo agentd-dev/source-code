@@ -271,6 +271,48 @@ unresolvable reference makes the predicate `false` (fail-closed, even for
 A predicate that can never hold (an empty `in` set, inverted `len` bounds) is
 rejected at define time, not silently routed around.
 
+### CEL expressions (`--features cel`)
+
+A build with the `cel` feature adds [CEL](https://cel.dev) — the expression
+language Kubernetes admission policies and Envoy use — wherever the structural
+ops run out (arithmetic, string functions, collection macros). CEL is
+non-Turing-complete, does no I/O, and always terminates, which makes it the one
+form of "code" a model can safely author and agentd can immediately execute.
+Three surfaces:
+
+- **Branch predicates** — `{"op": "cel", "expr": "..."}` (composable with
+  `all`/`any`/`not`); every blackboard key is a top-level identifier:
+  ```json
+  { "op": "cel", "expr": "results.filter(r, !has(r.error)).size() >= results.size() * 9 / 10" }
+  ```
+  Must return a bool; a non-bool, an eval error, or an unresolvable reference
+  is `false` (fail-closed).
+- **Computed `assign`** — `"expr"` instead of `"value"`: filter, map,
+  aggregate, and assemble deterministically, with zero model tokens:
+  ```json
+  { "kind": "assign", "expr": "scan.items.filter(i, i.ok).map(i, i.id)", "writes": "ids",
+    "edges": { "ok": "fan" } }
+  ```
+- **`infer` value constraints** — `"check"` runs over the (schema-valid)
+  answer's fields; a type-correct but out-of-bounds answer is re-asked with the
+  constraint named:
+  ```json
+  { "kind": "infer", "prompt": "score it", "schema": { "score": "number" },
+    "check": "score >= 0.0 && score <= 1.0", "writes": "s", "edges": { "ok": "next", "error": "manual" } }
+  ```
+
+Reactive subscriptions get the same power: a wake condition may be
+`{"op": "cel", "expr": "content.items.exists(i, i.urgent)"}` (the resource
+content — or the value at the condition's `pointer` — is `content`), so a
+daemon wakes only for the states it actually cares about.
+
+Every expression is compile-checked at define/parse time (length-capped at
+4 KiB), and a build **without** the feature rejects CEL right there with a
+clear message — never a silent mis-evaluation. JSON numbers are normalized to
+CEL ints/floats so `count + 1 > limit` behaves the way it reads. This is the
+one gated exception to the zero-dependency default build; `--features cel` is
+opt-in precisely so the moat holds everywhere else.
+
 ### Tier 2 — a semantic branch (opt-in)
 
 When the deterministic cases all miss and a `branch` carries a `semantic` spec,

@@ -143,7 +143,7 @@ pub fn run_reactive(
     #[cfg_attr(not(feature = "hot-reload"), allow(unused_mut))]
     let mut server_order: Vec<String> = Vec::new();
     for spec in &cfg.mcp_servers {
-        match McpClient::from_spec(spec, Duration::from_secs(60))
+        match crate::mcp::from_spec(spec, Duration::from_secs(60))
             .and_then(|mut c| c.initialize().map(|()| c))
         {
             Ok(c) => {
@@ -1387,7 +1387,7 @@ fn apply_mcp_server_diff(
         // must not block the reactor (and starve the liveness heartbeat) for the
         // full ~60s. A timeout is a contained `mcp.connect.fail` — the server is
         // simply absent (RFC 0007 / RFC 0017 §5.3 contained-failure), never fatal.
-        match McpClient::from_spec(spec, Duration::from_secs(60)).and_then(
+        match crate::mcp::from_spec(spec, Duration::from_secs(60)).and_then(
             |mut c| {
                 c.initialize_within(crate::obs::health::management_timeout())
                     .map(|()| c)

@@ -13,9 +13,9 @@
 //! long-lived `GET` SSE stream, opened lazily on the first subscribe — a
 //! background thread pumps them into a queue [`Self::drain_notifications`] serves.
 
-use crate::json::{self, RpcError};
-use ::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
-use crate::wire::mcp::{
+use crate::rpc::{self, RpcError};
+use crate::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
+use crate::wire::{
     CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
     GetPromptParams, GetPromptResult, Implementation, InitializeParams, InitializeResult,
     LATEST_MODERN_VERSION, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
@@ -26,7 +26,7 @@ use crate::wire::mcp::{
     is_modern_error_code, method, negotiate_version,
 };
 // The modern (stateless) request builders live alongside `wire` in the mcp crate.
-use ::mcp::modern;
+use crate::modern;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -60,7 +60,7 @@ impl fmt::Display for McpError {
 }
 impl std::error::Error for McpError {}
 
-type NotifQueue = Arc<Mutex<VecDeque<json::Notification>>>;
+type NotifQueue = Arc<Mutex<VecDeque<rpc::Notification>>>;
 
 /// A connected (and, after [`McpClient::initialize`], handshaken) remote MCP
 /// server over Streamable HTTP.
@@ -95,6 +95,10 @@ pub struct McpClient {
     /// `{"agent/run_id": …}`) so backing services can dedupe retries
     /// (RFC 0011 §idempotency).
     tool_meta: Option<Value>,
+    /// The client identity sent in `initialize` (legacy) / every request's `_meta`
+    /// (modern). Defaults to this crate's identity; the host overrides it via
+    /// [`Self::with_client_info`] (agentd sets its own name + version).
+    client_info: Implementation,
 }
 
 /// The background notification-stream thread + its stop flag (RFC 0004 §GET SSE).
@@ -136,33 +140,27 @@ impl McpClient {
             era: Era::Legacy,
             timeout,
             tool_meta: None,
+            client_info: Implementation {
+                name: "agentd".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                title: None,
+            },
         })
     }
 
-    /// Build a client from a declared [`McpServerSpec`]: connect to its remote
-    /// `endpoint` over Streamable HTTP, resolving its secret-free auth header
-    /// templates at this moment. Call [`Self::initialize`] before any call.
-    pub fn from_spec(
-        spec: &crate::config::McpServerSpec,
-        timeout: Duration,
-    ) -> Result<McpClient, McpError> {
-        if spec.endpoint.trim().is_empty() {
-            return Err(McpError::Transport(format!(
-                "mcp server '{}' has no endpoint",
-                spec.name
-            )));
-        }
-        let headers =
-            crate::mcp::auth::resolve_headers(&spec.headers).map_err(McpError::Transport)?;
-        McpClient::connect(&spec.name, &spec.endpoint, headers, timeout)
+    /// Override the client identity sent to servers (name + version). agentd sets
+    /// its own; other hosts of the `mcp` crate set theirs.
+    pub fn with_client_info(mut self, info: Implementation) -> Self {
+        self.client_info = info;
+        self
     }
 
     /// Attach a mutual-TLS client identity (a mounted cert chain + key) for a
     /// `https://` endpoint. A no-op on non-TLS endpoints (the identity is only
     /// presented during the TLS handshake). RFC 0012 §3.7: the key never leaves
-    /// the process (see [`crate::net::tls`]).
+    /// the process (see [`net::tls`]).
     #[cfg(feature = "tls")]
-    pub fn with_identity(mut self, identity: crate::net::tls::ClientIdentity) -> Self {
+    pub fn with_identity(mut self, identity: net::tls::ClientIdentity) -> Self {
         // The Arc is unshared here (called right after connect, before the event
         // thread), so get_mut succeeds; a no-op if it were somehow already shared.
         if let Some(h) = Arc::get_mut(&mut self.http) {
@@ -236,12 +234,12 @@ impl McpClient {
             .clone()
             .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
         let mut params = json!({});
-        modern::inject_client_meta(&mut params, &version, &client_info());
+        modern::inject_client_meta(&mut params, &version, &self.client_info);
         self.http.set_protocol_version(version);
         let routing = modern::routing_headers(method::SERVER_DISCOVER, &params);
         let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let req = json::Request::new(id, method::SERVER_DISCOVER, Some(params));
+        let req = rpc::Request::new(id, method::SERVER_DISCOVER, Some(params));
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode server/discover: {e}")))?;
         let notifications = &self.notifications;
@@ -253,7 +251,7 @@ impl McpClient {
             // HTTP 2xx: a discover result, or a JSON-RPC error (a legacy server that
             // doesn't know server/discover answers with a generic error).
             Ok(Some(msg)) => {
-                let resp: json::Response = serde_json::from_value(msg).map_err(|e| {
+                let resp: rpc::Response = serde_json::from_value(msg).map_err(|e| {
                     McpError::Transport(format!("bad server/discover reply on '{}': {e}", self.name))
                 })?;
                 if let Some(err) = resp.error {
@@ -310,7 +308,7 @@ impl McpClient {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities::default(),
-            client_info: client_info(),
+            client_info: self.client_info.clone(),
         };
         let result =
             self.request_with_timeout(method::INITIALIZE, Some(to_value(&params)), timeout)?;
@@ -662,12 +660,12 @@ impl McpClient {
             .clone()
             .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
         let mut params = json!({ "notifications": { "resourceSubscriptions": uris } });
-        modern::inject_client_meta(&mut params, &version, &client_info());
+        modern::inject_client_meta(&mut params, &version, &self.client_info);
         let routing: Vec<(String, String)> = modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect();
-        let req = json::Request::new(id, method::SUBSCRIPTIONS_LISTEN, Some(params));
+        let req = rpc::Request::new(id, method::SUBSCRIPTIONS_LISTEN, Some(params));
         let body = match serde_json::to_vec(&req) {
             Ok(b) => b,
             Err(_) => return,
@@ -730,7 +728,7 @@ impl McpClient {
     /// Drain any notifications queued since the last drain (e.g.
     /// `notifications/resources/updated`). The reactive router
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
-    pub fn drain_notifications(&self) -> Vec<json::Notification> {
+    pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
         let mut q = self.notifications.lock().unwrap_or_else(|e| e.into_inner());
         q.drain(..).collect()
     }
@@ -773,7 +771,7 @@ impl McpClient {
         let (params, routing) = if self.era == Era::Modern {
             let mut p = params.unwrap_or_else(|| json!({}));
             let version = self.protocol_version.as_deref().unwrap_or(LATEST_MODERN_VERSION);
-            modern::inject_client_meta(&mut p, version, &client_info());
+            modern::inject_client_meta(&mut p, version, &self.client_info);
             let mut routing: Vec<(String, String)> = modern::routing_headers(method, &p)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
@@ -799,7 +797,7 @@ impl McpClient {
             (params, Vec::new())
         };
         let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let req = json::Request::new(id, method, params);
+        let req = rpc::Request::new(id, method, params);
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
         let notifications = &self.notifications;
@@ -812,7 +810,7 @@ impl McpClient {
             .ok_or_else(|| {
                 McpError::Transport(format!("no response to {method} on '{}'", self.name))
             })?;
-        let resp: json::Response = serde_json::from_value(msg).map_err(|e| {
+        let resp: rpc::Response = serde_json::from_value(msg).map_err(|e| {
             McpError::Transport(format!("bad {method} response on '{}': {e}", self.name))
         })?;
         match resp.error {
@@ -822,7 +820,7 @@ impl McpClient {
     }
 
     fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
-        let note = json::Notification::new(method, params);
+        let note = rpc::Notification::new(method, params);
         let body = serde_json::to_vec(&note)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
         let notifications = &self.notifications;
@@ -864,20 +862,10 @@ enum Probe {
     Legacy,
 }
 
-/// agentd's client identity — sent in every request's `_meta` (modern) or in the
-/// `initialize` handshake (legacy).
-fn client_info() -> Implementation {
-    Implementation {
-        name: "agentd".into(),
-        version: crate::VERSION.into(),
-        title: None,
-    }
-}
-
 /// Parse a JSON-RPC error object out of a raw HTTP error-response body (a modern
 /// server returns one for an unsupported version / header mismatch).
 fn rpc_error_from_body(body: &[u8]) -> Option<RpcError> {
-    serde_json::from_slice::<json::Response>(body)
+    serde_json::from_slice::<rpc::Response>(body)
         .ok()
         .and_then(|r| r.error)
 }
@@ -927,8 +915,8 @@ fn http_err(name: &str, method: &str, e: HttpError) -> McpError {
 /// stream (a JSON-RPC message with no matching request id). Non-notification
 /// frames (e.g. a server→client request) that don't deserialize are dropped — v1
 /// declares no client capabilities, so there is nothing to answer.
-fn queue_notification(queue: &Mutex<VecDeque<json::Notification>>, n: Value) {
-    if let Ok(note) = serde_json::from_value::<json::Notification>(n) {
+fn queue_notification(queue: &Mutex<VecDeque<rpc::Notification>>, n: Value) {
+    if let Ok(note) = serde_json::from_value::<rpc::Notification>(n) {
         queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1000,7 +988,7 @@ fn pump_events(sse: &mut EventStream, queue: &NotifQueue, stop: &AtomicBool) {
         }
         match sse.next_event() {
             Ok(Some(ev)) => {
-                if let Ok(note) = serde_json::from_str::<json::Notification>(&ev.data) {
+                if let Ok(note) = serde_json::from_str::<rpc::Notification>(&ev.data) {
                     queue
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1208,27 +1196,5 @@ mod tests {
         assert_eq!(&buf, b"hi");
         h.join().unwrap();
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn management_timeout_const_is_under_the_liveness_window() {
-        // The pinned invariant (RFC 0016 §10): the reactor-thread management-call
-        // timeout MUST stay under the `/healthz` + health-file liveness staleness
-        // window, or a single management call could itself age the heartbeat past
-        // the threshold — the starvation the short bound exists to prevent. The
-        // authority is the compile-time `const _: () = assert!(...)` in `obs::health`
-        // (it fails the BUILD if the invariant is broken); this test documents the
-        // relationship where a reader of the client sees it, via the runtime
-        // `Duration` accessor (not a const-foldable comparison).
-        let mgmt = crate::obs::health::management_timeout();
-        let window = Duration::from_millis(crate::obs::health::LIVENESS_STALE_AFTER_MS);
-        assert!(
-            mgmt < window,
-            "management timeout {mgmt:?} must be under the liveness window {window:?}"
-        );
-        assert_eq!(
-            mgmt,
-            Duration::from_millis(crate::obs::health::MANAGEMENT_TIMEOUT_MS),
-        );
     }
 }

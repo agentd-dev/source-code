@@ -23,7 +23,7 @@ fn bogus_payload() -> SpawnPayload {
         output_contract: None,
         context_seed: Vec::new(),
         intelligence: IntelConfig {
-            uri: "unix:/nonexistent/agentd-subagent-test.sock".into(),
+            uri: "http://127.0.0.1:9".into(),
             token: None,
             model: Some("test-model".into()),
         },

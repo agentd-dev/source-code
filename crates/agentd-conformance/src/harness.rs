@@ -306,7 +306,7 @@ impl Harness {
                 "--instruction",
                 "stand by",
                 "--intelligence",
-                "unix:/nonexistent/agentd-conf.sock",
+                "http://127.0.0.1:9",
                 "--serve-mcp",
             ])
             .arg(format!("unix:{}", sock.display()))

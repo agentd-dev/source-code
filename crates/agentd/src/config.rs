@@ -1929,24 +1929,37 @@ fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate one endpoint URI's scheme (RFC 0018 §3.1). The *scheme shape* is the
-/// startup gate (a bad scheme on any element is exit 2); a transport this build
-/// can't dial (`https:` without `tls`, `vsock:` without `vsock`) is surfaced by
-/// the client as `Unsupported` at dial time — matching the established
-/// single-endpoint contract (so a manifest/validate-config probe of an
-/// https endpoint on a no-tls build still passes, as before this RFC).
+/// Validate one endpoint URI's scheme (RFC 0018 §3.1). Intelligence is
+/// **HTTPS-only** (target-vision pivot, Phase 1): `https://host[:port][/path]`,
+/// with plaintext `http://` admitted only for a loopback host (the dev/test
+/// carve-out — the built-in mock LLM). The *scheme shape* is the startup gate
+/// (a bad scheme on any element is exit 2); a transport this build can't dial
+/// (`https:` without `tls`) is surfaced by the client as `Unsupported` at dial
+/// time — so a manifest/validate-config probe of an https endpoint on a no-tls
+/// build still passes, as before.
 fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
-    let ok = uri.starts_with("https://")
-        || uri.starts_with("unix:")
-        || uri.starts_with("vsock:")
-        || uri.starts_with("http://"); // dev only; the client warns
-    if ok {
-        Ok(())
-    } else {
-        Err(usage(format!(
-            "intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: {uri})"
-        )))
+    if uri.starts_with("https://") {
+        return Ok(());
     }
+    if let Some(rest) = uri.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        // Split off the port: bracketed IPv6 keeps its brackets for the
+        // loopback classifier; bare host:port loses the port.
+        let host = if authority.starts_with('[') {
+            authority.split(']').next().map_or(authority, |h| &h[1..])
+        } else {
+            authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+        };
+        if crate::net::http::is_loopback_host(host) {
+            return Ok(());
+        }
+        return Err(usage(format!(
+            "plaintext http:// intelligence is allowed for loopback only (dev); use https:// (got: {uri})"
+        )));
+    }
+    Err(usage(format!(
+        "intelligence endpoint must be https://host[:port][/path] (got: {uri})"
+    )))
 }
 
 /// Probe each listed endpoint's per-endpoint token *file* env var (RFC 0018
@@ -2272,12 +2285,12 @@ fn help_text() -> String {
         "agentd {ver} — a minimal, MCP-native, reactive agent\n\
          \n\
          USAGE:\n\
-         \x20 agentd --instruction <TEXT> --intelligence <URI> [--mcp name=cmd ...] [options]\n\
+         \x20 agentd --instruction <TEXT> --intelligence <URI> [--mcp name=endpoint ...] [options]\n\
          \n\
          REQUIRED:\n\
          \x20 --instruction <TEXT>        the task (or INSTRUCTION env)\n\
          \x20 --instruction-file <PATH>   read the instruction from a file\n\
-         \x20 --intelligence <URI>        unix:/path | https://host/... | vsock:cid:port\n\
+         \x20 --intelligence <URI>        https://host[:port][/path] (comma-list = failover order; http:// loopback-only for dev)\n\
          \n\
          INTELLIGENCE:\n\
          \x20 --intelligence-token <T>    bearer/key (or AGENT_INTELLIGENCE_TOKEN)\n\
@@ -2348,18 +2361,18 @@ mod tests {
     #[test]
     fn flags_override_env() {
         let env = vec![
-            ("AGENTD_INTELLIGENCE".into(), "unix:/run/intel.sock".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
             ("INSTRUCTION".into(), "from-env".into()),
         ];
         let c = Config::load(&args(&["--instruction", "from-flag"]), &env).unwrap();
         assert_eq!(c.instruction.as_deref(), Some("from-flag"));
-        assert_eq!(c.intelligence.as_deref(), Some("unix:/run/intel.sock"));
+        assert_eq!(c.intelligence.as_deref(), Some("https://intel.example"));
     }
 
     fn base_env() -> Vec<(String, String)> {
         vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ]
     }
 
@@ -2369,12 +2382,12 @@ mod tests {
         // the branded `AGENTD_*` one is — fed through the single envmap normalization.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENT_INTELLIGENCE".into(), "unix:/neutral".into()),
+            ("AGENT_INTELLIGENCE".into(), "https://neutral.example".into()),
             ("AGENT_RUN_ID".into(), "run-neutral".into()),
             ("AGENT_MAX_STEPS".into(), "42".into()),
         ];
         let c = Config::load(&args(&[]), &env).unwrap();
-        assert_eq!(c.intelligence.as_deref(), Some("unix:/neutral"));
+        assert_eq!(c.intelligence.as_deref(), Some("https://neutral.example"));
         assert_eq!(c.run_id, "run-neutral");
         assert_eq!(c.max_steps, 42);
     }
@@ -2385,11 +2398,11 @@ mod tests {
         // and the branded-only path still works (neutral merely also accepted).
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/branded".into()),
-            ("AGENT_INTELLIGENCE".into(), "unix:/neutral".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://branded.example".into()),
+            ("AGENT_INTELLIGENCE".into(), "https://neutral.example".into()),
         ];
         let c = Config::load(&args(&[]), &env).unwrap();
-        assert_eq!(c.intelligence.as_deref(), Some("unix:/branded"));
+        assert_eq!(c.intelligence.as_deref(), Some("https://branded.example"));
     }
 
     #[test]
@@ -2705,7 +2718,7 @@ mod tests {
     fn claim_route_subscribes_its_uri_and_requires_declared_server() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         // A claim route against a declared server validates and folds its URI
         // into the subscribe set (so it is subscribed + routed as a Spawn).
@@ -2749,7 +2762,7 @@ mod tests {
     fn claim_route_on_a_continue_uri_is_a_continue_claim_not_a_spawn() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         // A `--claim` URI that is ALSO a `--continue` URI is a continue-claim:
         // marked `continue_session`, kept in `continue_subscribe` (routed as
@@ -2806,7 +2819,7 @@ mod tests {
     fn claim_route_requires_cluster_feature() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         let e = Config::load(
             &args(&[
@@ -2866,7 +2879,7 @@ mod tests {
         let mcp_env = || {
             vec![
                 ("INSTRUCTION".to_string(), "x".to_string()),
-                ("AGENTD_INTELLIGENCE".to_string(), "unix:/x".to_string()),
+                ("AGENTD_INTELLIGENCE".to_string(), "https://intel.example".to_string()),
             ]
         };
         let reactive = |extra: &[&str]| -> Vec<String> {
@@ -2915,7 +2928,7 @@ mod tests {
         // claim-pulls via the EXISTING machinery, no new path.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         let c = Config::load(
             &args(&[
@@ -2964,7 +2977,7 @@ mod tests {
     fn standby_requires_reactive_and_a_declared_server() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         // --assign-from naming an undeclared server is exit 2 (clear message).
         let e = Config::load(
@@ -3013,7 +3026,7 @@ mod tests {
         // A standby directive must NOT be silently ignored without the feature.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         let e = Config::load(&args(&["--mode", "reactive", "--standby"]), &env).unwrap_err();
         match e {
@@ -3031,7 +3044,7 @@ mod tests {
         // surfaces.standby + agentd://capacity.standby both reflect cfg.standby.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         let c = Config::load(
             &args(&[
@@ -3061,7 +3074,7 @@ mod tests {
 
     #[test]
     fn missing_instruction_is_usage_error() {
-        let env = vec![("AGENTD_INTELLIGENCE".into(), "unix:/x".into())];
+        let env = vec![("AGENTD_INTELLIGENCE".into(), "https://intel.example".into())];
         let e = Config::load(&[], &env).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
     }
@@ -3109,7 +3122,7 @@ mod tests {
     fn reactive_requires_subscribe() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         let e = Config::load(&args(&["--mode", "reactive"]), &env).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
@@ -3126,7 +3139,7 @@ mod tests {
     fn mcp_spec_parsing() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         // A `--mcp name=<endpoint>` is the Streamable HTTP transport (the only one).
         let c = Config::load(&args(&["--mcp", "fs=https://mcp.example.com/mcp"]), &env).unwrap();
@@ -3156,7 +3169,7 @@ mod tests {
     fn mcp_endpoint_is_required_and_validated() {
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         // A valid endpoint spec loads clean.
         let mut c =
@@ -3192,12 +3205,21 @@ mod tests {
 
     #[test]
     fn multi_endpoint_list_accepts_ordered_comma_list() {
-        // RFC 0018 §3.1: --intelligence is an ORDERED comma-list (unix needs no
-        // build feature, so this validates on the default test build).
+        // RFC 0018 §3.1: --intelligence is an ORDERED comma-list.
         let env = vec![("INSTRUCTION".into(), "x".into())];
-        let c = Config::load(&args(&["--intelligence", "unix:/a,unix:/b,unix:/c"]), &env).unwrap();
+        let c = Config::load(
+            &args(&[
+                "--intelligence",
+                "https://a.example,https://b.example,https://c.example",
+            ]),
+            &env,
+        )
+        .unwrap();
         // the raw scalar is preserved; the client parses it into N endpoints.
-        assert_eq!(c.intelligence.as_deref(), Some("unix:/a,unix:/b,unix:/c"));
+        assert_eq!(
+            c.intelligence.as_deref(),
+            Some("https://a.example,https://b.example,https://c.example")
+        );
     }
 
     #[test]
@@ -3205,7 +3227,7 @@ mod tests {
         // A bad scheme on ANY element rejects the whole list (RFC 0018 §3.1).
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(
-            &args(&["--intelligence", "unix:/a,ftp://nope,unix:/c"]),
+            &args(&["--intelligence", "https://a.example,ftp://nope,https://c.example"]),
             &env,
         )
         .unwrap_err();
@@ -3398,20 +3420,20 @@ mod tests {
     #[test]
     fn debug_redacts_credential_bearing_intelligence_uri() {
         // The raw `--intelligence` URI can carry inline creds
-        // (`http://user:pass@host`). The Debug impl must show the SCHEME only, never
-        // the userinfo/host/path (RFC 0012 §3.7 — mirror effective_view).
+        // (`https://user:pass@host`). The Debug impl must show the SCHEME only,
+        // never the userinfo/host/path (RFC 0012 §3.7 — mirror effective_view).
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
             (
                 "AGENTD_INTELLIGENCE".into(),
-                "http://alice:hunter2@internal.example/v1".into(),
+                "https://alice:hunter2@internal.example/v1".into(),
             ),
         ];
         let c = Config::load(&[], &env).unwrap();
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("hunter2"), "creds leaked: {dbg}");
         assert!(!dbg.contains("internal.example"), "host leaked: {dbg}");
-        assert!(dbg.contains("http:<redacted>"), "scheme missing: {dbg}");
+        assert!(dbg.contains("https:<redacted>"), "scheme missing: {dbg}");
     }
 
     #[test]
@@ -3720,7 +3742,7 @@ mod tests {
         // No INSTRUCTION at all: --validate-config still produces a verdict (it
         // does not need an instruction to *run*); the missing-instruction shows
         // up as an invalid diagnostic, not a crash.
-        let env = vec![("AGENTD_INTELLIGENCE".into(), "unix:/x".into())];
+        let env = vec![("AGENTD_INTELLIGENCE".into(), "https://intel.example".into())];
         let v = match Config::load(&args(&["--validate-config"]), &env).unwrap_err() {
             ConfigError::Validate(v) => v,
             other => panic!("expected Validate, got {other:?}"),
@@ -3952,7 +3974,7 @@ mod tests {
                 }]
             },
             // RFC 0018 §5.1: an endpoint repoint is a reloadable hot-swap.
-            |c: &mut Config| c.intelligence = Some("unix:/other.sock".into()),
+            |c: &mut Config| c.intelligence = Some("https://other.example".into()),
             |c: &mut Config| c.model_swap = SwapPolicy::RestartTurn,
         ] {
             let mut new = running.clone();

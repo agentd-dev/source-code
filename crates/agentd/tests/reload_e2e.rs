@@ -52,7 +52,7 @@ fn run_reload(initial_file: &str, new_file: &str) -> (Option<i32>, String) {
             "--instruction",
             "react",
             "--intelligence",
-            "unix:/nonexistent-reload.sock",
+            "http://127.0.0.1:9",
             "--subscribe",
             "file:///in.json",
             "--mcp",
@@ -175,8 +175,8 @@ fn sighup_applies_an_intelligence_repoint_as_a_hot_swap() {
     // The endpoints are unreachable (no live LLM), but the reload BEHAVIOUR — the
     // swap is accepted, the daemon stays up, drains to 0 — is fully observable.
     let initial =
-        r#"{ "intelligence": "unix:/nonexistent-a.sock", "model": "m", "log_level": "info" }"#;
-    let changed = r#"{ "intelligence": "unix:/nonexistent-b.sock,unix:/nonexistent-c.sock", "model": "m", "model_swap": "restart-turn", "log_level": "info" }"#;
+        r#"{ "intelligence": "http://127.0.0.2:9", "model": "m", "log_level": "info" }"#;
+    let changed = r#"{ "intelligence": "http://127.0.0.3:9,http://127.0.0.4:9", "model": "m", "model_swap": "restart-turn", "log_level": "info" }"#;
     let (code, out) = run_reload_intel_in_file(initial, changed);
 
     assert!(
@@ -196,11 +196,10 @@ fn sighup_applies_an_intelligence_repoint_as_a_hot_swap() {
         "the new swap policy should surface in the swap event:\n{out}"
     );
     // RFC 0012 §3.7: the endpoint URL must NEVER appear in the swap event/logs —
-    // only transport+index. The full `unix:/...` socket path must not leak.
-    // (The mock URI in `--subscribe` is file:///in.json, distinct from the intel
-    // sockets, so finding the intel path would be a real leak.)
+    // only transport+index. The new list's distinct loopback hosts (127.0.0.3/4)
+    // appear nowhere else in this run, so finding one would be a real leak.
     assert!(
-        !out.contains("nonexistent-b.sock"),
+        !out.contains("127.0.0.3"),
         "the endpoint URL leaked into the telemetry:\n{out}"
     );
     assert_eq!(code, Some(0), "expected graceful exit 0; stderr:\n{out}");
@@ -248,7 +247,7 @@ fn run_reload_mcp_in_file(initial_file: &str, new_file: &str) -> (Option<i32>, S
             "--instruction",
             "react",
             "--intelligence",
-            "unix:/nonexistent-reload.sock",
+            "http://127.0.0.1:9",
             "--log-level",
             "info",
         ])
@@ -349,7 +348,7 @@ fn sighup_contained_failure_when_an_added_mcp_server_cannot_connect() {
         r#"{{ "model": "m", "log_level": "info",
             "mcp_servers": [
               {{ "name": "mockA", "endpoint": "{}" }},
-              {{ "name": "broken", "endpoint": "unix:/nonexistent/agentd-broken.sock" }}
+              {{ "name": "broken", "endpoint": "http://127.0.0.1:9" }}
             ],
             "subscribe": ["file:///a.json"] }}"#,
         mock_a.uri()

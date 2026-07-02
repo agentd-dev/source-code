@@ -387,7 +387,7 @@ mod tests {
         // public surface so the coupling is enforced without exposing the const.
         let env: Vec<(String, String)> = vec![
             ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "unix:/x".into()),
+            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
         ];
         let cfg = crate::config::Config::load(&[], &env).unwrap();
         let id = crate::identity::Identity::from_env(&cfg.run_id);

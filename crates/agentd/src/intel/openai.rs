@@ -10,8 +10,8 @@
 use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
 use serde_json::{Map, Value, json};
 
-/// The default endpoint path when the intelligence URI is a bare socket
-/// (`unix:`/`vsock:`) rather than a full `https://…` URL.
+/// The default endpoint path when the intelligence URL carries no explicit
+/// path (`https://host[:port]` with path `/`).
 pub const DEFAULT_PATH: &str = "/v1/chat/completions";
 
 /// The OpenAI-compatible model-list path (RFC 0018 §5.4 discovery probe). The

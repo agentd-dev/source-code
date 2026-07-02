@@ -7,6 +7,48 @@
 use std::process::Command;
 
 #[test]
+fn validate_config_rejects_retired_intelligence_transports() {
+    // HTTPS-only intelligence (target-vision pivot, Phase 1): the retired unix:/
+    // vsock: schemes and non-loopback plaintext http:// are exit 2 at the
+    // validation gate; https:// (and loopback http://) pass.
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let run = |intel: &str| {
+        Command::new(exe)
+            .args([
+                "--validate-config",
+                "--instruction",
+                "x",
+                "--intelligence",
+                intel,
+            ])
+            .output()
+            .expect("run agentd --validate-config")
+    };
+    for bad in [
+        "unix:/run/intel.sock",
+        "vsock:3:8080",
+        "http://intel.example:8080",
+    ] {
+        let out = run(bad);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad} must be exit 2; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for good in ["https://intel.example", "http://127.0.0.1:9"] {
+        let out = run(good);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{good} must validate; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn supervised_once_exits_4_on_unreachable_intel() {
     let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
@@ -14,7 +56,7 @@ fn supervised_once_exits_4_on_unreachable_intel() {
             "--instruction",
             "do a thing",
             "--intelligence",
-            "unix:/nonexistent/agentd-cli-test.sock",
+            "http://127.0.0.1:9",
             "--model",
             "m",
             "--log-level",
@@ -51,7 +93,7 @@ fn reactive_requires_a_subscription() {
             "--instruction",
             "hi",
             "--intelligence",
-            "unix:/x",
+            "http://127.0.0.1:9",
         ])
         .output()
         .expect("run agentd");
@@ -68,11 +110,11 @@ fn reactive_exits_6_when_required_mcp_server_is_down() {
             "--instruction",
             "react",
             "--intelligence",
-            "unix:/x",
+            "http://127.0.0.1:9",
             "--subscribe",
             "file:///in.json",
             "--mcp",
-            "bad=unix:/nonexistent/agentd-mcp.sock",
+            "bad=http://127.0.0.1:9",
             "--log-level",
             "error",
         ])

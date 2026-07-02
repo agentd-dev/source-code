@@ -238,7 +238,7 @@ mod tests {
                 content: "prior note".into(),
             }],
             intelligence: IntelConfig {
-                uri: "unix:/run/intel.sock".into(),
+                uri: "https://intel.example".into(),
                 token: Some("secret".into()),
                 model: Some("m".into()),
             },
@@ -346,7 +346,7 @@ mod tests {
         }
         // A frame with no model/token defaults to finish-on-old (an endpoint
         // repoint with no model change).
-        let minimal: SwapIntel = serde_json::from_str(r#"{"uri":"unix:/a"}"#).unwrap();
+        let minimal: SwapIntel = serde_json::from_str(r#"{"uri":"https://a.example"}"#).unwrap();
         assert_eq!(minimal.policy, SwapPolicy::FinishOnOld);
         assert!(minimal.model.is_none() && minimal.token.is_none());
     }

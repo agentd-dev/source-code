@@ -185,12 +185,12 @@ fn endpoint_count(uri: Option<&str>) -> usize {
     })
 }
 
-/// Map the intelligence URI to its structural transport scheme (RFC 0006),
-/// never leaking the URL itself. `None`/unrecognised ⇒ JSON `null`.
+/// Map the intelligence URI to its structural transport scheme, never leaking
+/// the URL itself. HTTPS-only (target-vision pivot): both `https://` and the
+/// loopback-dev `http://` report `"https"` — the structural transport is HTTP
+/// over TCP; TLS-ness is a deployment property. `None`/unrecognised ⇒ `null`.
 fn transport_scheme(uri: Option<&str>) -> Value {
     match uri {
-        Some(u) if u.starts_with("unix:") => json!("unix"),
-        Some(u) if u.starts_with("vsock:") => json!("vsock"),
         Some(u) if u.starts_with("https://") || u.starts_with("http://") => json!("https"),
         _ => Value::Null,
     }
@@ -541,7 +541,7 @@ mod tests {
                 ("INSTRUCTION", "x"),
                 (
                     "AGENTD_INTELLIGENCE",
-                    "vsock:3:8080,vsock:3:8081,unix:/run/i.sock",
+                    "https://gw-a.example,https://gw-b.example,https://gw-c.example",
                 ),
             ],
             &[],
@@ -549,7 +549,7 @@ mod tests {
         let id = Identity::from_env(&cfg.run_id);
         let m = manifest(&cfg, &id, false);
         assert_eq!(m["intelligence"]["endpoints"], json!(3));
-        assert_eq!(m["intelligence"]["transport"], json!("vsock"));
+        assert_eq!(m["intelligence"]["transport"], json!("https"));
     }
 
     #[test]
@@ -672,7 +672,7 @@ mod tests {
         let cfg = cfg_with(
             &[
                 ("INSTRUCTION", "x"),
-                ("AGENTD_INTELLIGENCE", "unix:/x"),
+                ("AGENTD_INTELLIGENCE", "https://intel.example"),
                 ("AGENTD_SERVE_MCP", "unix:/run/agentd.sock"),
             ],
             &[],
@@ -689,7 +689,7 @@ mod tests {
         let cfg = cfg_with(
             &[
                 ("INSTRUCTION", "x"),
-                ("AGENTD_INTELLIGENCE", "unix:/x"),
+                ("AGENTD_INTELLIGENCE", "https://intel.example"),
                 ("AGENTD_SERVE_MCP", "unix:/run/agentd.sock"),
                 ("AGENTD_METRICS_ADDR", ":9090"),
             ],
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn limits_block_carries_caps_and_config() {
         let cfg = cfg_with(
-            &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "unix:/x")],
+            &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "https://intel.example")],
             &["--max-depth", "3", "--max-steps", "99"],
         );
         let id = Identity::from_env(&cfg.run_id);
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn mcp_servers_carry_name_and_tags_not_command() {
         let cfg = cfg_with(
-            &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "unix:/x")],
+            &[("INSTRUCTION", "x"), ("AGENTD_INTELLIGENCE", "https://intel.example")],
             &[
                 "--mcp",
                 "vault=unix:/vault.sock",

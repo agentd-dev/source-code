@@ -37,7 +37,7 @@ fn parent_payload() -> SpawnPayload {
         output_contract: None,
         context_seed: Vec::new(),
         intelligence: IntelConfig {
-            uri: "unix:/nonexistent/agentd-orch-test.sock".into(),
+            uri: "http://127.0.0.1:9".into(),
             token: None,
             model: Some("m".into()),
         },

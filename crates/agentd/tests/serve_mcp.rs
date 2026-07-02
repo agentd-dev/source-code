@@ -125,7 +125,7 @@ fn a_peer_initializes_lists_and_calls_status() {
             "--instruction",
             "x",
             "--intelligence",
-            "unix:/nonexistent.sock",
+            "http://127.0.0.1:9",
             "--serve-mcp",
         ])
         .arg(format!("unix:{}", sock.display()))
@@ -264,7 +264,7 @@ fn async_spawn_returns_a_handle_and_tracks_the_run() {
     let sock = dir.path().join("agentd.sock");
     // intel unreachable → the served async run fails fast; we observe the
     // lifecycle (handle → running → failed) via the registry.
-    let mut child = start_idle_daemon(exe, "unix:/nonexistent.sock", &sock);
+    let mut child = start_idle_daemon(exe, "http://127.0.0.1:9", &sock);
 
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");
@@ -704,7 +704,7 @@ fn management_peer_drives_the_operator_surface() {
     let sock = dir.path().join("agentd.sock");
     // An idle reactive daemon that just serves the socket (intel unreachable; it
     // never reacts, so nothing contends with the management calls).
-    let mut child = start_idle_daemon(exe, "unix:/nonexistent.sock", &sock);
+    let mut child = start_idle_daemon(exe, "http://127.0.0.1:9", &sock);
 
     let stream = connect(&sock);
     let mut write = stream.try_clone().expect("clone");

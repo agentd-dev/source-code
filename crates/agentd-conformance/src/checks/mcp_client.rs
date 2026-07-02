@@ -81,7 +81,7 @@ fn record_client_requests(h: &Harness) -> Vec<Value> {
         "--instruction",
         "stand by",
         "--intelligence",
-        "unix:/nonexistent/agentd-conf.sock",
+        "http://127.0.0.1:9",
         "--mcp",
         &mcp,
         "--log-level",

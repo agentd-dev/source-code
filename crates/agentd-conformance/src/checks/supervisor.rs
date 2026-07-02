@@ -84,7 +84,7 @@ fn exit_validation(h: &Harness) -> Outcome {
         "--instruction",
         "hi",
         "--intelligence",
-        "unix:/x",
+        "http://127.0.0.1:9",
     ]);
     Outcome::require(
         r.code == Some(2),
@@ -97,7 +97,7 @@ fn exit_intel_down(h: &Harness) -> Outcome {
         "--instruction",
         "do a thing",
         "--intelligence",
-        "unix:/nonexistent/agentd-conf-intel.sock",
+        "http://127.0.0.1:9",
         "--model",
         "m",
         "--log-level",
@@ -119,11 +119,11 @@ fn exit_mcp_down(h: &Harness) -> Outcome {
         "--instruction",
         "react",
         "--intelligence",
-        "unix:/x",
+        "http://127.0.0.1:9",
         "--subscribe",
         "file:///in.json",
         "--mcp",
-        "bad=unix:/nonexistent/agentd-conf-mcp.sock",
+        "bad=http://127.0.0.1:9",
         "--log-level",
         "error",
     ]);
@@ -200,7 +200,7 @@ fn drain_on_sigterm(h: &Harness) -> Outcome {
         "--instruction",
         "stand by",
         "--intelligence",
-        "unix:/nonexistent/agentd-conf.sock",
+        "http://127.0.0.1:9",
         "--log-level",
         "warn",
     ]);

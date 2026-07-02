@@ -101,14 +101,14 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
-    /// Branch on the blackboard: the first `case` whose predicate holds wins;
-    /// otherwise `default`. `semantic` is an optional Tier-2 prompt-only constraint
-    /// (a single model judgement) layered ON the deterministic cases.
+    /// Branch on the blackboard: the first deterministic `case` whose predicate holds
+    /// wins (Tier 1, free). If NONE match and an opt-in [`SemanticSpec`] is present, a
+    /// single model judgement (Tier 2) picks a labelled choice; otherwise `default`.
     Branch {
         cases: Vec<Case>,
         default: NodeId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        semantic: Option<String>,
+        semantic: Option<SemanticSpec>,
     },
     /// Suspend until `on_uri` updates (or `timeout_ms` elapses); write the read
     /// content to `writes`. Emits `updated`/`timeout`. Costs nothing while idle.
@@ -149,6 +149,25 @@ pub struct Case {
     pub when: Pred,
     /// The node to go to when `when` holds (first matching case wins).
     pub goto: NodeId,
+}
+
+/// A Tier-2 semantic branch (pivot Phase 7 §c, opt-in). When a `Branch`'s
+/// deterministic cases all miss, the driver folds the `reads` blackboard values into
+/// `prompt` and runs ONE intelligence `complete()` call with NO tools; the model's
+/// free-text answer is matched (prompt-only, NOT constrained decode) against the
+/// `choices` labels and routes to that label's node. An answer matching no label
+/// falls through to the `Branch` default. Tokens are charged to the graph budget.
+/// This is where the graph consults *intelligence*, not just structured data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticSpec {
+    /// The natural-language question posed to the model.
+    pub prompt: String,
+    /// Blackboard keys folded into the prompt as context (whole values).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// The allowed answer labels → their target nodes. The model is asked to answer
+    /// with exactly one label; an unrecognised answer takes the `Branch` default.
+    pub choices: BTreeMap<String, NodeId>,
 }
 
 /// A Tier-1 deterministic predicate over the blackboard (pivot Phase 7 §c). Total
@@ -250,9 +269,13 @@ impl Node {
             | Node::Tool { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges.values().collect(),
-            Node::Branch { cases, default, .. } => {
+            Node::Branch { cases, default, semantic } => {
                 let mut t: Vec<&NodeId> = cases.iter().map(|c| &c.goto).collect();
                 t.push(default);
+                // A Tier-2 semantic branch can also route to any of its choice nodes.
+                if let Some(s) = semantic {
+                    t.extend(s.choices.values());
+                }
                 t
             }
             Node::Halt { .. } => Vec::new(),
@@ -534,6 +557,24 @@ mod tests {
         };
         assert!(!missing.eval(&bb));
         assert!(Pred::Not { pred: Box::new(missing) }.eval(&bb));
+    }
+
+    #[test]
+    fn a_semantic_branch_dangling_choice_is_rejected() {
+        // A Tier-2 choice target counts as an out-edge — a dangling one is caught.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "b",
+            "nodes": {
+                "b": {"kind": "branch", "cases": [], "default": "h", "semantic": {"prompt": "?", "choices": {"yes": "ghost"}}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("unknown node \"ghost\"")),
+            "{errs:?}"
+        );
     }
 
     #[test]

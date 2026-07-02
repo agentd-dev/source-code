@@ -50,6 +50,7 @@ pub const SELF_CONTROL_TOOLS: &[&str] = &[
     "schedule",
     "subscribe",
     "unsubscribe",
+    "await_resource",
     "a2a.delegate",
     "resource.read",
 ];

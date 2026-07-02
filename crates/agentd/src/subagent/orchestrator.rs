@@ -168,11 +168,56 @@ impl Orchestrator {
         self.subscriptions.push(SubscriptionRequest {
             uri: uri.to_string(),
             action,
+            condition: None,
         });
         self.log
             .info("self.subscribe", json!({"action": verb, "uri": uri}));
         (
             format!("requested: the daemon will {verb} {uri} after this run"),
+            false,
+        )
+    }
+
+    /// `subagent.await_resource` (pivot Phase 5.2) — the in-turn WAIT primitive.
+    /// Park on a resource until its content satisfies a predicate, then re-enter.
+    /// It registers a CONDITIONAL self-subscription (a warm continue-session keyed
+    /// by the URI, like `subscribe`, but the daemon fires it only when the
+    /// condition matches); the model then ends this turn, and the daemon re-enters
+    /// the warm session with the changed resource when the wait is satisfied. The
+    /// condition is validated HERE so a malformed predicate is a clear tool-result
+    /// refusal (never a crash, never a route that can't be armed). Bounded by the
+    /// same self-subscription budget. Effective only under a daemon (a one-shot run
+    /// has no reactor to re-enter — the request rides out on the `Outcome` and is
+    /// dropped with a logged warning, like any deferred effect).
+    fn await_resource(&mut self, args: &Value) -> (String, bool) {
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
+            return refused("maximum self-subscription changes reached for this run");
+        }
+        let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+        if uri.is_empty() {
+            return ("error: await_resource requires a non-empty 'uri'".into(), true);
+        }
+        let Some(cond) = args.get("condition") else {
+            return (
+                "error: await_resource requires a 'condition' object (e.g. {\"pointer\":\"/status\",\"op\":\"eq\",\"value\":\"ready\"})".into(),
+                true,
+            );
+        };
+        // Validate the predicate now so a bad one is refused as a tool result.
+        if let Err(e) = crate::triggers::router::Condition::from_json(cond) {
+            return (format!("error: invalid await_resource condition: {e}"), true);
+        }
+        self.subscriptions.push(SubscriptionRequest {
+            uri: uri.to_string(),
+            action: SubscriptionAction::Subscribe,
+            condition: Some(cond.clone()),
+        });
+        self.log
+            .info("self.await_resource", json!({"uri": uri, "condition": cond}));
+        (
+            format!(
+                "parked: the daemon will re-enter this session when {uri} satisfies the condition"
+            ),
             false,
         )
     }
@@ -649,6 +694,7 @@ impl SelfHandler for Orchestrator {
             t.push(schedule_tool_def());
             t.push(subscribe_tool_def());
             t.push(unsubscribe_tool_def());
+            t.push(await_resource_tool_def());
         }
         t
     }
@@ -672,6 +718,7 @@ impl SelfHandler for Orchestrator {
             "unsubscribe" if self.parent_depth == 0 => {
                 Some(self.subscription(SubscriptionAction::Unsubscribe, args))
             }
+            "await_resource" if self.parent_depth == 0 => Some(self.await_resource(args)),
             _ => None,
         }
     }
@@ -889,6 +936,37 @@ fn unsubscribe_tool_def() -> ToolDef {
     }
 }
 
+/// `await_resource` (pivot Phase 5.2) — the conditional WAIT self-tool. Parks the
+/// session on a resource until its content satisfies a predicate, then re-enters.
+fn await_resource_tool_def() -> ToolDef {
+    ToolDef {
+        name: "await_resource".into(),
+        description: "Wait for an MCP resource to reach a specific state before continuing. \
+            Give a resource uri and a condition on its JSON content; agentd wakes you with \
+            the resource's current content only once the condition holds — so you can pause \
+            on a dependency (a job finishing, a flag flipping) instead of polling. End your \
+            turn after calling this; the daemon re-enters this session when the wait is \
+            satisfied. Effective only when agentd runs as a long-lived daemon."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "description": "the resource uri to wait on"},
+                "condition": {
+                    "type": "object",
+                    "description": "a predicate on the resource's JSON content",
+                    "properties": {
+                        "pointer": {"type": "string", "description": "RFC 6901 JSON Pointer into the content (e.g. \"/status\"); empty = whole document"},
+                        "op": {"type": "string", "enum": ["exists", "eq", "ne", "gt", "lt", "contains"], "description": "the comparison to apply at the pointer (default: exists)"},
+                        "value": {"description": "the value to compare against (required for eq/ne/gt/lt/contains)"}
+                    }
+                }
+            },
+            "required": ["uri", "condition"]
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1107,79 @@ mod tests {
         assert_eq!(drained[0].action, SubscriptionAction::Subscribe);
         assert_eq!(drained[1].action, SubscriptionAction::Unsubscribe);
         assert!(root.take_subscriptions().is_empty(), "take drains");
+    }
+
+    #[test]
+    fn await_resource_is_root_only_validates_and_arms_a_conditional_subscription() {
+        // Root-only, like the other reactive self-tools: a nested child does not
+        // get it (its wait would be lost to the parent), and handle() declines it.
+        let mut child = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(1, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(!child.tools().iter().any(|t| t.name == "await_resource"));
+        assert!(
+            child
+                .handle(
+                    "await_resource",
+                    &json!({"uri": "file:///w", "condition": {"op": "exists"}})
+                )
+                .is_none()
+        );
+
+        let mut root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(
+            root.tools().iter().any(|t| t.name == "await_resource"),
+            "root advertises await_resource"
+        );
+        // A valid await arms a CONDITIONAL subscribe request + a parked observation.
+        let (obs, err) = root
+            .handle(
+                "await_resource",
+                &json!({"uri": "file:///job", "condition": {"pointer": "/status", "op": "eq", "value": "done"}}),
+            )
+            .unwrap();
+        assert!(!err, "{obs}");
+        assert!(obs.contains("re-enter"), "parked observation: {obs}");
+        // Missing condition / missing uri / a malformed predicate are refused as
+        // tool results (not crashes) and arm NOTHING.
+        assert!(
+            root.handle("await_resource", &json!({"uri": "file:///x"}))
+                .unwrap()
+                .1,
+            "missing condition → error"
+        );
+        assert!(
+            root.handle("await_resource", &json!({"condition": {"op": "exists"}}))
+                .unwrap()
+                .1,
+            "missing uri → error"
+        );
+        assert!(
+            root.handle(
+                "await_resource",
+                &json!({"uri": "file:///x", "condition": {"op": "nope"}})
+            )
+            .unwrap()
+            .1,
+            "bad op → error"
+        );
+        // Only the one valid await armed a request; it carries the condition.
+        let drained = root.take_subscriptions();
+        assert_eq!(drained.len(), 1, "only the valid await armed a request");
+        assert_eq!(drained[0].uri, "file:///job");
+        assert_eq!(drained[0].action, SubscriptionAction::Subscribe);
+        assert_eq!(
+            drained[0].condition.as_ref().expect("carries a condition")["op"],
+            "eq"
+        );
     }
 
     #[test]

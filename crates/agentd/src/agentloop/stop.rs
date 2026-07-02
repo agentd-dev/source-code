@@ -80,13 +80,24 @@ pub struct ScheduleRequest {
 }
 
 /// A resource (un)subscription an agent requested for itself via the
-/// `subscribe`/`unsubscribe` self-tools (RFC 0008 §self-scheduling). The
-/// reactive daemon applies it to its live subscriptions + router after the run,
-/// so an agent can widen or narrow what wakes it. Honoured only under a daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `subscribe`/`unsubscribe`/`await_resource` self-tools (RFC 0008
+/// §self-scheduling; pivot Phase 5.2). The reactive daemon applies it to its live
+/// subscriptions + router after the run, so an agent can widen or narrow what
+/// wakes it. Honoured only under a daemon. Not `Eq` (a `condition` may carry a
+/// JSON number).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionRequest {
     pub uri: String,
     pub action: SubscriptionAction,
+    /// Optional content predicate (raw self-tool args, e.g.
+    /// `{"pointer":"/status","op":"eq","value":"ready"}`) for a conditional
+    /// `await_resource` subscribe — the route fires only when the resource content
+    /// satisfies it. Validated at tool-call time; re-parsed to a
+    /// [`Condition`](crate::triggers::router::Condition) when the daemon arms the
+    /// route. `None` = fire on any update (plain `subscribe`). Skipped in the wire
+    /// form when absent, so an `unsubscribe`/plain `subscribe` carries no extra key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

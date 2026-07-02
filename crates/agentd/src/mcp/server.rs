@@ -1201,58 +1201,6 @@ fn serve_handle(ctx: &ServeCtx) -> ServeHandle {
 /// so the caller decides if it's fatal. The transport + framing + connection loop
 /// live in the reusable [`mcp::server`](::mcp::server) framework; this only supplies
 /// the agentd domain surface (via [`ServeHandler`]) and the served-resource log.
-pub fn serve(path: &str, ctx: ServeCtx, log: Logger) -> std::io::Result<ServeHandle> {
-    let listener = ::mcp::server::bind_unix(path)?; // bind first; propagate a bind failure
-    log.info(
-        "mcp.serving",
-        json!({"transport": "unix", "path": path, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
-    );
-    let handle = serve_handle(&ctx);
-    // Coalesce ring-growth into `agentd://events` notifications (RFC 0016 §7.2).
-    #[cfg(feature = "events")]
-    spawn_events_notifier(Arc::clone(&ctx.subscriptions));
-    let subs = Arc::clone(&ctx.subscriptions);
-    let conn_counter = Arc::clone(&ctx.conn_counter);
-    let write_timeout = ctx.drain_timeout;
-    let handler: Arc<dyn ::mcp::server::Handler> = Arc::new(ServeHandler {
-        ctx: Arc::new(ctx),
-        log,
-    });
-    ::mcp::server::spawn_accept_unix(listener, handler, subs, conn_counter, write_timeout)?;
-    Ok(handle)
-}
-
-/// Bind a vsock `(cid, port)` and serve the self-MCP — the **management transport**
-/// (RFC 0015 §3.2). Byte-for-byte the unix server with the socket type swapped (the
-/// same framework, no new framing). Peers arrive in [`PeerOrigin::Management`].
-/// Returns a [`ServeHandle`] for shutdown drain, or the bind error.
-#[cfg(feature = "vsock")]
-pub fn serve_vsock(
-    cid: u32,
-    port: u32,
-    ctx: ServeCtx,
-    log: Logger,
-) -> std::io::Result<ServeHandle> {
-    let listener = ::mcp::server::bind_vsock(cid, port)?;
-    log.info(
-        "mcp.serving",
-        json!({"transport": "vsock", "cid": cid, "port": port, "tools": ["status", "subagent.spawn", "subagent.send", "subagent.status", "subagent.cancel"], "resources": ["agent://status", "agent://capabilities", crate::agentd_uri::run_uri(&ctx.run_id)]}),
-    );
-    let handle = serve_handle(&ctx);
-    // Coalesce ring-growth into `agentd://events` notifications (RFC 0016 §7.2).
-    #[cfg(feature = "events")]
-    spawn_events_notifier(Arc::clone(&ctx.subscriptions));
-    let subs = Arc::clone(&ctx.subscriptions);
-    let conn_counter = Arc::clone(&ctx.conn_counter);
-    let write_timeout = ctx.drain_timeout;
-    let handler: Arc<dyn ::mcp::server::Handler> = Arc::new(ServeHandler {
-        ctx: Arc::new(ctx),
-        log,
-    });
-    ::mcp::server::spawn_accept_vsock(listener, handler, subs, conn_counter, write_timeout)?;
-    Ok(handle)
-}
-
 /// Plugs agentd's domain dispatch into the reusable [`mcp::server`](::mcp::server)
 /// connection framework: the framework owns the transport, framing, lifecycle, and
 /// subscription registry and calls this per request / per connection. Holds the

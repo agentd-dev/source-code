@@ -284,35 +284,21 @@ impl ShardCfg {
 }
 
 /// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
-/// implicit default (no `--serve-mcp`). The target-vision transport is
+/// implicit default (no `--serve-mcp`). The sole transport is
 /// [`Http`](ServeTarget::Http) — `https://HOST:PORT` (TLS, the control plane) or
-/// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests). The legacy
-/// [`Unix`](ServeTarget::Unix) / [`Vsock`](ServeTarget::Vsock) socket targets
-/// still parse (removed in pivot Phase 3). String forms: `https://host:port` |
-/// `http://127.0.0.1:port` | `unix:PATH` | `vsock:PORT` | `vsock:CID:PORT`.
+/// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeTarget {
     /// Bind an HTTP(S) listener at `bind` (a `host:port` authority). `tls` is the
     /// production control plane (`https://`); plaintext (`http://`) is admitted
     /// only for a loopback host (dev/tests).
     Http { bind: String, tls: bool },
-    /// Bind a unix-domain socket at this path.
-    Unix(std::path::PathBuf),
-    /// Bind AF_VSOCK `(cid, port)`. `cid` is the wildcard `VMADDR_CID_ANY` for
-    /// the bare `vsock:PORT` form.
-    Vsock { cid: u32, port: u32 },
 }
 
-/// The wildcard listen context id (`VMADDR_CID_ANY`) for the bare `vsock:PORT`
-/// form. Hard-coded (libc's value) so config parsing carries no `vsock`-feature
-/// dependency — the binding itself is feature-gated in `mcp::server`.
-pub const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
-
 impl ServeTarget {
-    /// Parse a `--serve-mcp` value. Validates the scheme/port and, for `vsock:`,
-    /// that this build has the `vsock` feature (mirroring the intelligence
-    /// `https`-needs-`tls` scheme check). Returns a [`ConfigError::Usage`] (exit 2,
-    /// before any side effect) on any problem.
+    /// Parse a `--serve-mcp` value: `https://host:port` (or loopback
+    /// `http://host:port` for dev). Returns a [`ConfigError::Usage`] (exit 2,
+    /// before any side effect) on a bad scheme / missing port / a path.
     pub fn parse(spec: &str) -> Result<ServeTarget, ConfigError> {
         // The target-vision transport: `https://HOST:PORT` (TLS control plane) or
         // `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests). The bind is
@@ -346,44 +332,8 @@ impl ServeTarget {
                 tls,
             });
         }
-        if let Some(path) = spec.strip_prefix("unix:") {
-            if path.is_empty() {
-                return Err(usage("--serve-mcp: unix path is empty".into()));
-            }
-            return Ok(ServeTarget::Unix(path.into()));
-        }
-        if let Some(rest) = spec.strip_prefix("vsock:") {
-            // The scheme is gated on the build, like https→tls — reject early so the
-            // operator gets a crisp exit 2, not a silent inert listener.
-            if !cfg!(feature = "vsock") {
-                return Err(usage(
-                    "--serve-mcp: scheme unsupported: vsock requires the 'vsock' build feature"
-                        .into(),
-                ));
-            }
-            let (cid, port_str) = match rest.split_once(':') {
-                Some((c, p)) => {
-                    let cid = c.parse::<u32>().map_err(|_| {
-                        usage(format!(
-                            "--serve-mcp: invalid vsock cid '{c}' (want a number)"
-                        ))
-                    })?;
-                    (cid, p)
-                }
-                None => (VMADDR_CID_ANY, rest),
-            };
-            let port = port_str.parse::<u32>().map_err(|_| {
-                usage(format!(
-                    "--serve-mcp: invalid vsock port '{port_str}' (want a number)"
-                ))
-            })?;
-            if port == 0 {
-                return Err(usage("--serve-mcp: vsock port must be > 0".into()));
-            }
-            return Ok(ServeTarget::Vsock { cid, port });
-        }
         Err(usage(format!(
-            "--serve-mcp: scheme unsupported (want https://host:port | http://loopback:port | unix:PATH | vsock:PORT | vsock:CID:PORT): {spec}"
+            "--serve-mcp: want https://host:port (or loopback http://host:port for dev): {spec}"
         )))
     }
 }
@@ -400,22 +350,8 @@ impl Config {
         target: &ServeTarget,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), ConfigError> {
-        let (bind, tls) = match target {
-            ServeTarget::Http { bind, tls } => (bind.as_str(), *tls),
-            // The legacy socket targets take no TLS material / bearer.
-            _ => {
-                if self.serve_cert.is_some()
-                    || self.serve_key.is_some()
-                    || self.serve_client_ca.is_some()
-                    || self.serve_bearer.is_some()
-                {
-                    return Err(usage(
-                        "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer apply only to an https:// serve target".into(),
-                    ));
-                }
-                return Ok(());
-            }
-        };
+        let ServeTarget::Http { bind, tls } = target;
+        let (bind, tls) = (bind.as_str(), *tls);
         if tls {
             match (&self.serve_cert, &self.serve_key) {
                 (Some(cert), Some(key)) => {
@@ -3455,41 +3391,9 @@ mod tests {
     }
 
     #[test]
-    fn serve_target_unix_parses() {
-        assert_eq!(
-            ServeTarget::parse("unix:/run/agentd.sock").unwrap(),
-            ServeTarget::Unix("/run/agentd.sock".into())
-        );
-        // empty path → usage error
-        assert!(matches!(
-            ServeTarget::parse("unix:"),
-            Err(ConfigError::Usage(_))
-        ));
-        // a bare/foreign scheme → usage error
-        assert!(matches!(
-            ServeTarget::parse("tcp:1234"),
-            Err(ConfigError::Usage(_))
-        ));
-    }
-
-    #[cfg(feature = "vsock")]
-    #[test]
-    fn serve_target_vsock_parses_on_vsock_build() {
-        // vsock:PORT → wildcard cid (VMADDR_CID_ANY)
-        assert_eq!(
-            ServeTarget::parse("vsock:5005").unwrap(),
-            ServeTarget::Vsock {
-                cid: VMADDR_CID_ANY,
-                port: 5005
-            }
-        );
-        // vsock:CID:PORT → that cid
-        assert_eq!(
-            ServeTarget::parse("vsock:2:5005").unwrap(),
-            ServeTarget::Vsock { cid: 2, port: 5005 }
-        );
-        // port 0 / non-numeric port / non-numeric cid → usage error
-        for bad in ["vsock:0", "vsock:2:0", "vsock:abc", "vsock:x:5005"] {
+    fn serve_target_retired_socket_schemes_are_rejected() {
+        // The unix:/vsock: serve targets are gone (pivot Phase 3) — exit 2.
+        for bad in ["unix:/run/agentd.sock", "vsock:5005", "vsock:2:5005", "tcp:1234"] {
             assert!(
                 matches!(ServeTarget::parse(bad), Err(ConfigError::Usage(_))),
                 "{bad} must be a usage error"
@@ -3497,25 +3401,13 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "vsock"))]
-    #[test]
-    fn serve_target_vsock_rejected_without_feature() {
-        let e = ServeTarget::parse("vsock:5005").unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => assert!(
-                msg.contains("vsock requires the 'vsock' build feature"),
-                "got: {msg}"
-            ),
-            _ => panic!("expected a Usage error"),
-        }
-    }
-
     #[test]
     fn serve_mcp_validation_runs_at_load() {
-        // unix: still parses through full load() exactly as before.
-        let c = Config::load(&args(&["--serve-mcp", "unix:/tmp/a.sock"]), &base_env()).unwrap();
-        assert_eq!(c.serve_mcp.as_deref(), Some("unix:/tmp/a.sock"));
-        // a foreign scheme is rejected at load (exit 2) before any side effect.
+        // a loopback http serve target parses through full load().
+        let c =
+            Config::load(&args(&["--serve-mcp", "http://127.0.0.1:9000"]), &base_env()).unwrap();
+        assert_eq!(c.serve_mcp.as_deref(), Some("http://127.0.0.1:9000"));
+        // a retired/foreign scheme is rejected at load (exit 2) before any side effect.
         let e = Config::load(&args(&["--serve-mcp", "tcp:9000"]), &base_env()).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
     }

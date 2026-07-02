@@ -393,26 +393,8 @@ fn serve_self_mcp(
         )
     };
     match target {
-        // The target-vision HTTP(S) control plane (pivot Phase 2).
+        // The target-vision HTTP(S) control plane — the sole serve transport.
         ServeTarget::Http { bind, tls } => serve_self_mcp_https(bind, tls, cfg, new_ctx(), log),
-        ServeTarget::Unix(path) => {
-            let path = path.to_string_lossy().into_owned();
-            // Capture the live-config handle BEFORE the ctx is moved into `serve`
-            // (its `subs` is the same registry `serve` shares into the ServeHandle).
-            let ctx = new_ctx();
-            let live_config = ctx.live_config();
-            match agentd::mcp::server::serve(&path, ctx, log.clone()) {
-                Ok(handle) => Some((handle, live_config)),
-                Err(e) => {
-                    log.error(
-                        "mcp.serve_fail",
-                        json!({"path": path, "err": e.to_string()}),
-                    );
-                    None
-                }
-            }
-        }
-        ServeTarget::Vsock { cid, port } => serve_self_mcp_vsock(cid, port, new_ctx(), log),
     }
 }
 
@@ -486,9 +468,9 @@ fn serve_self_mcp_https(
     }
 }
 
-/// Without the `serve-https` feature an `https://`/`http://` serve target can't be
-/// bound — config validation admits the scheme (it's build-agnostic, like
-/// `vsock:`), so this build stays inert on that target rather than panicking.
+/// Without the `serve-https` feature the HTTP serve target can't be bound — config
+/// validation admits the scheme (it's build-agnostic), so this build stays inert
+/// on that target rather than panicking.
 #[cfg(all(feature = "serve-mcp", not(feature = "serve-https")))]
 fn serve_self_mcp_https(
     bind: String,
@@ -500,44 +482,6 @@ fn serve_self_mcp_https(
     log.error(
         "mcp.serve_fail",
         json!({"transport": "https", "bind": bind, "err": "build lacks the 'serve-https' feature"}),
-    );
-    None
-}
-
-/// Bind the served self-MCP over vsock when this build has the `vsock` feature;
-/// otherwise stay inert (config validation already rejects `vsock:` on a
-/// non-vsock build, so this arm is only reached on a `vsock` build).
-#[cfg(all(feature = "serve-mcp", feature = "vsock"))]
-fn serve_self_mcp_vsock(
-    cid: u32,
-    port: u32,
-    ctx: agentd::mcp::server::ServeCtx,
-    log: &Logger,
-) -> Option<ServeWiring> {
-    // Capture the live-config handle before the ctx moves into `serve_vsock`.
-    let live_config = ctx.live_config();
-    match agentd::mcp::server::serve_vsock(cid, port, ctx, log.clone()) {
-        Ok(handle) => Some((handle, live_config)),
-        Err(e) => {
-            log.error(
-                "mcp.serve_fail",
-                json!({"transport": "vsock", "cid": cid, "port": port, "err": e.to_string()}),
-            );
-            None
-        }
-    }
-}
-
-#[cfg(all(feature = "serve-mcp", not(feature = "vsock")))]
-fn serve_self_mcp_vsock(
-    cid: u32,
-    port: u32,
-    _ctx: agentd::mcp::server::ServeCtx,
-    log: &Logger,
-) -> Option<ServeWiring> {
-    log.warn(
-        "mcp.serve_unavailable",
-        json!({"transport": "vsock", "cid": cid, "port": port, "reason": "built without --features vsock"}),
     );
     None
 }

@@ -36,10 +36,19 @@ pub struct GraphOutcome {
     /// engine-forced termination (budget/loop/stall/crash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalStatus>,
+    /// WHY the engine terminated the walk (set on every engine-forced status —
+    /// which guard tripped, at which node); `None` for an author `Halt`. Precision
+    /// for the operator: `Exhausted` alone doesn't say steps vs tokens vs deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The projected result (the `Halt.result_from` blackboard value, or null).
     pub result: Value,
     /// Total node visits taken.
     pub steps: u32,
+    /// Total intelligence tokens the walk consumed (Agent turns, Infer asks,
+    /// Tier-2 judgements) — the workflow's cost, for the operator/agent summary.
+    #[serde(default)]
+    pub tokens: u64,
 }
 
 /// The engine-level graph status. Distinct from the per-turn/tool `TerminalStatus`
@@ -66,18 +75,34 @@ pub enum GraphStatus {
 /// times is a runaway cycle → `LoopDetected`, even under a large step budget.
 pub const MAX_VISITS_PER_NODE: u32 = 100;
 
-/// The graph run budget → the layer-1 termination guard (a total node-visit cap).
-/// Serde-serializable so it rides the persisted [`GraphState`] across a long Wait.
-/// Layers 2 (per-node visit cap) and 3 (progress guard) are enforced by the driver.
+/// The graph run budget → the layer-1 termination guard: a total node-visit cap
+/// AND a total intelligence-token cap (a workflow of many Agent/Infer nodes must
+/// not multiply the per-node token budget unboundedly — the whole walk shares one
+/// pool). Serde-serializable so it rides the persisted [`GraphState`] across a
+/// long Wait. Layers 2 (per-node visit cap) and 3 (progress guard) are enforced
+/// by the driver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphBudget {
     max_steps: u32,
     steps: u32,
+    #[serde(default = "u64_max")]
+    max_tokens: u64,
+    #[serde(default)]
+    tokens: u64,
+}
+
+fn u64_max() -> u64 {
+    u64::MAX
 }
 
 impl GraphBudget {
-    pub fn new(max_steps: u32) -> GraphBudget {
-        GraphBudget { max_steps, steps: 0 }
+    pub fn new(max_steps: u32, max_tokens: u64) -> GraphBudget {
+        GraphBudget {
+            max_steps,
+            steps: 0,
+            max_tokens,
+            tokens: 0,
+        }
     }
 
     /// Charge one node visit; `false` when the budget is spent (do not proceed).
@@ -89,8 +114,20 @@ impl GraphBudget {
         true
     }
 
+    /// Charge intelligence tokens the exec just consumed; `false` once the pool is
+    /// overdrawn (the walk stops — the tokens are already spent, so this charges
+    /// first and refuses after).
+    fn charge_tokens(&mut self, n: u64) -> bool {
+        self.tokens = self.tokens.saturating_add(n);
+        self.tokens <= self.max_tokens
+    }
+
     pub fn steps(&self) -> u32 {
         self.steps
+    }
+
+    pub fn tokens(&self) -> u64 {
+        self.tokens
     }
 }
 
@@ -114,19 +151,23 @@ pub struct GraphState {
 }
 
 impl GraphState {
-    /// A fresh run slice entering `start` with a total step cap.
-    pub fn new(start: NodeId, max_steps: u32) -> GraphState {
+    /// A fresh run slice entering `start` with a total step + token cap.
+    pub fn new(start: NodeId, max_steps: u32, max_tokens: u64) -> GraphState {
         GraphState {
             at: start,
             blackboard: BTreeMap::new(),
             visits: BTreeMap::new(),
             entry_hash: BTreeMap::new(),
-            budget: GraphBudget::new(max_steps),
+            budget: GraphBudget::new(max_steps, max_tokens),
         }
     }
 
     pub fn steps(&self) -> u32 {
         self.budget.steps()
+    }
+
+    pub fn tokens(&self) -> u64 {
+        self.budget.tokens()
     }
 }
 
@@ -230,6 +271,55 @@ pub trait GraphExec {
     ) -> Result<Value, String> {
         Err("this executor has no intelligence wired for infer".into())
     }
+
+    /// Intelligence tokens consumed since the last call (drained: a second call
+    /// returns 0 until more are spent). The driver charges these to the workflow's
+    /// shared token pool after every effectful node, so N agent nodes cannot
+    /// multiply the per-node budget N-fold. Default: 0 (a tokenless executor).
+    fn take_tokens(&mut self) -> u64 {
+        0
+    }
+
+    /// Whether the whole-workflow wall-clock deadline has passed. Checked by the
+    /// driver on every node entry — a workflow stuck in slow (but individually
+    /// succeeding) nodes still terminates. Default: never.
+    fn deadline_exceeded(&self) -> bool {
+        false
+    }
+}
+
+/// Per-blackboard-value size cap (serialized bytes). The blackboard is shared
+/// COORDINATION state, not bulk transport — an unbounded value (a whole file, a
+/// dumped dataset) multiplied by MAX_KEYS and a long walk is a real memory risk.
+/// An oversized node result is replaced by a small marker and takes the `error`
+/// edge (recoverable by authoring one), never silently truncated mid-JSON.
+pub const MAX_VALUE_BYTES: usize = 1 << 20;
+
+/// Clamp an effectful node's result to [`MAX_VALUE_BYTES`]: oversized → a marker
+/// value + forced error (the caller's `error` edge). Cheap for small values (one
+/// serialization only when the value is plausibly large).
+fn clamp_value(val: Value, is_err: bool) -> (Value, bool) {
+    // Fast path: primitives and short strings can't bust a 1 MiB cap.
+    let approx_small = match &val {
+        Value::String(s) => s.len() < MAX_VALUE_BYTES / 2,
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+        _ => false,
+    };
+    if approx_small {
+        return (val, is_err);
+    }
+    let bytes = serde_json::to_string(&val).map(|s| s.len()).unwrap_or(usize::MAX);
+    if bytes <= MAX_VALUE_BYTES {
+        return (val, is_err);
+    }
+    (
+        serde_json::json!({
+            "error": "workflow value too large for the blackboard",
+            "bytes": bytes,
+            "cap": MAX_VALUE_BYTES,
+        }),
+        true,
+    )
 }
 
 /// The label an effectful node emits given whether it errored.
@@ -276,7 +366,19 @@ fn with_retry(
 /// an unhandled emitted label fails CLOSED (`Crashed`) — the implicit `Halt(Crashed)`
 /// safety sink, so a mis-authored graph never runs away or panics.
 pub fn drive(graph: &Graph, exec: &mut dyn GraphExec, max_steps: u32) -> DriveResult {
-    let mut state = GraphState::new(graph.start.clone(), max_steps);
+    drive_budgeted(graph, exec, max_steps, u64::MAX)
+}
+
+/// [`drive`] with a whole-workflow intelligence-token pool: the walk terminates
+/// `Exhausted` once its Agent/Infer/judge calls have consumed `max_tokens` total
+/// (charged via [`GraphExec::take_tokens`]), independent of any per-node budget.
+pub fn drive_budgeted(
+    graph: &Graph,
+    exec: &mut dyn GraphExec,
+    max_steps: u32,
+    max_tokens: u64,
+) -> DriveResult {
+    let mut state = GraphState::new(graph.start.clone(), max_steps, max_tokens);
     drive_state(graph, &mut state, exec)
 }
 
@@ -294,13 +396,16 @@ pub fn resume(
     let Some(Node::Wait { writes, edges, .. }) = graph.nodes.get(&state.at) else {
         return DriveResult::Done(GraphOutcome::engine(
             GraphStatus::Crashed,
+            format!("resume at {:?}, which is not a Wait node", state.at),
             Value::Null,
             state.steps(),
+                state.tokens(),
         ));
     };
-    let label = match &outcome {
+    let label = match outcome {
         WaitOutcome::Updated(v) => {
-            write(&mut state.blackboard, writes, v.clone());
+            let (v, _oversized) = clamp_value(v, false);
+            write(&mut state.blackboard, writes, v);
             "updated"
         }
         WaitOutcome::TimedOut => "timeout",
@@ -308,11 +413,15 @@ pub fn resume(
     match edges.get(label) {
         Some(next) => state.at = next.clone(),
         None => {
+            let reason =
+                format!("Wait node {:?} has no {label:?} edge for its outcome", state.at);
             let result = bb_result(&state.blackboard, None);
             return DriveResult::Done(GraphOutcome::engine(
                 GraphStatus::Crashed,
+                reason,
                 result,
                 state.steps(),
+                state.tokens(),
             ));
         }
     }
@@ -330,12 +439,26 @@ pub fn resume(
 /// (`Done`) or hits a `Wait` (`Suspended`).
 fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) -> DriveResult {
     loop {
+        // Whole-workflow wall-clock deadline — checked on EVERY node entry, so a
+        // walk of slow-but-succeeding nodes still terminates on time.
+        if exec.deadline_exceeded() {
+            let result = bb_result(&state.blackboard, None);
+            return DriveResult::Done(GraphOutcome::engine(
+                GraphStatus::Exhausted,
+                "workflow deadline exceeded".into(),
+                result,
+                state.steps(),
+                state.tokens(),
+            ));
+        }
         let Some(node) = graph.nodes.get(&state.at) else {
             // A dangling edge slipped past validation → fail closed.
             return DriveResult::Done(GraphOutcome::engine(
                 GraphStatus::Crashed,
+                format!("no such node {:?} (dangling edge)", state.at),
                 Value::Null,
                 state.steps(),
+                state.tokens(),
             ));
         };
 
@@ -344,8 +467,10 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             let result = bb_result(&state.blackboard, None);
             return DriveResult::Done(GraphOutcome::engine(
                 GraphStatus::Exhausted,
+                format!("step budget exhausted ({} visits)", state.steps()),
                 result,
                 state.steps(),
+                state.tokens(),
             ));
         }
 
@@ -357,20 +482,32 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             let v = state.visits.entry(state.at.clone()).or_insert(0);
             *v += 1;
             if *v > MAX_VISITS_PER_NODE {
+                let reason = format!(
+                    "node {:?} visited more than {MAX_VISITS_PER_NODE} times (runaway cycle)",
+                    state.at
+                );
                 let result = bb_result(&state.blackboard, None);
                 return DriveResult::Done(GraphOutcome::engine(
                     GraphStatus::LoopDetected,
+                    reason,
                     result,
                     state.steps(),
+                state.tokens(),
                 ));
             }
             let h = bb_hash(&state.blackboard);
             if state.entry_hash.get(&state.at) == Some(&h) {
+                let reason = format!(
+                    "re-entered node {:?} with an unchanged blackboard (no progress)",
+                    state.at
+                );
                 let result = bb_result(&state.blackboard, None);
                 return DriveResult::Done(GraphOutcome::engine(
                     GraphStatus::Stalled,
+                    reason,
                     result,
                     state.steps(),
+                state.tokens(),
                 ));
             }
             state.entry_hash.insert(state.at.clone(), h);
@@ -381,7 +518,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
         let (label, edges) = match node {
             Node::Halt { status, result_from } => {
                 let result = bb_result(&state.blackboard, result_from.as_deref());
-                return DriveResult::Done(GraphOutcome::halt(*status, result, state.steps()));
+                return DriveResult::Done(GraphOutcome::halt(*status, result, state.steps(), state.tokens()));
             }
             // A Wait SUSPENDS: hand the daemon the watch (uri + timeout) and the state
             // to resume with. The current node stays `state.at` so `resume` knows which
@@ -408,6 +545,10 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 } else {
                     default.clone()
                 };
+                // A Tier-2 judgement consumed tokens — charge the shared pool.
+                if let Some(r) = charge(state, exec) {
+                    return r;
+                }
                 continue;
             }
             Node::Agent {
@@ -424,8 +565,9 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                     exec.run_agent(instruction, output_contract.as_deref(), blackboard, reads)
                 });
                 let Some((val, is_err)) = attempt else {
-                    return exhausted(state);
+                    return exhausted(state, "step budget exhausted mid-retry");
                 };
+                let (val, is_err) = clamp_value(val, is_err);
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
@@ -442,10 +584,11 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                             exec.call_tool(server, tool, &resolved)
                         }) {
                             Some(r) => r,
-                            None => return exhausted(state),
+                            None => return exhausted(state, "step budget exhausted mid-retry"),
                         }
                     }
                 };
+                let (val, is_err) = clamp_value(val, is_err);
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
@@ -453,7 +596,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // No model, no tool — deterministic and cheap.
             Node::Assign { value, writes, edges } => {
                 let (val, is_err) = match super::resolve_refs(value, &state.blackboard) {
-                    Ok(v) => (v, false),
+                    Ok(v) => clamp_value(v, false),
                     Err(e) => (Value::String(format!("assign error: {e}")), true),
                 };
                 state.blackboard.insert(writes.clone(), val);
@@ -485,8 +628,9 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                     )
                 });
                 let Some((val, is_err)) = attempt else {
-                    return exhausted(state);
+                    return exhausted(state, "step budget exhausted mid-retry");
                 };
+                let (val, is_err) = clamp_value(val, is_err);
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
@@ -494,20 +638,31 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             // spawns a capped subtree), write its result, follow ok/error.
             Node::Subgraph { graph: sub, async_, writes, edges } => {
                 let (val, is_err) = exec.run_subgraph(sub, *async_, &state.blackboard);
+                let (val, is_err) = clamp_value(val, is_err);
                 write(&mut state.blackboard, writes, val);
                 (edge_for(is_err), edges)
             }
         };
 
+        // Charge whatever intelligence tokens the node just consumed to the
+        // workflow's shared pool (Agent turns, Infer asks, subgraph interiors).
+        if let Some(r) = charge(state, exec) {
+            return r;
+        }
+
         match edges.get(label) {
             Some(next) => state.at = next.clone(),
             // Unhandled label → the implicit Halt(Crashed) safety sink.
             None => {
+                let reason =
+                    format!("node {:?} emitted unhandled label {label:?}", state.at);
                 let result = bb_result(&state.blackboard, None);
                 return DriveResult::Done(GraphOutcome::engine(
                     GraphStatus::Crashed,
+                    reason,
                     result,
                     state.steps(),
+                state.tokens(),
                 ));
             }
         }
@@ -516,13 +671,36 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
 
 /// The budget ran out (possibly mid-retry): report `Exhausted` with whatever the
 /// blackboard holds.
-fn exhausted(state: &GraphState) -> DriveResult {
+fn exhausted(state: &GraphState, reason: &str) -> DriveResult {
     let result = bb_result(&state.blackboard, None);
     DriveResult::Done(GraphOutcome::engine(
         GraphStatus::Exhausted,
+        reason.to_string(),
         result,
         state.steps(),
+                state.tokens(),
     ))
+}
+
+/// Drain the exec's just-consumed tokens into the shared pool; `Some(done)` when
+/// the pool is overdrawn (the walk must stop `Exhausted`).
+fn charge(state: &mut GraphState, exec: &mut dyn GraphExec) -> Option<DriveResult> {
+    let spent = exec.take_tokens();
+    if state.budget.charge_tokens(spent) {
+        return None;
+    }
+    let reason = format!(
+        "token budget exhausted ({} tokens consumed)",
+        state.budget.tokens()
+    );
+    let result = bb_result(&state.blackboard, None);
+    Some(DriveResult::Done(GraphOutcome::engine(
+        GraphStatus::Exhausted,
+        reason,
+        result,
+        state.steps(),
+                state.tokens(),
+    )))
 }
 
 /// Write a node's result to its `writes` key (a no-op when the node writes nothing).
@@ -542,7 +720,7 @@ fn bb_result(bb: &Blackboard, result_from: Option<&str>) -> Value {
 }
 
 impl GraphOutcome {
-    fn halt(status: TerminalStatus, result: Value, steps: u32) -> GraphOutcome {
+    fn halt(status: TerminalStatus, result: Value, steps: u32, tokens: u64) -> GraphOutcome {
         let gs = if status == TerminalStatus::Completed {
             GraphStatus::Completed
         } else {
@@ -551,17 +729,27 @@ impl GraphOutcome {
         GraphOutcome {
             status: gs,
             terminal: Some(status),
+            reason: None,
             result,
             steps,
+            tokens,
         }
     }
 
-    fn engine(status: GraphStatus, result: Value, steps: u32) -> GraphOutcome {
+    fn engine(
+        status: GraphStatus,
+        reason: String,
+        result: Value,
+        steps: u32,
+        tokens: u64,
+    ) -> GraphOutcome {
         GraphOutcome {
             status,
             terminal: None,
+            reason: Some(reason),
             result,
             steps,
+            tokens,
         }
     }
 }
@@ -595,6 +783,11 @@ mod tests {
         counter: i64,
         /// The label `judge` returns for a Tier-2 semantic branch (`None` = default).
         judge_answer: Option<String>,
+        /// Every effectful call "costs" this many tokens (drained by take_tokens).
+        tokens_per_call: u64,
+        pending_tokens: u64,
+        /// deadline_exceeded() turns true once this many calls were made.
+        deadline_after_calls: Option<usize>,
     }
 
     impl GraphExec for MockExec {
@@ -606,6 +799,7 @@ mod tests {
             _reads: &[String],
         ) -> (Value, bool) {
             self.calls.push(format!("agent:{instruction}"));
+            self.pending_tokens += self.tokens_per_call;
             self.last_blackboard = blackboard.clone();
             if self.counting.as_deref() == Some(instruction) {
                 self.counter += 1;
@@ -620,6 +814,7 @@ mod tests {
         fn call_tool(&mut self, server: &str, tool: &str, args: &Value) -> (Value, bool) {
             let key = format!("{server}.{tool}");
             self.calls.push(format!("tool:{key}"));
+            self.pending_tokens += self.tokens_per_call;
             self.tool_args.push(args.clone());
             if let Some(seq) = self.tool_seq.get_mut(&key)
                 && let Some(next) = seq.pop_front()
@@ -638,6 +833,7 @@ mod tests {
             feedback: Option<&str>,
         ) -> Result<Value, String> {
             self.calls.push(format!("infer:{prompt}"));
+            self.pending_tokens += self.tokens_per_call;
             self.infer_feedbacks.push(feedback.map(str::to_string));
             self.infers
                 .pop_front()
@@ -652,7 +848,17 @@ mod tests {
             _choices: &[String],
         ) -> Option<String> {
             self.calls.push(format!("judge:{prompt}"));
+            self.pending_tokens += self.tokens_per_call;
             self.judge_answer.clone()
+        }
+
+        fn take_tokens(&mut self) -> u64 {
+            std::mem::take(&mut self.pending_tokens)
+        }
+
+        fn deadline_exceeded(&self) -> bool {
+            self.deadline_after_calls
+                .is_some_and(|n| self.calls.len() >= n)
         }
 
         fn run_subgraph(&mut self, graph: &Graph, _async_: bool, _bb: &Blackboard) -> (Value, bool) {
@@ -1324,6 +1530,119 @@ mod tests {
         // 1 visit + 2 retries charged + the halt visit.
         assert_eq!(out.steps, 4, "each retry charges the budget");
         assert_eq!(exec.tool_args.len(), 3, "three attempts made");
+    }
+
+    // ── W3: shared token pool, workflow deadline, reasons, value clamp ───────
+
+    #[test]
+    fn the_token_pool_bounds_the_whole_workflow() {
+        // Each agent/judge call costs 100 tokens; a pool of 350 stops the
+        // otherwise-endless counter loop as Exhausted with a token reason —
+        // independent of the (huge) step budget.
+        let g = counter_loop(1_000_000);
+        let mut exec = MockExec {
+            counting: Some("tick".into()),
+            tokens_per_call: 100,
+            ..MockExec::default()
+        };
+        let DriveResult::Done(out) = drive_budgeted(&g, &mut exec, 100_000, 350) else {
+            panic!("no wait — should terminate");
+        };
+        assert_eq!(out.status, GraphStatus::Exhausted);
+        assert!(
+            out.reason.as_deref().unwrap().contains("token"),
+            "{:?}",
+            out.reason
+        );
+        assert!(out.tokens >= 350, "the spent pool is reported: {}", out.tokens);
+    }
+
+    #[test]
+    fn the_workflow_deadline_terminates_the_walk() {
+        // The exec's wall-clock deadline flips after 3 calls: the walk stops
+        // Exhausted with a deadline reason even though every node succeeds.
+        let g = counter_loop(1_000_000);
+        let mut exec = MockExec {
+            counting: Some("tick".into()),
+            deadline_after_calls: Some(3),
+            ..MockExec::default()
+        };
+        let out = run(&g, &mut exec, 100_000);
+        assert_eq!(out.status, GraphStatus::Exhausted);
+        assert!(
+            out.reason.as_deref().unwrap().contains("deadline"),
+            "{:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn engine_reasons_name_the_guard_and_the_node() {
+        // Stall: the reason names the re-entered node.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "const", "writes": "k", "edges": {"ok": "b"}},
+                "b": {"kind": "branch", "cases": [{"when": {"op": "eq", "key": "k", "value": "never"}, "goto": "done"}], "default": "a"},
+                "done": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        exec.agents.insert("const".into(), (json!("same"), false));
+        let out = run(&g, &mut exec, 1000);
+        assert_eq!(out.status, GraphStatus::Stalled);
+        // The guard fires at the first node RE-ENTERED with an unchanged board —
+        // the branch "b" (a → b → a → b: b sees the same board first).
+        assert!(out.reason.as_deref().unwrap().contains("\"b\""), "{:?}", out.reason);
+        // Unhandled label: the reason names the node and the label.
+        let g2: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "x", "edges": {"error": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let mut exec2 = MockExec::default();
+        let out2 = run(&g2, &mut exec2, 10);
+        assert_eq!(out2.status, GraphStatus::Crashed);
+        let r = out2.reason.as_deref().unwrap();
+        assert!(r.contains("\"a\"") && r.contains("\"ok\""), "{r}");
+        // An author Halt carries NO engine reason.
+        let g3 = etl();
+        let mut exec3 = MockExec::default();
+        let out3 = run(&g3, &mut exec3, 100);
+        assert!(out3.reason.is_none(), "author halts are reason-free");
+    }
+
+    #[test]
+    fn an_oversized_value_is_clamped_to_the_error_edge() {
+        // A ~2 MiB agent result busts MAX_VALUE_BYTES: the blackboard gets a small
+        // marker instead, and the node takes its error edge.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "big",
+            "nodes": {
+                "big": {"kind": "agent", "instruction": "dump", "writes": "blob", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "crashed", "result_from": "blob"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        exec.agents.insert(
+            "dump".into(),
+            (Value::String("x".repeat(2 * 1024 * 1024)), false),
+        );
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Crashed), "error edge taken");
+        assert!(
+            out.result.get("error").is_some(),
+            "a small marker replaced the blob: {:?}",
+            out.result
+        );
+        let stored = serde_json::to_string(&out.result).unwrap();
+        assert!(stored.len() < 1024, "the marker is small: {} bytes", stored.len());
     }
 
     #[test]

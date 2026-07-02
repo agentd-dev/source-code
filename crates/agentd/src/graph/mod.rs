@@ -27,8 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod driver;
 pub use driver::{
-    drive, resume, Blackboard, DriveResult, GraphBudget, GraphExec, GraphOutcome, GraphState,
-    GraphStatus, Suspension, WaitOutcome,
+    drive, drive_budgeted, resume, Blackboard, DriveResult, GraphBudget, GraphExec,
+    GraphOutcome, GraphState, GraphStatus, Suspension, WaitOutcome, MAX_VALUE_BYTES,
 };
 
 mod exec;

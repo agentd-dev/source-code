@@ -608,7 +608,7 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
 /// projects to the same exit table as a one-shot run.
 #[cfg(feature = "run-graph")]
 fn run_graph(cfg: &Config, log: &Logger) -> i32 {
-    use agentd::graph::{drive_pinned, DriveResult, GraphStatus};
+    use agentd::graph::{drive_pinned, GraphStatus};
     use std::time::Duration;
 
     // Load + parse + validate the pinned graph (fail-closed at the operator boundary).
@@ -650,15 +650,7 @@ fn run_graph(cfg: &Config, log: &Logger) -> i32 {
         log,
     );
     let outcome = match result {
-        Ok(DriveResult::Done(o)) => o,
-        Ok(DriveResult::Suspended(s)) => {
-            log.error("graph.suspended", json!({"on_uri": s.on_uri}));
-            eprintln!(
-                "agentd: graph suspended on a Wait ({}) — `--mode graph` is one-shot; a Wait needs a reactive daemon",
-                s.on_uri
-            );
-            return exit::GENERIC;
-        }
+        Ok(o) => o,
         Err(e) => {
             log.error("proc.exit", json!({"err": e.clone()}));
             eprintln!("agentd: {e}");

@@ -113,6 +113,13 @@ pub struct Orchestrator {
     /// Backgrounded children from `subagent.spawn{async|detach}`, keyed by handle
     /// (= the child's agent_path). Drained on status/await; reaped on Drop.
     async_children: HashMap<String, AsyncChild>,
+    /// Author-defined run-graphs (pivot Phase 7), keyed by a generated id. Populated
+    /// by `graph.define` (validate-then-store); run by `graph.run` (a later phase).
+    #[cfg(feature = "run-graph")]
+    graphs: std::collections::BTreeMap<String, crate::graph::Graph>,
+    /// Monotone id counter for `graph.define`.
+    #[cfg(feature = "run-graph")]
+    graph_seq: u64,
     log: Logger,
 }
 
@@ -144,6 +151,10 @@ impl Orchestrator {
             scheduled: Vec::new(),
             subscriptions: Vec::new(),
             async_children: HashMap::new(),
+            #[cfg(feature = "run-graph")]
+            graphs: std::collections::BTreeMap::new(),
+            #[cfg(feature = "run-graph")]
+            graph_seq: 0,
             log,
         }
     }
@@ -218,6 +229,39 @@ impl Orchestrator {
             format!(
                 "parked: the daemon will re-enter this session when {uri} satisfies the condition"
             ),
+            false,
+        )
+    }
+
+    /// `graph.define` (pivot Phase 7, `--features run-graph`) — validate an authored
+    /// run-graph and STORE it under a generated id for a later `graph.run`. Validation
+    /// is structural + fail-closed: a graph that can't reach a `Halt`, dangles an
+    /// edge, or busts the caps is REFUSED as a tool result (never stored, never a
+    /// crash). Bounded by a per-run graph budget (fork-bomb hygiene).
+    #[cfg(feature = "run-graph")]
+    fn graph_define(&mut self, args: &Value) -> (String, bool) {
+        const MAX_GRAPHS: usize = 16;
+        if self.graphs.len() >= MAX_GRAPHS {
+            return refused("maximum run-graphs defined for this run");
+        }
+        let Some(graph_val) = args.get("graph") else {
+            return ("error: graph.define requires a 'graph' object".into(), true);
+        };
+        let graph: crate::graph::Graph = match serde_json::from_value(graph_val.clone()) {
+            Ok(g) => g,
+            Err(e) => return (format!("error: malformed graph: {e}"), true),
+        };
+        if let Err(errs) = graph.validate() {
+            return (format!("error: invalid graph: {}", errs.join("; ")), true);
+        }
+        self.graph_seq += 1;
+        let id = format!("g{}", self.graph_seq);
+        let n = graph.nodes.len();
+        self.graphs.insert(id.clone(), graph);
+        self.log
+            .info("graph.define", json!({"graph_id": id, "nodes": n}));
+        (
+            format!("graph defined: {id} ({n} nodes) — run it with graph.run"),
             false,
         )
     }
@@ -695,6 +739,11 @@ impl SelfHandler for Orchestrator {
             t.push(subscribe_tool_def());
             t.push(unsubscribe_tool_def());
             t.push(await_resource_tool_def());
+            // Run-graph authoring (pivot Phase 7) is a root orchestration capability,
+            // like the reactive self-tools — a nested child distils a result, it does
+            // not drive a graph.
+            #[cfg(feature = "run-graph")]
+            t.push(graph_define_tool_def());
         }
         t
     }
@@ -719,6 +768,8 @@ impl SelfHandler for Orchestrator {
                 Some(self.subscription(SubscriptionAction::Unsubscribe, args))
             }
             "await_resource" if self.parent_depth == 0 => Some(self.await_resource(args)),
+            #[cfg(feature = "run-graph")]
+            "graph.define" if self.parent_depth == 0 => Some(self.graph_define(args)),
             _ => None,
         }
     }
@@ -967,6 +1018,31 @@ fn await_resource_tool_def() -> ToolDef {
     }
 }
 
+/// `graph.define` (pivot Phase 7) — author + store a run-graph for `graph.run`.
+#[cfg(feature = "run-graph")]
+fn graph_define_tool_def() -> ToolDef {
+    ToolDef {
+        name: "graph.define".into(),
+        description: "Define a run-graph: nodes (agent/tool/branch/wait/subgraph/halt) connected \
+            by labelled edges — cycles and conditional branches allowed — that agentd drives to \
+            process work items by itself. Provide the graph as a JSON object {start, nodes}; \
+            agentd validates it structurally (it must be able to reach a halt) and returns a \
+            graph id you then pass to graph.run. Use this to orchestrate multi-step, looping, or \
+            conditional work without hand-holding each turn."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "graph": {
+                    "type": "object",
+                    "description": "the run-graph: {\"start\": nodeId, \"nodes\": {id: {kind, ...}}}"
+                }
+            },
+            "required": ["graph"]
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1255,56 @@ mod tests {
         assert_eq!(
             drained[0].condition.as_ref().expect("carries a condition")["op"],
             "eq"
+        );
+    }
+
+    #[cfg(feature = "run-graph")]
+    #[test]
+    fn graph_define_is_root_only_validates_and_stores() {
+        // Nested child does not get the graph-authoring surface.
+        let mut child = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(1, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(!child.tools().iter().any(|t| t.name == "graph.define"));
+        assert!(child.handle("graph.define", &json!({"graph": {}})).is_none());
+
+        let mut root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        assert!(
+            root.tools().iter().any(|t| t.name == "graph.define"),
+            "root advertises graph.define"
+        );
+        // A valid graph is stored + an id returned.
+        let g = json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "do", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        });
+        let (obs, err) = root.handle("graph.define", &json!({"graph": g})).unwrap();
+        assert!(!err, "{obs}");
+        assert!(obs.contains("graph defined"), "{obs}");
+        // A structurally invalid graph (a bare self-loop, no reachable halt) is
+        // REFUSED as a tool result, not stored.
+        let bad = json!({
+            "start": "a",
+            "nodes": {"a": {"kind": "agent", "instruction": "spin", "edges": {"ok": "a"}}}
+        });
+        let (obs, err) = root.handle("graph.define", &json!({"graph": bad})).unwrap();
+        assert!(err, "no-halt graph must be refused: {obs}");
+        assert!(obs.contains("invalid graph"), "{obs}");
+        // Missing 'graph' arg is refused.
+        assert!(
+            root.handle("graph.define", &json!({})).unwrap().1,
+            "missing graph refused"
         );
     }
 

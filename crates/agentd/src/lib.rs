@@ -24,6 +24,8 @@ pub mod config_file; // the declarative config FILE (JSON) + JSON Schema export 
 #[cfg(all(unix, feature = "config-watch"))]
 pub mod config_watch; // inotify file-watch reload trigger (RFC 0017 §5.2)
 pub mod exit; // the public exit-code table + terminal-status -> code map
+#[cfg(feature = "run-graph")]
+pub mod graph; // agent-authored cyclic run-graph: serde model + validation + driver (pivot Phase 7)
 pub mod identity; // instance identity from the k8s downward API (env-only, RFC 0015 §6)
 pub mod intel; // intelligence client + provider adapters
 // JSON-RPC 2.0 codec + framing now lives in the reusable `mcp` crate; re-export

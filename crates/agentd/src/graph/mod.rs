@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod driver;
+pub use driver::{drive, Blackboard, GraphBudget, GraphExec, GraphOutcome, GraphStatus};
+
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;
 /// A well-known edge label a node emits: `ok`/`error` (Agent, Tool), `updated`/

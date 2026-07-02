@@ -4,12 +4,13 @@
 > decisions: [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md).
 > Milestones: [`docs/design/PLAN.md`](design/PLAN.md).
 
-agentd connects an LLM-driven loop to *arbitrary, operator-declared* MCP servers and an
-optional `exec` capability. That is, by construction, the worst-case shape for the one
-unsolved problem in agent security: **prompt injection** — and its acute form, Willison's
-**lethal trifecta**, where a single agent simultaneously (1) reads untrusted content,
-(2) holds sensitive data or tools, and (3) can communicate externally. Any agent holding all
-three legs is a one-injected-prompt exfiltration tool.
+agentd connects an LLM-driven loop to *arbitrary, operator-declared* MCP servers. It runs
+**no local code of its own** — there is no `exec`/shell tool and no way for the model to run
+a command; every capability it has is a tool from a declared MCP server. That still leaves
+the one unsolved problem in agent security: **prompt injection** — and its acute form,
+Willison's **lethal trifecta**, where a single agent simultaneously (1) reads untrusted
+content, (2) holds sensitive data or tools, and (3) can communicate externally. Any agent
+holding all three legs is a one-injected-prompt exfiltration tool.
 
 Prompt injection is **not patchable**. A 95%-effective guardrail is a failure in security
 terms. So agentd does not pretend to solve it with a classifier or a policy DSL. It contains
@@ -36,8 +37,12 @@ Concretely, the posture has eight load-bearing parts:
 3. **Process isolation + distilled returns** form an injection firewall.
 4. **All MCP server content is untrusted** — including tool descriptions (tool poisoning).
 5. **SSRF defenses** live in the one hand-rolled HTTP client.
-6. **`exec` is off by default** and gated.
-7. **Self-MCP serving is stdio/unix only** in v1 (HTTP serving deferred).
+6. **No local execution.** agentd runs no code of its own — no `exec`/shell tool exists; the
+   only process it launches is a re-exec of the trusted agentd binary itself (a subagent),
+   never a user- or model-supplied argv.
+7. **Every network surface is HTTPS with authenticated identity** — intelligence, the MCP
+   client, the served self-MCP, A2A, and operator control are all HTTP(S) with mTLS/bearer
+   auth (loopback `http://` for dev); agentd links no unix/vsock transport.
 8. **Secrets are env/flag only**, behind a `resolve()` front door, never logged.
 
 ---
@@ -63,7 +68,7 @@ it effectively is. The blast radius is whatever the surrounding sandbox permits.
 
 ## 2. Capability scoping = the granted MCP subset, as a trust budget
 
-agentd ships **no tools of its own** except a gated `exec` and its self-MCP control tools
+agentd ships **no task tools of its own** — only its self/control orchestration tools
 (`subagent.*`, resource read/subscribe). Every other capability comes from operator-declared
 MCP servers. A subagent's capability set is exactly the MCP subset it was granted, and scope
 **narrows monotonically** down the subagent tree (RFC 0009) — a child can never hold more than
@@ -78,12 +83,12 @@ operator config, *never* from server-supplied metadata (which is untrusted, §4)
 |-----|---------|
 | `untrusted_input` | tool returns content from an uncontrolled source — web pages, inbound email, issue text, arbitrary files |
 | `sensitive` | tool exposes private data or privileged systems — secrets store, internal DB, prod control plane |
-| `egress` | tool can move data out of the trust boundary or change external state — HTTP POST, send mail, open PR, `exec` |
+| `egress` | tool can move data out of the trust boundary or change external state — HTTP POST, send mail, open PR |
 
 **Untagged tools default to `untrusted_input: true`** — the safe assumption is that any tool's
-output may carry an injection; operators downgrade explicitly. The built-in self-MCP tools
-carry fixed tags: `exec` ⇒ `egress` (and `sensitive` when not jailed); resource read/subscribe
-inherit from the underlying server; `subagent.*` is untagged (it is the chokepoint, not a leaf
+output may carry an injection; operators downgrade explicitly. The self/control tools
+carry fixed tags: resource read/subscribe inherit from the underlying server; `subagent.*` is
+untagged (it is the chokepoint, not a leaf
 capability).
 
 The tag set is a **budget, not an allow/deny rule**. It bounds what a single isolation unit
@@ -111,7 +116,7 @@ split into e.g. a `read_*` subset that is `sensitive` but not `egress`):
 The trifecta check lives **inside `Config::validate()`** — the single validation authority (RFC
 0017 §7) that both startup and `--validate-config` run — over the **root grant**, the OR of the
 capability tags across every granted MCP server (an untagged server counts conservatively as
-`untrusted_input`; `--enable-exec` counts as `egress`). Because it is part of `validate()`,
+`untrusted_input`). Because it is part of `validate()`,
 `--validate-config` and startup can never disagree: a trifecta-only config that startup refuses
 is also reported `config.invalid` (exit 2) by the admission gate. Because scope narrows
 **monotonically** down the tree (a child's grant is always a subset of its parent's, RFC 0009),
@@ -210,26 +215,27 @@ Concrete rules:
   `{server, name, description_hash, description_len}` at `info`
   (`event:"mcp.tool.listed"`). A description whose hash changes between connections logs
   `event:"mcp.tool.description_changed"` at `warn` — rug-pull / TOCTOU detection.
-- **Launch commands are never model- or server-derived.** The set of MCP servers and their
-  `argv` come *only* from operator config (`--mcp`), validated at startup (bad config → exit 2).
-  The model cannot add a server, edit an `argv`, or make agentd spawn a process from a string it
-  produced. `subagent.spawn` re-execs agent's own `argv[0]`; `exec` runs an operator-allowed
-  binary, never a server-named one.
+- **Endpoints are never model- or server-derived.** The set of MCP servers and their endpoints
+  come *only* from operator config (`--mcp`), validated at startup (bad config → exit 2). The
+  model cannot add a server, edit an endpoint, or make agentd connect to a URL it produced.
+  agentd never *spawns* a server — it **connects** to a declared HTTPS endpoint; the only process
+  it launches is a re-exec of its own trusted binary (`subagent.spawn` re-execs `argv[0]` — §6).
 
-> **Spawning a stdio MCP server means trusting that command as code at agentd's privilege.**
-> Declaring `--mcp name=cmd` is an operator trust decision equivalent to running `cmd` yourself.
-> Vet your servers the way you vet any dependency you execute.
+> **Declaring an MCP server is an operator trust decision.** `--mcp name=https://…` points agentd
+> at a remote tool endpoint you have chosen; trust it the way you trust any dependency you call.
+> Its tools run in *its* sandbox, over the network — agentd runs none of its code.
 
-- **stdio is the default transport.** A stdio MCP server can reach only agentd's pipes — not the
-  network, not other processes — which is itself a confinement win over an HTTP server.
+- **The MCP transport is HTTPS.** A remote MCP server is reached over TLS with per-server auth
+  headers (loopback `http://` for a same-host dev sidecar); agentd links no unix/vsock dialer.
 
 ---
 
 ## 5. SSRF defenses in the hand-rolled HTTP client
 
 agentd's single hand-rolled HTTP/1.1 + SSE client is the **only** outbound network primitive,
-and therefore the only SSRF chokepoint. It carries the `https://` intelligence transport (and
-any future HTTP-MCP). Guards apply **after DNS resolution and on every redirect hop**:
+and therefore the only SSRF chokepoint. It carries every network surface — the `https://`
+intelligence transport, the MCP client, A2A, and the served self-MCP. Guards apply **after DNS
+resolution and on every redirect hop**:
 
 - **HTTPS in prod.** Plaintext `http://` targets are rejected by default; loopback dev may relax
   this.
@@ -257,62 +263,31 @@ no-ICU dependency stance.
 
 ---
 
-## 6. `exec` — off by default, gated, least-exposed
+## 6. No local execution
 
-`exec` is the strongest egress leg and therefore the most dangerous trifecta member. Rules:
+agentd **runs no code of its own.** There is no `exec` tool, no shell tool, no plugin loader —
+nothing the model can call that runs a local command. Every capability the agent has is a tool
+served by a declared MCP server, reached over the network (HTTPS). This removes the strongest
+egress leg of the lethal trifecta *by construction*: an injected prompt cannot make agentd run
+a binary, because agentd has no code path that runs one.
 
-- **Off by default.** Absent any `--enable-exec`, the `exec` self-tool is **not registered** in
-  the self-MCP `tools/list` — the model never sees it, so it cannot be discovered or poisoned
-  into existence. (Absent, not "present but erroring.")
-- **Operator allowlist of binaries.** `--enable-exec <abs-path>` (repeatable; or
-  `AGENT_ENABLE_EXEC` as a `:`-separated path list) names the absolute binaries the tool may
-  invoke. A bare `--enable-exec` with no path is a usage error (exit 2).
-- **Capability-checked at startup.** Each allowed path is validated to exist and be executable;
-  a missing/non-executable allowed binary is a **config error → exit 2** (in `Config::validate()`,
-  so `--validate-config` and startup agree), never a mid-loop surprise.
-- **No model-named binaries.** A tool call whose resolved `argv[0]` is not an exact-path match
-  against the allowlist is an `isError` observation (the model adapts). The executable is fixed
-  by config; arguments may be model-supplied, but the binary is not. No shell interpretation by
-  default (`execve`, not `/bin/sh -c`), so the model cannot inject shell metacharacters. A shell
-  opt-in for the cases that genuinely need it is loudly documented as widening the surface.
-- **Same OS regime.** Each `exec` child is its own process group (`setpgid`), carries a
-  mandatory finite deadline, counts against the subtree token/depth/breadth caps, and is torn
-  down by the same bounded SIGTERM→SIGKILL kill ladder as any child (RFC 0003).
-- **Tagged `egress` (+`sensitive` when un-jailed),** so the Rule-of-Two budget naturally refuses
-  co-locating `exec` with an untrusted-input reader. Guidance: an `exec`-scoped subagent should
-  be the one *least* exposed to untrusted content — pair it with a reader whose distilled
-  summary it consumes, never hand it the untrusted source directly.
+The one and only process agentd ever launches is a **re-exec of its own trusted binary** — a
+subagent (`subagent.spawn` re-execs `argv[0]`, the agentd executable). That path never takes a
+user- or model-supplied command:
 
-Enable it explicitly:
+- The executable is **fixed to agentd's own path**, passed by the supervisor at startup
+  (`current_exe()`), never derived from a request. Freezing this is a load-bearing invariant —
+  if `argv[0]` ever became request-controlled, subagent-spawn would become arbitrary-exec.
+- The child's work — its instruction, tool scope, limits — arrives as a serialized payload over
+  the child's **stdin pipe**, i.e. *data to a model loop*, never *code to a shell*.
+- Every child is its own process group (`setpgid`), carries a finite deadline, counts against the
+  subtree token/depth/breadth caps, and is torn down by the bounded SIGTERM→SIGKILL kill ladder
+  (RFC 0003).
 
-```bash
-agentd \
-  --instruction "build and run the test suite, report failures" \
-  --intelligence unix:/run/intel.sock \
-  --enable-exec /usr/bin/cargo \
-  --enable-exec /usr/bin/git
-```
-
-> **Status.** `--enable-exec <abs-path>` (repeatable) builds the operator allowlist of binaries
-> and defaults off (see `crates/agentd/src/config.rs` / `crates/agentd/src/sec/exec.rs`). The
-> runtime — config validation, the ReAct loop, the supervisor/subagent process tree, the MCP
-> client, and all four run modes — is implemented.
-
-> **⚠ Migration (v2.8.0 — breaking).** Before v2.8.0, `--enable-exec` was a bare boolean: it
-> turned on exec and let the model run **any** absolute-path binary. As of v2.8.0 it is an
-> **operator allowlist** (RFC 0012 §3.6) — it now **takes a path** and the bare form is rejected
-> at startup (exit 2 with an actionable error). To migrate, replace the bare flag with one
-> `--enable-exec <abs-path>` per binary you intend to allow (or set `AGENT_ENABLE_EXEC` to a
-> `:`-separated path list):
->
-> ```diff
-> - --enable-exec
-> + --enable-exec /usr/bin/git --enable-exec /usr/bin/cargo
-> ```
->
-> There is intentionally **no** "allow everything" switch — naming the binaries is the security
-> guarantee (the model can only run what you listed). If a deployment genuinely needs a broad set,
-> list each binary explicitly.
+If a workflow genuinely needs to run a command (build a project, run a test suite), that belongs
+behind an **MCP server** the operator declares and scopes — where it carries capability tags and
+is subject to the same Rule-of-Two budget as any other tool, and where the blast radius is the
+server's own sandbox, not agentd's process.
 
 ---
 
@@ -352,43 +327,45 @@ These security-relevant knobs exist in the binary today
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|
-| `--enable-exec <abs-path>` | `AGENT_ENABLE_EXEC` (`:`-list) | off | allow the gated `exec` self-tool to run this absolute binary (repeatable; the operator allowlist — argv[0] must match exactly) |
 | `--allow-trifecta` | — | off | permit all three capability legs in one subagent (audited override) |
 | `--mcp-tags name=tag,tag` | — | — | tag a server's tools `untrusted_input` / `sensitive` / `egress` for the Rule-of-Two |
 | `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | — | bearer/key for the intelligence endpoint (redacted in logs) |
-| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `unix:/path`, `https://host/…`, or `vsock:cid:port` (validated; `http://` is dev-only and warns) |
-| `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | off | serve agent's own MCP over a unix socket (stdio always available) |
-| `--mcp name=cmd` | — | — | declare an MCP server (repeatable; stdio; operator-only, never model-derived) |
+| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `https://host/…` (loopback `http://` for a same-host dev gateway; any other scheme is exit 2) |
+| `--serve-mcp <https://host:port>` | `AGENT_SERVE_MCP` | off | serve agent's own MCP over HTTP(S) with mTLS/bearer auth (loopback `http://` for dev) |
+| `--mcp name=<endpoint>` | — | — | declare a remote MCP server over Streamable HTTP (repeatable; operator-only, never model-derived) |
 | `--max-steps <N>` | `AGENT_MAX_STEPS` | 50 | per-run step cap (a bound on a runaway/injected loop) |
 | `--max-tokens <N>` | `AGENT_MAX_TOKENS` | 200000 | token budget |
 | `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
 | `--max-depth <N>` | — | 4 | subagent tree depth cap |
 
-The intelligence-URI validator rejects anything outside `unix:` / `https://` / `vsock:` /
-`http://` and exits **2** on a bad value — before any side effect, including any LLM round-trip.
-
-**Not yet flags** (RFC 0012): the SSRF policy override knobs and self-MCP-over-HTTP. They are
-documented above as the target so the posture is reviewable now.
+The intelligence-URI validator rejects any scheme outside `https://` (or a **loopback**
+`http://`) and exits **2** on a bad value — before any side effect, including any LLM
+round-trip. The same https-only rule holds for `--mcp`, `--serve-mcp`, and `--a2a-peer`.
 
 ---
 
-## 9. Self-MCP serving: stdio / unix only in v1
+## 9. Self-MCP serving: HTTPS with authenticated identity
 
-Serving the self-MCP over Streamable HTTP would expose `subagent.*`, `exec`, and state
-resources to network peers — a materially larger attack surface than stdio. A *safe* HTTP
-server requires all of: high-entropy non-deterministic session IDs; sessions that are **not**
-authentication; **no token passthrough** (MCP MUST NOT forward a bearer it was not issued);
-`Origin` validation with `403` on mismatch (DNS-rebinding defense) plus loopback binding; and
-the full POST+GET / SSE / protocol-version / resumability surface.
+The self-MCP — `subagent.*`, the `agentd://` state resources, and the operator control family —
+is served over **Streamable HTTP(S)**. Trust is **never derived from the transport**; it is
+established per request by an authenticated identity:
 
-Because v1 has **no auth model** (by the §thesis decision) and none of this hardening built:
+- **mTLS is the primary identity.** With `--serve-cert`/`--serve-key`/`--serve-client-ca`, the
+  TLS acceptor verifies the client certificate against the pinned CA; a presented, verified cert
+  mints a `Management` peer.
+- **A bearer token is the alternative.** `--serve-bearer <token>` accepts a request whose
+  `Authorization: Bearer …` matches in **constant time**, also minting `Management`. (The token
+  is redacted everywhere.)
+- **No open control plane.** A non-loopback bind **must** configure mTLS and/or a bearer — an
+  unauthenticated non-loopback listener is a startup error. A loopback `http://` bind with no
+  auth is allowed only for local development.
+- **Operator control is the A2A admin method family** (`a2a.Drain`/`LameDuck`/`Pause`/`Resume`/
+  `Cancel`), reachable only by a `Management` peer; an unauthenticated/in-process (`Stdio`) caller
+  gets `-32601`, as if the method did not exist.
 
-- v1 serves the self-MCP over **stdio (always)** and **unix-socket** (`--serve-mcp unix:…`,
-  NDJSON framing) only.
-- A unix socket inherits **filesystem permissions** as its access control — the operator sets
-  the socket mode/owner. That is structural, out-of-band auth, not an in-band token.
-- **Self-MCP-over-HTTP, an auth model, and `MCP-Session-Id` handling are deferred** (RFC 0013).
-  agentd ships no network-exposed control surface it cannot yet secure.
+This is the authenticated, hardened HTTP control surface earlier drafts deferred — it now ships
+(the HTTP/1.1 + SSE server framing lives in the reusable `mcp` crate). agentd links **no**
+unix/vsock listener.
 
 ---
 

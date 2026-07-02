@@ -410,6 +410,15 @@ indefinitely — idling between events with zero child processes alive. The live
 state is observable at the Management-only **`agent://workflow`** resource:
 `driving`, `suspended` (with the watched uri and spent budget), or `terminal`.
 
+> **Cluster compatibility.** A reactive workflow daemon is a single-instance
+> shape: its wait uris are its *own dependencies*, not a partitioned work
+> stream — so `--shard N>1`, `--standby`, and `--assign-from` are rejected at
+> startup when combined with it (the shard filter would silently drop the
+> workflow's own wait updates). `--subscribe` routes may ride the same daemon
+> (they then require the usual `--instruction`), but don't point a `--claim`
+> route at a uri the workflow also waits on — a wait resolving consumes that
+> delivery before the claim gate.
+
 ---
 
 ## Termination, budgets, and reasons

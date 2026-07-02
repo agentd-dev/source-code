@@ -17,6 +17,15 @@ publish = false
 name = "mcp"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Direct https:// MCP (TCP+TLS) + mutual-TLS client identities — maps to net/tls.
+tls = ["net/tls"]
+# AF_VSOCK MCP transport — maps to net/vsock.
+vsock = ["net/vsock"]
+
 [dependencies]
+# Shared transport primitives (the HTTP/1.1+SSE client, unix/tls/vsock connects).
+net = { path = "../net" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

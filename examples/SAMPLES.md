@@ -5,10 +5,10 @@ run, an event-reactive daemon, and a polling/work-until-done loop — plus the
 instruction files and MCP server config they use.
 
 > **Status.** Implemented and released (v2.0.1). The agentic ReAct loop, the
-> supervisor + subagent process tree, the MCP client, served self-MCP, and all
-> four run modes ship; the commands below run real agent runs (given an
-> intelligence endpoint + MCP servers). Every flag and env var used here exists
-> in `crates/agentd/src/config.rs` (the authoritative surface).
+> supervisor + subagent process tree, the MCP client, served self-MCP over
+> HTTP(S), and all four run modes ship; the commands below run real agent runs
+> (given an intelligence endpoint + MCP servers). Every flag and env var used
+> here exists in `crates/agentd/src/config.rs` (the authoritative surface).
 
 ---
 
@@ -18,7 +18,7 @@ instruction files and MCP server config they use.
 |---|---|
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |
-| `mcp-servers.json` | An illustrative MCP server config (name + stdio launch argv + optional allowlists), the shape the config-file layer takes. |
+| `mcp-servers.json` | An illustrative MCP server config (name + remote `endpoint` + auth `headers` + `tags`), the shape a `--config` JSON file carries. |
 | `run-once.sh` | `--mode once`: run the instruction to a terminal status, then exit. Job / CLI shape. |
 | `run-reactive.sh` | `--mode reactive`: idle, wake on MCP resource changes, never exit on its own. Deployment shape. |
 | `run-loop.sh` | `--mode loop`: re-enter on a cadence until a bound or a drain signal. Job-with-deadline / Deployment shape. |
@@ -31,30 +31,32 @@ and that an intelligence endpoint is reachable. Build the binary with
 
 ## Prerequisites
 
-agentd ships **no tools of its own** (except a gated `exec`, off by default) and
-talks to **one** intelligence endpoint. So every sample needs two things wired:
+agentd ships **no tools of its own** and runs **no local code** — every tool comes
+from an MCP server it reaches over the network. It talks to **one** intelligence
+endpoint. So every sample needs two things wired:
 
-1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENT_INTELLIGENCE`.
-   One of:
-   - `unix:/run/intel.sock` — a gateway/sidecar over a unix socket (core build).
-   - `https://host/v1/...` — a direct HTTPS endpoint (`tls` feature).
-   - `vsock:<cid>:<port>` — a host LLM service from inside an enclave/microVM
-     (`vsock` feature, roadmap M4).
+1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENT_INTELLIGENCE`,
+   one **HTTPS** URI:
+   - `https://host/v1/...` — a direct HTTPS endpoint (`tls` feature, on by default).
+   - `http://127.0.0.1:PORT/v1` — a **loopback-only** plaintext carve-out for a
+     same-host TLS-terminating sidecar (dev / no-TLS image). A non-loopback
+     `http://` is rejected at startup (exit `2`).
 
    The wire is OpenAI-compatible `/chat/completions` with native tool-calling
    (RFC 0006). The credential is passed by **env/flag only**, never read from a
    config file, and is redacted everywhere agentd logs:
 
    ```bash
-   export AGENT_INTELLIGENCE=unix:/run/intel.sock
+   export AGENT_INTELLIGENCE=https://gw.example/v1
    export AGENT_INTELLIGENCE_TOKEN=...        # or --intelligence-token
    ```
 
 2. **MCP servers for the tools/resources the instruction needs** — declared with
-   the repeatable `--mcp name=command arg arg` flag (stdio transport, RFC 0004).
-   For example `--mcp "fs=mcp-server-fs --root /data"`. The launch argv is
-   **trusted config** and is never built from model- or server-controlled
-   strings.
+   the repeatable `--mcp name=<endpoint>` flag (remote **Streamable HTTP**,
+   RFC 0004). For example `--mcp "fs=https://mcp-fs.internal/mcp"`. agentd
+   **connects** to that URL and speaks JSON-RPC 2.0 over HTTP(S); it spawns no
+   process. The endpoint is **trusted config** and is never built from model- or
+   server-controlled strings (RFC 0012).
 
 A bad config exits `2` in milliseconds, before any LLM round-trip — agentd
 validates everything up front (e.g. `--mode reactive` with no `--subscribe`, or
@@ -86,26 +88,24 @@ the supervisor can map to an exit code.
 ## The MCP server config
 
 `mcp-servers.json` shows the shape of a declarative MCP server list: each server
-has a `name`, a `command` argv launched over **stdio**, and optional `tools` /
-`resources` allowlists that scope what a subagent may see and call
-(RFC 0009/0012). This is the verbose structural config the file layer carries —
-secrets never go here (env/flag only).
+has a `name`, a remote `endpoint` (an `https://host/mcp` Streamable-HTTP URL),
+optional auth `headers` (carrying `{{secret:NAME}}` references resolved at connect
+time, never inlined or logged), and `tags` that scope the Rule-of-Two trust budget
+(RFC 0009/0012). Load it with **`--config <path>`** (or `AGENTD_CONFIG`); the
+intelligence token still stays env/flag only.
 
-> **v1 vs roadmap.** In v1 the stable, wired surface for declaring servers is the
-> repeatable **`--mcp name=command arg arg`** flag (see `config.rs`). The
-> JSON config file (loaded via a config-file layer / `AGENT_MCP_CONFIG`) and the
-> per-server allowlist fields are **(roadmap)** — the file layer slots between
-> built-in defaults and env in a later milestone (`docs/design/PLAN.md`). The
-> sample scripts therefore use `--mcp` flags directly so they match what v1
-> actually parses; `mcp-servers.json` documents where that config is headed.
+> **Config precedence.** `--config` is the lowest non-default layer
+> (`default < FILE < env < flag`, RFC 0017 §3). Repeatable list flags like `--mcp`
+> **add** to the file's `mcp_servers`, so a file can declare the base set and a
+> flag can append one for a one-off run.
 
-The `--mcp` equivalents of the sample file:
+The `--mcp` flag equivalents of the sample file (agentd connects to each URL):
 
 ```bash
---mcp "fs=mcp-server-fs --root /data --read-only" \
---mcp "search=mcp-server-websearch" \
---mcp "tickets=mcp-server-tickets --project OPS" \
---mcp "inbox=mcp-server-inbox --queue /var/run/inbox"
+--mcp "fs=https://mcp-fs.internal/mcp" \
+--mcp "search=https://mcp-search.internal/mcp" \
+--mcp "tickets=https://mcp-tickets.internal/mcp" \
+--mcp "inbox=https://mcp-inbox.internal/mcp"
 ```
 
 ---
@@ -113,10 +113,10 @@ The `--mcp` equivalents of the sample file:
 ## Sample 1 — `run-once.sh` (mode: once)
 
 Run an instruction to a terminal status, then exit. This is the Job / CLI shape:
-result on stdout, telemetry on stderr, no daemon, no socket.
+result on stdout, telemetry on stderr, no daemon, no served surface.
 
 ```bash
-export AGENT_INTELLIGENCE=unix:/run/intel.sock
+export AGENT_INTELLIGENCE=https://gw.example/v1
 export AGENT_INTELLIGENCE_TOKEN=...
 ./run-once.sh
 ```
@@ -128,8 +128,8 @@ agentd \
   --mode once \
   --instruction-file instructions/research.md \
   --model claude-opus-4 \
-  --mcp "search=mcp-server-websearch" \
-  --mcp "fs=mcp-server-fs --root /data --read-only" \
+  --mcp "search=https://mcp-search.internal/mcp" \
+  --mcp "fs=https://mcp-fs.internal/mcp" \
   --max-steps 40 --max-tokens 150000 --deadline 5m \
   --run-id "research-20260625-101500"
 ```
@@ -150,7 +150,7 @@ drain signal (`SIGTERM`) or a fatal/limit class stops it. Deploy it as a
 long-lived Deployment.
 
 ```bash
-export AGENT_INTELLIGENCE=unix:/run/intel.sock
+export AGENT_INTELLIGENCE=https://gw.example/v1
 export AGENT_INTELLIGENCE_TOKEN=...
 ./run-reactive.sh
 ```
@@ -162,8 +162,8 @@ agentd \
   --mode reactive \
   --instruction-file instructions/triage.md \
   --model claude-opus-4 \
-  --mcp "inbox=mcp-server-inbox --queue /var/run/inbox" \
-  --mcp "tickets=mcp-server-tickets --project OPS" \
+  --mcp "inbox=https://mcp-inbox.internal/mcp" \
+  --mcp "tickets=https://mcp-tickets.internal/mcp" \
   --subscribe "inbox:///items/new" \
   --max-steps 25 --max-tokens 2000000 \
   --health-file /run/agentd/health --drain-timeout 25s
@@ -175,9 +175,10 @@ lifetime-scoped — it is the ultimate backpressure. `--health-file` gives an
 orchestrator a liveness heartbeat to probe; `--drain-timeout` (default 25s)
 bounds graceful shutdown and should stay under the pod's termination grace.
 
-> **v1 boundary.** Reactivity is **stdio-only** in v1 — the subscribed servers
-> must be stdio MCP servers. Reactive-over-HTTP (an SSE GET stream) is
-> **(roadmap)**, RFC 0013.
+> **How reactivity works.** agentd subscribes over the MCP servers'
+> Streamable-HTTP transport and wakes on pushed `notifications/resources/updated`
+> (HTTP/SSE) — the subscribed servers are the same remote HTTP endpoints declared
+> with `--mcp` (RFC 0013).
 
 ---
 
@@ -188,7 +189,7 @@ step cap), the wall-clock `--deadline`, or the tree-wide token ceiling — or a
 drain signal. The Job-with-deadline / Deployment shape.
 
 ```bash
-export AGENT_INTELLIGENCE=unix:/run/intel.sock
+export AGENT_INTELLIGENCE=https://gw.example/v1
 export AGENT_INTELLIGENCE_TOKEN=...
 ./run-loop.sh
 ```
@@ -201,8 +202,8 @@ agentd \
   --interval 5m \
   --instruction-file instructions/triage.md \
   --model claude-opus-4 \
-  --mcp "inbox=mcp-server-inbox --queue /var/run/inbox" \
-  --mcp "tickets=mcp-server-tickets --project OPS" \
+  --mcp "inbox=https://mcp-inbox.internal/mcp" \
+  --mcp "tickets=https://mcp-tickets.internal/mcp" \
   --max-steps 25 --max-tokens 1000000 --deadline 2h \
   --drain-timeout 25s
 ```
@@ -222,8 +223,7 @@ kept-alive Deployment.
 
 ## What a run logs
 
-agentd emits structured JSON lines on stderr (one event per line). The intended
-v1 shape, illustrative:
+agentd emits structured JSON lines on stderr (one event per line), illustrative:
 
 ```json
 {"ts":"2026-06-25T10:15:00.142Z","level":"info","event":"run.start","run_id":"research-20260625-101500","mode":"once","model":"claude-opus-4"}
@@ -240,16 +240,19 @@ redacted (`***`) in all agentd output, including panic messages.
 ## Flag reference (used by these samples)
 
 Every flag below is in `crates/agentd/src/config.rs`; run `agentd --help` for the
-full list. Anything env-settable (12-factor) is shown with its env var.
+full list. Anything env-settable (12-factor) is shown with its env var. The
+neutral `AGENT_*` env prefix is accepted as an alias for the branded `AGENTD_*`
+one (branded wins on conflict).
 
 | Flag | Env | Meaning |
 |---|---|---|
 | `--instruction <TEXT>` | `INSTRUCTION` | the task |
 | `--instruction-file <PATH>` | — | read the instruction from a file |
-| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | `unix:/path` \| `https://host/…` \| `vsock:cid:port` |
+| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | `https://host/…` (or loopback `http://127.0.0.1:PORT` for a dev sidecar) |
 | `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
 | `--model <NAME>` | `AGENT_MODEL` | model id |
-| `--mcp name=command` | — | declare an MCP server (repeatable; stdio) |
+| `--mcp name=<endpoint>` | — | declare a remote MCP server URL (repeatable; Streamable HTTP) |
+| `--config <PATH>` | `AGENT_CONFIG` | load a declarative JSON config file (`mcp_servers[]`, limits, …) |
 | `--mode once\|loop\|reactive\|schedule` | `AGENT_MODE` | the driver (default `once`) |
 | `--subscribe <uri>` | — | subscribe to an MCP resource (repeatable; required for `reactive`) |
 | `--interval <dur>` | — | loop/schedule cadence (e.g. `5m`, `0`=immediate) |
@@ -261,19 +264,22 @@ full list. Anything env-settable (12-factor) is shown with its env var.
 | `--log-level <L>` | `AGENT_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
 | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
 | `--health-file <PATH>` | — | liveness heartbeat file |
-| `--serve-mcp <unix:/path>` | `AGENT_SERVE_MCP` | serve agentd's own MCP (stdio/unix; HTTP serving is roadmap) |
-| `--enable-exec` | `AGENT_ENABLE_EXEC` | expose the gated `exec` tool (off by default) |
+| `--serve-mcp https://host:port` | `AGENT_SERVE_MCP` | serve agentd's own MCP over HTTP(S) with mTLS/bearer (`serve-https`; loopback `http://` for dev) |
 
 Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 `30`, `5m`, `2h`.
 
 ---
 
-## Roadmap boundaries (don't expect these in v1)
+## Boundaries
 
-- **Reactivity is stdio-only.** Reactive-over-HTTP / SSE GET — **(roadmap)**, RFC 0013.
-- **Self-MCP serving is stdio/unix only** (`--serve-mcp unix:/path`). HTTP
-  serving — **(roadmap)**.
-- **MCP `tasks` / `sampling` / `roots`** are not used as a client — **(roadmap)**, RFC 0013.
-- **Config file / `AGENT_MCP_CONFIG`** layer and per-server allowlists —
-  **(roadmap)**; v1 uses `--mcp` flags. See `docs/design/PLAN.md`.
+- **All transports are HTTP(S).** Intelligence, the MCP client, the served
+  self-MCP, and A2A / operator control are HTTP(S) with mTLS/bearer auth;
+  plaintext `http://` is a **loopback-only** dev carve-out. agentd links no
+  unix/vsock of its own.
+- **agentd ships no tools and runs no local code.** There is no `exec` tool; every
+  tool comes from a remote MCP server it connects to.
+- **Agent-authored cyclic run-graphs** ship under `--features run-graph` — the
+  model self-authors a `Graph` and agentd drives it (see
+  [`docs/run-graphs.md`](../docs/run-graphs.md)).
+- **MCP `tasks` / `sampling` / `roots`** as a client are **(deferred)**, RFC 0013.

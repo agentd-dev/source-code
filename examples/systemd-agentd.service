@@ -7,7 +7,7 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=AGENT_INTELLIGENCE=unix:/run/intelligence.sock
+Environment=AGENT_INTELLIGENCE=https://gw.example/v1
 # Secrets via EnvironmentFile (mode 0600), never on the command line or a config
 # file (RFC 0011 §3.2). The file sets AGENT_INTELLIGENCE_TOKEN=...
 EnvironmentFile=/etc/agentd/triage.env
@@ -15,7 +15,7 @@ ExecStart=/usr/local/bin/agentd \
   --mode reactive \
   --instruction-file /etc/agentd/triage.txt \
   --model my-model \
-  --mcp tickets=mcp-server-tickets \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --subscribe tickets://queue/inbound \
   --drain-timeout 25s \
   --health-file /run/agent/health

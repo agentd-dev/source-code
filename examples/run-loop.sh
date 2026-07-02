@@ -3,9 +3,8 @@
 # cadence until a bound (max iterations via steps, wall-clock deadline, or
 # tree-wide token ceiling) or a drain signal is hit.
 #
-# Targets v1 behavior (see docs/design/PLAN.md). The binary today validates
-# config + scaffold-notices run modes; the supervisor driver lands across
-# M1-M3. All flags below exist in crates/agentd/src/config.rs.
+# All flags below exist in crates/agentd/src/config.rs. Tools come from remote
+# MCP servers reached over Streamable HTTP — agentd runs no local code of its own.
 #
 # --interval D selects the re-entry cadence: D>0 polls every D; D=0 re-enters
 # immediately on completion (work-until-done). Here we poll every 5 minutes.
@@ -15,7 +14,7 @@ set -euo pipefail
 
 AGENTD="${AGENTD:-agentd}"
 
-export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-unix:/run/intel.sock}"
+export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
 exec "$AGENTD" \
@@ -23,8 +22,8 @@ exec "$AGENTD" \
   --interval 5m \
   --instruction-file "$(dirname "$0")/instructions/triage.md" \
   --model "claude-opus-4" \
-  --mcp "inbox=mcp-server-inbox --queue /var/run/inbox" \
-  --mcp "tickets=mcp-server-tickets --project OPS" \
+  --mcp inbox=https://mcp-inbox.internal/mcp \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --max-steps 25 \
   --max-tokens 1000000 \
   --deadline 2h \

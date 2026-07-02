@@ -7,8 +7,8 @@
 # A rolled pod should look like a clean 0, not a 143 failure (rfcs/0011 §5) —
 # which is why the drain budget must fit inside the pod grace.
 #
-# SCOPE: reactivity is stdio-only — subscriptions ride stdio MCP servers spawned
-# by agentd. (Reactive-over-HTTP is a deferred v2 surface, RFC 0013.)
+# SCOPE: reactivity rides the MCP servers' Streamable-HTTP subscriptions — agentd
+# subscribes over HTTP/SSE and reacts to pushed notifications/resources/updated.
 #
 # NOTE: the operator that schedules/replicates/rolls this Deployment is
 # EXTERNAL and not part of agentd (rfcs/0011 §1). agentd only honors the
@@ -54,7 +54,7 @@ spec:
             - --mode
             - reactive
             # Reactive mode requires >= 1 subscription. These are MCP resource
-            # URIs served by the stdio MCP servers declared below.
+            # URIs served by the remote MCP servers declared below.
             - --subscribe
             - file:///data/inbox
             # Serve /healthz + /readyz (+ /metrics) for the k8s probes below.
@@ -66,9 +66,9 @@ spec:
             # Keep the drain budget < terminationGracePeriodSeconds above.
             - --drain-timeout
             - 25s
-            # Tools are stdio MCP servers — bundled in the image.
+            # Tools come from remote MCP servers (Streamable HTTP endpoints).
             - --mcp
-            - fs=/usr/local/bin/mcp-server-fs --root /data
+            - fs=https://mcp-fs.internal/mcp
           env:
             - name: INSTRUCTION
               value: >-
@@ -76,7 +76,7 @@ spec:
                 via the fs MCP server. Reconcile to desired state on each wake;
                 items already handled are a no-op.
             - name: AGENT_INTELLIGENCE
-              value: unix:/run/intel/intel.sock
+              value: https://gw.example/v1
             - name: AGENT_INTELLIGENCE_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -127,13 +127,11 @@ spec:
               # OOM => 137 => raise this (rfcs/0011 §5).
               memory: 512Mi
           volumeMounts:
-            - name: intel
-              mountPath: /run/intel
             - name: data
               mountPath: /data
       volumes:
-        # The TLS-terminating intelligence sidecar's unix socket, shared in.
-        - name: intel
-          emptyDir: {}
+        # Intelligence is reached directly over HTTPS (AGENT_INTELLIGENCE above); a
+        # same-pod TLS-terminating sidecar would instead be a loopback http:// URL —
+        # either way no shared socket volume is needed.
         - name: data
           emptyDir: {}

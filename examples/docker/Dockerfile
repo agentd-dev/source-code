@@ -4,38 +4,29 @@
 # stage can be a near-empty base. Stage 2 is a distroless nonroot image: no
 # shell, no package manager, runs as UID 65532.
 #
-# DEFAULT FEATURE BUILD = NO TLS. The default (no-feature) build has no
-# async runtime, no TLS, and no C toolchain — the minimalism target (see the
-# workspace Cargo.toml and rfcs/0001). In that build the intelligence and MCP
-# endpoints must be reached over plaintext that something *else* terminates:
-#   - unix:/path        — a local socket (e.g. a TLS-terminating sidecar)
-#   - http://host/...   — dev only; the client warns
-#   - vsock:cid:port    — needs the `vsock` feature (see below)
-# To call an https:// endpoint directly, build with the `tls` feature:
-#       --features tls           (rustls + ring + bundled webpki roots)
-# See the FEATURES build-arg below; pass e.g. --build-arg FEATURES=tls,vsock.
+# TRANSPORT = HTTPS. The default build links `tls` (rustls + ring + bundled
+# webpki roots), so agentd dials `https://` directly — intelligence, the MCP
+# client, the served self-MCP, and A2A are all HTTPS:
+#   - https://host/...   — the default; agentd holds the trust roots
+#   - http://127.0.0.1/… — loopback only, for a same-host TLS-terminating sidecar
+# To keep TLS out of the image, build --no-default-features and use a loopback
+# http:// sidecar. See the FEATURES build-arg below.
 #
-# MCP SERVERS ARE STDIO. agentd ships no tools of its own except a gated exec
-# (rfcs/0001, rfcs/0012). Every tool comes from an MCP server that agentd
-# spawns over **stdio** (`--mcp name=command ...`). Because the transport is
-# stdio (a child process, not a network call), each MCP server binary must be
-# reachable *inside this container's process namespace*. Two options:
-#   1. BUNDLE the server binaries into this image (copy them into the runtime
-#      stage and reference them with absolute paths in --mcp), or
-#   2. run them as SIDECAR containers in the same pod and have the sidecar
-#      expose a stdio bridge — but note stdio cannot cross a container
-#      boundary directly, so a bundled binary or a shared process namespace
-#      (shareProcessNamespace) is the simpler path in v1.
-# This example image bundles nothing; see examples/docker/README.md.
+# MCP SERVERS ARE REMOTE HTTP ENDPOINTS. agentd ships no tools of its own and runs
+# no local code (rfcs/0001, rfcs/0012 — no exec tool). Every tool comes from an MCP
+# server agentd CONNECTS to over Streamable HTTP (`--mcp name=https://host/mcp`); it
+# spawns no process. So nothing MCP-related is bundled into this image — deploy each
+# MCP server as its own service and point --mcp at its URL. See examples/docker/README.md.
 
 # ---------------------------------------------------------------------------
 # Stage 1 — build
 # ---------------------------------------------------------------------------
 FROM rust:1.88-bookworm AS build
 
-# Capability surface is compile-time. Default (empty) = the minimalism build:
-# no TLS, no async runtime, no C/C++ toolchain. Override to add features,
-# e.g. --build-arg FEATURES=tls  or  --build-arg FEATURES=tls,vsock,cron.
+# Capability surface is compile-time. The default build links `tls` (the
+# transport). Override to add opt-in surfaces, e.g.
+# --build-arg FEATURES=serve-https,a2a,cron,run-graph — or --no-default-features
+# (empty FEATURES + the build below) for the TLS-free loopback-sidecar posture.
 ARG FEATURES=""
 
 # Static musl target so the runtime stage needs no libc / dynamic loader.
@@ -48,8 +39,9 @@ RUN rustup target add ${TARGET} \
 WORKDIR /src
 COPY . .
 
-# Build the release binary. `--no-default-features` is redundant today (the
-# crate has no default features) but is explicit about the minimalism intent.
+# Build the release binary. `--no-default-features` strips the crate's default
+# `tls` feature, giving the minimal loopback-sidecar posture; opt TLS back in
+# (direct https://) with FEATURES=tls, or a served surface with serve-https.
 RUN if [ -n "${FEATURES}" ]; then FEAT="--features ${FEATURES}"; else FEAT=""; fi; \
     cargo build --release --locked \
         --target ${TARGET} \

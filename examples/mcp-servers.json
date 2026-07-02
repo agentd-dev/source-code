@@ -1,39 +1,35 @@
 {
-  "//": "Illustrative MCP server config — the shape AGENT_MCP_CONFIG points at.",
-  "//1": "Each server is launched over stdio (RFC 0004 §3.11): agentd spawns the",
-  "//2": "command, speaks JSON-RPC 2.0 / NDJSON on its stdin+stdout, and drains",
-  "//3": "stderr into structured logs. The launch argv is TRUSTED config and is",
-  "//4": "NEVER built from model- or server-controlled strings (RFC 0012).",
-  "//5": "On the CLI this same shape is expressed as --mcp name=command arg arg",
-  "//6": "(repeatable). The config-file layer carries the argv as an explicit array.",
-  "//7": "The optional `tools`/`resources` allowlists scope what a subagent may see",
-  "//8": "and call (RFC 0009/0012); omit a field to allow all from that server.",
+  "//": "Illustrative MCP server config — the mcp_servers[] shape a --config file carries.",
+  "//1": "Each server is a REMOTE endpoint reached over Streamable HTTP (RFC 0004):",
+  "//2": "agentd CONNECTS to `endpoint` and speaks JSON-RPC 2.0 over HTTP(S) — it spawns",
+  "//3": "no process and runs no local code. The endpoint is TRUSTED config and is NEVER",
+  "//4": "built from model- or server-controlled strings (RFC 0012).",
+  "//5": "On the CLI this same shape is expressed as --mcp name=https://host/mcp (repeatable).",
+  "//6": "Per-server `headers` carry auth/framing as {{secret:NAME}} references, resolved at",
+  "//7": "connect time — never inlined or logged. `tags` scope the Rule-of-Two trust budget.",
 
-  "servers": [
+  "mcp_servers": [
     {
       "name": "fs",
-      "command": ["mcp-server-fs", "--root", "/data", "--read-only"],
-      "tools": ["read_file", "list_directory"],
-      "resources": ["file:///data/**"]
+      "endpoint": "https://mcp-fs.internal/mcp",
+      "headers": { "authorization": "Bearer {{secret:FS_TOKEN}}" },
+      "tags": { "*": ["sensitive"] }
     },
     {
       "name": "search",
-      "command": ["mcp-server-websearch"],
-      "env": {
-        "SEARCH_PROVIDER": "tavily"
-      },
-      "tools": ["web_search", "fetch_url"]
+      "endpoint": "https://mcp-search.internal/mcp",
+      "tags": { "*": ["egress", "untrusted_input"] }
     },
     {
       "name": "tickets",
-      "command": ["mcp-server-tickets", "--project", "OPS"],
-      "tools": ["create_ticket", "update_ticket", "search_tickets"]
+      "endpoint": "https://mcp-tickets.internal/mcp",
+      "tags": { "*": ["egress"] }
     },
     {
       "name": "inbox",
-      "command": ["mcp-server-inbox", "--queue", "/var/run/inbox"],
       "//": "Exposes subscribable resources so reactive mode can wake on new items.",
-      "resources": ["inbox:///items/*"]
+      "endpoint": "https://mcp-inbox.internal/mcp",
+      "tags": { "*": ["untrusted_input"] }
     }
   ]
 }

@@ -237,11 +237,20 @@ impl McpClient {
         }
     }
 
+    /// Cap on the era-detection probe. Discovery is a no-op request a healthy
+    /// server answers immediately; a server that accepts the connection but never
+    /// answers `server/discover` (a legacy server that hangs on unknown methods
+    /// rather than erroring) must not pin the handshake for the caller's full
+    /// per-request timeout (default 60s) — the probe gives up quickly and the
+    /// legacy `initialize` (with the full timeout) decides for real.
+    const PROBE_TIMEOUT_CAP: Duration = Duration::from_secs(5);
+
     /// Probe the server with a MODERN `server/discover` and classify the era. The
     /// discover request carries the per-request `_meta` + routing headers; the raw
     /// transport outcome (a discover result, a modern JSON-RPC error, or anything
     /// else) tells us whether the server is modern or legacy.
     fn probe_modern(&mut self, timeout: Duration) -> Result<Probe, McpError> {
+        let timeout = timeout.min(Self::PROBE_TIMEOUT_CAP);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let version = self
             .protocol_version
@@ -290,8 +299,17 @@ impl McpClient {
                 .filter(|e| is_modern_error_code(e.code))
                 .map(|e| classify_modern_error(&e))
                 .unwrap_or(Probe::Legacy)),
-            // A connect/transport failure is not an era signal — propagate it.
-            Err(e) => Err(http_err(&self.name, method::SERVER_DISCOVER, e)),
+            // A CONNECT failure (or an unsupported-transport build) means the
+            // server is absent for both eras — propagate; nothing else can work.
+            Err(e @ (HttpError::Connect(_) | HttpError::Unsupported(_))) => {
+                Err(http_err(&self.name, method::SERVER_DISCOVER, e))
+            }
+            // Reached the server but got no discover answer (read timeout on a
+            // server that hangs on unknown methods, a close-without-reply, a
+            // mid-stream error): not a modern server signal — fall back to the
+            // legacy handshake, which uses the full timeout and errors visibly
+            // if the server is genuinely broken.
+            Err(_) => Ok(Probe::Legacy),
         }
     }
 

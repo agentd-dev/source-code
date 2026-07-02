@@ -3070,6 +3070,8 @@ mod tests {
             },
             depth: 0,
             warm: false,
+            #[cfg(feature = "workflow")]
+            workflow: None,
         }
     }
 

@@ -45,6 +45,8 @@ fn bogus_payload() -> SpawnPayload {
         },
         depth: 0,
         warm: false,
+        #[cfg(feature = "workflow")]
+        workflow: None,
     }
 }
 

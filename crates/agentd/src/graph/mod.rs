@@ -32,7 +32,7 @@ pub use driver::{
 };
 
 mod exec;
-pub use exec::{drive_pinned, SessionExec, GRAPH_MAX_STEPS};
+pub use exec::{drive_connected, drive_pinned, SessionExec, GRAPH_MAX_STEPS};
 
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;

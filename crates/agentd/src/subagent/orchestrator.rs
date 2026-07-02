@@ -317,6 +317,22 @@ impl Orchestrator {
                 true,
             );
         };
+        // detach: hand the workflow to a SPAWNED subagent (pivot Phase 7 · W4) —
+        // the child process drives it under full supervision while this agent
+        // keeps working; collect via subagent.status / subagent.await with the
+        // returned handle. Reuses the spawn path, so depth/breadth/rate caps and
+        // scope narrowing apply exactly as for any delegation.
+        if args.get("detach").and_then(Value::as_bool).unwrap_or(false) {
+            let wf = match serde_json::to_value(&graph) {
+                Ok(v) => v,
+                Err(e) => return (format!("error: workflow serialize: {e}"), true),
+            };
+            return self.spawn(&json!({
+                "instruction": format!("drive workflow {id}"),
+                "detach": true,
+                "workflow": wf,
+            }));
+        }
         let model = self.intelligence.model.clone().unwrap_or_default();
         let node_timeout = Duration::from_millis(self.child_limits.deadline_ms);
         // The whole workflow shares the child's wall budget: each node may use up
@@ -457,17 +473,44 @@ impl Orchestrator {
                 "memory pressure (cgroup at memory.high); do this step yourself or retry",
             );
         }
+        // An attached WORKFLOW (pivot Phase 7 · W4): the child drives this graph
+        // instead of running the ReAct loop on `instruction`. Validated here at
+        // the authoring boundary (fail-closed as a tool result, like
+        // workflow.define) and again by the child across the process boundary.
+        #[cfg(feature = "workflow")]
+        let workflow: Option<crate::graph::Graph> = match args.get("workflow") {
+            None => None,
+            Some(v) => match serde_json::from_value::<crate::graph::Graph>(v.clone()) {
+                Ok(g) => {
+                    if let Err(errs) = g.validate() {
+                        return (format!("error: invalid workflow: {}", errs.join("; ")), true);
+                    }
+                    Some(g)
+                }
+                Err(e) => return (format!("error: malformed workflow: {e}"), true),
+            },
+        };
+        #[cfg(not(feature = "workflow"))]
+        let has_workflow = false;
+        #[cfg(feature = "workflow")]
+        let has_workflow = workflow.is_some();
+
         let instruction = args
             .get("instruction")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        if instruction.is_empty() {
+        if instruction.is_empty() && !has_workflow {
             return (
-                "error: subagent.spawn requires a non-empty 'instruction'".into(),
+                "error: subagent.spawn requires a non-empty 'instruction' (or a 'workflow')".into(),
                 true,
             );
         }
+        let instruction = if instruction.is_empty() {
+            "drive the attached workflow"
+        } else {
+            instruction
+        };
 
         let output_contract = str_arg(args, "output_contract");
         let context_seed = str_arg(args, "context")
@@ -501,6 +544,8 @@ impl Orchestrator {
             },
             depth: self.parent_depth + 1,
             warm: false, // a delegated subagent is a one-shot distilled subtask
+            #[cfg(feature = "workflow")]
+            workflow,
         };
         let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
         let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
@@ -949,7 +994,8 @@ fn distill(result: &Value) -> String {
 }
 
 fn spawn_tool_def() -> ToolDef {
-    ToolDef {
+    #[allow(unused_mut)]
+    let mut def = ToolDef {
         name: "subagent.spawn".into(),
         description: "Delegate a focused subtask to a fresh child agent. By DEFAULT the call BLOCKS \
             until the child finishes and returns its distilled result. Pass async=true to instead \
@@ -973,7 +1019,18 @@ fn spawn_tool_def() -> ToolDef {
             },
             "required": ["instruction"]
         }),
+    };
+    // A workflow build lets a parent hand the child a whole WORKFLOW to drive
+    // instead of an instruction (pivot Phase 7 · W4).
+    #[cfg(feature = "workflow")]
+    {
+        def.input_schema["properties"]["workflow"] = json!({
+            "type": "object",
+            "description": "a workflow graph {start, nodes} for the child to drive instead of the instruction (same shape as workflow.define); 'instruction' becomes optional"
+        });
+        def.input_schema["required"] = json!([]);
     }
+    def
 }
 
 fn status_tool_def() -> ToolDef {
@@ -1160,7 +1217,10 @@ fn workflow_run_tool_def() -> ToolDef {
             .into(),
         input_schema: json!({
             "type": "object",
-            "properties": {"workflow_id": {"type": "string", "description": "the id returned by workflow.define"}},
+            "properties": {
+                "workflow_id": {"type": "string", "description": "the id returned by workflow.define"},
+                "detach": {"type": "boolean", "description": "run it in a spawned subagent and return a handle immediately (collect via subagent.status/subagent.await); default false = run synchronously here"}
+            },
             "required": ["workflow_id"]
         }),
     }
@@ -1255,6 +1315,8 @@ mod tests {
             },
             depth,
             warm: false,
+            #[cfg(feature = "workflow")]
+            workflow: None,
         }
     }
 
@@ -1547,6 +1609,77 @@ mod tests {
             root.handle("workflow.define", &json!({})).unwrap().1,
             "missing graph refused"
         );
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn spawn_validates_an_attached_workflow_at_the_boundary() {
+        let mut root = Orchestrator::from_payload(
+            "agentd".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        // Malformed workflow → tool error naming the parse problem.
+        let (obs, err) = root
+            .handle("subagent.spawn", &json!({"workflow": {"start": 1}}))
+            .unwrap();
+        assert!(err, "{obs}");
+        assert!(obs.contains("malformed workflow"), "{obs}");
+        // Structurally invalid (no reachable halt) → refused, never spawned.
+        let bad = json!({"start": "a", "nodes": {"a": {"kind": "agent", "instruction": "spin", "edges": {"ok": "a"}}}});
+        let (obs, err) = root
+            .handle("subagent.spawn", &json!({"workflow": bad}))
+            .unwrap();
+        assert!(err, "{obs}");
+        assert!(obs.contains("invalid workflow"), "{obs}");
+        // Neither instruction nor workflow → the combined requirement message.
+        let (obs, err) = root.handle("subagent.spawn", &json!({})).unwrap();
+        assert!(err);
+        assert!(obs.contains("'instruction' (or a 'workflow')"), "{obs}");
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_run_detach_hands_the_workflow_to_a_spawned_child() {
+        // `/bin/true` stands in for the agentd binary: the process SPAWN succeeds
+        // (which is all detach needs to mint a handle); the "child" then exits
+        // without speaking the protocol, which the async registry reports as a
+        // terminal failure — the plumbing under test is the workflow→spawn hand-off.
+        let mut root = Orchestrator::from_payload(
+            "/bin/true".into(),
+            &payload(0, 4),
+            Duration::from_secs(5),
+            logger(),
+        );
+        let g = json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "agent", "instruction": "do", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        });
+        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
+        assert!(!err, "{obs}");
+        let id = obs.split_whitespace().nth(2).unwrap().to_string();
+        // detach → the spawn path returns a HANDLE immediately (the child drives
+        // the workflow in the background; collect via subagent.status/await).
+        let (obs, err) = root
+            .handle("workflow.run", &json!({"workflow_id": id, "detach": true}))
+            .unwrap();
+        assert!(!err, "detach returns a handle observation: {obs}");
+        assert!(obs.contains("handle="), "{obs}");
+        // The handle is trackable through the normal subagent surface.
+        let h = obs
+            .split("handle=")
+            .nth(1)
+            .and_then(|r| r.split(')').next())
+            .unwrap()
+            .to_string();
+        let (obs, err) = root
+            .handle("subagent.status", &json!({"handle": h}))
+            .unwrap();
+        assert!(!err, "the handle is queryable: {obs}");
     }
 
     #[test]

@@ -511,6 +511,14 @@ fn serve_self_mcp(
 /// result; stderr is telemetry. The loop itself runs in the child process; the
 /// supervisor here owns lifecycle, liveness, and teardown.
 fn run_once(cfg: &Config, log: &Logger) -> i32 {
+    run_supervised_once(cfg, log, root_payload(cfg))
+}
+
+/// Spawn + supervise ONE root subagent from `payload` and map its result to an
+/// exit code — the shared engine behind `--mode once` and `--mode workflow`
+/// (whose payload carries the workflow; the child drives it). The supervisor owns
+/// lifecycle, liveness, and teardown either way.
+fn run_supervised_once(cfg: &Config, log: &Logger, payload: SpawnPayload) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -519,7 +527,6 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
             return exit::GENERIC;
         }
     };
-    let payload = root_payload(cfg);
 
     // Bookend the run for the report's duration / timestamps (RFC 0016 §6.2).
     let started = std::time::SystemTime::now();
@@ -608,10 +615,8 @@ fn run_once(cfg: &Config, log: &Logger) -> i32 {
 /// projects to the same exit table as a one-shot run.
 #[cfg(feature = "workflow")]
 fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
-    use agentd::graph::{drive_pinned, GraphStatus};
-    use std::time::Duration;
-
-    // Load + parse + validate the pinned workflow (fail-closed at the operator boundary).
+    // Load + parse + validate the pinned workflow (fail-closed at the operator
+    // boundary, exit 2 before any side effect).
     let path = cfg.workflow_file.as_deref().unwrap_or_default();
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -633,61 +638,16 @@ fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
         return exit::USAGE;
     }
 
-    // Drive it against the SAME intelligence + MCP a normal run uses (the shared
-    // `drive_pinned` path — identical to the agent-authored `workflow.run` self-tool).
-    let payload = root_payload(cfg);
-    let model = payload.intelligence.model.clone().unwrap_or_default();
-    let node_timeout = cfg.deadline.unwrap_or(Duration::from_secs(600));
-    // The operator's --deadline bounds the WHOLE workflow (checked per node entry),
-    // and --max-tokens is the whole-workflow intelligence pool.
-    let deadline = Some(std::time::Instant::now() + node_timeout);
-    let result = drive_pinned(
-        &graph,
-        &payload.intelligence.uri,
-        payload.intelligence.token.clone(),
-        &model,
-        &cfg.mcp_servers,
-        cfg.max_steps,
-        cfg.max_tokens,
-        node_timeout,
-        deadline,
-        log,
-    );
-    let outcome = match result {
-        Ok(o) => o,
-        Err(e) => {
-            log.error("proc.exit", json!({"err": e.clone()}));
-            eprintln!("agentd: {e}");
-            // A failed intelligence/MCP setup maps to the matching infra exit code.
-            return if e.starts_with("intelligence") {
-                exit::INTEL_UNAVAILABLE
-            } else {
-                exit::MCP_REQUIRED_DOWN
-            };
-        }
-    };
-
-    print_result(&outcome.result);
-    let code = match outcome.status {
-        GraphStatus::Completed => exit::SUCCESS,
-        GraphStatus::Halted => outcome
-            .terminal
-            .map(|t| exit::once_exit(t, false))
-            .unwrap_or(exit::GENERIC),
-        GraphStatus::Exhausted => exit::BUDGET,
-        GraphStatus::LoopDetected | GraphStatus::Stalled => exit::PARTIAL,
-        GraphStatus::Crashed => exit::GENERIC,
-    };
-    log.info(
-        "proc.exit",
-        json!({
-            "workflow_status": format!("{:?}", outcome.status),
-            "reason": outcome.reason,
-            "steps": outcome.steps,
-            "code": code,
-        }),
-    );
-    code
+    // Run it SUPERVISED like any one-shot (pivot Phase 7 · W4): the root child
+    // drives the workflow (the driver lives in the child process) while the
+    // supervisor owns the kill ladder, cgroup limits, liveness, drain, and the
+    // run report — a workflow gets exactly the safety an instruction run gets.
+    // The child maps the graph outcome onto the same RFC 0011 exit table
+    // (completed→0, refused→5, budget/deadline→7, stalled/loop→3, crashed→1) and
+    // carries the workflow detail (status/reason/steps/tokens) in the result.
+    let mut payload = root_payload(cfg);
+    payload.workflow = Some(graph);
+    run_supervised_once(cfg, log, payload)
 }
 
 /// Project a supervisor [`KillReason`] to a `(report status, has_usable_partial,
@@ -781,6 +741,8 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         },
         depth: 0,
         warm: false, // root runs are one-shot; warm continue-sessions are daemon-minted
+        #[cfg(feature = "workflow")]
+        workflow: None,
     }
 }
 

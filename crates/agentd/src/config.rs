@@ -481,10 +481,10 @@ fn serve_port_of(authority: &str) -> Option<u16> {
 /// A declared **A2A peer**: a name and a client transport endpoint to reach a
 /// remote A2A agent (or the on-node gateway that forwards into the mesh). This
 /// is the delegation-backend axis of RFC 0020 §3 — `a2a.delegate` looks a peer
-/// up here and runs the A2A client against `endpoint`. The endpoint is one of
-/// agentd's existing client transports: `unix:/path` or `vsock:CID:PORT`. No
-/// secrets live here (the gateway is the PEP; the vsock peer is trusted, RFC
-/// 0012 §3.8). Serializable so it travels in the spawn payload to subagents,
+/// up here and runs the A2A client against `endpoint`. The endpoint is an A2A
+/// client transport: `https://host[:port]` (the target-vision transport; loopback
+/// `http://` for dev) or the legacy `unix:/path` / `vsock:CID:PORT`. No secrets
+/// live here. Serializable so it travels in the spawn payload to subagents,
 /// exactly like `mcp_servers` (RFC 0009 §spawn-payload).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A2aPeerSpec {
@@ -508,6 +508,10 @@ impl A2aPeerSpec {
 /// peer, unlike the `--serve-mcp` listen form which may wildcard).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A2aEndpoint {
+    /// Dial an A2A peer over HTTP(S) — the target-vision transport (pivot Phase
+    /// 2): `https://host[:port][/path]` (or loopback `http://` for dev/tests).
+    /// The raw URL, parsed by the A2A client's HTTP dialer.
+    Https(String),
     /// Connect to a unix-domain socket at this path.
     Unix(std::path::PathBuf),
     /// Connect to AF_VSOCK `(cid, port)`.
@@ -520,6 +524,21 @@ impl A2aEndpoint {
     /// [`ServeTarget::parse`]. Returns a [`ConfigError::Usage`] (exit 2, before
     /// any side effect) on any problem.
     pub fn parse(spec: &str) -> Result<A2aEndpoint, ConfigError> {
+        // The target-vision transport: an https:// peer URL (or loopback http://).
+        if spec.starts_with("https://") {
+            return Ok(A2aEndpoint::Https(spec.to_string()));
+        }
+        if spec.starts_with("http://") {
+            let host = crate::net::http::Url::parse(spec)
+                .map(|u| u.host)
+                .unwrap_or_default();
+            if !crate::net::http::is_loopback_host(&host) {
+                return Err(usage(format!(
+                    "--a2a-peer: plaintext http:// is allowed for loopback only; use https:// (got: {spec})"
+                )));
+            }
+            return Ok(A2aEndpoint::Https(spec.to_string()));
+        }
         if let Some(path) = spec.strip_prefix("unix:") {
             if path.is_empty() {
                 return Err(usage("--a2a-peer: unix path is empty".into()));
@@ -555,7 +574,7 @@ impl A2aEndpoint {
             return Ok(A2aEndpoint::Vsock { cid, port });
         }
         Err(usage(format!(
-            "--a2a-peer: scheme unsupported (want unix:PATH | vsock:CID:PORT): {spec}"
+            "--a2a-peer: scheme unsupported (want https://host[:port] | http://loopback | unix:PATH | vsock:CID:PORT): {spec}"
         )))
     }
 }
@@ -3559,6 +3578,23 @@ mod tests {
         ));
         assert!(matches!(
             parse_a2a_peer_spec("mesh="),
+            Err(ConfigError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a2a_endpoint_https_parses_and_gates_plaintext() {
+        assert_eq!(
+            A2aEndpoint::parse("https://peer.example:8443/a2a").unwrap(),
+            A2aEndpoint::Https("https://peer.example:8443/a2a".into())
+        );
+        // loopback plaintext is allowed (dev); non-loopback plaintext is exit 2.
+        assert!(matches!(
+            A2aEndpoint::parse("http://127.0.0.1:9000"),
+            Ok(A2aEndpoint::Https(_))
+        ));
+        assert!(matches!(
+            A2aEndpoint::parse("http://peer.example:9000"),
             Err(ConfigError::Usage(_))
         ));
     }

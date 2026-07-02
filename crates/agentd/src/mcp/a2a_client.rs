@@ -6,10 +6,11 @@
 //! objective to a LOCAL supervised subagent (`subagent.spawn`, unchanged) OR to a
 //! REMOTE A2A agent. Same abstraction (objective → distilled result); this module
 //! is the remote backend. It connects to a declared peer (an [`A2aEndpoint`] —
-//! `unix:/path` or `vsock:CID:PORT`; the peer may be a co-located A2A agent or the
-//! on-node gateway that forwards into the mesh) over the SAME RFC 0004 JSON-RPC
-//! NDJSON codec ([`crate::json::frame`]) the rest of the crate speaks, then drives
-//! the A2A unary surface as a client:
+//! `https://host[:port]` over HTTP(S), the target-vision transport; or the legacy
+//! `unix:/path` / `vsock:CID:PORT` sockets) and drives the A2A unary surface as a
+//! client. HTTP peers use one `POST` per call (the [`HttpConn`] caller); socket
+//! peers speak the RFC 0004 JSON-RPC NDJSON codec ([`crate::json::frame`]). Both
+//! flow through the same transport-agnostic [`drive`] loop:
 //!
 //!   1. `a2a.SendMessage` with the objective as one text `Part` (role `ROLE_USER`,
 //!      a minted `messageId`) → a Task whose `id` comes back,
@@ -72,17 +73,23 @@ pub fn delegate(
     // left until the delegation deadline (so a single read never outlives it).
     let timeout = request_timeout(deadline);
     match endpoint {
+        // The target-vision transport: dial the peer's A2A method surface over
+        // HTTP(S), one POST per unary call (SendMessage + GetTask polls).
+        A2aEndpoint::Https(url) => match HttpEp::parse(url) {
+            Ok(ep) => drive(HttpConn::new(ep), objective, output_contract, deadline),
+            Err(e) => DelegateOutcome::Error(e),
+        },
         A2aEndpoint::Unix(path) => {
             let path = path.to_string_lossy().into_owned();
             match crate::net::unixsock::connect(&path, timeout) {
-                Ok(stream) => run(stream, objective, output_contract, deadline),
+                Ok(stream) => drive(Conn::new(stream), objective, output_contract, deadline),
                 Err(e) => DelegateOutcome::Error(format!("a2a: cannot reach peer {path}: {e}")),
             }
         }
         #[cfg(feature = "vsock")]
         A2aEndpoint::Vsock { cid, port } => {
             match crate::net::vsock::connect(*cid, *port, timeout) {
-                Ok(stream) => run(stream, objective, output_contract, deadline),
+                Ok(stream) => drive(Conn::new(stream), objective, output_contract, deadline),
                 Err(e) => DelegateOutcome::Error(format!(
                     "a2a: cannot reach peer vsock:{cid}:{port}: {e}"
                 )),
@@ -98,18 +105,22 @@ pub fn delegate(
     }
 }
 
-/// Drive the A2A unary exchange over an already-connected `Read + Write` peer
-/// stream: SendMessage → poll GetTask to terminal. Split out from [`delegate`] so
-/// it is transport-agnostic (unix / vsock alike — both are `Read + Write`) and
-/// directly unit-testable against an in-process server fixture.
-fn run<S: Read + Write + CloneStream>(
-    stream: S,
+/// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
+/// `result` Task value or an error string. Implemented by [`Conn`] (NDJSON over a
+/// socket) and [`HttpConn`] (HTTP POST). Lets [`drive`] be transport-agnostic.
+trait Caller {
+    fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String>;
+}
+
+/// Drive the A2A unary exchange over any [`Caller`]: SendMessage → poll GetTask to
+/// terminal. Split out from [`delegate`] so it is transport-agnostic (unix / vsock
+/// NDJSON and HTTP alike) and directly unit-testable against a fixture.
+fn drive<C: Caller>(
+    mut conn: C,
     objective: &str,
     output_contract: Option<&str>,
     deadline: Instant,
 ) -> DelegateOutcome {
-    let mut conn = Conn::new(stream);
-
     // 1) a2a.SendMessage → a Task; capture its id.
     let message_id = mint_message_id();
     let params = a2a::send_message_params(objective, output_contract, &message_id);
@@ -188,7 +199,9 @@ impl<S: Read + Write> Conn<S> {
             next_id: 1,
         }
     }
+}
 
+impl<S: Read + Write> Caller for Conn<S> {
     /// Send one `a2a.<Method>` request and read its reply, returning the `result`
     /// value (a `Task`) or an error string (a transport failure or a JSON-RPC
     /// error object from the peer). Skips any interleaved notification/mismatched
@@ -255,6 +268,99 @@ impl CloneStream for std::os::unix::net::UnixStream {
 impl CloneStream for vsock::VsockStream {
     fn clone_stream(&self) -> Self {
         self.try_clone().expect("clone vsock peer stream")
+    }
+}
+
+/// A resolved HTTP(S) A2A peer endpoint: the dial coordinates + framing.
+struct HttpEp {
+    host: String,
+    port: u16,
+    path: String,
+    host_header: String,
+    tls: bool,
+}
+
+impl HttpEp {
+    fn parse(url: &str) -> Result<HttpEp, String> {
+        let u = crate::net::http::Url::parse(url).map_err(|e| format!("a2a: bad peer url {url}: {e}"))?;
+        let path = if u.path.is_empty() || u.path == "/" {
+            "/".to_string()
+        } else {
+            u.path.clone()
+        };
+        Ok(HttpEp {
+            host_header: u.host_header(),
+            tls: u.is_tls(),
+            host: u.host,
+            port: u.port,
+            path,
+        })
+    }
+}
+
+/// An HTTP(S) A2A caller: each unary call is one `POST` (Connection: close),
+/// mirroring the MCP client's dialer — server-auth TLS for `https://`, plaintext
+/// for a loopback `http://` peer. (Presenting a client credential TO the peer —
+/// mTLS/bearer — is a follow-up; today agentd dials peers it already trusts.)
+struct HttpConn {
+    ep: HttpEp,
+    next_id: i64,
+}
+
+impl HttpConn {
+    fn new(ep: HttpEp) -> HttpConn {
+        HttpConn { ep, next_id: 1 }
+    }
+
+    fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
+        let tcp = crate::net::http::connect_tcp(&self.ep.host, self.ep.port, timeout)
+            .map_err(|e| format!("a2a: cannot reach peer {}: {e}", self.ep.host))?;
+        if self.ep.tls {
+            #[cfg(feature = "tls")]
+            {
+                let tls = crate::net::tls::connect(tcp, &self.ep.host, None)
+                    .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.host))?;
+                Ok(Box::new(tls))
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                Err("a2a: https peer requires the 'tls' build feature".to_string())
+            }
+        } else {
+            Ok(Box::new(tcp))
+        }
+    }
+}
+
+impl Caller for HttpConn {
+    fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let timeout = request_timeout(deadline);
+        let req = Request::new(Id::Num(id), method, Some(params));
+        let body = serde_json::to_vec(&req).map_err(|e| format!("a2a: encode {method}: {e}"))?;
+        let mut stream = self.connect(timeout)?;
+        let resp = crate::net::http::send(
+            &mut *stream,
+            &self.ep.host_header,
+            "POST",
+            &self.ep.path,
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .map_err(|e| format!("a2a: {method}: {e}"))?;
+        if !resp.is_success() {
+            return Err(format!("a2a: {method} HTTP {}", resp.status));
+        }
+        let response: crate::json::Response = serde_json::from_slice(&resp.body)
+            .map_err(|e| format!("a2a: {method} bad reply: {e}"))?;
+        if let Some(err) = response.error {
+            return Err(format!(
+                "a2a: {method} rpc error {}: {}",
+                err.code, err.message
+            ));
+        }
+        Ok(response.result.unwrap_or(Value::Null))
     }
 }
 
@@ -360,7 +466,7 @@ mod tests {
         let h = serve_fixture(server, send, gets);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let out = run(client, "do the work", Some("one line"), deadline);
+        let out = drive(Conn::new(client), "do the work", Some("one line"), deadline);
         match out {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "the distilled answer"),
             DelegateOutcome::Error(e) => panic!("expected distillate, got error: {e}"),
@@ -376,7 +482,7 @@ mod tests {
         let gets = Arc::new(Mutex::new(vec![task("t-2", TaskState::Working, None)]));
         let h = serve_fixture(server, send, gets);
         let deadline = Instant::now() + Duration::from_secs(5);
-        match run(client, "obj", None, deadline) {
+        match drive(Conn::new(client), "obj", None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "immediate"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -390,7 +496,7 @@ mod tests {
         let gets = Arc::new(Mutex::new(vec![task("t-3", TaskState::Failed, None)]));
         let h = serve_fixture(server, send, gets);
         let deadline = Instant::now() + Duration::from_secs(5);
-        match run(client, "obj", None, deadline) {
+        match drive(Conn::new(client), "obj", None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("failed"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got distillate: {s}"),
         }
@@ -406,7 +512,7 @@ mod tests {
         let h = serve_fixture(server, send, gets);
         // A short deadline so the test is fast.
         let deadline = Instant::now() + Duration::from_millis(300);
-        match run(client, "obj", None, deadline) {
+        match drive(Conn::new(client), "obj", None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
         }
@@ -430,10 +536,88 @@ mod tests {
             }
         });
         let deadline = Instant::now() + Duration::from_secs(2);
-        match run(client, "obj", None, deadline) {
+        match drive(Conn::new(client), "obj", None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("rpc error"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }
         let _ = h.join();
+    }
+
+    /// A tiny loopback-TCP **HTTP** A2A server fixture: answers each `POST` with
+    /// one JSON-RPC reply drawn from the canned queue (SendMessage first, then the
+    /// GetTask replies). Exercises the `HttpConn` client path end-to-end.
+    fn serve_http_fixture(replies: Vec<Value>) -> String {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut queue = replies.into_iter();
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { continue };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .ok();
+                // Read the request head + Content-Length body.
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                let mut req_id = json!(1);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).is_ok()
+                    && let Ok(rpc) = serde_json::from_slice::<Value>(&body)
+                {
+                    req_id = rpc["id"].clone();
+                }
+                let Some(result) = queue.next() else { break };
+                let payload = json!({"jsonrpc": "2.0", "id": req_id, "result": result});
+                let text = serde_json::to_vec(&payload).unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    text.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&text);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn delegate_over_http_send_then_poll_returns_the_distillate() {
+        // SendMessage → WORKING; GetTask → WORKING then COMPLETED — over HTTP.
+        let url = serve_http_fixture(vec![
+            task("h-1", TaskState::Working, None),
+            task("h-1", TaskState::Working, None),
+            task("h-1", TaskState::Completed, Some("http distilled answer")),
+        ]);
+        let ep = A2aEndpoint::parse(&url).expect("parse https endpoint");
+        assert!(matches!(ep, A2aEndpoint::Https(_)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match delegate(&ep, "do the work", Some("one line"), deadline) {
+            DelegateOutcome::Distillate(s) => assert_eq!(s, "http distilled answer"),
+            DelegateOutcome::Error(e) => panic!("expected distillate, got error: {e}"),
+        }
+    }
+
+    #[test]
+    fn delegate_over_http_surfaces_a_failed_task() {
+        let url = serve_http_fixture(vec![task("h-2", TaskState::Failed, None)]);
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            delegate(&ep, "obj", None, deadline),
+            DelegateOutcome::Error(_)
+        ));
     }
 }

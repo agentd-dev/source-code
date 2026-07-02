@@ -43,13 +43,13 @@ intelligence endpoint list + headers). Everything else is env-settable;
 |---|---|---|
 | Instruction | `INSTRUCTION` | `--instruction <TEXT>` / `--instruction-file <PATH>` |
 | Config file | `AGENT_CONFIG` | `--config <PATH>` |
-| Intelligence list | `AGENT_INTELLIGENCE` | `--intelligence unix:/… │ https://… │ vsock:cid:port` (comma-list = failover) |
+| Intelligence list | `AGENT_INTELLIGENCE` | `--intelligence https://…` (loopback `http://` for dev; comma-list = failover) |
 | Intelligence creds | `AGENT_INTELLIGENCE_TOKEN` / `…_FILE`, `…_<N>` / `…_<N>_FILE` | `--intelligence-token <T>` / `--intelligence-token-file <PATH>` |
 | Model / swap policy | `AGENT_MODEL` / `AGENT_MODEL_SWAP` | `--model <NAME>` / `--model-swap finish-on-old│restart-turn` |
-| MCP server | — | `--mcp name=command …` (repeatable, stdio) |
-| Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp unix:/… │ vsock:PORT │ vsock:CID:PORT` (`serve-mcp` feat.) |
-| A2A peer | `AGENT_A2A_PEER` | `--a2a-peer name=endpoint` (repeatable; `a2a` feat.) |
-| Enable exec tool | `AGENT_ENABLE_EXEC` (`:`-list) | `--enable-exec <abs-path>` (repeatable allowlist) |
+| MCP server | — | `--mcp name=<endpoint>` (repeatable; remote Streamable HTTP) |
+| Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp https://host:port` + `--serve-cert`/`--serve-key`/`--serve-client-ca` or `--serve-bearer` (`serve-https` feat.) |
+| A2A peer | `AGENT_A2A_PEER` | `--a2a-peer name=https://endpoint` (repeatable; `a2a` feat.) |
+| Run-graph | `AGENT_GRAPH` | `--graph <FILE>` with `--mode graph` (`run-graph` feat.) |
 | Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule` |
 | Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
 | Interval / cron | `AGENT_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
@@ -71,15 +71,15 @@ intelligence endpoint list + headers). Everything else is env-settable;
 | **Hot reload** | `AGENT_WATCH_CONFIG` | `--watch-config` (`config-watch` feat.) + SIGHUP (`hot-reload` feat.) |
 
 Durations accept `ms`/`s`/`m`/`h` or a bare integer (seconds): `600s`, `5m`,
-`2h`, `250ms`, `30`. Each intelligence list element must be `unix:/path`,
-`https://host/…`, or `vsock:cid:port` (`http://` is dev-only and the client
-warns). Config is validated **before any side effect** — a typo'd flag, a
-feature-gated flag in a build without its feature, or an unresolvable secret
-reference exits `2` in milliseconds, not after an LLM round-trip.
+`2h`, `250ms`, `30`. Each intelligence list element must be `https://host/…` (or a
+**loopback** `http://` for a same-host dev gateway); the same https-only rule holds
+for `--mcp`, `--serve-mcp`, and `--a2a-peer`. Config is validated **before any side
+effect** — a typo'd flag, a feature-gated flag in a build without its feature, or an
+unresolvable secret reference exits `2` in milliseconds, not after an LLM round-trip.
 
-> **Scope markers.** Reactivity is **stdio MCP only** (subscriptions ride stdio
-> MCP server children); self-MCP serving is **unix/vsock** (no HTTP serving of
-> the self-MCP); MCP tasks/sampling/roots are deferred (RFC 0013). The
+> **Scope markers.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions;
+> self-MCP serving is over HTTP(S) with mTLS/bearer auth (loopback `http://` for
+> dev); MCP tasks/sampling/roots are deferred (RFC 0013). The
 > `cluster` work-claim `:resource` style is a stub (`:tool` is the working
 > style), and `AGENT_WARM_INTEL` is forward-compat only — see
 > [`configuration.md`](configuration.md) §13. Items below are tagged where they
@@ -96,10 +96,10 @@ a code from the [exit-code table](#the-exit-code-contract).
 ```bash
 agentd \
   --instruction "Summarise today's open incidents and post a digest." \
-  --intelligence unix:/run/intelligence.sock \
+  --intelligence https://gw.example/v1 \
   --model my-model \
-  --mcp incidents="mcp-server-http --base https://incidents.internal" \
-  --mcp slack="mcp-server-slack" \
+  --mcp incidents=https://mcp-incidents.internal/mcp \
+  --mcp slack=https://mcp-slack.internal/mcp \
   --deadline 5m \
   --max-steps 40
 ```
@@ -152,9 +152,9 @@ individual reaction failing.
 agentd \
   --mode reactive \
   --instruction "When a ticket is filed, triage it and assign an owner." \
-  --intelligence unix:/run/intelligence.sock \
+  --intelligence https://gw.example/v1 \
   --model my-model \
-  --mcp tickets="mcp-server-tickets --watch" \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --subscribe "tickets://queue/inbound" \
   --drain-timeout 25s \
   --health-file /run/agent/health
@@ -167,8 +167,8 @@ read-after-subscribe so a change that happened while it was down is still acted
 on (RFC 0003 §3.11). No persistence layer — a restart is a cold start that
 reconciles.
 
-> **(roadmap)** v1 reactivity is **stdio MCP only**: subscriptions are served by
-> stdio MCP server children, not over HTTP. Reactive-over-HTTP is deferred.
+> Reactivity rides the MCP servers' **Streamable-HTTP** subscriptions: the client
+> subscribes and processes pushed `notifications/resources/updated` over HTTP/SSE.
 
 ### Graceful shutdown
 
@@ -198,13 +198,13 @@ Description=agent ticket triage (reactive)
 After=network.target
 
 [Service]
-Environment=AGENT_INTELLIGENCE=unix:/run/intelligence.sock
+Environment=AGENT_INTELLIGENCE=https://gw.example/v1
 Environment=AGENT_INTELLIGENCE_TOKEN=
 EnvironmentFile=/etc/agentd/triage.env
 ExecStart=/usr/local/bin/agentd \
   --mode reactive \
   --instruction-file /etc/agentd/triage.txt \
-  --mcp tickets=mcp-server-tickets \
+  --mcp tickets=https://mcp-tickets.internal/mcp \
   --subscribe tickets://queue/inbound \
   --drain-timeout 25s
 # Give the drain room: must exceed AGENT_DRAIN_TIMEOUT.
@@ -246,16 +246,16 @@ minimalism target. What each adds:
 | `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a reactive quiesce boundary. |
 | `config-watch` | The `inotify` file-watch reload trigger (`--watch-config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
 
-Build a narrower (or wider) surface with `--build-arg FEATURES=…`. `tls` and
-`vsock` are **not** in the default set (they change the dial transport — see the
-TLS note below); `events`/`a2a` ride `serve-mcp`; `FEATURES=` builds the pure,
-flag-free minimal binary.
+Build a narrower (or wider) surface with `--build-arg FEATURES=…`. `tls` is in the
+**default** set (it is the transport — every network surface is HTTPS); the served
+self-MCP is `serve-https`, and `events`/`a2a` ride it. `--no-default-features` drops
+TLS for the loopback-`http://`-to-a-sidecar posture.
 
 ```dockerfile
 # syntax=docker/dockerfile:1
 # Static musl binary on scratch — the dependency-free cloud-native feature set.
 FROM rust:1-alpine AS build
-ARG FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch"
+ARG FEATURES="serve-https,metrics,cron,otel,cluster,hot-reload,config-watch,run-graph"
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
@@ -273,8 +273,8 @@ FROM scratch
 COPY --from=build /src/target/release/agentd /agent
 # Non-root by uid (scratch has no /etc/passwd; the kernel uses the number).
 USER 65532:65532
-# MCP server binaries are part of the agentd's toolset — add them alongside:
-# COPY --from=build /path/to/mcp-server-tickets /usr/local/bin/
+# MCP servers are remote HTTP endpoints (--mcp name=https://…), deployed as their
+# own services — nothing MCP-related is bundled into the agentd image.
 ENTRYPOINT ["/agentd"]
 ```
 
@@ -282,21 +282,21 @@ ENTRYPOINT ["/agentd"]
 > compile-time choice, not a runtime flag. A runtime flag that needs an unbuilt
 > feature exits `2` — e.g. `--shard 2/8` on an image built without `cluster`.
 
-### TLS is off by default — terminate it in a sidecar
+### TLS is on by default — or terminate it in a sidecar
 
-The default build has **no TLS**. The intended container posture is **plaintext
-inside the pod, TLS at the boundary**:
+The default build links `tls` (rustls + bundled roots), so agentd dials `https://`
+directly. Two postures:
 
-- Point `--intelligence` at a **`unix:` socket** shared with a sidecar (or the
-  host) that terminates TLS to the real endpoint, or
-- Use **`vsock:cid:port`** to reach an intelligence endpoint on the host /
-  enclave (build with **`--features vsock`**), or
-- Build with **`--features tls`** to dial `https://` directly (rustls + bundled
-  roots; adds the one heavier dependency).
+- **Direct HTTPS (default):** `--intelligence https://…` (and `--mcp name=https://…`)
+  reach real endpoints over TLS; agentd holds the trust roots.
+- **Sidecar TLS termination:** build `--no-default-features` and point agentd at a
+  **same-host sidecar over loopback** — `--intelligence http://127.0.0.1:PORT/…` —
+  which terminates TLS + provider auth. A non-loopback `http://` is rejected.
 
 ```bash
-# In-pod: agentd talks plaintext over a unix socket to a TLS-terminating sidecar.
-agentd --intelligence unix:/run/intel/intel.sock --instruction-file /etc/task.txt --mcp …
+# Direct HTTPS (default build):
+agentd --intelligence https://gw.example/v1 --instruction-file /etc/task.txt \
+  --mcp fs=https://mcp-fs.internal/mcp
 ```
 
 This keeps the default image at scratch-size with no certificate management in
@@ -322,11 +322,11 @@ idle reactive agentd is healthy — liveness tracks the supervisor, not whether 
 is flowing.
 
 > **Self-MCP scope.** `--serve-mcp` lets other agents compose with this one over
-> MCP and is **unix/vsock only** (`serve-mcp` + optionally `vsock` features) —
-> there is no HTTP serving of the self-MCP (RFC 0013). The same unix/vsock
-> listener also carries the management transport and (with `--features a2a`) the
-> A2A method surface — see [the management transport](#management-over-vsock--a-node-agent)
-> below. Do not expose `--serve-mcp` over a TCP port.
+> **HTTP(S)** (`serve-https` feature), with trust minted per request by mTLS or a
+> bearer token — never by the transport; a non-loopback bind must authenticate. The
+> same listener carries the management transport and (with `--features a2a`) the A2A
+> method surface — see [the management transport](#management-over-https--a-node-agent)
+> below.
 
 ---
 
@@ -413,7 +413,7 @@ spec:
           args:
             - --mode=once
             - --instruction-file=/etc/agentd/task.txt
-            - --intelligence=unix:/run/intel/intel.sock
+            - --intelligence=https://gw.example/v1
             - --drain-timeout=25s
           env:
             - { name: AGENT_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
@@ -450,7 +450,7 @@ spec:
               args:
                 - --mode=once
                 - --instruction-file=/etc/agentd/nightly.txt
-                - --intelligence=unix:/run/intel/intel.sock
+                - --intelligence=https://gw.example/v1
                 - --drain-timeout=25s
 ```
 
@@ -477,7 +477,7 @@ spec:
           args:
             - --mode=reactive
             - --instruction-file=/etc/agentd/triage.txt
-            - --intelligence=unix:/run/intel/intel.sock
+            - --intelligence=https://gw.example/v1
             - --subscribe=tickets://queue/inbound
             - --drain-timeout=25s
             - --health-file=/run/agent/health
@@ -531,7 +531,7 @@ spec:
               K="${HOSTNAME##*-}"
               exec /agentd --mode reactive \
                 --instruction-file /etc/agentd/task.txt \
-                --intelligence unix:/run/intel/intel.sock \
+                --intelligence https://gw.example/v1 \
                 --subscribe tickets://queue/inbound \
                 --metrics-addr :9090 --drain-timeout 25s
           env:
@@ -563,7 +563,7 @@ either send `SIGHUP` or run `--watch-config`:
   applies the reloadable subset (model, the intelligence endpoint list, limits,
   `subscribe`, `log_level`, `mcp_servers` re-handshake) in place. An invalid
   candidate keeps the running config — nothing is half-applied. A diff that
-  touches a **restart-only** field (mode, run-id, serve-mcp, exec, drain, shard,
+  touches a **restart-only** field (mode, run-id, serve-mcp, drain, shard,
   claim/standby, continue topology) is **refused** with `reason="restart_required"`
   (roll the pod).
 - **`SIGHUP`** (`hot-reload` feature) is the portable trigger if you would rather
@@ -595,17 +595,18 @@ Secrets never live in the ConfigMap: the file carries only structural config and
 `{{secret:NAME}}` / `{{secret-file:PATH}}` references, resolved from env vars or
 mounted Secret files at load/reload ([`configuration.md`](configuration.md) §12).
 
-### Management over vsock + a node-agent
+### Management over HTTPS + a node-agent
 
 The same `--serve-mcp` listener that exposes the self-MCP also carries the
-**management transport** — status, subagent introspection, and (with
-`--features a2a`) the A2A method surface — over a **unix socket or AF_VSOCK port**
-(`--serve-mcp vsock:PORT`, `--features vsock`). vsock is the right transport when
-a host/enclave **node-agent** drives a guest agent across a VM boundary
-(Firecracker/Kata): no shared filesystem, no TCP port to firewall. There is **no
-HTTP** management surface — keep this off any TCP port. The node-agent (the thing
-that issues management RPCs, signals reloads, and reads `agent://` resources) is
-**external** and not part of agentd; agentd only honours the transport contract.
+**management transport** — status, subagent introspection, the operator control
+family (`a2a.Drain`/`LameDuck`/`Pause`/`Resume`/`Cancel`), and (with `--features
+a2a`) the A2A method surface — over **HTTP(S)**. Trust is minted per request by
+**mutual TLS** (`--serve-cert`/`--serve-key`/`--serve-client-ca`) or a **bearer
+token** (`--serve-bearer`), never by the transport; a non-loopback bind that
+configures neither is a startup error (no open control plane). The controller (the
+thing that issues management RPCs, signals reloads, and reads `agent://` resources —
+e.g. `agentctl`) is **external** and not part of agentd; it presents a client cert
+or bearer and agentd honours the authenticated-identity contract.
 
 ---
 

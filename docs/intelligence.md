@@ -31,47 +31,34 @@ only carries the LLM request/response. Do not conflate the two.
 > what an endpoint serves (see [Model discovery](#model-discovery)). The
 > single-endpoint behaviour described first is exactly the one-element-list case.
 
-## The one URI, three transports
+## The one URI: HTTPS
 
-The scheme of `AGENT_INTELLIGENCE` selects the transport. All three drive the
-*same* hand-rolled HTTP/1.1 client over a `Read + Write` byte stream — agentd
-ships no async runtime and no `url`/ICU stack.
+Intelligence is reached over **HTTPS** — a hand-rolled HTTP/1.1 client over a
+`Read + Write` byte stream, so agentd ships no async runtime and no `url`/ICU
+stack. The endpoint is a single transport, `https://`, with a **loopback
+`http://` carve-out for local development**.
 
 | URI form | Transport | Use case | Build |
 |---|---|---|---|
-| `unix:/path/to.sock` | Unix-domain socket | sidecar **gateway** on the same host/pod | core (always on) |
-| `https://host[:port]/path` | TCP + TLS | direct provider or a remote gateway | feature `tls` |
-| `vsock:<cid>:<port>` | AF_VSOCK | LLM service on the **host** from inside an enclave/microVM | feature `vsock` |
+| `https://host[:port]/path` | TCP + TLS | direct provider, or a gateway sidecar/service | feature `tls` (default) |
+| `http://127.0.0.1[:port]/path` | TCP, loopback only | a same-host dev gateway (LiteLLM, a local vLLM, your own proxy) | core |
 
-The URI is validated **at startup**, before any side effect. A scheme that
-isn't `unix:`, `https://`, or `vsock:` exits `2` in milliseconds:
+The URI is validated **at startup**, before any side effect. A scheme that isn't
+`https://` (or a **loopback** `http://`) exits `2` in milliseconds:
 
 ```
 $ agentd --instruction 'hi' --intelligence ftp://x
-agentd: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://x)
+agentd: intelligence endpoint must be https://host/… (http:// is loopback-only) (got: ftp://x)
 $ echo $?
 2
 ```
 
-Plain `http://` is accepted only for the local/sidecar dev case and is gated by
-the SSRF policy in RFC 0012 (loopback/RFC-1918/link-local blocked by default;
-the client warns). Use `unix:` or `https://` in production.
+A non-loopback `http://` is rejected — plaintext to a remote LLM would leak the
+prompt and the token. Terminate TLS + provider auth at a gateway if you don't want
+the key in the agentd process; agentd reaches that gateway over `https://`, or over
+`http://127.0.0.1` when it is a same-host sidecar.
 
-### `unix:` — sidecar gateway (canonical for clusters)
-
-A gateway sidecar (LiteLLM, a local vLLM, your own proxy) terminates TLS and
-provider auth; agentd talks plaintext HTTP over the socket. No TLS feature, no
-key in the agentd process.
-
-```bash
-agentd \
-  --instruction-file ./task.md \
-  --intelligence unix:/run/intel.sock \
-  --model gpt-4o \
-  --mcp fs='mcp-server-fs --root /data'
-```
-
-### `https://` — direct or remote gateway (feature `tls`)
+### `https://` — direct provider or gateway (feature `tls`)
 
 ```bash
 export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
@@ -85,19 +72,19 @@ agentd \
 TLS is rustls with the `ring` provider and `webpki-roots` — no C toolchain, no
 cmake. SNI is the parsed host.
 
-### `vsock:` — enclave / microVM (feature `vsock`)
+### `http://127.0.0.1` — a same-host dev gateway (loopback only)
 
 ```bash
 agentd \
-  --instruction-file /task.md \
-  --intelligence vsock:2:8080 \
-  --model claude-opus-4
+  --instruction-file ./task.md \
+  --intelligence http://127.0.0.1:4000/v1/chat/completions \
+  --model gpt-4o \
+  --mcp fs='mcp-server-http --base https://intra/fs'
 ```
 
-`vsock:<cid>:<port>` connects to a host-side LLM service from inside an enclave.
-The `vsock` transport ships behind the `vsock` feature; build with
-`--features vsock` to dial it (`net/vsock.rs`). The URI is parsed and validated
-even in default builds, which return a clear "requires --features vsock" error.
+A loopback gateway (a sidecar in the same pod, a dev proxy) terminates TLS and
+provider auth; agentd talks plaintext HTTP to it over loopback only. Any other
+`http://` host is a startup error.
 
 ---
 
@@ -278,15 +265,15 @@ single-endpoint behaviour above; the failover/breaker machinery is inert with on
 endpoint.
 
 ```bash
-# two enclave-host endpoints, then a sidecar gateway as the last resort
+# a primary provider, a second region, then a loopback sidecar as last resort
 agentd \
-  --intelligence 'vsock:3:8080,vsock:3:8081,unix:/run/intel.sock' \
+  --intelligence 'https://gw-a.example/v1,https://gw-b.example/v1,http://127.0.0.1:4000/v1' \
   --model claude-opus-4 \
   …
 ```
 
-Elements may **mix transports** (`vsock:`, `unix:`, `https://`) freely, and each
-element resolves its **own** credential (see [Credentials](#credentials)).
+Every element is an `https://` endpoint (or a loopback `http://` sidecar), and each
+resolves its **own** credential (see [Credentials](#credentials)).
 
 ### The failover sweep (sticky-primary)
 
@@ -345,19 +332,18 @@ list with **transport + index only — never the URL, host, cid, or credential**
   "discovery": true,
   "models": ["claude-opus-4", "claude-haiku-4"],
   "endpoints": [
-    { "index": 0, "transport": "vsock", "addr": "3:8080", "state": "closed",
+    { "index": 0, "transport": "https", "addr": "gw-a.example", "state": "closed",
       "active": true, "ewma_latency_ms": 41, "error_rate": 0.0, "consec_fail": 0,
       "last_ok_ms_ago": 120 },
-    { "index": 1, "transport": "unix", "addr": "/run/intel.sock", "state": "open",
+    { "index": 1, "transport": "https", "addr": "gw-b.example", "state": "open",
       "active": false, "ewma_latency_ms": 0, "error_rate": 1.0, "consec_fail": 3,
       "opened_ms_ago": 800, "cooldown_ms": 5000, "last_err": "refused" }
   ]
 }
 ```
 
-The `addr` is the bounded structural address (`cid:port` for vsock, the socket
-path for unix, `host[:port]` for https with the path dropped) — enough to tell
-endpoints apart, never a secret. The resource fires
+The `addr` is the bounded structural address (`host[:port]` with the path dropped)
+— enough to tell endpoints apart, never a secret. The resource fires
 `notifications/resources/updated` on a breaker/active/all-down transition, and on
 a hot-swap (below), so a subscriber re-reads it. (`swap_policy`, `discovery`, and
 `models` are covered in the next two sections.)
@@ -444,7 +430,7 @@ in parentheses; the flag wins over env, which wins over the default.)
 
 | Flag | Env | Meaning |
 |---|---|---|
-| `--intelligence <URI[,URI…]>` | `AGENT_INTELLIGENCE` | the endpoint **list**: comma-separated `unix:` \| `https://` \| `vsock:`, order = failover priority (required) |
+| `--intelligence <URI[,URI…]>` | `AGENT_INTELLIGENCE` | the endpoint **list**: comma-separated `https://` (or a loopback `http://`), order = failover priority (required) |
 | `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | endpoint-1 bearer / `x-api-key` value (never logged) |
 | `--intelligence-token-file <PATH>` | `AGENT_INTELLIGENCE_TOKEN_FILE` | read endpoint-1's token from a mounted file (rotation) |
 | *(per-endpoint, env-only)* | `AGENT_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | endpoint *N*'s token / token-file (1-indexed, N ≥ 2) |

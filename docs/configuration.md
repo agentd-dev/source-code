@@ -46,10 +46,10 @@ built-in default  <  config file  <  env var  <  CLI flag
 Example — a flag beats the environment:
 
 ```console
-$ INSTRUCTION='from-env' AGENT_INTELLIGENCE=unix:/run/intel.sock \
+$ INSTRUCTION='from-env' AGENT_INTELLIGENCE=https://gw.example/v1 \
     agentd --instruction 'from-flag'
 # effective instruction: "from-flag"   (flag wins)
-# effective intelligence: unix:/run/intel.sock  (env, no flag given)
+# effective intelligence: https://gw.example/v1  (env, no flag given)
 ```
 
 **Secrets are env/flag only** — never inline in the config file. The
@@ -76,15 +76,17 @@ Validations enforced at startup (each is also collected by `--validate-config`,
 |---|---|
 | instruction present & non-blank | `missing instruction (INSTRUCTION env or --instruction)` |
 | intelligence endpoint present | `missing intelligence endpoint (AGENT_INTELLIGENCE or --intelligence)` |
-| every intelligence list element's scheme supported | `intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: …)` |
+| every intelligence list element's scheme supported | `intelligence endpoint must be https://host/… (http:// is loopback-only) (got: …)` |
 | every per-endpoint token *file* readable | (the secret-file read error) |
-| every `--mcp` has a name and command | `mcp server '<name>' has empty name or command` |
+| every `--mcp` has a name and a valid endpoint | `mcp server '<name>' has empty name or endpoint` / `mcp server '<name>': endpoint must be https:// (loopback http:// for dev)` |
 | `--max-steps` > 0 | `--max-steps must be > 0` |
 | `--events-ring` > 0 | `--events-ring must be > 0` |
 | `--mode reactive` has ≥1 `--subscribe`/`--continue` | `--mode reactive requires at least one --subscribe or --continue <uri>` |
 | `--continue` only with `--mode reactive` | `--continue is only valid with --mode reactive` |
 | `--mode schedule` has an interval or cron | `--mode schedule requires --interval <dur> or --cron <expr>` |
 | `--cron` only with `--mode schedule` | `--cron is only valid with --mode schedule` |
+| `--mode graph` has a `--graph <file>` (feature `run-graph`) | `--mode graph requires --graph <file>` |
+| `--graph` only with `--mode graph` | `--graph is only valid with --mode graph` |
 | `--cgroup-memory-max`/`--cgroup-pids-max` need `--cgroup` | `--cgroup-memory-max/--cgroup-pids-max require --cgroup` |
 | `--cgroup-*-max` not `0` | `--cgroup-pids-max must be > 0 … or 'max'` / `--cgroup-memory-max must be > 0 or 'max'` |
 | `--serve-mcp` target scheme/port valid | `--serve-mcp: scheme unsupported …` |
@@ -108,7 +110,7 @@ diagnostic). An unrecognized argument is a usage error: `unknown argument:
 
 ```console
 $ agentd --instruction 'x' --intelligence ftp://nope
-agentd: intelligence endpoint must be unix:/path, https://host/…, or vsock:cid:port (got: ftp://nope)
+agentd: intelligence endpoint must be https://host/… (http:// is loopback-only) (got: ftp://nope)
 $ echo $?
 2
 ```
@@ -130,7 +132,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 |---|---|---|---|
 | `--instruction <TEXT>` | `INSTRUCTION` | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule` (and reactive, which reuses it per reaction). |
 | `--instruction-file <PATH>` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). Sets `instruction`. |
-| `--intelligence <LIST>` | `AGENT_INTELLIGENCE` | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `unix:/path` \| `https://host/…` \| `vsock:cid:port` (see §4). |
+| `--intelligence <LIST>` | `AGENT_INTELLIGENCE` | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `https://host/…` (or a loopback `http://` for a same-host dev gateway) — see §4. |
 | `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative JSON config file (§12). |
 
 ### 3.2 Intelligence
@@ -147,10 +149,10 @@ without the feature, they exit `2` (§2), never silently no-op.
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--mcp name=command` | — | *(none)* | Declare an MCP server (stdio). Repeatable. See §5. **Reloadable** (§11). |
-| `--serve-mcp <TARGET>` | `AGENT_SERVE_MCP` | *(off)* | Serve agent's own MCP so agents compose: `unix:/path` \| `vsock:PORT` \| `vsock:CID:PORT` (`vsock` needs `--features vsock`; bare `vsock:PORT` binds the wildcard CID). Needs `--features serve-mcp`. |
-| `--a2a-peer name=<ENDPOINT>` | `AGENT_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `unix:/path` \| `vsock:CID:PORT`. Repeatable (the env channel declares one). Needs `--features a2a`. |
-| `--enable-exec <abs-path>` | `AGENT_ENABLE_EXEC` | *(off)* | Allow the gated `exec` tool to run this absolute binary (off by default; RFC 0012 §3.6). Repeatable — each flag adds one binary to the operator allowlist; the tool refuses any `argv[0]` not on it. Each path must exist + be executable at startup (else exit 2). Env is a `:`-separated path list (a bare/empty value is a usage error). **⚠ Changed in v2.8.0:** the old bare `--enable-exec` (enable-anything) is removed — it now requires a path. See the [migration note in security.md §6](security.md). |
+| `--mcp name=<endpoint>` | — | *(none)* | Declare a remote MCP server, reached over **Streamable HTTP** — `name=https://host[:port][/path]` (or a loopback `http://` for dev). agentd spawns no local process. Repeatable. See §5. **Reloadable** (§11). |
+| `--serve-mcp <TARGET>` | `AGENT_SERVE_MCP` | *(off)* | Serve agent's own MCP so agents compose: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). Needs `--features serve-https`. |
+| `--a2a-peer name=<ENDPOINT>` | `AGENT_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`). Repeatable (the env channel declares one). Needs `--features a2a`. |
+| `--graph <FILE>` | `AGENT_GRAPH` | *(none)* | Path to a pinned run-graph JSON, driven by `--mode graph`. Needs `--features run-graph`. See [run-graphs.md](run-graphs.md). |
 | `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server (order-independent). Repeatable. |
 | `--allow-trifecta` | `AGENT_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
 
@@ -237,16 +239,14 @@ is selected by URI scheme (RFC 0006):
 
 | Scheme | Form | Use |
 |---|---|---|
-| `unix:` | `unix:/run/intel.sock` | Local unix-domain socket (a sidecar/broker). |
-| `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint (needs `--features tls` to dial). Pair with a token. |
-| `vsock:` | `vsock:2:5000` | VM-to-host vsock (`cid:port`), e.g. a Firecracker/Kata guest (needs `--features vsock` to dial). |
-| `http:` | `http://127.0.0.1:8080` | **Dev only** — accepted, but the client warns (no TLS). |
+| `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint (the default; `tls` feature). Pair with a token. |
+| `http:` | `http://127.0.0.1:8080` | **Loopback only** — a same-host dev gateway. Any other `http://` host is rejected. |
 
-Every element's scheme is validated at startup; an unknown scheme on **any**
-element (e.g. `ftp://…`) is exit `2`. A scheme this build cannot dial (`https:`
-without `tls`, `vsock:` without `vsock`) passes the startup scheme check and is
-surfaced by the client as `Unsupported` at dial time — so a `--validate-config`/
-`--capabilities` probe of an https endpoint on a no-TLS build still passes.
+Every element's scheme is validated at startup; a non-`https`/non-loopback-`http`
+scheme on **any** element (e.g. `ftp://…`, or `http://` to a remote host) is exit
+`2`. An `https:` endpoint on a `--no-default-features` build (no `tls`) passes the
+startup scheme check and is surfaced by the client as `Unsupported` at dial time —
+so a `--validate-config`/`--capabilities` probe still passes.
 
 **Per-endpoint credentials.** Endpoint 1 uses `--intelligence-token` /
 `AGENT_INTELLIGENCE_TOKEN` (or `…_FILE`). Later endpoints are 1-indexed by env
@@ -276,36 +276,32 @@ The endpoint **list** and the `model`/`model-swap` knobs are file-settable and
 
 ## 5. Declaring MCP servers — `--mcp name=command`
 
-All tools come from MCP servers; agentd ships none of its own (except the gated
-`exec`). Declare each server with `--mcp`, repeatable:
+All task tools come from MCP servers; agentd ships none of its own and never runs
+local code. Declare each server with `--mcp`, repeatable — each names a **remote
+MCP endpoint** reached over Streamable HTTP:
 
 ```
---mcp <name>=<command> [args…]
+--mcp <name>=<endpoint>
 ```
 
 The spec is split once on `=`: the left side is the server **name**, the right
-side is the **command**, whitespace-split into argv. The flag form does not
-support quoting/escaping — for a command with spaces or quotes in an argument,
-declare it in the config file's `mcp_servers[].argv` array, which carries argv
-verbatim (§12), or use a wrapper script.
+side is the **endpoint** — `https://host[:port][/path]` (or a loopback `http://`
+for dev). agentd spawns no subprocess; it dials the endpoint.
 
 ```console
 $ agentd --instruction 'tidy /data' \
-    --intelligence unix:/run/intel.sock \
-    --mcp fs='mcp-server-fs --root /data' \
-    --mcp git='mcp-server-git --repo /data/proj'
+    --intelligence https://gw.example/v1 \
+    --mcp fs=https://mcp-fs.internal/mcp \
+    --mcp git=https://mcp-git.internal/mcp
 ```
 
-This parses to two servers:
+Per-server auth/framing headers (e.g. `Authorization: Bearer {{secret:…}}`) are
+declared secret-free in the config file's `mcp_servers[].headers` and resolved at
+connect time (§12), never inlined in the spec or logged.
 
-- `fs` → argv `["mcp-server-fs", "--root", "/data"]`
-- `git` → argv `["mcp-server-git", "--repo", "/data/proj"]`
-
-An empty name or empty command is a usage error: `--mcp '<spec>' has empty name
-or command`, and a spec without `=` fails with `--mcp must be name=command (got:
-…)`. Both exit `2`.
-
-Transport is **stdio** in v1.
+An empty name or endpoint is a usage error: `--mcp '<spec>' has empty name or
+endpoint`, a spec without `=` fails with `--mcp must be name=endpoint (got: …)`,
+and a non-`https`/non-loopback-`http` endpoint is rejected at startup. All exit `2`.
 
 ---
 
@@ -329,25 +325,25 @@ assignment-driven member of a claim-pull pool — see §13. Both `--continue` an
 `--standby`/`--assign-from` are reactive-only (exit `2` otherwise).
 
 ```console
-# reactive: requires at least one subscription (stdio-only in v1)
+# reactive: requires at least one subscription
 $ agentd --instruction 'reconcile on change' \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --mode reactive \
     --subscribe 'file:///data/desired.json' \
     --subscribe 'file:///data/observed.json'
 
 # schedule: requires an interval
 $ agentd --instruction 'emit hourly digest' \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --mode schedule --interval 1h
 ```
 
-> **v1 scope.** Reactivity is **stdio-only** in v1 — reactive-over-HTTP is
-> roadmap. Self-MCP serving (`--serve-mcp`) is **stdio/unix only**; HTTP serving
-> is roadmap. Subagent spawn defaults to sync; `{async}`/`{detach}` also ship. MCP
-> tasks/sampling/roots are deferred (RFC 0013). For time-scheduling at scale,
-> prefer an external `CronJob` firing `--mode once` per tick (RFC 0011 §9); the
-> built-in `--interval` is a standalone convenience.
+> **Scope.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions.
+> Self-MCP serving (`--serve-mcp`) is over HTTP(S) with mTLS/bearer auth (loopback
+> `http://` for dev). Subagent spawn defaults to sync; `{async}`/`{detach}` also
+> ship. MCP tasks/sampling/roots are deferred (RFC 0013). For time-scheduling at
+> scale, prefer an external `CronJob` firing `--mode once` per tick (RFC 0011 §9);
+> the built-in `--interval` is a standalone convenience.
 
 ---
 
@@ -385,8 +381,8 @@ outbound MCP `tools/call` `_meta` so backing services can dedupe retries
 
 ```console
 $ agentd --instruction 'enqueue digest' \
-    --intelligence unix:/run/intel.sock \
-    --mcp queue='mcp-server-queue --addr /run/q.sock' \
+    --intelligence https://gw.example/v1 \
+    --mcp queue=https://mcp-queue.internal/mcp \
     --run-id "$JOB_NAME"
 ```
 
@@ -406,7 +402,7 @@ lands.
 
 ```console
 $ agentd --instruction 'serve reactions' \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --mode reactive --subscribe 'file:///data/in.json' \
     --drain-timeout 20s
 ```
@@ -418,8 +414,8 @@ groups.
 config file and applies the **reloadable subset** at a reactive quiesce boundary,
 validate-first. In a build **without** `hot-reload`, `SIGHUP` keeps its default
 disposition (terminates) — restart to reconfigure. Restart-only fields (mode,
-`run_id`, `serve_mcp`, `enable_exec`, `drain_timeout`, shard/claim/standby
-routing, `continue` topology) never reload (§11).
+`run_id`, `serve_mcp`, `drain_timeout`, shard/claim/standby routing, `continue`
+topology) never reload (§11).
 
 ---
 
@@ -434,7 +430,7 @@ shapes:
 ```
 
 ```json
-{"level":"info","event":"config.loaded","max_steps":50,"max_tokens":200000,"deadline_ms":600000,"max_depth":4,"enable_exec":false,"log_content":false,"serve_mcp":false,"intel_scheme":"unix","instruction_len":42}
+{"level":"info","event":"config.loaded","max_steps":50,"max_tokens":200000,"deadline_ms":600000,"max_depth":4,"log_content":false,"serve_mcp":false,"intel_scheme":"https","instruction_len":42}
 ```
 
 Content-capture stays **off**: `config.loaded` reports the instruction as a
@@ -478,8 +474,8 @@ invalid candidate is the same exit-2-class error startup would raise — the
 of these is **refused** with `reason="restart_required"` (agentctl rolls a pod
 restart):
 
-`mode`, `run_id`, `serve_mcp`, `enable_exec`, `drain_timeout`, `shard`,
-`claim_routes`, `standby`, `assign_from`, `continue_subscribe`.
+`mode`, `run_id`, `serve_mcp`, `drain_timeout`, `shard`, `claim_routes`,
+`standby`, `assign_from`, `continue_subscribe`.
 
 `--validate-config` runs the same coherence check (against no running config, so
 it reports the reloadable-subset consistency errors an admission webhook needs).
@@ -513,7 +509,7 @@ exit `0`); validate a candidate with `--validate-config`.
 | `model` | `--model` | Reloadable. |
 | `max_tokens` | `--max-tokens` | |
 | `limits.max_steps` / `limits.max_depth` / `limits.deadline_secs` | `--max-steps` / `--max-depth` / `--deadline` | `deadline_secs` is whole seconds. |
-| `mcp_servers[]` | `--mcp` + `--mcp-tags` | `{name, command, argv[], transport?, env_passthrough[], tags{glob:[…]}}`. `argv` carries arguments verbatim (no whitespace-split). `transport` is `stdio` (default) or `unix`. `tags` is a glob→tag-list map flattened to the server's tag set. Seeds the list. |
+| `mcp_servers[]` | `--mcp` + `--mcp-tags` | `{name, endpoint, headers{}, tags{glob:[…]}}`. `endpoint` is the `https://` (loopback `http://`) Streamable-HTTP URL. `headers` are secret-free auth/framing templates resolved at connect time (values may carry `{{secret:…}}` refs). `tags` is a glob→tag-list map flattened to the server's tag set. Seeds the list. |
 | `subscribe[]` | `--subscribe` | Each string is one subscription URI. Seeds the list. |
 | `a2a_peers[]` | `--a2a-peer` | `{name, endpoint}`. Seeds the list. |
 | `log_level` | `--log-level` | Reloadable. |
@@ -542,9 +538,10 @@ vars (§4).
   "model_swap": "finish-on-old",
   "limits": { "max_steps": 80, "max_depth": 3, "deadline_secs": 300 },
   "mcp_servers": [
-    { "name": "fs",    "command": "mcp-server-fs",    "argv": ["--root", "/data"],
+    { "name": "fs",    "endpoint": "https://mcp-fs.internal/mcp",
+      "headers": { "authorization": "Bearer {{secret:FS_TOKEN}}" },
       "tags": { "*": ["sensitive"] } },
-    { "name": "queue", "command": "mcp-server-queue", "argv": ["--addr", "/run/q.sock"] }
+    { "name": "queue", "endpoint": "https://mcp-queue.internal/mcp" }
   ],
   "subscribe": ["tickets://queue/inbound"],
   "intelligence_headers": { "anthropic-version": "2023-06-01",
@@ -608,15 +605,15 @@ must be a declared `--mcp` server.
 ```console
 # A sharded reactive fleet of N replicas (the ordinal → AGENT_SHARD, §deployment.md)
 $ AGENT_SHARD=2/8 agentd --mode reactive \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --instruction-file /etc/agentd/task.txt \
     --subscribe 'tickets://queue/inbound'
 
 # A work-claim worker leasing each item against a coordination server
 $ agentd --mode reactive \
-    --intelligence unix:/run/intel.sock \
+    --intelligence https://gw.example/v1 \
     --instruction-file /etc/agentd/task.txt \
-    --mcp coord='mcp-server-coord --addr /run/coord.sock' \
+    --mcp coord=https://mcp-coord.internal/mcp \
     --claim 'tickets://queue/inbound=coord' \
     --claim-ttl 45s
 ```
@@ -631,8 +628,8 @@ $ agentd \
     --intelligence https://llm.internal/v1 \
     --intelligence-token "$LLM_KEY" \
     --model my-model \
-    --mcp fs='mcp-server-fs --root /data' \
-    --mcp queue='mcp-server-queue --addr /run/q.sock' \
+    --mcp fs=https://mcp-fs.internal/mcp \
+    --mcp queue=https://mcp-queue.internal/mcp \
     --mode once \
     --max-steps 80 --max-tokens 150000 --deadline 5m \
     --max-depth 3 \
@@ -658,8 +655,8 @@ $ export AGENT_RUN_ID="$JOB_NAME"
 $ export AGENT_DRAIN_TIMEOUT=20s
 $ export AGENT_LOG_LEVEL=info
 $ agentd \
-    --mcp fs='mcp-server-fs --root /data' \
-    --mcp queue='mcp-server-queue --addr /run/q.sock' \
+    --mcp fs=https://mcp-fs.internal/mcp \
+    --mcp queue=https://mcp-queue.internal/mcp \
     --max-depth 3 \
     --health-file /run/agent/health
 ```

@@ -112,3 +112,55 @@ fn acceptor_rejects_garbage_identity_and_ca() {
     let err = TlsAcceptor::new(server_identity(), Some(b"not a ca")).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+/// The `--tls-ca` end-to-end proof: the DEFAULT client dial (`connect`, webpki
+/// roots — the path every intelligence/MCP/A2A dial uses) cannot reach a server
+/// carrying a private-CA cert until [`install_extra_ca`] adds that CA as a
+/// process-wide anchor; afterwards the same dial round-trips.
+///
+/// One test fn on purpose: the extra-CA registry is process-global set-once
+/// state, and the default no-identity config is CACHED at its first build — so
+/// the pre-install failure leg must use the per-call (identity) config build,
+/// keeping the cached default config unbuilt until after install. No other test
+/// in this binary uses plain `connect` (they pin via `connect_with_ca`, which
+/// deliberately ignores the extra anchors), so installing here is safe.
+#[test]
+fn install_extra_ca_unlocks_the_default_dial_against_a_private_ca() {
+    use net::tls::{connect, extra_ca_count, install_extra_ca};
+
+    // BEFORE install: the private-CA server is untrusted. (Identity path — the
+    // per-call config build — so the cached default config stays unbuilt.)
+    assert_eq!(extra_ca_count(), 0);
+    let port = spawn_echo(TlsAcceptor::new(server_identity(), None).expect("acceptor"));
+    let err = connect(dial(port), "127.0.0.1", Some(&client_identity()))
+        .and_then(|mut tls| tls.write_all(b"hello").and_then(|_| tls.flush()))
+        .expect_err("webpki roots must not trust the fixture CA");
+    assert!(
+        format!("{err}").contains("UnknownIssuer") || format!("{err}").contains("certificate"),
+        "want a trust failure, got: {err}"
+    );
+
+    // Install the private CA as a process-wide extra anchor.
+    let n = install_extra_ca(&fixture("ca.pem")).expect("install fixture CA");
+    assert!(n >= 1);
+
+    // AFTER install: the identity path (fresh config per call) trusts it...
+    let port = spawn_echo(TlsAcceptor::new(server_identity(), None).expect("acceptor"));
+    let mut tls = connect(dial(port), "127.0.0.1", Some(&client_identity()))
+        .expect("identity dial trusts the installed CA");
+    tls.write_all(b"hello").unwrap();
+    tls.flush().unwrap();
+    let mut echo = [0u8; 5];
+    tls.read_exact(&mut echo).unwrap();
+    assert_eq!(&echo, b"hello");
+
+    // ...and so does the DEFAULT (cached, no-identity) path, built AFTER install
+    // — the install-before-first-dial contract every agentd process follows.
+    let port = spawn_echo(TlsAcceptor::new(server_identity(), None).expect("acceptor"));
+    let mut tls = connect(dial(port), "127.0.0.1", None).expect("default dial trusts the CA");
+    tls.write_all(b"hello").unwrap();
+    tls.flush().unwrap();
+    let mut echo = [0u8; 5];
+    tls.read_exact(&mut echo).unwrap();
+    assert_eq!(&echo, b"hello");
+}

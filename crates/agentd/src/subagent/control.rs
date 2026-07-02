@@ -63,6 +63,20 @@ pub fn run() -> i32 {
         }
     };
 
+    // Outbound extra trust anchor (`--tls-ca`), inherited via the payload:
+    // install process-wide BEFORE the first dial (the intel/MCP/A2A clients
+    // below), exactly as the supervisor did in `main`. The path is public
+    // material (a CA cert); a re-exec child shares the pod fs, so the same path
+    // resolves here. Idempotent when the parent already installed it in THIS
+    // process image (never the case across re-exec, but harmless).
+    #[cfg(feature = "tls")]
+    if let Some(path) = payload.tls_ca.as_deref()
+        && let Err(e) = std::fs::read(path).and_then(|pem| crate::net::tls::install_extra_ca(&pem))
+    {
+        eprintln!("agentd subagent: --tls-ca {path}: {e}");
+        return crate::exit::USAGE;
+    }
+
     let up: Up = Arc::new(Mutex::new(io::stdout()));
     let log = build_logger(&payload);
     let cancel = Arc::new(AtomicBool::new(false));

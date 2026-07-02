@@ -25,6 +25,69 @@ use std::sync::OnceLock;
 /// [`crate::http::Stream`].
 pub type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
+/// Process-wide EXTRA trust anchors for outbound TLS, installed once at startup
+/// ([`install_extra_ca`]) and honored by every client-side dial in this process
+/// alongside the bundled webpki roots. This is deliberately process state, not a
+/// per-connection parameter: a trust store is process-scoped (it is the private
+/// deployment's replacement for the system CA bundle a scratch container lacks),
+/// while per-peer material (a [`ClientIdentity`]) stays a parameter.
+static EXTRA_CA: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+
+/// Install additional PEM CA certificate(s) — an internal / cluster-local CA —
+/// as process-wide trust anchors for **outbound** TLS, ADDED to the bundled
+/// webpki roots. Returns the number of anchors installed.
+///
+/// Call once, at startup, **before the first outbound dial** (the default
+/// no-identity client config is built once and cached; anchors installed after
+/// that first dial are not retrofitted onto it). A second call with the *same*
+/// bundle is an idempotent no-op; a second call with a *different* bundle is an
+/// error — trust anchors are set-once, restart to change them.
+pub fn install_extra_ca(ca_pem: &[u8]) -> io::Result<usize> {
+    // Parse AND prove addability now (roots_from_pem add-validates each cert),
+    // so a bad bundle fails fast at startup, never at a dial site.
+    validate_ca_pem(ca_pem)?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut io::Cursor::new(ca_pem))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| io::Error::other(format!("tls: bad CA PEM: {e}")))?;
+    let n = certs.len();
+    match EXTRA_CA.set(certs) {
+        Ok(()) => Ok(n),
+        Err(rejected) => {
+            if EXTRA_CA.get().map(Vec::as_slice) == Some(rejected.as_slice()) {
+                Ok(n) // same bundle re-installed — idempotent
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "tls: extra CA already installed with a different bundle (set-once; restart to change trust anchors)",
+                ))
+            }
+        }
+    }
+}
+
+/// The number of extra trust anchors installed (0 = pure webpki), for
+/// startup logging / diagnostics.
+pub fn extra_ca_count() -> usize {
+    EXTRA_CA.get().map_or(0, Vec::len)
+}
+
+/// Side-effect-free content check for a CA PEM bundle (parseable + every cert
+/// addable as a trust anchor) — the `--validate-config` half of
+/// [`install_extra_ca`], which performs exactly this before installing.
+/// Returns the anchor count.
+pub fn validate_ca_pem(ca_pem: &[u8]) -> io::Result<usize> {
+    roots_from_pem(ca_pem).map(|r| r.len())
+}
+
+/// Extend a root store with the installed extra anchors (no-op when none).
+/// Anchors were add-validated at install, so failures here are unreachable;
+/// they are ignored rather than panicking on the dial path.
+fn extend_with_extra_ca(roots: &mut RootCertStore) {
+    for cert in EXTRA_CA.get().into_iter().flatten() {
+        let _ = roots.add(cert.clone());
+    }
+}
+
 /// A blocking server-side TLS stream over an accepted TCP connection.
 /// `Read + Write`, so the HTTP server framing runs over it unchanged.
 pub type ServerTlsStream = StreamOwned<ServerConnection, TcpStream>;
@@ -284,6 +347,7 @@ pub fn peer_presented_cert(stream: &ServerTlsStream) -> bool {
 fn mtls_config(id: &ClientIdentity) -> io::Result<Arc<ClientConfig>> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    extend_with_extra_ca(&mut roots);
     let key = id.key.clone_key();
     let config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -296,12 +360,15 @@ fn mtls_config(id: &ClientIdentity) -> io::Result<Arc<ClientConfig>> {
 }
 
 /// Build the client config once (root store + ring provider) and reuse it.
+/// Incorporates the [`install_extra_ca`] anchors present at FIRST use — which is
+/// why install must precede the first dial (documented there).
 fn client_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     CONFIG
         .get_or_init(|| {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            extend_with_extra_ca(&mut roots);
             let config = ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
@@ -317,6 +384,41 @@ fn client_config() -> Arc<ClientConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One test fn on purpose: EXTRA_CA is process-global set-once state, so the
+    /// whole install lifecycle must be exercised in a deterministic order (the
+    /// test harness runs separate #[test] fns in parallel).
+    #[test]
+    fn install_extra_ca_lifecycle() {
+        let ca = include_bytes!("../tests/fixtures/ca.pem");
+        // Bad input fails BEFORE the set-once slot is consumed.
+        assert_eq!(
+            install_extra_ca(b"not a pem").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            install_extra_ca(b"").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(extra_ca_count(), 0);
+        // A valid CA installs and is counted.
+        let n = install_extra_ca(ca).expect("fixture CA installs");
+        assert!(n >= 1);
+        assert_eq!(extra_ca_count(), n);
+        // Re-installing the SAME bundle is an idempotent no-op.
+        assert_eq!(install_extra_ca(ca).expect("idempotent"), n);
+        // A DIFFERENT bundle (same CA twice = a different anchor vec) is refused.
+        let mut doubled = ca.to_vec();
+        doubled.extend_from_slice(ca);
+        assert_eq!(
+            install_extra_ca(&doubled).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        // The anchors flow into a fresh root store build.
+        let mut roots = RootCertStore::empty();
+        extend_with_extra_ca(&mut roots);
+        assert_eq!(roots.len(), n);
+    }
 
     #[test]
     fn client_identity_rejects_pem_without_cert_or_key() {

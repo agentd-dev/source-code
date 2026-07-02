@@ -3134,6 +3134,7 @@ mod tests {
                 },
             ],
             a2a_peers: Vec::new(),
+            tls_ca: None,
             limits: Limits {
                 max_steps: 10,
                 max_tokens: 1000,

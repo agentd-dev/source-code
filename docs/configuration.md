@@ -144,6 +144,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 | — | `AGENT_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | *(none)* | Per-endpoint credential for endpoint *N* (1-indexed; endpoint 1 uses the bare names above, endpoint 2 → `_2`/`_2_FILE`, etc.). A named-but-unreadable `…_FILE` is exit `2` at startup (fail fast before failover). Env-only. |
 | `--model <NAME>` | `AGENT_MODEL` | *(none)* | Model id passed to the endpoint. **Reloadable** (§11). |
 | `--model-swap <P>` | `AGENT_MODEL_SWAP` | `finish-on-old` | What an in-flight run does when a reload changes `model`: `finish-on-old` (the in-flight turn finishes on the old model, the next turn uses the new one) \| `restart-turn` (the in-flight turn is re-run on the new model from the same pre-turn state). An endpoint repoint with the model unchanged is always finish-on-old regardless (RFC 0018 §5). |
+| `--tls-ca <PATH>` | `AGENT_TLS_CA` | *(none — bundled webpki roots only)* | Extra PEM CA certificate(s) trusted for **every outbound** `https://` dial (intelligence, MCP servers, A2A peers, OAuth token endpoints), **added to** the bundled webpki roots — the private/in-cluster PKI anchor. Public material (a CA cert path, never a key). Validated at startup (missing/unreadable/non-CA PEM is exit `2`); installed process-wide before the first dial and inherited by every subagent via the spawn payload. Set-once / restart-only. Needs the `tls` build feature. |
 
 ### 3.3 Tools / MCP / delegation
 

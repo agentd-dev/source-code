@@ -100,6 +100,10 @@ pub struct Orchestrator {
     /// them by name. Carried on every build (it is inert config) but only
     /// surfaced as a tool under `--features a2a`.
     a2a_peers: Vec<crate::config::A2aPeerSpec>,
+    /// Outbound extra trust-anchor PATH (`--tls-ca`), propagated payload→child so
+    /// every process in the tree installs the same private-PKI anchor (public
+    /// material — a path, never key bytes).
+    tls_ca: Option<String>,
     run_id: String,
     trace_id: Option<String>,
     log_level: String,
@@ -142,6 +146,7 @@ impl Orchestrator {
             intelligence: payload.intelligence.clone(),
             mcp_servers: payload.mcp_servers.clone(),
             a2a_peers: payload.a2a_peers.clone(),
+            tls_ca: payload.tls_ca.clone(),
             run_id: payload.telemetry.run_id.clone(),
             trace_id: payload.telemetry.trace_id.clone(),
             log_level: payload.telemetry.log_level.clone(),
@@ -564,6 +569,7 @@ impl Orchestrator {
             intelligence: self.intelligence.clone(),
             mcp_servers,
             a2a_peers: self.a2a_peers.clone(),
+            tls_ca: self.tls_ca.clone(),
             limits: self.child_limits.clone(),
             telemetry: Telemetry {
                 run_id: self.run_id.clone(),
@@ -1381,6 +1387,7 @@ mod tests {
                 },
             ],
             a2a_peers: Vec::new(),
+            tls_ca: None,
             limits: Limits {
                 max_steps: 10,
                 max_tokens: 1000,

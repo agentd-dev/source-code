@@ -164,6 +164,13 @@ pub struct SpawnPayload {
     /// frames (and non-`a2a` peers, which simply send an empty vec) parseable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub a2a_peers: Vec<A2aPeerSpec>,
+    /// Extra PEM CA **file path** for outbound TLS trust (`--tls-ca`, the
+    /// private/in-cluster PKI anchor). PUBLIC material — a path to a CA
+    /// certificate, never key bytes — so it may ride the payload; the child
+    /// installs it process-wide before its first dial and passes it on to its
+    /// own children. `#[serde(default)]` keeps older frames parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
     pub limits: Limits,
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
@@ -285,6 +292,7 @@ mod tests {
                 ..Default::default()
             }],
             a2a_peers: Vec::new(),
+            tls_ca: None,
             limits: Limits {
                 max_steps: 20,
                 max_tokens: 100_000,

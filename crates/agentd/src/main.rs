@@ -144,6 +144,23 @@ fn run() -> i32 {
         }),
     );
 
+    // Outbound extra trust anchor (`--tls-ca`, private/in-cluster PKI): install
+    // process-wide BEFORE the first dial (the client TLS config is built once and
+    // cached). Content was validated by `Config::validate()`; a read/install
+    // failure here (e.g. the file vanished since) is still exit 2, never a
+    // first-dial surprise. The path rides the spawn payload so every subagent
+    // process installs the same anchor (see `root_payload`).
+    #[cfg(feature = "tls")]
+    if let Some(path) = &cfg.tls_ca {
+        match std::fs::read(path).and_then(|pem| agentd::net::tls::install_extra_ca(&pem)) {
+            Ok(n) => log.info("tls.extra_ca", json!({"path": path, "anchors": n})),
+            Err(e) => {
+                eprintln!("agentd: --tls-ca {path}: {e}");
+                return agentd::exit::USAGE;
+            }
+        }
+    }
+
     // Rule of Two (RFC 0012 §3.2): the lethal-trifecta REFUSAL is now enforced
     // inside `Config::validate()` — the single validation authority (RFC 0017 §7)
     // that `--validate-config` and startup both run — so a refused grant already
@@ -760,6 +777,7 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         },
         mcp_servers: cfg.mcp_servers.clone(),
         a2a_peers: cfg.a2a_peers.clone(),
+        tls_ca: cfg.tls_ca.clone(),
         limits: Limits {
             max_steps: cfg.max_steps,
             max_tokens: cfg.max_tokens,

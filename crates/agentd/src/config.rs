@@ -618,6 +618,14 @@ pub struct Config {
     /// template (`{{secret-file:PATH}}` / `{{secret:ENV}}`) or a literal; resolved
     /// at bind time, never logged.
     pub serve_bearer: Option<String>,
+    /// Extra PEM CA **file path** trusted for OUTBOUND `https://` dials
+    /// (intelligence, MCP servers, A2A peers, OAuth), ADDED to the bundled
+    /// webpki roots — the private/in-cluster PKI trust anchor (`--tls-ca` /
+    /// `AGENTD_TLS_CA`). Public material (a CA certificate, never a key);
+    /// installed process-wide at startup ([`crate::net::tls::install_extra_ca`])
+    /// and inherited by every subagent via the spawn payload. Set-once
+    /// (restart-only): trust anchors must not move under a live run.
+    pub tls_ca: Option<String>,
     pub health_file: Option<String>,
     /// Inbound W3C `traceparent` to continue (else a trace is minted from the
     /// run id). RFC 0010 §context-propagation.
@@ -772,6 +780,7 @@ impl Default for Config {
             serve_key: None,
             serve_client_ca: None,
             serve_bearer: None,
+            tls_ca: None,
             health_file: None,
             traceparent: None,
             log_content: false,
@@ -846,6 +855,7 @@ impl fmt::Debug for Config {
                 "serve_bearer",
                 &self.serve_bearer.as_ref().map(|_| "<redacted>"),
             )
+            .field("tls_ca", &self.tls_ca)
             .field("health_file", &self.health_file)
             .field("traceparent", &self.traceparent)
             .field("log_content", &self.log_content)
@@ -989,6 +999,9 @@ impl Config {
         }
         if let Some(v) = envmap.get("AGENTD_INTELLIGENCE_TOKEN_FILE") {
             c.intelligence_token_file = Some((*v).to_string());
+        }
+        if let Some(v) = envmap.get("AGENTD_TLS_CA") {
+            c.tls_ca = Some((*v).to_string());
         }
         if let Some(v) = envmap.get("AGENTD_MODEL") {
             c.model = Some((*v).to_string());
@@ -1240,6 +1253,7 @@ impl Config {
                 "--serve-key" => c.serve_key = Some(take("--serve-key")?),
                 "--serve-client-ca" => c.serve_client_ca = Some(take("--serve-client-ca")?),
                 "--serve-bearer" => c.serve_bearer = Some(take("--serve-bearer")?),
+                "--tls-ca" => c.tls_ca = Some(take("--tls-ca")?),
                 // Shard identity (RFC 0019 §4): `--shard K/N` overrides AGENTD_SHARD.
                 "--shard" => {
                     let v = take("--shard")?;
@@ -1755,6 +1769,25 @@ impl Config {
                 "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer require --serve-mcp"
                     .into(),
             ));
+        }
+        // Outbound extra trust anchor (`--tls-ca`): needs the `tls` build feature
+        // (a plaintext-only build has no dial to trust it on — silently ignoring
+        // it would leave the operator believing the private CA is honored), and
+        // the bundle must be present + a valid, addable CA PEM up front (exit 2,
+        // not a first-dial surprise). Content check is side-effect-free here;
+        // `main` installs the same bundle process-wide before the first dial.
+        if let Some(ca) = &self.tls_ca {
+            if !cfg!(feature = "tls") {
+                return Err(usage("--tls-ca requires the 'tls' build feature".into()));
+            }
+            check_readable("--tls-ca", ca)?;
+            #[cfg(feature = "tls")]
+            {
+                let pem =
+                    std::fs::read(ca).map_err(|e| usage(format!("--tls-ca {ca}: read: {e}")))?;
+                crate::net::tls::validate_ca_pem(&pem)
+                    .map_err(|e| usage(format!("--tls-ca {ca}: {e}")))?;
+            }
         }
         // Sharding (`--shard K/N`, RFC 0019 §4) needs the `cluster` build feature.
         // A requested `N > 1` without it is rejected at startup (exit 2) — NOT
@@ -2574,6 +2607,7 @@ fn help_text() -> String {
          \n\
          TOOLS / MCP:\n\
          \x20 --mcp name=endpoint         declare a remote MCP server (repeatable; https://host[:port][/path])\n\
+         \x20 --tls-ca <PATH>             extra PEM CA(s) trusted for outbound https (private/in-cluster PKI; added to the bundled roots)\n\
          \x20 --serve-mcp <TARGET>        serve agentd's own MCP over HTTP(S): https://host:port (or loopback http:// for dev)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: https://host[:port] (repeatable; needs --features a2a)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
@@ -4364,6 +4398,40 @@ mod tests {
         ));
         let c = Config::load(&args(&[]), &env).unwrap();
         assert_eq!(c.intelligence_token.as_deref(), Some("from-inline"));
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn tls_ca_flag_env_and_content_validation() {
+        // A real CA PEM (the net crate's test fixture) parses + validates.
+        let ca = write_tmp(include_str!("../../net/tests/fixtures/ca.pem"));
+        let ca_path = ca.path().to_str().unwrap().to_string();
+
+        // Flag form.
+        let c = Config::load(&args(&["--tls-ca", &ca_path]), &base_env()).unwrap();
+        assert_eq!(c.tls_ca.as_deref(), Some(ca_path.as_str()));
+        // A file PATH is public material — visible in the redacted Debug.
+        assert!(format!("{c:?}").contains(&ca_path));
+
+        // Env form, branded + neutral (debrand alias).
+        for key in ["AGENTD_TLS_CA", "AGENT_TLS_CA"] {
+            let mut env = base_env();
+            env.push((key.into(), ca_path.clone()));
+            let c = Config::load(&args(&[]), &env).unwrap();
+            assert_eq!(c.tls_ca.as_deref(), Some(ca_path.as_str()), "via {key}");
+        }
+
+        // A missing file is exit 2 at load, not a first-dial surprise.
+        let err = Config::load(&args(&["--tls-ca", "/nonexistent/ca.pem"]), &base_env());
+        assert!(matches!(err, Err(ConfigError::Usage(_))));
+
+        // Junk content (readable, but not a CA PEM) is exit 2 too.
+        let junk = write_tmp("not a pem");
+        let err = Config::load(
+            &args(&["--tls-ca", junk.path().to_str().unwrap()]),
+            &base_env(),
+        );
+        assert!(matches!(err, Err(ConfigError::Usage(_))));
     }
 
     #[test]

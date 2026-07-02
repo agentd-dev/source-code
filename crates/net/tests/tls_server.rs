@@ -164,3 +164,77 @@ fn install_extra_ca_unlocks_the_default_dial_against_a_private_ca() {
     tls.read_exact(&mut echo).unwrap();
     assert_eq!(&echo, b"hello");
 }
+
+/// The serving-cert hot-reload proof (`TlsAcceptor::from_paths`): an acceptor
+/// built from file paths serves identity 1; after the files are swapped IN
+/// PLACE to a second, unrelated PKI (the mounted-Secret rotation shape), the
+/// SAME acceptor — no rebind, no restart — serves identity 2: a client pinning
+/// CA 1 is refused and a client pinning CA 2 round-trips. A junk intermediate
+/// write must degrade to last-good, never kill the listener.
+#[test]
+fn from_paths_acceptor_rotates_identity_in_place() {
+    use net::tls::TlsAcceptor;
+    let dir = std::env::temp_dir().join(format!("net-tls-rotate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join("tls.crt");
+    let key = dir.join("tls.key");
+    std::fs::write(&cert, fixture("server.pem")).unwrap();
+    std::fs::write(&key, fixture("server.key")).unwrap();
+
+    let acceptor = TlsAcceptor::from_paths(&cert, &key, None).expect("live acceptor");
+    assert_eq!(acceptor.reload_generation(), 0);
+
+    // Serve MANY connections off one acceptor (spawn_echo serves one each).
+    let serve = |acc: std::sync::Arc<TlsAcceptor>| -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let Ok(mut tls) = acc.accept(tcp) else {
+                    continue;
+                };
+                let mut buf = [0u8; 5];
+                if tls.read_exact(&mut buf).is_ok() {
+                    let _ = tls.write_all(&buf);
+                    let _ = tls.flush();
+                }
+            }
+        });
+        port
+    };
+    let acceptor = std::sync::Arc::new(acceptor);
+    let port = serve(std::sync::Arc::clone(&acceptor));
+    let roundtrip = |ca: &str| -> std::io::Result<()> {
+        let mut tls = connect_with_ca(dial(port), "127.0.0.1", &fixture(ca), None)?;
+        tls.write_all(b"hello")?;
+        tls.flush()?;
+        let mut echo = [0u8; 5];
+        tls.read_exact(&mut echo)?;
+        assert_eq!(&echo, b"hello");
+        Ok(())
+    };
+
+    // Identity 1 serves; CA-2-pinned clients are refused.
+    roundtrip("ca.pem").expect("identity 1 round-trips against CA 1");
+    roundtrip("ca2.pem").expect_err("CA 2 must not trust identity 1");
+
+    // A junk intermediate write (half a rotation) keeps last-good serving.
+    std::fs::write(&cert, b"not a pem").unwrap();
+    acceptor.force_reload_check();
+    assert!(
+        acceptor.last_reload_error().is_some(),
+        "degraded is visible"
+    );
+    roundtrip("ca.pem").expect("last-good identity keeps serving through a bad reload");
+
+    // The real rotation: swap BOTH files to the second PKI.
+    std::fs::write(&cert, fixture("server2.pem")).unwrap();
+    std::fs::write(&key, fixture("server2.key")).unwrap();
+    acceptor.force_reload_check();
+    assert!(acceptor.reload_generation() >= 1, "a reload was applied");
+    assert_eq!(acceptor.last_reload_error(), None, "recovered");
+    roundtrip("ca2.pem").expect("identity 2 round-trips against CA 2 after rotation");
+    roundtrip("ca.pem").expect_err("CA 1 must no longer trust the rotated identity");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

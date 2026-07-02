@@ -452,37 +452,9 @@ fn serve_self_mcp_https(
     log: &Logger,
 ) -> Option<ServeWiring> {
     use agentd::mcp::server::HttpsServeConfig;
-    let read_pem = |what: &str, path: &Option<String>| -> Option<Vec<u8>> {
-        let p = path.as_ref()?;
-        match std::fs::read(p) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                log.error(
-                    "mcp.serve_fail",
-                    json!({"read": what, "path": p, "err": e.to_string()}),
-                );
-                None
-            }
-        }
-    };
-    let (cert_pem, key_pem) = if tls {
-        match (
-            read_pem("cert", &cfg.serve_cert),
-            read_pem("key", &cfg.serve_key),
-        ) {
-            (Some(c), Some(k)) => (c, k),
-            _ => return None,
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    let client_ca_pem = match &cfg.serve_client_ca {
-        Some(_) => match read_pem("client-ca", &cfg.serve_client_ca) {
-            Some(b) => Some(b),
-            None => return None,
-        },
-        None => None,
-    };
+    // Paths, not bytes: the acceptor re-reads the PEM files itself (live
+    // rotation). Presence/readability/content were validated at config load;
+    // a bind-time read failure still surfaces as `mcp.serve_fail` below.
     let bearer = match &cfg.serve_bearer {
         Some(tmpl) => match agentd::sec::secret::resolve(tmpl, &|k| std::env::var(k).ok()) {
             Ok(tok) => Some(tok),
@@ -499,9 +471,9 @@ fn serve_self_mcp_https(
     let tls_cfg = HttpsServeConfig {
         bind,
         tls,
-        cert_pem,
-        key_pem,
-        client_ca_pem,
+        cert_path: tls.then(|| cfg.serve_cert.clone()).flatten(),
+        key_path: tls.then(|| cfg.serve_key.clone()).flatten(),
+        client_ca_path: cfg.serve_client_ca.clone(),
         bearer,
     };
     let live_config = ctx.live_config();

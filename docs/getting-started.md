@@ -49,7 +49,7 @@ so it never weighs down a minimal build):
 ```console
 $ cargo build -p agentd --release                                 # default: tls (https)
 $ cargo build -p agentd --release --features serve-https,a2a      # served self-MCP + A2A
-$ cargo build -p agentd --release --features serve-https,cluster,run-graph
+$ cargo build -p agentd --release --features serve-https,cluster,workflow
 ```
 
 To keep TLS out of the binary entirely, terminate it at a same-host sidecar and
@@ -267,8 +267,8 @@ runtime is built around.
 > **Scope notes.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions;
 > serving agentd's own MCP (`--serve-mcp`) is over HTTP(S) with mTLS/bearer auth
 > (loopback `http://` for dev). Subagent spawning defaults to **synchronous**;
-> `{async}`/`{detach}` dispositions also ship. Agent-authored cyclic **run-graphs**
-> ship under `--features run-graph` ([run-graphs.md](run-graphs.md)). MCP
+> `{async}`/`{detach}` dispositions also ship. Agent-authored cyclic **workflows**
+> ship under `--features workflow` ([workflows.md](workflows.md)). MCP
 > tasks/sampling/roots are deferred ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).
 
 ---

@@ -25,12 +25,12 @@ docker build -f examples/docker/Dockerfile \
 
 # multiple features
 docker build -f examples/docker/Dockerfile \
-  --build-arg FEATURES=serve-https,a2a,cron,run-graph -t agentd:full .
+  --build-arg FEATURES=serve-https,a2a,cron,workflow -t agentd:full .
 ```
 
 Feature flags map to the crate's `[features]` (see `crates/agentd/Cargo.toml`):
 `tls` (rustls+ring, bundled roots — **on by default**, it is the transport),
-`serve-https`, `a2a`, `cron`, `metrics`, `otel`, `cluster`, `run-graph`.
+`serve-https`, `a2a`, `cron`, `metrics`, `otel`, `cluster`, `workflow`.
 
 ## Run — one-shot (`once`)
 
@@ -82,7 +82,7 @@ service and point `--mcp` at its URL; per-server auth headers go in the config f
   subscribes and reacts to pushed `notifications/resources/updated` over HTTP/SSE.
 - **Serving agentd's own MCP** (`--serve-mcp https://host:port`, `serve-https`
   feature) is over HTTP(S) with mTLS/bearer auth (loopback `http://` for dev).
-- **Agent-authored cyclic run-graphs** ship under `--features run-graph`.
+- **Agent-authored cyclic workflows** ship under `--features workflow`.
 - MCP **tasks / sampling / roots** are deferred (rfcs/0013).
 
 ## Exit codes

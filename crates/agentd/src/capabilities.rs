@@ -86,11 +86,29 @@ fn build_features() -> Vec<&'static str> {
     if cfg!(feature = "cron") {
         f.push("cron");
     }
+    if cfg!(feature = "oauth") {
+        f.push("oauth");
+    }
+    if cfg!(feature = "events") {
+        f.push("events");
+    }
+    if cfg!(feature = "cluster") {
+        f.push("cluster");
+    }
+    if cfg!(feature = "hot-reload") {
+        f.push("hot-reload");
+    }
+    if cfg!(feature = "config-watch") {
+        f.push("config-watch");
+    }
     if cfg!(feature = "metrics") {
         f.push("metrics");
     }
     if cfg!(feature = "otel") {
         f.push("otel");
+    }
+    if cfg!(feature = "workflow") {
+        f.push("workflow");
     }
     f
 }
@@ -467,8 +485,14 @@ mod tests {
                 "serve-https" => cfg!(feature = "serve-https"),
                 "a2a" => cfg!(feature = "a2a"),
                 "cron" => cfg!(feature = "cron"),
+                "oauth" => cfg!(feature = "oauth"),
+                "events" => cfg!(feature = "events"),
+                "cluster" => cfg!(feature = "cluster"),
+                "hot-reload" => cfg!(feature = "hot-reload"),
+                "config-watch" => cfg!(feature = "config-watch"),
                 "metrics" => cfg!(feature = "metrics"),
                 "otel" => cfg!(feature = "otel"),
+                "workflow" => cfg!(feature = "workflow"),
                 other => panic!("unexpected build feature {other}"),
             };
             assert!(present, "reported feature {f} is not compiled in");

@@ -279,7 +279,7 @@ Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
   unix/vsock of its own.
 - **agentd ships no tools and runs no local code.** There is no `exec` tool; every
   tool comes from a remote MCP server it connects to.
-- **Agent-authored cyclic run-graphs** ship under `--features run-graph` — the
+- **Agent-authored cyclic workflows** ship under `--features workflow` — the
   model self-authors a `Graph` and agentd drives it (see
-  [`docs/run-graphs.md`](../docs/run-graphs.md)).
+  [`docs/workflows.md`](../docs/workflows.md)).
 - **MCP `tasks` / `sampling` / `roots`** as a client are **(deferred)**, RFC 0013.

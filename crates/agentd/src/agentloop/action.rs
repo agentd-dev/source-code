@@ -51,9 +51,9 @@ pub const SELF_CONTROL_TOOLS: &[&str] = &[
     "subscribe",
     "unsubscribe",
     "await_resource",
-    "graph.define",
-    "graph.patch",
-    "graph.run",
+    "workflow.define",
+    "workflow.patch",
+    "workflow.run",
     "a2a.delegate",
     "resource.read",
 ];

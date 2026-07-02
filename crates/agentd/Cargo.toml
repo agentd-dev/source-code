@@ -90,15 +90,16 @@ config-watch = ["hot-reload"]
 # existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
 # `--features otel` stays dependency-free (3 deps).
 otel = []
-# Agent-authored cyclic run-graph (pivot Phase 7): a serde-only `Graph` the model
-# self-authors (graph.define/run/patch self-tools) and a thin driver reusing the
-# ReAct `Session`/`Budget`/`Router` — nodes Agent/Tool/Branch/Wait/Subgraph/Halt,
-# a blackboard, two-tier conditions (json-pointer preds + one semantic branch), and
+# Agent-authored cyclic workflows (pivot Phase 7): a serde-only graph the model
+# self-authors (workflow.define/run/patch self-tools) or the operator pins
+# (--mode workflow --workflow <file>), driven by a thin walker reusing the ReAct
+# `Session`/`Budget`/`Router` — nodes Agent/Tool/Branch/Wait/Subgraph/Halt, a
+# blackboard, two-tier conditions (json-pointer preds + one semantic branch), and
 # four-layer cycle termination with distinct graph statuses. Dependency-free (serde
 # + serde_json::Value::pointer only — the minimalism moat). Default OFF: an absent
-# build is byte-for-byte today; the degenerate single-Agent-node graph reproduces
-# today's behaviour. Rides `serve-mcp` (the graph self-resource + served surface).
-run-graph = ["serve-mcp"]
+# build is byte-for-byte today; the degenerate single-Agent-node workflow reproduces
+# today's behaviour. Rides `serve-mcp` (the workflow self-resource + served surface).
+workflow = ["serve-mcp"]
 # Built-in mock intelligence + mock MCP server (the hidden `--internal-mock-llm`
 # / `--internal-mock-mcp` re-exec modes) that the test + conformance suites drive.
 # Test scaffolding, never a shippable capability — so it's OFF in release and the

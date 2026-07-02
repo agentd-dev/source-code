@@ -113,13 +113,13 @@ pub struct Orchestrator {
     /// Backgrounded children from `subagent.spawn{async|detach}`, keyed by handle
     /// (= the child's agent_path). Drained on status/await; reaped on Drop.
     async_children: HashMap<String, AsyncChild>,
-    /// Author-defined run-graphs (pivot Phase 7), keyed by a generated id. Populated
-    /// by `graph.define` (validate-then-store); run by `graph.run` (a later phase).
-    #[cfg(feature = "run-graph")]
-    graphs: std::collections::BTreeMap<String, crate::graph::Graph>,
-    /// Monotone id counter for `graph.define`.
-    #[cfg(feature = "run-graph")]
-    graph_seq: u64,
+    /// Author-defined workflows (pivot Phase 7), keyed by a generated id. Populated
+    /// by `workflow.define` (validate-then-store); run by `workflow.run` (a later phase).
+    #[cfg(feature = "workflow")]
+    workflows: std::collections::BTreeMap<String, crate::graph::Graph>,
+    /// Monotone id counter for `workflow.define`.
+    #[cfg(feature = "workflow")]
+    workflow_seq: u64,
     log: Logger,
 }
 
@@ -151,10 +151,10 @@ impl Orchestrator {
             scheduled: Vec::new(),
             subscriptions: Vec::new(),
             async_children: HashMap::new(),
-            #[cfg(feature = "run-graph")]
-            graphs: std::collections::BTreeMap::new(),
-            #[cfg(feature = "run-graph")]
-            graph_seq: 0,
+            #[cfg(feature = "workflow")]
+            workflows: std::collections::BTreeMap::new(),
+            #[cfg(feature = "workflow")]
+            workflow_seq: 0,
             log,
         }
     }
@@ -233,69 +233,69 @@ impl Orchestrator {
         )
     }
 
-    /// `graph.define` (pivot Phase 7, `--features run-graph`) — validate an authored
-    /// run-graph and STORE it under a generated id for a later `graph.run`. Validation
+    /// `workflow.define` (pivot Phase 7, `--features workflow`) — validate an authored
+    /// workflow and STORE it under a generated id for a later `workflow.run`. Validation
     /// is structural + fail-closed: a graph that can't reach a `Halt`, dangles an
     /// edge, or busts the caps is REFUSED as a tool result (never stored, never a
     /// crash). Bounded by a per-run graph budget (fork-bomb hygiene).
-    #[cfg(feature = "run-graph")]
-    fn graph_define(&mut self, args: &Value) -> (String, bool) {
-        const MAX_GRAPHS: usize = 16;
-        if self.graphs.len() >= MAX_GRAPHS {
-            return refused("maximum run-graphs defined for this run");
+    #[cfg(feature = "workflow")]
+    fn workflow_define(&mut self, args: &Value) -> (String, bool) {
+        const MAX_WORKFLOWS: usize = 16;
+        if self.workflows.len() >= MAX_WORKFLOWS {
+            return refused("maximum workflows defined for this run");
         }
-        let Some(graph_val) = args.get("graph") else {
-            return ("error: graph.define requires a 'graph' object".into(), true);
+        let Some(graph_val) = args.get("workflow") else {
+            return ("error: workflow.define requires a 'workflow' object".into(), true);
         };
         let graph: crate::graph::Graph = match serde_json::from_value(graph_val.clone()) {
             Ok(g) => g,
-            Err(e) => return (format!("error: malformed graph: {e}"), true),
+            Err(e) => return (format!("error: malformed workflow: {e}"), true),
         };
         if let Err(errs) = graph.validate() {
-            return (format!("error: invalid graph: {}", errs.join("; ")), true);
+            return (format!("error: invalid workflow: {}", errs.join("; ")), true);
         }
-        self.graph_seq += 1;
-        let id = format!("g{}", self.graph_seq);
+        self.workflow_seq += 1;
+        let id = format!("w{}", self.workflow_seq);
         let n = graph.nodes.len();
-        self.graphs.insert(id.clone(), graph);
+        self.workflows.insert(id.clone(), graph);
         self.log
-            .info("graph.define", json!({"graph_id": id, "nodes": n}));
+            .info("workflow.define", json!({"workflow_id": id, "nodes": n}));
         (
-            format!("graph defined: {id} ({n} nodes) — run it with graph.run"),
+            format!("workflow defined: {id} ({n} nodes) — run it with workflow.run"),
             false,
         )
     }
 
-    /// `graph.patch` (pivot Phase 7 · P5, `--features run-graph`) — grow a stored graph
+    /// `workflow.patch` (pivot Phase 7 · P5, `--features workflow`) — grow a stored graph
     /// ADDITIVELY (new nodes/edges only; no overwrite, no retarget), so the model can
     /// extend its own plan at runtime without breaking a live run's reachability or
     /// termination. The patch is applied to a clone + re-validated; a rejected patch
     /// leaves the stored graph UNCHANGED and is refused as a tool result.
-    #[cfg(feature = "run-graph")]
-    fn graph_patch(&mut self, args: &Value) -> (String, bool) {
-        let id = args.get("graph_id").and_then(Value::as_str).unwrap_or("");
+    #[cfg(feature = "workflow")]
+    fn workflow_patch(&mut self, args: &Value) -> (String, bool) {
+        let id = args.get("workflow_id").and_then(Value::as_str).unwrap_or("");
         if id.is_empty() {
-            return ("error: graph.patch requires 'graph_id'".into(), true);
+            return ("error: workflow.patch requires 'workflow_id'".into(), true);
         }
-        if !self.graphs.contains_key(id) {
-            return (format!("error: no such graph '{id}'"), true);
+        if !self.workflows.contains_key(id) {
+            return (format!("error: no such workflow '{id}'"), true);
         }
         let patch: crate::graph::GraphPatch =
             match serde_json::from_value(args.get("patch").cloned().unwrap_or_else(|| json!({}))) {
                 Ok(p) => p,
                 Err(e) => return (format!("error: malformed patch: {e}"), true),
             };
-        let mut patched = self.graphs[id].clone();
+        let mut patched = self.workflows[id].clone();
         if let Err(errs) = patched.apply_patch(patch) {
             return (format!("error: patch rejected: {}", errs.join("; ")), true);
         }
         let n = patched.nodes.len();
-        self.graphs.insert(id.to_string(), patched);
-        self.log.info("graph.patch", json!({"graph_id": id, "nodes": n}));
-        (format!("graph {id} patched ({n} nodes)"), false)
+        self.workflows.insert(id.to_string(), patched);
+        self.log.info("workflow.patch", json!({"workflow_id": id, "nodes": n}));
+        (format!("workflow {id} patched ({n} nodes)"), false)
     }
 
-    /// `graph.run` (pivot Phase 7 · P6, `--features run-graph`) — the "agent
+    /// `workflow.run` (pivot Phase 7 · P6, `--features workflow`) — the "agent
     /// orchestrates BY ITSELF" primitive: drive a graph the agent defined to a
     /// terminal status, returning its status + projected result as the tool result.
     /// SYNCHRONOUS — it runs in the agent's own (child) process (per the design:
@@ -304,16 +304,16 @@ impl Orchestrator {
     /// identically to the operator `--mode graph`: a `Wait` node blocks in-process
     /// until its resource updates or the timeout elapses, then resumes. The whole call
     /// blocks until the graph terminates (uncancellable mid-run — a documented v1 limit).
-    #[cfg(feature = "run-graph")]
-    fn graph_run(&mut self, args: &Value) -> (String, bool) {
+    #[cfg(feature = "workflow")]
+    fn workflow_run(&mut self, args: &Value) -> (String, bool) {
         use crate::graph::GraphStatus;
-        let id = args.get("graph_id").and_then(Value::as_str).unwrap_or("");
+        let id = args.get("workflow_id").and_then(Value::as_str).unwrap_or("");
         if id.is_empty() {
-            return ("error: graph.run requires 'graph_id'".into(), true);
+            return ("error: workflow.run requires 'workflow_id'".into(), true);
         }
-        let Some(graph) = self.graphs.get(id).cloned() else {
+        let Some(graph) = self.workflows.get(id).cloned() else {
             return (
-                format!("error: no such graph '{id}' — define it with graph.define first"),
+                format!("error: no such workflow '{id}' — define it with workflow.define first"),
                 true,
             );
         };
@@ -334,18 +334,18 @@ impl Orchestrator {
             Ok(o) => {
                 let is_err = o.status != GraphStatus::Completed;
                 self.log.info(
-                    "graph.run",
-                    json!({"graph_id": id, "status": format!("{:?}", o.status), "steps": o.steps}),
+                    "workflow.run",
+                    json!({"workflow_id": id, "status": format!("{:?}", o.status), "steps": o.steps}),
                 );
                 let summary = json!({
-                    "graph_id": id,
+                    "workflow_id": id,
                     "status": format!("{:?}", o.status),
                     "steps": o.steps,
                     "result": o.result,
                 });
                 (summary.to_string(), is_err)
             }
-            Err(e) => (format!("error: graph.run setup failed: {e}"), true),
+            Err(e) => (format!("error: workflow.run setup failed: {e}"), true),
         }
     }
 
@@ -825,11 +825,11 @@ impl SelfHandler for Orchestrator {
             // Run-graph authoring (pivot Phase 7) is a root orchestration capability,
             // like the reactive self-tools — a nested child distils a result, it does
             // not drive a graph.
-            #[cfg(feature = "run-graph")]
+            #[cfg(feature = "workflow")]
             {
-                t.push(graph_define_tool_def());
-                t.push(graph_patch_tool_def());
-                t.push(graph_run_tool_def());
+                t.push(workflow_define_tool_def());
+                t.push(workflow_patch_tool_def());
+                t.push(workflow_run_tool_def());
             }
         }
         t
@@ -855,12 +855,12 @@ impl SelfHandler for Orchestrator {
                 Some(self.subscription(SubscriptionAction::Unsubscribe, args))
             }
             "await_resource" if self.parent_depth == 0 => Some(self.await_resource(args)),
-            #[cfg(feature = "run-graph")]
-            "graph.define" if self.parent_depth == 0 => Some(self.graph_define(args)),
-            #[cfg(feature = "run-graph")]
-            "graph.patch" if self.parent_depth == 0 => Some(self.graph_patch(args)),
-            #[cfg(feature = "run-graph")]
-            "graph.run" if self.parent_depth == 0 => Some(self.graph_run(args)),
+            #[cfg(feature = "workflow")]
+            "workflow.define" if self.parent_depth == 0 => Some(self.workflow_define(args)),
+            #[cfg(feature = "workflow")]
+            "workflow.patch" if self.parent_depth == 0 => Some(self.workflow_patch(args)),
+            #[cfg(feature = "workflow")]
+            "workflow.run" if self.parent_depth == 0 => Some(self.workflow_run(args)),
             _ => None,
         }
     }
@@ -1109,37 +1109,37 @@ fn await_resource_tool_def() -> ToolDef {
     }
 }
 
-/// `graph.define` (pivot Phase 7) — author + store a run-graph for `graph.run`.
-#[cfg(feature = "run-graph")]
-fn graph_define_tool_def() -> ToolDef {
+/// `workflow.define` (pivot Phase 7) — author + store a workflow for `workflow.run`.
+#[cfg(feature = "workflow")]
+fn workflow_define_tool_def() -> ToolDef {
     ToolDef {
-        name: "graph.define".into(),
-        description: "Define a run-graph: nodes (agent/tool/branch/wait/subgraph/halt) connected \
+        name: "workflow.define".into(),
+        description: "Define a workflow: a graph of nodes (agent/tool/branch/wait/subgraph/halt) connected \
             by labelled edges — cycles and conditional branches allowed — that agentd drives to \
-            process work items by itself. Provide the graph as a JSON object {start, nodes}; \
+            process work items by itself. Provide the workflow as a JSON object {start, nodes}; \
             agentd validates it structurally (it must be able to reach a halt) and returns a \
-            graph id you then pass to graph.run. Use this to orchestrate multi-step, looping, or \
+            workflow id you then pass to workflow.run. Use this to orchestrate multi-step, looping, or \
             conditional work without hand-holding each turn."
             .into(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "graph": {
+                "workflow": {
                     "type": "object",
-                    "description": "the run-graph: {\"start\": nodeId, \"nodes\": {id: {kind, ...}}}"
+                    "description": "the workflow graph: {\"start\": nodeId, \"nodes\": {id: {kind, ...}}}"
                 }
             },
-            "required": ["graph"]
+            "required": ["workflow"]
         }),
     }
 }
 
-/// `graph.run` (pivot Phase 7 · P6) — drive a graph the agent defined to completion.
-#[cfg(feature = "run-graph")]
-fn graph_run_tool_def() -> ToolDef {
+/// `workflow.run` (pivot Phase 7 · P6) — drive a workflow the agent defined to completion.
+#[cfg(feature = "workflow")]
+fn workflow_run_tool_def() -> ToolDef {
     ToolDef {
-        name: "graph.run".into(),
-        description: "Run a run-graph you defined (by graph_id) to completion, and get back its \
+        name: "workflow.run".into(),
+        description: "Run a workflow you defined (by workflow_id) to completion, and get back its \
             final status + result. agentd drives the whole graph itself — running each agent/tool \
             node, taking branches on the data or a judgement, and looping as the graph directs — \
             so you orchestrate multi-step work by defining a graph once and running it, instead of \
@@ -1147,19 +1147,19 @@ fn graph_run_tool_def() -> ToolDef {
             .into(),
         input_schema: json!({
             "type": "object",
-            "properties": {"graph_id": {"type": "string", "description": "the id returned by graph.define"}},
-            "required": ["graph_id"]
+            "properties": {"workflow_id": {"type": "string", "description": "the id returned by workflow.define"}},
+            "required": ["workflow_id"]
         }),
     }
 }
 
-/// `graph.patch` (pivot Phase 7 · P5) — grow a stored graph additively.
-#[cfg(feature = "run-graph")]
-fn graph_patch_tool_def() -> ToolDef {
+/// `workflow.patch` (pivot Phase 7 · P5) — grow a stored workflow additively.
+#[cfg(feature = "workflow")]
+fn workflow_patch_tool_def() -> ToolDef {
     ToolDef {
-        name: "graph.patch".into(),
-        description: "Extend a run-graph you defined, additively: add new nodes and/or new edges \
-            to existing nodes (never overwrite a node or retarget an edge). Give the graph_id and \
+        name: "workflow.patch".into(),
+        description: "Extend a workflow you defined, additively: add new nodes and/or new edges \
+            to existing nodes (never overwrite a node or retarget an edge). Give the workflow_id and \
             a patch {add_nodes, add_edges}; agentd re-validates the grown graph and rejects the \
             patch if it would break termination. Use this to elaborate your plan as you learn more, \
             without redefining the whole graph."
@@ -1167,7 +1167,7 @@ fn graph_patch_tool_def() -> ToolDef {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "graph_id": {"type": "string", "description": "the id returned by graph.define"},
+                "workflow_id": {"type": "string", "description": "the id returned by workflow.define"},
                 "patch": {
                     "type": "object",
                     "description": "additive changes",
@@ -1177,7 +1177,7 @@ fn graph_patch_tool_def() -> ToolDef {
                     }
                 }
             },
-            "required": ["graph_id", "patch"]
+            "required": ["workflow_id", "patch"]
         }),
     }
 }
@@ -1397,16 +1397,16 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "run-graph")]
+    #[cfg(feature = "workflow")]
     #[test]
-    fn graph_patch_grows_a_defined_graph_additively() {
+    fn workflow_patch_grows_a_defined_graph_additively() {
         let mut root = Orchestrator::from_payload(
             "agentd".into(),
             &payload(0, 4),
             Duration::from_secs(5),
             logger(),
         );
-        assert!(root.tools().iter().any(|t| t.name == "graph.patch"));
+        assert!(root.tools().iter().any(|t| t.name == "workflow.patch"));
         // Define a graph, then patch it additively.
         let g = json!({
             "start": "a",
@@ -1415,28 +1415,28 @@ mod tests {
                 "h": {"kind": "halt", "status": "completed"}
             }
         });
-        let (obs, err) = root.handle("graph.define", &json!({"graph": g})).unwrap();
+        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
         assert!(!err, "{obs}");
-        let id = obs.split_whitespace().nth(2).unwrap().to_string(); // "graph defined: g1 (...)"
+        let id = obs.split_whitespace().nth(2).unwrap().to_string(); // "workflow defined: w1 (...)"
         // A valid additive patch is accepted.
         let (obs, err) = root
             .handle(
-                "graph.patch",
-                &json!({"graph_id": id, "patch": {"add_edges": [{"from": "a", "label": "error", "to": "h"}]}}),
+                "workflow.patch",
+                &json!({"workflow_id": id, "patch": {"add_edges": [{"from": "a", "label": "error", "to": "h"}]}}),
             )
             .unwrap();
         assert!(!err, "additive patch accepted: {obs}");
         // Unknown graph id + a retargeting patch are refused.
         assert!(
-            root.handle("graph.patch", &json!({"graph_id": "gX", "patch": {}}))
+            root.handle("workflow.patch", &json!({"workflow_id": "gX", "patch": {}}))
                 .unwrap()
                 .1,
             "unknown id refused"
         );
         assert!(
             root.handle(
-                "graph.patch",
-                &json!({"graph_id": id, "patch": {"add_edges": [{"from": "a", "label": "ok", "to": "a"}]}})
+                "workflow.patch",
+                &json!({"workflow_id": id, "patch": {"add_edges": [{"from": "a", "label": "ok", "to": "a"}]}})
             )
             .unwrap()
             .1,
@@ -1444,21 +1444,21 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "run-graph")]
+    #[cfg(feature = "workflow")]
     #[test]
-    fn graph_run_drives_a_defined_graph_and_refuses_unknown_ids() {
+    fn workflow_run_drives_a_defined_graph_and_refuses_unknown_ids() {
         // Empty servers (no connect) + loopback-refused intel (`payload` sets a 1s
         // deadline, so the agent node fails FAST without a live LLM): the agent node
         // errors, the graph follows its `error` edge to the crashed halt, and
-        // graph.run returns a terminal graph summary — no hang, no panic.
+        // workflow.run returns a terminal graph summary — no hang, no panic.
         let mut p = payload(0, 4);
         p.mcp_servers = vec![];
         p.intelligence.uri = "http://127.0.0.1:9".into(); // loopback, nothing listening
         let mut root =
             Orchestrator::from_payload("agentd".into(), &p, Duration::from_secs(5), logger());
         assert!(
-            root.tools().iter().any(|t| t.name == "graph.run"),
-            "root advertises graph.run"
+            root.tools().iter().any(|t| t.name == "workflow.run"),
+            "root advertises workflow.run"
         );
         let g = json!({
             "start": "a",
@@ -1468,27 +1468,27 @@ mod tests {
                 "fail": {"kind": "halt", "status": "crashed"}
             }
         });
-        let (obs, err) = root.handle("graph.define", &json!({"graph": g})).unwrap();
+        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
         assert!(!err, "{obs}");
         let id = obs.split_whitespace().nth(2).unwrap().to_string();
         // Run it: the agent node fails on refused intel → error edge → crashed halt.
-        let (obs, err) = root.handle("graph.run", &json!({"graph_id": id})).unwrap();
+        let (obs, err) = root.handle("workflow.run", &json!({"workflow_id": id})).unwrap();
         assert!(err, "a graph that halts crashed is an error result: {obs}");
-        assert!(obs.contains("\"status\""), "graph.run returns a status summary: {obs}");
+        assert!(obs.contains("\"status\""), "workflow.run returns a status summary: {obs}");
         // An unknown / missing id is refused (never drives).
         assert!(
-            root.handle("graph.run", &json!({"graph_id": "gX"})).unwrap().1,
+            root.handle("workflow.run", &json!({"workflow_id": "gX"})).unwrap().1,
             "unknown id refused"
         );
         assert!(
-            root.handle("graph.run", &json!({})).unwrap().1,
+            root.handle("workflow.run", &json!({})).unwrap().1,
             "missing id refused"
         );
     }
 
-    #[cfg(feature = "run-graph")]
+    #[cfg(feature = "workflow")]
     #[test]
-    fn graph_define_is_root_only_validates_and_stores() {
+    fn workflow_define_is_root_only_validates_and_stores() {
         // Nested child does not get the graph-authoring surface.
         let mut child = Orchestrator::from_payload(
             "agentd".into(),
@@ -1496,8 +1496,8 @@ mod tests {
             Duration::from_secs(5),
             logger(),
         );
-        assert!(!child.tools().iter().any(|t| t.name == "graph.define"));
-        assert!(child.handle("graph.define", &json!({"graph": {}})).is_none());
+        assert!(!child.tools().iter().any(|t| t.name == "workflow.define"));
+        assert!(child.handle("workflow.define", &json!({"workflow": {}})).is_none());
 
         let mut root = Orchestrator::from_payload(
             "agentd".into(),
@@ -1506,8 +1506,8 @@ mod tests {
             logger(),
         );
         assert!(
-            root.tools().iter().any(|t| t.name == "graph.define"),
-            "root advertises graph.define"
+            root.tools().iter().any(|t| t.name == "workflow.define"),
+            "root advertises workflow.define"
         );
         // A valid graph is stored + an id returned.
         let g = json!({
@@ -1517,21 +1517,21 @@ mod tests {
                 "h": {"kind": "halt", "status": "completed"}
             }
         });
-        let (obs, err) = root.handle("graph.define", &json!({"graph": g})).unwrap();
+        let (obs, err) = root.handle("workflow.define", &json!({"workflow": g})).unwrap();
         assert!(!err, "{obs}");
-        assert!(obs.contains("graph defined"), "{obs}");
+        assert!(obs.contains("workflow defined"), "{obs}");
         // A structurally invalid graph (a bare self-loop, no reachable halt) is
         // REFUSED as a tool result, not stored.
         let bad = json!({
             "start": "a",
             "nodes": {"a": {"kind": "agent", "instruction": "spin", "edges": {"ok": "a"}}}
         });
-        let (obs, err) = root.handle("graph.define", &json!({"graph": bad})).unwrap();
+        let (obs, err) = root.handle("workflow.define", &json!({"workflow": bad})).unwrap();
         assert!(err, "no-halt graph must be refused: {obs}");
-        assert!(obs.contains("invalid graph"), "{obs}");
+        assert!(obs.contains("invalid workflow"), "{obs}");
         // Missing 'graph' arg is refused.
         assert!(
-            root.handle("graph.define", &json!({})).unwrap().1,
+            root.handle("workflow.define", &json!({})).unwrap().1,
             "missing graph refused"
         );
     }

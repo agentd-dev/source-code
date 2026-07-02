@@ -85,8 +85,8 @@ Validations enforced at startup (each is also collected by `--validate-config`,
 | `--continue` only with `--mode reactive` | `--continue is only valid with --mode reactive` |
 | `--mode schedule` has an interval or cron | `--mode schedule requires --interval <dur> or --cron <expr>` |
 | `--cron` only with `--mode schedule` | `--cron is only valid with --mode schedule` |
-| `--mode graph` has a `--graph <file>` (feature `run-graph`) | `--mode graph requires --graph <file>` |
-| `--graph` only with `--mode graph` | `--graph is only valid with --mode graph` |
+| `--mode workflow` has a `--workflow <file>` (feature `workflow`) | `--mode workflow requires --workflow <file>` |
+| `--workflow` only with `--mode workflow` | `--workflow is only valid with --mode workflow` |
 | `--cgroup-memory-max`/`--cgroup-pids-max` need `--cgroup` | `--cgroup-memory-max/--cgroup-pids-max require --cgroup` |
 | `--cgroup-*-max` not `0` | `--cgroup-pids-max must be > 0 … or 'max'` / `--cgroup-memory-max must be > 0 or 'max'` |
 | `--serve-mcp` target scheme/port valid | `--serve-mcp: scheme unsupported …` |
@@ -152,7 +152,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 | `--mcp name=<endpoint>` | — | *(none)* | Declare a remote MCP server, reached over **Streamable HTTP** — `name=https://host[:port][/path]` (or a loopback `http://` for dev). agentd spawns no local process. Repeatable. See §5. **Reloadable** (§11). |
 | `--serve-mcp <TARGET>` | `AGENT_SERVE_MCP` | *(off)* | Serve agent's own MCP so agents compose: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). Needs `--features serve-https`. |
 | `--a2a-peer name=<ENDPOINT>` | `AGENT_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`). Repeatable (the env channel declares one). Needs `--features a2a`. |
-| `--graph <FILE>` | `AGENT_GRAPH` | *(none)* | Path to a pinned run-graph JSON, driven by `--mode graph`. Needs `--features run-graph`. See [run-graphs.md](run-graphs.md). |
+| `--workflow <FILE>` | `AGENT_WORKFLOW` | *(none)* | Path to a pinned workflow JSON, driven by `--mode workflow`. Needs `--features workflow`. See [workflows.md](workflows.md). |
 | `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server (order-independent). Repeatable. |
 | `--allow-trifecta` | `AGENT_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
 

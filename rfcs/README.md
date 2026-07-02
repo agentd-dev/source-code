@@ -11,7 +11,7 @@
 > **[`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md)**;
 > where an RFC and that document diverge on transport/exec, the pivot wins. Affected
 > RFCs carry a banner. Run-graphs (an agent-orchestration feature) are documented in
-> **[`../docs/run-graphs.md`](../docs/run-graphs.md)**.
+> **[`../docs/workflows.md`](../docs/workflows.md)**.
 
 This directory holds the agentd RFC set. **0001–0013** are the rewrite core
 (Accepted, shipped v1): RFC **0001** is the readable narrative front door, and

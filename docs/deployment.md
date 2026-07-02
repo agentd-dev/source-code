@@ -49,7 +49,7 @@ intelligence endpoint list + headers). Everything else is env-settable;
 | MCP server | — | `--mcp name=<endpoint>` (repeatable; remote Streamable HTTP) |
 | Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp https://host:port` + `--serve-cert`/`--serve-key`/`--serve-client-ca` or `--serve-bearer` (`serve-https` feat.) |
 | A2A peer | `AGENT_A2A_PEER` | `--a2a-peer name=https://endpoint` (repeatable; `a2a` feat.) |
-| Run-graph | `AGENT_GRAPH` | `--graph <FILE>` with `--mode graph` (`run-graph` feat.) |
+| Run-graph | `AGENT_WORKFLOW` | `--workflow <FILE>` with `--mode workflow` (`workflow` feat.) |
 | Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule` |
 | Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
 | Interval / cron | `AGENT_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
@@ -255,7 +255,7 @@ TLS for the loopback-`http://`-to-a-sidecar posture.
 # syntax=docker/dockerfile:1
 # Static musl binary on scratch — the dependency-free cloud-native feature set.
 FROM rust:1-alpine AS build
-ARG FEATURES="serve-https,metrics,cron,otel,cluster,hot-reload,config-watch,run-graph"
+ARG FEATURES="serve-https,metrics,cron,otel,cluster,hot-reload,config-watch,workflow"
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .

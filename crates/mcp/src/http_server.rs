@@ -211,6 +211,12 @@ fn serve_conn<S: Read + Write + Send + 'static>(
         Ok(Incoming::Request(rpc_req)) if rpc_req.method == method::SUBSCRIPTIONS_LISTEN => {
             serve_listen(reader, rpc_req, origin, conn, handler, subs);
         }
+        // A server-streaming method (the embedder declares them — e.g. the A2A
+        // streaming pair): the response is an SSE stream of JSON-RPC frames.
+        Ok(Incoming::Request(rpc_req)) if handler.streams(&rpc_req.method) => {
+            serve_stream(reader, rpc_req, origin, conn, handler);
+            remove_and_disconnect(subs, conn, origin, handler);
+        }
         Ok(Incoming::Request(rpc_req)) => {
             serve_unary(reader.get_mut(), rpc_req, origin, conn, handler);
             remove_and_disconnect(subs, conn, origin, handler);
@@ -225,6 +231,56 @@ fn serve_conn<S: Read + Write + Send + 'static>(
             remove_and_disconnect(subs, conn, origin, handler);
         }
     }
+}
+
+/// A server-streaming request → a `text/event-stream` of JSON-RPC frames: the
+/// dispatch's INTERMEDIATE frames flow through the shared SSE writer as `data:`
+/// events while it runs, keep-alive comments cover the quiet stretches (the
+/// dispatch may block for minutes between frames), and the RETURNED `Response`
+/// is written as the FINAL event before the connection closes.
+fn serve_stream<S: Read + Write + Send + 'static>(
+    reader: BufReader<S>,
+    req: Request,
+    origin: PeerOrigin,
+    conn: u64,
+    handler: &Arc<dyn Handler>,
+) {
+    let mut stream = reader.into_inner();
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).and_then(|_| stream.flush()).is_err() {
+        return;
+    }
+    let writer: SharedWriter = Arc::new(Mutex::new(ServeStream::Http(Box::new(stream))));
+
+    // Keep-alives while the dispatch blocks between frames — the same probe
+    // cadence the listen stream uses. The mutex serializes them against frames.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ka = {
+        let writer = Arc::clone(&writer);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(SSE_KEEPALIVE);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let alive = writer
+                    .lock()
+                    .map(|mut w| w.write_all(b": keep-alive\n\n").and_then(|_| w.flush()).is_ok())
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+    };
+
+    let resp = handler.dispatch(req, origin, &writer, conn);
+    stop.store(true, Ordering::Relaxed);
+    if let Ok(mut w) = writer.lock() {
+        let _ = w.write_response(&resp);
+    }
+    let _ = ka.join();
 }
 
 /// A unary request → `application/json` reply. Streaming responses (a2a) are a

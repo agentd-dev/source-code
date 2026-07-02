@@ -758,6 +758,108 @@ fn management_peer_drives_the_operator_surface() {
 /// RFC 0020 §3 loopback: ONE agentd delegating to ANOTHER over A2A. A "server"
 /// agentd serves its A2A surface over a unix socket (with the mock LLM as its
 /// intelligence, so a served Task COMPLETES → a distillate). A "client" agentd
+/// `a2a.SendStreamingMessage` over HTTP answers as a REAL `text/event-stream`:
+/// a WORKING status frame arrives while the run is in flight, then (completed)
+/// the distillate artifact frame, then the final status frame — one connection,
+/// no polling (the deferred A2A SSE streaming, now served).
+#[cfg(feature = "a2a")]
+#[test]
+fn send_streaming_message_streams_sse_frames_over_http() {
+    use std::io::{BufRead, BufReader, Write};
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let llm = dir.path().join("llm.addr");
+    let (mut llm_proc, intel) = start_mock_llm(exe, &llm, "final");
+    let port = free_port();
+    let bind = format!("http://127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = Command::new(exe)
+        .args([
+            "--mode",
+            "loop",
+            "--interval",
+            "60s",
+            "--instruction",
+            "serve",
+            "--intelligence",
+        ])
+        .arg(&intel)
+        .arg("--serve-mcp")
+        .arg(&bind)
+        .args(["--log-level", "warn"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server agentd");
+    let _ready = Peer::connect(&addr); // wait for the port
+
+    // Raw streaming request — the client half is unit-tested; this asserts the
+    // SERVER's wire behavior precisely.
+    let body = r#"{"jsonrpc":"2.0","id":9,"method":"a2a.SendStreamingMessage","params":{"message":{"parts":[{"text":"do the streamed work"}]}}}"#;
+    let mut stream = std::net::TcpStream::connect(&addr).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .ok();
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).expect("send");
+    let mut reader = BufReader::new(stream);
+
+    // Head: an SSE response, not a unary JSON one.
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+            break;
+        }
+        head.push_str(&line);
+    }
+    assert!(
+        head.to_lowercase().contains("content-type: text/event-stream"),
+        "streaming method upgrades to SSE; head:\n{head}"
+    );
+
+    // Events: WORKING (final:false) → artifact (distillate) → final:true.
+    let mut data_events: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break; // server closed after the final frame
+        }
+        let line = line.trim_end();
+        if let Some(data) = line.strip_prefix("data: ") {
+            data_events.push(data.to_string());
+            if data.contains("\"final\":true") {
+                break;
+            }
+        }
+    }
+    assert!(
+        data_events
+            .iter()
+            .any(|d| d.contains("TASK_STATE_WORKING") && d.contains("\"final\":false")),
+        "a WORKING frame streamed before the terminal one: {data_events:?}"
+    );
+    assert!(
+        data_events.iter().any(|d| d.contains("artifactUpdate") && d.contains("mock-llm done")),
+        "the distillate artifact frame streamed: {data_events:?}"
+    );
+    assert!(
+        data_events
+            .last()
+            .is_some_and(|d| d.contains("TASK_STATE_COMPLETED") && d.contains("\"final\":true")),
+        "the stream ends on the final COMPLETED frame: {data_events:?}"
+    );
+
+    sigterm(server.id());
+    let _ = server.wait();
+    sigterm(llm_proc.id());
+    let _ = llm_proc.wait();
+}
+
 /// runs a one-shot whose mock LLM calls the `a2a.delegate` self-tool against a
 /// declared peer pointing at the server. This exercises the whole A2A client path
 /// end to end — connect → SendMessage → poll GetTask → distillate — and proves

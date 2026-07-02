@@ -1211,6 +1211,14 @@ struct ServeHandler {
 }
 
 impl ::mcp::server::Handler for ServeHandler {
+    /// The A2A streaming pair responds as a server stream (status-level
+    /// `StreamResponse` frames; RFC 0020 §5) — the HTTP transport upgrades these
+    /// to `text/event-stream` instead of a unary reply.
+    #[cfg(feature = "a2a")]
+    fn streams(&self, method: &str) -> bool {
+        matches!(method, "a2a.SendStreamingMessage" | "a2a.SubscribeToTask")
+    }
+
     fn dispatch(
         &self,
         req: Request,

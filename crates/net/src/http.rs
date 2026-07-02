@@ -366,6 +366,12 @@ impl<S: Read + Write> StreamingResponse<S> {
     pub fn sse(self) -> SseReader<BufReader<S>> {
         SseReader::new(self.reader)
     }
+
+    /// Consume into the raw body reader — for a response that turned out NOT to
+    /// be an event stream (e.g. a peer that answered `application/json`).
+    pub fn into_reader(self) -> BufReader<S> {
+        self.reader
+    }
 }
 
 /// Issue one request over an OWNED `stream` and return the status + headers +

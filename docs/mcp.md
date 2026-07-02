@@ -25,54 +25,50 @@ no special-case protocol.
 
 ### 1.1 There are no built-in tools
 
-agentd ships **no** tools of its own except a single, off-by-default gated
-`exec` (see §2.4). Every other capability — read a file, query an API, run a
-search — is a tool on some MCP server you declare. agentd discovers them with
-`tools/list` and invokes them with `tools/call`. If you declare zero servers and
-don't pass `--enable-exec`, agentd has an empty toolbox.
+agentd ships **no** task tools of its own and runs no local code. Every
+capability — read a file, query an API, run a search — is a tool on some MCP
+server you declare. agentd discovers them with `tools/list` and invokes them with
+`tools/call`. If you declare zero servers, agentd's task toolbox is empty (its only
+built-in tools are its self/control primitives — spawn a subagent, subscribe, run
+a graph).
 
 This is deliberate: the action space is configuration, not code. Swapping what
 an agent can do never means rebuilding agentd.
 
-### 1.2 Declaring servers — `--mcp name=command`
+### 1.2 Declaring servers — `--mcp name=<endpoint>`
 
-You declare each MCP server with `--mcp name=command`, repeatable. The transport
-is **stdio**: agentd launches the command as a subprocess and speaks JSON-RPC
-over its stdin/stdout.
+You declare each MCP server with `--mcp name=<endpoint>`, repeatable. Each names a
+**remote MCP endpoint** reached over **Streamable HTTP** — agentd connects to it
+and speaks JSON-RPC over HTTP(S); it spawns no subprocess and runs no local code.
 
 ```bash
 agentd \
   --instruction "Summarize the open TODOs under /work and write a digest" \
   --intelligence https://gw.example/v1 \
-  --mcp fs=mcp-server-fs --root /work \
-  --mcp http=mcp-server-http
+  --mcp fs=https://mcp-fs.internal/mcp \
+  --mcp http=https://mcp-http.internal/mcp
 ```
 
-The part after `=` is split on whitespace into an argv, so the first token is
-the executable and the rest are its arguments:
+The part after `=` is the endpoint — `https://host[:port][/path]`, or a loopback
+`http://` for a same-host dev sidecar. Per-server auth/framing headers (e.g.
+`Authorization: Bearer {{secret:…}}`) are declared secret-free in the config file's
+`mcp_servers[].headers` and resolved at connect time (never inlined or logged).
 
-```bash
---mcp fs=mcp-server-fs --root /data
-#       ^executable     ^^^^^^^^^^^^ args passed to the server
-# parsed as name="fs", command=["mcp-server-fs", "--root", "/data"]
-```
-
-> The launch command is **trusted config** — it is never built from
-> model-controlled or server-controlled strings. Declare servers from your
-> deployment config, not from agentd output.
+> The endpoint is **trusted config** — it is never built from model- or
+> server-controlled strings. Declare servers from your deployment config, not from
+> agentd output.
 
 Multiple servers coexist; tool names are **server-qualified** internally so two
-servers can both expose a `search` tool without colliding. A `--mcp` with an
-empty name or empty command is rejected at startup (exit `2`) before any
-side effect.
+servers can both expose a `search` tool without colliding. A `--mcp` with an empty
+name or a non-`https`/non-loopback-`http` endpoint is rejected at startup (exit
+`2`) before any side effect.
 
 The exact flag surface (from `agentd --help`):
 
 ```
 TOOLS / MCP:
-  --mcp name=command          declare an MCP server (repeatable; stdio)
-  --serve-mcp <unix:/path>    serve agentd's own MCP
-  --enable-exec               expose the gated exec tool
+  --mcp name=<endpoint>       declare a remote MCP server (repeatable; Streamable HTTP)
+  --serve-mcp <https://host:port>  serve agentd's own MCP (HTTP(S), mTLS/bearer auth)
 ```
 
 There is no `--mcp` env var; servers are a structural list. (A config-file layer
@@ -232,7 +228,7 @@ You wire a subscription to a run with `--subscribe` plus `--mode reactive`:
 agentd \
   --instruction "When the inbox changes, triage new items" \
   --intelligence https://gw.example/v1 \
-  --mcp fs=mcp-server-fs --root /work \
+  --mcp fs=https://mcp-fs.internal/mcp \
   --mode reactive \
   --subscribe file:///work/inbox
 ```
@@ -240,10 +236,10 @@ agentd \
 `--mode reactive` *requires* at least one `--subscribe <uri>`; without it the
 config is rejected at startup (exit `2`).
 
-> **v1 scope: reactivity is stdio-only.** Subscriptions ride the stdio transport.
-> Reactivity-over-HTTP needs a long-lived SSE GET stream with `Last-Event-ID`
-> resumption, which the v1 MCP client does not build. **(roadmap)** —
-> [RFC 0013](../rfcs/0013-deferred-v2-surface.md).
+> **Reactivity rides Streamable HTTP.** Subscriptions are `resources/subscribe`
+> against the owning MCP server; the client holds the SSE stream open and processes
+> pushed `notifications/resources/updated` (notify-then-read). No stdio transport
+> is involved.
 
 ### 1.7 Liveness and lifecycle
 
@@ -270,27 +266,28 @@ tools to spawn and steer subagents (`subagent.spawn` / `.send` / `.status` /
 `.cancel`) plus a `status` tool, and the subscribable `agent://` state resources
 (this agent's `status`, and a per-run `agent://subagent/<handle>`).
 
-It serves this over **stdio always**, and over a **unix socket** when you pass
-`--serve-mcp unix:PATH`:
+It serves this over **Streamable HTTP(S)** when you pass `--serve-mcp`, with trust
+minted per request by mutual-TLS (primary) or a constant-time bearer token
+(alternative) — never by the transport:
 
 ```bash
 agentd \
   --instruction "Be a reusable code-review worker" \
   --intelligence https://gw.example/v1 \
-  --mcp fs=mcp-server-fs --root /src \
-  --serve-mcp unix:/run/agent-review.sock
+  --mcp fs=https://mcp-fs.internal/mcp \
+  --serve-mcp https://0.0.0.0:8443 \
+  --serve-cert /etc/agentd/tls/server.crt \
+  --serve-key /etc/agentd/tls/server.key \
+  --serve-client-ca /etc/agentd/tls/clients-ca.crt
 ```
 
-> **stdout is sacred.** When serving the self-MCP over stdio, stdout carries MCP
-> messages only — all telemetry goes to stderr. A process serving self-MCP on
-> stdio therefore cannot *also* print an agent result on stdout; the
-> `once`-mode result-on-stdout path and self-MCP-on-stdio are mutually exclusive
-> per process (the supervisor picks one by mode).
-
-> **HTTP serving is (roadmap).** v1 serves over stdio + unix only. The full
-> Streamable-HTTP surface (POST+GET endpoint, SSE upgrade, `MCP-Session-Id`,
-> `Origin`→403, resumability) is deferred to
-> [RFC 0013](../rfcs/0013-deferred-v2-surface.md).
+> **The served surface is HTTP.** The self-MCP is a full Streamable-HTTP server
+> (POST for unary calls, `subscriptions/listen` over SSE) — the framing lives in
+> the reusable `mcp` crate. A non-loopback bind **must** configure mTLS and/or a
+> bearer (`--serve-bearer`); an unauthenticated non-loopback listener is a startup
+> error. A loopback `http://` bind with no auth is allowed only for local dev. The
+> in-process caller (the agent's own loop / the supervisor↔subagent control path)
+> is the `Stdio` origin; an authenticated HTTP request is the `Management` origin.
 
 ### 2.1 Declared capabilities
 
@@ -332,11 +329,11 @@ re-lists. Each `inputSchema` is JSON Schema 2020-12.
 | `subagent.status` | read a handle's status (and result once terminal) | sync |
 | `subagent.cancel` | request graceful cancel of a run/subtree (→ kill ladder) | sync ack |
 
-The in-agent `subscribe`/`unsubscribe` self-tools and the gated `exec` tool are
+The in-agent `subscribe`/`unsubscribe`/`await_resource`/`graph.*` self-tools are
 **not** part of this served list — they belong to a running agent's *own* loop,
-not to peers on the socket (the `subscribe` self-tool is covered in §2.4). To read
-an `agent://` resource a peer uses the JSON-RPC `resources/read` / `resources/subscribe`
-methods (§2.3), which are likewise not `tools/call` entries.
+not to peers on the transport (the reactive self-tools are covered in §2.4). To
+read an `agent://` resource a peer uses the JSON-RPC `resources/read` /
+`resources/subscribe` methods (§2.3), which are likewise not `tools/call` entries.
 
 `subagent.spawn` — the served `inputSchema` (the supervisor expands this compact
 surface into the rich internal spawn payload, [RFC 0009](../rfcs/0009-subagent-process-model.md)):
@@ -395,8 +392,9 @@ client (§1.4).
 > as a session you drive with `subagent.send`. (`detach` is an *in-loop*
 > orchestrator disposition, not offered on the served socket.)
 
-The gated `exec` tool is an in-agent self-tool (enabled by `--enable-exec` for the
-agent's *own* loop); it never appears in the served peer-facing `tools/list`.
+agentd has **no `exec`/shell tool** — it runs no local code (see
+[security §6](security.md)). The only process it launches is a re-exec of its own
+trusted binary (a subagent); everything else is a tool from a declared MCP server.
 
 ### 2.3 Subscribable `agent://` state resources
 
@@ -480,15 +478,26 @@ This keeps the public surface a single, clean MCP dialect.
 
 ## 3. Composition: one agent driving another
 
-Because agentd is symmetric, composition needs no new protocol. A parent agent
-declares a child agent as just another MCP server:
+Because agentd is symmetric, composition needs no new protocol. A **worker** agentd
+is deployed as its own service, serving its self-MCP over HTTPS:
 
 ```bash
-# the parent — the child agent is "just an MCP server" on a unix socket
+# the worker — a reusable reviewer, serving its self-MCP over HTTPS with auth
+agentd \
+  --instruction "Be a reusable code-review worker" \
+  --intelligence https://gw.example/v1 \
+  --mode reactive --subscribe file:///nowhere \
+  --serve-mcp https://0.0.0.0:8443 --serve-bearer "$REVIEWER_TOKEN"
+```
+
+A **parent** agentd then declares that worker as just another MCP server (or, with
+`--features a2a`, as an `--a2a-peer` it delegates to via `a2a.delegate`):
+
+```bash
 agentd \
   --instruction "Orchestrate the nightly review across the repo" \
   --intelligence https://gw.example/v1 \
-  --mcp reviewer="agentd --instruction worker --intelligence https://gw.example/v1 --serve-mcp unix:/run/rev.sock"
+  --mcp reviewer=https://reviewer.internal:8443
 ```
 
 From the parent's point of view the child is a normal MCP server: it
@@ -510,7 +519,7 @@ notify-then-read machinery, just across a process boundary.
 A worked picture of the reactive close-the-loop:
 
 ```
-parent agent                              child agent (self-MCP, unix:/run/rev.sock)
+parent agent                              child agent (self-MCP, https://reviewer.internal:8443)
   │  tools/call subagent.spawn{async}  ──▶
   │  ◀── ack: handle=served.2  (read agent://subagent/served.2)
   │  resources/subscribe{uri:agent://subagent/served.2}  ──▶

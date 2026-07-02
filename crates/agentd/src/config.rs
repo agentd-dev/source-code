@@ -508,23 +508,17 @@ impl A2aPeerSpec {
 /// peer, unlike the `--serve-mcp` listen form which may wildcard).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A2aEndpoint {
-    /// Dial an A2A peer over HTTP(S) — the target-vision transport (pivot Phase
-    /// 2): `https://host[:port][/path]` (or loopback `http://` for dev/tests).
-    /// The raw URL, parsed by the A2A client's HTTP dialer.
+    /// Dial an A2A peer over HTTP(S) — the sole transport (pivot):
+    /// `https://host[:port][/path]` (or loopback `http://` for dev/tests). The
+    /// raw URL, parsed by the A2A client's HTTP dialer.
     Https(String),
-    /// Connect to a unix-domain socket at this path.
-    Unix(std::path::PathBuf),
-    /// Connect to AF_VSOCK `(cid, port)`.
-    Vsock { cid: u32, port: u32 },
 }
 
 impl A2aEndpoint {
-    /// Parse an `--a2a-peer` endpoint. Validates the scheme/port and, for
-    /// `vsock:`, that this build has the `vsock` feature — mirroring
-    /// [`ServeTarget::parse`]. Returns a [`ConfigError::Usage`] (exit 2, before
-    /// any side effect) on any problem.
+    /// Parse an `--a2a-peer` endpoint. HTTPS-only (pivot Phase 3): an `https://`
+    /// peer URL, or a loopback `http://` for dev/tests. Returns a
+    /// [`ConfigError::Usage`] (exit 2, before any side effect) on any problem.
     pub fn parse(spec: &str) -> Result<A2aEndpoint, ConfigError> {
-        // The target-vision transport: an https:// peer URL (or loopback http://).
         if spec.starts_with("https://") {
             return Ok(A2aEndpoint::Https(spec.to_string()));
         }
@@ -539,42 +533,8 @@ impl A2aEndpoint {
             }
             return Ok(A2aEndpoint::Https(spec.to_string()));
         }
-        if let Some(path) = spec.strip_prefix("unix:") {
-            if path.is_empty() {
-                return Err(usage("--a2a-peer: unix path is empty".into()));
-            }
-            return Ok(A2aEndpoint::Unix(path.into()));
-        }
-        if let Some(rest) = spec.strip_prefix("vsock:") {
-            if !cfg!(feature = "vsock") {
-                return Err(usage(
-                    "--a2a-peer: scheme unsupported: vsock requires the 'vsock' build feature"
-                        .into(),
-                ));
-            }
-            // A client dials a concrete peer: CID:PORT is required (no wildcard).
-            let (cid_str, port_str) = rest.split_once(':').ok_or_else(|| {
-                usage(format!(
-                    "--a2a-peer: vsock endpoint must be vsock:CID:PORT (got: vsock:{rest})"
-                ))
-            })?;
-            let cid = cid_str.parse::<u32>().map_err(|_| {
-                usage(format!(
-                    "--a2a-peer: invalid vsock cid '{cid_str}' (want a number)"
-                ))
-            })?;
-            let port = port_str.parse::<u32>().map_err(|_| {
-                usage(format!(
-                    "--a2a-peer: invalid vsock port '{port_str}' (want a number)"
-                ))
-            })?;
-            if port == 0 {
-                return Err(usage("--a2a-peer: vsock port must be > 0".into()));
-            }
-            return Ok(A2aEndpoint::Vsock { cid, port });
-        }
         Err(usage(format!(
-            "--a2a-peer: scheme unsupported (want https://host[:port] | http://loopback | unix:PATH | vsock:CID:PORT): {spec}"
+            "--a2a-peer: endpoint must be https://host[:port] (or loopback http:// for dev): {spec}"
         )))
     }
 }
@@ -2498,7 +2458,7 @@ fn help_text() -> String {
          TOOLS / MCP:\n\
          \x20 --mcp name=endpoint         declare a remote MCP server (repeatable; https://|http://|unix:|vsock:)\n\
          \x20 --serve-mcp <TARGET>        serve agentd's own MCP: unix:/path | vsock:PORT | vsock:CID:PORT (vsock needs --features vsock)\n\
-         \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: unix:/path | vsock:CID:PORT (repeatable; needs --features a2a)\n\
+         \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: https://host[:port] (repeatable; needs --features a2a)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
          \x20 --allow-trifecta            permit all three capability legs in one agent\n\
          \n\
@@ -3564,16 +3524,16 @@ mod tests {
     fn a2a_peer_spec_parses_name_and_endpoint() {
         // The endpoint is the remainder after the first '=', so the unix:/vsock:
         // scheme passes through verbatim (no second '=' to confuse the split).
-        let spec = parse_a2a_peer_spec("mesh=unix:/run/peer.sock").unwrap();
+        let spec = parse_a2a_peer_spec("mesh=https://peer.example").unwrap();
         assert_eq!(spec.name, "mesh");
-        assert_eq!(spec.endpoint, "unix:/run/peer.sock");
+        assert_eq!(spec.endpoint, "https://peer.example");
         // Missing '=' / empty halves are usage errors.
         assert!(matches!(
             parse_a2a_peer_spec("noequals"),
             Err(ConfigError::Usage(_))
         ));
         assert!(matches!(
-            parse_a2a_peer_spec("=unix:/x"),
+            parse_a2a_peer_spec("=https://x"),
             Err(ConfigError::Usage(_))
         ));
         assert!(matches!(
@@ -3602,31 +3562,35 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn a2a_peer_flag_parses_and_validates_on_a2a_build() {
-        // A valid unix peer loads through full validation.
+        // A valid https peer loads through full validation.
         let c = Config::load(
-            &args(&["--a2a-peer", "mesh=unix:/run/peer.sock"]),
+            &args(&["--a2a-peer", "mesh=https://peer.example:8443/a2a"]),
             &base_env(),
         )
         .unwrap();
         assert_eq!(c.a2a_peers.len(), 1);
         assert_eq!(c.a2a_peers[0].name, "mesh");
-        assert_eq!(c.a2a_peers[0].endpoint, "unix:/run/peer.sock");
+        assert_eq!(c.a2a_peers[0].endpoint, "https://peer.example:8443/a2a");
 
-        // A bad endpoint scheme is rejected at load (exit 2) before any side effect.
-        let bad = Config::load(&args(&["--a2a-peer", "mesh=tcp:9000"]), &base_env()).unwrap_err();
-        assert!(matches!(bad, ConfigError::Usage(_)));
-
-        // An empty unix path is a usage error too.
-        let empty = Config::load(&args(&["--a2a-peer", "mesh=unix:"]), &base_env()).unwrap_err();
-        assert!(matches!(empty, ConfigError::Usage(_)));
+        // The retired socket schemes and non-loopback plaintext are rejected at
+        // load (exit 2) before any side effect.
+        for bad in [
+            "mesh=unix:/run/peer.sock",
+            "mesh=vsock:2:5005",
+            "mesh=http://peer.example:9000",
+            "mesh=tcp:9000",
+        ] {
+            let e = Config::load(&args(&["--a2a-peer", bad]), &base_env()).unwrap_err();
+            assert!(matches!(e, ConfigError::Usage(_)), "{bad} must be exit 2");
+        }
 
         // A duplicate peer name is rejected.
         let dup = Config::load(
             &args(&[
                 "--a2a-peer",
-                "mesh=unix:/a.sock",
+                "mesh=https://a.example",
                 "--a2a-peer",
-                "mesh=unix:/b.sock",
+                "mesh=https://b.example",
             ]),
             &base_env(),
         )
@@ -3639,7 +3603,7 @@ mod tests {
     fn a2a_peer_requires_the_a2a_feature() {
         // The flag parses, but validation rejects it without the build feature.
         let e = Config::load(
-            &args(&["--a2a-peer", "mesh=unix:/run/peer.sock"]),
+            &args(&["--a2a-peer", "mesh=https://peer.example"]),
             &base_env(),
         )
         .unwrap_err();
@@ -3649,24 +3613,6 @@ mod tests {
                 "got: {msg}"
             ),
             other => panic!("expected a Usage error, got {other:?}"),
-        }
-    }
-
-    #[cfg(all(feature = "a2a", feature = "vsock"))]
-    #[test]
-    fn a2a_peer_vsock_endpoint_requires_cid_and_port() {
-        // vsock:CID:PORT parses; the wildcard/bare forms do not (a client dials a
-        // concrete peer).
-        let c = Config::load(&args(&["--a2a-peer", "g=vsock:2:5005"]), &base_env()).unwrap();
-        assert_eq!(c.a2a_peers[0].endpoint, "vsock:2:5005");
-        for bad in ["g=vsock:5005", "g=vsock:2:0", "g=vsock:x:5005"] {
-            assert!(
-                matches!(
-                    Config::load(&args(&["--a2a-peer", bad]), &base_env()),
-                    Err(ConfigError::Usage(_))
-                ),
-                "{bad} must be a usage error"
-            );
         }
     }
 

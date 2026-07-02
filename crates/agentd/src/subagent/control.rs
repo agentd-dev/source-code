@@ -277,6 +277,12 @@ fn run_warm(
         // while we wait. The supervisor reactor and its liveness heartbeat are not
         // affected — only this child loop suspends.
         pause_wait(paused, cancel, log);
+        // Live tools refresh (pivot Phase 7 follow-up): an inbound
+        // `notifications/tools/list_changed` on any of THIS child's own MCP
+        // connections re-enumerates the catalogue at this turn boundary, so a
+        // warm session tracks a changing server instead of holding a stale tool
+        // set for its whole life. (Spawned one-shots already re-list per run.)
+        refresh_tools_if_changed(&mut session, orch, servers, log);
         // RFC 0018 §5.2 turn-boundary read: a hot-swap parked by the control thread
         // is drained + applied HERE, before the turn — the loop rebuilds its client
         // (fresh health/breaker) and adopts the new model. The transcript is
@@ -546,6 +552,40 @@ fn fail(up: &Up, log: &Logger, error: String, code: i32) -> i32 {
     log.error("loop.error", serde_json::json!({"err": error}));
     send_up(up, &AgentMsg::Failed { error });
     code
+}
+
+/// Drain this child's own MCP notification queues at a warm turn boundary; on an
+/// inbound `tools/list_changed`, rebuild the session's tool catalogue live. A
+/// failed re-list is a warning (the old catalogue stays — the next boundary
+/// retries); a warm child holds no subscriptions, so draining here eats nothing
+/// the daemon relies on (subscriptions live on the DAEMON's own connections).
+fn refresh_tools_if_changed(
+    session: &mut Session,
+    orch: &mut Orchestrator,
+    servers: &[McpClient],
+    log: &Logger,
+) {
+    use crate::wire::mcp::method;
+    let changed = servers.iter().any(|s| {
+        s.drain_notifications()
+            .iter()
+            .any(|n| n.method == method::NOTIFY_TOOLS_LIST_CHANGED)
+    });
+    if !changed {
+        return;
+    }
+    match session.refresh_tools(orch) {
+        Ok(()) => log.info(
+            "mcp.tools_refreshed",
+            serde_json::json!({"tools": session.tools_len()}),
+        ),
+        Err(e) => {
+            let msg = match e {
+                LoopAbort::Intel(m) | LoopAbort::Mcp(m) => m,
+            };
+            log.warn("mcp.tools_refresh_failed", serde_json::json!({"err": msg}));
+        }
+    }
 }
 
 /// Drive a payload-carried workflow to its terminal outcome and map it onto the

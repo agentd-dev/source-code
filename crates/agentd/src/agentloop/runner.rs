@@ -129,6 +129,29 @@ impl<'a> Session<'a> {
         })
     }
 
+    /// Rebuild the MCP side of the tool catalogue from the servers' CURRENT
+    /// `tools/list` (the warm-session LIVE refresh, pivot Phase 7 follow-up):
+    /// called at a turn boundary after an inbound
+    /// `notifications/tools/list_changed`, so a long-lived continue-session
+    /// tracks a server whose tool set changed instead of holding a stale
+    /// catalogue for its whole life. Self-tools and `resource.read` are
+    /// re-merged; the transcript is untouched.
+    pub fn refresh_tools(&mut self, self_handler: &mut dyn SelfHandler) -> Result<(), LoopAbort> {
+        let (mut tools, tool_to_server) = build_catalogue(self.servers)?;
+        tools.extend(self_handler.tools());
+        if !self.resources.owner.is_empty() || self_handler.serves_self_resources() {
+            tools.push(resource_read_tool_def());
+        }
+        self.tools = tools;
+        self.tool_to_server = tool_to_server;
+        Ok(())
+    }
+
+    /// The current catalogue size (observability for the live refresh).
+    pub fn tools_len(&self) -> usize {
+        self.tools.len()
+    }
+
     /// Classify a catalogue tool by its seam (pivot Phase 5.1 — name the class): a
     /// name routed to an MCP server is [`ToolClass::Mcp`] (dispatched back to that
     /// server); every other catalogue entry is agentd's own
@@ -762,6 +785,56 @@ mod tests {
     // returned `Usage` carries the model's reported tokens. The consumer→counter
     // half is covered by the `obs::metrics` `record_tokens` tests and (end to end)
     // by the reactive `/metrics` scrape in `reactive_e2e`.
+    #[test]
+    fn refresh_tools_picks_up_a_changed_handler_catalogue() {
+        // A handler whose advertised tool set CHANGES between turns: refresh
+        // rebuilds the catalogue in place (the live warm-session refresh) and
+        // leaves the transcript untouched.
+        struct GrowingHandler {
+            grown: bool,
+        }
+        impl SelfHandler for GrowingHandler {
+            fn tools(&self) -> Vec<ToolDef> {
+                let mut t = vec![ToolDef {
+                    name: "alpha".into(),
+                    description: String::new(),
+                    input_schema: Value::Null,
+                }];
+                if self.grown {
+                    t.push(ToolDef {
+                        name: "beta".into(),
+                        description: String::new(),
+                        input_schema: Value::Null,
+                    });
+                }
+                t
+            }
+            fn handle(&mut self, _name: &str, _args: &Value) -> Option<(String, bool)> {
+                None
+            }
+        }
+        let input = LoopInput {
+            instruction: "x".into(),
+            output_contract: None,
+            seed: Vec::new(),
+            model: "m".into(),
+            max_steps: 5,
+            max_tokens: 1000,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            cancel: None,
+        };
+        let mut handler = GrowingHandler { grown: false };
+        let mut session = Session::prepare(&[], &input, &mut handler).unwrap();
+        let before = session.tools_len();
+        let transcript = session.transcript_len();
+        handler.grown = true;
+        session.refresh_tools(&mut handler).unwrap();
+        assert_eq!(session.tools_len(), before + 1, "the new tool is live");
+        assert_eq!(session.transcript_len(), transcript, "transcript untouched");
+        // And the class boundary still holds: a self-tool is SelfControl.
+        assert_eq!(session.tool_class("beta"), ToolClass::SelfControl);
+    }
+
     #[cfg(unix)]
     mod usage_producer {
         use super::*;

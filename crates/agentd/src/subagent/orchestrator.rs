@@ -1114,12 +1114,18 @@ fn await_resource_tool_def() -> ToolDef {
 fn workflow_define_tool_def() -> ToolDef {
     ToolDef {
         name: "workflow.define".into(),
-        description: "Define a workflow: a graph of nodes (agent/tool/branch/wait/subgraph/halt) connected \
-            by labelled edges — cycles and conditional branches allowed — that agentd drives to \
-            process work items by itself. Provide the workflow as a JSON object {start, nodes}; \
-            agentd validates it structurally (it must be able to reach a halt) and returns a \
-            workflow id you then pass to workflow.run. Use this to orchestrate multi-step, looping, or \
-            conditional work without hand-holding each turn."
+        description: "Define a workflow: a graph of nodes connected by labelled edges — cycles and \
+            conditional branches allowed — that agentd drives to process work items by itself. \
+            Node kinds: agent (a full agentic turn), tool (one MCP call; args may embed \
+            {\"$from\": key, \"pointer\": \"/p\", \"default\": v} blackboard references), assign \
+            (pure data shaping, no model call), infer (one structured intelligence call validated \
+            against a schema of field->type, with automatic re-asks), branch (deterministic \
+            predicates over the blackboard, plus an optional semantic judgement), wait (suspend on \
+            an MCP resource), subgraph, and halt. Effectful nodes accept a retry {max, backoff_ms} \
+            policy. Provide the workflow as a JSON object {start, nodes}; agentd validates it \
+            structurally (it must be able to reach a halt) and returns a workflow id you then pass \
+            to workflow.run. Use this to orchestrate multi-step, looping, or conditional work \
+            without hand-holding each turn."
             .into(),
         input_schema: json!({
             "type": "object",

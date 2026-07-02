@@ -136,6 +136,9 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
             "subagent.spawn",
             r#"{"instruction":"do a trivial subtask","detach":true}"#,
         ),
+        // A structured JSON answer for the workflow `infer` node tests: the exec
+        // parses + schema-checks this object.
+        ("json", _) => final_answer(r#"{"verdict":"approve","score":9}"#),
         _ => final_answer("mock-llm done"),
     }
 }

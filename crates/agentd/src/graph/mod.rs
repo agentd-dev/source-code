@@ -7,9 +7,13 @@
 //! runtime. This module reifies that into an explicit serde [`Graph`] the model
 //! self-authors (`workflow.define`/`workflow.run`/`workflow.patch` self-tools) and — from
 //! P1 on — a thin driver reuses `Session::run_turn`, `Budget`, `TerminalStatus`,
-//! and the `Router`. It adds exactly two genuinely-new node kinds over today's
-//! primitives: an explicit condition/[`Branch`](Node::Branch) and an explicit
-//! wait-on-resource ([`Wait`](Node::Wait)).
+//! and the `Router`. Node kinds: [`Agent`](Node::Agent) (a full agentic turn),
+//! [`Tool`](Node::Tool) (one MCP call, args resolved via [`resolve_refs`]),
+//! [`Assign`](Node::Assign) (pure data shaping), [`Infer`](Node::Infer) (one
+//! schema-checked structured intelligence call), [`Branch`](Node::Branch)
+//! (deterministic predicates + an optional semantic judgement),
+//! [`Wait`](Node::Wait) (suspend on a resource), [`Subgraph`](Node::Subgraph),
+//! and [`Halt`](Node::Halt).
 //!
 //! **This file is the frozen, topology-only wire type (P0).** The resume point, the
 //! blackboard, and the budget live on the persisted RUN SLICE (a later phase), NOT
@@ -91,6 +95,132 @@ pub struct NodeLimits {
     pub deadline_ms: Option<u64>,
 }
 
+/// Per-node retry cap (author-time validated) — bounded so a flaky node cannot
+/// turn into an unbounded loop.
+pub const MAX_RETRY: u32 = 5;
+/// Per-node retry backoff ceiling (ms).
+pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
+/// `Infer` re-ask cap: at most this many validation-feedback re-asks.
+pub const MAX_INFER_RETRIES: u32 = 3;
+
+/// An in-node retry policy for the effectful kinds (`Agent`/`Tool`/`Infer`): on an
+/// error result, re-run the SAME node up to `max` more times (each attempt charges
+/// the step budget), sleeping `backoff_ms` between attempts, before following the
+/// `error` edge. Distinct from an authored self-edge retry loop: retries happen
+/// within ONE node visit, so the loop/stall guards (which assume a revisit means
+/// progress is expected) are not tripped by an intentionally-identical retry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Retry {
+    /// Additional attempts after the first failure (1..=MAX_RETRY).
+    pub max: u32,
+    /// Sleep between attempts, in ms (0..=MAX_RETRY_BACKOFF_MS).
+    #[serde(default)]
+    pub backoff_ms: u64,
+}
+
+/// The primitive type an [`Node::Infer`] schema field must satisfy. Deliberately a
+/// tiny, closed set (not JSON-Schema): enough to make a model's structured answer
+/// checkable + retryable, cheap enough to validate in-process with no deps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Any,
+}
+
+impl FieldType {
+    fn matches(self, v: &Value) -> bool {
+        match self {
+            FieldType::String => v.is_string(),
+            FieldType::Number => v.is_number(),
+            FieldType::Boolean => v.is_boolean(),
+            FieldType::Array => v.is_array(),
+            FieldType::Object => v.is_object(),
+            FieldType::Any => true,
+        }
+    }
+}
+
+/// Check an [`Node::Infer`] result against its schema: it must be a JSON object
+/// carrying EVERY schema field with the declared type. Extra fields are allowed
+/// (the schema is a floor, not a ceiling). Returns a message naming every miss —
+/// the driver feeds it back to the model on a re-ask.
+pub fn check_schema(schema: &BTreeMap<String, FieldType>, v: &Value) -> Result<(), String> {
+    let Some(obj) = v.as_object() else {
+        return Err("expected a JSON object".into());
+    };
+    let mut misses = Vec::new();
+    for (field, ty) in schema {
+        match obj.get(field) {
+            None => misses.push(format!("missing field {field:?}")),
+            Some(got) if !ty.matches(got) => {
+                misses.push(format!("field {field:?} must be a {ty:?}"))
+            }
+            Some(_) => {}
+        }
+    }
+    if misses.is_empty() {
+        Ok(())
+    } else {
+        Err(misses.join("; "))
+    }
+}
+
+/// Resolve `{"$from": key[, "pointer": ptr][, "default": v]}` references inside a
+/// JSON template against the blackboard — the data-flow primitive `Tool.args` and
+/// `Assign.value` use. Walks arrays/objects recursively; a ref object is replaced
+/// by the blackboard value (or its `default` when the path is absent). A missing
+/// path with NO default, or a ref object with unknown extra keys (a typo shield),
+/// is an error — the node takes its `error` edge rather than calling a tool with a
+/// silently-wrong shape.
+pub fn resolve_refs(
+    template: &Value,
+    blackboard: &BTreeMap<String, Value>,
+) -> Result<Value, String> {
+    match template {
+        Value::Object(map) => {
+            if let Some(from) = map.get("$from") {
+                let Some(key) = from.as_str() else {
+                    return Err("$from must be a string blackboard key".into());
+                };
+                for k in map.keys() {
+                    if k != "$from" && k != "pointer" && k != "default" {
+                        return Err(format!("unknown key {k:?} in a $from reference"));
+                    }
+                }
+                let pointer = map.get("pointer").and_then(Value::as_str).unwrap_or("");
+                match blackboard.get(key).and_then(|v| v.pointer(pointer)) {
+                    Some(v) => Ok(v.clone()),
+                    None => match map.get("default") {
+                        Some(d) => Ok(d.clone()),
+                        None => Err(format!(
+                            "blackboard has no value at {key:?}{pointer} (add \"default\" to make it optional)"
+                        )),
+                    },
+                }
+            } else {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, v) in map {
+                    out.insert(k.clone(), resolve_refs(v, blackboard)?);
+                }
+                Ok(Value::Object(out))
+            }
+        }
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for v in items {
+                out.push(resolve_refs(v, blackboard)?);
+            }
+            Ok(Value::Array(out))
+        }
+        v => Ok(v.clone()),
+    }
+}
+
 /// A graph node. Internally tagged by `kind` so the author writes
 /// `{"kind":"agent", …}`. Control-flow nodes (Agent/Tool/Wait/Subgraph) carry their
 /// out-edges as a `label → target` map; `Branch` carries per-case gotos; `Halt`
@@ -113,11 +243,16 @@ pub enum Node {
         writes: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limits: Option<NodeLimits>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<Retry>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
-    /// Call one MCP `tool` on `server` with `args` (a later phase substitutes
-    /// blackboard values); write the tool result to `writes`. Emits `ok`/`error`.
+    /// Call one MCP `tool` on `server` with `args`. `args` may embed
+    /// `{"$from": key[, "pointer", "default"]}` references, resolved against the
+    /// blackboard just before the call ([`resolve_refs`]) — the explicit data flow
+    /// from earlier nodes into a tool. Write the tool result to `writes`. Emits
+    /// `ok`/`error` (an unresolvable reference is an error).
     Tool {
         server: String,
         tool: String,
@@ -125,6 +260,41 @@ pub enum Node {
         args: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<Retry>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        edges: BTreeMap<EdgeLabel, NodeId>,
+    },
+    /// Pure data shaping — NO model call, no tool call: resolve the `value`
+    /// template (with `{"$from": …}` references) against the blackboard and write
+    /// the result to `writes`. Project, rename, combine, or constant-seed values so
+    /// downstream `Tool.args`/`Branch` predicates get exactly the shape they need.
+    /// Emits `ok`/`error` (error only on an unresolvable reference).
+    Assign {
+        value: Value,
+        writes: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        edges: BTreeMap<EdgeLabel, NodeId>,
+    },
+    /// One structured intelligence call — the model answers `prompt` (with `reads`
+    /// folded in) as a JSON object satisfying `schema` (field → [`FieldType`]).
+    /// The driver validates the answer and re-asks with the validation errors up
+    /// to `retries` times ([`MAX_INFER_RETRIES`] cap) before taking `error`. This
+    /// is how a workflow turns free-form intelligence into CHECKED structured data
+    /// the deterministic Tier-1 branches can route on. Writes the parsed object to
+    /// `writes`. Emits `ok`/`error`.
+    Infer {
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reads: Vec<String>,
+        schema: BTreeMap<String, FieldType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writes: Option<String>,
+        /// Validation-feedback re-asks (default 1, capped at [`MAX_INFER_RETRIES`]).
+        #[serde(default = "default_infer_retries")]
+        retries: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<Retry>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
@@ -167,6 +337,10 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_from: Option<String>,
     },
+}
+
+fn default_infer_retries() -> u32 {
+    1
 }
 
 /// One `Branch` case: a deterministic predicate and where to go when it holds.
@@ -232,6 +406,52 @@ pub enum Pred {
         pointer: String,
         value: f64,
     },
+    /// Numerically less-than-or-equal `value`.
+    Lte {
+        key: String,
+        #[serde(default)]
+        pointer: String,
+        value: f64,
+    },
+    /// Numerically greater-than-or-equal `value`.
+    Gte {
+        key: String,
+        #[serde(default)]
+        pointer: String,
+        value: f64,
+    },
+    /// The value deep-equals ONE of `values` (set membership).
+    In {
+        key: String,
+        #[serde(default)]
+        pointer: String,
+        values: Vec<Value>,
+    },
+    /// A string starting with `value`.
+    StartsWith {
+        key: String,
+        #[serde(default)]
+        pointer: String,
+        value: String,
+    },
+    /// A string ending with `value`.
+    EndsWith {
+        key: String,
+        #[serde(default)]
+        pointer: String,
+        value: String,
+    },
+    /// The length of a string (chars), array, or object is within `[min, max]`
+    /// (either bound optional; both absent is simply "it has a length").
+    Len {
+        key: String,
+        #[serde(default)]
+        pointer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u64>,
+    },
     /// The path resolves to a present, non-null value.
     Exists {
         key: String,
@@ -266,6 +486,32 @@ impl Pred {
             Pred::Gt { key, pointer, value } => at(blackboard, key, pointer)
                 .and_then(Value::as_f64)
                 .is_some_and(|x| x > *value),
+            Pred::Lte { key, pointer, value } => at(blackboard, key, pointer)
+                .and_then(Value::as_f64)
+                .is_some_and(|x| x <= *value),
+            Pred::Gte { key, pointer, value } => at(blackboard, key, pointer)
+                .and_then(Value::as_f64)
+                .is_some_and(|x| x >= *value),
+            Pred::In { key, pointer, values } => {
+                at(blackboard, key, pointer).is_some_and(|v| values.contains(v))
+            }
+            Pred::StartsWith { key, pointer, value } => at(blackboard, key, pointer)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with(value.as_str())),
+            Pred::EndsWith { key, pointer, value } => at(blackboard, key, pointer)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.ends_with(value.as_str())),
+            Pred::Len { key, pointer, min, max } => {
+                let len = match at(blackboard, key, pointer) {
+                    Some(Value::String(s)) => Some(s.chars().count() as u64),
+                    Some(Value::Array(a)) => Some(a.len() as u64),
+                    Some(Value::Object(o)) => Some(o.len() as u64),
+                    _ => None,
+                };
+                len.is_some_and(|n| {
+                    min.is_none_or(|lo| n >= lo) && max.is_none_or(|hi| n <= hi)
+                })
+            }
             Pred::Exists { key, pointer } => {
                 at(blackboard, key, pointer).is_some_and(|v| !v.is_null())
             }
@@ -277,6 +523,27 @@ impl Pred {
             Pred::All { preds } => preds.iter().all(|p| p.eval(blackboard)),
             Pred::Any { preds } => preds.iter().any(|p| p.eval(blackboard)),
             Pred::Not { pred } => !pred.eval(blackboard),
+        }
+    }
+}
+
+impl Pred {
+    /// Author-time structural sanity (recursive): a predicate that can NEVER hold
+    /// (empty `In` set, inverted `Len` bounds) is almost certainly a mistake —
+    /// surface it at define time instead of silently routing to `default` forever.
+    fn check(&self) -> Option<String> {
+        match self {
+            Pred::In { values, .. } if values.is_empty() => {
+                Some("`in` with an empty values set can never hold".into())
+            }
+            Pred::Len { min: Some(lo), max: Some(hi), .. } if lo > hi => {
+                Some(format!("`len` bounds are inverted (min {lo} > max {hi})"))
+            }
+            Pred::All { preds } | Pred::Any { preds } => {
+                preds.iter().find_map(|p| p.check())
+            }
+            Pred::Not { pred } => pred.check(),
+            _ => None,
         }
     }
 }
@@ -294,6 +561,8 @@ impl Node {
         match self {
             Node::Agent { edges, .. }
             | Node::Tool { edges, .. }
+            | Node::Assign { edges, .. }
+            | Node::Infer { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges.values().collect(),
             Node::Branch { cases, default, semantic } => {
@@ -320,6 +589,8 @@ impl Node {
         let edges = match self {
             Node::Agent { edges, .. }
             | Node::Tool { edges, .. }
+            | Node::Assign { edges, .. }
+            | Node::Infer { edges, .. }
             | Node::Wait { edges, .. }
             | Node::Subgraph { edges, .. } => edges,
             Node::Branch { .. } => return Err("cannot add an edge to a Branch (use cases)".into()),
@@ -339,8 +610,20 @@ impl Node {
         match self {
             Node::Agent { writes, .. }
             | Node::Tool { writes, .. }
+            | Node::Infer { writes, .. }
             | Node::Wait { writes, .. }
             | Node::Subgraph { writes, .. } => writes.as_deref(),
+            Node::Assign { writes, .. } => Some(writes),
+            _ => None,
+        }
+    }
+
+    /// This node's in-node retry policy, if any (the effectful kinds only).
+    pub(crate) fn retry(&self) -> Option<&Retry> {
+        match self {
+            Node::Agent { retry, .. } | Node::Tool { retry, .. } | Node::Infer { retry, .. } => {
+                retry.as_ref()
+            }
             _ => None,
         }
     }
@@ -395,6 +678,20 @@ impl Graph {
             if let Some(k) = node.writes_key() {
                 keys.insert(k.to_string());
             }
+            if let Some(r) = node.retry() {
+                if r.max == 0 || r.max > MAX_RETRY {
+                    errs.push(format!(
+                        "node {id:?} retry.max must be 1..={MAX_RETRY} (got {})",
+                        r.max
+                    ));
+                }
+                if r.backoff_ms > MAX_RETRY_BACKOFF_MS {
+                    errs.push(format!(
+                        "node {id:?} retry.backoff_ms must be <= {MAX_RETRY_BACKOFF_MS} (got {})",
+                        r.backoff_ms
+                    ));
+                }
+            }
             match node {
                 Node::Wait { timeout_ms, on_uri, .. } => {
                     if *timeout_ms == 0 {
@@ -402,6 +699,26 @@ impl Graph {
                     }
                     if on_uri.trim().is_empty() {
                         errs.push(format!("Wait node {id:?} has an empty on_uri"));
+                    }
+                }
+                Node::Assign { writes, .. } if writes.trim().is_empty() => {
+                    errs.push(format!("Assign node {id:?} has an empty writes key"));
+                }
+                Node::Infer { schema, retries, .. } => {
+                    if schema.is_empty() {
+                        errs.push(format!("Infer node {id:?} has an empty schema"));
+                    }
+                    if *retries > MAX_INFER_RETRIES {
+                        errs.push(format!(
+                            "Infer node {id:?} retries must be <= {MAX_INFER_RETRIES} (got {retries})"
+                        ));
+                    }
+                }
+                Node::Branch { cases, .. } => {
+                    for (i, c) in cases.iter().enumerate() {
+                        if let Some(msg) = c.when.check() {
+                            errs.push(format!("Branch node {id:?} case {i}: {msg}"));
+                        }
                     }
                 }
                 Node::Subgraph { graph, .. } => graph.validate_into(depth + 1, errs),
@@ -610,6 +927,7 @@ mod tests {
                     reads: vec![],
                     writes: None,
                     limits: None,
+                    retry: None,
                     edges,
                 },
             );
@@ -730,6 +1048,139 @@ mod tests {
             errs.iter().any(|e| e.contains("unknown node \"ghost\"")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn richer_preds_evaluate_totally() {
+        let mut bb = BTreeMap::new();
+        bb.insert(
+            "item".to_string(),
+            json!({"n": 5, "tag": "urgent-ops", "list": [1, 2, 3], "status": "open"}),
+        );
+        let p = |v: serde_json::Value| -> Pred { serde_json::from_value(v).unwrap() };
+        assert!(p(json!({"op":"gte","key":"item","pointer":"/n","value":5.0})).eval(&bb));
+        assert!(p(json!({"op":"lte","key":"item","pointer":"/n","value":5.0})).eval(&bb));
+        assert!(!p(json!({"op":"gte","key":"item","pointer":"/n","value":6.0})).eval(&bb));
+        assert!(
+            p(json!({"op":"in","key":"item","pointer":"/status","values":["open","held"]}))
+                .eval(&bb)
+        );
+        assert!(
+            !p(json!({"op":"in","key":"item","pointer":"/status","values":["closed"]})).eval(&bb)
+        );
+        assert!(
+            p(json!({"op":"starts_with","key":"item","pointer":"/tag","value":"urgent"}))
+                .eval(&bb)
+        );
+        assert!(
+            p(json!({"op":"ends_with","key":"item","pointer":"/tag","value":"ops"})).eval(&bb)
+        );
+        assert!(
+            p(json!({"op":"len","key":"item","pointer":"/list","min":1,"max":3})).eval(&bb)
+        );
+        assert!(!p(json!({"op":"len","key":"item","pointer":"/list","min":4})).eval(&bb));
+        // Total over missing paths / non-strings — false, never a panic.
+        assert!(!p(json!({"op":"starts_with","key":"item","pointer":"/n","value":"5"})).eval(&bb));
+        assert!(!p(json!({"op":"len","key":"ghost","min":0})).eval(&bb));
+    }
+
+    #[test]
+    fn an_impossible_predicate_is_rejected_at_author_time() {
+        // An empty `in` set and inverted `len` bounds can never hold — a Branch
+        // carrying one is refused at validation, not silently routed to default.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "b",
+            "nodes": {
+                "b": {"kind": "branch", "cases": [
+                    {"when": {"op": "in", "key": "k", "values": []}, "goto": "h"},
+                    {"when": {"op": "not", "pred": {"op": "len", "key": "k", "min": 9, "max": 3}}, "goto": "h"}
+                ], "default": "h"},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("empty values set")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("inverted")), "{errs:?}");
+    }
+
+    #[test]
+    fn resolve_refs_substitutes_nested_defaults_and_rejects_typos() {
+        let mut bb = BTreeMap::new();
+        bb.insert("item".to_string(), json!({"id": 7, "meta": {"tag": "x"}}));
+        // Nested substitution + pointer + default + literals pass through.
+        let tpl = json!({
+            "a": {"$from": "item", "pointer": "/id"},
+            "b": [{"$from": "item", "pointer": "/meta/tag"}, "lit"],
+            "c": {"$from": "ghost", "default": null},
+            "d": 4
+        });
+        assert_eq!(
+            resolve_refs(&tpl, &bb).unwrap(),
+            json!({"a": 7, "b": ["x", "lit"], "c": null, "d": 4})
+        );
+        // A missing path with no default errs, naming the path.
+        let e = resolve_refs(&json!({"$from": "ghost"}), &bb).unwrap_err();
+        assert!(e.contains("ghost"), "{e}");
+        // An unknown extra key in a ref object is a typo shield.
+        let e = resolve_refs(&json!({"$from": "item", "pointr": "/id"}), &bb).unwrap_err();
+        assert!(e.contains("pointr"), "{e}");
+        // $from must be a string.
+        assert!(resolve_refs(&json!({"$from": 3}), &bb).is_err());
+    }
+
+    #[test]
+    fn check_schema_enforces_fields_and_types() {
+        let schema: BTreeMap<String, FieldType> = serde_json::from_value(json!({
+            "verdict": "string", "score": "number", "extra_ok": "any"
+        }))
+        .unwrap();
+        assert!(check_schema(
+            &schema,
+            &json!({"verdict": "ok", "score": 1, "extra_ok": [1], "unlisted": true})
+        )
+        .is_ok());
+        let e = check_schema(&schema, &json!({"verdict": 5, "extra_ok": 1})).unwrap_err();
+        assert!(e.contains("verdict") && e.contains("score"), "every miss named: {e}");
+        assert!(check_schema(&schema, &json!("not an object")).is_err());
+    }
+
+    #[test]
+    fn retry_and_infer_caps_are_validated() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "t",
+            "nodes": {
+                "t": {"kind": "tool", "server": "s", "tool": "x", "retry": {"max": 99, "backoff_ms": 999999}, "edges": {"ok": "i"}},
+                "i": {"kind": "infer", "prompt": "p", "schema": {}, "retries": 9, "edges": {"ok": "a"}},
+                "a": {"kind": "assign", "value": 1, "writes": " ", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let errs = g.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("retry.max")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("retry.backoff_ms")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("empty schema")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("retries must be")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("empty writes key")), "{errs:?}");
+    }
+
+    #[test]
+    fn assign_and_infer_nodes_round_trip_through_serde() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "assign", "value": {"x": {"$from": "k"}}, "writes": "out", "edges": {"ok": "i"}},
+                "i": {"kind": "infer", "prompt": "p", "reads": ["out"], "schema": {"v": "string"}, "writes": "c", "edges": {"ok": "h", "error": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&g).unwrap();
+        let back: Graph = serde_json::from_value(wire).unwrap();
+        assert_eq!(g, back);
+        assert!(matches!(g.nodes["a"], Node::Assign { .. }));
+        assert!(matches!(g.nodes["i"], Node::Infer { .. }));
     }
 
     #[test]

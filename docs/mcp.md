@@ -43,7 +43,7 @@ over its stdin/stdout.
 ```bash
 agentd \
   --instruction "Summarize the open TODOs under /work and write a digest" \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp fs=mcp-server-fs --root /work \
   --mcp http=mcp-server-http
 ```
@@ -231,7 +231,7 @@ You wire a subscription to a run with `--subscribe` plus `--mode reactive`:
 ```bash
 agentd \
   --instruction "When the inbox changes, triage new items" \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp fs=mcp-server-fs --root /work \
   --mode reactive \
   --subscribe file:///work/inbox
@@ -276,7 +276,7 @@ It serves this over **stdio always**, and over a **unix socket** when you pass
 ```bash
 agentd \
   --instruction "Be a reusable code-review worker" \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp fs=mcp-server-fs --root /src \
   --serve-mcp unix:/run/agent-review.sock
 ```
@@ -487,8 +487,8 @@ declares a child agent as just another MCP server:
 # the parent — the child agent is "just an MCP server" on a unix socket
 agentd \
   --instruction "Orchestrate the nightly review across the repo" \
-  --intelligence unix:/run/intel.sock \
-  --mcp reviewer="agentd --instruction worker --intelligence unix:/run/intel.sock --serve-mcp unix:/run/rev.sock"
+  --intelligence https://gw.example/v1 \
+  --mcp reviewer="agentd --instruction worker --intelligence https://gw.example/v1 --serve-mcp unix:/run/rev.sock"
 ```
 
 From the parent's point of view the child is a normal MCP server: it

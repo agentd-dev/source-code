@@ -57,7 +57,7 @@ scheduler can branch on it.
 agentd \
   --mode once \
   --instruction-file instructions/research.md \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp "search=mcp-server-websearch" \
   --mcp "fs=mcp-server-fs --root /data --read-only" \
   --max-steps 40 --max-tokens 150000 --deadline 5m \
@@ -92,7 +92,7 @@ landed as a resource — and it triages each item as it arrives.
 agentd \
   --mode reactive \
   --instruction-file instructions/triage.md \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp "inbox=mcp-server-inbox --queue /var/run/inbox" \
   --mcp "tickets=mcp-server-tickets --project OPS" \
   --subscribe "inbox:///items/new" \
@@ -132,7 +132,7 @@ data lake for schema violations every 15 minutes.
 agentd \
   --mode once \
   --instruction-file /etc/agentd/audit.md \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp "fs=mcp-server-fs --root /data --read-only" \
   --mcp "tickets=mcp-server-tickets --project SEC" \
   --max-steps 30 --deadline 10m \
@@ -185,7 +185,7 @@ backfill and reconcile the shard reports.
 agentd \
   --mode once \
   --instruction-file /etc/agentd/repo-audit.md \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --mcp "fs=mcp-server-fs --root /src --read-only" \
   --mcp "tickets=mcp-server-tickets --project ENG" \
   --max-depth 2 --max-tokens 4000000 --deadline 20m
@@ -230,7 +230,7 @@ untrusted ticket in a child scoped to `tickets` only, then act in the parent:
 agentd \
   --mode reactive \
   --instruction-file /etc/agentd/handle-ticket.md \
-  --intelligence unix:/run/intel.sock \
+  --intelligence https://gw.example/v1 \
   --subscribe "tickets:///incoming" \
   --mcp "tickets=mcp-server-tickets --project SUP" --mcp-tags "tickets=untrusted_input" \
   --mcp "crm=mcp-server-crm"                       --mcp-tags "crm=sensitive"
@@ -269,8 +269,8 @@ declares the worker as one more `--mcp` server.
 # An orchestrator agent driving a worker agent, both on one node:
 agentd \
   --instruction "Run the nightly review; delegate each PR to the reviewer service." \
-  --intelligence unix:/run/intel.sock \
-  --mcp reviewer="agentd --instruction worker --intelligence unix:/run/intel.sock --serve-mcp unix:/run/rev.sock"
+  --intelligence https://gw.example/v1 \
+  --mcp reviewer="agentd --instruction worker --intelligence https://gw.example/v1 --serve-mcp unix:/run/rev.sock"
 ```
 
 Two patterns fall out ([`mcp.md`](mcp.md) §3):

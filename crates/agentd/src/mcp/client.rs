@@ -18,8 +18,9 @@ use crate::mcp::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
 use crate::wire::mcp::{
     CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
     GetPromptParams, GetPromptResult, Implementation, InitializeParams, InitializeResult,
-    LATEST_MODERN_VERSION, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Resource,
+    LATEST_MODERN_VERSION, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Resource,
+    ResourceTemplate,
     SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Tool,
     UnsupportedProtocolVersion, UNSUPPORTED_PROTOCOL_VERSION_CODE, best_mutual_version,
     is_modern_error_code, method, negotiate_version,
@@ -530,6 +531,34 @@ impl McpClient {
             context: None,
         };
         self.request_as(method::COMPLETION_COMPLETE, Some(to_value(&params)))
+    }
+
+    /// `resources/templates/list`, paginated. Empty when the server doesn't
+    /// advertise `resources`.
+    pub fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
+        if !self.caps.supports_resources() {
+            return Ok(Vec::new());
+        }
+        let mut templates = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
+            let page: ListResourceTemplatesResult =
+                self.request_as(method::RESOURCES_TEMPLATES_LIST, params)?;
+            templates.extend(page.resource_templates);
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(templates)
+    }
+
+    /// `ping` — a liveness round-trip (RFC 0004 §utilities). Returns `Ok(())` if
+    /// the server answers within the default timeout.
+    pub fn ping(&self) -> Result<(), McpError> {
+        self.request_with_timeout(method::PING, None, self.timeout)?;
+        Ok(())
     }
 
     pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {

@@ -1,5 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
-pub mod client;
+// The MCP client now lives in the reusable `mcp` crate (`mcp::client`); re-export
+// so `crate::mcp::client::{McpClient, McpError}` keeps resolving. `from_spec`
+// below is the agentd integration (config + auth + identity) that stays here.
+pub use ::mcp::client;
+
+/// Build an MCP client from a declared [`crate::config::McpServerSpec`]: resolve
+/// its secret-free `{{secret:…}}` auth header templates (via [`auth`]) and connect
+/// to the spec's remote `endpoint`, stamping agentd's client identity. The
+/// config/auth-coupled counterpart of the crate's transport-only
+/// [`client::McpClient::connect`]. Call `initialize` on the result before use.
+pub fn from_spec(
+    spec: &crate::config::McpServerSpec,
+    timeout: std::time::Duration,
+) -> Result<client::McpClient, client::McpError> {
+    use client::{McpClient, McpError};
+    if spec.endpoint.trim().is_empty() {
+        return Err(McpError::Transport(format!(
+            "mcp server '{}' has no endpoint",
+            spec.name
+        )));
+    }
+    let headers = auth::resolve_headers(&spec.headers).map_err(McpError::Transport)?;
+    Ok(
+        McpClient::connect(&spec.name, &spec.endpoint, headers, timeout)?.with_client_info(
+            ::mcp::wire::Implementation {
+                name: "agentd".into(),
+                version: crate::VERSION.into(),
+                title: None,
+            },
+        ),
+    )
+}
+
 // The Streamable HTTP client transport (RFC 0004) now lives in the reusable `mcp`
 // crate as `mcp::http`; `client` uses it directly (`::mcp::http`).
 // Auth material resolution for remote MCP endpoints (RFC 0012 §3.7): materialize

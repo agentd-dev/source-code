@@ -124,7 +124,7 @@ pub fn run() -> i32 {
 
     let mut servers = Vec::new();
     for spec in &payload.mcp_servers {
-        let connected = McpClient::from_spec(spec, Duration::from_secs(60))
+        let connected = crate::mcp::from_spec(spec, Duration::from_secs(60))
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
             Ok(mut c) => {

@@ -26,7 +26,7 @@ use crate::subagent::protocol::SwapIntel;
 use crate::subagent::protocol::{SeedMessage, SpawnPayload};
 use crate::supervisor::reactor::{SuperviseResult, supervise_once};
 use crate::supervisor::restart::{RestartAction, RestartConfig, RestartGovernor};
-use crate::triggers::router::{Disposition, Route, Router};
+use crate::triggers::router::{Condition, Disposition, Route, Router};
 use crate::triggers::warm::WarmRegistry;
 use crate::wire::mcp::method;
 use serde_json::{Value, json};
@@ -619,6 +619,20 @@ pub fn run_reactive(
         // Fire due (debounced) deliveries: notify-then-read, then react.
         for delivery in router.due(now) {
             let content = read_current(&servers, &owner, &delivery.uri).unwrap_or_default();
+            // Condition predicate (pivot Phase 5.2): a conditional route/subscription
+            // fires ONLY when the freshly-read content satisfies the predicate.
+            // Notify-then-read means the content is authoritative here (not the stale
+            // notification). An unmet condition drops THIS delivery but leaves the
+            // subscription armed for the next update. This is the daemon half of
+            // `subagent.await_resource`: the agent parks on a resource state and only
+            // wakes when it is reached.
+            if !condition_met(&delivery.condition, &content) {
+                log.debug(
+                    "trigger.condition_unmet",
+                    json!({"uri": delivery.uri, "bytes": content.len()}),
+                );
+                continue;
+            }
             crate::obs::metrics::record_reaction();
             match delivery.disposition {
                 Disposition::Spawn => {
@@ -2068,16 +2082,46 @@ fn apply_effects(
                 }
                 match arm_uri_on_first_supporting(servers, server_order, owner, &req.uri) {
                     Some(server) => {
+                        // A conditional subscribe (`await_resource`, pivot Phase 5.2)
+                        // carries a content predicate; re-parse it here (it was
+                        // validated at tool-call time). A predicate that somehow
+                        // fails to parse arms the route UNCONDITIONALLY would be
+                        // wrong (it would fire on any update, defeating the wait), so
+                        // skip arming and log — the agent's wait simply never arms
+                        // rather than misfiring.
+                        let condition = match &req.condition {
+                            None => None,
+                            Some(raw) => match crate::triggers::router::Condition::from_json(raw) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    log.warn(
+                                        "await_resource.bad_condition",
+                                        json!({"uri": req.uri, "err": e}),
+                                    );
+                                    continue;
+                                }
+                            },
+                        };
+                        let kind = if condition.is_some() {
+                            "await_resource"
+                        } else {
+                            "self_subscribe"
+                        };
                         // Self-subscribe = self-scheduling into a WARM session
                         // (RFC 0008 §self-subscribe): the agent re-enters one live
                         // continue-session per event (session keyed by the URI),
-                        // rather than a fresh spawn each time.
-                        router.add_route(Route::new(
-                            &req.uri,
-                            Disposition::Continue(req.uri.clone()),
-                            DEBOUNCE,
-                        ));
-                        log.info("trigger.armed", json!({"kind": "self_subscribe", "uri": req.uri, "server": server, "disposition": "continue"}));
+                        // rather than a fresh spawn each time. A condition makes the
+                        // re-entry fire only when the resource reaches the wanted
+                        // state (the in-turn wait).
+                        router.add_route(
+                            Route::new(
+                                &req.uri,
+                                Disposition::Continue(req.uri.clone()),
+                                DEBOUNCE,
+                            )
+                            .with_condition(condition),
+                        );
+                        log.info("trigger.armed", json!({"kind": kind, "uri": req.uri, "server": server, "disposition": "continue"}));
                     }
                     None => log.warn(
                         "subscribe.unsupported",
@@ -2167,6 +2211,22 @@ fn updated_uri(params: &Option<Value>) -> Option<String> {
     params.as_ref()?.get("uri")?.as_str().map(str::to_string)
 }
 
+/// Whether a delivery's optional content predicate is satisfied by the freshly
+/// read resource content (pivot Phase 5.2 — the reactor's condition gate). No
+/// condition → always fire (the v1 fire-on-any behaviour). A condition against
+/// content that does not parse as JSON → `false` (a structured predicate cannot
+/// match non-JSON), so a conditional wait simply does not fire rather than
+/// misfiring. Pure + total, so the fire/skip decision is unit-testable in
+/// isolation from the reactor loop.
+fn condition_met(condition: &Option<Condition>, content: &str) -> bool {
+    match condition {
+        None => true,
+        Some(cond) => serde_json::from_str::<Value>(content)
+            .map(|v| cond.eval(&v))
+            .unwrap_or(false),
+    }
+}
+
 fn read_current(
     servers: &BTreeMap<String, McpClient>,
     owner: &HashMap<String, String>,
@@ -2190,6 +2250,26 @@ fn read_current(
 mod tests {
     use super::*;
     use crate::subagent::protocol::{IntelConfig, Limits, Telemetry};
+
+    #[test]
+    fn condition_gate_fires_only_on_a_content_match() {
+        use serde_json::json;
+        // The reactor's decision point (pivot Phase 5.2): a conditional delivery
+        // fires ONLY when the freshly-read content satisfies the predicate — the
+        // "daemon fires only on match" behaviour behind `await_resource`.
+        let cond = Condition::from_json(&json!({"pointer": "/status", "op": "eq", "value": "ready"}))
+            .unwrap();
+        let some = Some(cond);
+        // Match → fire.
+        assert!(condition_met(&some, r#"{"status":"ready"}"#));
+        // No match → skip (the wait stays armed for the next update).
+        assert!(!condition_met(&some, r#"{"status":"working"}"#));
+        // Non-JSON content can never satisfy a structured predicate → skip.
+        assert!(!condition_met(&some, "not json at all"));
+        // No condition → always fire (the v1 fire-on-any behaviour is preserved).
+        assert!(condition_met(&None, r#"{"anything":true}"#));
+        assert!(condition_met(&None, "even non-json fires when unconditional"));
+    }
 
     /// The mcp_servers reload diff/apply DECISION logic (RFC 0017 §5.3 step 4),
     /// unit-tested in isolation from the spawn I/O (the live re-handshake itself is

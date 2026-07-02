@@ -21,6 +21,7 @@
 //! deliveries (`resources/read` then spawn-or-continue). `mode.rs`/`mcp` wire
 //! it to real notifications.
 
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,102 @@ pub enum Disposition {
     Spawn,
     /// Deliver into one warm session, in order (stateful reaction).
     Continue(String),
+}
+
+/// A structured-content condition on a reactive delivery (pivot Phase 5.2). The
+/// router matches a resource URI; a `Condition` ADDITIONALLY gates on the
+/// resource's parsed-JSON CONTENT — evaluated post-read (notify-then-read, so the
+/// router itself stays content-free) — so a route/subscription fires only when the
+/// resource reaches a wanted state. This is the predicate half of the reactive
+/// gaps: it turns "fire on any update" into "fire on the update I'm waiting for",
+/// and underpins the `await_resource` in-turn wait (a one-shot conditional
+/// continue). RFC 0008 §reactive-routing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Condition {
+    /// RFC 6901 JSON Pointer into the resource content (`""` = the whole document).
+    pointer: String,
+    op: CondOp,
+}
+
+/// The comparison a [`Condition`] applies at its pointer.
+#[derive(Debug, Clone, PartialEq)]
+enum CondOp {
+    /// The pointer resolves to a present, non-null value.
+    Exists,
+    /// Deep-equals the given JSON value.
+    Eq(Value),
+    /// Does NOT deep-equal the given JSON value.
+    Ne(Value),
+    /// Numeric strictly-greater-than (the target parses as a number).
+    Gt(f64),
+    /// Numeric strictly-less-than.
+    Lt(f64),
+    /// A string that contains the substring, or an array containing the string.
+    Contains(String),
+}
+
+impl Condition {
+    /// Parse a condition from the self-tool arg shape
+    /// `{"pointer": "/status", "op": "eq", "value": "ready"}`. `op` defaults to
+    /// `exists`; `pointer` defaults to `""` (the whole document). Returns a
+    /// human-readable error the caller surfaces as a refused tool-result (never a
+    /// crash) — a malformed predicate must not arm a route.
+    pub fn from_json(v: &Value) -> Result<Condition, String> {
+        let pointer = v
+            .get("pointer")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // A JSON Pointer is empty (whole doc) or starts with '/'.
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            return Err(format!(
+                "condition 'pointer' must be a JSON Pointer (empty or starting with '/'): {pointer:?}"
+            ));
+        }
+        let op = v.get("op").and_then(Value::as_str).unwrap_or("exists");
+        let value = v.get("value").cloned();
+        let op = match op {
+            "exists" => CondOp::Exists,
+            "eq" => CondOp::Eq(value.ok_or_else(|| "condition op 'eq' requires 'value'".to_string())?),
+            "ne" => CondOp::Ne(value.ok_or_else(|| "condition op 'ne' requires 'value'".to_string())?),
+            "gt" => CondOp::Gt(
+                value
+                    .and_then(|x| x.as_f64())
+                    .ok_or_else(|| "condition op 'gt' requires a numeric 'value'".to_string())?,
+            ),
+            "lt" => CondOp::Lt(
+                value
+                    .and_then(|x| x.as_f64())
+                    .ok_or_else(|| "condition op 'lt' requires a numeric 'value'".to_string())?,
+            ),
+            "contains" => CondOp::Contains(
+                value
+                    .and_then(|x| x.as_str().map(str::to_string))
+                    .ok_or_else(|| "condition op 'contains' requires a string 'value'".to_string())?,
+            ),
+            other => return Err(format!("unknown condition op: {other:?}")),
+        };
+        Ok(Condition { pointer, op })
+    }
+
+    /// Evaluate against a resource's parsed-JSON content. A pointer that does not
+    /// resolve is a non-match for every op (except a deliberate `ne`, which holds
+    /// when the wanted value is simply absent). Never panics.
+    pub fn eval(&self, content: &Value) -> bool {
+        let at = content.pointer(&self.pointer);
+        match &self.op {
+            CondOp::Exists => at.is_some_and(|v| !v.is_null()),
+            CondOp::Eq(want) => at == Some(want),
+            CondOp::Ne(want) => at != Some(want),
+            CondOp::Gt(n) => at.and_then(Value::as_f64).is_some_and(|x| x > *n),
+            CondOp::Lt(n) => at.and_then(Value::as_f64).is_some_and(|x| x < *n),
+            CondOp::Contains(s) => match at {
+                Some(Value::String(hay)) => hay.contains(s.as_str()),
+                Some(Value::Array(arr)) => arr.iter().any(|e| e.as_str() == Some(s.as_str())),
+                _ => false,
+            },
+        }
+    }
 }
 
 /// How a route matches resource URIs.
@@ -71,6 +168,10 @@ pub struct Route {
     matcher: Match,
     disposition: Disposition,
     debounce: Duration,
+    /// Optional content predicate (pivot Phase 5.2): the route fires only when the
+    /// updated resource's content satisfies it. `None` = fire on any update (the
+    /// v1 behaviour of every config `--subscribe`/`--continue` route).
+    condition: Option<Condition>,
 }
 
 impl Route {
@@ -79,7 +180,15 @@ impl Route {
             matcher: Match::parse(pattern),
             disposition,
             debounce,
+            condition: None,
         }
+    }
+
+    /// Attach a content predicate (builder). A self-subscribe/await with a
+    /// condition arms the route this way; config routes leave it `None`.
+    pub fn with_condition(mut self, condition: Option<Condition>) -> Route {
+        self.condition = condition;
+        self
     }
 
     /// Whether this route is an exact match for `uri` — used for dynamic
@@ -89,19 +198,25 @@ impl Route {
     }
 }
 
-/// A debounced, ready-to-act delivery.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A debounced, ready-to-act delivery. Carries the route's optional content
+/// predicate ([`Condition`]) so the reactor can gate the reaction on the resource
+/// content it reads (notify-then-read). Not `Eq` (a `Condition` may hold a JSON
+/// number, which is not `Eq`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Delivery {
     pub uri: String,
     pub disposition: Disposition,
+    pub condition: Option<Condition>,
 }
 
 /// The reactive router. Holds the route table and the per-URI debounce state.
 pub struct Router {
     routes: Vec<Route>,
-    /// uri → (fire-at, disposition). Newest-wins coalesce: the entry is set on
-    /// the first event of a burst and fires once after the debounce.
-    pending: HashMap<String, (Instant, Disposition)>,
+    /// uri → (fire-at, disposition, condition). Newest-wins coalesce: the entry is
+    /// set on the first event of a burst and fires once after the debounce. The
+    /// owning route is deterministic per URI (exact-else-longest-glob), so the
+    /// coalesced condition is stable across the burst.
+    pending: HashMap<String, (Instant, Disposition, Option<Condition>)>,
     dropped: u64,
 }
 
@@ -148,7 +263,7 @@ impl Router {
         // the route table is released before we mutate `pending`.
         let armed = self
             .best_match(uri)
-            .map(|r| (now + r.debounce, r.disposition.clone()));
+            .map(|r| (now + r.debounce, r.disposition.clone(), r.condition.clone()));
         match armed {
             Some(entry) => {
                 // Coalesce: arm only on the first event of a burst; later events
@@ -167,7 +282,7 @@ impl Router {
     /// shipped `run_reactive` instead polls on a fixed `TICK` and calls
     /// `due(now)` each tick, so this is currently used only in unit tests.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending.values().map(|(at, _)| *at).min()
+        self.pending.values().map(|(at, ..)| *at).min()
     }
 
     /// Number of distinct URIs currently armed/coalesced and not yet fired — the
@@ -182,7 +297,7 @@ impl Router {
     /// `armed_at + debounce`, so the minimum is the oldest pending item's deadline;
     /// the caller derives a `lag_ms` from it. `None` when nothing is pending.
     pub fn oldest_pending(&self) -> Option<Instant> {
-        self.pending.values().map(|(at, _)| *at).min()
+        self.pending.values().map(|(at, ..)| *at).min()
     }
 
     /// Drain every delivery whose debounce has elapsed by `now`.
@@ -190,14 +305,18 @@ impl Router {
         let ready: Vec<String> = self
             .pending
             .iter()
-            .filter(|(_, (at, _))| *at <= now)
+            .filter(|(_, (at, ..))| *at <= now)
             .map(|(uri, _)| uri.clone())
             .collect();
         ready
             .into_iter()
             .map(|uri| {
-                let (_, disposition) = self.pending.remove(&uri).expect("present");
-                Delivery { uri, disposition }
+                let (_, disposition, condition) = self.pending.remove(&uri).expect("present");
+                Delivery {
+                    uri,
+                    disposition,
+                    condition,
+                }
             })
             .collect()
     }
@@ -333,5 +452,70 @@ mod tests {
         assert!(!r.has_exact("file:///watch.json"));
         assert!(r.due(t0).is_empty(), "pending dropped on unsubscribe");
         assert!(!r.on_updated("file:///watch.json", t0));
+    }
+
+    // ── condition predicates (pivot Phase 5.2) ───────────────────────────────
+
+    use serde_json::json;
+
+    #[test]
+    fn condition_from_json_parses_each_op_and_rejects_bad_input() {
+        // Defaults: no op → exists, no pointer → whole doc.
+        let c = Condition::from_json(&json!({})).unwrap();
+        assert!(c.eval(&json!({"any": 1})), "exists on the whole doc");
+        // Each op round-trips through eval.
+        let eq = Condition::from_json(&json!({"pointer": "/status", "op": "eq", "value": "ready"}))
+            .unwrap();
+        assert!(eq.eval(&json!({"status": "ready"})));
+        assert!(!eq.eval(&json!({"status": "working"})));
+        let gt =
+            Condition::from_json(&json!({"pointer": "/n", "op": "gt", "value": 10})).unwrap();
+        assert!(gt.eval(&json!({"n": 11})));
+        assert!(!gt.eval(&json!({"n": 10})));
+        let contains =
+            Condition::from_json(&json!({"pointer": "/tags", "op": "contains", "value": "urgent"}))
+                .unwrap();
+        assert!(contains.eval(&json!({"tags": ["low", "urgent"]})));
+        assert!(!contains.eval(&json!({"tags": ["low"]})));
+        // Malformed: non-pointer, missing value, unknown op, non-numeric gt.
+        assert!(Condition::from_json(&json!({"pointer": "status"})).is_err());
+        assert!(Condition::from_json(&json!({"op": "eq"})).is_err());
+        assert!(Condition::from_json(&json!({"op": "nope"})).is_err());
+        assert!(Condition::from_json(&json!({"op": "gt", "value": "x"})).is_err());
+    }
+
+    #[test]
+    fn condition_eval_on_missing_pointer_is_a_non_match() {
+        let c = Condition::from_json(&json!({"pointer": "/missing", "op": "eq", "value": 1}))
+            .unwrap();
+        assert!(!c.eval(&json!({"present": 1})), "absent pointer never matches eq");
+        // ne holds when the wanted value is simply absent.
+        let ne = Condition::from_json(&json!({"pointer": "/missing", "op": "ne", "value": 1}))
+            .unwrap();
+        assert!(ne.eval(&json!({"present": 1})));
+    }
+
+    #[test]
+    fn a_conditional_route_carries_its_condition_into_the_delivery() {
+        // The router matches by URI (content-free); the condition rides along on the
+        // Delivery for the reactor to evaluate post-read.
+        let cond = Condition::from_json(&json!({"pointer": "/ready", "op": "eq", "value": true}))
+            .unwrap();
+        let route = Route::new("file:///w.json", Disposition::Spawn, ms(0))
+            .with_condition(Some(cond.clone()));
+        let mut r = Router::new(vec![route]);
+        let t0 = Instant::now();
+        assert!(r.on_updated("file:///w.json", t0));
+        let due = r.due(t0);
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            due[0].condition,
+            Some(cond),
+            "the delivery carries the route's condition"
+        );
+        // An unconditional route delivers with no condition (v1 fire-on-any).
+        let mut r2 = Router::new(vec![Route::new("file:///w.json", Disposition::Spawn, ms(0))]);
+        assert!(r2.on_updated("file:///w.json", t0));
+        assert_eq!(r2.due(t0)[0].condition, None);
     }
 }

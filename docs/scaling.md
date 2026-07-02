@@ -78,7 +78,7 @@ no gap.
 ```bash
 # replica 2 of a 4-shard fleet
 agentd --instruction-file /etc/agentd/task.md \
-       --intelligence unix:/run/intel.sock \
+       --intelligence https://gw.example/v1 \
        --mode reactive \
        --subscribe 'file:///inbox/' \
        --shard 2/4
@@ -128,9 +128,9 @@ proceeds only on a granted lease.
 
 ```bash
 agentd --instruction-file /etc/agentd/task.md \
-       --intelligence unix:/run/intel.sock \
+       --intelligence https://gw.example/v1 \
        --mode reactive \
-       --mcp coord='mcp-server-workqueue --addr /run/coord.sock' \
+       --mcp coord=https://mcp-workqueue.internal/mcp \
        --claim 'file:///inbox/'=coord
 ```
 
@@ -200,7 +200,7 @@ route whose URI is also a `--continue` URI".
 ```bash
 # continue-claim: one warm session per claimed channel, lease held for its life
 agentd … --mode reactive \
-         --mcp coord='mcp-server-workqueue --addr /run/coord.sock' \
+         --mcp coord=https://mcp-workqueue.internal/mcp \
          --continue 'file:///stream/in.json' \
          --claim 'file:///stream/in.json'=coord
 ```
@@ -318,9 +318,9 @@ the existing claim machinery with no new code path.
 
 ```bash
 agentd --instruction-file /etc/agentd/task.md \
-       --intelligence unix:/run/intel.sock \
+       --intelligence https://gw.example/v1 \
        --mode reactive --standby \
-       --mcp coord='mcp-server-workqueue --addr /run/coord.sock' \
+       --mcp coord=https://mcp-workqueue.internal/mcp \
        --assign-from coord:'agent://assignments'
 ```
 
@@ -365,14 +365,14 @@ spec:
             - name: AGENT_SHARD
               value: "0/4"            # rewritten per-pod from the ordinal
             - name: AGENT_INTELLIGENCE
-              value: "unix:/run/intel.sock"
+              value: "https://gw.example/v1"
             - name: AGENT_MODE
               value: "reactive"
           args:
             - --instruction-file=/etc/agentd/task.md
             - --subscribe=file:///inbox/
             # Optional claim backstop for death recovery within the shard:
-            - --mcp=coord=mcp-server-workqueue --addr /run/coord.sock
+            - --mcp=coord=https://mcp-workqueue.internal/mcp
             - --claim=file:///inbox/=coord
             - --metrics-addr=:9090
           livenessProbe:

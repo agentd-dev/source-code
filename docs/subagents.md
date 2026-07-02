@@ -66,8 +66,8 @@ and exits.
 ```console
 $ agentd \
     --instruction "summarize the open PRs and post a digest" \
-    --intelligence unix:/run/intel.sock \
-    --mcp github=mcp-server-github \
+    --intelligence https://gw.example/v1 \
+    --mcp github=https://mcp-github.internal/mcp \
     --mode once
 ```
 

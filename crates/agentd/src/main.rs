@@ -278,6 +278,7 @@ fn run() -> i32 {
                 // are inert without the `hot-reload` feature (the loop never
                 // consults the reload latch), so the no-reload path is unchanged.
                 Mode::Reactive => {
+                    #[cfg_attr(not(feature = "workflow"), allow(unused_mut))]
                     let mut payload = root_payload(&cfg);
                     // A reactive WORKFLOW daemon (pivot Phase 7 follow-up): the
                     // pinned workflow rides the base payload with REACTIVE

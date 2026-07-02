@@ -238,3 +238,19 @@ fn from_paths_acceptor_rotates_identity_in_place() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// An ABSOLUTE DNS name (trailing root dot — the cluster-deployment spelling
+/// that defeats resolver search lists) must verify against a certificate that
+/// carries the undotted name: the dial strips the root dot for SNI/verification.
+#[test]
+fn absolute_dns_name_verifies_against_undotted_san() {
+    let port = spawn_echo(TlsAcceptor::new(server_identity(), None).expect("acceptor"));
+    // The fixture server cert's SAN is `localhost` (no trailing dot).
+    let mut tls = connect_with_ca(dial(port), "localhost.", &fixture("ca.pem"), None)
+        .expect("absolute (trailing-dot) name must verify against the undotted SAN");
+    tls.write_all(b"hello").unwrap();
+    tls.flush().unwrap();
+    let mut echo = [0u8; 5];
+    tls.read_exact(&mut echo).unwrap();
+    assert_eq!(&echo, b"hello");
+}

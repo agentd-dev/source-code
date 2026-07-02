@@ -51,6 +51,7 @@ pub const SELF_CONTROL_TOOLS: &[&str] = &[
     "subscribe",
     "unsubscribe",
     "await_resource",
+    "graph.define",
     "a2a.delegate",
     "resource.read",
 ];

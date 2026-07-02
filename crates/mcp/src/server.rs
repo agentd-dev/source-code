@@ -54,36 +54,63 @@ impl PeerOrigin {
 
 /// The served-MCP transport, type-erased to one concrete enum so the connection
 /// registry ([`SharedWriter`], [`Subscriber`]) stays monomorphic across transports
-/// while the *same* connection code serves each. Both variants are `Read + Write`
-/// with a [`try_clone`](ServeStream::try_clone) (the connection's write half is
-/// shared with the threads that push notifications), so the NDJSON framing,
-/// threading, and dispatch are entirely transport-agnostic (RFC 0015 §3.2).
+/// while the *same* connection code serves each. The socket variants are
+/// `Read + Write` with a [`try_clone`](ServeStream::try_clone) (their write half is
+/// shared with the threads that push NDJSON notifications). The [`Http`](ServeStream::Http)
+/// variant is a **write-only SSE sink**: an HTTP subscription stream's write half,
+/// so an HTTP subscriber registers in the SAME [`SubRegistry`] and the embedder's
+/// existing `notify_*` calls reach it transparently — the framing (NDJSON vs SSE
+/// `data:` events) is chosen per-variant in [`write_notification`](ServeStream::write_notification).
 pub enum ServeStream {
     /// A unix-domain-socket peer.
     Unix(UnixStream),
     /// An AF_VSOCK peer (host↔guest management transport).
     #[cfg(feature = "vsock")]
     Vsock(vsock::VsockStream),
+    /// The write half of an HTTP subscription (SSE) stream — a push-only sink.
+    /// Never read from, never a reply channel; notifications are framed as SSE
+    /// `data:` events. Boxed so it spans plain TCP and (feature `tls`) TLS.
+    Http(Box<dyn Write + Send>),
 }
 
 impl ServeStream {
     /// Clone the handle (a second fd onto the same connection) for the shared write
-    /// half. Mirrors `UnixStream::try_clone`.
+    /// half. Mirrors `UnixStream::try_clone`. The [`Http`](ServeStream::Http) sink
+    /// is single-owner (its SharedWriter is built directly from the stream half),
+    /// so it is never cloned — attempting to is an error.
     pub fn try_clone(&self) -> io::Result<ServeStream> {
         match self {
             ServeStream::Unix(s) => s.try_clone().map(ServeStream::Unix),
             #[cfg(feature = "vsock")]
             ServeStream::Vsock(s) => s.try_clone().map(ServeStream::Vsock),
+            ServeStream::Http(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "http SSE sink is not clonable",
+            )),
         }
     }
 
     /// Bound a stalled-but-alive peer so it can't pin the writer Mutex forever.
+    /// The HTTP sink sets its timeout on the underlying stream before boxing.
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             ServeStream::Unix(s) => s.set_write_timeout(dur),
             #[cfg(feature = "vsock")]
             ServeStream::Vsock(s) => s.set_write_timeout(dur),
+            ServeStream::Http(_) => Ok(()),
         }
+    }
+
+    /// Push one notification, framed for this transport: NDJSON (one JSON object +
+    /// `\n`) on the socket variants, an SSE `data:` event on [`Http`](ServeStream::Http).
+    /// This is the single seam the `notify_*` push helpers write through.
+    pub fn write_notification(&mut self, note: &Notification) -> io::Result<()> {
+        if let ServeStream::Http(sink) = self {
+            let json = serde_json::to_string(note).map_err(io::Error::other)?;
+            sink.write_all(format!("data: {json}\n\n").as_bytes())?;
+            return sink.flush();
+        }
+        frame::write_line(self, note)
     }
 }
 
@@ -93,6 +120,8 @@ impl Read for ServeStream {
             ServeStream::Unix(s) => s.read(buf),
             #[cfg(feature = "vsock")]
             ServeStream::Vsock(s) => s.read(buf),
+            // A push-only sink; a reader loop never runs over it.
+            ServeStream::Http(_) => Ok(0),
         }
     }
 }
@@ -103,6 +132,7 @@ impl Write for ServeStream {
             ServeStream::Unix(s) => s.write(buf),
             #[cfg(feature = "vsock")]
             ServeStream::Vsock(s) => s.write(buf),
+            ServeStream::Http(s) => s.write(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -110,6 +140,7 @@ impl Write for ServeStream {
             ServeStream::Unix(s) => s.flush(),
             #[cfg(feature = "vsock")]
             ServeStream::Vsock(s) => s.flush(),
+            ServeStream::Http(s) => s.flush(),
         }
     }
 }
@@ -208,7 +239,7 @@ fn push_updated(writers: &[SharedWriter], uri: &str) {
     let note = Notification::new(method::NOTIFY_RESOURCES_UPDATED, Some(json!({ "uri": uri })));
     for w in writers {
         if let Ok(mut wl) = w.lock() {
-            let _ = frame::write_line(&mut *wl, &note);
+            let _ = wl.write_notification(&note);
         }
     }
 }
@@ -236,7 +267,7 @@ pub fn broadcast_distinct(subs: &SubRegistry, note: &Notification) {
     };
     for w in writers {
         if let Ok(mut wl) = w.lock() {
-            let _ = frame::write_line(&mut *wl, note);
+            let _ = wl.write_notification(note);
         }
     }
 }

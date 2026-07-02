@@ -22,6 +22,7 @@
 
 pub mod client;
 pub mod http;
+pub mod http_server;
 pub mod modern;
 pub mod rpc;
 pub mod server;

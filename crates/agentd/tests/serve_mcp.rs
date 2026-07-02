@@ -11,6 +11,18 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+/// Serialize the process-heavy e2e tests. Each one re-execs a full agentd daemon
+/// plus subagent children (several with multi-second `hang`/`slow` mock scripts),
+/// so running them in parallel on a 2-core CI runner starves the timing-sensitive
+/// ones (the warm-session turn poll, the subscribed-run push) for CPU — no
+/// deadline is large enough to beat contention that scales with parallelism.
+/// Holding this lock for a test's duration gives it the runner to itself; poison
+/// is recovered so one panicking test does not cascade-fail the rest.
+static E2E_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn e2e_guard() -> std::sync::MutexGuard<'static, ()> {
+    E2E_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn sigterm(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
@@ -187,6 +199,7 @@ fn poll_until_done(peer: &Peer, handle: &str, deadline: Instant) -> serde_json::
 
 #[test]
 fn a_peer_initializes_lists_and_calls_status() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     let exe = env!("CARGO_BIN_EXE_agentd");
 
     // A loop-mode daemon serves the self-MCP over loopback HTTP while it runs
@@ -309,6 +322,7 @@ fn a_peer_initializes_lists_and_calls_status() {
 
 #[test]
 fn async_spawn_returns_a_handle_and_tracks_the_run() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     let exe = env!("CARGO_BIN_EXE_agentd");
     // intel unreachable → the served async run fails fast; we observe the
     // lifecycle (handle → running → failed) via the registry.
@@ -372,6 +386,7 @@ fn recv_resource_updated(rx: &Receiver<serde_json::Value>, uri: &str, deadline: 
 
 #[test]
 fn a_peer_is_pushed_a_notification_when_a_subscribed_run_completes() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     // The reactive loop closed: a peer opens a subscriptions/listen SSE stream for
     // agentd://subagent/<handle> and is PUSHED notifications/resources/updated when
     // that run terminates — no polling. (We cancel a hanging run to terminate it.)
@@ -440,6 +455,7 @@ fn poll_warm_turns(peer: &Peer, handle: &str, target: u64, deadline: Instant) ->
 
 #[test]
 fn a_warm_session_runs_a_turn_per_send() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     // Bidirectional composability: subagent.spawn warm=true keeps the agent alive;
     // each subagent.send runs another turn over the SAME conversation.
     let exe = env!("CARGO_BIN_EXE_agentd");
@@ -520,6 +536,7 @@ fn a_warm_session_runs_a_turn_per_send() {
 
 #[test]
 fn concurrent_async_runs_do_not_serialize() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     // Two async runs in flight at once. The second is cancelled and must drain
     // PROMPTLY *while the first is still supervising its (hanging) run*. Before
     // the single-reaper refactor, run 2's reactor would be blocked on the
@@ -582,6 +599,7 @@ fn concurrent_async_runs_do_not_serialize() {
 
 #[test]
 fn cancel_drains_a_live_async_run() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
     let llm_sock = dir.path().join("llm.addr");
@@ -634,6 +652,7 @@ fn cancel_drains_a_live_async_run() {
 #[cfg(feature = "a2a")]
 #[test]
 fn management_peer_drives_the_operator_surface() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     let exe = env!("CARGO_BIN_EXE_agentd");
     // An idle reactive daemon that just serves the socket (intel unreachable; it
     // never reacts, so nothing contends with the management calls).
@@ -757,6 +776,7 @@ fn management_peer_drives_the_operator_surface() {
 #[cfg(feature = "a2a")]
 #[test]
 fn send_streaming_message_streams_sse_frames_over_http() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     use std::io::{BufRead, BufReader, Write};
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -868,6 +888,7 @@ fn send_streaming_message_streams_sse_frames_over_http() {
 #[cfg(feature = "a2a")]
 #[test]
 fn one_agentd_delegates_to_another_over_a2a() {
+    let _serial = e2e_guard(); // process-heavy: run serially
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().expect("tempdir");
 

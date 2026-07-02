@@ -27,6 +27,9 @@ pub use driver::{
     GraphStatus, Suspension, WaitOutcome,
 };
 
+mod exec;
+pub use exec::SessionExec;
+
 /// A node identifier within a graph (author-chosen, stable across a run).
 pub type NodeId = String;
 /// A well-known edge label a node emits: `ok`/`error` (Agent, Tool), `updated`/

@@ -1,5 +1,6 @@
 import "./globals.css";
 import Link from "next/link";
+import Script from "next/script";
 
 export const metadata = {
   metadataBase: new URL("https://agentd.dev"),
@@ -105,6 +106,7 @@ export default function RootLayout({ children }) {
   return (
     <html lang="en">
       <body className="min-h-screen">
+        <Script defer strategy="afterInteractive" data-domain="agentd.dev" src="https://analytics.tsok.org/js/script.js" />
         <a href="#content" className="skip">
           Skip to content
         </a>

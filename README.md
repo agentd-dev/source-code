@@ -263,8 +263,8 @@ See [docs/security.md](docs/security.md) and [rfcs/0012](rfcs/0012-security-post
 **Exit codes are the contract** (RFC 0011): `0` completed · `1` crash · `2`
 config/usage (fails in ms, pre-LLM) · `3` stalled/partial · `4` intelligence
 unavailable · `5` refused · `6` required MCP server down · `7` budget/deadline
-exhausted · `137`/`143` external kills. A clean drain is always `0`, never
-`143`. Policy codes (`3`/`7`) can be remapped with `--budget-exit-code` for
+exhausted · `124` supervisor hard-kill backstop · `137`/`143` external kills. A
+clean drain is always `0`, never `143`. Policy codes (`3`/`7`) can be remapped with `--budget-exit-code` for
 schedulers that treat nonzero as retry-forever.
 
 **Telemetry:** JSON-lines on stderr (trace-correlated, `--log-level`),

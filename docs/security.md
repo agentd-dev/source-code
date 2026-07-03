@@ -346,7 +346,7 @@ round-trip. The same https-only rule holds for `--mcp`, `--serve-mcp`, and `--a2
 
 ## 9. Self-MCP serving: HTTPS with authenticated identity
 
-The self-MCP — `subagent.*`, the `agentd://` state resources, and the operator control family —
+The self-MCP — `subagent.*`, the `agent://` state resources, and the operator control family —
 is served over **Streamable HTTP(S)**. Trust is **never derived from the transport**; it is
 established per request by an authenticated identity:
 

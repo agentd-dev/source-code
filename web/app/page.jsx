@@ -266,13 +266,14 @@ $ agentd --mode reactive \\
         intro="Some work is a graph, not a single reasoning loop. agentd lets the agent build one itself — like LangGraph, but the agent authors and drives the graph, and agentd supervises every node."
       >
         <div className="grid gap-4 md:grid-cols-3">
-          <Card tag="deterministic where it can be" title="Nine node kinds">
+          <Card tag="deterministic where it can be" title="Ten node kinds">
             <span className="kbd">agent</span>, <span className="kbd">tool</span> (with{" "}
             <span className="kbd">$from</span> data flow), <span className="kbd">assign</span>,{" "}
             <span className="kbd">infer</span> (schema-checked structured extraction),{" "}
             <span className="kbd">branch</span>, <span className="kbd">foreach</span>,{" "}
-            <span className="kbd">wait</span>, <span className="kbd">subgraph</span>,{" "}
-            <span className="kbd">halt</span>. A tool/branch-only path spends zero model tokens.
+            <span className="kbd">join</span>, <span className="kbd">wait</span>,{" "}
+            <span className="kbd">subgraph</span>, <span className="kbd">halt</span>. A
+            tool/branch-only path spends zero model tokens.
           </Card>
           <Card tag="fan out without the model" title="Process arrays at scale">
             A tool returns 500 items? <span className="kbd">foreach</span> maps a body over each on

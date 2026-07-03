@@ -234,7 +234,7 @@ Example of the redaction (the token is set but never echoed):
 ```jsonc
 // proc.start — note: no token field exists anywhere in the log stream
 {"ts":"2026-06-25T12:00:00Z","level":"info","event":"proc.start",
- "version":"2.0.0","mode":"once","mcp_servers":1,"subscribe":0}
+ "version":"1.0.0","mode":"once","mcp_servers":1,"subscribe":0}
 ```
 
 ---

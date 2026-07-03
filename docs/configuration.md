@@ -7,7 +7,7 @@ a missing endpoint, or an unresolvable secret reference exits `2` in
 milliseconds, not after an LLM round-trip or an MCP handshake.
 
 > **Build status.** The runtime is implemented: config validation, the agentic
-> loop, the supervisor + subagent tree, the MCP client, all four run modes, the
+> loop, the supervisor + subagent tree, the MCP client, all five run modes, the
 > reactive router + self-scheduling, the served self-MCP, the declarative config
 > file (`--config`) with hot reload (SIGHUP + inotify), horizontal scaling
 > (`--shard`/`--claim`/`--standby`, `cluster` feature), and multi-endpoint
@@ -161,7 +161,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--mode once\|loop\|reactive\|schedule` | `AGENT_MODE` | `once` | Selects the exit predicate (RFC 0008). See §6. |
+| `--mode once\|loop\|reactive\|schedule\|workflow` | `AGENT_MODE` | `once` | Selects the exit predicate (RFC 0008); `workflow` needs `--features workflow` + `--workflow <file>`. See §6. |
 | `--subscribe <uri>` | — | *(none)* | Subscribe to an MCP resource (reactive mode); each event spawns a fresh run. Repeatable. |
 | `--continue <uri>` | — | *(none)* | Like `--subscribe`, but route every event on the URI into **one warm session** (in order). Reactive only. Repeatable. |
 | `--interval <dur>` | — | *(none)* | loop/schedule interval (duration syntax, §7). |

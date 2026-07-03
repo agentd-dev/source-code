@@ -22,7 +22,7 @@ code + an optional `--health-file`). Everything heavier is feature-gated. Full
 rationale is in [RFC 0010](../rfcs/0010-observability-health-telemetry.md).
 
 > **Status.** The runtime is implemented: the supervisor reactor, MCP client,
-> intelligence client, the agentic loop, all four run modes, and therefore the
+> intelligence client, the agentic loop, all five run modes, and therefore the
 > events below are all live. The examples here describe real behaviour.
 
 ---
@@ -331,7 +331,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
    | 5 | semantic — task cannot be done / refused | non-retriable |
    | 6 | required MCP server failed to connect / handshake / died | retriable |
    | 7 | budget exceeded (steps / tokens / deadline / tree) | policy |
-   | 124 | hard wall-clock deadline (mnemonic to `timeout(1)`) | — |
+   | 124 | supervisor hard-kill backstop — child unresponsive past the deadline (mnemonic to `timeout(1)`; a self-detected deadline is 7) | — |
    | 137 | killed by SIGKILL (128+9, OS-set) — often OOM | raise memory |
    | 143 | killed by SIGTERM (128+15, OS-set) — ungraceful | — |
 

@@ -130,9 +130,9 @@ without the feature, they exit `2` (§2), never silently no-op.
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--instruction <TEXT>` | `INSTRUCTION` | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule` (and reactive, which reuses it per reaction). |
+| `--instruction <TEXT>` | `INSTRUCTION` (or `AGENT_INSTRUCTION`) | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule` (and reactive, which reuses it per reaction). A prefixed spelling wins over the bare one. |
 | `--instruction-file <PATH>` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). Sets `instruction`. |
-| `--intelligence <LIST>` | `AGENT_INTELLIGENCE` | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `https://host/…` (or a loopback `http://` for a same-host dev gateway) — see §4. |
+| `--intelligence <LIST>` | `AGENT_INTELLIGENCE` (or bare `INTELLIGENCE`) | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `https://host/…` (or a loopback `http://` for a same-host dev gateway) — see §4. A prefixed spelling wins over the bare one. |
 | `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative JSON config file (§12). |
 
 ### 3.2 Intelligence

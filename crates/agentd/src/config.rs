@@ -988,10 +988,21 @@ impl Config {
         }
 
         // --- env layer ---
-        if let Some(v) = envmap.get("INSTRUCTION") {
+        // The two REQUIRED inputs each accept a bare spelling alongside the
+        // prefixed one (`INSTRUCTION`/`INTELLIGENCE` next to `AGENT[D]_*`), so the
+        // minimal quickstart is `INSTRUCTION=… INTELLIGENCE=… agentd`. Precedence
+        // within the env layer is by specificity: branded > neutral (debrand_env
+        // above) > bare — a prefixed spelling always wins over the bare one.
+        if let Some(v) = envmap
+            .get("AGENTD_INSTRUCTION")
+            .or_else(|| envmap.get("INSTRUCTION"))
+        {
             c.instruction = Some((*v).to_string());
         }
-        if let Some(v) = envmap.get("AGENTD_INTELLIGENCE") {
+        if let Some(v) = envmap
+            .get("AGENTD_INTELLIGENCE")
+            .or_else(|| envmap.get("INTELLIGENCE"))
+        {
             c.intelligence = Some((*v).to_string());
         }
         if let Some(v) = envmap.get("AGENTD_INTELLIGENCE_TOKEN") {
@@ -2595,9 +2606,9 @@ fn help_text() -> String {
          \x20 agentd --instruction <TEXT> --intelligence <URI> [--mcp name=endpoint ...] [options]\n\
          \n\
          REQUIRED:\n\
-         \x20 --instruction <TEXT>        the task (or INSTRUCTION env)\n\
+         \x20 --instruction <TEXT>        the task (or INSTRUCTION / AGENT_INSTRUCTION env)\n\
          \x20 --instruction-file <PATH>   read the instruction from a file\n\
-         \x20 --intelligence <URI>        https://host[:port][/path] (comma-list = failover order; http:// loopback-only for dev)\n\
+         \x20 --intelligence <URI>        https://host[:port][/path] (comma-list = failover order; http:// loopback-only for dev; or INTELLIGENCE / AGENT_INTELLIGENCE env)\n\
          \n\
          INTELLIGENCE:\n\
          \x20 --intelligence-token <T>    bearer/key (or AGENT_INTELLIGENCE_TOKEN)\n\
@@ -2878,6 +2889,38 @@ mod tests {
         ];
         let c = Config::load(&args(&[]), &env).unwrap();
         assert_eq!(c.intelligence.as_deref(), Some("https://branded.example"));
+    }
+
+    #[test]
+    fn bare_env_spellings_work_for_the_two_required_inputs() {
+        // The bare `INTELLIGENCE` mirrors the bare `INSTRUCTION`: the minimal
+        // quickstart is `INSTRUCTION=… INTELLIGENCE=… agentd` with no prefix.
+        let env = vec![
+            ("INSTRUCTION".into(), "x".into()),
+            ("INTELLIGENCE".into(), "https://bare.example".into()),
+        ];
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.intelligence.as_deref(), Some("https://bare.example"));
+    }
+
+    #[test]
+    fn prefixed_env_wins_over_the_bare_spelling() {
+        // Specificity order within the env layer: branded > neutral > bare. The
+        // neutral AGENT_* forms (debranded to AGENTD_*) beat the bare aliases,
+        // for BOTH required inputs — including AGENT_INSTRUCTION, which used to
+        // be silently ignored (debranded to an unread AGENTD_INSTRUCTION).
+        let env = vec![
+            ("INSTRUCTION".into(), "bare-task".into()),
+            ("AGENT_INSTRUCTION".into(), "neutral-task".into()),
+            ("INTELLIGENCE".into(), "https://bare.example".into()),
+            (
+                "AGENT_INTELLIGENCE".into(),
+                "https://neutral.example".into(),
+            ),
+        ];
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.instruction.as_deref(), Some("neutral-task"));
+        assert_eq!(c.intelligence.as_deref(), Some("https://neutral.example"));
     }
 
     #[test]

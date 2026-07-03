@@ -13,8 +13,8 @@ Where this overview simplifies, those win.
 
 > **Build status (2026-06):** the agent runtime is implemented — config
 > validation, the agentic ReAct loop, the supervisor + subagent process tree
-> (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all four
-> run modes (once/loop/reactive/schedule), the reactive router, the
+> (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all five
+> run modes (once/loop/reactive/schedule/workflow), the reactive router, the
 > self-scheduling/self-subscribe self-tools, and the served self-MCP
 > (`--serve-mcp`), with the serve-https/a2a/cron/metrics/workflow surfaces
 > feature-gated. Every network surface is HTTPS (the default `tls` build); agentd
@@ -145,7 +145,7 @@ sources it juggles (RFC 0002):
 
 | Source | Count | Liveness concern |
 |---|---|---|
-| MCP server connections (stdio) | ~1–8 | server hangs mid-call; emits async `resources/updated` |
+| MCP server connections (Streamable HTTP) | ~1–8 | server hangs mid-call; emits async `resources/updated` |
 | Subagent control channels | 1–50 (bounded tree) | runaway loop, deadlock, crash |
 | Intelligence connection | 1 | slow/streaming, can stall mid-token |
 | Timers | a few | deadline / interval / backoff / ping cadence |
@@ -288,8 +288,9 @@ Two boundaries are worth internalizing as a contributor:
 - **`json/` is the one place wire types live**, so swapping the JSON
   implementation (the minimalism audit may revisit `serde_json`) stays
   mechanical. The MCP codec and the control-channel codec **share** parse/
-  serialize but differ in framing — NDJSON for MCP-over-stdio (per spec),
-  length-prefixed (4-byte LE + payload) for the private control channel.
+  serialize but differ in framing — HTTP bodies (+ SSE) for the Streamable-HTTP
+  MCP transport, length-prefixed (4-byte LE + payload) for the private control
+  channel.
 - **`supervisor/` never reasons; `agentloop/` never supervises.** That wall
   mirrors the two-loop split. RFC 0002 owns *how events arrive and writes
   leave*; RFC 0003 owns *what to conclude and do about a child*; RFC 0007 owns
@@ -454,7 +455,8 @@ updates.
 > - **`subagent.spawn` defaults to synchronous** — it blocks the parent's turn
 >   and returns the distilled result. `{async}` / `{detach}` spawns and
 >   completion-as-self-resource (`agent://subagent/<handle>`) also ship.
-> - **MCP tasks, sampling, and roots are deferred** to v2 (RFC 0013). v1
+> - **MCP tasks, sampling, and roots are deferred** to a future major
+>   (RFC 0013). The current runtime
 >   declares no client capabilities; it answers `roots/list` with `{"roots":[]}`
 >   and rejects an unsolicited `sampling/createMessage`.
 
@@ -472,11 +474,12 @@ agentd reaches exactly two kinds of outside system, on **different wires**:
   (`openai-compatible` + `anthropic`), with other provider quirks pushed to the
   gateway. Credentials come from env/flags only, are never logged or persisted,
   and print as `***`.
-- **MCP servers (every tool).** agentd is a client to N servers over **stdio**
-  (spawn the server as a child, NDJSON JSON-RPC over pipes). There is no
-  built-in tool that isn't either an MCP tool from one of these servers or one
-  of agent's own self-MCP tools (`subagent.*`, `subscribe`, `resource.read`,
-  gated `exec`). That invariant is the whole point.
+- **MCP servers (every tool).** agentd is a client to N **remote** servers over
+  **Streamable HTTP(S)** (`--mcp name=https://…`); it spawns no server process
+  and runs no local code. There is no built-in tool that isn't either an MCP
+  tool from one of these servers or one of agentd's own self/control tools
+  (`subagent.*`, `subscribe`, `resource.read`). That invariant is the whole
+  point.
 
 ---
 
@@ -522,8 +525,9 @@ agentd's only obligation to an external scheduler is to be a clean citizen:
 - **The exit-code table is a public, machine-actionable API** (for
   `podFailurePolicy`): `0` success, `2` config/usage (non-retriable), `3`
   partial, `4` intelligence unreachable/auth, `5` semantic refusal
-  (non-retriable), `6` required MCP server failed, `7` budget exceeded, `124`
-  hard deadline, `137`/`143` SIGKILL/SIGTERM. A one-shot maps the root
+  (non-retriable), `6` required MCP server failed, `7` budget exceeded
+  (steps/tokens/deadline), `124` supervisor hard-kill backstop (a child that
+  won't self-terminate), `137`/`143` SIGKILL/SIGTERM. A one-shot maps the root
   subagent's terminal status to a code (`completed`→0, `refused`→5,
   partial→3, budget→7).
 - **Health is mode-aware.** One-shot = the exit code. loop/reactive =
@@ -550,7 +554,7 @@ three legs of the lethal trifecta (untrusted-input + sensitive + egress) is
 warned or refused without an explicit override. **All MCP server content is
 treated as untrusted**, including tool descriptions and schemas. The hand-rolled
 HTTP client carries SSRF defenses (block RFC-1918 / loopback / link-local by
-default). `exec` is **off by default**. Secrets come from env/flags via a single
+default). There is **no `exec` tool** — agentd runs no local code. Secrets come from env/flags via a single
 `resolve()` front door, never logged, never persisted, `Debug` prints `***`.
 
 ---

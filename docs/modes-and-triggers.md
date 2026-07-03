@@ -1,24 +1,24 @@
 # Modes & triggers
 
-agentd has **one loop**. The "four modes" are not four programs — they are one
-supervisor loop with four different **exit predicates**. A `once` run and a
+agentd has **one loop**. The "five modes" are not five programs — they are one
+supervisor loop with five different **exit predicates**. A `once` run and a
 long-lived `reactive` daemon share the same inner agentic loop, the same spawn
 chokepoint, the same router; they differ only in *when the supervisor decides to
 stop*. This is deliberate (RFC 0008 §2): anything else reproduces the
 "the daemon and the job have separate code" footgun.
 
-This page covers the four modes, then deep-dives the signature mode —
+This page covers the five modes, then deep-dives the signature mode —
 **reactive** — and time scheduling.
 
 > **Build status.** The runtime is implemented: config validation, the agentic
-> loop, the supervisor + subagent process tree, the MCP client, all four run
+> loop, the supervisor + subagent process tree, the MCP client, all five run
 > modes, the reactive router, and the self-tools / served self-MCP all ship and
 > are covered by tests. The examples below describe live behavior. Where an item
 > is deferred past v1 it is marked **(roadmap)**.
 
 ---
 
-## The four modes as one loop
+## The five modes as one loop
 
 A **driver** is a thin supervisor state machine consulted at three points:
 on startup, when a root subagent reaches a terminal status, and on every reactor
@@ -32,14 +32,15 @@ what to do next.
 | `loop` | spawn the first root "shift" | a bound is hit (max steps / wall-clock deadline / tree-wide token ceiling) **or** a drain signal | Job-with-deadline or Deployment |
 | `reactive` | arm subscriptions + routes; idle (no root at start) | **never on its own** — only a drain signal or a fatal/limit class | Deployment |
 | `schedule` | arm a timer event source; no root at start | per-fire identical to `once`; the daemon form exits only on signal/limit | external CronJob (recommended) or internal `--interval` |
+| `workflow` | spawn ONE root subagent driving the pinned graph (`--workflow <file>`, needs `--features workflow`) | the graph reaches a terminal status → map status to exit code (once-shaped) | Job, CLI |
 
 Default mode is `once`. Select with `--mode` (or `AGENT_MODE`):
 
 ```
---mode once|loop|reactive|schedule
+--mode once|loop|reactive|schedule|workflow
 ```
 
-**Invariants shared by all four (binding, RFC 0008 §3.1):**
+**Invariants shared by all five (binding, RFC 0008 §3.1):**
 
 - The **step / token / deadline cap is non-negotiable.** For `loop`/`reactive`
   the cap is tree-wide and lifetime-scoped (cumulative across all shifts and

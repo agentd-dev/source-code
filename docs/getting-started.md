@@ -16,7 +16,7 @@ see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 
 > **Build status.** The agent runtime is fully implemented — config
 > validation, the agentic loop, the supervisor + subagent process tree, the
-> MCP client, the intelligence client, and all four run modes. The examples on
+> MCP client, the intelligence client, and all five run modes. The examples on
 > this page run as written.
 
 ---
@@ -150,7 +150,7 @@ On stderr you get one JSON object per line. The run threads a
 with the same `run_id`, `agent_id`, `agent_path`, and `comp` correlation tuple:
 
 ```jsonc
-{"ts":"2026-06-25T11:18:02.796Z","level":"info","event":"proc.start","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1741188,"version":"2.0.0","mode":"once","mcp_servers":1,"subscribe":0}
+{"ts":"2026-06-25T11:18:02.796Z","level":"info","event":"proc.start","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1741188,"version":"1.0.0","mode":"once","mcp_servers":1,"subscribe":0}
 {"ts":"...","level":"info","event":"mcp.connect","run_id":"19efe80512c1a9184","agent_id":"sup","agent_path":"0","comp":"mcp","server":"fs"}
 {"ts":"...","level":"info","event":"tool.call","run_id":"19efe80512c1a9184","agent_id":"a1","agent_path":"0.1","comp":"agent","server":"fs","tool":"read_file"}
 {"ts":"...","level":"info","event":"tool.call","run_id":"19efe80512c1a9184","agent_id":"a1","agent_path":"0.1","comp":"agent","server":"fs","tool":"write_file"}
@@ -277,7 +277,7 @@ runtime is built around.
 
 - **[configuration.md](configuration.md)** — every flag and env var, precedence
   (`default < config file < env < flag`), limits, secrets, exit codes.
-- **[modes-and-triggers.md](modes-and-triggers.md)** — the four modes as exit
+- **[modes-and-triggers.md](modes-and-triggers.md)** — the five modes as exit
   predicates, reactive routing (exactly-one-owner, spawn-vs-continue,
   debounce/coalesce), self-subscribe, and internal `schedule`/cron.
 - **[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md)** — the architecture

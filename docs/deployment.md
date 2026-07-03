@@ -17,8 +17,8 @@ class.
 
 > **Build status.** The runtime is implemented — config precedence +
 > validate-at-startup (exit `2`), the agentic loop, the supervisor + subagent
-> process tree, the MCP client, all four run modes (`once`/`loop`/`reactive`/
-> `schedule`), reactive routing, and the served self-MCP all ship. The examples
+> process tree, the MCP client, all five run modes (`once`/`loop`/`reactive`/
+> `schedule`/`workflow`), reactive routing, and the served self-MCP all ship. The examples
 > below describe real behaviour.
 
 Every flag and env var on this page is taken verbatim from
@@ -50,7 +50,7 @@ intelligence endpoint list + headers). Everything else is env-settable;
 | Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp https://host:port` + `--serve-cert`/`--serve-key`/`--serve-client-ca` or `--serve-bearer` (`serve-https` feat.) |
 | A2A peer | `AGENT_A2A_PEER` | `--a2a-peer name=https://endpoint` (repeatable; `a2a` feat.) |
 | Run-graph | `AGENT_WORKFLOW` | `--workflow <FILE>` with `--mode workflow` (`workflow` feat.) |
-| Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule` |
+| Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule│workflow` |
 | Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
 | Interval / cron | `AGENT_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
 | **Sharding** | `AGENT_SHARD`, `AGENT_SHARD_TIMER` | `--shard K/N` (`cluster` feat.) |
@@ -109,7 +109,7 @@ line. The canonical fields are
 `ts level event run_id agent_id agent_path comp pid …` (RFC 0010):
 
 ```json
-{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"0197f3c4a01abcd","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"2.0.0","mode":"once","mcp_servers":2,"subscribe":0}
+{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"0197f3c4a01abcd","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"1.0.0","mode":"once","mcp_servers":2,"subscribe":0}
 ```
 
 Because stdout is the result and stderr is telemetry, you compose with ordinary
@@ -354,7 +354,7 @@ against it (RFC 0011 §5; constants in
 | `5` | agentd ran correctly but the task **cannot** be done / refused | **non-retriable** |
 | `6` | a required MCP server failed to connect / handshake / died | retriable |
 | `7` | budget exceeded (steps / tokens / deadline / tree) | policy |
-| `124` | hard wall-clock deadline (`--deadline`) tripped | — |
+| `124` | supervisor hard-kill backstop (a child that won't self-terminate; a self-detected `--deadline` is `7`) | — |
 | `137` | killed by `SIGKILL` (OOM / kubelet) — OS-set | raise memory limit |
 | `143` | killed by `SIGTERM` **without** clean drain — OS-set | distinguishes ungraceful from `0` |
 
@@ -409,7 +409,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: agent
-          image: ghcr.io/example/agent:2.0.0
+          image: ghcr.io/example/agent:1.0.0
           args:
             - --mode=once
             - --instruction-file=/etc/agentd/task.txt
@@ -446,7 +446,7 @@ spec:
           terminationGracePeriodSeconds: 30
           containers:
             - name: agent
-              image: ghcr.io/example/agent:2.0.0
+              image: ghcr.io/example/agent:1.0.0
               args:
                 - --mode=once
                 - --instruction-file=/etc/agentd/nightly.txt
@@ -473,7 +473,7 @@ spec:
       terminationGracePeriodSeconds: 30   # > --drain-timeout
       containers:
         - name: agent
-          image: ghcr.io/example/agent:2.0.0
+          image: ghcr.io/example/agent:1.0.0
           args:
             - --mode=reactive
             - --instruction-file=/etc/agentd/triage.txt

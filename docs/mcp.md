@@ -85,7 +85,7 @@ On connect, before anything else, agentd runs the MCP lifecycle. It pins
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agentd","version":"2.0.1"}             // title omitted
+    "clientInfo":{"name":"agentd","version":"1.0.0"}             // title omitted
 }}
 // server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
@@ -302,7 +302,7 @@ nothing else. Note `tools` is an **empty object** (no `listChanged`) and
       "tools":     { },
       "resources": { "subscribe": true }
     },
-    "serverInfo":{ "name":"agentd","version":"2.0.1" }   // version = the binary's CARGO_PKG_VERSION
+    "serverInfo":{ "name":"agentd","version":"1.0.0" }   // version = the binary's CARGO_PKG_VERSION
 }}
 ```
 

@@ -24,7 +24,7 @@ owns the *spawn-boundary payload and grant-time policy*; RFC 0003 owns the
 > **Build status.** This is implemented. The runtime ships config validation,
 > the agentic ReAct loop, the supervisor + subagent process tree
 > (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, and all
-> four run modes.
+> five run modes.
 
 ---
 
@@ -544,7 +544,7 @@ the restart boundary: any change that happened while the supervisor was down is
 recovered, because the agentd acts on *current state*, not a missed delta. Warm
 sessions and dynamic self-subscriptions are **lost** in v1 — recovered by
 idempotent re-trigger (`--run-id` / `AGENT_RUN_ID`), not by resurrection.
-Durable warm-session checkpointing is deferred to v2 (RFC 0013).
+Durable warm-session checkpointing is deferred to a future major (RFC 0013).
 
 ---
 
@@ -559,7 +559,7 @@ Knobs that exist on the CLI/env surface today (`config.rs`):
 | `--max-tokens N` | `AGENT_MAX_TOKENS` | 200000 | token budget |
 | `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
 | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | 25s | whole-tree drain budget (`< pod grace`) |
-| `--mode <m>` | `AGENT_MODE` | once | `once` / `loop` / `reactive` / `schedule` |
+| `--mode <m>` | `AGENT_MODE` | once | `once` / `loop` / `reactive` / `schedule` / `workflow` |
 | `--run-id <id>` | `AGENT_RUN_ID` | generated | idempotency key for re-trigger |
 
 RFC-level chokepoint and detector defaults (not CLI flags in v1):

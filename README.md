@@ -93,8 +93,8 @@ transport and spawns no tool processes.
 **Release binaries** (static musl, amd64 + arm64, with `SHA256SUMS`):
 
 ```console
-$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v2.1.0/agentd-v2.1.0-x86_64-unknown-linux-musl.tar.gz
-$ tar xzf agentd-v2.1.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
+$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v1.0.0/agentd-v1.0.0-x86_64-unknown-linux-musl.tar.gz
+$ tar xzf agentd-v1.0.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
 agentd 1.0.0
 ```
 
@@ -331,7 +331,7 @@ Shipped release feature set:
 
 ## Footprint (measured)
 
-Measured on the v2.1.0 release build (x86_64, musl, stripped):
+Measured on the v1.0.0 release build (x86_64, musl, stripped):
 
 | Metric | Value |
 |---|---|
@@ -360,7 +360,7 @@ Measured on the v2.1.0 release build (x86_64, musl, stripped):
 - **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: shell
   one-liners, Docker Compose, Kubernetes `Job`/`CronJob`/`Deployment`
   manifests, a systemd unit.
-- **[CHANGELOG.md](CHANGELOG.md)** — release history (v2.1.0 current).
+- **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.0.0 current).
 - **Website:** [agentd.dev](https://agentd.dev) — rendered docs + RFCs.
 
 ## License

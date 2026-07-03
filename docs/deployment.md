@@ -522,7 +522,7 @@ spec:
       terminationGracePeriodSeconds: 30   # > --drain-timeout
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with `cluster`
+          image: ghcr.io/agentd-dev/agentd:1.0.0   # built with `cluster`
           # Derive K from the StatefulSet ordinal (the trailing -N of the hostname)
           # and export AGENT_SHARD=K/8 before exec'ing agent.
           command: ["/bin/sh", "-c"]   # use a shell image, or bake this into an entrypoint
@@ -576,7 +576,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:2.7.0   # built with config-watch
+          image: ghcr.io/agentd-dev/agentd:1.0.0   # built with config-watch
           args:
             - --mode=reactive
             - --config=/etc/agentd/config.json      # mounted from the ConfigMap

@@ -3585,7 +3585,7 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&json).expect("manifest must be valid JSON");
         // It reflects the resolved config (a minted run id is always present).
-        assert_eq!(v["contract_version"], serde_json::json!("2.0"));
+        assert_eq!(v["contract_version"], serde_json::json!("1.0"));
         assert!(
             v["identity"]["run_id"]
                 .as_str()

@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 /// The agentctl↔agentd contract version (major.minor) this binary speaks
 /// (RFC 0014 §3.4 / §6.3). agentctl refuses an instance whose *major* it does
 /// not understand.
-const CONTRACT_VERSION: &str = "2.0";
+const CONTRACT_VERSION: &str = "1.0";
 
 /// The operator/admin control methods this build serves — the authoritative
 /// `surfaces.operator_tools` list agentctl drives. Operator control is unified
@@ -472,7 +472,7 @@ mod tests {
         ] {
             assert!(m.get(key).is_some(), "manifest missing top-level key {key}");
         }
-        assert_eq!(m["contract_version"], json!("2.0"));
+        assert_eq!(m["contract_version"], json!("1.0"));
         // De-branded (ACC SPEC L4): only the neutral `agent_version` is emitted;
         // the legacy `agentd_version` key is gone (the root anyOf is satisfied by
         // `agent_version` alone).

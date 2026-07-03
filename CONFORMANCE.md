@@ -104,7 +104,7 @@ The golden corpus in `contract/fixtures/capabilities/` is **owned by the agentct
 contract repo** and pinned by its `agent-contract-client` fixture tests
 (`tests/fixtures.rs`), which assert exact content — `default.json` `version ==
 "2.5.0"` and `surfaces.claim` as an object, plus the `full-features.json` surface
-values. They remain the **real `--capabilities` captures from agentd 2.5.0** and
+values. They remain the **real `--capabilities` captures from agentd 1.0.0** and
 all four validate against the *current* `manifest.schema.json`.
 
 The current binary's `--capabilities` is a **superset** of the 2.5.0 capture

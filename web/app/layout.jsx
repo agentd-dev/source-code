@@ -41,6 +41,9 @@ function Nav() {
           agentd<span className="text-[var(--dim)]">@</span>
           <span className="text-[var(--green)]">~</span>
         </Link>
+        <Link href="/#a2a" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          a2a
+        </Link>
         <Link href="/#mcp" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
           mcp
         </Link>
@@ -71,7 +74,7 @@ function Footer() {
         <div>
           <span className="text-[var(--green)]">$</span>{" "}
           <span className="text-[var(--fg)]">agentd</span> — a minimal, MCP-native, reactive agent
-          runtime · MIT
+          runtime · Apache-2.0
         </div>
         <div className="flex gap-5">
           <Link href="/docs/overview/" className="hover:text-[var(--fg-strong)]">

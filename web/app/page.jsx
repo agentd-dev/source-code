@@ -358,6 +358,7 @@ $ agentd --mode reactive \\
 
       {/* ── A2A ──────────────────────────────────────────────── */}
       <Section
+        id="a2a"
         eyebrow="agent-to-agent"
         title="A first-class agent in the mesh"
         intro="agentd speaks the Agent2Agent protocol both ways — a served run is an A2A Task — so it interoperates with any conformant A2A peer, not just other agentds."
@@ -375,6 +376,17 @@ $ agentd --mode reactive \\
             One protocol for the whole mesh.
           </Card>
         </div>
+        <p className="mt-4 text-sm text-[var(--dim)]">
+          The full method surface — <span className="kbd">SendMessage</span> ·{" "}
+          <span className="kbd">SendStreamingMessage</span> · <span className="kbd">GetTask</span> ·{" "}
+          <span className="kbd">CancelTask</span> · <span className="kbd">ListTasks</span> ·{" "}
+          <span className="kbd">SubscribeToTask</span> — with spec-exact semantics:{" "}
+          <span className="text-[var(--fg)]">blocking by default</span> (opt into{" "}
+          <span className="kbd">returnImmediately</span>), spec error codes
+          (TaskNotFound, TaskNotCancelable, UnsupportedOperation), and terminality signalled by
+          the task state + stream close. A run's lifecycle <em>is</em> the Task lifecycle — no
+          adapter layer, no second state machine.
+        </p>
       </Section>
 
       {/* ── cloud-native spec sheet ──────────────────────────── */}

@@ -5,6 +5,33 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.1.0
+
+### Added
+
+- **Bare env spellings for the two required inputs.** `INTELLIGENCE` is now
+  accepted alongside `AGENT_INTELLIGENCE` (mirroring the existing bare
+  `INSTRUCTION`), so the minimal launch is `INSTRUCTION=… INTELLIGENCE=… agentd`.
+  Precedence within the env layer is by specificity — branded `AGENTD_*` >
+  neutral `AGENT_*` > bare — so a prefixed spelling always wins over the bare
+  one. Additive; no existing spelling changes meaning. `contract_version`
+  stays `1.0`.
+
+### Fixed
+
+- **`AGENT_INSTRUCTION` is honoured.** It was silently ignored (de-branded to an
+  `AGENTD_INSTRUCTION` nothing read), so following the neutral `AGENT_*`
+  convention for the instruction produced a confusing "missing instruction"
+  error. It now works like every other `AGENT_*` key.
+- **Docs/site consistency sweep** (post-1.0.0-reset): five run modes everywhere
+  (the modes page gains the `workflow` mode row); exit `124` correctly
+  attributed to the supervisor hard-kill backstop (a self-detected `--deadline`
+  is `7`); stale stdio-era claims in `architecture.md` ("MCP servers over
+  stdio", "gated `exec`") rewritten to the remote-HTTPS / no-exec reality; one
+  stray `agentd://` → `agent://`; wire/log example versions → 1.0.0; the
+  landing page's workflow card lists all **ten** node kinds (`join` was
+  missing); `use-cases.md` added to the docs index.
+
 ## v1.0.0 — first public release
 
 The first public release of **`agentd`**: a small, MCP-native, HTTPS-everywhere

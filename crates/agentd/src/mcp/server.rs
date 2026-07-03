@@ -3385,7 +3385,7 @@ mod tests {
         // The served manifest is the canonical RFC 0015 §5.2 schema (the same
         // builder as the `--capabilities` one-shot): contract_version + top-level
         // mode + identity.run_id from the downward-API/run id.
-        assert_eq!(body["contract_version"], "2.0");
+        assert_eq!(body["contract_version"], "1.0");
         assert_eq!(body["identity"]["run_id"], "r1");
         assert_eq!(body["mode"], "reactive");
     }

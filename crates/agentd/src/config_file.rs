@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 /// The `x-agentd-contract-version` the schema carries (ties to the capabilities
 /// manifest's `contract_version`, RFC 0014 §5 / RFC 0017 §4.2). Kept equal to the
 /// manifest's contract version by `tests::schema_contract_version_matches_manifest`.
-pub const SCHEMA_CONTRACT_VERSION: &str = "2.0";
+pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 
 /// The deserialized config-file shape — one source of truth for the loader, the
 /// validator, and the `--config-schema` generator. `serde` only.

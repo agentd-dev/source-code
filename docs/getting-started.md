@@ -29,10 +29,10 @@ dependency-light: no async runtime, no TLS, no C/C++ toolchain.
 ```console
 $ git clone <repo> agent && cd agent
 $ cargo build -p agentd --release
-   Compiling agentd v2.0.0
+   Compiling agentd v1.0.0
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
-agentd 2.0.0
+agentd 1.0.0
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops

@@ -95,13 +95,13 @@ transport and spawns no tool processes.
 ```console
 $ curl -LO https://github.com/agentd-dev/source-code/releases/download/v2.1.0/agentd-v2.1.0-x86_64-unknown-linux-musl.tar.gz
 $ tar xzf agentd-v2.1.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
-agentd 2.1.0
+agentd 1.0.0
 ```
 
 **Container image** (multi-arch, cosign-signed, single layer, ~1.2 MiB pull):
 
 ```console
-$ docker run --rm ghcr.io/agentd-dev/agentd:2.1.0 --capabilities
+$ docker run --rm ghcr.io/agentd-dev/agentd:1.0.0 --capabilities
 ```
 
 **From source** (Rust stable; no C toolchain needed):
@@ -275,7 +275,7 @@ heartbeat file via `--health-file`, and the `agent://events` live ring when
 serving (`--features events`).
 
 **Discovery:** `agentd --capabilities` prints a machine-readable manifest
-(`contract_version: "2.0"` + a `surfaces{}` block of exactly what's compiled
+(`contract_version: "1.0"` + a `surfaces{}` block of exactly what's compiled
 and configured in) and exits — feature-detect from this, not the version
 string.
 

@@ -217,7 +217,10 @@ struct ServedSession {
     /// `input-required`, the gate resource serves the payload); an A2A
     /// `SendMessage` addressed to this task posts the reply, which the reactor
     /// fans back to the opener child as `ctrl/inject`. The gate parallel of
-    /// `swap`. Cloned into the reactor at launch.
+    /// `swap`. Cloned into the reactor at launch; READ only by the A2A surface
+    /// (a non-`a2a` build carries the channel unread — the reactor side is
+    /// feature-independent).
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
     gate: crate::supervisor::gate::GateChannel,
     started: Instant,
 }

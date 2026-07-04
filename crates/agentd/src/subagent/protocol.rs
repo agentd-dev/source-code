@@ -107,6 +107,17 @@ pub enum AgentMsg {
     Result { outcome: Outcome },
     /// Terminal: a fatal infrastructure failure (intel/mcp unreachable).
     Failed { error: String },
+    /// A HUMAN GATE opened (RFC 0021 §7): a workflow `human` node suspended
+    /// awaiting input. `node` is the workflow node id; `payload` is the resolved
+    /// gate payload (what the human is being asked to look at). The supervisor
+    /// records it (the served A2A task projects `input-required`, the gate
+    /// resource serves the payload) and later fans the human's reply DOWN as
+    /// [`ControlMsg::Inject`]. Non-terminal; also progress for liveness.
+    Gate { node: String, payload: Value },
+    /// The gate resolved (`via` = `"reply"` | `"uri"` | `"timeout"`): the
+    /// supervisor clears the recorded gate and the A2A task returns to
+    /// `working`. Non-terminal.
+    GateClosed { node: String, via: String },
     /// The child's intelligence reachability, edge-triggered at the breaker/
     /// failover seam (RFC 0018 §6). Emitted ONLY on a transition: on **entering**
     /// all-endpoints-down (every configured endpoint's breaker open / the failover
@@ -202,6 +213,32 @@ pub struct SpawnPayload {
     #[cfg(feature = "workflow")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_resume: Option<WorkflowResume>,
+    /// Resume from a CHECKPOINT (RFC 0021 §8.4, `--workflow-resume`): the child
+    /// fetches the envelope from the named checkpointer server after connecting,
+    /// verifies the workflow hash, and drives from the restored slice (board,
+    /// budget, and visit counts carry over). Minted from operator config only.
+    #[cfg(feature = "workflow")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_resume_ref: Option<WorkflowResumeRef>,
+}
+
+/// A checkpoint-resume reference (RFC 0021 §8.4): `--workflow-resume
+/// <server>:<key>[@seq]` parsed. `force` (`--workflow-resume-force`) overrides
+/// the workflow-hash verification for deliberate graph-edit-and-continue (visit
+/// counts reset; board + budget keep).
+#[cfg(feature = "workflow")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowResumeRef {
+    /// The configured MCP server implementing the checkpointer profile.
+    pub server: String,
+    /// The state key (already `{run_id}`-interpolated by the supervisor).
+    pub key: String,
+    /// A specific envelope seq (fork/time-travel); latest when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Skip the workflow-hash verification (graph-edit-and-continue).
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// How a suspended reactive workflow's `Wait` resolved — the daemon→child resume
@@ -315,6 +352,8 @@ mod tests {
             workflow_reactive: false,
             #[cfg(feature = "workflow")]
             workflow_resume: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume_ref: None,
         }
     }
 

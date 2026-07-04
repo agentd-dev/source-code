@@ -120,24 +120,50 @@ non-scalar placeholder takes the `error` edge.
 
 ### Node kinds
 
-Every node has a `kind`. There are ten:
+Every node has a `kind`. There are twelve (dialect 2, RFC 0021):
 
 | Kind | Does | Key fields | Emits |
 |---|---|---|---|
-| `agent` | Runs a full ReAct turn on `instruction` (with `reads` folded into context, honoring an optional `output_contract`) against the MCP tools. | `instruction`, `reads?`, `writes?`, `output_contract?`, `retry?`, `edges` | `ok` / `error` |
-| `tool` | Calls one MCP `tool` on `server` with `args` (with `$from` references resolved). | `server`, `tool`, `args?`, `writes?`, `retry?`, `edges` | `ok` / `error` |
-| `assign` | Pure data shaping — resolves a `value` template (with `$from` references) and writes it. No model, no tool. | `value`, `writes`, `edges` | `ok` / `error` |
-| `infer` | ONE structured intelligence call: the model answers `prompt` as a JSON object satisfying `schema` (field → type); invalid answers are automatically re-asked with the validation errors, up to `retries` times. | `prompt`, `schema`, `reads?`, `writes?`, `retries?`, `retry?`, `edges` | `ok` / `error` |
+| `agent` | Runs a full ReAct turn on `instruction` (with `reads` folded into context, honoring an optional `output_contract`) against the MCP tools. | `instruction`, `reads?`, `writes?`, `writes_mode?`, `output_contract?`, `retry?`, `edges` | `ok` / `error` |
+| `tool` | Calls one MCP `tool` on `server` with `args` (with `$from` references resolved). | `server`, `tool`, `args?`, `writes?`, `writes_mode?`, `retry?`, `edges` | `ok` / `error` |
+| `assign` | Pure data shaping — resolves a `value` template (with `$from` references) and writes it. No model, no tool. | `value`, `writes`, `writes_mode?`, `edges` | `ok` / `error` |
+| `infer` | ONE structured intelligence call: the model answers `prompt` as a JSON object satisfying `schema` (field → type); invalid answers are automatically re-asked with the validation errors, up to `retries` times. | `prompt`, `schema`, `reads?`, `writes?`, `writes_mode?`, `retries?`, `retry?`, `edges` | `ok` / `error` |
 | `branch` | Routes on the blackboard (see [Conditions](#conditions)). | `cases`, `default`, `semantic?` | (per-case goto) |
-| `foreach` | Fans out over an array (see [Fan-out](#foreach--deterministic-fan-out-over-an-array)): runs `body` once per item on a scoped board, collecting results positionally. | `items`, `body`, `parallel?`, `on_error?`, `writes?`, `edges` | `ok` / `error` |
-| `wait` | Suspends until `on_uri` updates or `timeout_ms` elapses, writing the read content. | `on_uri`, `timeout_ms`, `writes?`, `edges` | `updated` / `timeout` |
-| `subgraph` | Runs a nested workflow inline (waits included) — or `async: true`: SPAWNS it as a supervised child process and writes `{"handle"}` immediately. | `graph`, `async?`, `writes?`, `edges` | `ok` / `error` |
-| `join` | Fans IN: awaits async-subgraph handles (a handle, a `{"handle"}` object, or an array), collecting results positionally. | `handles`, `timeout_ms`, `writes?`, `edges` | `ok` / `error` / `timeout` |
+| `foreach` | Fans out over an array (see [Fan-out](#foreach--deterministic-fan-out-over-an-array)): runs `body` once per item on a scoped board, collecting results positionally. | `items`, `body`, `parallel?`, `on_error?`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` |
+| `parallel` | Fans out over NAMED heterogeneous branches (see [Parallel](#parallel--heterogeneous-branches)): each branch body runs concurrently on a scoped board; results collect into ONE OBJECT keyed by branch name. | `branches`, `on_error?`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` |
+| `wait` | Suspends until `on_uri` updates or `timeout_ms` elapses, writing the read content. | `on_uri`, `timeout_ms`, `writes?`, `writes_mode?`, `edges` | `updated` / `timeout` |
+| `human` | A HUMAN GATE (see [Human gates](#human-gates--a2a-input-required)): publishes `payload`, flips the served A2A task to `input-required`, and suspends until an A2A reply / `reply_uri` update / timeout. | `payload`, `reply_uri?`, `timeout_ms`, `writes?`, `writes_mode?`, `edges` | `replied` / `timeout` / `error` |
+| `subgraph` | Runs a nested workflow inline (waits included) — or `async: true`: SPAWNS it as a supervised child process and writes `{"handle"}` immediately. | `graph`, `async?`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` |
+| `join` | Fans IN: awaits async-subgraph handles (a handle, a `{"handle"}` object, or an array), collecting results positionally. | `handles`, `timeout_ms`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` / `timeout` |
 | `halt` | Terminates the workflow with an author-chosen status, projecting a result. | `status`, `result_from?` | — |
 
 A node that emits a label with no matching edge, an unhandled node, or a dangling
 edge fails **closed** to a `Crashed` outcome — a mis-authored workflow never runs
-away.
+away. **Unknown node fields are define-time errors** (RFC 0021 §4): a typo'd
+`writes_mode` is refused, never silently ignored. The manifest advertises the
+graph language as `surfaces.workflow.dialect` (currently `2`) — feature-detect
+from it, not the version string.
+
+### `writes_mode` — reducers (RFC 0021 §5)
+
+By default a node's `writes` **overwrites** its key. `writes_mode` folds instead:
+
+| Mode | Semantics | Type mismatch |
+|---|---|---|
+| `overwrite` *(default)* | replace | never errors |
+| `append` | absent → `[v]`; array → push | `error` edge |
+| `merge` | absent → `v`; object+object → shallow merge, incoming wins | `error` edge |
+| `union` | as `append`, skipping a deep-equal duplicate | `error` edge |
+
+```json
+{ "kind": "agent", "instruction": "find one more issue", "writes": "issues",
+  "writes_mode": "append", "edges": { "ok": "route", "error": "fail" } }
+```
+
+Reducers are pure (no model, no tool); the reduce happens **before** the 1 MiB
+clamp (the accumulated value is what must fit); a mismatch writes a readable
+error marker and takes the `error` edge — never a silent coercion. CEL
+`assign.expr` remains the escape hatch for custom folds.
 
 ### `infer` — checked structured intelligence
 
@@ -224,6 +250,84 @@ the context):
   whole fan-out is deterministic. Put an `infer`/`agent` node in the body only
   where an item genuinely needs intelligence, and the shared pool still bounds
   the total.
+
+---
+
+## `parallel` — heterogeneous branches
+
+Where `foreach` maps **one body over N items**, `parallel` runs **N different
+bodies at once** — "run the security review AND the perf review, then continue"
+(RFC 0021 §6):
+
+```json
+{ "kind": "parallel",
+  "branches": {
+    "security": { "start": "s0", "nodes": { "…": "a full sub-graph" } },
+    "perf":     { "start": "p0", "nodes": { "…": "a different sub-graph" } }
+  },
+  "on_error": "continue",
+  "writes": "reviews",
+  "edges": { "ok": "synthesize", "error": "fail" } }
+```
+
+- Each branch runs on a **scoped board** (a clone of the parent's, with
+  `branch` = its name seeded); branch writes never flow back — the collected
+  result does: **one object keyed by branch name** (a failed branch's slot
+  carries `{"branch","error"}`).
+- **Bounds**: ≤ 16 branches; concurrency rides the SAME 8-lane pool `foreach`
+  uses — one pool, so composing `parallel` inside `foreach` (or vice versa)
+  never multiplies lanes. Every branch pre-charges a budget step; all branches
+  draw the one shared token pool.
+- `on_error`: `fail_fast` (default — any failed branch → the `error` edge) or
+  `continue` (`ok` iff at least one branch succeeded; markers stay in place).
+- `halt` inside a branch halts the **branch**, not the run.
+
+---
+
+## Human gates — A2A `input-required`
+
+A `human` node is the **human-in-the-loop primitive** (RFC 0021 §7): publish
+something for a person (or any A2A peer) to inspect, suspend, and resume on
+their reply — **A2A is the conversation channel**.
+
+```json
+{ "kind": "human",
+  "payload": { "question": "Ship it?", "diff": { "$from": "patch" } },
+  "reply_uri": "approvals://deploy-42",
+  "timeout_ms": 86400000,
+  "writes": "verdict",
+  "edges": { "replied": "route_on_verdict", "timeout": "escalate" } }
+```
+
+What happens, in order:
+
+1. The resolved `payload` travels up to the supervisor; when the run is a
+   **served A2A task**, the task transitions to **`TASK_STATE_INPUT_REQUIRED`**
+   with the payload as its status message — a spec-conformant A2A client
+   (a human's UI, another agent) *sees* the wait via `GetTask`/`SubscribeToTask`.
+2. The workflow suspends. Three resume paths race, **first one wins**:
+   - **an A2A `SendMessage` carrying this task's `taskId`** — its text parts
+     become the reply (the spec-native human answer);
+   - an update on `reply_uri` (any MCP resource — the notify-then-read read
+     is the reply);
+   - the `timeout_ms` expiry (nothing written; the `timeout` edge).
+3. The reply lands on `writes` (through `writes_mode`) and the node takes
+   `replied`. The task returns to `working`.
+
+The gate deliberately does **not** encode approve/reject — the reply is data,
+and routing on it is a `branch` (predicates or CEL on the verdict), so
+multi-approver schemes and rejection reasons stay authorable. Notes:
+
+- A reply while another is pending is refused (`-32004 UnsupportedOperation`);
+  an unknown `taskId` is `-32001 TaskNotFound`; a message to a live task with
+  **no open gate** is `-32004` (agentd runs are single-instruction — the gate
+  reply is the one supported mid-task continuation).
+- Without `--serve-mcp` the gate degrades to a plain wait on
+  `reply_uri`/timeout — never a hard serving requirement.
+- In the **reactive-daemon** shape the gate suspends the daemon's workflow like
+  a `wait` (the payload appears on `agent://workflow`); it resolves by
+  `reply_uri`/timeout — the A2A reply path serves **served async tasks**.
+- An unresolvable `$from` in `payload` emits `error` (route it or fail closed).
 
 ---
 
@@ -451,6 +555,59 @@ steps distinguished by the `reason`), `LoopDetected` / `Stalled` → 3,
 `Crashed` → 1. The result body always carries
 `{workflow_status, reason, steps, tokens, result}` so the operator sees *why* and
 *at what cost*, not just the code.
+
+---
+
+## Durable state — the MCP checkpointer (RFC 0021 §8)
+
+A workflow can persist its run slice **after every superstep** — crash-resume,
+state history, and fork/time-travel — with **zero new dependencies**: the
+checkpointer is *any MCP server* implementing a three-tool profile. Declare the
+policy at the graph root:
+
+```json
+{ "checkpoint": { "server": "state", "key": "run/{run_id}", "every": 1,
+                  "on_error": "continue" },
+  "start": "…", "nodes": { "…": "…" } }
+```
+
+- `server` names a configured `--mcp` server; `key` is the state lineage
+  (`{run_id}` interpolates — a **stable operator-chosen key** makes the run
+  resumable across pod replacements); `every` gates the periodic writes
+  (a suspension and a `halt` **always** checkpoint).
+- The **envelope** is versioned and self-describing:
+  `{v:1, seq, workflow_hash, state, ts_ms}` — `seq` is the superstep count
+  (monotonic, carried across resume), `workflow_hash` is the SHA-256 of the
+  canonical graph JSON (resume verifies it), and `state` is the same serialized
+  run slice a `wait` suspension produces (cursor, blackboard, budget, visit
+  counts). Its cursor is the next **unexecuted** node — resume is exactly-once
+  for checkpointed nodes, at-least-once for the one in flight.
+- **The server contract** (any language, any store): `state.put {key,seq,state}`
+  (MUST refuse `seq <=` latest with `{ok:false,latest}` — the split-brain
+  guard; a refused put is ALWAYS fatal for the run), `state.get {key[,seq]}`,
+  `state.list {key}`. Postgres, S3, sqlite, etcd — all are somebody's MCP
+  server; agentd links none of them.
+- `on_error`: `continue` (default — a failed write degrades durability, never
+  the run; `workflow.checkpoint.fail` telemetry records it) or `halt`.
+
+**Resume / fork:**
+
+```console
+$ agentd --mode workflow --workflow pipeline.json \
+    --mcp state=https://ckpt.internal/mcp \
+    --workflow-resume state:run/abc            # latest — the crash-recovery flow
+$ agentd … --workflow-resume state:run/abc@17  # a specific seq, under a NEW
+                                               # --run-id = a FORK (time-travel)
+```
+
+The child fetches the envelope after connecting, **verifies the workflow
+hash** (a mismatch is a refusal, exit `5` — the state was not taken from this
+graph; `--workflow-resume-force` overrides for deliberate
+graph-edit-and-continue, resetting the loop guards but keeping board and
+budget), and drives on. **Budgets carry over**: a resumed run does not get a
+fresh token pool — the budget is a property of the work, not the process.
+agentd never resumes implicitly: a `Job` with `restartPolicy: OnFailure` opts
+in by passing `--workflow-resume` with the stable key.
 
 ---
 

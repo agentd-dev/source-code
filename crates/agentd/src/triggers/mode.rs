@@ -2167,10 +2167,21 @@ fn handle_workflow_outcome(
                     return Some(crate::exit::GENERIC);
                 }
             };
+        // A HUMAN GATE suspension (RFC 0021 §7) rides the same machinery: its
+        // `reply_uri` (may be empty = timeout-only in the daemon shape) is the
+        // watch, and the gate's payload is surfaced on `agent://workflow` for
+        // the operator/peer to inspect. The A2A `SendMessage` reply path serves
+        // ASYNC served runs; the reactive daemon's gates resolve by
+        // reply_uri/timeout (documented in workflows.md).
+        let gate = susp.get("gate").filter(|g| !g.is_null()).cloned();
         // Arm the watch through the NORMAL subscription machinery; a uri no
         // server can watch still resumes via the timeout (fail open, like the
-        // in-process wait).
-        if arm_uri_on_first_supporting(servers, server_order, owner, &on_uri).is_some() {
+        // in-process wait). A gate with NO reply_uri arms nothing — timeout only.
+        if on_uri.is_empty() {
+            if gate.is_none() {
+                log.warn("workflow.wait.unwatchable", json!({"uri": ""}));
+            }
+        } else if arm_uri_on_first_supporting(servers, server_order, owner, &on_uri).is_some() {
             router.add_route(Route::new(&on_uri, Disposition::Spawn, DEBOUNCE));
         } else {
             log.warn("workflow.wait.unwatchable", json!({"uri": on_uri}));
@@ -2178,15 +2189,19 @@ fn handle_workflow_outcome(
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         log.info(
             "workflow.suspended",
-            json!({"on_uri": on_uri, "timeout_ms": timeout_ms, "steps": state.steps(), "tokens": state.tokens()}),
+            json!({"on_uri": on_uri, "timeout_ms": timeout_ms, "steps": state.steps(), "tokens": state.tokens(), "gate": gate.as_ref().and_then(|g| g.get("node"))}),
         );
-        crate::graph::live::publish(json!({
+        let mut live = json!({
             "status": "suspended",
             "on_uri": on_uri,
             "timeout_ms": timeout_ms,
             "steps": state.steps(),
             "tokens": state.tokens(),
-        }));
+        });
+        if let Some(g) = &gate {
+            live["gate"] = g.clone();
+        }
+        crate::graph::live::publish(live);
         *wf_suspended = Some((state, on_uri, deadline));
         return None;
     }
@@ -2619,6 +2634,8 @@ mod tests {
             workflow_reactive: false,
             #[cfg(feature = "workflow")]
             workflow_resume: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume_ref: None,
         }
     }
 

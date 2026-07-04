@@ -1,9 +1,37 @@
 # RFC 0021: Durable workflows & parity extensions — reducers, parallel branches, human gates, and the MCP checkpointer
 
-**Status:** Draft
+**Status:** Implemented (2026-07-04 — all five sections; see the amendments box below)
 **Author:** Andrii Tsok
 **Date:** 2026-07-04
 **Part of:** the workflow surface (docs/workflows.md is the shipped baseline); extends the agentic-loop contract (RFC 0007), reactive routing (RFC 0008), the self-MCP surface (RFC 0005), and the capabilities manifest (RFC 0014/0015)
+
+> **Implementation amendments (binding — where the built system refines this
+> draft, the list below wins):**
+> 1. **§6 `on_error` vocabulary** is `fail_fast | continue` (not `collect`) —
+>    the same enum `foreach` already speaks; one word per concept.
+> 2. **§7 gate publishing**: the dedicated `agent://workflow/gate/<node-id>`
+>    resource was dropped as redundant — the gate payload is delivered where the
+>    consumers already look: the served A2A task's **`status.message`** (the
+>    `input-required` projection over `GetTask`/`SubscribeToTask`) and, for the
+>    reactive daemon, the `agent://workflow` live snapshot's `gate` field. The
+>    A2A projection IS the publish.
+> 3. **§8.2 envelope** embeds the run slice verbatim (`state` = the same
+>    serialization the `wait` suspension produces — one serializer, two
+>    consumers); the graph-identity field is `workflow_hash` (SHA-256 hex, a
+>    hand-rolled FIPS-180-4 in `graph/sha.rs` — the moat holds).
+> 4. **§8.4 hash-mismatch resume** terminates `refused` (exit `5`), not exit
+>    `2`: the check needs the fetched envelope, which needs the child's MCP
+>    connection — past config validation. A refusal is the honest class
+>    (semantically cannot do this), and the reason names both hashes.
+> 5. **§8.4 crash-recovery semantics**: a periodic checkpoint's cursor is the
+>    next unexecuted node, so latest-resume after a SIGKILL re-enters the
+>    in-flight node (at-least-once) — the k8s restart flow. A run that ends via
+>    a FAILURE `halt` checkpointed on entering that halt; latest-resume
+>    reproduces its outcome (deliberate — a failure halt is a graph decision,
+>    not a crash); recovery from *before* the failing node is `@seq`-addressed.
+> 6. **§7 warm sessions**: a `human` gate inside a warm session's turn degrades
+>    to `reply_uri`/timeout (the warm `Inject` stream is its turn-input channel,
+>    never a gate reply).
 
 ---
 

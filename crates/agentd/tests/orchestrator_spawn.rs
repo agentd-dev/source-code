@@ -66,6 +66,8 @@ fn parent_payload() -> SpawnPayload {
         workflow_reactive: false,
         #[cfg(feature = "workflow")]
         workflow_resume: None,
+        #[cfg(feature = "workflow")]
+        workflow_resume_ref: None,
     }
 }
 

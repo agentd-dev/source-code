@@ -14,6 +14,27 @@ subagents, MCP tools, and structured data it already uses.
 > graph reproduces today's one-shot behavior, so the graph is a superset, never a
 > replacement.
 
+## What a workflow can do — the capability map
+
+| Capability | Mechanism | Where |
+|---|---|---|
+| Mix intelligence and determinism per step | twelve node kinds: `agent` (a full reasoning turn), `infer` (one schema-checked structured ask), `tool`/`assign` (zero model tokens) | [Node kinds](#node-kinds) |
+| Route on data — or on judgement | `branch`: deterministic predicates (free), CEL expressions, one opt-in semantic tier | [Conditions](#conditions) |
+| Accumulate instead of overwrite | `writes_mode` reducers: `append` / `merge` / `union` | [Reducers](#writes_mode--reducers-rfc-0021-5) |
+| Process an array without feeding it through the LLM | `foreach`: one body × N items, up to 8 parallel lanes | [Fan-out](#foreach--deterministic-fan-out-over-an-array) |
+| Run *different* things at once, then continue | `parallel`: N named bodies, one result object, the same lane pool | [Parallel](#parallel--heterogeneous-branches) |
+| Run phases as isolated processes | `subgraph {async}` + `join`: supervised child workflows, fan-in later | [Async subgraphs](#async-subgraphs--join--parallel-phases-as-supervised-children) |
+| Wait for the world | `wait`: suspend on an MCP resource update, at zero idle cost | [Waits](#waits) |
+| **Ask a human** — over A2A | `human`: the task projects `input-required`; the reply is a spec-native `SendMessage` | [Human gates](#human-gates--a2a-input-required) |
+| Survive crashes; fork; time-travel | the **MCP checkpointer**: per-superstep durable state, `--workflow-resume` | [Durable state](#durable-state--the-mcp-checkpointer-rfc-0021-8) |
+| Loop safely | layered termination: step budget, shared token pool, wall deadline, visit caps, progress guard — each with a typed `reason` | [Termination](#termination-budgets-and-reasons) |
+| Grow the plan mid-run | `workflow.patch`: additive-only self-modification | [Patching](#patching-a-workflow-additive) |
+| Stay supervised | the driver runs in a killable child; the supervisor owns the kill ladder, cgroups, drain, and the exit-code contract | [Termination](#termination-budgets-and-reasons) |
+
+Everything below is the same graph language everywhere: what the model authors
+via `workflow.define` is exactly what an operator pins with `--workflow` — one
+dialect, advertised as `surfaces.workflow.dialect` in the capabilities manifest.
+
 ---
 
 ## The three ways to run a workflow
@@ -314,6 +335,41 @@ What happens, in order:
 3. The reply lands on `writes` (through `writes_mode`) and the node takes
    `replied`. The task returns to `working`.
 
+### The conversation on the wire
+
+What a human's UI (or any conformant A2A client) actually sees, end to end.
+Dispatch the work and note the task id:
+
+```jsonc
+// → SendMessage {"message":{"parts":[{"text":"run the gated deploy"}]},
+//                "configuration":{"returnImmediately":true}}
+// ← {"task":{"id":"a3","contextId":"ctx-a3","status":{"state":"TASK_STATE_WORKING", …}}}
+```
+
+Poll (`GetTask {"id":"a3"}`) or stream (`SubscribeToTask`). When the workflow
+reaches its `human` node, the task is **visibly waiting** — and the question is
+IN the task:
+
+```jsonc
+// ← {"id":"a3", "status":{
+//      "state": "TASK_STATE_INPUT_REQUIRED",
+//      "message": {"role":"agent","parts":[{"text":"{\"question\":\"Ship it?\",\"diff\":\"+1 -0\"}"}]},
+//      "timestamp": "…"}}
+```
+
+The human answers with a plain `SendMessage` that **continues the task by id**
+— no agentd-specific API, just the A2A spec's multi-turn shape:
+
+```jsonc
+// → SendMessage {"message":{"taskId":"a3","parts":[{"text":"yes"}]}}
+// ← {"task":{"id":"a3", …}}          // the reply is accepted; the run resumes
+```
+
+The reply text lands on the gate's `writes` key (parsed as JSON when it *is*
+JSON — reply `{"approve":true,"reason":"lgtm"}` and branch on `/approve`), the
+workflow takes `replied`, and the next `GetTask` shows `TASK_STATE_WORKING`,
+then the terminal state with the distillate artifact.
+
 The gate deliberately does **not** encode approve/reject — the reply is data,
 and routing on it is a `branch` (predicates or CEL on the verdict), so
 multi-approver schemes and rejection reasons stay authorable. Notes:
@@ -609,6 +665,53 @@ fresh token pool — the budget is a property of the work, not the process.
 agentd never resumes implicitly: a `Job` with `restartPolicy: OnFailure` opts
 in by passing `--workflow-resume` with the stable key.
 
+### Crash recovery, mechanically
+
+A checkpoint's cursor is the next **unexecuted** node, so semantics after a
+hard kill (OOM, node loss, `kill -9`) are exactly what you want: every
+completed node is **exactly-once**; the one that was in flight when the
+process died is **at-least-once** (it re-runs — pair it with idempotent tools
+/ the `agent/run_id` dedup meta, RFC 0011 §7). A Kubernetes `Job` that
+survives pod replacement:
+
+```yaml
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: agent
+          image: ghcr.io/agentd-dev/agentd:latest
+          args:
+            - --mode=workflow
+            - --workflow=/etc/agent/pipeline.json     # checkpoint.key: "job/nightly-2026-07-04"
+            - --mcp=state=https://ckpt.internal/mcp
+            - --workflow-resume=state:job/nightly-2026-07-04   # see the subtlety below
+```
+
+One subtlety: `--workflow-resume` of a key that does not exist yet is a
+refusal (resuming *nothing* is a config error), so attempt 1 must run without
+the flag — an init step that checks `state.list` (or a wrapper that drops the
+flag when the key is empty) picks the variant. The explicitness is deliberate:
+agentd never silently resumes state you didn't name.
+
+### Fork and time-travel
+
+History is immutable and `@seq`-addressed; a **fork** is a resume from any
+recorded superstep under a **new run id** (and therefore a new checkpoint
+lineage — the original history is never rewritten):
+
+```console
+$ agentd … --workflow-resume state:run/abc@12 --run-id run-abc-fork1
+```
+
+Want to fork with an **edited blackboard** (the "what if the review had said
+no?" experiment)? The envelope is plain JSON behind a plain MCP server — fetch
+it with any MCP client, edit `state.blackboard`, `state.put` it under a new
+key, and resume from that. Time-travel needs no agentd surface at all; it
+falls out of state-behind-MCP.
+
 ---
 
 ## Patching a workflow (additive)
@@ -666,6 +769,83 @@ a judge approves — bounded by the budget, the token pool, and the deadline:
 The `revise → judge` back-edge is the loop; the semantic branch decides when to
 exit; the visit cap + progress guard stop a draft that never converges; the
 `infer` output feeds a **free** deterministic branch.
+
+---
+
+## A worked example: the gated release pipeline (everything composed)
+
+The dialect-2 surface in one graph — review a change **three ways at once**
+(`parallel`), fold the verdicts into one object (`merge` reducers inside the
+branches, one object out), **ask a human over A2A** with the full evidence
+(`human`), branch on the answer, and survive a mid-pipeline crash
+(`checkpoint`):
+
+```json
+{
+  "dialect": 2,
+  "checkpoint": { "server": "state", "key": "release/{run_id}" },
+  "start": "reviews",
+  "nodes": {
+    "reviews": { "kind": "parallel",
+      "branches": {
+        "security": { "start": "s", "nodes": {
+          "s": { "kind": "agent", "instruction": "security-review the change", "reads": ["change"],
+                 "writes": "r", "edges": { "ok": "h", "error": "hf" } },
+          "h": { "kind": "halt", "status": "completed", "result_from": "r" },
+          "hf": { "kind": "halt", "status": "crashed", "result_from": "r" } } },
+        "perf": { "start": "p", "nodes": {
+          "p": { "kind": "infer", "prompt": "Estimate the perf impact.", "reads": ["change"],
+                 "schema": { "risk": "string", "p99_delta_ms": "number" },
+                 "writes": "r", "edges": { "ok": "h", "error": "hf" } },
+          "h": { "kind": "halt", "status": "completed", "result_from": "r" },
+          "hf": { "kind": "halt", "status": "crashed", "result_from": "r" } } },
+        "tests": { "start": "t", "nodes": {
+          "t": { "kind": "tool", "server": "ci", "tool": "run_suite",
+                 "args": { "ref": { "$from": "change", "pointer": "/ref" } },
+                 "retry": { "max": 2, "backoff_ms": 5000 },
+                 "writes": "r", "edges": { "ok": "h", "error": "hf" } },
+          "h": { "kind": "halt", "status": "completed", "result_from": "r" },
+          "hf": { "kind": "halt", "status": "crashed", "result_from": "r" } } }
+      },
+      "on_error": "continue",
+      "writes": "evidence", "edges": { "ok": "gate", "error": "gate" } },
+
+    "gate": { "kind": "human",
+      "payload": { "question": "Ship it?", "evidence": { "$from": "evidence" } },
+      "timeout_ms": 86400000,
+      "writes": "verdict",
+      "edges": { "replied": "route", "timeout": "abort" } },
+
+    "route": { "kind": "branch",
+      "cases": [ { "when": { "op": "eq", "key": "verdict", "pointer": "/approve", "value": true },
+                   "goto": "ship" } ],
+      "default": "abort" },
+
+    "ship":  { "kind": "tool", "server": "deploy", "tool": "rollout",
+               "args": { "ref": { "$from": "change", "pointer": "/ref" } },
+               "writes": "rollout", "edges": { "ok": "done", "error": "abort" } },
+    "done":  { "kind": "halt", "status": "completed", "result_from": "rollout" },
+    "abort": { "kind": "halt", "status": "refused", "result_from": "evidence" }
+  }
+}
+```
+
+What each capability buys here:
+
+- The three reviews run **concurrently on the lane pool** — an agent turn, a
+  structured `infer`, and a plain CI tool call, each in the shape it deserves;
+  `on_error: continue` means one failed review does not blind the human — its
+  error marker lands in `evidence` alongside the others.
+- The human sees **everything** (`evidence` rides the A2A task's status
+  message), replies `{"approve": true}` from any A2A client, and the
+  deterministic branch routes on `/approve` — free, no model call.
+- Durability: the fan-out completes as one superstep (no mid-lane checkpoints
+  — a deliberate v1 simplification), so a pod lost during the reviews re-runs
+  them; a pod lost **after** them resumes at `gate` with the evidence intact —
+  the human is never re-asked for already-gathered facts, and a crash while
+  *waiting on the human* resumes the wait (suspensions always checkpoint).
+- The whole run stays inside the step budget / token pool / deadline, and the
+  operator reads its live face on `agent://workflow` and the A2A task states.
 
 ---
 

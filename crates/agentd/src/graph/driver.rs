@@ -17,7 +17,7 @@
 //! persists, watches, and hands back to [`resume`]. `Subgraph` (P5), a dangling edge,
 //! or an unhandled label fail CLOSED (`Crashed`) rather than panicking.
 
-use super::{FieldType, Graph, Node, NodeId, OnError, Retry};
+use super::{FieldType, Graph, Node, NodeId, OnError, Retry, WritesMode};
 use crate::agentloop::stop::TerminalStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -176,9 +176,24 @@ impl GraphState {
 /// + a `timeout_ms` timer; whichever fires first, it calls [`resume`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Suspension {
+    /// The resource to watch. For a `Human` gate this is its `reply_uri` — or
+    /// EMPTY when the gate relies on A2A alone (`gate` tells the host which).
     pub on_uri: String,
     pub timeout_ms: u64,
     pub state: GraphState,
+    /// Present iff this suspension is a HUMAN GATE (RFC 0021 §7): the resolved
+    /// payload the host publishes (served resource + A2A `input-required`).
+    /// Additive+optional, so pre-0021 persisted suspensions still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GatePayload>,
+}
+
+/// A human gate's published face (RFC 0021 §7): which node opened it and the
+/// resolved payload the human is being asked to look at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatePayload {
+    pub node: NodeId,
+    pub payload: Value,
 }
 
 /// How a `Wait` resolved — supplied by the daemon on [`resume`].
@@ -323,6 +338,41 @@ pub trait GraphExec {
             .collect()
     }
 
+    /// Run a batch of HETEROGENEOUS branch bodies (RFC 0021 §6 `Parallel`), up
+    /// to `parallel` at a time — one `(index, body, seed)` job per branch.
+    /// Returns one `(index, result, is_error)` per job, ANY order. Default:
+    /// sequential over [`GraphExec::run_body`] — a correct fallback for any
+    /// executor; the production impl rides the same worker lanes as
+    /// [`GraphExec::run_body_parallel`] (one pool: composition never multiplies
+    /// concurrency).
+    fn run_bodies_parallel(
+        &mut self,
+        jobs: Vec<(usize, &Graph, Blackboard)>,
+        _parallel: u32,
+    ) -> Vec<(usize, Value, bool)> {
+        jobs.into_iter()
+            .map(|(i, body, seed)| {
+                let (v, e) = self.run_body(body, seed);
+                (i, v, e)
+            })
+            .collect()
+    }
+
+    /// Persist one checkpoint envelope (RFC 0021 §8) — called by the driver per
+    /// its graph's `checkpoint` policy after successful supersteps and at a
+    /// suspension/terminal. `Failed` (transport/tool error) is subject to the
+    /// policy's `on_error`; `Conflict` (the server refused a stale seq — a
+    /// SECOND WRITER owns the key) is ALWAYS fatal for the run, policy
+    /// regardless (the split-brain guard, RFC 0021 §12). Default: no-op
+    /// (test/degraded executors checkpoint nothing).
+    fn checkpoint_put(
+        &mut self,
+        _policy: &super::CheckpointPolicy,
+        _envelope: &Value,
+    ) -> Result<(), CheckpointError> {
+        Ok(())
+    }
+
     /// Spawn `graph` as a DETACHED CHILD WORKFLOW (a supervised subagent process
     /// drives it; depth/breadth/rate caps apply), returning its handle at once —
     /// the `Subgraph { async: true }` seam. Default: no spawn machinery wired —
@@ -343,6 +393,16 @@ pub trait GraphExec {
             true,
         )
     }
+}
+
+/// A failed [`GraphExec::checkpoint_put`] (RFC 0021 §8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointError {
+    /// The write failed (transport/tool error) — the policy's `on_error` rules.
+    Failed(String),
+    /// The server refused a stale/duplicate seq: a SECOND WRITER owns the key.
+    /// Always fatal for the run (the split-brain guard) — never `continue`d.
+    Conflict(String),
 }
 
 /// One [`GraphExec::await_handle`] resolution.
@@ -484,6 +544,25 @@ pub fn drive_seeded(
     drive_state(graph, &mut state, exec)
 }
 
+/// Drive from a RESTORED run slice (RFC 0021 §8.4 — `--workflow-resume`): the
+/// envelope's cursor is the next unexecuted node, its board/budget/visits carry
+/// over (a resumed run does NOT get a fresh token pool — the budget is a
+/// property of the work, not the process). `reset_guards` (the
+/// `--workflow-resume-force` graph-edit-and-continue path) clears the visit +
+/// progress bookkeeping, keeping board and budget.
+pub fn drive_from(
+    graph: &Graph,
+    mut state: GraphState,
+    exec: &mut dyn GraphExec,
+    reset_guards: bool,
+) -> DriveResult {
+    if reset_guards {
+        state.visits.clear();
+        state.entry_hash.clear();
+    }
+    drive_state(graph, &mut state, exec)
+}
+
 /// Resume a suspended graph once its `Wait` resolved: apply the [`WaitOutcome`] (write
 /// the updated value + take the `updated` edge, or take the `timeout` edge), then keep
 /// driving. Resuming a state whose `at` is not a `Wait`, or a `Wait` missing the
@@ -495,20 +574,45 @@ pub fn resume(
     exec: &mut dyn GraphExec,
     outcome: WaitOutcome,
 ) -> DriveResult {
-    let Some(Node::Wait { writes, edges, .. }) = graph.nodes.get(&state.at) else {
-        return DriveResult::Done(GraphOutcome::engine(
-            GraphStatus::Crashed,
-            format!("resume at {:?}, which is not a Wait node", state.at),
-            Value::Null,
-            state.steps(),
-            state.tokens(),
-        ));
+    // A suspension is either a `Wait` (resolved by a resource update →
+    // `updated`) or a `Human` gate (resolved by a reply → `replied`); both
+    // share the `timeout` edge and the reducer-aware write (RFC 0021 §7).
+    let (writes, writes_mode, edges, resolved_label) = match graph.nodes.get(&state.at) {
+        Some(Node::Wait {
+            writes,
+            writes_mode,
+            edges,
+            ..
+        }) => (writes, *writes_mode, edges, "updated"),
+        Some(Node::Human {
+            writes,
+            writes_mode,
+            edges,
+            ..
+        }) => (writes, *writes_mode, edges, "replied"),
+        _ => {
+            return DriveResult::Done(GraphOutcome::engine(
+                GraphStatus::Crashed,
+                format!(
+                    "resume at {:?}, which is not a Wait or Human node",
+                    state.at
+                ),
+                Value::Null,
+                state.steps(),
+                state.tokens(),
+            ));
+        }
     };
     let label = match outcome {
         WaitOutcome::Updated(v) => {
-            let (v, _oversized) = clamp_value(v, false);
-            write(&mut state.blackboard, writes, v);
-            "updated"
+            let reduce_err = write_reduced(
+                &mut state.blackboard,
+                writes.as_deref(),
+                writes_mode,
+                v,
+                false,
+            );
+            if reduce_err { "error" } else { resolved_label }
         }
         WaitOutcome::TimedOut => "timeout",
     };
@@ -516,7 +620,7 @@ pub fn resume(
         Some(next) => state.at = next.clone(),
         None => {
             let reason = format!(
-                "Wait node {:?} has no {label:?} edge for its outcome",
+                "suspended node {:?} has no {label:?} edge for its outcome",
                 state.at
             );
             let result = bb_result(&state.blackboard, None);
@@ -541,7 +645,58 @@ pub fn resume(
 
 /// The core walk from `state.at`, mutating the run slice in place until it terminates
 /// (`Done`) or hits a `Wait` (`Suspended`).
+/// Build one checkpoint envelope (RFC 0021 §8.2): versioned, self-describing,
+/// binding the graph by hash. `state` is the SAME serialization the `Wait`
+/// suspension produces — one serializer, two consumers.
+fn envelope(hash: &str, state: &GraphState) -> Value {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "v": 1,
+        "seq": state.steps(),
+        "workflow_hash": hash,
+        "state": state,
+        "ts_ms": ts_ms,
+    })
+}
+
+/// Apply the graph's checkpoint policy at a superstep boundary (RFC 0021 §8).
+/// `force` = a suspension or the halt step (ALWAYS checkpointed); otherwise the
+/// policy's `every` gates. Returns `Some(reason)` when a failed write must halt
+/// the run (`on_error: halt`); `Continue` failures are the exec's to log.
+fn maybe_checkpoint(
+    graph: &Graph,
+    hash: &str,
+    state: &GraphState,
+    exec: &mut dyn GraphExec,
+    force: bool,
+) -> Option<String> {
+    let policy = graph.checkpoint.as_ref()?;
+    if !force && !state.steps().is_multiple_of(policy.every.max(1)) {
+        return None;
+    }
+    match exec.checkpoint_put(policy, &envelope(hash, state)) {
+        Ok(()) => None,
+        // A seq conflict means a SECOND WRITER owns this key — continuing would
+        // interleave two runs' histories. Always fatal (RFC 0021 §12).
+        Err(CheckpointError::Conflict(e)) => Some(format!("checkpoint seq conflict: {e}")),
+        Err(CheckpointError::Failed(e)) => match policy.on_error {
+            super::CheckpointOnError::Continue => None, // durability degrades, the run does not
+            super::CheckpointOnError::Halt => Some(format!("checkpoint write failed: {e}")),
+        },
+    }
+}
+
 fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) -> DriveResult {
+    // The workflow-identity hash is computed once per drive (only when a
+    // checkpoint policy is present — hashing is not free).
+    let ckpt_hash = graph
+        .checkpoint
+        .as_ref()
+        .map(|_| super::workflow_hash(graph))
+        .unwrap_or_default();
     loop {
         // Whole-workflow wall-clock deadline — checked on EVERY node entry, so a
         // walk of slow-but-succeeding nodes still terminates on time.
@@ -578,11 +733,11 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             ));
         }
 
-        // Layers 2 + 3 apply to COMPUTE nodes only. A `Wait` suspends (it does not
-        // spin), so a back-edge into a Wait is a long-lived reactive loop that must
-        // NOT trip loop-detection/stall — it costs nothing idle. The step budget is
-        // the backstop even for a Wait loop.
-        if !matches!(node, Node::Wait { .. }) {
+        // Layers 2 + 3 apply to COMPUTE nodes only. A `Wait` (and a `Human` gate)
+        // suspends (it does not spin), so a back-edge into one is a long-lived
+        // reactive/approval loop that must NOT trip loop-detection/stall — it
+        // costs nothing idle. The step budget is the backstop even for these.
+        if !matches!(node, Node::Wait { .. } | Node::Human { .. }) {
             let v = state.visits.entry(state.at.clone()).or_insert(0);
             *v += 1;
             if *v > MAX_VISITS_PER_NODE {
@@ -624,6 +779,17 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 status,
                 result_from,
             } => {
+                // The terminal step ALWAYS checkpoints (RFC 0021 §8.1) — the
+                // completed lineage is readable history for fork/time-travel.
+                if let Some(reason) = maybe_checkpoint(graph, &ckpt_hash, state, exec, true) {
+                    return DriveResult::Done(GraphOutcome::engine(
+                        GraphStatus::Crashed,
+                        reason,
+                        bb_result(&state.blackboard, None),
+                        state.steps(),
+                        state.tokens(),
+                    ));
+                }
                 let result = bb_result(&state.blackboard, result_from.as_deref());
                 return DriveResult::Done(GraphOutcome::halt(
                     *status,
@@ -638,10 +804,22 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
             Node::Wait {
                 on_uri, timeout_ms, ..
             } => {
+                // A suspension ALWAYS checkpoints (RFC 0021 §8.1) — it is the
+                // durable point a crashed-while-suspended run resumes from.
+                if let Some(reason) = maybe_checkpoint(graph, &ckpt_hash, state, exec, true) {
+                    return DriveResult::Done(GraphOutcome::engine(
+                        GraphStatus::Crashed,
+                        reason,
+                        bb_result(&state.blackboard, None),
+                        state.steps(),
+                        state.tokens(),
+                    ));
+                }
                 return DriveResult::Suspended(Suspension {
                     on_uri: on_uri.clone(),
                     timeout_ms: *timeout_ms,
                     state: state.clone(),
+                    gate: None,
                 });
             }
             // Branch: the first deterministic case whose predicate holds wins (Tier 1,
@@ -674,6 +852,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 output_contract,
                 reads,
                 writes,
+                writes_mode,
                 retry,
                 edges,
                 ..
@@ -687,8 +866,13 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 let Some((val, is_err)) = attempt else {
                     return exhausted(state, "step budget exhausted mid-retry");
                 };
-                let (val, is_err) = clamp_value(val, is_err);
-                write(&mut state.blackboard, writes, val);
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
                 (edge_for(is_err), edges)
             }
             Node::Tool {
@@ -696,6 +880,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 tool,
                 args,
                 writes,
+                writes_mode,
                 retry,
                 edges,
             } => {
@@ -715,8 +900,13 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                         }
                     }
                 };
-                let (val, is_err) = clamp_value(val, is_err);
-                write(&mut state.blackboard, writes, val);
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
                 (edge_for(is_err), edges)
             }
             // Pure data shaping: resolve the value template against the blackboard.
@@ -725,6 +915,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 value,
                 expr,
                 writes,
+                writes_mode,
                 edges,
             } => {
                 let computed = match expr {
@@ -735,10 +926,16 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                     None => super::resolve_refs(value, &state.blackboard),
                 };
                 let (val, is_err) = match computed {
-                    Ok(v) => clamp_value(v, false),
+                    Ok(v) => (v, false),
                     Err(e) => (Value::String(format!("assign error: {e}")), true),
                 };
-                state.blackboard.insert(writes.clone(), val);
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    Some(writes),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
                 (edge_for(is_err), edges)
             }
             // One structured intelligence ask, schema-checked, with bounded
@@ -750,6 +947,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 schema,
                 check,
                 writes,
+                writes_mode,
                 retries,
                 retry,
                 edges,
@@ -782,8 +980,13 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 let Some((val, is_err)) = attempt else {
                     return exhausted(state, "step budget exhausted mid-retry");
                 };
-                let (val, is_err) = clamp_value(val, is_err);
-                write(&mut state.blackboard, writes, val);
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
                 (edge_for(is_err), edges)
             }
             // Fan OUT over an array (the deterministic map primitive): resolve the
@@ -797,6 +1000,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 parallel,
                 on_error,
                 writes,
+                writes_mode,
                 edges,
             } => {
                 let (val, is_err) = match super::resolve_refs(items, &state.blackboard) {
@@ -823,9 +1027,86 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                         true,
                     ),
                 };
-                let (val, is_err) = clamp_value(val, is_err);
-                write(&mut state.blackboard, writes, val);
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
                 (edge_for(is_err), edges)
+            }
+            // Fan OUT over NAMED heterogeneous branches (RFC 0021 §6): run each
+            // branch body concurrently on a scoped board (the same lane pool as
+            // Foreach — composition never multiplies lanes), collecting results
+            // into ONE OBJECT keyed by branch name. Every branch charges a
+            // budget step (pre-charged); body model usage lands on the shared
+            // token pool.
+            Node::Parallel {
+                branches,
+                on_error,
+                writes,
+                writes_mode,
+                edges,
+            } => {
+                let (val, is_err) = match run_parallel(branches, *on_error, state, exec) {
+                    Ok(r) => r,
+                    Err(done) => return *done,
+                };
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
+                (edge_for(is_err), edges)
+            }
+            // A HUMAN GATE (RFC 0021 §7) suspends exactly like a Wait, carrying
+            // the RESOLVED payload so the host can publish it (served resource +
+            // A2A `input-required`). The host resumes with the reply — from an
+            // A2A SendMessage to the waiting task or a `reply_uri` update,
+            // whichever fires first.
+            Node::Human {
+                payload,
+                reply_uri,
+                timeout_ms,
+                edges,
+                ..
+            } => {
+                match super::resolve_refs(payload, &state.blackboard) {
+                    // An unresolvable payload reference is an authoring error:
+                    // emit `error` (authors may route it; unhandled it falls to
+                    // the fail-closed Crashed sink).
+                    Err(e) => {
+                        state.blackboard.insert(
+                            "$gate_error".into(),
+                            Value::String(format!("human payload: {e}")),
+                        );
+                        ("error", edges)
+                    }
+                    Ok(resolved) => {
+                        if let Some(reason) = maybe_checkpoint(graph, &ckpt_hash, state, exec, true)
+                        {
+                            return DriveResult::Done(GraphOutcome::engine(
+                                GraphStatus::Crashed,
+                                reason,
+                                bb_result(&state.blackboard, None),
+                                state.steps(),
+                                state.tokens(),
+                            ));
+                        }
+                        return DriveResult::Suspended(Suspension {
+                            on_uri: reply_uri.clone().unwrap_or_default(),
+                            timeout_ms: *timeout_ms,
+                            state: state.clone(),
+                            gate: Some(GatePayload {
+                                node: state.at.clone(),
+                                payload: resolved,
+                            }),
+                        });
+                    }
+                }
             }
             // Subgraph: inline (sync) through the exec seam — or `async: true`,
             // SPAWNED as a supervised child workflow whose handle is written for
@@ -834,6 +1115,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 graph: sub,
                 async_,
                 writes,
+                writes_mode,
                 edges,
             } => {
                 let (val, is_err) = if *async_ {
@@ -844,8 +1126,13 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 } else {
                     exec.run_subgraph(sub, false, &state.blackboard)
                 };
-                let (val, is_err) = clamp_value(val, is_err);
-                write(&mut state.blackboard, writes, val);
+                let is_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    is_err,
+                );
                 (edge_for(is_err), edges)
             }
             // Join: fan IN — await async-subgraph handles, collecting results
@@ -855,6 +1142,7 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                 handles,
                 timeout_ms,
                 writes,
+                writes_mode,
                 edges,
             } => {
                 let started = std::time::Instant::now();
@@ -893,8 +1181,14 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                         (Value::Array(results), label)
                     }
                 };
-                let (val, _) = clamp_value(val, false);
-                write(&mut state.blackboard, writes, val);
+                let reduce_err = write_reduced(
+                    &mut state.blackboard,
+                    writes.as_deref(),
+                    *writes_mode,
+                    val,
+                    false,
+                );
+                let label = if reduce_err { "error" } else { label };
                 match edges.get(label) {
                     Some(next) => {
                         state.at = next.clone();
@@ -936,6 +1230,20 @@ fn drive_state(graph: &Graph, state: &mut GraphState, exec: &mut dyn GraphExec) 
                     state.tokens(),
                 ));
             }
+        }
+        // A completed superstep (node executed + cursor advanced) is the
+        // periodic checkpoint boundary (RFC 0021 §8.1): the envelope's cursor
+        // is the next UNEXECUTED node, so resume is exactly-once for every
+        // checkpointed node.
+        if let Some(reason) = maybe_checkpoint(graph, &ckpt_hash, state, exec, false) {
+            let result = bb_result(&state.blackboard, None);
+            return DriveResult::Done(GraphOutcome::engine(
+                GraphStatus::Crashed,
+                reason,
+                result,
+                state.steps(),
+                state.tokens(),
+            ));
         }
     }
 }
@@ -1031,6 +1339,66 @@ fn run_foreach(
     ))
 }
 
+/// Execute a `Parallel`'s named branches (RFC 0021 §6): every branch runs on a
+/// scoped board (parent values + `branch` = its name), concurrently on the SAME
+/// lane pool `Foreach` uses ([`super::MAX_FOREACH_PARALLEL`] cap), results
+/// collected into ONE OBJECT keyed by branch name. A failed branch's slot
+/// carries `{"branch","error"}`. `fail_fast` reports the error edge on any
+/// failure; `continue` reports ok iff at least one branch succeeded.
+fn run_parallel(
+    branches: &BTreeMap<String, Graph>,
+    on_error: OnError,
+    state: &mut GraphState,
+    exec: &mut dyn GraphExec,
+) -> Result<(Value, bool), Box<DriveResult>> {
+    // Pre-charge one step per branch (refuse before running anything the
+    // budget can't cover) — the same discipline as the parallel foreach batch.
+    for _ in 0..branches.len() {
+        if !state.budget.step() {
+            return Err(Box::new(exhausted(
+                state,
+                "step budget exhausted (parallel pre-charge)",
+            )));
+        }
+    }
+    let jobs: Vec<(usize, &Graph, Blackboard)> = branches
+        .iter()
+        .enumerate()
+        .map(|(i, (name, g))| {
+            let mut seed = state.blackboard.clone();
+            seed.insert("branch".into(), Value::String(name.clone()));
+            (i, g, seed)
+        })
+        .collect();
+    let lanes = (branches.len() as u32).min(super::MAX_FOREACH_PARALLEL);
+    let mut batch = exec.run_bodies_parallel(jobs, lanes);
+    batch.sort_by_key(|(i, _, _)| *i);
+    if let Some(done) = charge(state, exec) {
+        return Err(Box::new(done));
+    }
+    let names: Vec<&String> = branches.keys().collect();
+    let mut out = serde_json::Map::new();
+    let (mut any_failed, mut any_ok) = (false, false);
+    for (i, v, e) in batch {
+        let name = names.get(i).map(|s| s.as_str()).unwrap_or("?");
+        if e {
+            any_failed = true;
+            out.insert(
+                name.to_string(),
+                serde_json::json!({"branch": name, "error": v}),
+            );
+        } else {
+            any_ok = true;
+            out.insert(name.to_string(), v);
+        }
+    }
+    let is_err = match on_error {
+        OnError::FailFast => any_failed,
+        OnError::Continue => !any_ok,
+    };
+    Ok((Value::Object(out), is_err))
+}
+
 /// The JSON kind name (for the foreach items type error).
 fn kind_of(v: &Value) -> &'static str {
     match v {
@@ -1094,11 +1462,86 @@ fn charge(state: &mut GraphState, exec: &mut dyn GraphExec) -> Option<DriveResul
     )))
 }
 
-/// Write a node's result to its `writes` key (a no-op when the node writes nothing).
-fn write(bb: &mut Blackboard, writes: &Option<String>, val: Value) {
-    if let Some(k) = writes {
-        bb.insert(k.clone(), val);
+/// RFC 0021 §5 — the pure reducer: fold `incoming` into the existing value per
+/// the node's `writes_mode`. A type mismatch is an `Err` (the node takes its
+/// `error` edge), never a silent coercion.
+fn reduce(existing: Option<&Value>, mode: WritesMode, incoming: Value) -> Result<Value, String> {
+    match mode {
+        WritesMode::Overwrite => Ok(incoming),
+        WritesMode::Append => match existing {
+            None => Ok(Value::Array(vec![incoming])),
+            Some(Value::Array(a)) => {
+                let mut a = a.clone();
+                a.push(incoming);
+                Ok(Value::Array(a))
+            }
+            Some(other) => Err(format!(
+                "writes_mode append: existing value is {} (need array or absent)",
+                kind_of(other)
+            )),
+        },
+        WritesMode::Merge => match (existing, incoming) {
+            (None, v) => Ok(v),
+            (Some(Value::Object(e)), Value::Object(inc)) => {
+                let mut m = e.clone();
+                for (k, v) in inc {
+                    m.insert(k, v); // incoming wins per key (shallow)
+                }
+                Ok(Value::Object(m))
+            }
+            (Some(Value::Object(_)), other) => Err(format!(
+                "writes_mode merge: incoming value is {} (need object)",
+                kind_of(&other)
+            )),
+            (Some(other), _) => Err(format!(
+                "writes_mode merge: existing value is {} (need object or absent)",
+                kind_of(other)
+            )),
+        },
+        WritesMode::Union => match existing {
+            None => Ok(Value::Array(vec![incoming])),
+            Some(Value::Array(a)) => {
+                let mut a = a.clone();
+                if !a.contains(&incoming) {
+                    a.push(incoming);
+                }
+                Ok(Value::Array(a))
+            }
+            Some(other) => Err(format!(
+                "writes_mode union: existing value is {} (need array or absent)",
+                kind_of(other)
+            )),
+        },
     }
+}
+
+/// Land a node result on the blackboard through its reducer (RFC 0021 §5),
+/// clamping the REDUCED value (the accumulated value is what must fit). Returns
+/// the final error state: the incoming one, a reduce type error, or an
+/// over-clamp — the error marker lands via overwrite so the author can see it
+/// (reducing a marker into an accumulator would corrupt it silently).
+fn write_reduced(
+    bb: &mut Blackboard,
+    writes: Option<&str>,
+    mode: WritesMode,
+    val: Value,
+    is_err: bool,
+) -> bool {
+    let Some(k) = writes else { return is_err };
+    if is_err {
+        bb.insert(k.to_string(), val);
+        return true;
+    }
+    let reduced = match reduce(bb.get(k), mode, val) {
+        Ok(v) => v,
+        Err(e) => {
+            bb.insert(k.to_string(), Value::String(e));
+            return true;
+        }
+    };
+    let (clamped, oversize) = clamp_value(reduced, false);
+    bb.insert(k.to_string(), clamped);
+    oversize
 }
 
 /// Project the graph result: the `result_from` blackboard value (or null if unset /
@@ -1185,6 +1628,10 @@ mod tests {
         pending_tokens: u64,
         /// deadline_exceeded() turns true once this many calls were made.
         deadline_after_calls: Option<usize>,
+        /// Every envelope `checkpoint_put` received, in order (RFC 0021 §8).
+        checkpoints: Vec<Value>,
+        /// Scripted checkpoint failures, consumed front-first (None = success).
+        checkpoint_errs: std::collections::VecDeque<Option<CheckpointError>>,
     }
 
     impl GraphExec for MockExec {
@@ -1298,6 +1745,22 @@ mod tests {
             match drive(graph, self, 1000) {
                 DriveResult::Done(o) => (o.result, o.status != GraphStatus::Completed),
                 DriveResult::Suspended(_) => (json!("subgraph suspended"), true),
+            }
+        }
+
+        fn checkpoint_put(
+            &mut self,
+            _policy: &super::super::CheckpointPolicy,
+            envelope: &Value,
+        ) -> Result<(), CheckpointError> {
+            self.calls.push(format!(
+                "checkpoint:{}",
+                envelope.get("seq").and_then(Value::as_u64).unwrap_or(0)
+            ));
+            self.checkpoints.push(envelope.clone());
+            match self.checkpoint_errs.pop_front().flatten() {
+                Some(e) => Err(e),
+                None => Ok(()),
             }
         }
     }
@@ -2538,5 +3001,481 @@ mod tests {
         let out = run(&g, &mut exec, 2);
         assert_eq!(out.status, GraphStatus::Exhausted);
         assert_eq!(exec.tool_args.len(), 2, "visit + one retry, then stopped");
+    }
+
+    // ── RFC 0021 §5: write reducers ───────────────────────────────────────────
+
+    #[test]
+    fn reduce_covers_every_mode_and_type_case() {
+        use WritesMode::*;
+        let arr = json!([1, 2]);
+        let obj = json!({"a": 1, "b": 1});
+        // overwrite never errors, always replaces.
+        assert_eq!(reduce(Some(&arr), Overwrite, json!(9)).unwrap(), json!(9));
+        assert_eq!(reduce(None, Overwrite, json!(9)).unwrap(), json!(9));
+        // append: absent → [v]; array → push; non-array existing → type error.
+        assert_eq!(reduce(None, Append, json!(3)).unwrap(), json!([3]));
+        assert_eq!(
+            reduce(Some(&arr), Append, json!(3)).unwrap(),
+            json!([1, 2, 3])
+        );
+        assert!(reduce(Some(&obj), Append, json!(3)).is_err());
+        // merge: absent → v; object+object → shallow, incoming wins; mismatches error.
+        assert_eq!(reduce(None, Merge, obj.clone()).unwrap(), obj);
+        assert_eq!(
+            reduce(Some(&obj), Merge, json!({"b": 2, "c": 3})).unwrap(),
+            json!({"a": 1, "b": 2, "c": 3})
+        );
+        assert!(
+            reduce(Some(&obj), Merge, json!(7)).is_err(),
+            "incoming non-object"
+        );
+        assert!(
+            reduce(Some(&arr), Merge, json!({})).is_err(),
+            "existing non-object"
+        );
+        // union: as append but deep-equal dedup.
+        assert_eq!(reduce(Some(&arr), Union, json!(2)).unwrap(), json!([1, 2]));
+        assert_eq!(
+            reduce(Some(&arr), Union, json!(3)).unwrap(),
+            json!([1, 2, 3])
+        );
+        assert!(reduce(Some(&obj), Union, json!(1)).is_err());
+    }
+
+    #[test]
+    fn append_accumulates_across_a_loop_and_a_mismatch_takes_the_error_edge() {
+        // A counting agent loops: each visit APPENDS its result; the branch exits
+        // once three results accumulated — LangGraph's add-reducer shape.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "work",
+            "nodes": {
+                "work": {"kind": "agent", "instruction": "count", "writes": "acc",
+                         "writes_mode": "append", "edges": {"ok": "route", "error": "fail"}},
+                "route": {"kind": "branch",
+                          "cases": [{"when": {"op": "exists", "key": "acc", "pointer": "/2"}, "goto": "done"}],
+                          "default": "work"},
+                "done": {"kind": "halt", "status": "completed", "result_from": "acc"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec {
+            counting: Some("count".into()),
+            ..MockExec::default()
+        };
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(out.result, json!([{"n": 1}, {"n": 2}, {"n": 3}]));
+
+        // A type mismatch (append onto a non-array) takes the error edge with a
+        // readable marker — never a silent coercion.
+        let g2: Graph = serde_json::from_value(json!({
+            "start": "seed",
+            "nodes": {
+                "seed": {"kind": "assign", "value": {"x": 1}, "writes": "acc",
+                         "edges": {"ok": "app", "error": "fail"}},
+                "app": {"kind": "assign", "value": 2, "writes": "acc",
+                        "writes_mode": "append", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "refused", "result_from": "acc"}
+            }
+        }))
+        .unwrap();
+        let out2 = run(&g2, &mut MockExec::default(), 100);
+        assert_eq!(out2.terminal, Some(TerminalStatus::Refused));
+        assert!(
+            out2.result
+                .as_str()
+                .unwrap_or("")
+                .contains("writes_mode append"),
+            "the error marker names the reducer: {}",
+            out2.result
+        );
+    }
+
+    #[test]
+    fn merge_folds_infer_fragments_into_one_object() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "assign", "value": {"title": "x"}, "writes": "doc",
+                      "writes_mode": "merge", "edges": {"ok": "b", "error": "fail"}},
+                "b": {"kind": "assign", "value": {"body": "y"}, "writes": "doc",
+                      "writes_mode": "merge", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "doc"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap();
+        let out = run(&g, &mut MockExec::default(), 100);
+        assert_eq!(out.result, json!({"title": "x", "body": "y"}));
+    }
+
+    // ── RFC 0021 §6: the parallel node ────────────────────────────────────────
+
+    fn review_parallel(on_error: &str) -> Graph {
+        serde_json::from_value(json!({
+            "start": "fan",
+            "nodes": {
+                "fan": {"kind": "parallel",
+                        "branches": {
+                            "security": {"start": "s", "nodes": {
+                                "s": {"kind": "agent", "instruction": "sec", "writes": "r", "edges": {"ok": "h", "error": "hf"}},
+                                "h": {"kind": "halt", "status": "completed", "result_from": "r"},
+                                "hf": {"kind": "halt", "status": "crashed", "result_from": "r"}}},
+                            "perf": {"start": "p", "nodes": {
+                                "p": {"kind": "agent", "instruction": "perf", "writes": "r", "edges": {"ok": "h", "error": "hf"}},
+                                "h": {"kind": "halt", "status": "completed", "result_from": "r"},
+                                "hf": {"kind": "halt", "status": "crashed", "result_from": "r"}}}
+                        },
+                        "on_error": on_error,
+                        "writes": "reviews", "edges": {"ok": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "reviews"},
+                "fail": {"kind": "halt", "status": "refused", "result_from": "reviews"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn parallel_collects_named_branch_results_into_one_object() {
+        let g = review_parallel("fail_fast");
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        exec.agents
+            .insert("sec".into(), (json!({"issues": 0}), false));
+        exec.agents
+            .insert("perf".into(), (json!({"p99": "2ms"}), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(
+            out.result,
+            json!({"security": {"issues": 0}, "perf": {"p99": "2ms"}})
+        );
+        // Each branch body saw its own name seeded as `branch` (the sequential
+        // fallback runs jobs in BTreeMap order — "perf" then "security", so the
+        // LAST agent call's board carries the security branch's name).
+        assert_eq!(exec.last_blackboard.get("branch"), Some(&json!("security")));
+    }
+
+    #[test]
+    fn parallel_fail_fast_vs_continue_error_policies() {
+        // fail_fast: one failed branch → the error edge, marker in its slot.
+        let g = review_parallel("fail_fast");
+        let mut exec = MockExec::default();
+        exec.agents.insert("sec".into(), (json!("boom"), true));
+        exec.agents
+            .insert("perf".into(), (json!({"ok": true}), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Refused), "error edge");
+        assert_eq!(out.result["security"]["branch"], json!("security"));
+        assert!(out.result["security"]["error"].is_string());
+
+        // continue: ≥1 success → the ok edge, the marker stays in place.
+        let g = review_parallel("continue");
+        let mut exec = MockExec::default();
+        exec.agents.insert("sec".into(), (json!("boom"), true));
+        exec.agents
+            .insert("perf".into(), (json!({"ok": true}), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Completed), "ok edge");
+        assert_eq!(out.result["perf"], json!({"ok": true}));
+        assert!(out.result["security"]["error"].is_string());
+    }
+
+    #[test]
+    fn parallel_precharges_a_step_per_branch() {
+        // Budget 2 covers the fan's two branch pre-charges but not the fan node
+        // visit itself → Exhausted before any branch runs.
+        let g = review_parallel("fail_fast");
+        let mut exec = MockExec::default();
+        let out = run(&g, &mut exec, 2);
+        assert_eq!(out.status, GraphStatus::Exhausted);
+        assert!(exec.calls.is_empty(), "refused before running any branch");
+    }
+
+    #[test]
+    fn parallel_branch_writes_never_leak_to_the_parent_board() {
+        // The branch body writes `r` on ITS scoped board; the parent board only
+        // receives the collected object under `reviews`.
+        let g = review_parallel("fail_fast");
+        let mut exec = MockExec::default();
+        exec.agents.insert("sec".into(), (json!(1), false));
+        exec.agents.insert("perf".into(), (json!(2), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        // `r` was a branch-scope key; the halt projected `reviews` only.
+        assert_eq!(out.result, json!({"security": 1, "perf": 2}));
+    }
+
+    // ── RFC 0021 §7: the human gate ───────────────────────────────────────────
+
+    fn approval_graph() -> Graph {
+        serde_json::from_value(json!({
+            "start": "plan",
+            "nodes": {
+                "plan": {"kind": "assign", "value": {"diff": "+1 -0"}, "writes": "patch",
+                         "edges": {"ok": "gate", "error": "fail"}},
+                "gate": {"kind": "human",
+                         "payload": {"question": "ship it?", "diff": {"$from": "patch", "pointer": "/diff"}},
+                         "reply_uri": "approvals://deploy",
+                         "timeout_ms": 60000,
+                         "writes": "verdict",
+                         "edges": {"replied": "route", "timeout": "escalate", "error": "fail"}},
+                "route": {"kind": "branch",
+                          "cases": [{"when": {"op": "eq", "key": "verdict", "value": "yes"}, "goto": "ship"}],
+                          "default": "escalate"},
+                "ship": {"kind": "halt", "status": "completed", "result_from": "verdict"},
+                "escalate": {"kind": "halt", "status": "refused"},
+                "fail": {"kind": "halt", "status": "crashed"}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_human_gate_suspends_with_the_resolved_payload_and_resumes_on_replied() {
+        let g = approval_graph();
+        assert!(g.validate().is_ok());
+        let mut exec = MockExec::default();
+        let s = match drive(&g, &mut exec, 100) {
+            DriveResult::Suspended(s) => s,
+            DriveResult::Done(o) => panic!("expected a gate suspension, got {o:?}"),
+        };
+        // The suspension carries the gate: the RESOLVED payload ($from applied)
+        // and the reply_uri as the watchable on_uri.
+        let gate = s
+            .gate
+            .as_ref()
+            .expect("a human suspension carries its gate");
+        assert_eq!(gate.node, "gate");
+        assert_eq!(
+            gate.payload,
+            json!({"question": "ship it?", "diff": "+1 -0"})
+        );
+        assert_eq!(s.on_uri, "approvals://deploy");
+
+        // The reply resumes on the `replied` edge; the branch routes on it.
+        let out = match resume(&g, s.state, &mut exec, WaitOutcome::Updated(json!("yes"))) {
+            DriveResult::Done(o) => o,
+            DriveResult::Suspended(_) => panic!("resumed run must complete"),
+        };
+        assert_eq!(out.terminal, Some(TerminalStatus::Completed));
+        assert_eq!(out.result, json!("yes"));
+    }
+
+    #[test]
+    fn a_human_gate_timeout_takes_the_timeout_edge() {
+        let g = approval_graph();
+        let mut exec = MockExec::default();
+        let s = match drive(&g, &mut exec, 100) {
+            DriveResult::Suspended(s) => s,
+            DriveResult::Done(o) => panic!("expected a suspension, got {o:?}"),
+        };
+        let out = match resume(&g, s.state, &mut exec, WaitOutcome::TimedOut) {
+            DriveResult::Done(o) => o,
+            DriveResult::Suspended(_) => panic!("resumed run must complete"),
+        };
+        assert_eq!(out.terminal, Some(TerminalStatus::Refused), "escalate");
+    }
+
+    #[test]
+    fn an_unresolvable_gate_payload_takes_the_error_edge() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "gate",
+            "nodes": {
+                "gate": {"kind": "human",
+                         "payload": {"$from": "nothing_here"},
+                         "timeout_ms": 1000,
+                         "edges": {"replied": "done", "timeout": "done", "error": "fail"}},
+                "done": {"kind": "halt", "status": "completed"},
+                "fail": {"kind": "halt", "status": "refused"}
+            }
+        }))
+        .unwrap();
+        let out = run(&g, &mut MockExec::default(), 100);
+        assert_eq!(out.terminal, Some(TerminalStatus::Refused));
+    }
+
+    #[test]
+    fn a_gate_without_reply_uri_suspends_with_an_empty_watch() {
+        // A2A-only gate: nothing to poll — the host resumes via the injected
+        // reply or the timeout.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "gate",
+            "nodes": {
+                "gate": {"kind": "human", "payload": {"q": 1}, "timeout_ms": 1000,
+                         "writes": "r", "edges": {"replied": "done", "timeout": "done"}},
+                "done": {"kind": "halt", "status": "completed", "result_from": "r"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        let s = match drive(&g, &mut exec, 100) {
+            DriveResult::Suspended(s) => s,
+            DriveResult::Done(o) => panic!("expected a suspension, got {o:?}"),
+        };
+        assert_eq!(s.on_uri, "", "no reply_uri = A2A-only");
+        assert!(s.gate.is_some());
+    }
+
+    // ── RFC 0021 §8: the checkpointer ─────────────────────────────────────────
+
+    fn checkpointed_etl(every: u32, on_error: &str) -> Graph {
+        let mut g = etl();
+        g.checkpoint = Some(super::super::CheckpointPolicy {
+            server: "state".into(),
+            key: "run/{run_id}".into(),
+            every,
+            on_error: serde_json::from_value(json!(on_error)).unwrap(),
+        });
+        g
+    }
+
+    #[test]
+    fn checkpoints_fire_per_superstep_and_carry_a_resumable_slice() {
+        let g = checkpointed_etl(1, "continue");
+        let mut exec = MockExec::default();
+        exec.agents
+            .insert("extract".into(), (json!({"rows": 3}), false));
+        exec.tools
+            .insert("fs.transform".into(), (json!({"clean": true}), false));
+        exec.agents
+            .insert("load".into(), (json!({"loaded": 3}), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        // extract, transform, load advances + the terminal halt = 4 envelopes.
+        assert_eq!(exec.checkpoints.len(), 4);
+        for env in &exec.checkpoints {
+            assert_eq!(env["v"], json!(1));
+            assert_eq!(
+                env["workflow_hash"].as_str().unwrap().len(),
+                64,
+                "sha256 hex"
+            );
+            assert!(env["seq"].as_u64().unwrap() > 0);
+        }
+        // Monotonic seq.
+        let seqs: Vec<u64> = exec
+            .checkpoints
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        // The FIRST envelope's slice resumes: its cursor is the next unexecuted
+        // node (transform), so a fresh exec replays exactly the tail.
+        let slice: GraphState =
+            serde_json::from_value(exec.checkpoints[0]["state"].clone()).unwrap();
+        assert_eq!(slice.at, "transform");
+        let mut exec2 = MockExec::default();
+        exec2
+            .tools
+            .insert("fs.transform".into(), (json!({"clean": true}), false));
+        exec2
+            .agents
+            .insert("load".into(), (json!({"loaded": 99}), false));
+        let out2 = match drive_from(&g, slice, &mut exec2, false) {
+            DriveResult::Done(o) => o,
+            DriveResult::Suspended(_) => panic!("must complete"),
+        };
+        assert_eq!(out2.result, json!({"loaded": 99}));
+        assert_eq!(
+            exec2
+                .calls
+                .iter()
+                .filter(|c| c.starts_with("agent:extract"))
+                .count(),
+            0,
+            "checkpointed nodes are exactly-once — extract never re-ran"
+        );
+        // The resumed run CARRIED the budget: its seqs continue past the slice's.
+        let resumed_first = exec2.checkpoints[0]["seq"].as_u64().unwrap();
+        assert!(resumed_first > seqs[0]);
+    }
+
+    #[test]
+    fn every_n_gates_periodic_checkpoints_but_terminal_always_fires() {
+        let g = checkpointed_etl(10, "continue"); // every=10 → periodic never fires
+        let mut exec = MockExec::default();
+        exec.agents.insert("extract".into(), (json!(1), false));
+        exec.tools.insert("fs.transform".into(), (json!(2), false));
+        exec.agents.insert("load".into(), (json!(3), false));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+        assert_eq!(exec.checkpoints.len(), 1, "the forced terminal one only");
+    }
+
+    #[test]
+    fn checkpoint_failure_policy_continue_vs_halt_vs_conflict() {
+        // continue: a failed write degrades durability, never the run.
+        let g = checkpointed_etl(1, "continue");
+        let mut exec = MockExec::default();
+        exec.agents.insert("extract".into(), (json!(1), false));
+        exec.tools.insert("fs.transform".into(), (json!(2), false));
+        exec.agents.insert("load".into(), (json!(3), false));
+        exec.checkpoint_errs
+            .push_back(Some(CheckpointError::Failed("io".into())));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Completed);
+
+        // halt: the same failure stops the run on the failure path.
+        let g = checkpointed_etl(1, "halt");
+        let mut exec = MockExec::default();
+        exec.agents.insert("extract".into(), (json!(1), false));
+        exec.checkpoint_errs
+            .push_back(Some(CheckpointError::Failed("io".into())));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Crashed);
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("checkpoint write failed")
+        );
+
+        // conflict: ALWAYS fatal, even under continue (the split-brain guard).
+        let g = checkpointed_etl(1, "continue");
+        let mut exec = MockExec::default();
+        exec.agents.insert("extract".into(), (json!(1), false));
+        exec.checkpoint_errs
+            .push_back(Some(CheckpointError::Conflict("newer seq".into())));
+        let out = run(&g, &mut exec, 100);
+        assert_eq!(out.status, GraphStatus::Crashed);
+        assert!(
+            out.reason.as_deref().unwrap_or("").contains("seq conflict"),
+            "{:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn a_suspension_always_checkpoints_and_resume_force_resets_guards() {
+        let g: Graph = serde_json::from_value(json!({
+            "start": "w",
+            "checkpoint": {"server": "state", "every": 100},
+            "nodes": {
+                "w": {"kind": "wait", "on_uri": "x://y", "timeout_ms": 1000,
+                      "edges": {"updated": "done", "timeout": "done"}},
+                "done": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let mut exec = MockExec::default();
+        let s = match drive(&g, &mut exec, 100) {
+            DriveResult::Suspended(s) => s,
+            DriveResult::Done(o) => panic!("expected suspension, got {o:?}"),
+        };
+        assert_eq!(exec.checkpoints.len(), 1, "suspension forces a checkpoint");
+        // drive_from with reset_guards (the --workflow-resume-force path) clears
+        // the visit/progress bookkeeping but keeps the board + budget.
+        let steps_before = s.state.steps();
+        let out = match drive_from(&g, s.state, &mut exec, true) {
+            // Re-entering the wait suspends again (guards reset, budget carried).
+            DriveResult::Suspended(s2) => s2,
+            DriveResult::Done(o) => panic!("expected re-suspension, got {o:?}"),
+        };
+        assert!(out.state.steps() > steps_before, "budget carried over");
     }
 }

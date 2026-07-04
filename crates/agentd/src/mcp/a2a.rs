@@ -63,6 +63,18 @@ const A2A_METHODS: &[&str] = &[
     "SubscribeToTask",
 ];
 
+/// Why a gate reply could not be posted (RFC 0021 §7 — the `SendMessage`
+/// continuation of an existing task).
+pub(crate) enum GateReplyError {
+    /// No such task (→ A2A `TaskNotFound`, -32001).
+    NotFound,
+    /// The task is terminal (→ `UnsupportedOperation`, -32004).
+    Terminal,
+    /// The task is live but no gate is open / a reply is already pending
+    /// (→ `UnsupportedOperation`, -32004, with the reason).
+    NoGate(&'static str),
+}
+
 /// The bare A2A method name — an optional legacy `a2a.` prefix stripped.
 fn bare_a2a(method: &str) -> &str {
     method.strip_prefix("a2a.").unwrap_or(method)
@@ -238,13 +250,15 @@ pub fn terminal_to_state(status: &str) -> TaskState {
 }
 
 /// Map a served-run status string from the registry to an A2A `TaskState`. The
-/// synthetic `"running"` (a still-live run) is `WORKING`; every terminal status
-/// goes through [`terminal_to_state`] (RFC 0020 §5).
+/// synthetic `"running"` (a still-live run) is `WORKING`; the synthetic
+/// `"input-required"` (a live run with an OPEN HUMAN GATE, RFC 0021 §7) is
+/// `INPUT_REQUIRED`; every terminal status goes through [`terminal_to_state`]
+/// (RFC 0020 §5).
 fn state_from_status(status: &str) -> TaskState {
-    if status == "running" {
-        TaskState::Working
-    } else {
-        terminal_to_state(status)
+    match status {
+        "running" => TaskState::Working,
+        "input-required" => TaskState::InputRequired,
+        _ => terminal_to_state(status),
     }
 }
 
@@ -309,9 +323,26 @@ fn instruction_from_message(message: &Value) -> String {
 }
 
 /// Project a served-run snapshot `(status, result)` to an A2A `Task` value, with
-/// the distillate attached only on a terminal-completed run.
+/// the distillate attached only on a terminal-completed run. For an
+/// `input-required` task (RFC 0021 §7) the snapshot value is the OPEN GATE's
+/// payload — it rides `status.message` (an agent-role message the human/peer
+/// inspects), never `artifacts` (the distillate-only invariant holds).
 fn snapshot_to_task(handle: &str, state: TaskState, result: Option<&Value>) -> Value {
     let context_id = context_id_for(handle);
+    if state == TaskState::InputRequired {
+        let mut task = task_object(handle, &context_id, state, None);
+        if let Some(payload) = result {
+            let text = match payload {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            task["status"]["message"] = json!({
+                "role": "agent",
+                "parts": [{ "text": text }],
+            });
+        }
+        return task;
+    }
     let artifact = if state == TaskState::Completed {
         result
     } else {
@@ -444,6 +475,34 @@ fn send_message(req: Request, ctx: &ServeCtx, log: &Logger) -> Response {
             json::INVALID_PARAMS,
             "SendMessage requires a message with at least one non-empty text part",
         );
+    }
+    // A message carrying a `taskId` CONTINUES that task (A2A multi-turn): agentd
+    // supports exactly one continuation shape — the reply to an OPEN HUMAN GATE
+    // (RFC 0021 §7). The text lands on the waiting workflow's blackboard; the
+    // task returns to `working` once the run's reactor fans the reply. Any other
+    // mid-task message is `UnsupportedOperation` (spec §5.4) — agentd runs are
+    // single-instruction; multi-turn conversation is a gateway/peer concern.
+    if let Some(task_id) = message.get("taskId").and_then(Value::as_str) {
+        return match ctx.a2a_gate_reply(task_id, &instruction) {
+            Ok(()) => {
+                log.info(
+                    "a2a.gate_reply",
+                    json!({"task": task_id, "len": instruction.len()}),
+                );
+                let (status, result) = ctx
+                    .a2a_task_snapshot(task_id)
+                    .unwrap_or(("running".into(), None));
+                let task = snapshot_to_task(task_id, state_from_status(&status), result.as_ref());
+                Response::ok(id, json!({ "task": task }))
+            }
+            Err(GateReplyError::NotFound) => Response::err(id, TASK_NOT_FOUND, "task not found"),
+            Err(GateReplyError::Terminal) => Response::err(
+                id,
+                UNSUPPORTED_OPERATION,
+                "task is in a terminal state and cannot receive messages",
+            ),
+            Err(GateReplyError::NoGate(msg)) => Response::err(id, UNSUPPORTED_OPERATION, msg),
+        };
     }
     // A2A `returnImmediately` defaults to FALSE — a config-less SendMessage BLOCKS
     // until the task reaches a terminal state and returns the terminal Task (A2A
@@ -876,6 +935,8 @@ mod tests {
             workflow_reactive: false,
             #[cfg(feature = "workflow")]
             workflow_resume: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume_ref: None,
         }
     }
 

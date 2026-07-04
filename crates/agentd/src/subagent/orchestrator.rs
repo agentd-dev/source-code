@@ -263,16 +263,18 @@ impl Orchestrator {
                 true,
             );
         };
-        let graph: crate::graph::Graph = match serde_json::from_value(graph_val.clone()) {
+        // THE one front door (RFC 0021 §4): strict unknown-field check (fail
+        // closed) → deserialize → structural validation — same pipeline as
+        // `--workflow`, so no entry admits a graph the other would refuse.
+        let graph = match crate::graph::parse_graph(graph_val) {
             Ok(g) => g,
-            Err(e) => return (format!("error: malformed workflow: {e}"), true),
+            Err(errs) => {
+                return (
+                    format!("error: invalid workflow: {}", errs.join("; ")),
+                    true,
+                );
+            }
         };
-        if let Err(errs) = graph.validate() {
-            return (
-                format!("error: invalid workflow: {}", errs.join("; ")),
-                true,
-            );
-        }
         self.workflow_seq += 1;
         let id = format!("w{}", self.workflow_seq);
         let n = graph.nodes.len();
@@ -302,11 +304,20 @@ impl Orchestrator {
         if !self.workflows.contains_key(id) {
             return (format!("error: no such workflow '{id}'"), true);
         }
-        let patch: crate::graph::GraphPatch =
-            match serde_json::from_value(args.get("patch").cloned().unwrap_or_else(|| json!({}))) {
-                Ok(p) => p,
-                Err(e) => return (format!("error: malformed patch: {e}"), true),
-            };
+        let patch_val = args.get("patch").cloned().unwrap_or_else(|| json!({}));
+        // Strict-field hygiene applies to patched-in nodes too (RFC 0021 §4):
+        // a typo'd/unknown field on an added node is refused, never ignored.
+        if let Some(nodes) = patch_val.get("add_nodes") {
+            let probe = json!({"start": "", "nodes": nodes});
+            let errs = crate::graph::strict_check(&probe);
+            if !errs.is_empty() {
+                return (format!("error: patch rejected: {}", errs.join("; ")), true);
+            }
+        }
+        let patch: crate::graph::GraphPatch = match serde_json::from_value(patch_val) {
+            Ok(p) => p,
+            Err(e) => return (format!("error: malformed patch: {e}"), true),
+        };
         let mut patched = self.workflows[id].clone();
         if let Err(errs) = patched.apply_patch(patch) {
             return (format!("error: patch rejected: {}", errs.join("; ")), true);
@@ -588,6 +599,8 @@ impl Orchestrator {
             workflow_reactive: false,
             #[cfg(feature = "workflow")]
             workflow_resume: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume_ref: None,
         };
         let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
         let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
@@ -1410,6 +1423,8 @@ mod tests {
             workflow_reactive: false,
             #[cfg(feature = "workflow")]
             workflow_resume: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume_ref: None,
         }
     }
 

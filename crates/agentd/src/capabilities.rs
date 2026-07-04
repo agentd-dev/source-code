@@ -368,6 +368,25 @@ fn surfaces(cfg: &Config) -> Value {
     if let Some(obj) = s.as_object_mut() {
         obj.insert("claim".into(), json!({ "styles": ["tool", "resource"] }));
     }
+    // RFC 0021 §4/§10: the workflow surface — the graph-language DIALECT this
+    // build speaks (agentctl feature-detects from this, never the version
+    // string), the node-kind set, and whether the MCP checkpointer is wired
+    // (`--workflow-resume` + the `checkpoint` policy). A build without the
+    // feature OMITS the key (capability-absence-not-error, RFC 0015 §2.5).
+    #[cfg(feature = "workflow")]
+    if let Some(obj) = s.as_object_mut() {
+        obj.insert(
+            "workflow".into(),
+            json!({
+                "dialect": crate::graph::DIALECT,
+                "checkpoint": true,
+                "kinds": [
+                    "agent", "tool", "assign", "infer", "branch", "foreach",
+                    "parallel", "join", "wait", "human", "subgraph", "halt",
+                ],
+            }),
+        );
+    }
     // The events ENVELOPE schema version (RFC 0016 §7), emitted ALONGSIDE
     // surfaces.events when the stream is actually served — exactly like
     // metrics/metrics_schema. Sourced from the owning obs module (never hardcoded);

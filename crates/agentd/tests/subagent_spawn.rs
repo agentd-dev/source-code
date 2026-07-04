@@ -52,6 +52,8 @@ fn bogus_payload() -> SpawnPayload {
         workflow_reactive: false,
         #[cfg(feature = "workflow")]
         workflow_resume: None,
+        #[cfg(feature = "workflow")]
+        workflow_resume_ref: None,
     }
 }
 
@@ -107,6 +109,8 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
                     AgentMsg::Result { .. } => "result",
                     AgentMsg::Failed { .. } => "failed",
                     AgentMsg::IntelHealth { .. } => "intel_health",
+                    AgentMsg::Gate { .. } => "gate",
+                    AgentMsg::GateClosed { .. } => "gate_closed",
                 };
                 if m == kind {
                     return true;

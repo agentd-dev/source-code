@@ -15,7 +15,7 @@ use crate::json::{self, Id, Notification, Request, Response};
 use crate::obs::log::Logger;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload, SwapIntel};
 use crate::supervisor::cgroup;
-use crate::supervisor::reactor::{SuperviseResult, supervise_once, supervise_swappable};
+use crate::supervisor::reactor::{SuperviseResult, supervise_gated, supervise_once};
 use crate::supervisor::spawn::{Subagent, spawn};
 use crate::supervisor::tree::NodeId;
 use crate::wire::mcp::method;
@@ -212,6 +212,13 @@ struct ServedSession {
     /// the reload fan-out (via `LiveConfig::fan_swap_intel`) publishes; the reactor
     /// reads + forwards. Cloned into the reactor at launch.
     swap: crate::supervisor::swap::SwapChannel,
+    /// Per-run HUMAN-GATE channel (RFC 0021 §7): the run's reactor records a
+    /// child's opened `human` gate here (the A2A task then projects
+    /// `input-required`, the gate resource serves the payload); an A2A
+    /// `SendMessage` addressed to this task posts the reply, which the reactor
+    /// fans back to the opener child as `ctrl/inject`. The gate parallel of
+    /// `swap`. Cloned into the reactor at launch.
+    gate: crate::supervisor::gate::GateChannel,
     started: Instant,
 }
 
@@ -986,6 +993,7 @@ impl ServeCtx {
                 paused: Arc::new(AtomicBool::new(false)),
                 // A terminal session never runs again, so its swap channel is inert.
                 swap: crate::supervisor::swap::SwapChannel::new(),
+                gate: crate::supervisor::gate::GateChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -1040,9 +1048,38 @@ impl ServeCtx {
     pub(crate) fn a2a_task_snapshot(&self, handle: &str) -> Option<(String, Option<Value>)> {
         let reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         reg.get(handle).map(|s| match &s.status {
-            ServedStatus::Running => ("running".to_string(), None),
+            // A live run with an OPEN HUMAN GATE (RFC 0021 §7) projects the
+            // synthetic `"input-required"` + the gate payload (→ the A2A task's
+            // `status.message`); a gate-less live run is plain `"running"`.
+            ServedStatus::Running => match s.gate.snapshot() {
+                Some((node, payload)) => (
+                    "input-required".to_string(),
+                    Some(json!({"node": node, "payload": payload})),
+                ),
+                None => ("running".to_string(), None),
+            },
             other => a2a_status_and_result(other),
         })
+    }
+
+    /// Post a human/peer reply to a served run's OPEN GATE (RFC 0021 §7 — an A2A
+    /// `SendMessage` carrying this task's id). The run's reactor fans it to the
+    /// opener child as `ctrl/inject`; the workflow resumes on its `replied` edge.
+    pub(crate) fn a2a_gate_reply(
+        &self,
+        handle: &str,
+        reply: &str,
+    ) -> Result<(), crate::mcp::a2a::GateReplyError> {
+        use crate::mcp::a2a::GateReplyError;
+        let reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match reg.get(handle) {
+            None => Err(GateReplyError::NotFound),
+            Some(s) if s.status.is_terminal() => Err(GateReplyError::Terminal),
+            Some(s) => s
+                .gate
+                .post_reply(reply.to_string())
+                .map_err(GateReplyError::NoGate),
+        }
     }
 
     /// Cancel a served run by handle for an A2A `CancelTask`. `Some(true)` = a live
@@ -1076,7 +1113,13 @@ impl ServeCtx {
         reg.iter()
             .map(|(handle, s)| {
                 let (status, result) = match &s.status {
-                    ServedStatus::Running => ("running".to_string(), None),
+                    ServedStatus::Running => match s.gate.snapshot() {
+                        Some((node, payload)) => (
+                            "input-required".to_string(),
+                            Some(json!({"node": node, "payload": payload})),
+                        ),
+                        None => ("running".to_string(), None),
+                    },
                     other => a2a_status_and_result(other),
                 };
                 (handle.clone(), status, result)
@@ -2753,6 +2796,9 @@ fn launch_async_run(
     // The per-run intelligence hot-swap channel (RFC 0018 §5.2): the reload
     // fan-out publishes into it; the run's reactor reads + fans to its children.
     let swap = crate::supervisor::swap::SwapChannel::new();
+    // The per-run human-gate channel (RFC 0021 §7): the reactor records opened
+    // gates; the A2A surface projects + replies through it.
+    let gate = crate::supervisor::gate::GateChannel::new();
     {
         let mut reg = ctx.sessions.lock().unwrap_or_else(|e| e.into_inner());
         evict_if_full(&mut reg);
@@ -2763,6 +2809,7 @@ fn launch_async_run(
                 cancel: Arc::clone(&cancel),
                 paused: Arc::clone(&paused),
                 swap: swap.clone(),
+                gate: gate.clone(),
                 started: Instant::now(),
             },
         );
@@ -2780,7 +2827,7 @@ fn launch_async_run(
         .name(format!("served-run:{handle}"))
         .spawn(move || {
             let _permit = permit; // held for the run's lifetime → bounds live runs
-            let result = supervise_swappable(
+            let result = supervise_gated(
                 exe,
                 &payload,
                 drain,
@@ -2788,6 +2835,7 @@ fn launch_async_run(
                 Some(Arc::clone(&cancel)),
                 Some(Arc::clone(&paused)),
                 Some(swap),
+                Some(gate),
             );
             // Write the terminal status and re-read the cancel flag UNDER the same
             // lock the cancel tool uses, so a cancel that lands while we finish is
@@ -3176,6 +3224,8 @@ mod tests {
             workflow_reactive: false,
             #[cfg(feature = "workflow")]
             workflow_resume: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume_ref: None,
         }
     }
 
@@ -3230,6 +3280,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 paused: Arc::new(AtomicBool::new(false)),
                 swap: crate::supervisor::swap::SwapChannel::new(),
+                gate: crate::supervisor::gate::GateChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -3853,6 +3904,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             swap: crate::supervisor::swap::SwapChannel::new(),
+            gate: crate::supervisor::gate::GateChannel::new(),
             started: Instant::now(),
         };
         let b = session_body("served.0", &s);
@@ -3868,6 +3920,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             swap: crate::supervisor::swap::SwapChannel::new(),
+            gate: crate::supervisor::gate::GateChannel::new(),
             started: Instant::now(),
         };
         let b = session_body("served.0", &s);
@@ -3896,6 +3949,7 @@ mod tests {
                     cancel: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
                     swap: crate::supervisor::swap::SwapChannel::new(),
+                    gate: crate::supervisor::gate::GateChannel::new(),
                     started: Instant::now(),
                 },
             );
@@ -3921,6 +3975,7 @@ mod tests {
                     cancel: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
                     swap: crate::supervisor::swap::SwapChannel::new(),
+                    gate: crate::supervisor::gate::GateChannel::new(),
                     started: Instant::now(),
                 },
             );
@@ -4048,6 +4103,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 paused: Arc::new(AtomicBool::new(false)),
                 swap: crate::supervisor::swap::SwapChannel::new(),
+                gate: crate::supervisor::gate::GateChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -4386,6 +4442,7 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 paused: Arc::new(AtomicBool::new(false)),
                 swap: crate::supervisor::swap::SwapChannel::new(),
+                gate: crate::supervisor::gate::GateChannel::new(),
                 started: Instant::now(),
             },
         );
@@ -5104,6 +5161,7 @@ mod tests {
                     cancel: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
                     swap: crate::supervisor::swap::SwapChannel::new(),
+                    gate: crate::supervisor::gate::GateChannel::new(),
                     started: Instant::now(),
                 },
             );

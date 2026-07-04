@@ -992,3 +992,153 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
         }
     }
 }
+
+/// RFC 0021 §7 end to end — **A2A as the human channel**: a served task's agent
+/// AUTHORS a workflow with a `human` gate (the gate-scripted mock LLM), the gate
+/// opens and the task projects `TASK_STATE_INPUT_REQUIRED` with the payload as
+/// its status message; a spec-conformant `SendMessage` carrying the `taskId`
+/// delivers the human's reply; the workflow resumes and the task completes.
+#[cfg(all(feature = "a2a", feature = "workflow"))]
+#[test]
+fn a_human_gate_projects_input_required_and_resumes_on_an_a2a_reply() {
+    let _serial = e2e_guard(); // process-heavy: run serially
+    let exe = env!("CARGO_BIN_EXE_agentd");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let llm = dir.path().join("llm.addr");
+    let (mut llm_proc, intel) = start_mock_llm(exe, &llm, "gate");
+    let port = free_port();
+    let bind = format!("http://127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{port}");
+    let mut server = Command::new(exe)
+        .args([
+            "--mode",
+            "loop",
+            "--interval",
+            "60s",
+            "--instruction",
+            "serve",
+            "--intelligence",
+        ])
+        .arg(&intel)
+        .arg("--serve-mcp")
+        .arg(&bind)
+        .args(["--log-level", "warn"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server agentd");
+    let peer = Peer::connect(&addr);
+
+    // 1. Dispatch the task async; it starts WORKING.
+    let resp = peer.rpc(
+        r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"parts":[{"text":"run the gated deploy"}]},"configuration":{"returnImmediately":true}}}"#,
+    );
+    let task = &resp["result"]["task"];
+    let handle = task["id"].as_str().expect("task id").to_string();
+    assert_eq!(task["status"]["state"], "TASK_STATE_WORKING");
+
+    // 2. The agent defines + runs the gated workflow; the gate opens → the task
+    //    projects INPUT_REQUIRED, its status message carrying the gate payload.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let gated = loop {
+        let t = peer.rpc(&format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{{"id":"{handle}"}}}}"#
+        ));
+        let state = t["result"]["status"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if state == "TASK_STATE_INPUT_REQUIRED" {
+            break t;
+        }
+        assert!(
+            !crate::a2a_terminal(&state),
+            "task went terminal before the gate opened: {t}"
+        );
+        assert!(Instant::now() < deadline, "gate never opened (last: {t})");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let msg_text = gated["result"]["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        msg_text.contains("approve the deploy?"),
+        "the status message carries the gate payload: {gated}"
+    );
+
+    // 3. The human replies over A2A: a SendMessage CONTINUING the task by id.
+    let reply = peer.rpc(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"SendMessage","params":{{"message":{{"taskId":"{handle}","parts":[{{"text":"yes"}}]}}}}}}"#
+    ));
+    assert!(
+        reply["result"]["task"]["id"].as_str() == Some(handle.as_str()),
+        "the reply returns the continued task: {reply}"
+    );
+
+    // 3b. A SECOND reply while the first is still pending is refused with the
+    //     A2A UnsupportedOperation code (first one wins).
+    let dup = peer.rpc(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"SendMessage","params":{{"message":{{"taskId":"{handle}","parts":[{{"text":"no"}}]}}}}}}"#
+    ));
+    if let Some(code) = dup["error"]["code"].as_i64() {
+        assert_eq!(
+            code, -32004,
+            "duplicate reply → UnsupportedOperation: {dup}"
+        );
+    } // (a fast resume may have already closed the gate — then the dup is a
+    // no-gate refusal with the same code, or the task is already past it)
+
+    // 4. The workflow resumes on `replied`; the run completes.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let t = peer.rpc(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"GetTask","params":{{"id":"{handle}"}}}}"#
+        ));
+        let state = t["result"]["status"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if state == "TASK_STATE_COMPLETED" {
+            let artifact = t["result"]["artifacts"][0]["parts"][0]["text"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                artifact.contains("gate flow complete"),
+                "the distillate landed: {t}"
+            );
+            break;
+        }
+        assert!(
+            state == "TASK_STATE_WORKING" || state == "TASK_STATE_INPUT_REQUIRED",
+            "unexpected state {state}: {t}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "task never completed (last: {t})"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // 5. An unknown taskId reply is TaskNotFound.
+    let ghost = peer.rpc(
+        r#"{"jsonrpc":"2.0","id":6,"method":"SendMessage","params":{"message":{"taskId":"nope","parts":[{"text":"x"}]}}}"#,
+    );
+    assert_eq!(ghost["error"]["code"].as_i64(), Some(-32001), "{ghost}");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = llm_proc.kill();
+    let _ = llm_proc.wait();
+}
+
+/// Whether an A2A wire state string is terminal (test-local helper).
+#[cfg(all(feature = "a2a", feature = "workflow"))]
+fn a2a_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "TASK_STATE_COMPLETED"
+            | "TASK_STATE_FAILED"
+            | "TASK_STATE_CANCELED"
+            | "TASK_STATE_REJECTED"
+    )
+}

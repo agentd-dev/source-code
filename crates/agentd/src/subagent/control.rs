@@ -44,6 +44,70 @@ type PendingSwap = Arc<Mutex<Option<SwapIntel>>>;
 
 type Up = Arc<Mutex<Stdout>>;
 
+/// The child-process HUMAN-GATE bus (RFC 0021 §7) — process-global access to the
+/// control-channel writer + the `Inject` receiver, so the workflow engine (deep
+/// inside `graph::exec`, possibly under the orchestrator's `workflow.run`) can
+/// open a gate and poll for the human's reply without threading handles through
+/// every layer (the child-side parallel of `graph::live`). Installed once by
+/// [`run`] for NON-WARM children only: a warm session's `Inject` stream is its
+/// turn-input channel (`run_warm`), never a gate reply — a gate inside a warm
+/// turn degrades to `reply_uri`/timeout.
+#[cfg(feature = "workflow")]
+pub(crate) mod gatebus {
+    use super::{AgentMsg, Up, send_up};
+    use serde_json::Value;
+    use std::sync::mpsc::Receiver;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Bus {
+        up: Up,
+        inject: Mutex<Receiver<String>>,
+    }
+    // SAFETY-BY-TYPES: Receiver is !Sync; the Mutex restores Sync for the static.
+    static BUS: OnceLock<Bus> = OnceLock::new();
+
+    /// Install the bus (once, at child startup). A second install is a no-op.
+    pub(crate) fn install(up: Up, inject: Receiver<String>) {
+        let _ = BUS.set(Bus {
+            up,
+            inject: Mutex::new(inject),
+        });
+    }
+
+    /// Report an opened gate UP the control channel.
+    pub(crate) fn open(node: &str, payload: &Value) {
+        if let Some(b) = BUS.get() {
+            send_up(
+                &b.up,
+                &AgentMsg::Gate {
+                    node: node.to_string(),
+                    payload: payload.clone(),
+                },
+            );
+        }
+    }
+
+    /// Poll (non-blocking) for a human reply delivered as `ControlMsg::Inject`.
+    pub(crate) fn try_reply() -> Option<String> {
+        let b = BUS.get()?;
+        let rx = b.inject.lock().unwrap_or_else(|e| e.into_inner());
+        rx.try_recv().ok()
+    }
+
+    /// Report the gate resolved (`via` = `"reply"` | `"uri"` | `"timeout"`).
+    pub(crate) fn close(node: &str, via: &str) {
+        if let Some(b) = BUS.get() {
+            send_up(
+                &b.up,
+                &AgentMsg::GateClosed {
+                    node: node.to_string(),
+                    via: via.to_string(),
+                },
+            );
+        }
+    }
+}
+
 /// The subagent entry point. Returns the process exit code.
 pub fn run() -> i32 {
     install_pdeathsig();
@@ -107,6 +171,21 @@ pub fn run() -> i32 {
         Arc::clone(&pending_swap),
         log.ctx().clone(),
     );
+
+    // A NON-WARM child hands its `Inject` stream to the gate bus (RFC 0021 §7):
+    // a workflow `human` node deep in this child polls it for the human's reply.
+    // A warm session keeps the stream — it is its turn-input channel.
+    #[cfg_attr(not(feature = "workflow"), allow(unused_mut))]
+    let mut inject_rx = Some(inject_rx);
+    #[cfg(feature = "workflow")]
+    if !payload.warm {
+        gatebus::install(
+            Arc::clone(&up),
+            inject_rx
+                .take()
+                .expect("inject_rx handed to the gate bus once"),
+        );
+    }
 
     send_up(&up, &AgentMsg::Ready);
     log.info(
@@ -206,7 +285,9 @@ pub fn run() -> i32 {
             &mut orch,
             &cancel,
             &paused,
-            &inject_rx,
+            inject_rx
+                .as_ref()
+                .expect("a warm session keeps its inject stream"),
             &pending_swap,
             &up,
             &log,
@@ -712,6 +793,9 @@ fn run_workflow_child(
                             "on_uri": s.on_uri,
                             "timeout_ms": s.timeout_ms,
                             "state": s.state,
+                            // A HUMAN GATE's published face (RFC 0021 §7) rides
+                            // the suspension so the daemon can surface it.
+                            "gate": s.gate,
                         }}
                     }),
                     scheduled: Vec::new(),
@@ -721,6 +805,56 @@ fn run_workflow_child(
                 crate::exit::SUCCESS
             }
         };
+    }
+
+    // Checkpoint resume (RFC 0021 §8.4): fetch the envelope from the named
+    // checkpointer server, verify the workflow hash, and drive from the restored
+    // slice — board, budget, and visit counts carry over. A hash mismatch is a
+    // REFUSAL (the graph is not the one the state was taken from), overridable
+    // only by the explicit `--workflow-resume-force`.
+    if let Some(r) = &payload.workflow_resume_ref {
+        let state = match fetch_resume_state(graph, r, intel, servers, &model, payload, log) {
+            Ok(s) => s,
+            Err(reason) => {
+                log.error(
+                    "workflow.resume.refused",
+                    serde_json::json!({"err": reason}),
+                );
+                let outcome = Outcome {
+                    status: TerminalStatus::Refused,
+                    partial: false,
+                    result: serde_json::Value::String(reason),
+                    scheduled: Vec::new(),
+                    subscriptions: Vec::new(),
+                };
+                send_up(up, &AgentMsg::Result { outcome });
+                return crate::exit::REFUSED;
+            }
+        };
+        log.info(
+            "workflow.resume",
+            serde_json::json!({
+                "server": r.server, "key": r.key, "seq": r.seq,
+                "at": state.at, "steps": state.steps(), "tokens": state.tokens(),
+            }),
+        );
+        let entry_tokens = state.tokens();
+        let o = crate::graph::drive_connected_from(
+            graph,
+            state,
+            r.force, // graph-edit-and-continue resets the progress guards
+            intel,
+            servers,
+            &model,
+            payload.limits.max_steps,
+            payload.limits.max_tokens,
+            wall,
+            deadline,
+            Some(factory),
+            Some(&mut orch),
+            log,
+        );
+        return finish_workflow_child(o, entry_tokens, up, log);
     }
 
     let o = drive_connected(
@@ -738,6 +872,69 @@ fn run_workflow_child(
     );
 
     finish_workflow_child(o, 0, up, log)
+}
+
+/// Fetch + verify a checkpoint envelope (RFC 0021 §8.4): `state.get {key[,seq]}`
+/// on the checkpointer server, envelope version check, workflow-hash
+/// verification (skipped under `force`), and the run-slice extraction. Every
+/// failure is a REFUSAL string (exit 5) — resuming from nothing/a foreign graph
+/// is a semantic refusal, not a crash.
+#[cfg(feature = "workflow")]
+fn fetch_resume_state(
+    graph: &crate::graph::Graph,
+    r: &crate::subagent::protocol::WorkflowResumeRef,
+    intel: &IntelClient,
+    servers: &[McpClient],
+    model: &str,
+    payload: &SpawnPayload,
+    log: &Logger,
+) -> Result<crate::graph::GraphState, String> {
+    use crate::graph::{GraphExec, SessionExec};
+    let key = r.key.replace("{run_id}", &payload.telemetry.run_id);
+    let mut args = serde_json::json!({"key": key});
+    if let Some(seq) = r.seq {
+        args["seq"] = seq.into();
+    }
+    let wall = Duration::from_millis(payload.limits.deadline_ms.max(1));
+    let mut exec = SessionExec::new(
+        intel,
+        servers,
+        log,
+        model,
+        payload.limits.max_steps,
+        payload.limits.max_tokens,
+        wall,
+    );
+    let (val, is_err) = exec.call_tool(&r.server, "state.get", &args);
+    if is_err {
+        return Err(format!(
+            "workflow-resume: state.get on '{}' failed: {val}",
+            r.server
+        ));
+    }
+    let envelope = val.get("state").unwrap_or(&val);
+    if envelope.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(format!(
+            "workflow-resume: unsupported envelope version (want v=1): {}",
+            envelope
+                .get("v")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        ));
+    }
+    let want = crate::graph::workflow_hash(graph);
+    let got = envelope
+        .get("workflow_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !r.force && got != want {
+        return Err(format!(
+            "workflow-resume: workflow hash mismatch (checkpoint {got}, supplied graph {want}) — \
+             the state was not taken from this graph; --workflow-resume-force overrides"
+        ));
+    }
+    serde_json::from_value(envelope.get("state").cloned().unwrap_or_default())
+        .map_err(|e| format!("workflow-resume: bad run slice in envelope: {e}"))
 }
 
 /// Map a terminal [`GraphOutcome`] onto the child result contract: GraphStatus →

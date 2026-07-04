@@ -57,8 +57,11 @@ fn handle(mut stream: TcpStream, script: &str) {
         return;
     };
     // A `role:tool` message means the model already called a tool, so the next
-    // turn is a final answer.
-    let saw_tool_result = body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\"");
+    // turn is a final answer. The `gate` script needs the COUNT (define → run →
+    // final is a three-phase conversation).
+    let tool_results =
+        body.matches("\"role\":\"tool\"").count() + body.matches("\"role\": \"tool\"").count();
+    let saw_tool_result = tool_results > 0;
     // `slow`/`hang`: hold the response so the calling subagent stays alive in the
     // model call — `slow` (5s) lets the chaos suite catch a live subagent before
     // collapsing the tree; `hang` (long) keeps a run alive so a cancel/drain test
@@ -77,7 +80,25 @@ fn handle(mut stream: TcpStream, script: &str) {
         }
         other => other,
     };
-    let payload = response_json(script, saw_tool_result);
+    // RFC 0021 §7 e2e: the model AUTHORS a workflow with a `human` gate, runs
+    // it (the run blocks while the gate awaits the A2A reply), then answers.
+    let payload = if script == "gate" {
+        match tool_results {
+            0 => tool_call(
+                "workflow.define",
+                r#"{"workflow":{"start":"gate","nodes":{
+                    "gate":{"kind":"human","payload":{"question":"approve the deploy?"},
+                            "timeout_ms":30000,"writes":"verdict",
+                            "edges":{"replied":"done","timeout":"esc"}},
+                    "done":{"kind":"halt","status":"completed","result_from":"verdict"},
+                    "esc":{"kind":"halt","status":"refused"}}}}"#,
+            ),
+            1 => tool_call("workflow.run", r#"{"workflow_id":"w1"}"#),
+            _ => final_answer("gate flow complete"),
+        }
+    } else {
+        response_json(script, saw_tool_result)
+    };
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),

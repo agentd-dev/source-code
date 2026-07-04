@@ -159,21 +159,159 @@ pub fn drive_connected(
     .with_deadline(deadline)
     .with_factory(factory)
     .with_spawner(spawner);
-    let mut result = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
+    let first = drive_budgeted(graph, &mut exec, GRAPH_MAX_STEPS, max_tokens);
+    drive_suspensions(graph, first, &mut exec, servers, log)
+}
+
+/// [`drive_connected`] from a RESTORED checkpoint slice (RFC 0021 §8.4 —
+/// `--workflow-resume`): the envelope's cursor/board/budget/visits carry over;
+/// `reset_guards` (the `--workflow-resume-force` path) clears the visit +
+/// progress bookkeeping, keeping board and budget.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_connected_from(
+    graph: &Graph,
+    state: super::GraphState,
+    reset_guards: bool,
+    intel: &IntelClient,
+    servers: &[McpClient],
+    model: &str,
+    max_steps: u32,
+    max_tokens: u64,
+    node_timeout: Duration,
+    deadline: Option<Instant>,
+    factory: Option<ExecFactory>,
+    spawner: Option<&mut Orchestrator>,
+    log: &Logger,
+) -> GraphOutcome {
+    let mut exec = SessionExec::new(
+        intel,
+        servers,
+        log,
+        model,
+        max_steps,
+        max_tokens,
+        node_timeout,
+    )
+    .with_deadline(deadline)
+    .with_factory(factory)
+    .with_spawner(spawner);
+    let first = super::drive_from(graph, state, &mut exec, reset_guards);
+    drive_suspensions(graph, first, &mut exec, servers, log)
+}
+
+/// The blocking suspension loop behind [`drive_connected`]: resolve each `Wait`
+/// in-process (block-until-update-or-timeout), and each `Human` gate (RFC 0021
+/// §7) by publishing it on the child's gate bus (→ A2A `input-required` on the
+/// served task) and racing the injected reply against `reply_uri` and the
+/// timeout — first signal wins.
+fn drive_suspensions(
+    graph: &Graph,
+    mut result: DriveResult,
+    exec: &mut SessionExec,
+    servers: &[McpClient],
+    log: &Logger,
+) -> GraphOutcome {
     loop {
         match result {
             DriveResult::Done(outcome) => return outcome,
             DriveResult::Suspended(s) => {
-                log.info(
-                    "workflow.wait",
-                    serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms}),
-                );
-                let outcome =
-                    wait_for_uri(servers, &s.on_uri, Duration::from_millis(s.timeout_ms), log);
-                result = resume(graph, s.state, &mut exec, outcome);
+                let timeout = Duration::from_millis(s.timeout_ms);
+                let outcome = match &s.gate {
+                    Some(g) => {
+                        log.info(
+                            "workflow.gate.open",
+                            serde_json::json!({
+                                "node": g.node,
+                                "reply_uri": (!s.on_uri.is_empty()).then_some(&s.on_uri),
+                                "timeout_ms": s.timeout_ms,
+                            }),
+                        );
+                        crate::subagent::control::gatebus::open(&g.node, &g.payload);
+                        let (outcome, via) =
+                            wait_for_reply_or_uri(servers, &s.on_uri, timeout, log);
+                        crate::subagent::control::gatebus::close(&g.node, via);
+                        log.info(
+                            "workflow.gate.close",
+                            serde_json::json!({"node": g.node, "via": via}),
+                        );
+                        outcome
+                    }
+                    None => {
+                        log.info(
+                            "workflow.wait",
+                            serde_json::json!({"on_uri": s.on_uri, "timeout_ms": s.timeout_ms}),
+                        );
+                        wait_for_uri(servers, &s.on_uri, timeout, log)
+                    }
+                };
+                result = resume(graph, s.state, exec, outcome);
             }
         }
     }
+}
+
+/// Race a HUMAN GATE's resume paths (RFC 0021 §7): a reply injected down the
+/// control channel (an A2A `SendMessage` to the waiting task), an update on
+/// `reply_uri` (empty = A2A-only), or the timeout — first signal wins, the
+/// other is disarmed. The reply text is parsed as JSON when it is JSON, else
+/// carried as a string (the author `Branch`es on it either way).
+fn wait_for_reply_or_uri(
+    servers: &[McpClient],
+    reply_uri: &str,
+    timeout: Duration,
+    log: &Logger,
+) -> (WaitOutcome, &'static str) {
+    use crate::wire::mcp::method;
+    // Arm the optional resource path. A uri no server can watch degrades to the
+    // reply/timeout paths (fail open, like `wait_for_uri`).
+    let server = (!reply_uri.is_empty())
+        .then(|| {
+            servers
+                .iter()
+                .find(|s| s.capabilities().supports_subscribe() && s.subscribe(reply_uri).is_ok())
+        })
+        .flatten();
+    if !reply_uri.is_empty() && server.is_none() {
+        log.warn(
+            "workflow.gate.unwatchable",
+            serde_json::json!({"uri": reply_uri}),
+        );
+    }
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        if Instant::now() >= deadline {
+            break (WaitOutcome::TimedOut, "timeout");
+        }
+        // Path 1: the injected human reply (ControlMsg::Inject via the gate bus).
+        if let Some(reply) = crate::subagent::control::gatebus::try_reply() {
+            let val = serde_json::from_str::<Value>(&reply).unwrap_or(Value::String(reply));
+            break (WaitOutcome::Updated(val), "reply");
+        }
+        // Path 2: the reply_uri update (notify-then-read).
+        if let Some(server) = server {
+            let hit = server.drain_notifications().into_iter().any(|n| {
+                n.method == method::NOTIFY_RESOURCES_UPDATED
+                    && n.params
+                        .as_ref()
+                        .and_then(|p| p.get("uri"))
+                        .and_then(Value::as_str)
+                        == Some(reply_uri)
+            });
+            if hit {
+                let content = server
+                    .read_resource_within(reply_uri, Duration::from_secs(5))
+                    .map(|r| r.text())
+                    .unwrap_or_default();
+                let val = serde_json::from_str::<Value>(&content).unwrap_or(Value::String(content));
+                break (WaitOutcome::Updated(val), "uri");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if let Some(server) = server {
+        let _ = server.unsubscribe(reply_uri);
+    }
+    outcome
 }
 
 /// Drive (or RESUME) one reactive step against already-connected clients,
@@ -654,10 +792,30 @@ impl GraphExec for SessionExec<'_> {
         seeds: Vec<(usize, Blackboard)>,
         parallel: u32,
     ) -> Vec<(usize, Value, bool)> {
+        // The homogeneous fan-out is the heterogeneous one with one body: the
+        // SAME lane engine runs both (RFC 0021 §6 — one pool, one discipline).
+        let jobs: Vec<(usize, &Graph, Blackboard)> =
+            seeds.into_iter().map(|(i, seed)| (i, body, seed)).collect();
+        self.run_bodies_parallel(jobs, parallel)
+    }
+
+    /// The shared lane engine (Foreach items + Parallel branches): up to
+    /// `parallel` worker threads, EACH building its own intelligence + MCP
+    /// connections from the [`ExecFactory`] recipe (no live client crosses a
+    /// thread), pulling `(index, body, seed)` jobs off a shared queue. Per-job
+    /// deadline checks; every lane's model usage folds back into this exec's
+    /// pending tokens, so the workflow's shared pool still accounts for the
+    /// whole batch. Without a factory, degrades to sequential on this exec's
+    /// connections.
+    fn run_bodies_parallel(
+        &mut self,
+        jobs: Vec<(usize, &Graph, Blackboard)>,
+        parallel: u32,
+    ) -> Vec<(usize, Value, bool)> {
         let Some(factory) = self.factory.clone() else {
-            return seeds
+            return jobs
                 .into_iter()
-                .map(|(i, seed)| {
+                .map(|(i, body, seed)| {
                     let (v, e) = self.drive_body(body, seed);
                     (i, v, e)
                 })
@@ -667,8 +825,8 @@ impl GraphExec for SessionExec<'_> {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        let lanes = (parallel as usize).min(seeds.len()).max(1);
-        let queue: Mutex<VecDeque<(usize, Blackboard)>> = Mutex::new(seeds.into());
+        let lanes = (parallel as usize).min(jobs.len()).max(1);
+        let queue: Mutex<VecDeque<(usize, &Graph, Blackboard)>> = Mutex::new(jobs.into());
         let out: Mutex<Vec<(usize, Value, bool)>> = Mutex::new(Vec::new());
         let lane_tokens = AtomicU64::new(0);
         let deadline = self.deadline;
@@ -722,7 +880,7 @@ impl GraphExec for SessionExec<'_> {
                     .with_deadline(deadline);
                     loop {
                         let item = queue.lock().expect("foreach queue").pop_front();
-                        let Some((i, seed)) = item else { break };
+                        let Some((i, body, seed)) = item else { break };
                         if deadline.is_some_and(|d| Instant::now() >= d) {
                             out.lock().expect("foreach out").push((
                                 i,
@@ -745,7 +903,7 @@ impl GraphExec for SessionExec<'_> {
         let mut results = out.into_inner().expect("foreach out");
         // Items no lane processed (every lane failed to connect) are errors, not
         // silent drops.
-        for (i, _) in queue.into_inner().expect("foreach queue") {
+        for (i, _, _) in queue.into_inner().expect("foreach queue") {
             results.push((
                 i,
                 Value::String("no foreach lane available (all lanes failed to connect)".into()),
@@ -753,6 +911,51 @@ impl GraphExec for SessionExec<'_> {
             ));
         }
         results
+    }
+
+    /// Persist one checkpoint envelope (RFC 0021 §8.3): `state.put {key, seq,
+    /// state}` on the policy's server (found by name among this exec's
+    /// connections). `{run_id}` interpolates from the run's log identity. A
+    /// refused write (`{ok:false}` — a newer seq exists, so a SECOND writer owns
+    /// the key) and a transport/tool failure are both `Err`; the driver applies
+    /// the policy's `on_error`. Success and failure both emit telemetry.
+    fn checkpoint_put(
+        &mut self,
+        policy: &super::CheckpointPolicy,
+        envelope: &Value,
+    ) -> Result<(), super::CheckpointError> {
+        use super::CheckpointError;
+        let started = Instant::now();
+        let key = policy.key.replace("{run_id}", &self.log.ctx().run_id);
+        let seq = envelope.get("seq").cloned().unwrap_or(Value::Null);
+        let args = serde_json::json!({"key": key, "seq": seq, "state": envelope});
+        let (val, is_err) = self.call_tool(&policy.server, "state.put", &args);
+        let refused = val.get("ok").and_then(Value::as_bool) == Some(false);
+        if is_err || refused {
+            let err = if refused {
+                CheckpointError::Conflict(format!(
+                    "a newer seq owns key {key:?} (latest: {})",
+                    val.get("latest").cloned().unwrap_or(Value::Null)
+                ))
+            } else {
+                CheckpointError::Failed(format!("state.put: {val}"))
+            };
+            self.log.warn(
+                "workflow.checkpoint.fail",
+                serde_json::json!({"server": policy.server, "seq": seq, "err": format!("{err:?}")}),
+            );
+            return Err(err);
+        }
+        self.log.info(
+            "workflow.checkpoint",
+            serde_json::json!({
+                "server": policy.server,
+                "seq": seq,
+                "bytes": envelope.to_string().len(),
+                "ms": started.elapsed().as_millis() as u64,
+            }),
+        );
+        Ok(())
     }
 }
 

@@ -644,18 +644,23 @@ fn load_workflow(path: &str, log: &Logger) -> Result<agentd::graph::Graph, i32> 
             return Err(exit::USAGE);
         }
     };
-    let graph: agentd::graph::Graph = match serde_json::from_str(&text) {
-        Ok(g) => g,
+    let raw: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("agentd: invalid workflow JSON in '{path}': {e}");
             return Err(exit::USAGE);
         }
     };
-    if let Err(errs) = graph.validate() {
-        eprintln!("agentd: invalid workflow '{path}': {}", errs.join("; "));
-        return Err(exit::USAGE);
+    // THE one front door (RFC 0021 §4): strict unknown-field check (fail
+    // closed) → deserialize → structural validation — same pipeline as
+    // `workflow.define`, so no entry admits a graph the other would refuse.
+    match agentd::graph::parse_graph(&raw) {
+        Ok(g) => Ok(g),
+        Err(errs) => {
+            eprintln!("agentd: invalid workflow '{path}': {}", errs.join("; "));
+            Err(exit::USAGE)
+        }
     }
-    Ok(graph)
 }
 
 #[cfg(feature = "workflow")]
@@ -675,6 +680,10 @@ fn run_workflow(cfg: &Config, log: &Logger) -> i32 {
     // carries the workflow detail (status/reason/steps/tokens) in the result.
     let mut payload = root_payload(cfg);
     payload.workflow = Some(graph);
+    // Checkpoint resume (RFC 0021 §8.4): the operator's `--workflow-resume
+    // server:key[@seq]` rides the payload; the CHILD fetches + verifies the
+    // envelope after connecting (the supervisor never talks MCP).
+    payload.workflow_resume_ref = cfg.workflow_resume.clone();
     run_supervised_once(cfg, log, payload)
 }
 
@@ -776,6 +785,8 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         workflow_reactive: false,
         #[cfg(feature = "workflow")]
         workflow_resume: None,
+        #[cfg(feature = "workflow")]
+        workflow_resume_ref: None,
     }
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pub mod budget;
 pub mod cgroup;
+pub mod gate;
 pub mod kill;
 pub mod liveness;
 pub mod reactor;

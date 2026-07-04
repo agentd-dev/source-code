@@ -27,11 +27,19 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod driver;
+mod sha;
 pub use driver::{
-    Blackboard, DriveResult, GraphBudget, GraphExec, GraphOutcome, GraphState, GraphStatus,
-    JoinWait, MAX_VALUE_BYTES, Suspension, WaitOutcome, drive, drive_budgeted, drive_seeded,
-    resume,
+    Blackboard, CheckpointError, DriveResult, GatePayload, GraphBudget, GraphExec, GraphOutcome,
+    GraphState, GraphStatus, JoinWait, MAX_VALUE_BYTES, Suspension, WaitOutcome, drive,
+    drive_budgeted, drive_from, drive_seeded, resume,
 };
+
+/// The workflow-identity hash (RFC 0021 §8.2): SHA-256 of the canonical
+/// (compact, key-sorted — `BTreeMap` serialization) graph JSON. A checkpoint
+/// envelope binds the graph it was taken from; resume refuses a mismatch.
+pub fn workflow_hash(graph: &Graph) -> String {
+    sha::sha256_hex(serde_json::to_string(graph).unwrap_or_default().as_bytes())
+}
 
 /// The LIVE reactive-workflow snapshot (`agent://workflow`): the daemon
 /// publishes each transition (driving / suspended / terminal) into a process-
@@ -61,7 +69,8 @@ pub mod live {
 
 mod exec;
 pub use exec::{
-    ExecFactory, GRAPH_MAX_STEPS, SessionExec, drive_connected, drive_connected_once, drive_pinned,
+    ExecFactory, GRAPH_MAX_STEPS, SessionExec, drive_connected, drive_connected_from,
+    drive_connected_once, drive_pinned,
 };
 
 /// A node identifier within a graph (author-chosen, stable across a run).
@@ -83,6 +92,14 @@ pub const MAX_KEYS: usize = 64;
 /// Maximum `Subgraph` nesting depth.
 pub const MAX_SUBGRAPH_DEPTH: u32 = 4;
 
+/// The workflow dialect this build speaks (RFC 0021 §4). Dialect 1 is the
+/// baseline ten-kind surface; dialect 2 adds `writes_mode` reducers, the
+/// `parallel` and `human` kinds, and the `checkpoint` policy. A graph declaring
+/// a HIGHER dialect than this is refused at define time (fail closed); a graph
+/// merely *using* dialect-2 constructs without declaring is auto-upgraded (the
+/// construct itself is the signal — the field exists for humans and tooling).
+pub const DIALECT: u32 = 2;
+
 /// The authored workflow graph — PURE TOPOLOGY (pivot Phase 7). Serde-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -90,6 +107,88 @@ pub struct Graph {
     pub start: NodeId,
     /// The node set keyed by id (`BTreeMap` = deterministic iteration + wire order).
     pub nodes: BTreeMap<NodeId, Node>,
+    /// The declared workflow dialect (RFC 0021 §4). Default 1; serialized only
+    /// when explicitly non-default, so dialect-1 graphs stay byte-identical.
+    #[serde(
+        default = "default_dialect",
+        skip_serializing_if = "is_default_dialect"
+    )]
+    pub dialect: u32,
+    /// Durable-state policy (RFC 0021 §8): checkpoint the run slice to an MCP
+    /// checkpointer server after supersteps. Absent = no checkpointing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointPolicy>,
+}
+
+fn default_dialect() -> u32 {
+    1
+}
+fn is_default_dialect(d: &u32) -> bool {
+    *d == 1
+}
+
+/// The graph-level checkpoint policy (RFC 0021 §8.1): after every `every`
+/// successful supersteps (and ALWAYS at a suspension and at the terminal step),
+/// the driver serializes the run slice and calls `state.put` on the named MCP
+/// `server`. `key` identifies the run's state lineage (`{run_id}` interpolates).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointPolicy {
+    /// The declared `--mcp` server name implementing the checkpointer tool
+    /// profile (`state.put`/`state.get`/`state.list`).
+    pub server: String,
+    /// The state key; `{run_id}` interpolates the run id. A stable
+    /// operator-chosen key makes the run resumable across pod replacements.
+    #[serde(default = "default_checkpoint_key")]
+    pub key: String,
+    /// Checkpoint after every N successful supersteps (>= 1).
+    #[serde(default = "default_checkpoint_every")]
+    pub every: u32,
+    /// What a failed checkpoint write does to the run.
+    #[serde(default)]
+    pub on_error: CheckpointOnError,
+}
+
+fn default_checkpoint_key() -> String {
+    "run/{run_id}".into()
+}
+fn default_checkpoint_every() -> u32 {
+    1
+}
+
+/// Failure policy for a checkpoint write (RFC 0021 §8.1): `continue` (default —
+/// durability degrades, the run does not; telemetry records the failure) or
+/// `halt` (the run takes the standard failure path — for workflows where replay
+/// is worse than stopping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointOnError {
+    #[default]
+    Continue,
+    Halt,
+}
+
+/// How a node's result lands on its `writes` key (RFC 0021 §5) — the reducer.
+/// Pure and synchronous; a type mismatch takes the node's `error` edge, never a
+/// silent coercion. The reduce happens BEFORE the value clamp (the accumulated
+/// value is what must fit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WritesMode {
+    /// Replace the existing value (the dialect-1 behavior).
+    #[default]
+    Overwrite,
+    /// Absent → `[v]`; array → push; anything else is a type error.
+    Append,
+    /// Absent → `v`; both objects → shallow merge (incoming wins per key);
+    /// anything else is a type error.
+    Merge,
+    /// As `append`, but skip the incoming value if an existing element is
+    /// deep-equal to it.
+    Union,
+}
+
+fn is_overwrite(m: &WritesMode) -> bool {
+    *m == WritesMode::Overwrite
 }
 
 /// An ADDITIVE patch to a stored graph (pivot Phase 7 · P5 — the `workflow.patch` self
@@ -137,8 +236,12 @@ pub const MAX_INFER_RETRIES: u32 = 3;
 /// month-long walk.
 pub const MAX_FOREACH_ITEMS: usize = 1024;
 /// `Foreach` parallel-lane ceiling (each lane is a worker with its own
-/// intelligence + MCP connections).
+/// intelligence + MCP connections). `Parallel` branches ride the SAME lane
+/// ceiling — one pool, so composition never multiplies concurrency (RFC 0021 §6).
 pub const MAX_FOREACH_PARALLEL: u32 = 8;
+/// `Parallel` branch ceiling (RFC 0021 §6) — named heterogeneous branches per
+/// node; concurrency is separately capped by [`MAX_FOREACH_PARALLEL`].
+pub const MAX_PARALLEL_BRANCHES: usize = 16;
 
 /// An in-node retry policy for the effectful kinds (`Agent`/`Tool`/`Infer`): on an
 /// error result, re-run the SAME node up to `max` more times (each attempt charges
@@ -335,6 +438,8 @@ pub enum Node {
         reads: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limits: Option<NodeLimits>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +459,8 @@ pub enum Node {
         args: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<Retry>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -373,6 +480,8 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expr: Option<String>,
         writes: String,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
@@ -396,6 +505,8 @@ pub enum Node {
         check: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         /// Validation-feedback re-asks (default 1, capped at [`MAX_INFER_RETRIES`]).
         #[serde(default = "default_infer_retries")]
         retries: u32,
@@ -424,6 +535,28 @@ pub enum Node {
         on_error: OnError,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        edges: BTreeMap<EdgeLabel, NodeId>,
+    },
+    /// Run NAMED heterogeneous branch bodies CONCURRENTLY in-process (RFC 0021
+    /// §6) — the "review it three ways at once" primitive. Each branch is a full
+    /// sub-graph run on a scoped board (a clone of the parent board with
+    /// `branch` = its name seeded — like `Foreach`'s lanes, body writes do NOT
+    /// flow back); results are collected into ONE OBJECT keyed by branch name
+    /// (a failed branch's slot carries `{"branch","error"}`). Branches share
+    /// the run's step budget and token pool; concurrency rides the same lane
+    /// ceiling as `Foreach` ([`MAX_FOREACH_PARALLEL`]), so composition never
+    /// multiplies lanes. Emits `ok`/`error` per [`OnError`].
+    Parallel {
+        branches: BTreeMap<String, Graph>,
+        #[serde(default)]
+        on_error: OnError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
@@ -442,6 +575,8 @@ pub enum Node {
         timeout_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
@@ -460,7 +595,35 @@ pub enum Node {
         on_uri: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        edges: BTreeMap<EdgeLabel, NodeId>,
+    },
+    /// A HUMAN GATE (RFC 0021 §7): publish `payload` for a human (or any A2A
+    /// peer) to inspect, signal `input-required` on the served A2A task, and
+    /// SUSPEND until a reply arrives — via an A2A `SendMessage` addressed to
+    /// the waiting task, or an update on `reply_uri` (any MCP resource; the
+    /// standard notify-then-read). First signal wins. The reply value lands on
+    /// `writes`; the node emits `replied`/`timeout`. Without a serving build
+    /// this degrades to a plain wait on `reply_uri` — never a hard requirement
+    /// on `--serve-mcp`. The gate deliberately does NOT encode approve/reject:
+    /// the reply is data, and routing on it is a `Branch`.
+    Human {
+        /// The gate payload (may embed `{"$from": …}` references) — what the
+        /// human is being asked to look at.
+        #[serde(default)]
+        payload: Value,
+        /// An MCP resource whose update carries the reply (optional when the
+        /// run is served over A2A — `SendMessage` is the other resume path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_uri: Option<String>,
+        timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
@@ -477,6 +640,8 @@ pub enum Node {
         async_: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writes: Option<String>,
+        #[serde(default, skip_serializing_if = "is_overwrite")]
+        writes_mode: WritesMode,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         edges: BTreeMap<EdgeLabel, NodeId>,
     },
@@ -815,8 +980,10 @@ impl Node {
             | Node::Assign { edges, .. }
             | Node::Infer { edges, .. }
             | Node::Foreach { edges, .. }
+            | Node::Parallel { edges, .. }
             | Node::Join { edges, .. }
             | Node::Wait { edges, .. }
+            | Node::Human { edges, .. }
             | Node::Subgraph { edges, .. } => edges.values().collect(),
             Node::Branch {
                 cases,
@@ -849,8 +1016,10 @@ impl Node {
             | Node::Assign { edges, .. }
             | Node::Infer { edges, .. }
             | Node::Foreach { edges, .. }
+            | Node::Parallel { edges, .. }
             | Node::Join { edges, .. }
             | Node::Wait { edges, .. }
+            | Node::Human { edges, .. }
             | Node::Subgraph { edges, .. } => edges,
             Node::Branch { .. } => return Err("cannot add an edge to a Branch (use cases)".into()),
             Node::Halt { .. } => return Err("cannot add an edge to a Halt (it terminates)".into()),
@@ -871,12 +1040,37 @@ impl Node {
             | Node::Tool { writes, .. }
             | Node::Infer { writes, .. }
             | Node::Foreach { writes, .. }
+            | Node::Parallel { writes, .. }
             | Node::Join { writes, .. }
             | Node::Wait { writes, .. }
+            | Node::Human { writes, .. }
             | Node::Subgraph { writes, .. } => writes.as_deref(),
             Node::Assign { writes, .. } => Some(writes),
             _ => None,
         }
+    }
+
+    /// This node's write reducer (RFC 0021 §5); `Overwrite` for non-writing kinds.
+    pub(crate) fn writes_mode(&self) -> WritesMode {
+        match self {
+            Node::Agent { writes_mode, .. }
+            | Node::Tool { writes_mode, .. }
+            | Node::Assign { writes_mode, .. }
+            | Node::Infer { writes_mode, .. }
+            | Node::Foreach { writes_mode, .. }
+            | Node::Parallel { writes_mode, .. }
+            | Node::Join { writes_mode, .. }
+            | Node::Wait { writes_mode, .. }
+            | Node::Human { writes_mode, .. }
+            | Node::Subgraph { writes_mode, .. } => *writes_mode,
+            Node::Branch { .. } | Node::Halt { .. } => WritesMode::Overwrite,
+        }
+    }
+
+    /// Does this node use a dialect-2 construct (RFC 0021 §4 auto-upgrade signal)?
+    fn uses_dialect2(&self) -> bool {
+        matches!(self, Node::Parallel { .. } | Node::Human { .. })
+            || self.writes_mode() != WritesMode::Overwrite
     }
 
     /// This node's in-node retry policy, if any (the effectful kinds only).
@@ -1028,9 +1222,66 @@ impl Graph {
                     // nesting depth Subgraph does.
                     body.validate_into(depth + 1, errs);
                 }
+                Node::Parallel { branches, .. } => {
+                    if branches.is_empty() {
+                        errs.push(format!("Parallel node {id:?} has no branches"));
+                    }
+                    if branches.len() > MAX_PARALLEL_BRANCHES {
+                        errs.push(format!(
+                            "Parallel node {id:?} has {} branches (max {MAX_PARALLEL_BRANCHES})",
+                            branches.len()
+                        ));
+                    }
+                    for (name, body) in branches {
+                        if name.trim().is_empty() {
+                            errs.push(format!("Parallel node {id:?} has an empty branch name"));
+                        }
+                        body.validate_into(depth + 1, errs);
+                    }
+                }
+                Node::Human {
+                    timeout_ms,
+                    reply_uri,
+                    ..
+                } => {
+                    if *timeout_ms == 0 {
+                        errs.push(format!("Human node {id:?} has timeout_ms=0 (must be > 0)"));
+                    }
+                    if let Some(u) = reply_uri
+                        && u.trim().is_empty()
+                    {
+                        errs.push(format!(
+                            "Human node {id:?} has an empty reply_uri (omit it to rely on A2A)"
+                        ));
+                    }
+                }
                 Node::Subgraph { graph, .. } => graph.validate_into(depth + 1, errs),
                 _ => {}
             }
+        }
+        // RFC 0021 §4: a declared dialect above this build's is refused; §8.1:
+        // the checkpoint policy must be sane (the server-name existence check
+        // happens at run wiring, where the configured set is known).
+        if depth == 0 {
+            if self.dialect > DIALECT {
+                errs.push(format!(
+                    "workflow dialect {} is not supported by this build (max {DIALECT})",
+                    self.dialect
+                ));
+            }
+            if let Some(cp) = &self.checkpoint {
+                if cp.server.trim().is_empty() {
+                    errs.push("checkpoint.server must name a configured MCP server".into());
+                }
+                if cp.key.trim().is_empty() {
+                    errs.push("checkpoint.key must be non-empty".into());
+                }
+                if cp.every == 0 {
+                    errs.push("checkpoint.every must be >= 1".into());
+                }
+            }
+        } else if self.checkpoint.is_some() {
+            errs.push("checkpoint policy is root-only (found on a nested graph)".into());
         }
         if edge_count > MAX_EDGES {
             errs.push(format!("graph has {edge_count} edges (max {MAX_EDGES})"));
@@ -1089,6 +1340,29 @@ impl Graph {
         Ok(())
     }
 
+    /// The graph's EFFECTIVE dialect (RFC 0021 §4): the declared field, upgraded
+    /// to 2 when any node (at any nesting depth) uses a dialect-2 construct —
+    /// the construct itself is the signal.
+    pub fn effective_dialect(&self) -> u32 {
+        fn any_d2(g: &Graph) -> bool {
+            g.checkpoint.is_some()
+                || g.nodes.values().any(|n| {
+                    n.uses_dialect2()
+                        || match n {
+                            Node::Foreach { body, .. } => any_d2(body),
+                            Node::Subgraph { graph, .. } => any_d2(graph),
+                            Node::Parallel { branches, .. } => branches.values().any(any_d2),
+                            _ => false,
+                        }
+                })
+        }
+        if any_d2(self) {
+            self.dialect.max(2)
+        } else {
+            self.dialect
+        }
+    }
+
     /// BFS/DFS from `start`; true if any reachable node is a `Halt`.
     fn reaches_halt(&self) -> bool {
         let mut seen = BTreeSet::new();
@@ -1109,6 +1383,205 @@ impl Graph {
         }
         false
     }
+}
+
+/// STRICT node-field validation over the RAW graph JSON (RFC 0021 §4.1, fail
+/// closed). Serde's internally-tagged enums cannot `deny_unknown_fields`, so an
+/// unknown field on a known kind would deserialize SILENTLY — and a dialect-2
+/// field like `writes_mode` on an older build would silently overwrite where
+/// the author wrote append. This walker compares each node object's keys
+/// against the kind's allowlist (recursing into `foreach.body`,
+/// `subgraph.graph`, and `parallel.branches`) so a typo'd or future field is a
+/// DEFINE-TIME error, never a semantic change. Predicate/args/value/payload
+/// interiors are data, not dialect — they are not walked.
+pub fn strict_check(graph_json: &Value) -> Vec<String> {
+    /// Per-kind allowed field sets (must track the [`Node`] enum exactly —
+    /// `tests::strict_allowlists_track_the_node_enum` round-trips every kind).
+    fn allowed(kind: &str) -> Option<&'static [&'static str]> {
+        Some(match kind {
+            "agent" => &[
+                "kind",
+                "instruction",
+                "output_contract",
+                "reads",
+                "writes",
+                "writes_mode",
+                "limits",
+                "retry",
+                "edges",
+            ],
+            "tool" => &[
+                "kind",
+                "server",
+                "tool",
+                "args",
+                "writes",
+                "writes_mode",
+                "retry",
+                "edges",
+            ],
+            "assign" => &["kind", "value", "expr", "writes", "writes_mode", "edges"],
+            "infer" => &[
+                "kind",
+                "prompt",
+                "reads",
+                "schema",
+                "check",
+                "writes",
+                "writes_mode",
+                "retries",
+                "retry",
+                "edges",
+            ],
+            "foreach" => &[
+                "kind",
+                "items",
+                "body",
+                "parallel",
+                "on_error",
+                "writes",
+                "writes_mode",
+                "edges",
+            ],
+            "parallel" => &[
+                "kind",
+                "branches",
+                "on_error",
+                "writes",
+                "writes_mode",
+                "edges",
+            ],
+            "join" => &[
+                "kind",
+                "handles",
+                "timeout_ms",
+                "writes",
+                "writes_mode",
+                "edges",
+            ],
+            "branch" => &["kind", "cases", "default", "semantic"],
+            "wait" => &[
+                "kind",
+                "on_uri",
+                "writes",
+                "writes_mode",
+                "timeout_ms",
+                "edges",
+            ],
+            "human" => &[
+                "kind",
+                "payload",
+                "reply_uri",
+                "timeout_ms",
+                "writes",
+                "writes_mode",
+                "edges",
+            ],
+            "subgraph" => &["kind", "graph", "async", "writes", "writes_mode", "edges"],
+            "halt" => &["kind", "status", "result_from"],
+            _ => return None, // unknown kind — serde will refuse it with its own error
+        })
+    }
+
+    fn check_node(path: &str, node: &Value, errs: &mut Vec<String>) {
+        let Some(obj) = node.as_object() else {
+            return; // serde will refuse a non-object node
+        };
+        let Some(kind) = obj.get("kind").and_then(Value::as_str) else {
+            return; // serde will refuse a missing/typed kind
+        };
+        let Some(allow) = allowed(kind) else {
+            return;
+        };
+        for key in obj.keys() {
+            if !allow.contains(&key.as_str()) {
+                errs.push(format!(
+                    "node {path:?} ({kind}): unknown field {key:?} (allowed: {})",
+                    allow.join(", ")
+                ));
+            }
+        }
+        // Recurse into nested graph bodies.
+        match kind {
+            "foreach" => {
+                if let Some(body) = obj.get("body") {
+                    check_graph(&format!("{path}.body"), body, errs);
+                }
+            }
+            "subgraph" => {
+                if let Some(g) = obj.get("graph") {
+                    check_graph(&format!("{path}.graph"), g, errs);
+                }
+            }
+            "parallel" => {
+                if let Some(branches) = obj.get("branches").and_then(Value::as_object) {
+                    for (name, g) in branches {
+                        check_graph(&format!("{path}.branches.{name}"), g, errs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_graph(path: &str, graph: &Value, errs: &mut Vec<String>) {
+        let Some(obj) = graph.as_object() else {
+            return;
+        };
+        const GRAPH_KEYS: &[&str] = &["start", "nodes", "dialect", "checkpoint"];
+        for key in obj.keys() {
+            if !GRAPH_KEYS.contains(&key.as_str()) {
+                errs.push(format!(
+                    "graph {path:?}: unknown field {key:?} (allowed: {})",
+                    GRAPH_KEYS.join(", ")
+                ));
+            }
+        }
+        if let Some(cp) = obj.get("checkpoint").and_then(Value::as_object) {
+            const CP_KEYS: &[&str] = &["server", "key", "every", "on_error"];
+            for key in cp.keys() {
+                if !CP_KEYS.contains(&key.as_str()) {
+                    errs.push(format!(
+                        "graph {path:?} checkpoint: unknown field {key:?} (allowed: {})",
+                        CP_KEYS.join(", ")
+                    ));
+                }
+            }
+        }
+        if let Some(nodes) = obj.get("nodes").and_then(Value::as_object) {
+            for (id, node) in nodes {
+                check_node(
+                    &if path.is_empty() {
+                        id.clone()
+                    } else {
+                        format!("{path}.{id}")
+                    },
+                    node,
+                    errs,
+                );
+            }
+        }
+    }
+
+    let mut errs = Vec::new();
+    check_graph("", graph_json, &mut errs);
+    errs
+}
+
+/// THE one front door for a graph entering agentd from raw JSON (RFC 0021 §4):
+/// strict-field check (fail closed on unknown fields) → deserialize →
+/// structural [`Graph::validate`]. Every entry point (`--workflow` file,
+/// `workflow.define`, `workflow.patch` nodes) routes here so no path can admit
+/// a graph the others would refuse.
+pub fn parse_graph(graph_json: &Value) -> Result<Graph, Vec<String>> {
+    let strict = strict_check(graph_json);
+    if !strict.is_empty() {
+        return Err(strict);
+    }
+    let graph: Graph =
+        serde_json::from_value(graph_json.clone()).map_err(|e| vec![format!("parse: {e}")])?;
+    graph.validate()?;
+    Ok(graph)
 }
 
 #[cfg(test)]
@@ -1242,6 +1715,7 @@ mod tests {
                     output_contract: None,
                     reads: vec![],
                     writes: None,
+                    writes_mode: WritesMode::Overwrite,
                     limits: None,
                     retry: None,
                     edges,
@@ -1251,9 +1725,210 @@ mod tests {
         let g = Graph {
             start: "h".into(),
             nodes,
+            dialect: 1,
+            checkpoint: None,
         };
         let errs = g.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("max")), "{errs:?}");
+    }
+
+    // ── RFC 0021 §4: dialect hygiene ──────────────────────────────────────────
+
+    #[test]
+    fn strict_check_rejects_unknown_fields_on_every_kind() {
+        // The §5 hazard verbatim: `writes_mode` misspelled would silently
+        // overwrite where the author wrote append — strict_check catches it.
+        let errs = strict_check(&json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "assign", "value": 1, "writes": "x",
+                      "write_mode": "append", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }));
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("write_mode"), "{errs:?}");
+
+        // Recursion: a typo inside a foreach body / subgraph / parallel branch
+        // is found with its path.
+        let errs = strict_check(&json!({
+            "start": "f",
+            "nodes": {
+                "f": {"kind": "foreach", "items": [1], "body": {
+                    "start": "b", "nodes": {
+                        "b": {"kind": "tool", "server": "s", "tool": "t",
+                              "arguments": {}, "edges": {"ok": "h"}},
+                        "h": {"kind": "halt", "status": "completed"}
+                    }}, "edges": {"ok": "h2"}},
+                "h2": {"kind": "halt", "status": "completed"}
+            }
+        }));
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].contains("f.body.b") && errs[0].contains("arguments"),
+            "{errs:?}"
+        );
+
+        // Root + checkpoint keys are strict too.
+        let errs = strict_check(&json!({
+            "start": "h", "node": {}, "checkpoint": {"server": "s", "ttl": 5},
+            "nodes": {"h": {"kind": "halt", "status": "completed"}}
+        }));
+        assert_eq!(errs.len(), 2, "{errs:?}");
+
+        // A clean dialect-2 graph passes.
+        let errs = strict_check(&json!({
+            "start": "p", "dialect": 2,
+            "checkpoint": {"server": "state", "key": "k", "every": 2, "on_error": "halt"},
+            "nodes": {
+                "p": {"kind": "parallel", "branches": {"a": {"start": "h", "nodes": {
+                        "h": {"kind": "halt", "status": "completed"}}}},
+                      "writes": "r", "writes_mode": "merge", "edges": {"ok": "g"}},
+                "g": {"kind": "human", "payload": {}, "reply_uri": "u://r",
+                      "timeout_ms": 1, "writes": "v", "edges": {"replied": "h", "timeout": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }));
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn parse_graph_is_the_one_front_door() {
+        // strict error → refused before deserialization.
+        let errs = parse_graph(&json!({
+            "start": "h",
+            "nodes": {"h": {"kind": "halt", "status": "completed", "results_from": "x"}}
+        }))
+        .unwrap_err();
+        assert!(errs[0].contains("results_from"));
+        // unknown KIND → serde's fail-closed error surfaces as parse.
+        let errs = parse_graph(&json!({
+            "start": "h", "nodes": {"h": {"kind": "hlat", "status": "completed"}}
+        }))
+        .unwrap_err();
+        assert!(errs[0].starts_with("parse:"), "{errs:?}");
+        // structural validation still runs (no reachable halt, dangling edge…).
+        let errs = parse_graph(&json!({
+            "start": "a",
+            "nodes": {"a": {"kind": "assign", "value": 1, "writes": "x", "edges": {"ok": "a"}}}
+        }))
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("Halt")), "{errs:?}");
+    }
+
+    #[test]
+    fn dialect_gating_and_auto_upgrade() {
+        // A future dialect is refused (fail closed).
+        let errs = parse_graph(&json!({
+            "start": "h", "dialect": 3,
+            "nodes": {"h": {"kind": "halt", "status": "completed"}}
+        }))
+        .unwrap_err();
+        assert!(errs[0].contains("dialect 3"), "{errs:?}");
+
+        // Using a dialect-2 construct without declaring auto-upgrades.
+        let g: Graph = serde_json::from_value(json!({
+            "start": "a",
+            "nodes": {
+                "a": {"kind": "assign", "value": 1, "writes": "x",
+                      "writes_mode": "append", "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(g.dialect, 1, "declared");
+        assert_eq!(g.effective_dialect(), 2, "upgraded by the construct");
+
+        // A plain dialect-1 graph stays 1 — and round-trips byte-identically
+        // (no dialect/checkpoint/writes_mode keys appear on the wire).
+        let g = sample();
+        assert_eq!(g.effective_dialect(), 1);
+        let wire = serde_json::to_value(&g).unwrap();
+        assert!(wire.get("dialect").is_none());
+        assert!(wire.get("checkpoint").is_none());
+        assert!(
+            !serde_json::to_string(&wire)
+                .unwrap()
+                .contains("writes_mode"),
+            "default reducers are invisible on the wire"
+        );
+    }
+
+    #[test]
+    fn checkpoint_policy_is_validated_and_root_only() {
+        let errs = parse_graph(&json!({
+            "start": "h",
+            "checkpoint": {"server": " ", "key": "", "every": 0},
+            "nodes": {"h": {"kind": "halt", "status": "completed"}}
+        }))
+        .unwrap_err();
+        assert_eq!(errs.len(), 3, "{errs:?}");
+
+        // A nested checkpoint (inside a subgraph body) is refused.
+        let errs = parse_graph(&json!({
+            "start": "s",
+            "nodes": {
+                "s": {"kind": "subgraph", "graph": {
+                        "start": "h", "checkpoint": {"server": "x"},
+                        "nodes": {"h": {"kind": "halt", "status": "completed"}}},
+                      "edges": {"ok": "h2"}},
+                "h2": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("root-only")), "{errs:?}");
+    }
+
+    #[test]
+    fn parallel_validation_caps_branches_and_recurses() {
+        // Empty branch set refused.
+        let errs = parse_graph(&json!({
+            "start": "p",
+            "nodes": {
+                "p": {"kind": "parallel", "branches": {}, "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("no branches")), "{errs:?}");
+        // A broken body inside a branch is found.
+        let errs = parse_graph(&json!({
+            "start": "p",
+            "nodes": {
+                "p": {"kind": "parallel",
+                      "branches": {"a": {"start": "missing", "nodes": {
+                          "x": {"kind": "halt", "status": "completed"}}}},
+                      "edges": {"ok": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("start node")), "{errs:?}");
+        // Human validation: timeout_ms=0 refused.
+        let errs = parse_graph(&json!({
+            "start": "g",
+            "nodes": {
+                "g": {"kind": "human", "payload": {}, "timeout_ms": 0,
+                      "edges": {"replied": "h", "timeout": "h"}},
+                "h": {"kind": "halt", "status": "completed"}
+            }
+        }))
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("timeout_ms=0")), "{errs:?}");
+    }
+
+    #[test]
+    fn workflow_hash_is_stable_and_content_sensitive() {
+        let g = sample();
+        let h1 = workflow_hash(&g);
+        let h2 = workflow_hash(&g.clone());
+        assert_eq!(h1, h2, "deterministic");
+        assert_eq!(h1.len(), 64);
+        let mut g2 = g.clone();
+        g2.start = g2.start.clone(); // no-op → same hash
+        assert_eq!(workflow_hash(&g2), h1);
+        g2.nodes.remove(&g2.nodes.keys().next().unwrap().clone());
+        assert_ne!(workflow_hash(&g2), h1, "content-sensitive");
     }
 
     #[test]

@@ -603,6 +603,11 @@ pub struct Config {
     /// (pivot Phase 7 · P6). `None` unless a workflow is pinned.
     #[cfg(feature = "workflow")]
     pub workflow_file: Option<String>,
+    /// Resume a pinned workflow from a checkpoint (RFC 0021 §8.4):
+    /// `--workflow-resume <server>:<key>[@seq]` (+ `--workflow-resume-force`).
+    /// The child fetches + verifies the envelope after connecting.
+    #[cfg(feature = "workflow")]
+    pub workflow_resume: Option<crate::subagent::protocol::WorkflowResumeRef>,
     pub serve_mcp: Option<String>,
     /// TLS server cert / key PEM **file paths** for an `https://` serve target
     /// (pivot Phase 2). Required when serving TLS; the file *contents* (a private
@@ -775,6 +780,8 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(25),
             #[cfg(feature = "workflow")]
             workflow_file: None,
+            #[cfg(feature = "workflow")]
+            workflow_resume: None,
             serve_mcp: None,
             serve_cert: None,
             serve_key: None,
@@ -1083,6 +1090,10 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_WORKFLOW") {
             c.workflow_file = Some((*v).to_string());
         }
+        #[cfg(feature = "workflow")]
+        if let Some(v) = envmap.get("AGENTD_WORKFLOW_RESUME") {
+            c.workflow_resume = Some(parse_workflow_resume(v)?);
+        }
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
@@ -1259,6 +1270,31 @@ impl Config {
                 "--cgroup-pids-max" => c.cgroup_pids_max = Some(take("--cgroup-pids-max")?),
                 #[cfg(feature = "workflow")]
                 "--workflow" => c.workflow_file = Some(take("--workflow")?),
+                #[cfg(feature = "workflow")]
+                "--workflow-resume" => {
+                    // Order-independent with --workflow-resume-force: a force
+                    // remembered from either side survives.
+                    let force = c.workflow_resume.as_ref().is_some_and(|r| r.force);
+                    let mut r = parse_workflow_resume(&take("--workflow-resume")?)?;
+                    r.force = r.force || force;
+                    c.workflow_resume = Some(r);
+                }
+                #[cfg(feature = "workflow")]
+                "--workflow-resume-force" => {
+                    match c.workflow_resume.as_mut() {
+                        Some(r) => r.force = true,
+                        // Order-independent: remember the force for a later
+                        // --workflow-resume (validated below to require one).
+                        None => {
+                            c.workflow_resume = Some(crate::subagent::protocol::WorkflowResumeRef {
+                                server: String::new(),
+                                key: String::new(),
+                                seq: None,
+                                force: true,
+                            })
+                        }
+                    }
+                }
                 "--serve-mcp" => c.serve_mcp = Some(take("--serve-mcp")?),
                 "--serve-cert" => c.serve_cert = Some(take("--serve-cert")?),
                 "--serve-key" => c.serve_key = Some(take("--serve-key")?),
@@ -1713,6 +1749,28 @@ impl Config {
         {
             if self.mode == Mode::Workflow && self.workflow_file.is_none() {
                 return Err(usage("--mode workflow requires --workflow <file>".into()));
+            }
+            // Checkpoint resume (RFC 0021 §8.4): only meaningful for a pinned
+            // workflow run, and the named checkpointer must be a configured
+            // server — both misconfigs fail here, in ms, pre-network.
+            if let Some(r) = &self.workflow_resume {
+                if r.server.is_empty() {
+                    return Err(usage(
+                        "--workflow-resume-force requires --workflow-resume <server>:<key>[@seq]"
+                            .into(),
+                    ));
+                }
+                if self.mode != Mode::Workflow {
+                    return Err(usage(
+                        "--workflow-resume is only valid with --mode workflow".into(),
+                    ));
+                }
+                if !self.mcp_servers.iter().any(|s| s.name == r.server) {
+                    return Err(usage(format!(
+                        "--workflow-resume names server '{}', which is not a configured --mcp server",
+                        r.server
+                    )));
+                }
             }
             if self.workflow_file.is_some()
                 && self.mode != Mode::Workflow
@@ -2557,6 +2615,41 @@ fn apply_config_file(
     Ok(())
 }
 
+/// Parse `--workflow-resume <server>:<key>[@seq]` (RFC 0021 §8.4). The server
+/// is the configured `--mcp` name of the checkpointer; the key identifies the
+/// state lineage (`{run_id}` interpolates later); `@seq` pins a specific
+/// envelope (fork/time-travel) — latest when absent.
+#[cfg(feature = "workflow")]
+fn parse_workflow_resume(
+    spec: &str,
+) -> Result<crate::subagent::protocol::WorkflowResumeRef, ConfigError> {
+    let (server, rest) = spec.split_once(':').ok_or_else(|| {
+        usage(format!(
+            "--workflow-resume: want <server>:<key>[@seq] (got: {spec})"
+        ))
+    })?;
+    let (key, seq) = match rest.rsplit_once('@') {
+        Some((k, s)) => {
+            let seq: u64 = s
+                .parse()
+                .map_err(|_| usage(format!("--workflow-resume: bad @seq {s:?} (want a number)")))?;
+            (k, Some(seq))
+        }
+        None => (rest, None),
+    };
+    if server.trim().is_empty() || key.trim().is_empty() {
+        return Err(usage(format!(
+            "--workflow-resume: server and key must be non-empty (got: {spec})"
+        )));
+    }
+    Ok(crate::subagent::protocol::WorkflowResumeRef {
+        server: server.to_string(),
+        key: key.to_string(),
+        seq,
+        force: false,
+    })
+}
+
 fn usage(msg: String) -> ConfigError {
     ConfigError::Usage(format!("agentd: {msg}"))
 }
@@ -2627,6 +2720,8 @@ fn help_text() -> String {
          MODE / TRIGGERS:\n\
          \x20 --mode once|loop|reactive|schedule|workflow   (default once)\n\
          \x20 --workflow <FILE>           pinned workflow JSON, driven by --mode workflow (needs --features workflow; or AGENT_WORKFLOW)\n\
+         \x20 --workflow-resume <REF>     resume from a checkpoint: <server>:<key>[@seq] (needs --mode workflow; or AGENT_WORKFLOW_RESUME)\n\
+         \x20 --workflow-resume-force     override the workflow-hash check (graph-edit-and-continue)\n\
          \x20 --subscribe <uri>           subscribe to an MCP resource (repeatable)\n\
          \x20 --continue <uri>            subscribe, routed to one warm session (repeatable)\n\
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
@@ -2844,6 +2939,104 @@ mod tests {
         assert_eq!(c.mode, Mode::Workflow);
         assert_eq!(c.workflow_file.as_deref(), Some("/tmp/g.json"));
         assert!(c.instruction.as_deref().unwrap_or("").is_empty());
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_resume_parses_and_validates(/* RFC 0021 §8.4 */) {
+        let intel_only = vec![(
+            "AGENTD_INTELLIGENCE".to_string(),
+            "https://intel.example".to_string(),
+        )];
+        // Full form, with a configured checkpointer server: server:key@seq.
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "workflow",
+                "--workflow",
+                "/tmp/g.json",
+                "--mcp",
+                "state=https://ckpt.internal/mcp",
+                "--workflow-resume",
+                "state:run/abc@17",
+                "--workflow-resume-force",
+            ]),
+            &intel_only,
+        )
+        .unwrap();
+        let r = c.workflow_resume.expect("parsed");
+        assert_eq!(r.server, "state");
+        assert_eq!(r.key, "run/abc");
+        assert_eq!(r.seq, Some(17));
+        assert!(r.force);
+
+        // Force is order-independent (force first, then the ref).
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "workflow",
+                "--workflow",
+                "/tmp/g.json",
+                "--mcp",
+                "state=https://ckpt.internal/mcp",
+                "--workflow-resume-force",
+                "--workflow-resume",
+                "state:run/abc",
+            ]),
+            &intel_only,
+        )
+        .unwrap();
+        assert!(c.workflow_resume.unwrap().force);
+
+        // Misconfigs are exit-2-shaped errors, pre-network: bad spec, force
+        // without a ref, a non-workflow mode, an unconfigured server name.
+        for bad in [
+            vec![
+                "--mode",
+                "workflow",
+                "--workflow",
+                "/g",
+                "--workflow-resume",
+                "nocolon",
+            ],
+            vec![
+                "--mode",
+                "workflow",
+                "--workflow",
+                "/g",
+                "--workflow-resume-force",
+            ],
+            vec!["--instruction", "x", "--workflow-resume", "s:k"],
+            vec![
+                "--mode",
+                "workflow",
+                "--workflow",
+                "/g",
+                "--workflow-resume",
+                "ghost:k",
+            ],
+        ] {
+            assert!(
+                Config::load(&args(&bad), &base_env()).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        // env spelling works too.
+        let mut env = intel_only.clone();
+        env.push(("AGENT_WORKFLOW_RESUME".into(), "state:run/xyz".into()));
+        let c = Config::load(
+            &args(&[
+                "--mode",
+                "workflow",
+                "--workflow",
+                "/g",
+                "--mcp",
+                "state=https://ckpt.internal/mcp",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(c.workflow_resume.unwrap().key, "run/xyz");
     }
 
     fn base_env() -> Vec<(String, String)> {

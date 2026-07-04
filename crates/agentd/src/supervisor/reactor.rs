@@ -135,6 +135,12 @@ pub struct Supervisor {
     /// `paused_sent`).
     swap: Option<SwapChannel>,
     swap_sent_gen: u64,
+    /// Optional per-run human-gate channel (RFC 0021 §7): the reactor records a
+    /// child's opened gate here (the served surface projects `input-required` +
+    /// serves the payload) and fans a posted reply DOWN to the opener child as
+    /// `ControlMsg::Inject` — the gate parallel of `swap`. `None` for runs with
+    /// no gate channel (a plain CLI run; a build without workflows).
+    gate: Option<crate::supervisor::gate::GateChannel>,
     /// The per-run child cgroup (opt-in via `--cgroup`; `None` when off / not
     /// writable). The root subagent is placed here so its whole subtree can be
     /// torn down atomically with `cgroup.kill` — the backstop beyond killpg +
@@ -173,6 +179,7 @@ impl Supervisor {
             paused_sent: false,
             swap: None,
             swap_sent_gen: 0,
+            gate: None,
             cgroup: None,
             log,
         }
@@ -270,6 +277,11 @@ impl Supervisor {
             // endpoint list / changes the model. Same drain exclusion as pause.
             self.forward_swap();
 
+            // Fan a posted human-gate reply to the opener child (RFC 0021 §7) —
+            // the served surface accepted an A2A `SendMessage` for the waiting
+            // task; deliver it as `ControlMsg::Inject`, exactly once.
+            self.forward_gate_reply();
+
             self.maybe_send_pings(Instant::now());
             self.tick_liveness();
 
@@ -346,6 +358,36 @@ impl Supervisor {
                     .error("subagent.failed", json!({"node": node.0, "err": error}));
                 if node == self.root && self.root_terminal.is_none() {
                     self.root_terminal = Some(SuperviseResult::Failed(error));
+                }
+            }
+            AgentMsg::Gate {
+                node: gate_node,
+                payload,
+            } => {
+                // A workflow human gate opened (RFC 0021 §7): record it on the
+                // run's gate channel (the served surface projects
+                // `input-required` and serves the payload) — and progress for
+                // liveness (a child awaiting a human is alive, not stuck).
+                self.on_event(node, now);
+                self.log.info(
+                    "workflow.gate.open",
+                    json!({"node": node.0, "gate": gate_node}),
+                );
+                if let Some(ch) = &self.gate {
+                    ch.open(node.0, &gate_node, payload);
+                }
+            }
+            AgentMsg::GateClosed {
+                node: gate_node,
+                via,
+            } => {
+                self.on_event(node, now);
+                self.log.info(
+                    "workflow.gate.close",
+                    json!({"node": node.0, "gate": gate_node, "via": via}),
+                );
+                if let Some(ch) = &self.gate {
+                    ch.close();
                 }
             }
             AgentMsg::IntelHealth { all_down, active } => {
@@ -460,6 +502,36 @@ impl Supervisor {
             json!({"live": self.live.len(), "policy": policy}),
         );
         self.swap_sent_gen = generation;
+    }
+
+    /// Deliver a posted human-gate reply (RFC 0021 §7) to the child that opened
+    /// the gate, as `ControlMsg::Inject`. Suspended during a drain (the kill
+    /// ladder owns the children then). The reply content is NEVER logged — only
+    /// its length (it is human/peer input, potentially sensitive).
+    fn forward_gate_reply(&mut self) {
+        if self.drain.is_some() {
+            return;
+        }
+        let Some(ch) = self.gate.as_ref() else {
+            return;
+        };
+        let Some((opener, reply)) = ch.take_reply() else {
+            return;
+        };
+        let len = reply.len();
+        match self.live.get_mut(&NodeId(opener)) {
+            Some(h) => {
+                let _ = h.send(&ControlMsg::Inject { message: reply });
+                self.log
+                    .info("workflow.gate.reply", json!({"node": opener, "len": len}));
+            }
+            None => {
+                // The opener died between the post and the fan — the gate will
+                // be torn down with it; log the drop rather than mis-deliver.
+                self.log
+                    .warn("workflow.gate.reply_dropped", json!({"node": opener}));
+            }
+        }
     }
 
     fn reap(&mut self) {
@@ -813,11 +885,32 @@ pub fn supervise_swappable(
     paused: Option<Arc<AtomicBool>>,
     swap: Option<SwapChannel>,
 ) -> std::io::Result<SuperviseResult> {
+    supervise_gated(exe, payload, drain_timeout, log, cancel, paused, swap, None)
+}
+
+/// Like [`supervise_swappable`] but also with an optional per-run human-gate
+/// channel (RFC 0021 §7): a workflow child's opened `human` gate is recorded
+/// here (the served surface projects A2A `input-required` + serves the
+/// payload), and a posted human reply is fanned back to the opener child as
+/// `ControlMsg::Inject`. The gate parallel of `swap`. `None` for runs with no
+/// served surface — the gate then resolves by `reply_uri`/timeout alone.
+#[allow(clippy::too_many_arguments)]
+pub fn supervise_gated(
+    exe: PathBuf,
+    payload: &SpawnPayload,
+    drain_timeout: Duration,
+    log: Logger,
+    cancel: Option<Arc<AtomicBool>>,
+    paused: Option<Arc<AtomicBool>>,
+    swap: Option<SwapChannel>,
+    gate: Option<crate::supervisor::gate::GateChannel>,
+) -> std::io::Result<SuperviseResult> {
     crate::obs::metrics::record_run_started();
     let mut sup = Supervisor::new(exe, drain_timeout, log);
     sup.cancel = cancel;
     sup.paused = paused;
     sup.swap = swap;
+    sup.gate = gate;
     // Per-run child cgroup (opt-in, best-effort): the root + its whole subtree
     // land here so teardown can `cgroup.kill` them atomically. `None` when the
     // feature is off or the tree isn't writable — the run then relies on

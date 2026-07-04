@@ -154,6 +154,8 @@ without the feature, they exit `2` (§2), never silently no-op.
 | `--serve-mcp <TARGET>` | `AGENT_SERVE_MCP` | *(off)* | Serve agent's own MCP so agents compose: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). Needs `--features serve-https`. |
 | `--a2a-peer name=<ENDPOINT>` | `AGENT_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`). Repeatable (the env channel declares one). Needs `--features a2a`. |
 | `--workflow <FILE>` | `AGENT_WORKFLOW` | *(none)* | Path to a pinned workflow JSON, driven by `--mode workflow`. Needs `--features workflow`. See [workflows.md](workflows.md). |
+| `--workflow-resume <REF>` | `AGENT_WORKFLOW_RESUME` | *(none)* | Resume a pinned workflow from a checkpoint (RFC 0021 §8.4): `<server>:<key>[@seq]` — `server` is a configured `--mcp` checkpointer, `@seq` pins a specific envelope (fork). Only with `--mode workflow`; validated pre-network (unknown server name is exit `2`). A workflow-hash mismatch at resume is a refusal (exit `5`). |
+| `--workflow-resume-force` | — | `false` | Override the resume hash check (deliberate graph-edit-and-continue): loop guards reset, board + budget keep. Requires `--workflow-resume`. |
 | `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server (order-independent). Repeatable. |
 | `--allow-trifecta` | `AGENT_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
 

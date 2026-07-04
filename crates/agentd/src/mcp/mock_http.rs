@@ -26,11 +26,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Cross-connection server state: a subscribe (on a POST) arms a one-shot push
-/// that the open `GET` SSE stream delivers.
+/// that the open `GET` SSE stream delivers. The mock also implements the RFC
+/// 0021 §8.3 **checkpointer tool profile** (`state.put`/`state.get`/`state.list`
+/// over an in-memory per-key history with the monotonic-seq guard) plus a
+/// `flaky` tool (fails on its first call, succeeds after) — together they let
+/// the e2e suite prove crash → `--workflow-resume` → complete with no external
+/// infrastructure.
 struct State {
     uri: String,
     emit: bool,
     pending_emit: AtomicBool,
+    /// The checkpointer store: key → (seq → envelope). Monotonic per key.
+    store: std::sync::Mutex<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, serde_json::Value>>,
+    >,
+    /// `flaky` call counter (first call errors, later ones succeed).
+    flaky_calls: std::sync::atomic::AtomicU64,
 }
 
 /// Serve the mock on loopback TCP until the process is killed, announcing the
@@ -51,6 +62,8 @@ pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
         uri: uri.to_string(),
         emit,
         pending_emit: AtomicBool::new(false),
+        store: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        flaky_calls: std::sync::atomic::AtomicU64::new(0),
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -104,7 +117,19 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
             true,
         ),
         "ping" => (Response::ok(req.id, json!({})), false),
-        "tools/list" => (Response::ok(req.id, json!({"tools": []})), false),
+        "tools/list" => (
+            Response::ok(
+                req.id,
+                json!({"tools": [
+                    {"name": "state.put", "description": "checkpointer put", "inputSchema": {"type": "object"}},
+                    {"name": "state.get", "description": "checkpointer get", "inputSchema": {"type": "object"}},
+                    {"name": "state.list", "description": "checkpointer list", "inputSchema": {"type": "object"}},
+                    {"name": "flaky", "description": "fails once, then succeeds", "inputSchema": {"type": "object"}},
+                ]}),
+            ),
+            false,
+        ),
+        "tools/call" => (handle_tool_call(req, state), false),
         "resources/list" => (
             Response::ok(req.id, json!({"resources": [{"uri": uri, "name": "mock"}]})),
             false,
@@ -132,6 +157,90 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
             ),
             false,
         ),
+    }
+}
+
+/// One MCP `tools/call` (the RFC 0021 §8.3 checkpointer profile + `flaky`).
+/// A tool result is standard MCP content: one text part carrying the JSON.
+fn handle_tool_call(req: Request, state: &State) -> Response {
+    fn tool_ok(id: json::Id, v: serde_json::Value) -> Response {
+        Response::ok(
+            id,
+            json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false}),
+        )
+    }
+    fn tool_err(id: json::Id, msg: &str) -> Response {
+        Response::ok(
+            id,
+            json!({"content": [{"type": "text", "text": msg}], "isError": true}),
+        )
+    }
+    let params = req.params.clone().unwrap_or(json!({}));
+    let name = params.get("name").and_then(serde_json::Value::as_str);
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let key = || {
+        args.get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    match name {
+        Some("state.put") => {
+            let seq = args
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let env = args.get("state").cloned().unwrap_or(json!(null));
+            let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            let hist = store.entry(key()).or_default();
+            let latest = hist.keys().next_back().copied().unwrap_or(0);
+            if seq <= latest {
+                // The monotonic-seq guard: a stale/duplicate writer is REFUSED
+                // (`ok:false` + the latest seq) — the split-brain signal.
+                return tool_ok(req.id, json!({"ok": false, "latest": latest}));
+            }
+            hist.insert(seq, env);
+            tool_ok(req.id, json!({"ok": true, "seq": seq}))
+        }
+        Some("state.get") => {
+            let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            match store.get(&key()) {
+                None => tool_err(req.id, "no such key"),
+                Some(hist) => {
+                    let picked = match args.get("seq").and_then(serde_json::Value::as_u64) {
+                        Some(seq) => hist.get(&seq),
+                        None => hist.values().next_back(),
+                    };
+                    match picked {
+                        Some(env) => tool_ok(req.id, json!({"state": env})),
+                        None => tool_err(req.id, "no such seq"),
+                    }
+                }
+            }
+        }
+        Some("state.list") => {
+            let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            let seqs: Vec<u64> = store
+                .get(&key())
+                .map(|h| h.keys().copied().collect())
+                .unwrap_or_default();
+            tool_ok(req.id, json!({"seqs": seqs}))
+        }
+        Some("flaky") => {
+            // The crash-recovery shape (RFC 0021 §8.4 e2e): the FIRST call hangs
+            // (long enough for the harness to SIGKILL the agent mid-node — the
+            // checkpoint cursor then sits AT this node); every later call
+            // returns instantly. A resumed run re-enters the in-flight node
+            // (at-least-once) and succeeds.
+            let n = state.flaky_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                std::thread::sleep(Duration::from_secs(60));
+                tool_err(req.id, "flaky: the first call never completes in time")
+            } else {
+                tool_ok(req.id, json!({"ok": true, "attempt": n + 1}))
+            }
+        }
+        other => tool_err(req.id, &format!("no such tool: {other:?}")),
     }
 }
 

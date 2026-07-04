@@ -93,15 +93,15 @@ transport and spawns no tool processes.
 **Release binaries** (static musl, amd64 + arm64, with `SHA256SUMS`):
 
 ```console
-$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v1.1.0/agentd-v1.1.0-x86_64-unknown-linux-musl.tar.gz
-$ tar xzf agentd-v1.1.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
-agentd 1.1.0
+$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v1.2.0/agentd-v1.2.0-x86_64-unknown-linux-musl.tar.gz
+$ tar xzf agentd-v1.2.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
+agentd 1.2.0
 ```
 
 **Container image** (multi-arch, cosign-signed, single layer, ~1.2 MiB pull):
 
 ```console
-$ docker run --rm ghcr.io/agentd-dev/agentd:1.1.0 --capabilities
+$ docker run --rm ghcr.io/agentd-dev/agentd:1.2.0 --capabilities
 ```
 
 **From source** (Rust stable; no C toolchain needed):
@@ -185,14 +185,22 @@ Deterministic steps cost **zero model tokens** — the graph walker measured at
 }
 ```
 
-- **Ten node kinds:** `agent` (a full agentic sub-run), `tool` (direct MCP
+- **Twelve node kinds:** `agent` (a full agentic sub-run), `tool` (direct MCP
   call), `assign` (pure data shaping), `infer` (schema-checked structured
   intelligence), `branch` (JSON-pointer predicates + one semantic tier),
-  `foreach` (deterministic fan-out, ≤1024 items, ≤8 parallel lanes), `subgraph`
+  `foreach` (deterministic fan-out, ≤1024 items, ≤8 parallel lanes),
+  `parallel` (named heterogeneous branches, one result object), `subgraph`
   (sync or `async: true` → spawned child), `join` (fan-in of async handles),
-  `wait`, `halt`.
+  `wait`, `human` (a **human gate**: the served A2A task projects
+  `input-required` and resumes on a spec-native `SendMessage` reply), `halt`.
 - **A blackboard** threads data between nodes (`writes` / `reads` /
-  `{"$from": …}` JSON-pointer references; 1 MiB per-value clamp).
+  `{"$from": …}` JSON-pointer references; 1 MiB per-value clamp), with
+  **reducers** (`writes_mode: append|merge|union`) to accumulate instead of
+  overwrite.
+- **Durable state — the MCP checkpointer:** per-superstep envelopes to any MCP
+  server implementing a 3-tool profile; `--workflow-resume` gives crash-resume
+  with budgets carried over, and `@seq` under a new run-id is a fork
+  (time-travel). No database is linked — the store is behind MCP.
 - **Cycles are legal, runaways are not:** layered termination — step budget,
   shared token pool, wall deadline, per-node visit caps, and a progress guard —
   each with a distinct `reason` in the result.
@@ -360,7 +368,7 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
 - **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: shell
   one-liners, Docker Compose, Kubernetes `Job`/`CronJob`/`Deployment`
   manifests, a systemd unit.
-- **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.1.0 current).
+- **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.2.0 current).
 - **Website:** [agentd.dev](https://agentd.dev) — rendered docs + RFCs.
 
 ## License

@@ -5,6 +5,57 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.2.0 — workflow dialect 2: durable, parallel, human-in-the-loop workflows (RFC 0021)
+
+Workflows now match — and in places exceed — the code-first agent SDKs, while
+staying a declarative JSON artifact. Zero new dependencies (the moat holds at 3).
+`contract_version` stays `1.0`; feature-detect via `surfaces.workflow.dialect >= 2`.
+
+### Added
+
+- **Human gates over A2A** (`human` node): a workflow suspends and asks a person
+  — the served task projects **`TASK_STATE_INPUT_REQUIRED`** with the payload as
+  its status message; the reply is a spec-native `SendMessage` carrying the
+  `taskId` (the A2A multi-turn shape — no agentd-specific API). Reply /
+  `reply_uri` update / timeout race, first wins. Duplicate reply → `-32004`,
+  unknown task → `-32001`; degrades to a plain wait without serving.
+- **The MCP checkpointer** (`checkpoint` graph policy): per-superstep durable
+  run state, with the checkpointer as *any MCP server* implementing
+  `state.put`/`state.get`/`state.list` (monotonic-seq guard; a refused put is
+  always fatal — the split-brain protection). `--workflow-resume
+  <server>:<key>[@seq]` (+ `AGENT_WORKFLOW_RESUME`, `--workflow-resume-force`):
+  crash-recovery from the latest envelope (exactly-once for completed nodes,
+  at-least-once for the in-flight one), `@seq` under a new run-id = a fork,
+  hash-mismatch = refusal (exit `5`). Budgets carry over across resume.
+  Envelopes bind the graph by SHA-256 (hand-rolled FIPS 180-4, NIST-vector
+  tested).
+- **Write reducers** (`writes_mode: overwrite|append|merge|union` on every
+  writing node): accumulate instead of clobber; pure, clamp-aware, type
+  mismatch → the `error` edge with a readable marker.
+- **The `parallel` node**: named heterogeneous branch bodies run concurrently
+  on the SAME 8-lane pool `foreach` uses (composition never multiplies
+  concurrency); ≤16 branches, step pre-charge, shared token pool, results as
+  one object keyed by branch name, `fail_fast|continue`.
+- Manifest: `surfaces.workflow.{dialect: 2, checkpoint: true, kinds: [12]}`.
+
+### Changed (fail-closed hardening)
+
+- **Unknown workflow fields are define-time errors** (a typo'd `writes_mode`
+  can no longer silently mean overwrite): one strict `parse_graph` front door
+  behind `--workflow`, `workflow.define`, and `workflow.patch`. Dialect-1
+  graphs are byte-identical on the wire and behaviorally unchanged.
+- A2A `SendMessage` now accepts `message.taskId` as a gate-reply continuation
+  of an existing task (`-32004` when nothing is waiting).
+
+### Verified
+
+Two new real-process e2e suites: a `--mode workflow` run SIGKILLed mid-node
+resumes from its checkpoint on a real HTTP checkpointer and completes with the
+pre-crash blackboard; a served A2A task flows WORKING → INPUT_REQUIRED → reply
+→ COMPLETED on the wire. 686/686 featured tests (36 new), 384/384 default,
+conformance 38/38. RFC 0021 (Implemented) is the normative spec;
+[docs/workflows.md](docs/workflows.md) the guide.
+
 ## v1.1.0
 
 ### Added

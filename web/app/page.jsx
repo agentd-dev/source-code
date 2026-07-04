@@ -266,19 +266,35 @@ $ agentd --mode reactive \\
         intro="Some work is a graph, not a single reasoning loop. agentd lets the agent build one itself — like LangGraph, but the agent authors and drives the graph, and agentd supervises every node."
       >
         <div className="grid gap-4 md:grid-cols-3">
-          <Card tag="deterministic where it can be" title="Ten node kinds">
+          <Card tag="deterministic where it can be" title="Twelve node kinds">
             <span className="kbd">agent</span>, <span className="kbd">tool</span> (with{" "}
             <span className="kbd">$from</span> data flow), <span className="kbd">assign</span>,{" "}
             <span className="kbd">infer</span> (schema-checked structured extraction),{" "}
             <span className="kbd">branch</span>, <span className="kbd">foreach</span>,{" "}
-            <span className="kbd">join</span>, <span className="kbd">wait</span>,{" "}
-            <span className="kbd">subgraph</span>, <span className="kbd">halt</span>. A
+            <span className="kbd">parallel</span>, <span className="kbd">join</span>,{" "}
+            <span className="kbd">wait</span>, <span className="kbd">human</span>,{" "}
+            <span className="kbd">subgraph</span>, <span className="kbd">halt</span> — plus{" "}
+            <span className="kbd">writes_mode</span> reducers (append/merge/union). A
             tool/branch-only path spends zero model tokens.
           </Card>
+          <Card tag="humans in the loop, over A2A" title="Ask a person mid-workflow">
+            A <span className="kbd">human</span> node flips the served A2A task to{" "}
+            <span className="kbd">input-required</span> with the question as its status message;
+            the person answers with a plain <span className="kbd">SendMessage</span> carrying the
+            task id — the spec&apos;s own multi-turn shape — and the workflow resumes on{" "}
+            <span className="kbd">replied</span>.
+          </Card>
+          <Card tag="durable by MCP" title="Crash-resume, fork, time-travel">
+            A <span className="kbd">checkpoint</span> policy writes every superstep to ANY MCP
+            server speaking a 3-tool profile. <span className="kbd">--workflow-resume</span>{" "}
+            recovers a SIGKILLed run with its blackboard and budget intact;{" "}
+            <span className="kbd">@seq</span> under a new run id is a fork. No database linked —
+            the store lives behind MCP.
+          </Card>
           <Card tag="fan out without the model" title="Process arrays at scale">
-            A tool returns 500 items? <span className="kbd">foreach</span> maps a body over each on
-            up to 8 parallel lanes — deterministically, without feeding the array through the LLM.
-            Cross-key predicates and computed pointers keep the routing token-free.
+            A tool returns 500 items? <span className="kbd">foreach</span> maps a body over each —
+            and <span className="kbd">parallel</span> runs different bodies at once — on up to 8
+            shared lanes, deterministically, without feeding anything through the LLM.
           </Card>
           <Card tag="agentic where it must be" title="Authored, run, or delegated">
             The agent calls <span className="kbd">workflow.define</span> /{" "}

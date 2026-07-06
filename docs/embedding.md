@@ -1,4 +1,4 @@
-# Embedding — build your own CLI on the agentd engine
+# Embedding — the agentd engine in your app
 
 agentd ships as **two published crates around one engine**: `agentd-core` (the
 library — lib name `agentd`) and `agentd-cli` (the thin binary shell that
@@ -81,6 +81,99 @@ edge. Registration refuses duplicates and agentd's own self/control names
 Trust: a code tool is **your compiled code** — first-party like the rest of
 your binary, outside the `--mcp-tags` trifecta accounting. You own what it
 touches.
+
+## Recipes — agentic logic inside your app
+
+Four levels, thinnest first. The first two are shipped as **compile-guaranteed
+examples** (CI builds them; the snippets below are excerpts of real files).
+
+### Recipe 1 — one agentic run as a function call
+
+Your app calls the loop directly and gets `(Outcome, Usage)` back as plain
+Rust values — the model sees your code tools next to any MCP tools. Full file:
+[`crates/agentd/examples/embedded-agent.rs`](../crates/agentd/examples/embedded-agent.rs).
+
+```rust
+use agentd::agentloop::runner::{run_loop, LoopInput};
+use agentd::intel::client::IntelClient;
+
+// native tools first (see “The three obligations”)
+agentd::tools::register(agentd::tools::CodeTool::new(
+    "word_count", "Count the words in a text.",
+    json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+    |args| Ok(json!({ "words": args["text"].as_str().unwrap_or("").split_whitespace().count() })),
+))?;
+
+let intel = IntelClient::from_parts("https://gw.example/v1", token)?;
+let input = LoopInput {
+    instruction: "Count the words in this review and summarize it.".into(),
+    output_contract: Some("JSON: {words, summary}".into()),
+    seed: vec![],                       // narrowed context, (role, content) pairs
+    model: "my-model".into(),
+    max_steps: 10, max_tokens: 20_000,
+    deadline: Instant::now() + Duration::from_secs(120),
+    cancel: None,                       // or an Arc<AtomicBool> you flip
+};
+let (outcome, usage) = run_loop(&intel, &servers, &input, &mut NoSelfTools, &log)?;
+println!("{} ({} tokens)", outcome.result, usage.input_tokens + usage.output_tokens);
+```
+
+The run is bounded by the same budget machinery the stock CLI uses
+(steps/tokens/deadline + a cooperative cancel flag). Trade-off: the reasoning
+runs **in your process** — no supervisor isolation; when you want the kill
+ladder around the model, use Recipe 3. (CI compiles this example; it was
+verified end-to-end against the built-in mock intelligence.)
+
+### Recipe 2 — a workflow (deterministic + intelligent steps) in your app
+
+Author a dialect-2 graph as data, drive it with your own executor — the whole
+RFC 0021 surface (reducers, `parallel`, `human` gates, the checkpointer) works
+from an embedder. Full file:
+[`crates/agentd/examples/custom-cli.rs`](../crates/agentd/examples/custom-cli.rs).
+
+```rust
+let graph = agentd::graph::parse_graph(&json!({
+    "start": "seed",
+    "nodes": {
+        "seed":  { "kind": "assign", "value": { "text": "ship it" }, "writes": "input",
+                   "edges": { "ok": "shout", "error": "fail" } },
+        "shout": { "kind": "tool", "server": "code", "tool": "shout",
+                   "args": { "text": { "$from": "input", "pointer": "/text" } },
+                   "writes": "loud", "edges": { "ok": "done", "error": "fail" } },
+        "done":  { "kind": "halt", "status": "completed", "result_from": "loud" },
+        "fail":  { "kind": "halt", "status": "crashed" }
+    }
+}))?;
+match agentd::graph::drive(&graph, &mut my_exec, 50) {
+    DriveResult::Done(outcome) => println!("{:?}: {}", outcome.status, outcome.result),
+    DriveResult::Suspended(s) => { /* arm s.on_uri / s.gate, resume() later */ }
+}
+```
+
+Your executor implements `GraphExec` — two required methods (`run_agent`,
+`call_tool`; everything else has safe defaults), so you decide what an `agent`
+node or an MCP call means in your app. The production executor
+(`agentd::graph::SessionExec`) is available when you want the stock behavior,
+including checkpointing and parallel lanes.
+
+### Recipe 3 — the full supervised stack (the stock posture)
+
+When you want the kill ladder, cgroup limits, liveness, and the exit-code
+contract AROUND the model, do what `agentd-cli/src/main.rs` does: install the
+re-exec dispatch, build a `SpawnPayload`, and call
+`agentd::supervisor::reactor::supervise_once` — the reasoning then runs in a
+killable child of *your* binary, and everything in this documentation set
+(modes, workflows, serving, A2A) applies unchanged. The CLI's `main.rs` is
+deliberately small enough to read as the reference (~900 lines including all
+five modes).
+
+### Recipe 4 — just the pieces
+
+- `agentd-mcp`: the MCP client (dual-era, Streamable HTTP) and server machinery
+  — use agentd's MCP stack without the agent.
+- `agentd-net`: the blocking HTTP/1.1+SSE client, TLS, SSRF guard.
+- `agentd::intel::client::IntelClient`: the OpenAI-compatible client with
+  endpoint-list failover and breakers.
 
 ## Depending on the crates
 

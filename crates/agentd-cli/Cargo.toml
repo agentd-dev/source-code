@@ -1,0 +1,61 @@
+# The agentd CLI — the thin binary shell over the `agentd-core` library (the
+# engine). This crate owns exactly what a PROCESS owns: argv dispatch (the
+# supervisor path, the subagent re-exec, the hidden test mocks) and the process
+# exit code. All business logic lives in the library; an embedder building its
+# own CLI on `agentd-core` replicates only the ~10-line dispatch in
+# `src/main.rs` (RFC 0022 §3). Every feature below is a 1:1 forward to the
+# library — `cargo build -p agentd-cli --features X` means what
+# `-p agentd-core --features X` means.
+[package]
+name = "agentd-cli"
+version = "1.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "agentd — a minimal, MCP-native, reactive agent runtime (the CLI binary over the agentd-core engine)"
+license = "Apache-2.0"
+repository = "https://github.com/agentd-dev/source-code"
+keywords = ["agent", "mcp", "a2a", "llm", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "agentd"
+path = "src/main.rs"
+
+# Each feature forwards to the library AND mirrors the library's internal
+# feature graph locally (serve-https implies serve-mcp, a2a rides serve-https,
+# …), because `src/main.rs`'s own `#[cfg(feature = …)]` gates evaluate against
+# THIS crate's features. The two graphs must stay isomorphic — CI's per-feature
+# matrix compiles both crates per row, so a drift fails loudly.
+[features]
+default = ["tls"]
+tls = ["agentd/tls"]
+serve-mcp = ["agentd/serve-mcp"]
+serve-https = ["serve-mcp", "tls", "agentd/serve-https"]
+a2a = ["serve-https", "agentd/a2a"]
+cron = ["agentd/cron"]
+oauth = ["agentd/oauth"]
+events = ["serve-https", "agentd/events"]
+cluster = ["agentd/cluster"]
+metrics = ["agentd/metrics"]
+hot-reload = ["agentd/hot-reload"]
+config-watch = ["hot-reload", "agentd/config-watch"]
+otel = ["agentd/otel"]
+workflow = ["agentd/workflow"]
+cel = ["workflow", "agentd/cel"]
+internal-mocks = ["agentd/internal-mocks"]
+
+[dependencies]
+# The engine. Dependency-renamed so the binary's code (and every embedder
+# following its shape) writes `use agentd::…` — the package name carries the
+# crates.io-unique `-core` suffix, the LIB name stays `agentd`.
+agentd = { package = "agentd-core", path = "../agentd", version = "1.2.0", default-features = false }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Unix-only test helper: send SIGTERM to a spawned agent to exercise the
+# graceful-drain → exit-0 contract for the long-lived (loop/schedule/reactive)
+# modes.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

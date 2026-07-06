@@ -68,8 +68,13 @@ jobs:
       # Per-feature lint: --all-features unification hides a solo-build clippy
       # error (a dead test helper, a duplicated cfg_attr) — each combo must lint
       # clean on its own, not just compile.
-      - run: cargo clippy -p agentd --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo test -p agentd ${{ matrix.features }}
+      # The feature graphs of the engine and the CLI shell are isomorphic (the
+      # CLI mirrors + forwards); each matrix row gates BOTH crates so a drift
+      # between them fails loudly.
+      - run: cargo clippy -p agentd-core --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo clippy -p agentd-cli --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test -p agentd-core ${{ matrix.features }}
+      - run: cargo test -p agentd-cli ${{ matrix.features }}
 
   # Minimalism is the moat: the DEFAULT build must stay at exactly three direct
   # dependencies (serde, serde_json, libc) — no async runtime, no TLS, no C. This
@@ -88,11 +93,11 @@ jobs:
           # Workspace path crates (net, mcp — they print with a `(/…)` path suffix)
           # are OUR OWN code, not third-party surface; only EXTERNAL crates count
           # against the moat.
-          deps=$(cargo tree -p agentd --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/' | grep -c .)
+          deps=$(cargo tree -p agentd-core --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/' | grep -c .)
           echo "direct deps: $deps"
           if [ "$deps" -ne 3 ]; then
             echo "::error::default build must have exactly 3 direct deps (serde, serde_json, libc); found $deps"
-            cargo tree -p agentd --depth 1 --edges normal --prefix none
+            cargo tree -p agentd-core --depth 1 --edges normal --prefix none
             exit 1
           fi
 

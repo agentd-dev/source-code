@@ -2380,6 +2380,14 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     if name.is_empty() || endpoint.is_empty() {
         return Err(usage(format!("--mcp '{spec}' has empty name or endpoint")));
     }
+    // `code` is RESERVED (RFC 0022 §4): workflow `tool` nodes address
+    // code-registered (in-process, embedder-native) tools as server `code`, so
+    // a remote server may not claim the name.
+    if name == "code" {
+        return Err(usage(
+            "--mcp: the server name 'code' is reserved for code-registered tools (RFC 0022)".into(),
+        ));
+    }
     if !is_mcp_endpoint(endpoint) {
         return Err(usage(format!(
             "--mcp '{spec}': endpoint must be https://host[:port][/path] \

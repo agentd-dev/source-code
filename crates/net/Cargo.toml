@@ -4,14 +4,15 @@
 # The single highest-leverage minimalism decision (RFC 0002): no url→IDNA→ICU,
 # no async runtime. serde-free; TLS/vsock are the only (optional) deps.
 [package]
-name = "net"
+name = "agentd-net"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Minimal blocking HTTP/1.1 + SSE over Read+Write, unix/tls/vsock connects, SSRF guard"
 license = "Apache-2.0"
 repository = "https://github.com/agentd-dev/source-code"
-publish = false
+keywords = ["http", "sse", "tls", "ssrf", "transport"]
+categories = ["network-programming"]
 
 [lib]
 name = "net"

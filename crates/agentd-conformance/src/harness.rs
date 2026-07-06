@@ -69,7 +69,7 @@ fn binaries() -> &'static Bins {
         build(&[
             "build",
             "-p",
-            "agentd",
+            "agentd-cli",
             "--features",
             "serve-https,internal-mocks",
         ]);
@@ -91,7 +91,7 @@ fn binaries() -> &'static Bins {
             &[
                 "build",
                 "-p",
-                "agentd",
+                "agentd-cli",
                 "--features",
                 "serve-https,internal-mocks,cluster",
             ],

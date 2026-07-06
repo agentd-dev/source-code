@@ -1,20 +1,17 @@
 [package]
-name = "agentd"
+name = "agentd-core"
 version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Minimal, MCP-native, reactive agent runtime (rfcs/0001-mcp-native-agent-runtime.md)"
+description = "Minimal, MCP-native agent runtime as a library: the agentic loop, supervisor, workflows, and code-registered tools (the agentd engine)"
 license = "Apache-2.0"
 repository = "https://github.com/agentd-dev/source-code"
-publish = false
+keywords = ["agent", "mcp", "a2a", "llm", "workflow"]
+categories = ["development-tools", "network-programming"]
 
 [lib]
 name = "agentd"
 path = "src/lib.rs"
-
-[[bin]]
-name = "agentd"
-path = "src/main.rs"
 
 # Capability surface is compile-time. The default build stays lean — no async
 # runtime, no C/C++ toolchain, single-digit first-party crates — but as of v2.0.0
@@ -122,11 +119,11 @@ cel = ["dep:cel-interpreter"]
 cel-interpreter = { version = "0.10.0", optional = true, features = ["json"] }
 # The reusable MCP base library (workspace crate): wire types + the version/era
 # model + the modern dialect helpers + the JSON-RPC codec. In-tree.
-mcp = { path = "../mcp" }
+mcp = { package = "agentd-mcp", path = "../mcp", version = "0.2.1" }
 # Shared transport primitives (workspace crate): the HTTP/1.1+SSE client, unix +
 # feature-gated tls/vsock connects, SSRF guard. Owns the rustls/webpki deps
 # (agentd's `tls` feature maps to `net/tls`).
-net = { path = "../net" }
+net = { package = "agentd-net", path = "../net", version = "0.2.0" }
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.
 # Keep all wire types in one module (json/, wire/) so a swap to miniserde
 # stays mechanical (rfcs/0002).
@@ -151,3 +148,9 @@ tempfile = "3"
 # modes. `libc` is already a runtime dependency on Unix; this adds no new crate.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# The compile-guaranteed embedding contract (RFC 0022): a minimal custom CLI
+# registering a native tool and driving a workflow offline. Built by CI.
+[[example]]
+name = "custom-cli"
+required-features = ["workflow"]

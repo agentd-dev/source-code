@@ -32,6 +32,11 @@ pub enum ToolClass {
     Mcp,
     /// One of agentd's own self/control orchestration primitives; handled in-process.
     SelfControl,
+    /// A CODE-REGISTERED tool (RFC 0022 §4): native Rust the embedder
+    /// registered via [`crate::tools::register`] — first-party by definition,
+    /// dispatched in-process, and it WINS a name collision with a remote MCP
+    /// tool (a server cannot steal a registered tool's calls).
+    Code,
 }
 
 /// The authoritative membership of the [`ToolClass::SelfControl`] class: every

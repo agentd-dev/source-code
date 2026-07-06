@@ -552,6 +552,13 @@ impl GraphExec for SessionExec<'_> {
     }
 
     fn call_tool(&mut self, server: &str, tool: &str, args: &Value) -> (Value, bool) {
+        // The RESERVED server name `code` addresses CODE-REGISTERED tools
+        // (RFC 0022 §4) — the embedder's native Rust, dispatched in-process.
+        // Config validation refuses an `--mcp` server named `code`, so this
+        // routing can never shadow a real remote server.
+        if server == "code" {
+            return crate::tools::call_for_workflow(tool, args);
+        }
         // A graph Tool node names its (server, tool) explicitly, so route straight to
         // that server's client (not the loop's tool-name catalogue).
         let Some(client) = self.servers.iter().find(|s| s.name() == server) else {

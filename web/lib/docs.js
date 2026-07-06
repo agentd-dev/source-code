@@ -13,6 +13,7 @@ export const DOCS = [
   { slug: "mcp", file: "docs/mcp.md", title: "mcp surface" },
   { slug: "modes-and-triggers", file: "docs/modes-and-triggers.md", title: "modes & triggers" },
   { slug: "workflows", file: "docs/workflows.md", title: "workflows" },
+  { slug: "embedding", file: "docs/embedding.md", title: "embedding" },
   { slug: "subagents", file: "docs/subagents.md", title: "subagents" },
   { slug: "intelligence", file: "docs/intelligence.md", title: "intelligence" },
   { slug: "configuration", file: "docs/configuration.md", title: "configuration" },
@@ -42,6 +43,7 @@ export const DOCS = [
   { slug: "rfc-0019", file: "rfcs/0019-horizontal-scaling.md", title: "rfc 0019 · horizontal scaling" },
   { slug: "rfc-0020", file: "rfcs/0020-a2a-interop-over-vsock.md", title: "rfc 0020 · a2a over vsock" },
   { slug: "rfc-0021", file: "rfcs/0021-durable-workflows-and-parity-extensions.md", title: "rfc 0021 · durable workflows" },
+  { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "rfc 0022 · embedding & code tools" },
 ];
 
 // docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so

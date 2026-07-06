@@ -102,6 +102,14 @@ impl<'a> Session<'a> {
         self_handler: &mut dyn SelfHandler,
     ) -> Result<Session<'a>, LoopAbort> {
         let (mut tools, tool_to_server) = build_catalogue(servers)?;
+        // CODE-REGISTERED tools (RFC 0022 §4): first-party wins a name
+        // collision — drop the MCP entry so the catalogue offers ONE def per
+        // name and it is the one the dispatch will actually run.
+        let code = crate::tools::defs();
+        if !code.is_empty() {
+            tools.retain(|t| !crate::tools::is_registered(&t.name));
+            tools.extend(code);
+        }
         tools.extend(self_handler.tools());
         let resources = collect_resources(servers);
         // Offer `resource.read` when there are MCP resources OR the handler
@@ -138,6 +146,12 @@ impl<'a> Session<'a> {
     /// re-merged; the transcript is untouched.
     pub fn refresh_tools(&mut self, self_handler: &mut dyn SelfHandler) -> Result<(), LoopAbort> {
         let (mut tools, tool_to_server) = build_catalogue(self.servers)?;
+        // Same code-tool precedence as `prepare` (RFC 0022 §4).
+        let code = crate::tools::defs();
+        if !code.is_empty() {
+            tools.retain(|t| !crate::tools::is_registered(&t.name));
+            tools.extend(code);
+        }
         tools.extend(self_handler.tools());
         if !self.resources.owner.is_empty() || self_handler.serves_self_resources() {
             tools.push(resource_read_tool_def());
@@ -164,7 +178,13 @@ impl<'a> Session<'a> {
     /// `SelfControl` (it is, by definition, not a routed server tool), so classify
     /// only names drawn from the catalogue.
     pub fn tool_class(&self, name: &str) -> ToolClass {
-        if self.tool_to_server.contains_key(name) {
+        // A code-registered name classifies `Code` even when an MCP server
+        // publishes the same name — matching the dispatch (code wins; a remote
+        // server cannot steal a registered tool's calls). Registration refuses
+        // self/control names, so `Code` never claims that class.
+        if crate::tools::is_registered(name) {
+            ToolClass::Code
+        } else if self.tool_to_server.contains_key(name) {
             ToolClass::Mcp
         } else {
             ToolClass::SelfControl
@@ -363,12 +383,17 @@ impl<'a> Session<'a> {
                     } else {
                         match self_handler.handle(&tc.name, &tc.arguments) {
                             Some(r) => r, // a self-tool (e.g. subagent.spawn)
-                            None => dispatch_tool(
-                                self.servers,
-                                &self.tool_to_server,
-                                &tc.name,
-                                &tc.arguments,
-                            ),
+                            // Code-registered tools next (RFC 0022 §4):
+                            // first-party beats a colliding remote name.
+                            None => match crate::tools::dispatch(&tc.name, &tc.arguments) {
+                                Some(r) => r,
+                                None => dispatch_tool(
+                                    self.servers,
+                                    &self.tool_to_server,
+                                    &tc.name,
+                                    &tc.arguments,
+                                ),
+                            },
                         }
                     };
                     run_span.record_tool(&tc.name, !is_error, tool_start);
@@ -675,6 +700,46 @@ mod tests {
     }
 
     #[test]
+    fn a_code_registered_tool_classifies_code_and_wins_a_name_collision() {
+        // RFC 0022 §4: first-party (code-registered) beats a remote MCP tool of
+        // the same name — in classification and therefore in dispatch. Unique
+        // tool names: the registry is process-global and tests share a process.
+        crate::tools::register(crate::tools::CodeTool::new(
+            "runner.code_tool",
+            "a native tool",
+            json!({"type": "object"}),
+            |_| Ok(json!("native")),
+        ))
+        .expect("register");
+        let mut tool_to_server = HashMap::new();
+        // The MCP side ALSO publishes the colliding name (a rogue/coincidental server).
+        tool_to_server.insert("runner.code_tool".to_string(), 0usize);
+        let sess = Session {
+            servers: &[],
+            tools: vec![],
+            tool_to_server,
+            resources: ResourceCatalogue {
+                owner: HashMap::new(),
+                entries: vec![],
+                truncated: false,
+            },
+            model: "m".into(),
+            messages: vec![],
+        };
+        assert_eq!(
+            sess.tool_class("runner.code_tool"),
+            ToolClass::Code,
+            "code wins the collision — a server cannot steal a registered tool's calls"
+        );
+        // And the dispatch agrees with the classification.
+        let (content, is_err) =
+            crate::tools::dispatch("runner.code_tool", &json!({})).expect("code tool dispatches");
+        assert!(!is_err);
+        assert_eq!(content, "native");
+        assert!(crate::tools::unregister("runner.code_tool"));
+    }
+
+    #[test]
     fn catalogue_partitions_into_mcp_and_self_control_classes() {
         use crate::agentloop::action::SELF_CONTROL_TOOLS;
         // A catalogue: two MCP-server tools (routed) + agentd's full self/control
@@ -725,14 +790,17 @@ mod tests {
                 "{n} is self/control"
             );
         }
-        // The two classes EXACTLY cover the catalogue (no unclassified tool).
-        let (mut n_mcp, mut n_self) = (0usize, 0usize);
+        // The classes EXACTLY cover the catalogue (no unclassified tool; no
+        // code tools are registered in this test, so `Code` counts zero).
+        let (mut n_mcp, mut n_self, mut n_code) = (0usize, 0usize, 0usize);
         for t in &sess.tools {
             match sess.tool_class(&t.name) {
                 ToolClass::Mcp => n_mcp += 1,
                 ToolClass::SelfControl => n_self += 1,
+                ToolClass::Code => n_code += 1,
             }
         }
+        assert_eq!(n_code, 0, "no code tools registered here");
         assert_eq!(n_mcp, mcp.len(), "every MCP tool classified");
         assert_eq!(
             n_self,

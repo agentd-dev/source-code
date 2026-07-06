@@ -107,8 +107,8 @@ $ docker run --rm ghcr.io/agentd-dev/agentd:1.2.0 --capabilities
 **From source** (Rust stable; no C toolchain needed):
 
 ```console
-$ cargo build -p agentd --release
-$ cargo build -p agentd --release \
+$ cargo build -p agentd-cli --release
+$ cargo build -p agentd-cli --release \
     --features "serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow"   # the shipped set
 ```
 
@@ -212,6 +212,29 @@ Deterministic steps cost **zero model tokens** — the graph walker measured at
   node and resumes on the trigger — a durable, event-driven pipeline.
 
 See [docs/workflows.md](docs/workflows.md).
+
+## Embedding — your CLI, your tools, this engine
+
+agentd is also **a library**: the binary is a thin shell (`agentd-cli`) over
+the published engine crate (`agentd-core`, lib name `agentd`). Your own CLI can
+embed the whole runtime — and register **native Rust tools** the agent calls
+alongside MCP tools:
+
+```rust
+agentd::tools::register(agentd::tools::CodeTool::new(
+    "shout", "Uppercase the input text.",
+    json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+    |args| Ok(json!({ "text": args["text"].as_str().unwrap_or("").to_uppercase() })),
+))?;
+```
+
+Registered tools join the model's catalogue (and win name collisions with
+remote servers — first-party is unstealable), are addressable from workflows as
+the reserved server `code`, and show up in the capabilities manifest. The
+**stock CLI registers nothing** — its no-local-code posture holds by
+construction. Reusable on their own: `agentd-mcp` (MCP client/server + wire)
+and `agentd-net` (transports). See [docs/embedding.md](docs/embedding.md) and
+RFC 0022.
 
 ## Composition: serving, subagents, A2A
 
@@ -364,7 +387,7 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
   [deployment](docs/deployment.md) · [scaling](docs/scaling.md) ·
   [use cases](docs/use-cases.md)
 - **[rfcs/README.md](rfcs/README.md)** — the normative specifications
-  (RFC 0001–0020; RFC 0001 is the narrative front door).
+  (RFC 0001–0022; RFC 0001 is the narrative front door).
 - **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: shell
   one-liners, Docker Compose, Kubernetes `Job`/`CronJob`/`Deployment`
   manifests, a systemd unit.

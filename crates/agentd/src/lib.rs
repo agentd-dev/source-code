@@ -42,6 +42,7 @@ pub mod sec; // secrets, tool-scope, gated exec
 pub mod signals;
 pub mod subagent; // supervisor<->subagent control protocol
 pub mod supervisor; // the reactor, process tree, spawn/reap/liveness/kill/restart
+pub mod tools; // CODE-REGISTERED tools — the embedder seam (RFC 0022 §4)
 pub mod triggers; // execution modes + reactive routing + timers
 pub mod wire; // MCP + intelligence wire types // sigaction + self-pipe; SIGTERM/INT/CHLD/PIPE
 

@@ -43,7 +43,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - run: cross build --release --locked -p agentd --target ${{ matrix.target }} --features "$FEATURES"
+      - run: cross build --release --locked -p agentd-cli --target ${{ matrix.target }} --features "$FEATURES"
       - name: Package
         run: |
           mkdir -p dist

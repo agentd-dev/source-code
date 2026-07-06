@@ -28,7 +28,7 @@ dependency-light: no async runtime, no TLS, no C/C++ toolchain.
 
 ```console
 $ git clone <repo> agent && cd agent
-$ cargo build -p agentd --release
+$ cargo build -p agentd-cli --release
    Compiling agentd v1.0.0
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
@@ -47,9 +47,9 @@ only transport agentd uses. Turn on the rest only when you need them (each is ga
 so it never weighs down a minimal build):
 
 ```console
-$ cargo build -p agentd --release                                 # default: tls (https)
-$ cargo build -p agentd --release --features serve-https,a2a      # served self-MCP + A2A
-$ cargo build -p agentd --release --features serve-https,cluster,workflow
+$ cargo build -p agentd-cli --release                                 # default: tls (https)
+$ cargo build -p agentd-cli --release --features serve-https,a2a      # served self-MCP + A2A
+$ cargo build -p agentd-cli --release --features serve-https,cluster,workflow
 ```
 
 To keep TLS out of the binary entirely, terminate it at a same-host sidecar and
@@ -65,7 +65,7 @@ they are not bundled into the agentd image:
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build -p agentd --release
+RUN cargo build -p agentd-cli --release
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/agentd /usr/local/bin/agentd

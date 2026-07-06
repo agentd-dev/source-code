@@ -5,6 +5,40 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased — the library split + code-registered tools (RFC 0022)
+
+agentd is now consumable as a **library**. The workspace splits into four
+publishable crates around one engine; the stock binary is behaviorally
+unchanged.
+
+### Added
+
+- **Crates**: `agentd-core` (the engine — lib name `agentd`), `agentd-cli` (the
+  thin binary shell producing the `agentd` command), `agentd-mcp` and
+  `agentd-net` (the already-reusable MCP + transport libraries, renamed for
+  crates.io; the bare name `agentd` on crates.io belongs to an unrelated
+  project). Feature graphs are isomorphic between core and cli; CI gates both
+  per matrix row.
+- **Code-registered tools** (`agentd::tools`, RFC 0022 §4): an embedder
+  registers native Rust tools (`CodeTool::new(name, description, schema,
+  handler)`) that join the model's catalogue, are addressable from workflows as
+  the reserved server **`code`**, and are callable via the public
+  `tools::call`. Dispatch precedence self → code → MCP: the orchestration
+  surface is unshadowable and a remote server cannot steal a first-party
+  tool's calls (`ToolClass::Code`). The **stock CLI registers nothing** — its
+  no-local-code posture holds by construction; the manifest surfaces
+  `surfaces.code_tools` only when non-zero.
+- The compile-guaranteed embedder reference:
+  `crates/agentd/examples/custom-cli.rs` (built by CI, runs offline);
+  [docs/embedding.md](docs/embedding.md); RFC 0022 with the three
+  API-stability tiers.
+
+### Changed
+
+- `--mcp code=…` is refused (`code` is the reserved code-tools server name).
+- Building from source: the binary is now `cargo build -p agentd-cli`
+  (release artifacts unchanged).
+
 ## v1.2.0 — workflow dialect 2: durable, parallel, human-in-the-loop workflows (RFC 0021)
 
 Workflows now match — and in places exceed — the code-first agent SDKs, while

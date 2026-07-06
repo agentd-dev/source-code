@@ -3,14 +3,11 @@
 version = 4
 
 [[package]]
-name = "agentd"
+name = "agentd-cli"
 version = "1.2.0"
 dependencies = [
- "cel-interpreter",
+ "agentd-core",
  "libc",
- "mcp",
- "net",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -21,6 +18,39 @@ version = "1.2.0"
 dependencies = [
  "libc",
  "serde_json",
+]
+
+[[package]]
+name = "agentd-core"
+version = "1.2.0"
+dependencies = [
+ "agentd-mcp",
+ "agentd-net",
+ "cel-interpreter",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "agentd-mcp"
+version = "0.2.1"
+dependencies = [
+ "agentd-net",
+ "serde",
+ "serde_json",
+ "vsock",
+]
+
+[[package]]
+name = "agentd-net"
+version = "0.2.0"
+dependencies = [
+ "rustls",
+ "rustls-pemfile",
+ "vsock",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -343,16 +373,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
-name = "mcp"
-version = "0.2.1"
-dependencies = [
- "net",
- "serde",
- "serde_json",
- "vsock",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -380,16 +400,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a198f9589efc03f544388dfc4a19fe8af4323662b62f598b8dcfdac62c14771c"
 dependencies = [
  "byteorder",
-]
-
-[[package]]
-name = "net"
-version = "0.2.0"
-dependencies = [
- "rustls",
- "rustls-pemfile",
- "vsock",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

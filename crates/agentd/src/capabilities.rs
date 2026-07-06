@@ -368,6 +368,16 @@ fn surfaces(cfg: &Config) -> Value {
     if let Some(obj) = s.as_object_mut() {
         obj.insert("claim".into(), json!({ "styles": ["tool", "resource"] }));
     }
+    // RFC 0022 §4: CODE-REGISTERED tools — an EMBEDDER's binary that registered
+    // native tools advertises how many (their names ride the served tools/list
+    // like any tool). The stock agentd CLI registers none, so the key is absent
+    // there (capability-absence-not-error) and the no-local-code posture stays
+    // visibly intact.
+    if crate::tools::count() > 0
+        && let Some(obj) = s.as_object_mut()
+    {
+        obj.insert("code_tools".into(), json!(crate::tools::count()));
+    }
     // RFC 0021 §4/§10: the workflow surface — the graph-language DIALECT this
     // build speaks (agentctl feature-detects from this, never the version
     // string), the node-kind set, and whether the MCP checkpointer is wired

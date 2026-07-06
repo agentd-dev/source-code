@@ -21,6 +21,7 @@ idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · Apache-2
 - [Quickstart](#quickstart)
 - [Five modes](#five-modes)
 - [Workflows](#workflows)
+- [Embedding — the engine in your app](#embedding--the-engine-in-your-app)
 - [Composition: serving, subagents, A2A](#composition-serving-subagents-a2a)
 - [Security model](#security-model)
 - [Operating it](#operating-it)
@@ -213,28 +214,43 @@ Deterministic steps cost **zero model tokens** — the graph walker measured at
 
 See [docs/workflows.md](docs/workflows.md).
 
-## Embedding — your CLI, your tools, this engine
+## Embedding — the engine in your app
 
 agentd is also **a library**: the binary is a thin shell (`agentd-cli`) over
-the published engine crate (`agentd-core`, lib name `agentd`). Your own CLI can
-embed the whole runtime — and register **native Rust tools** the agent calls
-alongside MCP tools:
+the published engine crate (`agentd-core`, lib name `agentd`). Any Rust app can
+run agentic logic as a **function call**, with **native Rust tools** the model
+calls alongside MCP tools:
 
 ```rust
+// 1. Register your code as a tool (it joins the model's catalogue — and wins
+//    name collisions with remote servers; first-party is unstealable).
 agentd::tools::register(agentd::tools::CodeTool::new(
-    "shout", "Uppercase the input text.",
+    "word_count", "Count the words in a text.",
     json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
-    |args| Ok(json!({ "text": args["text"].as_str().unwrap_or("").to_uppercase() })),
+    |args| Ok(json!({ "words": args["text"].as_str().unwrap_or("").split_whitespace().count() })),
 ))?;
+
+// 2. One agentic run, as a call — Outcome + token Usage back as plain values.
+let intel = IntelClient::from_parts("https://gw.example/v1", token)?;
+let (outcome, usage) = run_loop(&intel, &mcp_servers, &LoopInput {
+    instruction: "Count the words in this review, then summarize it.".into(),
+    output_contract: Some("JSON: {words, summary}".into()),
+    model: "my-model".into(), max_steps: 10, max_tokens: 20_000,
+    deadline: Instant::now() + Duration::from_secs(120),
+    seed: vec![], cancel: None,
+}, &mut NoSelfTools, &log)?;
 ```
 
-Registered tools join the model's catalogue (and win name collisions with
-remote servers — first-party is unstealable), are addressable from workflows as
-the reserved server `code`, and show up in the capabilities manifest. The
-**stock CLI registers nothing** — its no-local-code posture holds by
-construction. Reusable on their own: `agentd-mcp` (MCP client/server + wire)
-and `agentd-net` (transports). See [docs/embedding.md](docs/embedding.md) and
-RFC 0022.
+Workflows embed the same way — author a dialect-2 graph as data, `drive()` it
+with your own executor, and code tools are addressable from `tool` nodes as the
+reserved server **`code`**. Two compile-guaranteed examples ship in-tree:
+[`embedded-agent.rs`](crates/agentd/examples/embedded-agent.rs) (the loop in a
+host app) and [`custom-cli.rs`](crates/agentd/examples/custom-cli.rs) (a custom
+CLI driving a code-tool workflow offline). The **stock CLI registers nothing**
+— its no-local-code posture holds by construction. Reusable on their own:
+`agentd-mcp` (MCP client/server + wire) and `agentd-net` (transports). Recipes,
+the embedder obligations (the re-exec dispatch!), and the API-stability tiers:
+[docs/embedding.md](docs/embedding.md) + RFC 0022.
 
 ## Composition: serving, subagents, A2A
 

@@ -37,9 +37,9 @@ COPY . .
 # Release profile (workspace Cargo.toml): LTO'd, stripped, size-optimized,
 # panic=abort. `--locked` keeps the build reproducible against Cargo.lock.
 RUN if [ -n "$FEATURES" ]; then \
-      cargo build --release --locked -p agentd --features "$FEATURES"; \
+      cargo build --release --locked -p agentd-cli --features "$FEATURES"; \
     else \
-      cargo build --release --locked -p agentd; \
+      cargo build --release --locked -p agentd-cli; \
     fi
 
 # ---- runtime: scratch ----------------------------------------------------

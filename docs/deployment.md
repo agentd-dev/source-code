@@ -262,9 +262,9 @@ COPY . .
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static; one Dockerfile yields native-static amd64 AND arm64 via buildx.
 RUN if [ -n "$FEATURES" ]; then \
-      cargo build --release --locked -p agentd --features "$FEATURES"; \
+      cargo build --release --locked -p agentd-cli --features "$FEATURES"; \
     else \
-      cargo build --release --locked -p agentd; \
+      cargo build --release --locked -p agentd-cli; \
     fi
 
 # scratch: nothing but the binary. (Swap for gcr.io/distroless/static if you

@@ -45,6 +45,9 @@ function Nav() {
         <Link href="/#a2a" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
           a2a
         </Link>
+        <Link href="/#aauth" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          aauth
+        </Link>
         <Link href="/#mcp" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
           mcp
         </Link>

@@ -126,11 +126,24 @@ impl McpClient {
         headers: Vec<(String, String)>,
         timeout: Duration,
     ) -> Result<McpClient, McpError> {
+        Self::connect_signed(name, endpoint, headers, timeout, None)
+    }
+
+    /// [`Self::connect`] with an optional per-request AAuth signer (RFC 0023) —
+    /// every outbound request to this server is signed. `None` = unsigned (the
+    /// `connect` default).
+    pub fn connect_signed(
+        name: &str,
+        endpoint: &str,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+        signer: Option<Arc<dyn crate::http::RequestSigner>>,
+    ) -> Result<McpClient, McpError> {
         let ep = McpEndpoint::parse(endpoint)
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
         Ok(McpClient {
             name: name.to_string(),
-            http: Arc::new(HttpTransport::new(ep, headers)),
+            http: Arc::new(HttpTransport::new(ep, headers).with_signer(signer)),
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             events: Mutex::new(None),
             subscribed_uris: Mutex::new(BTreeSet::new()),

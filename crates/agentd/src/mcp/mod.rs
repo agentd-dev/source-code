@@ -21,14 +21,20 @@ pub fn from_spec(
         )));
     }
     let headers = auth::resolve_headers(&spec.headers).map_err(McpError::Transport)?;
+    // AAuth (RFC 0023): when an agent identity is configured, sign every
+    // outbound request to this server. A non-AAuth server ignores the extra
+    // headers; the signing path is absent entirely without `--features aauth`.
+    #[cfg(feature = "aauth")]
+    let signer = crate::aauth::signer();
+    #[cfg(not(feature = "aauth"))]
+    let signer = None;
     Ok(
-        McpClient::connect(&spec.name, &spec.endpoint, headers, timeout)?.with_client_info(
-            ::mcp::wire::Implementation {
+        McpClient::connect_signed(&spec.name, &spec.endpoint, headers, timeout, signer)?
+            .with_client_info(::mcp::wire::Implementation {
                 name: "agentd".into(),
                 version: crate::VERSION.into(),
                 title: None,
-            },
-        ),
+            }),
     )
 }
 

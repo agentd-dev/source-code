@@ -141,6 +141,18 @@ pub fn run() -> i32 {
         return crate::exit::USAGE;
     }
 
+    // AAuth [DRAFT] (RFC 0023): install the SAME agent identity the root has, so
+    // this child signs its MCP requests under one tree-wide identity. The key
+    // file is a shared-fs path resolved here (re-exec crossed the process
+    // boundary); a bad key/secret is a startup failure (exit 2).
+    #[cfg(feature = "aauth")]
+    if let Some(settings) = &payload.aauth
+        && let Err(e) = crate::aauth::setup(settings, std::time::Duration::from_secs(30))
+    {
+        eprintln!("agentd subagent: aauth: {e}");
+        return crate::exit::USAGE;
+    }
+
     let up: Up = Arc::new(Mutex::new(io::stdout()));
     let log = build_logger(&payload);
     let cancel = Arc::new(AtomicBool::new(false));

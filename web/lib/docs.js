@@ -19,6 +19,7 @@ export const DOCS = [
   { slug: "configuration", file: "docs/configuration.md", title: "configuration" },
   { slug: "observability", file: "docs/observability.md", title: "observability" },
   { slug: "operations", file: "docs/operations.md", title: "operations" },
+  { slug: "aauth", file: "docs/aauth.md", title: "aauth [draft]" },
   { slug: "security", file: "docs/security.md", title: "security" },
   { slug: "deployment", file: "docs/deployment.md", title: "deployment" },
   { slug: "scaling", file: "docs/scaling.md", title: "scaling" },
@@ -44,6 +45,7 @@ export const DOCS = [
   { slug: "rfc-0020", file: "rfcs/0020-a2a-interop-over-vsock.md", title: "rfc 0020 · a2a over vsock" },
   { slug: "rfc-0021", file: "rfcs/0021-durable-workflows-and-parity-extensions.md", title: "rfc 0021 · durable workflows" },
   { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "rfc 0022 · embedding & code tools" },
+  { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "rfc 0023 · aauth [draft]" },
 ];
 
 // docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so

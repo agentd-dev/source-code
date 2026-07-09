@@ -42,6 +42,7 @@ config-watch = ["hot-reload", "agentd/config-watch"]
 otel = ["agentd/otel"]
 workflow = ["agentd/workflow"]
 cel = ["workflow", "agentd/cel"]
+aauth = ["tls", "agentd/aauth"]
 internal-mocks = ["agentd/internal-mocks"]
 
 [dependencies]

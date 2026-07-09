@@ -406,6 +406,37 @@ $ agentd --mode reactive \\
         </p>
       </Section>
 
+      {/* ── AAuth [draft] ────────────────────────────────────── */}
+      <Section
+        id="aauth"
+        eyebrow="signed agent identity · draft"
+        title="AAuth — your agent, provably itself"
+        intro="Calling an MCP server protected by AAuth? agentd gets an Ed25519 identity, a short-lived token from an Agent Provider, and signs every MCP request — no shared API key, and the server knows exactly which agent is calling."
+      >
+        <div className="grid gap-4 md:grid-cols-2">
+          <Card tag="no shared secret" title="Keys, not API keys">
+            agentd holds an <span className="kbd">Ed25519</span> key, enrolls once with an{" "}
+            <span className="kbd">Agent Provider</span>, and fetches a short-lived{" "}
+            <span className="kbd">agent token</span> — cached and refreshed automatically. Nothing to
+            rotate by hand; no long-lived secret to leak.
+          </Card>
+          <Card tag="RFC 9421" title="Every request signed">
+            Each MCP <span className="kbd">POST</span> carries HTTP Message Signatures over{" "}
+            <span className="kbd">@method</span> / <span className="kbd">@authority</span> /{" "}
+            <span className="kbd">@path</span>. The server verifies against the provider&apos;s keys and
+            knows the caller. The whole subagent tree signs under one identity.
+          </Card>
+        </div>
+        <p className="mt-4 text-sm text-[var(--dim)]">
+          Turn it on with <span className="kbd">--aauth-provider</span> +{" "}
+          <span className="kbd">--features aauth</span>. In steady state the human is never in the loop
+          — they enable the agent once; it signs every call. <span className="text-[var(--fg)]">Draft
+          support</span> (identity-based servers end-to-end; user-scoped Person-Server consent on the
+          roadmap), shipped build-from-source like CEL. The one crypto dependency,{" "}
+          <span className="kbd">ring</span>, is the same one rustls already links.
+        </p>
+      </Section>
+
       {/* ── cloud-native spec sheet ──────────────────────────── */}
       <Section
         eyebrow="footprint"

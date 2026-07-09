@@ -161,6 +161,29 @@ fn run() -> i32 {
         }
     }
 
+    // AAuth [DRAFT] (RFC 0023): install the agent identity + prime the first
+    // token now, so an unreachable provider / bad enrollment token fails at
+    // startup (exit 4) rather than on the first MCP call. The identity rides the
+    // spawn payload to every subagent.
+    #[cfg(feature = "aauth")]
+    if let Some(settings) = &cfg.aauth {
+        if let Err(e) = agentd::aauth::setup(settings, std::time::Duration::from_secs(30)) {
+            eprintln!("agentd: aauth: {e}");
+            return agentd::exit::USAGE;
+        }
+        match agentd::aauth::installed().map(|c| c.prime()) {
+            Some(Ok(agent_id)) => log.info(
+                "aauth.ready",
+                json!({"provider": settings.provider, "agent": agent_id}),
+            ),
+            Some(Err(e)) => {
+                eprintln!("agentd: aauth: enroll/token failed: {e}");
+                return agentd::exit::INTEL_UNAVAILABLE;
+            }
+            None => {}
+        }
+    }
+
     // Rule of Two (RFC 0012 §3.2): the lethal-trifecta REFUSAL is now enforced
     // inside `Config::validate()` — the single validation authority (RFC 0017 §7)
     // that `--validate-config` and startup both run — so a refused grant already
@@ -759,6 +782,7 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         mcp_servers: cfg.mcp_servers.clone(),
         a2a_peers: cfg.a2a_peers.clone(),
         tls_ca: cfg.tls_ca.clone(),
+        aauth: cfg.aauth.clone(),
         limits: Limits {
             max_steps: cfg.max_steps,
             max_tokens: cfg.max_tokens,

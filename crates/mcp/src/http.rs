@@ -129,6 +129,24 @@ impl std::fmt::Display for HttpError {
 }
 impl std::error::Error for HttpError {}
 
+/// A per-request signer (RFC 0023 — AAuth). The transport calls it just before
+/// each POST with the derived HTTP components; the returned `(name, value)`
+/// pairs are written as request headers (e.g. the RFC 9421 `Signature-Input` /
+/// `Signature` / `Signature-Key`). Kept dependency-free here — the CRYPTO lives
+/// in the caller (agentd's `aauth` module); this crate only owns the seam, so
+/// `agentd-mcp` gains no crypto dependency.
+pub trait RequestSigner: Send + Sync {
+    /// Sign one request. `authority` is the `Host` value (host[:port]); `path`
+    /// is the request-target. Returns headers to add; an empty vec = send
+    /// unsigned (let the server answer with its auth requirement).
+    fn sign(&self, method: &str, authority: &str, path: &str) -> Vec<(String, String)>;
+    /// An optional `AAuth-Capabilities` header value (interaction shapes the
+    /// agent can drive). `None` = omit.
+    fn capabilities(&self) -> Option<String> {
+        None
+    }
+}
+
 /// The Streamable HTTP transport for one MCP server. Cheap to hold; each request
 /// opens a fresh connection (`Connection: close`), so there is no persistent
 /// socket to reap. `session` is set from the server's `Mcp-Session-Id` on the
@@ -148,6 +166,9 @@ pub struct HttpTransport {
     /// — a MUST for Streamable HTTP). `None` until the client sets it, so the
     /// `initialize` request itself carries no header (no version agreed yet).
     protocol_version: Mutex<Option<String>>,
+    /// An optional per-request signer (AAuth, RFC 0023). `None` = the endpoint
+    /// is called unsigned (the default; static-bearer/mTLS auth is unaffected).
+    signer: Option<std::sync::Arc<dyn RequestSigner>>,
 }
 
 impl HttpTransport {
@@ -159,7 +180,14 @@ impl HttpTransport {
             identity: None,
             session: Mutex::new(None),
             protocol_version: Mutex::new(None),
+            signer: None,
         }
+    }
+
+    /// Install a per-request signer (AAuth). Builder-style; call before use.
+    pub fn with_signer(mut self, signer: Option<std::sync::Arc<dyn RequestSigner>>) -> Self {
+        self.signer = signer;
+        self
     }
 
     /// Attach a mutual-TLS client identity (used only for `https://` endpoints).
@@ -284,6 +312,22 @@ impl HttpTransport {
             headers.push((k, v));
         }
         for (k, v) in &self.headers {
+            headers.push((k.as_str(), v.as_str()));
+        }
+        // AAuth request signing (RFC 0023): sign over @method/@authority/@path
+        // for THIS request. Owned strings kept alive in `signed` for the borrow.
+        let signed: Vec<(String, String)> = match &self.signer {
+            Some(s) => {
+                let authority = self.endpoint.host_header();
+                let mut sig = s.sign("POST", authority, self.endpoint.http_path());
+                if let Some(caps) = s.capabilities() {
+                    sig.push(("AAuth-Capabilities".into(), caps));
+                }
+                sig
+            }
+            None => Vec::new(),
+        };
+        for (k, v) in &signed {
             headers.push((k.as_str(), v.as_str()));
         }
 

@@ -54,6 +54,7 @@ jobs:
           - "--features config-watch"
           - "--features workflow"
           - "--features cel"
+          - "--features aauth" # AAuth [DRAFT] — Ed25519 identity + RFC 9421 signing (ships build-from-source, like cel)
           - "--features serve-https,hot-reload" # the combo that latently broke once
           - "--features cluster,metrics" # the scaling-signal cross combo
           - "--release --features internal-mocks" # debug auto-enables it; --release exercises the opt-in path

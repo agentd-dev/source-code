@@ -44,6 +44,7 @@ status and the M1–M3 milestones.
 | [embedding.md](embedding.md) | Build your own CLI on the `agentd-core` library: the re-exec dispatch, **code-registered tools** (native Rust in the agent), the reserved `code` workflow server, and the API-stability tiers (RFC 0022). |
 | [subagents.md](subagents.md) | The same-binary re-exec subagent model, the rich spawn payload + output contract, narrowed seeds, the spawn chokepoint, and depth/breadth/rate caps. |
 | [observability.md](observability.md) | JSON-lines telemetry, the line schema + event vocabulary, the correlation tuple / `agent_path` subtree trick, health, and metrics-from-logs. |
+| [aauth.md](aauth.md) | **AAuth [DRAFT]** (`--features aauth`): agent identity for AAuth-protected MCP servers — an Ed25519 key + Agent-Provider token + RFC 9421 request signing (RFC 0023). |
 | [security.md](security.md) | The granted-MCP-subset trust budget (Rule-of-Two), untrusted-content stance, SSRF defenses, the no-local-execution posture, and secrets handling. |
 | [deployment.md](deployment.md) | Deployment shapes — standalone CLI, Kubernetes Job/CronJob, reactive Deployment, systemd — drain choreography, and the exit-code contract. |
 | [operations.md](operations.md) | The control plane: the HTTPS management transport (mTLS/bearer auth), the operator control family (`a2a.Drain`/`LameDuck`/`Pause`/`Resume`/`Cancel`), the capabilities manifest + `surfaces{}`, and hot reload (SIGHUP + ConfigMap file-watch). |

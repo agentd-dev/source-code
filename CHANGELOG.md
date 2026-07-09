@@ -33,6 +33,20 @@ unchanged.
   [docs/embedding.md](docs/embedding.md); RFC 0022 with the three
   API-stability tiers.
 
+### Added (AAuth [DRAFT], RFC 0023 — `--features aauth`)
+
+- Agent-side auth for calling **AAuth-protected MCP servers**: an Ed25519 agent
+  identity (`agentd::aauth::AgentKey`), an Agent-Provider enroll + agent-token
+  client with cache/refresh (`ApdClient`), and **RFC 9421 HTTP Message
+  Signatures** on every outbound MCP request — no shared API key. Wired via a
+  dependency-free `RequestSigner` seam in `agentd-mcp` (the crypto stays in
+  `agentd-core`; `ring` is a direct edge only under `aauth`, the same crate
+  rustls already links). One identity per process tree (rides the spawn
+  payload). Config: `--aauth-provider` / `--aauth-key-file` /
+  `--aauth-enroll-token` / `--aauth-person-server` (+ `AGENT_AAUTH_*`).
+  Manifest: `surfaces.aauth`. **Draft**: Case A (identity-based) end to end;
+  Case B partial; Case C scaffolded. Ships build-from-source, like `cel`.
+
 ### Changed
 
 - `--mcp code=…` is refused (`code` is the reserved code-tools server name).

@@ -520,6 +520,27 @@ pub struct McpServerSpec {
     pub tags: Vec<TrifectaTag>,
 }
 
+/// AAuth [DRAFT] agent-identity settings (RFC 0023). Serde-serializable so it
+/// rides the spawn payload verbatim (one identity per process tree). Always
+/// defined (not feature-gated) so payload plumbing is feature-clean; the CLI
+/// flags that populate it require `--features aauth` at validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AAuthSettings {
+    /// The Agent Provider base URL (`https://apd.example`) — enroll + agent-token.
+    pub provider: String,
+    /// The durable Ed25519 key file (created 0600 if absent). A SHARED-FS path,
+    /// like `--tls-ca`, so a re-exec'd subagent resolves the same identity.
+    pub key_file: String,
+    /// A one-time enrollment token template (`{{secret:…}}`), if the provider is
+    /// in `token` mode. Secret-free (a reference, never an inline secret).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token: Option<String>,
+    /// The user's Person Server (`ps` claim) for Case C (user-scoped identity).
+    /// Enrolled today; the interactive consent flow is a roadmap item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_server: Option<String>,
+}
+
 /// Does `s` name a remote MCP endpoint? The four Streamable-HTTP transport
 /// schemes agentd dials (RFC 0004 / RFC 0006).
 pub fn is_mcp_endpoint(s: &str) -> bool {
@@ -631,6 +652,12 @@ pub struct Config {
     /// and inherited by every subagent via the spawn payload. Set-once
     /// (restart-only): trust anchors must not move under a live run.
     pub tls_ca: Option<String>,
+    /// AAuth [DRAFT] agent-identity config (RFC 0023): when the provider URL is
+    /// set, agentd gets an Ed25519 identity + agent token and SIGNS every
+    /// outbound MCP request. `None` = no AAuth (the default). Rides the spawn
+    /// payload to subagents (one identity per process tree). Needs
+    /// `--features aauth`.
+    pub aauth: Option<AAuthSettings>,
     pub health_file: Option<String>,
     /// Inbound W3C `traceparent` to continue (else a trace is minted from the
     /// run id). RFC 0010 §context-propagation.
@@ -788,6 +815,7 @@ impl Default for Config {
             serve_client_ca: None,
             serve_bearer: None,
             tls_ca: None,
+            aauth: None,
             health_file: None,
             traceparent: None,
             log_content: false,
@@ -1169,6 +1197,12 @@ impl Config {
         // validation, so it reflects whatever config is present and succeeds with
         // no instruction.
         let mut capabilities = false;
+        // AAuth [DRAFT] sub-flags accumulate here (order-independent) and are
+        // assembled into `c.aauth` after the loop.
+        let mut aauth_provider: Option<String> = None;
+        let mut aauth_key_file: Option<String> = None;
+        let mut aauth_enroll_token: Option<String> = None;
+        let mut aauth_person_server: Option<String> = None;
         let mut it = args.iter().peekable();
         while let Some(arg) = it.next() {
             let mut take = |name: &str| -> Result<String, ConfigError> {
@@ -1301,6 +1335,15 @@ impl Config {
                 "--serve-client-ca" => c.serve_client_ca = Some(take("--serve-client-ca")?),
                 "--serve-bearer" => c.serve_bearer = Some(take("--serve-bearer")?),
                 "--tls-ca" => c.tls_ca = Some(take("--tls-ca")?),
+                // AAuth [DRAFT] (RFC 0023): --aauth-provider turns it on; the
+                // rest fill AAuthSettings. Gathered into `c.aauth` after the
+                // loop (so the sub-flags are order-independent).
+                "--aauth-provider" => aauth_provider = Some(take("--aauth-provider")?),
+                "--aauth-key-file" => aauth_key_file = Some(take("--aauth-key-file")?),
+                "--aauth-enroll-token" => aauth_enroll_token = Some(take("--aauth-enroll-token")?),
+                "--aauth-person-server" => {
+                    aauth_person_server = Some(take("--aauth-person-server")?)
+                }
                 // Shard identity (RFC 0019 §4): `--shard K/N` overrides AGENTD_SHARD.
                 "--shard" => {
                     let v = take("--shard")?;
@@ -1359,6 +1402,30 @@ impl Config {
                 }
                 other => return Err(usage(format!("unknown argument: {other}"))),
             }
+        }
+
+        // Assemble AAuth [DRAFT] settings (RFC 0023). The provider (flag or
+        // AGENT_AAUTH_PROVIDER env) is what turns it on; a key file defaults to
+        // `./agent.key` in the process cwd (a durable, shared-fs identity).
+        let aauth_provider =
+            aauth_provider.or_else(|| envmap.get("AGENT_AAUTH_PROVIDER").map(|v| v.to_string()));
+        if let Some(provider) = aauth_provider {
+            c.aauth = Some(AAuthSettings {
+                provider,
+                key_file: aauth_key_file
+                    .or_else(|| envmap.get("AGENT_AAUTH_KEY_FILE").map(|v| v.to_string()))
+                    .unwrap_or_else(|| "agent.key".to_string()),
+                enrollment_token: aauth_enroll_token.or_else(|| {
+                    envmap
+                        .get("AGENT_AAUTH_ENROLL_TOKEN")
+                        .map(|v| v.to_string())
+                }),
+                person_server: aauth_person_server.or_else(|| {
+                    envmap
+                        .get("AGENT_AAUTH_PERSON_SERVER")
+                        .map(|v| v.to_string())
+                }),
+            });
         }
 
         // Apply collected `--mcp-tags` to their servers (order-independent).
@@ -1822,6 +1889,29 @@ impl Config {
         }
         if self.cgroup_memory_max.as_deref().map(str::trim) == Some("0") {
             return Err(usage("--cgroup-memory-max must be > 0 or 'max'".into()));
+        }
+        // AAuth [DRAFT] (RFC 0023): the feature-gated flag must be in the build,
+        // and the provider must be a real http(s) URL — both exit 2 before any
+        // network I/O (like every other feature/URL check).
+        if let Some(a) = &self.aauth {
+            if !cfg!(feature = "aauth") {
+                return Err(usage(
+                    "--aauth-provider needs a build with --features aauth".into(),
+                ));
+            }
+            if crate::net::http::Url::parse(&a.provider).is_err() {
+                return Err(usage(format!(
+                    "--aauth-provider must be an http(s) URL (got: {})",
+                    a.provider
+                )));
+            }
+            if let Some(ps) = &a.person_server
+                && crate::net::http::Url::parse(ps).is_err()
+            {
+                return Err(usage(format!(
+                    "--aauth-person-server must be an http(s) URL (got: {ps})"
+                )));
+            }
         }
         // Validate the served-MCP target up front (RFC 0015 §3.1): a bad scheme,
         // a missing port, or a non-loopback plaintext bind exits 2 before any
@@ -2720,6 +2810,10 @@ fn help_text() -> String {
          TOOLS / MCP:\n\
          \x20 --mcp name=endpoint         declare a remote MCP server (repeatable; https://host[:port][/path])\n\
          \x20 --tls-ca <PATH>             extra PEM CA(s) trusted for outbound https (private/in-cluster PKI; added to the bundled roots)\n\
+         \x20 --aauth-provider <URL>      [DRAFT] Agent Provider — sign every MCP request with an Ed25519 agent identity (needs --features aauth; or AGENT_AAUTH_PROVIDER)\n\
+         \x20 --aauth-key-file <PATH>     durable Ed25519 key file (created 0600 if absent; default agent.key; or AGENT_AAUTH_KEY_FILE)\n\
+         \x20 --aauth-enroll-token <T>    one-time enrollment token ({{secret:…}}; provider `token` mode; or AGENT_AAUTH_ENROLL_TOKEN)\n\
+         \x20 --aauth-person-server <URL> [DRAFT] Person Server for user-scoped identity (Case C; or AGENT_AAUTH_PERSON_SERVER)\n\
          \x20 --serve-mcp <TARGET>        serve agentd's own MCP over HTTP(S): https://host:port (or loopback http:// for dev)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: https://host[:port] (repeatable; needs --features a2a)\n\
          \x20 --mcp-tags name=t,t         capability tags: untrusted_input|sensitive|egress\n\
@@ -4642,6 +4736,57 @@ mod tests {
         ));
         let c = Config::load(&args(&[]), &env).unwrap();
         assert_eq!(c.intelligence_token.as_deref(), Some("from-inline"));
+    }
+
+    #[test]
+    #[cfg(feature = "aauth")]
+    fn aauth_flags_and_validation(/* RFC 0023 */) {
+        // Provider + all sub-flags parse into AAuthSettings (order-independent).
+        let c = Config::load(
+            &args(&[
+                "--aauth-key-file",
+                "/tmp/id.key",
+                "--aauth-provider",
+                "https://apd.example",
+                "--aauth-enroll-token",
+                "{{secret:ENROLL}}",
+                "--aauth-person-server",
+                "https://ps.example",
+            ]),
+            &base_env(),
+        )
+        .unwrap();
+        let a = c.aauth.expect("aauth configured");
+        assert_eq!(a.provider, "https://apd.example");
+        assert_eq!(a.key_file, "/tmp/id.key");
+        assert_eq!(a.enrollment_token.as_deref(), Some("{{secret:ENROLL}}"));
+        assert_eq!(a.person_server.as_deref(), Some("https://ps.example"));
+
+        // Key file defaults; env spelling; a bad provider URL is exit 2.
+        let mut env = base_env();
+        env.push(("AGENT_AAUTH_PROVIDER".into(), "https://apd.example".into()));
+        let c = Config::load(&args(&[]), &env).unwrap();
+        assert_eq!(c.aauth.unwrap().key_file, "agent.key");
+        assert!(Config::load(&args(&["--aauth-provider", "not-a-url"]), &base_env()).is_err());
+        assert!(
+            Config::load(
+                &args(&[
+                    "--aauth-provider",
+                    "https://apd.example",
+                    "--aauth-person-server",
+                    "nope"
+                ]),
+                &base_env()
+            )
+            .is_err()
+        );
+        // No provider ⇒ no aauth (the sub-flags alone are inert).
+        assert!(
+            Config::load(&args(&["--aauth-key-file", "/x"]), &base_env())
+                .unwrap()
+                .aauth
+                .is_none()
+        );
     }
 
     #[test]

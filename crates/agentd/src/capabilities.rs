@@ -368,6 +368,23 @@ fn surfaces(cfg: &Config) -> Value {
     if let Some(obj) = s.as_object_mut() {
         obj.insert("claim".into(), json!({ "styles": ["tool", "resource"] }));
     }
+    // RFC 0023 [DRAFT]: AAuth agent identity. When AAuth is configured (an Agent
+    // Provider is set), advertise it — the resolved agent id once primed (never
+    // a key/token), else null (the manifest is a pre-install early exit). Absent
+    // when unconfigured, so a fleet view can tell a signed instance from stock.
+    #[cfg(feature = "aauth")]
+    if cfg.aauth.is_some()
+        && let Some(obj) = s.as_object_mut()
+    {
+        obj.insert(
+            "aauth".into(),
+            json!({
+                "draft": true,
+                "provider": cfg.aauth.as_ref().map(|a| a.provider.clone()),
+                "agent": crate::aauth::installed().and_then(|c| c.agent_id()),
+            }),
+        );
+    }
     // RFC 0022 §4: CODE-REGISTERED tools — an EMBEDDER's binary that registered
     // native tools advertises how many (their names ride the served tools/list
     // like any tool). The stock agentd CLI registers none, so the key is absent

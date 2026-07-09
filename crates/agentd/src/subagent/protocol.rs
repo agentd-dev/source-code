@@ -182,6 +182,13 @@ pub struct SpawnPayload {
     /// own children. `#[serde(default)]` keeps older frames parseable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
+    /// AAuth [DRAFT] agent-identity settings (RFC 0023): inherited by every
+    /// subagent so the whole process tree signs MCP requests under ONE identity.
+    /// The key file is a shared-fs path (like `tls_ca`); no secret rides here
+    /// (the enrollment token is a `{{secret:…}}` template). `#[serde(default)]`
+    /// keeps older frames parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth: Option<crate::config::AAuthSettings>,
     pub limits: Limits,
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
@@ -330,6 +337,7 @@ mod tests {
             }],
             a2a_peers: Vec::new(),
             tls_ca: None,
+            aauth: None,
             limits: Limits {
                 max_steps: 20,
                 max_tokens: 100_000,

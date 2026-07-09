@@ -114,9 +114,21 @@ internal-mocks = []
 # default build carries none of it; a non-cel build REJECTS graphs using CEL at
 # define time (fail-closed, clear message). Rides `workflow`.
 cel = ["dep:cel-interpreter"]
+# AAuth [DRAFT] — agent-side auth for calling AAuth-protected MCP servers
+# (RFC 0023): an Ed25519 agent identity, an Agent-Provider token client
+# (enroll + agent-token cache/refresh), and RFC 9421 HTTP Message Signatures on
+# every outbound MCP request. Rides `tls` (the token/enroll dials are https).
+# `ring` is ALREADY in the tree (rustls's crypto provider), so this adds a
+# direct edge, not a new crate — the crypto exception, like `cel` is the
+# expression exception. OFF by default; a non-aauth binary carries none of it.
+aauth = ["tls", "dep:ring"]
 
 [dependencies]
 cel-interpreter = { version = "0.10.0", optional = true, features = ["json"] }
+# AAuth [DRAFT] crypto (feature `aauth`): Ed25519 keygen/sign + SHA-256. Pinned
+# to the SAME ring rustls already resolves (no new crate in the graph). The
+# `less-safe-getrandom-custom-or-rdrand` avoidance is default; std rng is used.
+ring = { version = "0.17", optional = true }
 # The reusable MCP base library (workspace crate): wire types + the version/era
 # model + the modern dialect helpers + the JSON-RPC codec. In-tree.
 mcp = { package = "agentd-mcp", path = "../mcp", version = "0.2.1" }

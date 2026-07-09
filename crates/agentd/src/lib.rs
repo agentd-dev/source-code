@@ -14,6 +14,8 @@
 //! Module map (assessment §4.0). `agentloop` is named to avoid the `loop`
 //! keyword.
 
+#[cfg(feature = "aauth")]
+pub mod aauth; // AAuth [DRAFT] — agent-side auth for AAuth-protected MCP (RFC 0023)
 pub mod agentd_uri; // the agentd:// resource scheme (self-state + async completion)
 pub mod agentloop; // the ReAct loop + terminal-status state machine
 pub mod capabilities; // the capabilities manifest — the agentctl control-plane spine (RFC 0015)

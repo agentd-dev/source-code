@@ -305,6 +305,23 @@ every child is one `SIGKILL` from gone.
 
 See [docs/security.md](docs/security.md) and [rfcs/0012](rfcs/0012-security-posture.md).
 
+### AAuth [draft] — signed agent identity
+
+Calling an MCP server protected by **AAuth**? Build with `--features aauth` and
+agentd gets an **Ed25519 identity**, an agent token from an **Agent Provider**,
+and **signs every MCP request** (RFC 9421) — no shared API key, and the server
+knows exactly which agent is calling:
+
+```console
+$ agentd --instruction "…" --intelligence https://gw.example/v1 \
+    --mcp secure=https://mcp.secure.example/mcp \
+    --aauth-provider https://apd.example --aauth-enroll-token '{{secret:ENROLL}}'
+```
+
+The token is fetched, cached, and refreshed automatically; the whole subagent
+tree signs under one identity. Draft support (Case A end-to-end); ships
+build-from-source, like CEL. See [docs/aauth.md](docs/aauth.md) + RFC 0023.
+
 ## Operating it
 
 **Exit codes are the contract** (RFC 0011): `0` completed · `1` crash · `2`

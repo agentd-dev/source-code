@@ -413,8 +413,29 @@ pub fn run_reactive(
         }
     }
 
+    // RFC 0025: set once the per-instance lifetime token budget is exhausted, so
+    // the drain block below returns the budget disposition (clean exit 0 by
+    // default, or `--budget-exit-code`) rather than the plain SIGTERM exit 0.
+    let mut budget_stop = false;
+
     loop {
         crate::obs::health::tick();
+
+        // RFC 0025: the per-instance lifetime token budget is enforced HERE —
+        // before accepting the next reaction. When the cumulative cap (charged in
+        // the supervisor reactor) is reached, we stop accepting new work and fall
+        // into the graceful drain below (the in-flight reaction, if any, already
+        // completed — reactions run to completion inside `react`). Idempotent: the
+        // event fires once, on the transition into drain.
+        if !budget_stop && crate::budget::exhausted() && !signals::draining() {
+            budget_stop = true;
+            log.warn(
+                "budget.exhausted",
+                json!({"limit": "tokens_lifetime", "action": "drain"}),
+            );
+            crate::obs::metrics::set_budget_tokens_remaining(0);
+            signals::request_drain();
+        }
 
         // Hot-reload routine (RFC 0017 §5.3): on a tick where a SIGHUP-set RELOAD
         // is pending AND we are not draining (drain wins, §5.2), run the bounded
@@ -624,8 +645,20 @@ pub fn run_reactive(
             // claims released, subscriptions dropped) in THIS (supervisor) process.
             // The block runs once before returning, so this counts each drain once.
             crate::obs::metrics::record_drain("completed");
-            log.info("proc.exit", json!({"reason": "drain", "mode": "reactive"}));
-            return exit::SUCCESS;
+            // RFC 0025: a lifetime-budget drain reports the budget disposition —
+            // clean exit 0 by default (the preferred "drained cleanly" outcome),
+            // or the operator's `--budget-exit-code` (e.g. 7) to signal a policy
+            // stop to the orchestrator. A plain SIGTERM drain stays exit 0.
+            let (reason, code) = if budget_stop {
+                ("budget", cfg.budget_exit_code.unwrap_or(exit::SUCCESS))
+            } else {
+                ("drain", exit::SUCCESS)
+            };
+            log.info(
+                "proc.exit",
+                json!({"reason": reason, "mode": "reactive", "code": code}),
+            );
+            return code;
         }
         let now = Instant::now();
 
@@ -1758,17 +1791,41 @@ pub fn run_scheduled(exe: PathBuf, base: SpawnPayload, cfg: &Config, log: &Logge
         return exit::SUCCESS;
     }
 
+    // RFC 0025: set once the per-instance lifetime token budget is exhausted (see
+    // `run_reactive`); makes the drain below report the budget disposition.
+    let mut budget_stop = false;
+
     loop {
         crate::obs::health::tick();
+        // RFC 0025: enforce the lifetime token budget between fires — a `loop`/
+        // `schedule` daemon stops firing new runs once the cumulative cap
+        // (charged in the supervisor reactor) is reached, then drains cleanly.
+        if !budget_stop && crate::budget::exhausted() && !signals::draining() {
+            budget_stop = true;
+            log.warn(
+                "budget.exhausted",
+                json!({"limit": "tokens_lifetime", "action": "drain"}),
+            );
+            crate::obs::metrics::set_budget_tokens_remaining(0);
+            signals::request_drain();
+        }
         if signals::draining() {
             // Frozen §4.3 `agentd_drains_total{phase="completed"}` (supervisor).
             crate::obs::metrics::record_drain("completed");
+            // A lifetime-budget drain reports the budget disposition (exit 0 by
+            // default, or `--budget-exit-code`); a plain SIGTERM drain is exit 0.
+            let code = if budget_stop {
+                cfg.budget_exit_code.unwrap_or(exit::SUCCESS)
+            } else {
+                exit::SUCCESS
+            };
             log.info(
                 "proc.exit",
-                json!({"reason": "drain", "mode": cfg.mode.as_str()}),
+                json!({"reason": if budget_stop { "budget" } else { "drain" },
+                       "mode": cfg.mode.as_str(), "code": code}),
             );
-            write_daemon_report(cfg, last_status, exit::SUCCESS, daemon_started, log);
-            return exit::SUCCESS;
+            write_daemon_report(cfg, last_status, code, daemon_started, log);
+            return code;
         }
 
         // cron fires *at* its instants, so the wait precedes the run (vs interval,

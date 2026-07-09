@@ -86,6 +86,7 @@ fn enroll_token_and_sign_end_to_end() {
         ApdConfig {
             base_url: provider,
             enrollment_token: Some("one-time-abc".into()),
+            enroll_assertion_file: None,
             person_server: None,
             platform: "workload".into(),
         },

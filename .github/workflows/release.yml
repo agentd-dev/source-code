@@ -18,11 +18,14 @@ permissions:
 # static binary trusts public CAs with no system bundle): the served self-MCP +
 # A2A control plane over HTTP(S) with mTLS/bearer, /healthz+/readyz+/metrics,
 # UTC-cron, OTLP, horizontal scaling (sharding + work-claim + autoscaling
-# signals), SIGHUP/inotify config hot-reload, and agent-authored workflows.
-# CEL (`--features cel`) is the one dependency-bearing opt-in and stays
-# build-from-source by design (the minimalism moat holds in shipped artifacts).
+# signals), SIGHUP/inotify config hot-reload, agent-authored workflows, and the
+# AAuth [DRAFT] agent-identity client (`--features aauth`). AAuth ships in the
+# artifact because its crypto (`ring`) is ALREADY linked by rustls (the `tls`
+# default) — zero marginal dependency, so the minimalism moat is untouched.
+# CEL (`--features cel`) is the one dependency-BEARING opt-in and stays
+# build-from-source by design (the moat holds in shipped artifacts).
 env:
-  FEATURES: "serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow"
+  FEATURES: "serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow,aauth"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

@@ -256,6 +256,19 @@ fn run() -> i32 {
     // pays nothing. Telemetry never crashes the run (§8.4).
     install_event_ring(&cfg, &log);
 
+    // RFC 0025: arm the per-instance lifetime token budget (process-global, this
+    // supervisor process). `0`/unset leaves it inert. A bounded `once` run also
+    // folds `min(max_tokens, cap)` into its per-run box (see `root_payload`); a
+    // long-lived daemon's loop consults `budget::exhausted()` before each new
+    // reaction and drains when the cumulative cap is reached.
+    agentd::budget::install(cfg.budget_tokens_lifetime);
+    if cfg.budget_tokens_lifetime > 0 {
+        log.info(
+            "budget.armed",
+            json!({"lifetime_tokens": cfg.budget_tokens_lifetime, "mode": cfg.mode.as_str()}),
+        );
+    }
+
     match cfg.mode {
         Mode::Once => run_once(&cfg, &log),
         // Drive a pinned workflow to a terminal graph status, then exit (pivot Phase
@@ -764,6 +777,18 @@ fn write_run_report(
 
 /// Build the root subagent's spawn payload from CLI config. The root gets the
 /// full configured MCP set (scope narrows only for *child* subagents).
+/// The per-run token box for the spawned child (RFC 0025). For a bounded `once`
+/// run the instance is that single run, so the lifetime cap folds in as
+/// `min(max_tokens, lifetime)`; long-lived modes keep the plain per-run box and
+/// let the supervisor ledger bound the cumulative total across runs/reactions.
+fn effective_run_token_cap(cfg: &Config) -> u64 {
+    if cfg.mode == Mode::Once && cfg.budget_tokens_lifetime > 0 {
+        cfg.max_tokens.min(cfg.budget_tokens_lifetime)
+    } else {
+        cfg.max_tokens
+    }
+}
+
 fn root_payload(cfg: &Config) -> SpawnPayload {
     // ~10 years if no deadline, so the child's `Instant + ms` never overflows.
     let deadline_ms = cfg
@@ -785,7 +810,12 @@ fn root_payload(cfg: &Config) -> SpawnPayload {
         aauth: cfg.aauth.clone(),
         limits: Limits {
             max_steps: cfg.max_steps,
-            max_tokens: cfg.max_tokens,
+            // RFC 0025: for a BOUNDED (`once`) run the instance IS this one run,
+            // so fold the lifetime cap into the per-run token box — the existing
+            // `ExhaustedTokens → EXIT_BUDGET(7)` path then carries it, mid-run.
+            // Long-lived modes must NOT fold (each reaction keeps its own box; the
+            // cumulative cap is enforced by the supervisor ledger across runs).
+            max_tokens: effective_run_token_cap(cfg),
             deadline_ms,
             max_depth: cfg.max_depth,
         },

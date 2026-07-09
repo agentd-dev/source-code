@@ -541,6 +541,13 @@ pub struct AAuthSettings {
     /// in `token` mode. Secret-free (a reference, never an inline secret).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrollment_token: Option<String>,
+    /// Path to an **enrollment assertion** file (RFC 0023 §5.1 federated gate) —
+    /// e.g. a Kubernetes projected ServiceAccount token whose audience is the
+    /// provider. Re-read fresh on every enroll (projected tokens rotate), so this
+    /// is a PATH, not the assertion itself; it rides the spawn payload like
+    /// `key_file`. Presented in the `/enroll` body; never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_assertion_file: Option<String>,
     /// The user's Person Server (`ps` claim) for Case C (user-scoped identity).
     /// Enrolled today; the interactive consent flow is a roadmap item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -621,6 +628,13 @@ pub struct Config {
     pub interval: Option<Duration>,
     pub max_steps: u32,
     pub max_tokens: u64,
+    /// Per-**instance** cumulative token budget across ALL runs/reactions
+    /// (`--budget-tokens-lifetime` / `AGENT_BUDGET_TOKENS`; RFC 0025). `0` =
+    /// unbounded (today's behaviour). Distinct from `max_tokens`, which boxes a
+    /// single run: a bounded run folds `min(max_tokens, lifetime)` and trips
+    /// `EXIT_BUDGET(7)`; a reactive instance stops accepting new reactions and
+    /// drains when the cumulative cap is reached.
+    pub budget_tokens_lifetime: u64,
     pub deadline: Option<Duration>,
     pub max_depth: u32,
     pub run_id: String,
@@ -806,6 +820,7 @@ impl Default for Config {
             interval: None,
             max_steps: 50,
             max_tokens: 200_000,
+            budget_tokens_lifetime: 0,
             deadline: Some(Duration::from_secs(600)),
             max_depth: 4,
             run_id: String::new(), // filled in load() if unset
@@ -881,6 +896,7 @@ impl fmt::Debug for Config {
             .field("interval", &self.interval)
             .field("max_steps", &self.max_steps)
             .field("max_tokens", &self.max_tokens)
+            .field("budget_tokens_lifetime", &self.budget_tokens_lifetime)
             .field("deadline", &self.deadline)
             .field("max_depth", &self.max_depth)
             .field("run_id", &self.run_id)
@@ -1078,6 +1094,13 @@ impl Config {
                 .parse()
                 .map_err(|_| usage(format!("invalid AGENTD_MAX_TOKENS: {v}")))?;
         }
+        // RFC 0025 per-instance lifetime budget. The neutral `AGENT_BUDGET_TOKENS`
+        // is auto-aliased to `AGENTD_BUDGET_TOKENS` by the debranding pass above.
+        if let Some(v) = envmap.get("AGENTD_BUDGET_TOKENS") {
+            c.budget_tokens_lifetime = v
+                .parse()
+                .map_err(|_| usage(format!("invalid AGENTD_BUDGET_TOKENS: {v}")))?;
+        }
         if let Some(v) = envmap.get("AGENTD_DEADLINE") {
             c.deadline = Some(parse_duration(v).map_err(usage)?);
         }
@@ -1208,6 +1231,7 @@ impl Config {
         let mut aauth_provider: Option<String> = None;
         let mut aauth_key_file: Option<String> = None;
         let mut aauth_enroll_token: Option<String> = None;
+        let mut aauth_enroll_assertion_file: Option<String> = None;
         let mut aauth_person_server: Option<String> = None;
         let mut it = args.iter().peekable();
         while let Some(arg) = it.next() {
@@ -1283,6 +1307,12 @@ impl Config {
                         .parse()
                         .map_err(|_| usage(format!("invalid --max-tokens: {v}")))?;
                 }
+                "--budget-tokens-lifetime" => {
+                    let v = take("--budget-tokens-lifetime")?;
+                    c.budget_tokens_lifetime = v
+                        .parse()
+                        .map_err(|_| usage(format!("invalid --budget-tokens-lifetime: {v}")))?;
+                }
                 "--deadline" => {
                     c.deadline = Some(parse_duration(&take("--deadline")?).map_err(usage)?)
                 }
@@ -1347,6 +1377,9 @@ impl Config {
                 "--aauth-provider" => aauth_provider = Some(take("--aauth-provider")?),
                 "--aauth-key-file" => aauth_key_file = Some(take("--aauth-key-file")?),
                 "--aauth-enroll-token" => aauth_enroll_token = Some(take("--aauth-enroll-token")?),
+                "--aauth-enroll-assertion-file" => {
+                    aauth_enroll_assertion_file = Some(take("--aauth-enroll-assertion-file")?)
+                }
                 "--aauth-person-server" => {
                     aauth_person_server = Some(take("--aauth-person-server")?)
                 }
@@ -1424,6 +1457,11 @@ impl Config {
                 enrollment_token: aauth_enroll_token.or_else(|| {
                     envmap
                         .get("AGENT_AAUTH_ENROLL_TOKEN")
+                        .map(|v| v.to_string())
+                }),
+                enroll_assertion_file: aauth_enroll_assertion_file.or_else(|| {
+                    envmap
+                        .get("AGENT_AAUTH_ENROLL_ASSERTION_FILE")
                         .map(|v| v.to_string())
                 }),
                 person_server: aauth_person_server.or_else(|| {
@@ -2284,6 +2322,9 @@ impl Config {
                 "max_steps": self.max_steps,
                 "max_depth": self.max_depth,
                 "deadline_secs": self.deadline.map(|d| d.as_secs()),
+                // RFC 0025 per-instance lifetime budget; omitted when unbounded (0).
+                "lifetime_tokens": (self.budget_tokens_lifetime > 0)
+                    .then_some(self.budget_tokens_lifetime),
             },
             // Structural name + tags only — never the endpoint (its host/path can
             // be sensitive) nor the auth headers, mirroring the manifest.
@@ -2652,6 +2693,9 @@ fn apply_config_file(
         if let Some(secs) = limits.deadline_secs {
             c.deadline = Some(Duration::from_secs(secs));
         }
+        if let Some(lt) = limits.lifetime_tokens {
+            c.budget_tokens_lifetime = lt;
+        }
     }
     if let Some(level) = cf.log_level {
         c.log_level = Level::parse(&level)
@@ -2820,6 +2864,7 @@ fn help_text() -> String {
          \x20 --aauth-provider <URL>      [DRAFT] Agent Provider — sign every MCP request with an Ed25519 agent identity (needs --features aauth; or AGENT_AAUTH_PROVIDER)\n\
          \x20 --aauth-key-file <PATH>     durable Ed25519 key file (created 0600 if absent; default agent.key; or AGENT_AAUTH_KEY_FILE)\n\
          \x20 --aauth-enroll-token <T>    one-time enrollment token ({{secret:…}}; provider `token` mode; or AGENT_AAUTH_ENROLL_TOKEN)\n\
+         \x20 --aauth-enroll-assertion-file <PATH>  enrollment assertion file — e.g. a projected K8s SA token (provider `federated` mode; re-read each enroll; or AGENT_AAUTH_ENROLL_ASSERTION_FILE)\n\
          \x20 --aauth-person-server <URL> [DRAFT] Person Server for user-scoped identity (Case C; or AGENT_AAUTH_PERSON_SERVER)\n\
          \x20 --serve-mcp <TARGET>        serve agentd's own MCP over HTTP(S): https://host:port (or loopback http:// for dev)\n\
          \x20 --a2a-peer name=<ENDPOINT>  declare a remote A2A delegation peer: https://host[:port] (repeatable; needs --features a2a)\n\
@@ -2844,7 +2889,8 @@ fn help_text() -> String {
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
-         \x20 --max-tokens <N>            token budget (default 200000)\n\
+         \x20 --max-tokens <N>            per-run token budget (default 200000)\n\
+         \x20 --budget-tokens-lifetime <N>  per-INSTANCE cumulative token cap across all runs/reactions (RFC 0025; 0/unset = unbounded; or AGENT_BUDGET_TOKENS)\n\
          \x20 --deadline <dur>            wall-clock deadline (default 600s)\n\
          \x20 --max-depth <N>             subagent tree depth cap (default 4)\n\
          \n\
@@ -4427,6 +4473,47 @@ mod tests {
     }
 
     #[test]
+    fn budget_tokens_lifetime_parses_from_flag_env_and_file() {
+        // RFC 0025 — the per-instance lifetime cap. Unbounded (0) by default.
+        assert_eq!(
+            Config::load(&args(&[]), &base_env())
+                .unwrap()
+                .budget_tokens_lifetime,
+            0
+        );
+        // Flag.
+        let c = Config::load(&args(&["--budget-tokens-lifetime", "2000000"]), &base_env()).unwrap();
+        assert_eq!(c.budget_tokens_lifetime, 2_000_000);
+        // Env (the neutral `AGENT_BUDGET_TOKENS` is aliased to `AGENTD_*`).
+        let mut env = base_env();
+        env.push(("AGENT_BUDGET_TOKENS".into(), "500000".into()));
+        assert_eq!(
+            Config::load(&args(&[]), &env)
+                .unwrap()
+                .budget_tokens_lifetime,
+            500_000
+        );
+        // Config-file `limits.lifetime_tokens`, and flag > file precedence.
+        let file = write_tmp(r#"{ "model": "m", "limits": { "lifetime_tokens": 111 } }"#);
+        let path = file.path().to_str().unwrap().to_string();
+        assert_eq!(
+            Config::load(&args(&["--config", &path]), &base_env())
+                .unwrap()
+                .budget_tokens_lifetime,
+            111
+        );
+        assert_eq!(
+            Config::load(
+                &args(&["--config", &path, "--budget-tokens-lifetime", "222"]),
+                &base_env()
+            )
+            .unwrap()
+            .budget_tokens_lifetime,
+            222
+        );
+    }
+
+    #[test]
     fn env_and_flag_override_file_per_precedence() {
         // built-in < FILE < env < flag (RFC 0011 §2.1 / RFC 0017 §3.2).
         let file = write_tmp(r#"{ "model": "from-file", "max_tokens": 100 }"#);
@@ -4757,6 +4844,8 @@ mod tests {
                 "https://apd.example",
                 "--aauth-enroll-token",
                 "{{secret:ENROLL}}",
+                "--aauth-enroll-assertion-file",
+                "/var/run/secrets/aauth/token",
                 "--aauth-person-server",
                 "https://ps.example",
             ]),
@@ -4767,7 +4856,24 @@ mod tests {
         assert_eq!(a.provider, "https://apd.example");
         assert_eq!(a.key_file, "/tmp/id.key");
         assert_eq!(a.enrollment_token.as_deref(), Some("{{secret:ENROLL}}"));
+        assert_eq!(
+            a.enroll_assertion_file.as_deref(),
+            Some("/var/run/secrets/aauth/token")
+        );
         assert_eq!(a.person_server.as_deref(), Some("https://ps.example"));
+
+        // The assertion file path also parses from its env spelling.
+        let mut env = base_env();
+        env.push(("AGENT_AAUTH_PROVIDER".into(), "https://apd.example".into()));
+        env.push((
+            "AGENT_AAUTH_ENROLL_ASSERTION_FILE".into(),
+            "/var/run/secrets/aauth/token".into(),
+        ));
+        let a = Config::load(&args(&[]), &env).unwrap().aauth.unwrap();
+        assert_eq!(
+            a.enroll_assertion_file.as_deref(),
+            Some("/var/run/secrets/aauth/token")
+        );
 
         // Key file defaults; env spelling; a bad provider URL is exit 2.
         let mut env = base_env();

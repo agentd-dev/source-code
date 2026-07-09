@@ -86,6 +86,10 @@ pub struct LimitsFile {
     pub max_depth: Option<u32>,
     /// `--deadline` in whole seconds.
     pub deadline_secs: Option<u64>,
+    /// `--budget-tokens-lifetime` — the RFC 0025 per-instance cumulative token
+    /// cap across all runs/reactions (the CRD's `limits.lifetimeTokens`). `0` or
+    /// absent = unbounded.
+    pub lifetime_tokens: Option<u64>,
 }
 
 /// One MCP server, reached over the v2.0.0 Streamable HTTP transport: a remote
@@ -280,7 +284,8 @@ pub fn config_schema() -> Value {
                 "properties": {
                     "max_steps": { "type": "integer", "minimum": 1 },
                     "max_depth": { "type": "integer", "minimum": 0 },
-                    "deadline_secs": { "type": "integer", "minimum": 0 }
+                    "deadline_secs": { "type": "integer", "minimum": 0 },
+                    "lifetime_tokens": { "type": "integer", "minimum": 0 }
                 }
             },
             "McpServer": {

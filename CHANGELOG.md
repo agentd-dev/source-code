@@ -44,7 +44,12 @@ unchanged.
   rustls already links). One identity per process tree (rides the spawn
   payload). Config: `--aauth-provider` / `--aauth-key-file` /
   `--aauth-enroll-token` / `--aauth-person-server` (+ `AGENT_AAUTH_*`).
-  Manifest: `surfaces.aauth`. Ships build-from-source, like `cel`.
+  Manifest: `surfaces.aauth`.
+- **Now ships in the release binary and container image** (the `aauth` feature
+  joined the default release feature set). Its crypto (`ring`) is already linked
+  by the default `tls`/rustls transport, so shipping it adds **no new crate to
+  the graph** — unlike `cel`, which stays build-from-source. Still a compile-time
+  feature (a trimmed build can drop it) and still `[draft]`.
 - The transport runs the full **request reaction loop** (sign → inspect
   `AAuth-Requirement`/`AAuth-Access` → satisfy → re-sign → retry, bounded), so
   **all three access modes run end to end**: **Case A** (identity-based),
@@ -53,9 +58,38 @@ unchanged.
   exchange, presented as the `Signature-Key`). Plus **discovery**
   (`/.well-known/aauth-resource.json`), **content-digest** covering when a
   server requires body integrity, and **per-server opt-out** (`aauth: false` on
-  a `--mcp` config entry). Proven by two live-socket e2e tests (`aauth_e2e`
-  Case A; `aauth_flow_e2e` Case C over a real `McpClient`). **Draft**: the wire
+  a `--mcp` config entry).
+- **Federated enrollment** (`--aauth-enroll-assertion-file` /
+  `AGENT_AAUTH_ENROLL_ASSERTION_FILE`): the enroll body carries an
+  `enrollment_assertion` (e.g. a Kubernetes projected ServiceAccount token),
+  **re-read fresh on every enroll** so a rotated token is always current — the
+  secret-free fleet path (no shared enrollment secret, no operator key custody).
+- **The intelligence dial is signed** (agentctl RFC 0024 §7.1): with an identity
+  installed, agentd applies the same RFC 9421 headers to its `--intelligence`
+  requests (chat POST + `/v1/models` GET), so a model gateway can attest the
+  individual agent by signature instead of source IP. Additive — the bearer, if
+  any, still rides alongside.
+- Proven by four live-socket e2e tests (`aauth_e2e` Case A; `aauth_flow_e2e`
+  Case C over a real `McpClient`; `aauth_enroll_assertion_e2e` federated
+  fresh-read; `aauth_intel_sign_e2e` signed model dial). **Draft**: the wire
   tracks the AAuth guide agentd was built against and may shift.
+
+### Added (harness-tracked budgets, RFC 0025)
+
+- **Per-instance lifetime token budget** (`--budget-tokens-lifetime` /
+  `AGENT_BUDGET_TOKENS`, config-file `limits.lifetime_tokens`): a cumulative
+  token cap across **all** runs/reactions of an instance, distinct from the
+  per-run `--max-tokens` box. Bounds a long-lived agent on a path with no
+  metering gateway (e.g. an AAuth direct dial). `0`/unset = unbounded (today's
+  behaviour). A bounded `once` run folds `min(max_tokens, cap)` and trips
+  `EXIT_BUDGET(7)`; a `reactive`/`loop`/`schedule` daemon stops accepting new
+  work and **drains cleanly** (exit `0`, or `--budget-exit-code`) with a
+  `budget.exhausted` event. Metered where all child tokens converge in the
+  supervisor.
+- Observability (`metrics_schema` → **1.1**, additive): the gauge
+  `agent_budget_tokens_remaining` (the alerting/scaling hook) and the
+  `tokens_lifetime` value of `agent_limit_exceeded_total{limit}`; a one-shot
+  `limit.threshold` event fires the first time usage crosses 90% of the cap.
 
 ### Changed
 

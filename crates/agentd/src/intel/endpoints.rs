@@ -317,6 +317,25 @@ fn host_only(rest: &str) -> String {
 }
 
 impl Endpoint {
+    /// AAuth (RFC 0023; agentctl RFC 0024 §7.1 — the modelgateway inbound
+    /// posture): when a process AAuth identity is installed, **sign the
+    /// intelligence dial** (RFC 9421) so the gateway can attest the agent by
+    /// signature instead of source IP. Additive and identity-cover only — a
+    /// non-AAuth endpoint ignores the headers, and the bearer (if any) still
+    /// rides alongside. Empty without `--features aauth` or with no identity
+    /// configured, so the default path is byte-identical to before.
+    #[cfg(feature = "aauth")]
+    fn aauth_headers(&self, method: &str, path: &str, body: &[u8]) -> Vec<(String, String)> {
+        match crate::aauth::signer() {
+            Some(signer) => signer.sign(method, &self.host_header, path, body),
+            None => Vec::new(),
+        }
+    }
+    #[cfg(not(feature = "aauth"))]
+    fn aauth_headers(&self, _method: &str, _path: &str, _body: &[u8]) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Build the request body + headers for this endpoint's dialect, then dial +
     /// round-trip exactly as RFC 0006 (`complete_once`). Returns the parsed
     /// response and the round-trip latency. The wire/adapter/JSON path is
@@ -340,6 +359,11 @@ impl Endpoint {
                 "traceparent".into(),
                 crate::obs::trace::outbound_traceparent(tid),
             ));
+        }
+        // AAuth: sign the dial over the exact body bytes (content-digest cover
+        // applies when discovery flagged it) before we borrow `headers`.
+        for (k, v) in self.aauth_headers("POST", &self.http_path, &body) {
+            headers.push((k, v));
         }
         let header_refs: Vec<(&str, &str)> = headers
             .iter()
@@ -397,6 +421,11 @@ impl Endpoint {
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(tok) = self.token.as_deref() {
             headers.push(("authorization".into(), format!("Bearer {tok}")));
+        }
+        // Sign the discovery GET too (over its own `/v1/models` path), so a
+        // signature-attesting gateway accepts it exactly like the chat dial.
+        for (k, v) in self.aauth_headers("GET", &path, &[]) {
+            headers.push((k, v));
         }
         let header_refs: Vec<(&str, &str)> = headers
             .iter()

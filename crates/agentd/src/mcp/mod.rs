@@ -21,11 +21,25 @@ pub fn from_spec(
         )));
     }
     let headers = auth::resolve_headers(&spec.headers).map_err(McpError::Transport)?;
-    // AAuth (RFC 0023): when an agent identity is configured, sign every
-    // outbound request to this server. A non-AAuth server ignores the extra
-    // headers; the signing path is absent entirely without `--features aauth`.
+    // AAuth (RFC 0023): sign requests to this server with the agent identity.
+    // Per-server opt-in — `spec.aauth == Some(false)` opts out; otherwise the
+    // global default is "sign all when an identity is configured". The signing
+    // path is absent entirely without `--features aauth`.
     #[cfg(feature = "aauth")]
-    let signer = crate::aauth::signer();
+    let signer = if spec.aauth == Some(false) {
+        None
+    } else {
+        let s = crate::aauth::signer();
+        // Learn the server's discovery metadata (content-digest requirement)
+        // once at connect (best-effort). Only when we will actually sign it.
+        if s.is_some()
+            && let Some(client) = crate::aauth::installed()
+        {
+            let authority = ::mcp::http::authority_of(&spec.endpoint);
+            client.discover(&authority, &spec.endpoint);
+        }
+        s
+    };
     #[cfg(not(feature = "aauth"))]
     let signer = None;
     Ok(

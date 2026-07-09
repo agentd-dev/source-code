@@ -107,7 +107,7 @@ fn enroll_token_and_sign_end_to_end() {
     );
 
     // The signer produces the three RFC 9421 headers for an MCP request…
-    let hdrs = client.sign("POST", "mcp.example", "/mcp");
+    let hdrs = client.sign("POST", "mcp.example", "/mcp", b"{}");
     let map: std::collections::HashMap<_, _> = hdrs.into_iter().collect();
     assert!(map.contains_key("Signature-Input"));
     assert!(map.contains_key("Signature"));
@@ -138,7 +138,7 @@ fn enroll_token_and_sign_end_to_end() {
 
     // A second sign() reuses the CACHED token — no more apd calls (the mock was
     // told to serve only 2; a third connect would block/fail).
-    let again = client.sign("POST", "mcp.example", "/mcp");
+    let again = client.sign("POST", "mcp.example", "/mcp", b"{}");
     assert_eq!(again.len(), 3);
 }
 

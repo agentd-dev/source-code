@@ -106,6 +106,11 @@ pub struct McpServerFile {
     /// Glob→trifecta-tags (RFC 0012 §3.1). An untagged server ⇒ `untrusted_input`.
     #[serde(default)]
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Sign requests to this server with the AAuth agent identity (RFC 0023).
+    /// `None` inherits the global default (sign all when an identity is
+    /// configured); `false` opts out; `true` opts in. Needs `--features aauth`.
+    #[serde(default)]
+    pub aauth: Option<bool>,
 }
 
 /// One A2A peer — maps to `--a2a-peer name=endpoint` (RFC 0020 §3).
@@ -295,6 +300,10 @@ pub fn config_schema() -> Value {
                             "type": "array",
                             "items": { "enum": ["untrusted_input", "sensitive", "egress"] }
                         }
+                    },
+                    "aauth": {
+                        "type": "boolean",
+                        "description": "sign requests to this server with the AAuth agent identity (RFC 0023); omit to inherit the global default"
                     }
                 }
             },

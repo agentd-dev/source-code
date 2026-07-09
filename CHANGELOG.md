@@ -44,8 +44,18 @@ unchanged.
   rustls already links). One identity per process tree (rides the spawn
   payload). Config: `--aauth-provider` / `--aauth-key-file` /
   `--aauth-enroll-token` / `--aauth-person-server` (+ `AGENT_AAUTH_*`).
-  Manifest: `surfaces.aauth`. **Draft**: Case A (identity-based) end to end;
-  Case B partial; Case C scaffolded. Ships build-from-source, like `cel`.
+  Manifest: `surfaces.aauth`. Ships build-from-source, like `cel`.
+- The transport runs the full **request reaction loop** (sign → inspect
+  `AAuth-Requirement`/`AAuth-Access` → satisfy → re-sign → retry, bounded), so
+  **all three access modes run end to end**: **Case A** (identity-based),
+  **Case B** (adopt a returned `AAuth-Access` token and replay it), and
+  **Case C** (user-scoped — the Person-Server resource-token → user auth-token
+  exchange, presented as the `Signature-Key`). Plus **discovery**
+  (`/.well-known/aauth-resource.json`), **content-digest** covering when a
+  server requires body integrity, and **per-server opt-out** (`aauth: false` on
+  a `--mcp` config entry). Proven by two live-socket e2e tests (`aauth_e2e`
+  Case A; `aauth_flow_e2e` Case C over a real `McpClient`). **Draft**: the wire
+  tracks the AAuth guide agentd was built against and may shift.
 
 ### Changed
 

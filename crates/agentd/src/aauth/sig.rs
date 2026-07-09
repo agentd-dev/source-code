@@ -46,8 +46,17 @@ impl SigKey<'_> {
 
 /// The signature headers for one request. `authority` is the `Host` value
 /// (host[:port]); `path` is the request-target path (with query, if any).
-/// `created` is unix seconds (clock must be sane, ±60s of the verifier).
-/// Returns `(Signature-Input, Signature, Signature-Key)` header pairs.
+/// The `Content-Digest` header value (RFC 9530) for a body:
+/// `sha-256=:<base64 sha256>:`. Covered by the signature when the server
+/// requires body integrity (RFC 0023 §content-digest).
+pub fn content_digest(body: &[u8]) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, body);
+    format!("sha-256=:{}:", b64::std_pad(d.as_ref()))
+}
+
+/// `created` is unix seconds (clock must be sane, ±60s of the verifier). When
+/// `digest` is `Some`, a `Content-Digest` header is added and covered (body
+/// integrity, RFC 0023 §content-digest). Returns the header pairs.
 pub fn sign_request(
     key: &AgentKey,
     method: &str,
@@ -55,32 +64,46 @@ pub fn sign_request(
     path: &str,
     sigkey: SigKey<'_>,
     created: u64,
-) -> [(String, String); 3] {
+    digest: Option<&str>,
+) -> Vec<(String, String)> {
     let key_hdr = sigkey.header_value(key);
     // The covered-components list + params (the `Signature-Input` value). The
-    // `signature-key` covered component ties the signature to the presented key.
-    let covered = r#"("@method" "@authority" "@path" "signature-key")"#;
+    // `signature-key` covered component ties the signature to the presented key;
+    // `content-digest` is covered only when a body digest is present.
+    let covered = if digest.is_some() {
+        r#"("@method" "@authority" "@path" "content-digest" "signature-key")"#
+    } else {
+        r#"("@method" "@authority" "@path" "signature-key")"#
+    };
     let sig_params = format!("{covered};created={created}");
 
     // The signature base (RFC 9421 §2.5): one line per covered component in
     // list order, then the `@signature-params` line with the SAME params.
+    let digest_line = digest
+        .map(|d| format!("\"content-digest\": {d}\n"))
+        .unwrap_or_default();
     let base = format!(
         "\"@method\": {method}\n\
          \"@authority\": {authority}\n\
          \"@path\": {path}\n\
+         {digest_line}\
          \"signature-key\": {key_hdr}\n\
          \"@signature-params\": {sig_params}"
     );
 
     let signature = key.sign(base.as_bytes());
-    [
+    let mut headers = vec![
         ("Signature-Input".into(), format!("sig={sig_params}")),
         (
             "Signature".into(),
             format!("sig=:{}:", b64::std_pad(&signature)),
         ),
         ("Signature-Key".into(), key_hdr),
-    ]
+    ];
+    if let Some(d) = digest {
+        headers.push(("Content-Digest".into(), d.to_string()));
+    }
+    headers
 }
 
 /// Unix seconds now (for `created`). Isolated so tests can inject a fixed time.
@@ -105,6 +128,7 @@ mod tests {
             "/mcp",
             SigKey::Jwt("TOK"),
             1_700_000_000,
+            None,
         );
         let map: std::collections::HashMap<_, _> = hdrs.iter().cloned().collect();
 
@@ -132,9 +156,44 @@ mod tests {
     }
 
     #[test]
+    fn content_digest_is_added_and_covered() {
+        let key = AgentKey::from_seed(&[5u8; 32]).unwrap();
+        let body = br#"{"jsonrpc":"2.0","method":"tools/call"}"#;
+        let digest = content_digest(body);
+        assert!(digest.starts_with("sha-256=:") && digest.ends_with(':'));
+        let hdrs = sign_request(
+            &key,
+            "POST",
+            "mcp.example",
+            "/mcp",
+            SigKey::Jwt("TOK"),
+            1,
+            Some(&digest),
+        );
+        let map: std::collections::HashMap<_, _> = hdrs.iter().cloned().collect();
+        // The Content-Digest header is emitted and the input covers it.
+        assert_eq!(map["Content-Digest"], digest);
+        assert!(map["Signature-Input"].contains("\"content-digest\""));
+        // The signature verifies over the digest-covering base.
+        let base = format!(
+            "\"@method\": POST\n\"@authority\": mcp.example\n\"@path\": /mcp\n\
+             \"content-digest\": {digest}\n\"signature-key\": sig=jwt;jwt=\"TOK\"\n\
+             \"@signature-params\": (\"@method\" \"@authority\" \"@path\" \"content-digest\" \"signature-key\");created=1"
+        );
+        let raw = map["Signature"]
+            .trim_start_matches("sig=:")
+            .trim_end_matches(':');
+        let sig = b64::url_decode(raw).unwrap();
+        let vk =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key.public_bytes());
+        vk.verify(base.as_bytes(), &sig)
+            .expect("digest-covering signature verifies");
+    }
+
+    #[test]
     fn hwk_scheme_presents_the_public_jwk() {
         let key = AgentKey::from_seed(&[9u8; 32]).unwrap();
-        let hdrs = sign_request(&key, "POST", "apd.example", "/enroll", SigKey::Hwk, 1);
+        let hdrs = sign_request(&key, "POST", "apd.example", "/enroll", SigKey::Hwk, 1, None);
         let map: std::collections::HashMap<_, _> = hdrs.iter().cloned().collect();
         assert!(map["Signature-Key"].starts_with("sig=hwk;jwk=\""));
         // The presented jwk decodes back to this key's public JWK.

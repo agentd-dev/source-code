@@ -129,21 +129,74 @@ impl std::fmt::Display for HttpError {
 }
 impl std::error::Error for HttpError {}
 
-/// A per-request signer (RFC 0023 — AAuth). The transport calls it just before
-/// each POST with the derived HTTP components; the returned `(name, value)`
-/// pairs are written as request headers (e.g. the RFC 9421 `Signature-Input` /
-/// `Signature` / `Signature-Key`). Kept dependency-free here — the CRYPTO lives
-/// in the caller (agentd's `aauth` module); this crate only owns the seam, so
-/// `agentd-mcp` gains no crypto dependency.
+/// The `Host` authority (host[:port]) of an MCP endpoint URL — the `@authority`
+/// AAuth signs over. `localhost` for non-TCP endpoints. Best-effort (a parse
+/// failure yields an empty string).
+pub fn authority_of(endpoint: &str) -> String {
+    McpEndpoint::parse(endpoint)
+        .map(|e| e.host_header().to_string())
+        .unwrap_or_default()
+}
+
+/// The classification of one [`HttpTransport::send_once`] attempt (AAuth loop).
+enum SendOutcome {
+    /// A final JSON-RPC result (or `None` for a notification ack).
+    Result(Option<Value>),
+    /// A terminal transport/HTTP error.
+    Error(HttpError),
+    /// The signer satisfied an `AAuth-Requirement`; re-sign and retry.
+    RetryAuth,
+}
+
+/// The AAuth-relevant fields of a server response (RFC 0023 §5 — the request
+/// loop). Handed to [`RequestSigner::on_response`] so the signer can satisfy a
+/// runtime `AAuth-Requirement` and decide whether a retry would now succeed.
+#[derive(Debug, Clone, Default)]
+pub struct AuthResponse {
+    pub status: u16,
+    /// The `AAuth-Requirement` header value (e.g. `agent-token`,
+    /// `auth-token; resource-token="…"`, `interaction; url=…; code=…`).
+    pub requirement: Option<String>,
+    /// An opaque `AAuth-Access` token the server issued (Case B).
+    pub access: Option<String>,
+    /// A `Location` for a pending interaction (202) to poll.
+    pub location: Option<String>,
+    /// A `Signature-Error` / `AAuth-Error` detail (diagnostics only).
+    pub error: Option<String>,
+}
+
+/// A per-request signer (RFC 0023 — AAuth). The transport calls [`sign`] just
+/// before each POST (the returned `(name, value)` pairs become request headers —
+/// the RFC 9421 `Signature-Input`/`Signature`/`Signature-Key`), and
+/// [`on_response`] after, to react to the server's `AAuth-Requirement` (adopt an
+/// access token, run the Person-Server flow) and re-sign+retry. Kept
+/// dependency-free here — the CRYPTO lives in the caller (agentd's `aauth`
+/// module); this crate only owns the seam, so `agentd-mcp` gains no crypto dep.
 pub trait RequestSigner: Send + Sync {
     /// Sign one request. `authority` is the `Host` value (host[:port]); `path`
-    /// is the request-target. Returns headers to add; an empty vec = send
-    /// unsigned (let the server answer with its auth requirement).
-    fn sign(&self, method: &str, authority: &str, path: &str) -> Vec<(String, String)>;
+    /// is the request-target. `body` is the JSON-RPC bytes (for a
+    /// `content-digest` cover when the server requires it). Returns headers to
+    /// add; an empty vec = send unsigned (let the server answer with its
+    /// requirement).
+    fn sign(&self, method: &str, authority: &str, path: &str, body: &[u8])
+    -> Vec<(String, String)>;
+    /// React to a response (RFC 0023 §5): adopt an `AAuth-Access` token, satisfy
+    /// an `AAuth-Requirement` (e.g. run the Person-Server exchange), and return
+    /// `true` iff the request should be RE-SIGNED and retried (a requirement was
+    /// newly satisfied). The default reacts to nothing. May do network I/O
+    /// (the PS token exchange).
+    fn on_response(&self, _resp: &AuthResponse, _authority: &str) -> bool {
+        false
+    }
     /// An optional `AAuth-Capabilities` header value (interaction shapes the
     /// agent can drive). `None` = omit.
     fn capabilities(&self) -> Option<String> {
         None
+    }
+    /// Whether this server requires a `content-digest` cover (learned at
+    /// discovery). The transport adds/covers the body digest when true.
+    fn wants_content_digest(&self, _authority: &str) -> bool {
+        false
     }
 }
 
@@ -283,6 +336,55 @@ impl HttpTransport {
         extra_headers: &[(&str, &str)],
         mut on_notification: F,
     ) -> Result<Option<Value>, HttpError> {
+        // AAuth request loop (RFC 0023 §5): send signed; if the server answers
+        // with an `AAuth-Requirement` the signer can satisfy (adopt an access
+        // token, run the Person-Server exchange), re-sign and retry — bounded,
+        // so a mis-satisfied requirement cannot spin. Without a signer this is
+        // exactly one pass.
+        const MAX_AUTH_ATTEMPTS: usize = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.send_once(
+                request_id,
+                body,
+                timeout,
+                extra_headers,
+                &mut on_notification,
+            )? {
+                SendOutcome::Result(v) => return Ok(v),
+                SendOutcome::Error(e) => return Err(e),
+                SendOutcome::RetryAuth if attempt < MAX_AUTH_ATTEMPTS => continue,
+                // Out of retries: re-send once more unsigned-of-retry to surface
+                // the server's real error rather than looping.
+                SendOutcome::RetryAuth => {
+                    return match self.send_once(
+                        request_id,
+                        body,
+                        timeout,
+                        extra_headers,
+                        &mut on_notification,
+                    )? {
+                        SendOutcome::Result(v) => Ok(v),
+                        SendOutcome::Error(e) => Err(e),
+                        SendOutcome::RetryAuth => Err(HttpError::NoResponse),
+                    };
+                }
+            }
+        }
+    }
+
+    /// One send attempt: build headers (+ AAuth signing), POST, and classify the
+    /// response — a parsed result, a terminal error, or `RetryAuth` (the signer
+    /// satisfied an `AAuth-Requirement`; the caller re-signs and retries).
+    fn send_once<F: FnMut(Value)>(
+        &self,
+        request_id: Option<i64>,
+        body: &[u8],
+        timeout: Duration,
+        extra_headers: &[(&str, &str)],
+        on_notification: &mut F,
+    ) -> Result<SendOutcome, HttpError> {
         let mut stream = self.connect(timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![
             ("Content-Type", "application/json"),
@@ -315,11 +417,12 @@ impl HttpTransport {
             headers.push((k.as_str(), v.as_str()));
         }
         // AAuth request signing (RFC 0023): sign over @method/@authority/@path
-        // for THIS request. Owned strings kept alive in `signed` for the borrow.
+        // (+ content-digest when the server requires it). Owned strings kept
+        // alive in `signed` for the borrow.
         let signed: Vec<(String, String)> = match &self.signer {
             Some(s) => {
                 let authority = self.endpoint.host_header();
-                let mut sig = s.sign("POST", authority, self.endpoint.http_path());
+                let mut sig = s.sign("POST", authority, self.endpoint.http_path(), body);
                 if let Some(caps) = s.capabilities() {
                     sig.push(("AAuth-Capabilities".into(), caps));
                 }
@@ -345,31 +448,60 @@ impl HttpTransport {
         if let Some(sid) = resp.header("mcp-session-id") {
             *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
+
+        // AAuth response reaction (RFC 0023 §5): let the signer adopt an access
+        // token / satisfy a requirement. `on_response` returns whether a retry
+        // would now differ. Only consulted when a signer is present AND the
+        // response carries an AAuth signal (a requirement, an access token, or a
+        // 401/202) — a plain success skips it.
+        if let Some(signer) = &self.signer {
+            let ar = AuthResponse {
+                status: resp.status,
+                requirement: resp.header("aauth-requirement").map(str::to_string),
+                access: resp.header("aauth-access").map(str::to_string),
+                location: resp.header("location").map(str::to_string),
+                error: resp
+                    .header("signature-error")
+                    .or_else(|| resp.header("aauth-error"))
+                    .map(str::to_string),
+            };
+            if ar.requirement.is_some()
+                || ar.access.is_some()
+                || resp.status == 401
+                || resp.status == 202
+            {
+                let authority = self.endpoint.host_header().to_string();
+                if signer.on_response(&ar, &authority) {
+                    return Ok(SendOutcome::RetryAuth);
+                }
+            }
+        }
+
         if !resp.is_success() {
             // Capture the body so the caller can classify a modern JSON-RPC error.
             let status = resp.status;
             let body = resp.into_body().unwrap_or_default();
-            return Err(HttpError::Status(status, body));
+            return Ok(SendOutcome::Error(HttpError::Status(status, body)));
         }
 
         // A notification POST is acknowledged with an empty body (often 202).
         if request_id.is_none() {
-            return Ok(None);
+            return Ok(SendOutcome::Result(None));
         }
 
         if resp.is_event_stream() {
             let mut sse = resp.sse();
             while let Some(ev) = sse.next_event().map_err(HttpError::Http)? {
-                if let Some(msg) = route_message(&ev, request_id, &mut on_notification) {
-                    return Ok(Some(msg));
+                if let Some(msg) = route_message(&ev, request_id, on_notification) {
+                    return Ok(SendOutcome::Result(Some(msg)));
                 }
             }
-            Err(HttpError::NoResponse)
+            Ok(SendOutcome::Error(HttpError::NoResponse))
         } else {
             let bytes = resp.into_body().map_err(HttpError::Http)?;
             let v: Value = serde_json::from_slice(&bytes)
                 .map_err(|e| HttpError::Http(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-            Ok(Some(v))
+            Ok(SendOutcome::Result(Some(v)))
         }
     }
 

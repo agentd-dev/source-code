@@ -413,7 +413,7 @@ $ agentd --mode reactive \\
         title="AAuth — your agent, provably itself"
         intro="Calling an MCP server protected by AAuth? agentd gets an Ed25519 identity, a short-lived token from an Agent Provider, and signs every MCP request — no shared API key, and the server knows exactly which agent is calling."
       >
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-3">
           <Card tag="no shared secret" title="Keys, not API keys">
             agentd holds an <span className="kbd">Ed25519</span> key, enrolls once with an{" "}
             <span className="kbd">Agent Provider</span>, and fetches a short-lived{" "}
@@ -423,17 +423,25 @@ $ agentd --mode reactive \\
           <Card tag="RFC 9421" title="Every request signed">
             Each MCP <span className="kbd">POST</span> carries HTTP Message Signatures over{" "}
             <span className="kbd">@method</span> / <span className="kbd">@authority</span> /{" "}
-            <span className="kbd">@path</span>. The server verifies against the provider&apos;s keys and
-            knows the caller. The whole subagent tree signs under one identity.
+            <span className="kbd">@path</span> — plus <span className="kbd">content-digest</span> when a
+            server wants body integrity. The server verifies and knows the caller; the whole subagent
+            tree signs under one identity.
+          </Card>
+          <Card tag="Case A · B · C" title="Reacts to what the server asks">
+            The server wants the <em>agent</em> (Case&nbsp;A)? It&apos;s already signed. An opaque{" "}
+            <span className="kbd">AAuth-Access</span> token (Case&nbsp;B)? Adopted and replayed. The{" "}
+            <em>human</em> behind it (Case&nbsp;C)? agentd runs the{" "}
+            <span className="kbd">Person&nbsp;Server</span> exchange and presents the user token — all
+            inside one request, bounded.
           </Card>
         </div>
         <p className="mt-4 text-sm text-[var(--dim)]">
           Turn it on with <span className="kbd">--aauth-provider</span> +{" "}
           <span className="kbd">--features aauth</span>. In steady state the human is never in the loop
           — they enable the agent once; it signs every call. <span className="text-[var(--fg)]">Draft
-          support</span> (identity-based servers end-to-end; user-scoped Person-Server consent on the
-          roadmap), shipped build-from-source like CEL. The one crypto dependency,{" "}
-          <span className="kbd">ring</span>, is the same one rustls already links.
+          support — all three access modes end-to-end</span> (identity, resource-managed, and
+          user-scoped Person-Server consent), shipped build-from-source like CEL. The one crypto
+          dependency, <span className="kbd">ring</span>, is the same one rustls already links.
         </p>
       </Section>
 

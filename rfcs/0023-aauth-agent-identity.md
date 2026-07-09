@@ -5,13 +5,14 @@
 **Date:** 2026-07-09
 **Part of:** the MCP client transport (RFC 0004) + the security posture (RFC 0012); references the AAuth agent/MCP guides supplied by the agentprovider team.
 
-> **DRAFT.** AAuth itself is an evolving spec. agentd implements the **agent
-> (client) side** for **Case A** (identity-based MCP) end to end, with partial
-> Case B (opaque access-token adoption) and scaffolding for Case C (Person
-> Server / user-scoped identity). The wire details below track the guide agentd
-> was built against; they may shift as AAuth stabilizes. The feature is OFF by
-> default and OMITTED from the shipped release binary — build with
-> `--features aauth`.
+> **DRAFT SPEC.** AAuth itself is an evolving spec, so the feature is labelled
+> `[draft]` and ships **build-from-source** (`--features aauth`, OFF by
+> default, omitted from the release binary — like `cel`). The agent-side
+> implementation is **complete**: **Case A** (identity-based), **Case B**
+> (resource-managed access-token adoption), and **Case C** (Person-Server /
+> user-scoped identity) all run end to end — plus discovery and content-digest
+> covering, driven by the transport reaction loop. The wire details track the
+> guide agentd was built against; they may shift as AAuth stabilizes.
 
 ---
 
@@ -33,8 +34,8 @@ bearer, RFC 0012 §3.7).
 **This RFC owns:** the agent-side key/identity, the apd enroll + agent-token
 client, the RFC 9421 signing applied to MCP requests, the config surface, and
 the process-tree identity model. **It does not own:** the AAuth spec itself, the
-MCP/resource server side (agentd is the client), or the Person-Server consent
-UX (a documented roadmap item).
+MCP/resource server side (agentd is the client), or the Person-Server's own
+consent UX (the human approves *at their PS*; agentd only drives the exchange).
 
 ## 2. Where the human user sits (per the guide)
 
@@ -42,17 +43,20 @@ agentd is the **agent**. The human's involvement is entirely a function of the
 server's access mode — and agentd **reacts** to what the server signals, it does
 not choose:
 
-- **Case A — identity-based** (implemented): the server only wants *which agent*.
-  The user acts **at setup only** (enable the agent; provide a one-time
-  enrollment token if the provider requires one). No per-request consent.
-- **Case B — resource-managed** (partial): the server runs its own OAuth-style
-  consent once and hands back an opaque token; agentd **adopts** an
-  `AAuth-Access` token and presents it on later calls. The interactive first
-  consent is out of agentd's request loop (a human/gateway concern).
-- **Case C — Person-Server / user-scoped** (scaffolded): the server wants the
-  *human behind the agent*. agentd enrolls the `ps` claim; the interactive
-  consent round-trip (`401 requirement=auth-token` → PS approve/deny) is a
-  **roadmap item** — today it surfaces as a clear error, not a PS flow.
+- **Case A — identity-based**: the server only wants *which agent*. The user
+  acts **at setup only** (enable the agent; provide a one-time enrollment token
+  if the provider requires one). No per-request consent.
+- **Case B — resource-managed**: the server runs its own OAuth-style consent
+  once and hands back an opaque token; agentd **adopts** the `AAuth-Access`
+  token (from the response) and presents it on the retry + later calls. The
+  interactive first consent is out of agentd's request loop (a human/gateway
+  concern).
+- **Case C — Person-Server / user-scoped**: the server wants the *human behind
+  the agent*. On `401 requirement=auth-token`, agentd exchanges the resource
+  token at the user's Person Server (the human approves there — the exchange
+  carries a justification), receives the user-scoped auth token, and presents
+  it on the retry. The user's active steps are: one-time authorize the agent at
+  their PS, and approve/deny (and optionally clarify) per new scope.
 
 In steady state (all cases) the user is not in the loop — agentd just signs.
 
@@ -86,19 +90,24 @@ Signature-Key: sig=jwt;jwt="<agent_token>"
 ```
 
 The covered set is the guide's minimum (`@method`, `@authority`, `@path`,
-`signature-key`). Signing is hand-rolled string assembly + `ring` Ed25519, unit-
+`signature-key`), plus `content-digest` when discovery says the server requires
+body integrity. Signing is hand-rolled string assembly + `ring` Ed25519, unit-
 tested by reconstructing the base a verifier builds and checking the signature.
 `created` is unix-now (the verifier's ±60 s window applies).
 
-### 3.4 The transport seam (`::mcp::http::RequestSigner`)
+### 3.4 The transport seam + reaction loop (`::mcp::http::RequestSigner`)
 
-The signer is a **trait in `agentd-mcp`** — `sign(method, authority, path) →
-Vec<(name, value)>`, taking and returning strings only, so `agentd-mcp` gains
-**no crypto dependency**. The transport calls it just before each POST and adds
-the headers. `agentd::aauth::AAuthClient` implements the trait; the crypto lives
-only in `agentd-core` behind `aauth`. A token-fetch failure yields no headers
-(the request goes unsigned; the server answers with its requirement) rather than
-wedging the transport.
+The signer is a **trait in `agentd-mcp`** — `sign(method, authority, path, body)
+→ Vec<(name, value)>` and `on_response(AuthResponse, authority) → bool`, taking
+and returning strings only, so `agentd-mcp` gains **no crypto dependency**. The
+transport runs the RFC 0023 §5 **request loop**: sign → send → if the response
+carries an `AAuth-Requirement`/`AAuth-Access`/`401`/`202`, call `on_response`
+(which adopts an access token or runs the Person-Server exchange) → if it
+returns `true`, re-sign (now presenting the new token) and retry — bounded
+(3 attempts) so a mis-satisfied requirement cannot spin.
+`agentd::aauth::AAuthClient` implements the trait; the crypto lives only in
+`agentd-core` behind `aauth`. A token-fetch failure yields no headers (the
+request goes unsigned; the server answers with its requirement).
 
 ### 3.5 One identity per process tree
 
@@ -108,12 +117,14 @@ so the whole re-exec'd tree signs under **one agent identity**. The root
 **primes** it at startup — enroll + first token — so an unreachable provider or
 bad enrollment token fails fast (exit 4/2), not on the first MCP call.
 
-### 3.6 What gets signed
+### 3.6 What gets signed (per-server opt-in)
 
-When `--aauth-provider` is set, **every** configured MCP server is signed (the
-agent has one identity; a non-AAuth server ignores the extra headers). Per-server
-scoping is a possible refinement (§7). Static-bearer/mTLS auth is unaffected —
-signing is additive.
+When `--aauth-provider` is set, **every** configured MCP server is signed by
+default (the agent has one identity; a non-AAuth server ignores the extra
+headers). A specific server opts **out** with `aauth: false` on its `--mcp`
+config-file entry — useful to withhold identity from a server that should not
+learn who the agent is. Static-bearer/mTLS auth is unaffected — signing is
+additive.
 
 ## 4. Config surface
 
@@ -122,7 +133,7 @@ signing is additive.
 | `--aauth-provider <url>` | `AGENT_AAUTH_PROVIDER` | The Agent Provider — **turns AAuth on**. |
 | `--aauth-key-file <path>` | `AGENT_AAUTH_KEY_FILE` | Durable Ed25519 key (created 0600 if absent; default `agent.key`). Shared-fs. |
 | `--aauth-enroll-token <T>` | `AGENT_AAUTH_ENROLL_TOKEN` | One-time enrollment token (`{{secret:…}}`), provider `token` mode. |
-| `--aauth-person-server <url>` | `AGENT_AAUTH_PERSON_SERVER` | Person Server (`ps`) for Case C (enrolled; consent flow is roadmap). |
+| `--aauth-person-server <url>` | `AGENT_AAUTH_PERSON_SERVER` | Person Server (`ps`) for Case C — the resource-token → user-scoped auth-token exchange. |
 
 All exit `2` at validation without `--features aauth`, or on a bad URL — before
 any network I/O. Manifest: `surfaces.aauth = {draft:true, agent:"aauth:…"}` when
@@ -135,40 +146,45 @@ AAuth reserves no names.
 - **No new secret on the wire**: the key seed is a local 0600 file; the agent
   token is short-lived and re-fetchable; the enrollment token is a secret
   reference resolved at use. None are logged.
-- **The signature covers request identity**, not the body, by default — a
-  `content-digest` cover is a future add (§7) for servers that require body
-  integrity.
+- **The signature covers request identity** by default; when discovery
+  (`/.well-known/aauth-resource.json`) says a server requires body integrity,
+  the signature **also covers `content-digest`** (RFC 9530 SHA-256 of the body).
 - Signing is **additive and opt-in**: a build without `aauth` has no signing
   path and no `ring` edge; a run without `--aauth-provider` signs nothing.
-- The agent token is presented to **every** signed server; an operator who
-  needs to withhold identity from a specific server should not route it through
-  an AAuth-on agentd (per-server opt-out is §7).
+- The agent token is presented to **every** signed server by default; an
+  operator withholds identity from a specific server with `aauth: false` on its
+  `--mcp` entry (§3.6).
 
 ## 6. Conformance & tests
 
 Unit: base64 (RFC 4648 vectors), Ed25519 keygen/persist/reload/sign + `ring`
-verify, RFC 9421 base reconstruction + verify, `hwk` JWK presentation, config
-parse/validation. E2e (`aauth_e2e.rs`): the full chain against a **live mock
-Agent Provider socket** — key → signed enroll → signed agent-token → cache →
-request-signature headers that a verifier checks against the enrolled public
-key, plus cache-reuse (no second token fetch). This mirrors exactly what a real
-AAuth MCP server verifies.
+verify, RFC 9421 base reconstruction + verify (identity-only **and**
+`content-digest`-covering), `hwk` JWK presentation, Person-Server resource-token
+parse, config parse/validation. E2e:
+
+- `aauth_e2e.rs` (**Case A**): the full chain against a **live mock Agent
+  Provider socket** — key → signed enroll → signed agent-token → cache →
+  request-signature headers that a verifier checks against the enrolled public
+  key, plus cache-reuse (no second token fetch).
+- `aauth_flow_e2e.rs` (**Case C**, over the real transport): a real `McpClient`
+  with the AAuth signer against a live mock apd + Person Server + AAuth MCP
+  server. The first signed `tools/call` gets `401 requirement=auth-token`; the
+  transport reaction loop runs the PS exchange (carrying a justification),
+  caches the user-scoped auth token, re-signs presenting it, and the retry
+  returns the protected result — the whole loop inside one `call_tool`.
+
+Together these mirror exactly what a real AAuth MCP server verifies across all
+three access modes.
 
 ## 7. Deferred (roadmap)
 
-- **Case C interactive consent**: the `401 requirement=auth-token` → Person
-  Server approve/deny/clarify round-trip, and presenting the resulting
-  user-scoped **auth token** as the `Signature-Key` instead of the agent token.
-  The `ps` claim is already enrolled; the resume-after-key-refresh dance
-  (guide §6) comes with it.
+The agent-side loop (Case A/B/C, discovery, content-digest, per-server opt-in)
+is done. What remains:
+
 - **`202 requirement=interaction`** (elicitation/HITL): drive the user to the
-  URL + poll `Location`. Natural fit with the RFC 0021 `human` gate.
-- **Discovery**: read `/.well-known/aauth-resource.json` to pick the case up
-  front (agentd currently signs proactively and reacts to the runtime
-  requirement).
-- **`content-digest` covering** for servers that require body integrity.
-- **Per-server AAuth opt-in/out** (a `--mcp` tag or config-file `aauth: bool`),
-  replacing today's sign-all-when-configured.
+  URL + poll `Location`. The Person-Server exchange already polls an interaction
+  URL for the async-approval case; extending it to a server's own `202` and
+  wiring it to the RFC 0021 `human` gate is the remaining step.
 - **AAuth Events** (`/inbox` polling) for async tool results.
 - Shipping in the release binary once the draft stabilizes (today: build from
   source, like `cel`).

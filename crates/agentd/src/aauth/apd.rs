@@ -153,15 +153,18 @@ impl ApdClient {
         let full = format!("{}{path}", self.config.base_url.trim_end_matches('/'));
         let url = Url::parse(&full).map_err(|e| format!("aauth: apd url {full}: {e}"))?;
         let bytes = serde_json::to_vec(body).unwrap_or_default();
-        let hdrs = sig::sign_request(
+        // The apd calls cover the body digest (integrity of the enroll/token
+        // request), signed with the durable key via the hwk scheme.
+        let digest = sig::content_digest(&bytes);
+        let owned = sig::sign_request(
             &self.key,
             "POST",
             &url.host_header(),
             &url.path,
             SigKey::Hwk,
             sig::now_secs(),
+            Some(&digest),
         );
-        let owned: Vec<(String, String)> = hdrs.into_iter().collect();
         let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
         for (k, v) in &owned {
             headers.push((k.as_str(), v.as_str()));

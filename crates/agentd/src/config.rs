@@ -518,6 +518,12 @@ pub struct McpServerSpec {
     /// an untagged server conservatively as `untrusted_input`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TrifectaTag>,
+    /// Sign requests to THIS server with the AAuth agent identity (RFC 0023).
+    /// Per-server opt-in: `None` inherits the global default (sign all when an
+    /// `--aauth-provider` is configured); `Some(false)` opts out; `Some(true)`
+    /// opts in even if the global default were off. Travels in the spawn payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth: Option<bool>,
 }
 
 /// AAuth [DRAFT] agent-identity settings (RFC 0023). Serde-serializable so it
@@ -2690,6 +2696,7 @@ fn apply_config_file(
             endpoint,
             headers,
             tags,
+            aauth: s.aauth,
         });
     }
     c.subscribe.extend(cf.subscribe);

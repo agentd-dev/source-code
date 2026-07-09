@@ -319,6 +319,25 @@ impl Supervisor {
             AgentMsg::Usage(u) => {
                 self.on_event(node, now);
                 crate::obs::metrics::record_tokens(u.input_tokens, u.output_tokens);
+                // RFC 0025: charge the per-INSTANCE lifetime budget. This is the
+                // one point where every child's tokens converge in the long-lived
+                // supervisor process, so the cumulative counter (and the
+                // `agent_budget_tokens_remaining` gauge) live here. The reactive
+                // daemon's loop consults `budget::exhausted()` before accepting
+                // the next reaction; here we only meter + surface the crossing.
+                match crate::budget::charge(u.total()) {
+                    crate::budget::Crossed::Threshold => self.log.warn(
+                        "limit.threshold",
+                        json!({"limit": "tokens_lifetime",
+                               "remaining": crate::budget::remaining().unwrap_or(0)}),
+                    ),
+                    crate::budget::Crossed::Exhausted => {
+                        self.log
+                            .warn("limit.exceeded", json!({"limit": "tokens_lifetime"}));
+                        crate::obs::metrics::record_limit_exceeded("tokens_lifetime");
+                    }
+                    crate::budget::Crossed::None => {}
+                }
                 if self.tree.charge_tokens(node, u.total()) && self.drain.is_none() {
                     self.log
                         .warn("limit.exceeded", json!({"limit": "tree_tokens"}));

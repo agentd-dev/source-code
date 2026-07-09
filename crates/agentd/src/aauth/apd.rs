@@ -27,6 +27,11 @@ pub struct ApdConfig {
     /// (RFC 0023 §Step 1 — the human/operator provides it). `None` for
     /// open/self-hosted mode.
     pub enrollment_token: Option<String>,
+    /// Path to an enrollment-assertion file for the provider's `federated` gate
+    /// (RFC 0023 §5.1) — e.g. a Kubernetes projected ServiceAccount token. Read
+    /// **fresh on every enroll** (the projected token rotates), so we hold the
+    /// path, never the assertion. `None` when not using assertion enrollment.
+    pub enroll_assertion_file: Option<String>,
     /// The user's chosen Person Server (`ps` claim), if this agent acts for a
     /// human under Case C. `None` for identity-only (Case A). Forwarded to
     /// enroll; the PS consent flow itself is a roadmap item (RFC 0023 §Case C).
@@ -118,6 +123,19 @@ impl ApdClient {
         let mut body = serde_json::json!({ "platform": self.config.platform });
         if let Some(t) = &self.config.enrollment_token {
             body["enrollment_token"] = serde_json::Value::String(t.clone());
+        }
+        // Federated gate (RFC 0023 §5.1): read the assertion FRESH on every
+        // enroll — a projected SA token rotates, so a value cached at construction
+        // would go stale across restarts/re-enrolls. The path rode the spawn
+        // payload; the short-lived token never touches config or logs.
+        if let Some(path) = &self.config.enroll_assertion_file {
+            let assertion = std::fs::read_to_string(path)
+                .map_err(|e| format!("aauth: enrollment assertion file {path}: {e}"))?;
+            let assertion = assertion.trim();
+            if assertion.is_empty() {
+                return Err(format!("aauth: enrollment assertion file {path} is empty"));
+            }
+            body["enrollment_assertion"] = serde_json::Value::String(assertion.to_string());
         }
         if let Some(ps) = &self.config.person_server {
             body["ps"] = serde_json::Value::String(ps.clone());

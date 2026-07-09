@@ -40,7 +40,10 @@
 /// at `surfaces.metrics_schema`; the integrator wires the surface — this const is
 /// the single source of truth this chunk owns. Additive series/label-values bump
 /// the minor; a removed/renamed metric or label key bumps the major (§8.2).
-pub const METRICS_SCHEMA: &str = "1.0";
+///
+/// 1.1 (RFC 0025): additive — the `agent_budget_tokens_remaining` gauge and the
+/// `tokens_lifetime` value of the `agent_limit_exceeded_total{limit}` domain.
+pub const METRICS_SCHEMA: &str = "1.1";
 
 /// Terminal disposition of one supervised run.
 #[derive(Debug, Clone, Copy)]
@@ -395,6 +398,22 @@ pub fn set_config_generation(generation: u64) {
     let _ = generation;
 }
 
+/// Point-in-time set of the lifetime-budget balance gauge
+/// (`agent_budget_tokens_remaining`, RFC 0025 §3.4): tokens left before the
+/// per-instance cumulative cap is reached — the alerting/scaling hook for the
+/// threshold event. Only ever set when a budget is installed (absent = the
+/// gauge stays at its 0 default, which a scraper reads together with the fact
+/// that no budget metric transitions occurred; unbounded instances simply never
+/// call this).
+pub fn set_budget_tokens_remaining(remaining: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY
+        .budget_tokens_remaining
+        .store(remaining, Ordering::Relaxed);
+    #[cfg(not(feature = "metrics"))]
+    let _ = remaining;
+}
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -447,6 +466,7 @@ mod imp {
         "deadline",
         "depth",
         "tree_tokens",
+        "tokens_lifetime",
         "restart_storm",
         "spawn_rate",
         "other",
@@ -567,6 +587,9 @@ mod imp {
         // --- RFC 0017 §5.6: hot-reload outcome counter + generation gauge -----
         config_reloads: LabelCounter<{ RELOAD_RESULTS.len() }>,
         pub(super) config_generation: AtomicU64,
+
+        // --- RFC 0025 §3.4: per-instance lifetime-budget balance gauge --------
+        pub(super) budget_tokens_remaining: AtomicU64,
     }
 
     impl Registry {
@@ -612,6 +635,7 @@ mod imp {
                 claims_released: AtomicU64::new(0),
                 config_reloads: LabelCounter::new(),
                 config_generation: AtomicU64::new(0),
+                budget_tokens_remaining: AtomicU64::new(0),
             }
         }
 
@@ -1023,6 +1047,18 @@ mod imp {
                 "agent_config_generation",
                 "Successfully-applied config reloads (the live generation).",
                 g(&self.config_generation),
+            );
+
+            // --- lifetime budget balance (RFC 0025 §3.4) ---------------------
+            // Tokens remaining before the per-instance cumulative cap; the
+            // alerting/scaling hook. 0 both when unbounded (never set) and when
+            // exhausted — a scraper distinguishes them via the budget event/limit
+            // metric, so unbounded instances read as "no budget in play".
+            gauge(
+                &mut s,
+                "agent_budget_tokens_remaining",
+                "Tokens left before the per-instance lifetime budget (RFC 0025); 0 when unbounded or exhausted.",
+                g(&self.budget_tokens_remaining),
             );
 
             // --- reactive backlog — the RFC 0019 scaling signal set (§4.3) ---
@@ -1499,6 +1535,23 @@ mod imp {
                     .count(),
                 1
             );
+        }
+
+        #[test]
+        fn budget_gauge_and_lifetime_limit_render() {
+            // RFC 0025: the balance gauge (present at 0 by default) + the additive
+            // `tokens_lifetime` value of the closed `agent_limit_exceeded_total`
+            // domain.
+            let r = Registry::new();
+            let out = r.render();
+            assert!(out.contains("# TYPE agent_budget_tokens_remaining gauge"));
+            assert!(out.contains("agent_budget_tokens_remaining 0"));
+
+            r.budget_tokens_remaining.store(1500, Ordering::Relaxed);
+            r.record_limit_exceeded("tokens_lifetime");
+            let out = r.render();
+            assert!(out.contains("agent_budget_tokens_remaining 1500"));
+            assert!(out.contains("agent_limit_exceeded_total{limit=\"tokens_lifetime\"} 1"));
         }
 
         #[test]

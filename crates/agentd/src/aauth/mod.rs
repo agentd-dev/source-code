@@ -93,6 +93,7 @@ pub fn setup(settings: &crate::config::AAuthSettings, timeout: Duration) -> Resu
     let config = ApdConfig {
         base_url: settings.provider.clone(),
         enrollment_token,
+        enroll_assertion_file: settings.enroll_assertion_file.clone(),
         person_server: settings.person_server.clone(),
         platform: "workload".into(),
     };

@@ -421,11 +421,11 @@ $ agentd --mode reactive \\
             rotate by hand; no long-lived secret to leak.
           </Card>
           <Card tag="RFC 9421" title="Every request signed">
-            Each MCP <span className="kbd">POST</span> carries HTTP Message Signatures over{" "}
+            Each MCP <span className="kbd">POST</span> — and the{" "}
+            <span className="kbd">--intelligence</span> dial — carries HTTP Message Signatures over{" "}
             <span className="kbd">@method</span> / <span className="kbd">@authority</span> /{" "}
-            <span className="kbd">@path</span> — plus <span className="kbd">content-digest</span> when a
-            server wants body integrity. The server verifies and knows the caller; the whole subagent
-            tree signs under one identity.
+            <span className="kbd">@path</span>. The server (or model gateway) verifies and knows the
+            caller by signature, not source IP; the whole subagent tree signs under one identity.
           </Card>
           <Card tag="Case A · B · C" title="Reacts to what the server asks">
             The server wants the <em>agent</em> (Case&nbsp;A)? It&apos;s already signed. An opaque{" "}
@@ -436,12 +436,14 @@ $ agentd --mode reactive \\
           </Card>
         </div>
         <p className="mt-4 text-sm text-[var(--dim)]">
-          Turn it on with <span className="kbd">--aauth-provider</span> +{" "}
-          <span className="kbd">--features aauth</span>. In steady state the human is never in the loop
-          — they enable the agent once; it signs every call. <span className="text-[var(--fg)]">Draft
-          support — all three access modes end-to-end</span> (identity, resource-managed, and
-          user-scoped Person-Server consent), shipped build-from-source like CEL. The one crypto
-          dependency, <span className="kbd">ring</span>, is the same one rustls already links.
+          Turn it on with just <span className="kbd">--aauth-provider</span> — the feature is{" "}
+          <span className="text-[var(--fg)]">in the release binary and image</span>. In steady state
+          the human is never in the loop; they enable the agent once and it signs every call.{" "}
+          <span className="text-[var(--fg)]">Draft support — all three access modes end-to-end</span>{" "}
+          (identity, resource-managed, and user-scoped Person-Server consent), plus{" "}
+          <span className="text-[var(--fg)]">federated enrollment</span> (per-pod projected tokens, no
+          shared secret). It ships free: the one crypto dependency,{" "}
+          <span className="kbd">ring</span>, is the same one rustls already links — zero new crate.
         </p>
       </Section>
 

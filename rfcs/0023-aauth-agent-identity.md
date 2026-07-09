@@ -1,18 +1,22 @@
 # RFC 0023: AAuth [DRAFT] — agent identity for calling AAuth-protected MCP servers
 
-**Status:** Implemented (draft support, 2026-07-09) — `--features aauth`, ships build-from-source
+**Status:** Implemented (draft support, 2026-07-09) — `--features aauth`, **ships in the release binary** (zero marginal dep: the crypto is already linked by the `tls` transport)
 **Author:** Andrii Tsok
 **Date:** 2026-07-09
 **Part of:** the MCP client transport (RFC 0004) + the security posture (RFC 0012); references the AAuth agent/MCP guides supplied by the agentprovider team.
 
 > **DRAFT SPEC.** AAuth itself is an evolving spec, so the feature is labelled
-> `[draft]` and ships **build-from-source** (`--features aauth`, OFF by
-> default, omitted from the release binary — like `cel`). The agent-side
+> `[draft]`. Unlike `cel` (which pulls a real dependency and stays
+> build-from-source), the `aauth` feature is **in the default release feature
+> set** — its crypto (`ring`) is the same crate rustls already links for the
+> `tls` transport, so shipping it adds **no new crate to the graph**. It stays a
+> compile-time feature (a trimmed build can drop it). The agent-side
 > implementation is **complete**: **Case A** (identity-based), **Case B**
 > (resource-managed access-token adoption), and **Case C** (Person-Server /
-> user-scoped identity) all run end to end — plus discovery and content-digest
-> covering, driven by the transport reaction loop. The wire details track the
-> guide agentd was built against; they may shift as AAuth stabilizes.
+> user-scoped identity) all run end to end — plus discovery, content-digest
+> covering, **federated (assertion) enrollment**, and **signing the
+> intelligence dial**. The wire details track the guide agentd was built
+> against; they may shift as AAuth stabilizes.
 
 ---
 
@@ -75,9 +79,19 @@ x}`), the RFC 7638 thumbprint (`jkt`), and `sign(base) → 64-byte sig`.
 `POST {apd}/enroll` (signed, `hwk` scheme — presents the public JWK; the agent
 has no token yet) → agent identity. `POST {apd}/agent-token` (signed) → a
 short-lived token, **cached** and **proactively refreshed** 60 s before expiry.
-The enrollment token is a `{{secret:…}}` template resolved at use (RFC 0012 §3.7
-— never inline, never logged). Fully automatic after setup; losing a token just
-fetches another (no long-lived secret).
+Fully automatic after setup; losing a token just fetches another (no long-lived
+secret).
+
+**Enrollment gates.** The enroll body carries whatever the provider's gate
+needs: `token` mode presents a one-time enrollment token (a `{{secret:…}}`
+template resolved at use — RFC 0012 §3.7, never inline, never logged);
+**`federated` mode** presents an `enrollment_assertion` read from
+`--aauth-enroll-assertion-file` (e.g. a Kubernetes projected ServiceAccount
+token). The assertion is **re-read fresh on every enroll** — projected tokens
+rotate, so the path (not the value) rides config and the spawn payload, and the
+short-lived assertion never touches config or logs. Federated is the secret-free
+fleet path: each pod presents its own platform identity, so there is no shared
+enrollment secret.
 
 ### 3.3 Request signing (`aauth::sig`, RFC 9421)
 
@@ -117,7 +131,7 @@ so the whole re-exec'd tree signs under **one agent identity**. The root
 **primes** it at startup — enroll + first token — so an unreachable provider or
 bad enrollment token fails fast (exit 4/2), not on the first MCP call.
 
-### 3.6 What gets signed (per-server opt-in)
+### 3.6 What gets signed (per-server opt-in + the intel dial)
 
 When `--aauth-provider` is set, **every** configured MCP server is signed by
 default (the agent has one identity; a non-AAuth server ignores the extra
@@ -126,6 +140,13 @@ config-file entry — useful to withhold identity from a server that should not
 learn who the agent is. Static-bearer/mTLS auth is unaffected — signing is
 additive.
 
+The **intelligence dial** is signed too: agentd's LLM client applies the same
+RFC 9421 headers to its requests to the `--intelligence` endpoint (both the chat
+POST and the `/v1/models` discovery GET), so a model gateway can attest the
+individual agent by signature instead of source IP (agentctl RFC 0024 §7.1).
+Identity-cover only (no content-digest for the intel dial in this cut); the
+endpoint's bearer, if any, still rides alongside.
+
 ## 4. Config surface
 
 | Flag | Env | Meaning |
@@ -133,6 +154,7 @@ additive.
 | `--aauth-provider <url>` | `AGENT_AAUTH_PROVIDER` | The Agent Provider — **turns AAuth on**. |
 | `--aauth-key-file <path>` | `AGENT_AAUTH_KEY_FILE` | Durable Ed25519 key (created 0600 if absent; default `agent.key`). Shared-fs. |
 | `--aauth-enroll-token <T>` | `AGENT_AAUTH_ENROLL_TOKEN` | One-time enrollment token (`{{secret:…}}`), provider `token` mode. |
+| `--aauth-enroll-assertion-file <path>` | `AGENT_AAUTH_ENROLL_ASSERTION_FILE` | Enrollment assertion file (projected SA token / JWS), provider `federated` mode — re-read fresh on every enroll. |
 | `--aauth-person-server <url>` | `AGENT_AAUTH_PERSON_SERVER` | Person Server (`ps`) for Case C — the resource-token → user-scoped auth-token exchange. |
 
 All exit `2` at validation without `--features aauth`, or on a bad URL — before
@@ -172,19 +194,28 @@ parse, config parse/validation. E2e:
   transport reaction loop runs the PS exchange (carrying a justification),
   caches the user-scoped auth token, re-signs presenting it, and the retry
   returns the protected result — the whole loop inside one `call_tool`.
+- `aauth_enroll_assertion_e2e.rs` (**federated enroll**): two fresh clients read
+  the same assertion file across a rotation; each enroll body carries the file's
+  current contents — proving the assertion is read *at enroll*, not cached.
+- `aauth_intel_sign_e2e.rs` (**signed intel dial**): a real `IntelClient` with
+  the signer installed dials a mock LLM that asserts the RFC 9421 headers
+  arrived (and the bearer still rides alongside).
 
-Together these mirror exactly what a real AAuth MCP server verifies across all
-three access modes.
+Together these mirror exactly what a real AAuth MCP server / model gateway
+verifies across all three access modes and both signed surfaces.
 
 ## 7. Deferred (roadmap)
 
-The agent-side loop (Case A/B/C, discovery, content-digest, per-server opt-in)
-is done. What remains:
+The agent-side loop (Case A/B/C, discovery, content-digest, per-server opt-in,
+federated enrollment, signing the intel dial) is done and ships in the release
+binary. What remains:
 
 - **`202 requirement=interaction`** (elicitation/HITL): drive the user to the
   URL + poll `Location`. The Person-Server exchange already polls an interaction
   URL for the async-approval case; extending it to a server's own `202` and
   wiring it to the RFC 0021 `human` gate is the remaining step.
 - **AAuth Events** (`/inbox` polling) for async tool results.
-- Shipping in the release binary once the draft stabilizes (today: build from
-  source, like `cel`).
+- **Content-digest on the intel dial** — identity-cover only today; add body
+  integrity if a model gateway requires it.
+- **Signing the A2A client** (peer delegation is bearer/mTLS-only today —
+  agentctl RFC 0024 §8).

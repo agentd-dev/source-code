@@ -169,9 +169,32 @@ without the feature, they exit `2` (§2), never silently no-op.
 | `--interval <dur>` | — | *(none)* | loop/schedule interval (duration syntax, §7). |
 | `--cron <5-field>` | `AGENT_CRON` | *(none)* | UTC cron schedule for `--mode schedule` (needs `--features cron`; §6). |
 | `--max-steps <N>` | `AGENT_MAX_STEPS` | `50` | Per-run step cap. Must be > 0. |
-| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | `200000` | Token budget for the run. **Reloadable** (§11). |
+| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | `200000` | Token budget for a single **run**. **Reloadable** (§11). |
+| `--budget-tokens-lifetime <N>` | `AGENT_BUDGET_TOKENS` | `0` (unbounded) | Per-**instance** cumulative token cap across **all** runs/reactions (RFC 0025). See §3.4a. |
 | `--deadline <dur>` | `AGENT_DEADLINE` | `600s` | Wall-clock deadline (duration syntax, §7). |
 | `--max-depth <N>` | — | `4` | Subagent tree depth cap (RFC 0009). |
+
+#### 3.4a The lifetime token budget (`--budget-tokens-lifetime`, RFC 0025)
+
+`--max-tokens` boxes a single run; `--budget-tokens-lifetime` bounds the **whole
+instance** — the cumulative tokens across every run and every reaction the
+process performs. It exists so a long-lived agent on a path with **no metering
+gateway** (e.g. an AAuth direct dial) still stays bounded. `0` (the default) is
+unbounded — today's behaviour.
+
+- **Bounded (`once`)**: the instance is that single run, so the effective per-run
+  cap becomes `min(--max-tokens, --budget-tokens-lifetime)`; exhaustion is the
+  ordinary `EXIT_BUDGET(7)` path (remappable with `--budget-exit-code`).
+- **`reactive` / `loop` / `schedule`**: the supervisor meters cumulative usage;
+  once the cap is reached the daemon **stops accepting new reactions/fires** and
+  **drains cleanly** (exit `0` by default — the preferred outcome — or
+  `--budget-exit-code` to signal a policy stop). A `budget.exhausted` event marks
+  the transition.
+- **Observability**: the gauge `agent_budget_tokens_remaining` tracks the balance
+  continuously, and a one-shot `limit.threshold` event fires the first time usage
+  crosses 90% of the cap — the alerting/scaling hook, *before* exhaustion. On the
+  fleet, `AGENT_BUDGET_TOKENS` is per-member (each pod carries its own instance
+  budget); an aggregate fleet cap remains a gateway concern.
 
 ### 3.5 Sharding / work-claim / standby (`--features cluster`)
 
@@ -512,6 +535,7 @@ exit `0`); validate a candidate with `--validate-config`.
 | `model` | `--model` | Reloadable. |
 | `max_tokens` | `--max-tokens` | |
 | `limits.max_steps` / `limits.max_depth` / `limits.deadline_secs` | `--max-steps` / `--max-depth` / `--deadline` | `deadline_secs` is whole seconds. |
+| `limits.lifetime_tokens` | `--budget-tokens-lifetime` | Per-instance cumulative token cap (RFC 0025); restart-only. |
 | `mcp_servers[]` | `--mcp` + `--mcp-tags` | `{name, endpoint, headers{}, tags{glob:[…]}}`. `endpoint` is the `https://` (loopback `http://`) Streamable-HTTP URL. `headers` are secret-free auth/framing templates resolved at connect time (values may carry `{{secret:…}}` refs). `tags` is a glob→tag-list map flattened to the server's tag set. Seeds the list. |
 | `subscribe[]` | `--subscribe` | Each string is one subscription URI. Seeds the list. |
 | `a2a_peers[]` | `--a2a-peer` | `{name, endpoint}`. Seeds the list. |

@@ -182,6 +182,7 @@ fn case_c_person_server_exchange_over_the_transport() {
         ApdConfig {
             base_url: apd,
             enrollment_token: None,
+            enroll_assertion_file: None,
             person_server: Some(ps),
             platform: "workload".into(),
         },

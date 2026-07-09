@@ -753,10 +753,7 @@ impl Supervisor {
                     .unwrap_or(SuperviseResult::Killed(reason)),
             );
         }
-        let action = match self.drain.as_mut() {
-            Some(d) => d.ladder.poll(now, all_reaped, force),
-            None => return None,
-        };
+        let action = self.drain.as_mut()?.ladder.poll(now, all_reaped, force);
         match action {
             LadderAction::Wait => None,
             LadderAction::Term => {

@@ -1,0 +1,5 @@
+// A SWE-bench/Terminal-Bench-shaped smoke task, runnable OFFLINE end to end: the
+// tool-bridge is a SHELL environment (a `builtin: bash` tool over a sandbox dir);
+// the built-in shell-call mock model runs a command; grading is filesystem-based
+// (the sandbox must hold the expected file content). No keys, no Docker.
+{"id": "swe-bash-offline", "instruction": "Write the text 'pong' into out.txt.", "mock_llm": "shell-call", "tool_server": {"name": "env", "tools": [{"name": "bash", "description": "run a shell command in the working directory", "builtin": "bash", "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}}}]}, "grade": {"files": {"out.txt": {"contains": "pong"}}, "command": {"run": "test -f out.txt", "expect_exit": 0}}}

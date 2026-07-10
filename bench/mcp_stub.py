@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -108,18 +109,27 @@ def _get(state, dotted: str):
 
 
 class Stub:
-    """A stateful tool-bridge. Beyond serving tools, a tool may declare an
-    `effect` over a shared JSON `state` — the τ²-bench / MCP-Universe shape, where
-    write-actions mutate an environment and grading inspects the final state:
-      * {"set": "orders.o1.status" [, "value_arg": "status"]}  -> store args (or
-        one arg) at the dotted path;
-      * {"append": "cart.items" [, "value_arg": "item"]}       -> append to a list;
-      * {"return": "orders.o1"}                                -> read a value out.
-    After each mutating call the full state is written to `state_file` so the
-    runner's outcome grader can read the end-state.
+    """A stateful tool-bridge. Beyond serving canned tools, a tool may declare:
+
+    * an `effect` over a shared JSON `state` — the τ²-bench / MCP-Universe shape,
+      where write-actions mutate an environment graded by its final state:
+        - {"set": "orders.o1.status" [, "value_arg": "status"]}  -> store at a path;
+        - {"append": "cart.items" [, "value_arg": "item"]}       -> append to a list;
+        - {"return": "orders.o1"}                                -> read a value out.
+      The full state is written to `state_file` after each mutation for grading.
+
+    * a `builtin` handler over a sandbox working directory (`workdir`) — the
+      SWE-bench / Terminal-Bench shape, where the agent runs commands and edits
+      files, graded by the resulting filesystem / a check command:
+        - {"builtin": "bash"}        -> run `arguments.command` in the workdir;
+        - {"builtin": "read_file"}   -> read `arguments.path`;
+        - {"builtin": "write_file"}  -> write `arguments.path` = `arguments.content`.
+      Builtins require `--workdir` (the sandbox); intended to run in a per-task
+      throwaway dir (a container in a real run). read/write are confined to it.
     """
 
-    def __init__(self, tools: list[dict], state_file: str | None = None):
+    def __init__(self, tools: list[dict], state_file: str | None = None,
+                 workdir: str | None = None):
         # Tool list as advertised on tools/list (name/description/inputSchema).
         self.tools = [
             {"name": t["name"],
@@ -127,10 +137,12 @@ class Stub:
              "inputSchema": t.get("inputSchema", {"type": "object"})}
             for t in tools
         ]
-        # name -> canned result (echoed if absent) and optional state effect.
+        # name -> canned result (echoed if absent), state effect, or builtin.
         self.results = {t["name"]: t.get("result") for t in tools}
         self.effects = {t["name"]: t.get("effect") for t in tools if t.get("effect")}
+        self.builtins = {t["name"]: t["builtin"] for t in tools if t.get("builtin")}
         self.state_file = state_file
+        self.workdir = Path(workdir).resolve() if workdir else None
         self.lock = threading.Lock()
         # Seed the environment from the state file (the runner pre-populates it
         # with the task's initial state), then own it in memory.
@@ -140,6 +152,39 @@ class Stub:
                 self.state = json.loads(Path(state_file).read_text() or "{}")
             except json.JSONDecodeError:
                 self.state = {}
+
+    def _run_builtin(self, kind: str, args: dict) -> dict:
+        """Sandboxed exec / file ops over `workdir`. Never raises — errors are
+        returned as data so the model can adapt (MCP `isError` stays false)."""
+        if self.workdir is None:
+            return {"error": "builtin tools require the bridge's --workdir sandbox"}
+
+        def _confined(rel: str) -> Path | None:
+            p = (self.workdir / rel).resolve()
+            root = str(self.workdir)
+            return p if str(p) == root or str(p).startswith(root + "/") else None
+
+        if kind == "bash":
+            cmd = args.get("command") or args.get("cmd") or ""
+            try:
+                cp = subprocess.run(cmd, shell=True, cwd=self.workdir,
+                                    capture_output=True, text=True, timeout=120)
+                return {"stdout": cp.stdout, "stderr": cp.stderr, "exit": cp.returncode}
+            except subprocess.TimeoutExpired:
+                return {"stdout": "", "stderr": "timed out", "exit": 124}
+        if kind == "read_file":
+            p = _confined(args.get("path", ""))
+            if p is None:
+                return {"error": "path escapes the sandbox"}
+            return {"content": p.read_text()} if p.exists() else {"error": "no such file"}
+        if kind == "write_file":
+            p = _confined(args.get("path", ""))
+            if p is None:
+                return {"error": "path escapes the sandbox"}
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(args.get("content", ""))
+            return {"ok": True, "path": args.get("path")}
+        return {"error": f"unknown builtin: {kind}"}
 
     def _apply_effect(self, name: str, args: dict):
         """Mutate/read state per the tool's effect; return an explicit read
@@ -183,13 +228,16 @@ class Stub:
             params = req.get("params") or {}
             name = params.get("name")
             args = params.get("arguments") or {}
-            read = self._apply_effect(name, args)      # stateful mutate/read
-            if read is not None:
-                payload = read
-            elif self.results.get(name) is not None:
-                payload = self.results[name]
+            if name in self.builtins:                  # sandboxed exec / file ops
+                payload = self._run_builtin(self.builtins[name], args)
             else:
-                payload = {"ok": True, "tool": name, "arguments": args}
+                read = self._apply_effect(name, args)  # stateful mutate/read
+                if read is not None:
+                    payload = read
+                elif self.results.get(name) is not None:
+                    payload = self.results[name]
+                else:
+                    payload = {"ok": True, "tool": name, "arguments": args}
             return _ok(rid, {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "isError": False,
@@ -231,8 +279,9 @@ class Stub:
                 pass
 
 
-def serve(addr_file: str, tools: list[dict], state_file: str | None = None) -> None:
-    stub = Stub(tools, state_file)
+def serve(addr_file: str, tools: list[dict], state_file: str | None = None,
+          workdir: str | None = None) -> None:
+    stub = Stub(tools, state_file, workdir)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -250,11 +299,48 @@ def main() -> int:
     ap.add_argument("--tools", required=True, help="JSON file: [{name, description, inputSchema, result?, effect?}]")
     ap.add_argument("--state-file", default=None,
                     help="stateful env: seed from + persist the JSON environment state here")
+    ap.add_argument("--workdir", default=None,
+                    help="sandbox dir for `builtin` bash/file tools (SWE-bench shape)")
     args = ap.parse_args()
     tools = json.loads(Path(args.tools).read_text())
-    serve(args.addr_file, tools, args.state_file)
+    serve(args.addr_file, tools, args.state_file, args.workdir)
     return 0
 
 
+# --- self-checks (run: python3 bench/mcp_stub.py --selftest) -------------------
+
+def _selftest() -> None:
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tools = [{"name": "bash", "builtin": "bash"},
+                 {"name": "read_file", "builtin": "read_file"},
+                 {"name": "write_file", "builtin": "write_file"}]
+        stub = Stub(tools, workdir=td)
+
+        def call(name, args):
+            resp, _ = stub.dispatch({"id": 1, "method": "tools/call",
+                                     "params": {"name": name, "arguments": args}})
+            return json.loads(resp["result"]["content"][0]["text"])
+
+        # bash runs in the sandbox and reports exit/stdout.
+        r = call("bash", {"command": "echo pong > out.txt && echo done"})
+        assert r["exit"] == 0 and "done" in r["stdout"], r
+        # read_file sees what bash wrote.
+        assert call("read_file", {"path": "out.txt"})["content"].strip() == "pong"
+        # write_file then bash observes it.
+        call("write_file", {"path": "sub/f.txt", "content": "hi"})
+        assert call("bash", {"command": "cat sub/f.txt"})["stdout"].strip() == "hi"
+        # path escape is refused.
+        assert "error" in call("read_file", {"path": "../../etc/passwd"})
+        # a bad command reports non-zero exit, not a crash.
+        assert call("bash", {"command": "exit 3"})["exit"] == 3
+        # builtins without a workdir are refused (explicit sandbox).
+        assert "error" in Stub(tools)._run_builtin("bash", {"command": "echo x"})
+    print("mcp_stub: all self-checks passed")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        sys.exit(main())

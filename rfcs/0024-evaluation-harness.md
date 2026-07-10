@@ -184,25 +184,34 @@ A dependency-free (Python stdlib) runner lives at `bench/`:
 - `bench/run.py` — spawns `agentd` per task (booting its built-in mock LLM /
   mock MCP so the rig runs **offline, no API keys**), captures stdout (the
   deliverable) + stderr (telemetry) + exit + wall-clock, grades against a
-  per-task matcher, and aggregates **pass@1 / pass^k / wall-clock / tool-calls**
-  into a JSON scorecard + a printed table.
+  per-task matcher, and aggregates **pass@1 / pass^k** plus **cost-adjusted**
+  metrics — **tokens, steps, cost-per-solved-task** (§7) — into a JSON scorecard
+  + a printed table. Cost is real, at no runtime cost: the child loop already
+  reports per-run usage in its `loop.final` telemetry, which the runner sums
+  across the subagent tree.
+- `bench/compare.py` — diffs two scorecards side-by-side with deltas + per-task
+  regressions/fixes. This is the thesis's core operation (a score is a
+  *comparison*): model A vs B, agentd vs a reference scaffold, or plain `once`
+  vs a fan-out `workflow` (the §5 ablation).
 - `bench/tasks/smoke.jsonl` — a tiny suite proving the mechanics: a pure-answer
   ReAct run and a tool-call ReAct cycle.
 - A task's `intelligence` / `mcp` fields make **pointing at a real model + real
   MCP servers a data change**, not a code change — the on-ramp to Phase 1.
 
 Phase 0 deliberately tests the *harness plumbing* (drive agentd → capture
-deliverable → grade → aggregate telemetry), which is the reusable core every
-later phase builds on, with zero external cost.
+deliverable → grade → aggregate cost/telemetry → compare configurations), which
+is the reusable core every later phase builds on, with zero external cost.
 
 ## 10. Non-goals / caveats
 
 - Not a new benchmark — we integrate public ones and their native graders.
 - Not a runtime dependency — the runner is external tooling; the moat holds.
-- Token/step capture in `once` mode is currently partial (RFC 0016 §6.4 records
-  usage honestly-or-not-at-all); real-model runs read the served `/metrics`
-  (`agent_tokens_total`) or a `--report-file`. The runner degrades gracefully
-  (labels what the build surfaces) rather than faking numbers.
+- Token/step **cost is captured from the child's `loop.final` telemetry** (the
+  loop reports real per-run usage; the runner sums it across the subagent tree),
+  so cost-adjusted scoring works with no runtime change. The durable *run report*
+  (`report.usage`, RFC 0016 §6.2) still records honest-absence zeros in `once`
+  mode; wiring it to the real total is a separate, optional follow-up (the
+  telemetry path is sufficient for the harness).
 - SWE-bench full is expensive; the Verified 500 / Mini subset is the default.
 
 ## 11. References (external)

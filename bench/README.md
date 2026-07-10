@@ -74,9 +74,11 @@ Flags: `--agentd <path>` (or `AGENTD_BIN`), `--tasks <file.jsonl>`,
  "expect": {"tool_call": "resource.read", "completed": true}}
 ```
 
-- `mock_llm` — a built-in mock-LLM script (`final`, `read`, `schedule`, …).
+- `mock_llm` — a built-in mock-LLM script (`final`, `read`, `mcp-call`, …).
 - `mock_mcp` — boots the built-in mock MCP server serving `uri`.
-- `grade` — deliverable matcher: `contains` | `exact` | `regex` (on stdout).
+- `tool_server` — boots the generic tool-bridge (see Phase 1) serving a tool set.
+- `grade` — deliverable matcher: `contains` | `exact` | `regex` (on stdout), or
+  `tool_calls` (a BFCL-style tool-call matcher, see Phase 1).
 - `expect` — telemetry assertions: `completed` (loop reached `status=completed`),
   `tool_call` (a `tool.call` for the named tool was observed).
 - Optional budgets: `max_tokens`, `max_steps`, `deadline`.
@@ -131,10 +133,63 @@ cost/solved (tok)         25.0        25.0   → +0.0
   B regresses (1): task-3
 ```
 
+## Phase 1: real tool-use benchmarks (BFCL)
+
+The reusable pieces that turn "run agentd" into "run a benchmark":
+
+- **`mcp_stub.py` — the generic tool-bridge.** A configurable MCP server that
+  exposes an arbitrary tool set (from JSON) over the transport agentd speaks, so
+  a benchmark that provides its own functions is a *data file*, not new harness
+  code (RFC 0024 §6). A task's `tool_server` field boots it:
+
+  ```json
+  {"id": "…", "instruction": "…", "intelligence": "https://gw/v1", "model": "…",
+   "tool_server": {"name": "bfcl", "tools": [
+       {"name": "get_weather", "description": "…",
+        "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}}]},
+   "grade": {"tool_calls": {"name": "get_weather", "args": {"city": "Paris"}}}}
+  ```
+
+  agentd exposes MCP tools by their **verbatim** catalogue name, so BFCL function
+  names map straight through — the grader matches ground-truth names directly.
+
+- **`graders.py` — the tool-call grader.** Reads `tool.call` telemetry (name +,
+  under `--log-content`, arguments — the runner adds it automatically) and matches
+  a ground truth: name + each named arg, where a value may be a **list of
+  acceptable forms** (BFCL-style) and `""`-marked params are optional. Supports
+  alternatives (any-one-matches) and `{"all": [...]}` (all-must-appear). Run its
+  self-checks: `python3 bench/graders.py`.
+
+- **`bfcl.py` — the BFCL converter.** Turns BFCL question + answer files into
+  runner tasks (functions → tool-bridge tools, question → instruction,
+  ground-truth → `tool_calls`):
+
+  ```console
+  $ python3 bench/bfcl.py --questions BFCL_v3_simple.json \
+      --answers possible_answer/BFCL_v3_simple.json \
+      --intelligence https://gateway.example/v1 --model claude-opus-4-8 \
+      --out bench/tasks/bfcl_simple.jsonl
+  $ AGENT_INTELLIGENCE_TOKEN=sk-... python3 bench/run.py \
+      --tasks bench/tasks/bfcl_simple.jsonl --repeats 5 --config opus
+  ```
+
+  Self-check: `python3 bench/bfcl.py --selftest`. Covers BFCL's single/parallel
+  *AST* categories; executable / multi-turn categories want BFCL's own runtime.
+
+The whole pipeline is proven **offline** (no keys) by `tasks/bfcl_smoke.jsonl`:
+the tool-bridge serves `bench_echo`, the built-in `mcp-call` mock model calls it,
+and the grader scores the name + args —
+
+```console
+$ python3 bench/run.py --tasks bench/tasks/bfcl_smoke.jsonl
+bfcl-echo-offline    PASS    PASS    34.0    2.0    0.21    1.0
+```
+
 ## Roadmap (RFC 0024 §8)
 
-- **Phase 0 (here):** the runner + offline smoke suite — proves the plumbing.
-- **Phase 1:** BFCL (tool-call correctness), MCP-Universe (native MCP tasks),
+- **Phase 0 (done):** the runner + offline smoke suite — proves the plumbing.
+- **Phase 1 (in progress):** ✅ **BFCL** (converter + tool-bridge + tool-call
+  grader, above); next: MCP-Universe (point `tool_server`/`mcp` at its servers),
   τ²-bench-retail (tool + simulated-user + policy + pass^k).
 - **Phase 2:** SWE-bench Verified (shell+fs MCP bridge; baseline vs
   mini-swe-agent) + GAIA (web/file MCP).

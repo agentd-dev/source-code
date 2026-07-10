@@ -168,10 +168,12 @@ The scorecard is machine-readable JSON + a printed table; it can back a served
 
 ## 8. Phasing
 
-- **Phase 0 (days):** the reference runner + BFCL — validates the `agentd × model`
-  tool loop end-to-end with almost no infra. Ships in this RFC (§9).
-- **Phase 1 (weeks):** MCP-Universe + τ²-bench-retail — the native pair; core
-  competency + reliability (pass^k).
+- **Phase 0 (done):** the reference runner + offline smoke — cost-adjusted
+  scoring + config comparison (§9).
+- **Phase 1 (in progress):** ✅ **BFCL** landed — the generic tool-bridge MCP
+  stub, the tool-call grader, and the BFCL converter (§9), proven end-to-end
+  offline. Next: MCP-Universe + τ²-bench-retail — the native pair; core
+  competency + reliability (pass^k), reusing the same tool-bridge.
 - **Phase 2:** SWE-bench Verified (with the mini-swe-agent baseline) + GAIA — the
   shell/web bridges + headline credibility.
 - **Phase 3:** the workflow-lift ablation matrix (§5) across GAIA-L3 / τ² /
@@ -193,10 +195,20 @@ A dependency-free (Python stdlib) runner lives at `bench/`:
   regressions/fixes. This is the thesis's core operation (a score is a
   *comparison*): model A vs B, agentd vs a reference scaffold, or plain `once`
   vs a fan-out `workflow` (the §5 ablation).
-- `bench/tasks/smoke.jsonl` — a tiny suite proving the mechanics: a pure-answer
-  ReAct run and a tool-call ReAct cycle.
-- A task's `intelligence` / `mcp` fields make **pointing at a real model + real
-  MCP servers a data change**, not a code change — the on-ramp to Phase 1.
+- **Phase 1 (BFCL):** `bench/mcp_stub.py` — the **generic tool-bridge** (§6): a
+  configurable MCP server that serves an arbitrary tool set to agentd, so a
+  benchmark environment is a data file, not harness code. `bench/graders.py` —
+  the **tool-call grader** (reads `tool.call` telemetry; BFCL-style name + args
+  match with acceptable-value lists, optional params, and `all`/alternatives).
+  `bench/bfcl.py` — the **BFCL converter** (functions → tool-bridge tools,
+  question → instruction, ground-truth → matcher). agentd exposes MCP tools by
+  their verbatim catalogue name, so BFCL function names map straight through.
+- `bench/tasks/smoke.jsonl` + `bench/tasks/bfcl_smoke.jsonl` — offline suites:
+  the mechanics (pure-answer + tool-call ReAct) and the **full BFCL pipeline**
+  (tool-bridge serves a function → the built-in `mcp-call` mock model calls it →
+  the grader scores name + args), all with no keys.
+- A task's `intelligence` / `model` / `tool_server` (or `mcp`) fields make
+  **pointing at a real model + real tools a data change**, not a code change.
 
 Phase 0 deliberately tests the *harness plumbing* (drive agentd → capture
 deliverable → grade → aggregate cost/telemetry → compare configurations), which

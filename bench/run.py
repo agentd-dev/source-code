@@ -33,6 +33,9 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import graders  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Spawning agentd's built-in mock servers (offline mode).
@@ -65,6 +68,20 @@ def spawn_mock_mcp(agentd: str, uri: str, emit: bool, workdir: Path) -> tuple[su
     if not emit:
         args.append("--no-emit")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _wait_for_file(addr_file)
+    return proc, "http://" + addr_file.read_text().strip()
+
+
+def spawn_tool_stub(tools: list[dict], workdir: Path) -> tuple[subprocess.Popen, str]:
+    """Spawn the generic tool-bridge MCP stub (bench/mcp_stub.py) serving `tools`
+    — the reusable environment adapter (RFC 0024 §6). Returns (proc, http url)."""
+    stub = Path(__file__).resolve().parent / "mcp_stub.py"
+    tools_file = workdir / "tools.json"
+    tools_file.write_text(json.dumps(tools))
+    addr_file = workdir / "stub.addr"
+    proc = subprocess.Popen(
+        [sys.executable, str(stub), "--addr-file", str(addr_file), "--tools", str(tools_file)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _wait_for_file(addr_file)
     return proc, "http://" + addr_file.read_text().strip()
 
@@ -131,6 +148,13 @@ def _grade(stdout: str, telemetry: str, task: dict) -> tuple[bool, str]:
     if "regex" in g and not re.search(g["regex"], stdout):
         return False, f'stdout !~ /{g["regex"]}/'
 
+    # BFCL-style tool-call grading (RFC 0024 §3, Phase 1) — needs --log-content
+    # so the args ride the telemetry (run_task_once adds it automatically).
+    if "tool_calls" in g:
+        ok, why = graders.grade_tool_calls(telemetry, g["tool_calls"])
+        if not ok:
+            return False, why
+
     exp = task.get("expect", {})
     if exp.get("completed") and '"status":"completed"' not in telemetry:
         return False, "loop did not reach status=completed"
@@ -141,12 +165,15 @@ def _grade(stdout: str, telemetry: str, task: dict) -> tuple[bool, str]:
 
 
 def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
-    llm_proc = mcp_proc = None
+    llm_proc = mcp_proc = stub_proc = None
     with tempfile.TemporaryDirectory(prefix="agentd-bench-") as td:
         workdir = Path(td)
         argv = [agentd, "--mode", task.get("mode", "once"),
                 "--instruction", task["instruction"],
                 "--log-level", "info"]
+        # Tool-call grading needs the arguments in telemetry.
+        if "tool_calls" in task.get("grade", {}):
+            argv += ["--log-content"]
 
         # Intelligence: built-in mock (offline) or a real endpoint (Phase 1+).
         if "mock_llm" in task:
@@ -165,6 +192,13 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
             argv += ["--mcp", f'{m.get("name", "mock")}={mcp_url}']
         for spec in task.get("mcp", []):
             argv += ["--mcp", spec]
+
+        # Tool-bridge: a benchmark that provides its own functions (BFCL) or a
+        # stubbed environment serves them via the generic MCP stub (RFC 0024 §6).
+        if "tool_server" in task:
+            ts = task["tool_server"]
+            stub_proc, stub_url = spawn_tool_stub(ts["tools"], workdir)
+            argv += ["--mcp", f'{ts.get("name", "bench")}={stub_url}']
 
         for k, flag in (("max_tokens", "--max-tokens"),
                         ("max_steps", "--max-steps"),
@@ -187,6 +221,7 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
         finally:
             _kill(llm_proc)
             _kill(mcp_proc)
+            _kill(stub_proc)
 
 
 # ---------------------------------------------------------------------------

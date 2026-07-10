@@ -1,0 +1,2 @@
+{"id": "final-answer", "instruction": "Give a short final answer.", "mock_llm": "final", "grade": {"contains": "mock-llm done"}, "expect": {"completed": true}}
+{"id": "tool-call-cycle", "instruction": "Read the resource, then answer.", "mock_llm": "read", "mock_mcp": {"uri": "file:///in.json", "emit": false, "name": "mock"}, "grade": {"contains": "read complete"}, "expect": {"tool_call": "resource.read", "completed": true}}

@@ -9,3 +9,7 @@
 
 # OS noise
 .DS_Store
+
+# Bench runner output (generated scorecards)
+/bench/scorecard.json
+__pycache__/

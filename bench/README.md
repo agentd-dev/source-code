@@ -247,6 +247,36 @@ Proven offline by `tasks/tau2_convo_smoke.jsonl` (agent = `mcp-call`, user =
 `final`, bounded by `max_turns`): a full agent↔user exchange with a stateful env,
 graded on the end-state — no keys, no runtime change.
 
+## Shell / file environments (SWE-bench / Terminal-Bench shape)
+
+Coding benchmarks grade a **filesystem outcome**: the agent runs commands and
+edits files, and success is "do the repo's tests pass now." The same tool-bridge
+serves this — a tool with a `builtin` handler over a per-task **sandbox** dir:
+
+- `{"builtin": "bash"}` — run `arguments.command` in the sandbox (stdout/stderr/exit);
+- `{"builtin": "read_file"}` / `{"builtin": "write_file"}` — confined to the sandbox.
+
+A task seeds the initial tree via `tool_server.files` (path → content), and
+grades with `grade.files` (path → `contains`/`exact`) and/or `grade.command`
+(run a check command — e.g. the repo's tests — assert its exit):
+
+```json
+{"id": "…", "instruction": "Make the failing test pass.",
+ "intelligence": "https://gw/v1", "model": "…",
+ "tool_server": {"name": "repo",
+   "files": {"app.py": "…", "test_app.py": "…"},
+   "tools": [{"name": "bash", "builtin": "bash",
+              "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}}}]},
+ "grade": {"command": {"run": "pytest -q", "expect_exit": 0}}}
+```
+
+Proven offline by `tasks/swe_smoke.jsonl`: the bridge serves `bash`, the built-in
+`shell-call` mock model runs a command that writes a file, and grading is
+filesystem-based (`grade.files` + `grade.command`) — no keys, no Docker. (A real
+SWE-bench run seeds the repo at the pre-fix commit and grades with its test
+command; the sandbox should be a container.) `python3 bench/mcp_stub.py --selftest`
+covers the bash/file builtins directly.
+
 ## Roadmap (RFC 0024 §8)
 
 - **Phase 0 (done):** the runner + offline smoke suite — proves the plumbing.
@@ -255,8 +285,11 @@ graded on the end-state — no keys, no runtime change.
   grading), and ✅ the **simulated-user loop** (multi-turn agent↔user
   conversations, outcome-graded). Next: point them at real datasets/servers
   (MCP-Universe, τ²-retail) with a live model.
-- **Phase 2:** SWE-bench Verified (shell+fs MCP bridge; baseline vs
-  mini-swe-agent) + GAIA (web/file MCP).
+- **Phase 2 (in progress):** ✅ the **shell/file environment** (sandboxed
+  `bash`/file builtins + filesystem/command grading) — the SWE-bench /
+  Terminal-Bench substrate. Next: seed a real SWE-bench-Verified instance
+  (repo@commit + test command) and add the mini-swe-agent baseline; GAIA
+  (web/file bridge).
 - **Phase 3:** the workflow-lift ablation — plain `once` vs a fan-out/subagent
   workflow vs workflow+durability, reported cost-adjusted, to map *where*
   decomposition pays off.

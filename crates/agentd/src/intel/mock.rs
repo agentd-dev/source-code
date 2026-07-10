@@ -145,6 +145,10 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         // end to end (offline). Turn 2 answers once the tool result is seen.
         ("mcp-call", false) => tool_call("bench_echo", r#"{"query":"ping"}"#),
         ("mcp-call", true) => final_answer("bench tool called"),
+        // Call a sandboxed `bash` tool the bench shell-bridge serves (RFC 0024
+        // Phase 2, the SWE-bench / Terminal-Bench environment shape), then answer.
+        ("shell-call", false) => tool_call("bash", r#"{"command":"echo pong > out.txt"}"#),
+        ("shell-call", true) => final_answer("ran the command"),
         ("schedule", false) => tool_call(
             "schedule",
             r#"{"after_seconds":1,"instruction":"follow up"}"#,

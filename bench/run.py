@@ -74,12 +74,12 @@ def spawn_mock_mcp(agentd: str, uri: str, emit: bool, workdir: Path) -> tuple[su
     return proc, "http://" + addr_file.read_text().strip()
 
 
-def spawn_tool_stub(tools: list[dict], workdir: Path,
-                    state_file: Path | None = None) -> tuple[subprocess.Popen, str]:
+def spawn_tool_stub(tools: list[dict], workdir: Path, state_file: Path | None = None,
+                    sandbox: Path | None = None) -> tuple[subprocess.Popen, str]:
     """Spawn the generic tool-bridge MCP stub (bench/mcp_stub.py) serving `tools`
-    — the reusable environment adapter (RFC 0024 §6). When `state_file` is given
-    the bridge is a stateful environment (seeds from + persists it). Returns
-    (proc, http url)."""
+    — the reusable environment adapter (RFC 0024 §6). `state_file` makes it a
+    stateful JSON environment; `sandbox` makes it a shell/file environment (the
+    dir `builtin` bash/file tools operate in). Returns (proc, http url)."""
     stub = Path(__file__).resolve().parent / "mcp_stub.py"
     tools_file = workdir / "tools.json"
     tools_file.write_text(json.dumps(tools))
@@ -87,6 +87,8 @@ def spawn_tool_stub(tools: list[dict], workdir: Path,
     argv = [sys.executable, str(stub), "--addr-file", str(addr_file), "--tools", str(tools_file)]
     if state_file is not None:
         argv += ["--state-file", str(state_file)]
+    if sandbox is not None:
+        argv += ["--workdir", str(sandbox)]
     proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _wait_for_file(addr_file)
     return proc, "http://" + addr_file.read_text().strip()
@@ -144,7 +146,8 @@ class RunResult:
     timed_out: bool = False
 
 
-def _grade(stdout: str, telemetry: str, task: dict, final_state: dict) -> tuple[bool, str]:
+def _grade(stdout: str, telemetry: str, task: dict, final_state: dict,
+           sandbox: Path | None = None) -> tuple[bool, str]:
     """Grade the deliverable (stdout) + telemetry + end-state. Returns (pass, why)."""
     g = task.get("grade", {})
     if "contains" in g and g["contains"] not in stdout:
@@ -167,6 +170,30 @@ def _grade(stdout: str, telemetry: str, task: dict, final_state: dict) -> tuple[
         ok, why = graders.grade_state(final_state, g["state"])
         if not ok:
             return False, why
+
+    # Filesystem outcome grading (SWE-bench / Terminal-Bench shape): the sandbox
+    # must hold the expected files, and/or a check command must pass (e.g. the
+    # repo's tests). `grade.files`: {path: {"contains"|"exact": ...}}.
+    if "files" in g:
+        if sandbox is None:
+            return False, "grade.files needs a sandbox (a tool_server with builtin/files)"
+        for rel, spec in g["files"].items():
+            f = sandbox / rel
+            if not f.exists():
+                return False, f"expected file missing: {rel}"
+            text = f.read_text()
+            if "contains" in spec and spec["contains"] not in text:
+                return False, f"{rel} missing {spec['contains']!r}"
+            if "exact" in spec and text.strip() != spec["exact"]:
+                return False, f"{rel} != expected"
+    if "command" in g:
+        if sandbox is None:
+            return False, "grade.command needs a sandbox"
+        c = g["command"]
+        cp = subprocess.run(c["run"], shell=True, cwd=sandbox,
+                            capture_output=True, text=True, timeout=120)
+        if cp.returncode != c.get("expect_exit", 0):
+            return False, f"check command exit {cp.returncode} != {c.get('expect_exit', 0)}"
 
     exp = task.get("expect", {})
     if exp.get("completed") and '"status":"completed"' not in telemetry:
@@ -323,13 +350,23 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
         # A stateful env (an initial `state` or any tool `effect`) persists to a
         # state-file the outcome grader reads after the run (τ²-bench shape).
         state_file = None
+        sandbox = None
         if "tool_server" in task:
             ts = task["tool_server"]
             stateful = "state" in ts or any("effect" in t for t in ts["tools"])
             if stateful:
                 state_file = workdir / "state.json"
                 state_file.write_text(json.dumps(ts.get("state", {})))
-            stub_proc, stub_url = spawn_tool_stub(ts["tools"], workdir, state_file)
+            # A shell/file env (any `builtin` tool, or seeded `files`) gets a
+            # sandbox dir the bridge's bash/file tools operate in (SWE-bench shape).
+            if any("builtin" in t for t in ts["tools"]) or "files" in ts:
+                sandbox = workdir / "sandbox"
+                sandbox.mkdir(exist_ok=True)
+                for rel, content in ts.get("files", {}).items():
+                    f = sandbox / rel
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_text(content)
+            stub_proc, stub_url = spawn_tool_stub(ts["tools"], workdir, state_file, sandbox)
             argv += ["--mcp", f'{ts.get("name", "bench")}={stub_url}']
 
         for k, flag in (("max_tokens", "--max-tokens"),
@@ -348,7 +385,7 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
                     final_state = json.loads(state_file.read_text() or "{}")
                 except json.JSONDecodeError:
                     final_state = {}
-            passed, why = _grade(cp.stdout, cp.stderr, task, final_state)
+            passed, why = _grade(cp.stdout, cp.stderr, task, final_state, sandbox)
             tokens, steps = _extract_usage(cp.stderr)
             return RunResult(passed, cp.returncode, wall, tokens, steps,
                              _count_tool_calls(cp.stderr),

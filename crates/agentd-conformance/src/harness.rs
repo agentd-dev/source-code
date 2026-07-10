@@ -561,7 +561,19 @@ impl Client {
     /// and return the parsed reply, or `None` for a `202` no-reply (a notification)
     /// / an empty body.
     pub fn raw(&mut self, body: &str) -> Option<Value> {
-        let mut stream = TcpStream::connect(&self.addr).expect("connect served http");
+        // Retry the connect briefly: under the heavily-parallel `--all-features`
+        // CI run this process-heavy served agentd can transiently refuse (a
+        // starved accept queue), which a single `connect` would flake on.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match TcpStream::connect(&self.addr) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => panic!("connect served http {}: {e}", self.addr),
+            }
+        };
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let req = format!(
             "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

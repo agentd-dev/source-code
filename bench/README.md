@@ -185,12 +185,48 @@ $ python3 bench/run.py --tasks bench/tasks/bfcl_smoke.jsonl
 bfcl-echo-offline    PASS    PASS    34.0    2.0    0.21    1.0
 ```
 
+## Stateful environments + outcome grading (τ²-bench / MCP-Universe shape)
+
+Tool-call correctness (did the agent call the right function) isn't enough for
+benchmarks that grade an **outcome** — did the agent's write-actions leave the
+environment in the right end-state (τ²-bench: the order is cancelled; the DB
+reflects it). Two additions cover this:
+
+- **The tool-bridge is stateful.** A tool may declare an `effect` over a shared
+  JSON environment `state`, and the bridge persists the state so the grader can
+  inspect it:
+  - `{"set": "orders.o1.status", "value_arg": "status"}` — store an arg at a
+    dotted path;
+  - `{"append": "cart.items", "value_arg": "item"}` — append to a list;
+  - `{"return": "orders.o1"}` — read a value back out (a lookup tool).
+  A task seeds the initial world via `tool_server.state`.
+
+- **`grade.state` — outcome grading.** Assert the final environment state matches
+  a partial spec (a subset: named keys/values must be present; lists match
+  element-for-element). Backed by `graders.grade_state`.
+
+```json
+{"id": "…", "instruction": "Cancel order o1.", "intelligence": "https://gw/v1",
+ "tool_server": {"name": "retail",
+   "state": {"orders": {"o1": {"status": "open"}}},
+   "tools": [{"name": "cancel_order",
+              "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}},
+              "effect": {"set": "orders.o1.status", "value_arg": "id"}}]},
+ "grade": {"state": {"orders": {"o1": {"status": "cancelled"}}}}}
+```
+
+Proven offline by `tasks/tau2_smoke.jsonl`: a stateful env + the `mcp-call` mock
+model + an end-state assertion — no keys, no runtime change. This is the τ²-bench
+foundation; the remaining τ² piece is the simulated user (a second model), which
+maps onto agentd's A2A / `human` gate.
+
 ## Roadmap (RFC 0024 §8)
 
 - **Phase 0 (done):** the runner + offline smoke suite — proves the plumbing.
 - **Phase 1 (in progress):** ✅ **BFCL** (converter + tool-bridge + tool-call
-  grader, above); next: MCP-Universe (point `tool_server`/`mcp` at its servers),
-  τ²-bench-retail (tool + simulated-user + policy + pass^k).
+  grader) and ✅ the **τ²-bench foundation** (stateful tool-bridge +
+  outcome/state grading, above). Next: point them at real datasets/servers
+  (MCP-Universe, τ²-retail) + the simulated-user loop.
 - **Phase 2:** SWE-bench Verified (shell+fs MCP bridge; baseline vs
   mini-swe-agent) + GAIA (web/file MCP).
 - **Phase 3:** the workflow-lift ablation — plain `once` vs a fan-out/subagent

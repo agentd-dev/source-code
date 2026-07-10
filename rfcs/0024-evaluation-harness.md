@@ -171,9 +171,13 @@ The scorecard is machine-readable JSON + a printed table; it can back a served
 - **Phase 0 (done):** the reference runner + offline smoke — cost-adjusted
   scoring + config comparison (§9).
 - **Phase 1 (in progress):** ✅ **BFCL** landed — the generic tool-bridge MCP
-  stub, the tool-call grader, and the BFCL converter (§9), proven end-to-end
-  offline. Next: MCP-Universe + τ²-bench-retail — the native pair; core
-  competency + reliability (pass^k), reusing the same tool-bridge.
+  stub, the tool-call grader, and the BFCL converter (§9). ✅ The **τ²-bench
+  foundation** — the tool-bridge is now a **stateful environment** (tool
+  `effect`s over a JSON store) and grading can be **outcome-based**
+  (`grade.state`: the world must reach the expected end-state), the τ² grading
+  model. Both proven end-to-end offline. Remaining τ² piece: the simulated user
+  (a second model), which maps onto agentd's A2A / `human` gate. Next: point at
+  the real MCP-Universe servers + τ²-retail data.
 - **Phase 2:** SWE-bench Verified (with the mini-swe-agent baseline) + GAIA — the
   shell/web bridges + headline credibility.
 - **Phase 3:** the workflow-lift ablation matrix (§5) across GAIA-L3 / τ² /
@@ -197,16 +201,21 @@ A dependency-free (Python stdlib) runner lives at `bench/`:
   vs a fan-out `workflow` (the §5 ablation).
 - **Phase 1 (BFCL):** `bench/mcp_stub.py` — the **generic tool-bridge** (§6): a
   configurable MCP server that serves an arbitrary tool set to agentd, so a
-  benchmark environment is a data file, not harness code. `bench/graders.py` —
-  the **tool-call grader** (reads `tool.call` telemetry; BFCL-style name + args
-  match with acceptable-value lists, optional params, and `all`/alternatives).
-  `bench/bfcl.py` — the **BFCL converter** (functions → tool-bridge tools,
-  question → instruction, ground-truth → matcher). agentd exposes MCP tools by
-  their verbatim catalogue name, so BFCL function names map straight through.
-- `bench/tasks/smoke.jsonl` + `bench/tasks/bfcl_smoke.jsonl` — offline suites:
-  the mechanics (pure-answer + tool-call ReAct) and the **full BFCL pipeline**
-  (tool-bridge serves a function → the built-in `mcp-call` mock model calls it →
-  the grader scores name + args), all with no keys.
+  benchmark environment is a data file, not harness code. It is **stateful** — a
+  tool may declare an `effect` (`set`/`append`/`return` over a dotted-path JSON
+  store) and the world is persisted for grading. `bench/graders.py` — the
+  **tool-call grader** (BFCL-style name + args match) **and the outcome grader**
+  (`grade_state`: the final environment must satisfy an expected subset — the
+  τ²-bench model). `bench/bfcl.py` — the **BFCL converter** (functions →
+  tool-bridge tools, question → instruction, ground-truth → matcher). agentd
+  exposes MCP tools by their verbatim catalogue name, so BFCL function names map
+  straight through.
+- `bench/tasks/{smoke,bfcl_smoke,tau2_smoke}.jsonl` — offline suites: the
+  mechanics (pure-answer + tool-call ReAct), the **full BFCL pipeline**
+  (tool-bridge serves a function → the `mcp-call` mock model calls it → the
+  grader scores name + args), and the **τ²-shaped stateful pipeline** (a tool
+  `effect` mutates the environment → outcome grading on the end-state) — all with
+  no keys.
 - A task's `intelligence` / `model` / `tool_server` (or `mcp`) fields make
   **pointing at a real model + real tools a data change**, not a code change.
 

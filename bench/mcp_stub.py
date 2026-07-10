@@ -85,8 +85,41 @@ def _err(rid, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
+def _dig(state: dict, dotted: str) -> tuple[dict, str]:
+    """Walk `a.b.c` creating dicts, returning (parent, leaf-key)."""
+    cur = state
+    parts = dotted.split(".")
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[p] = nxt
+        cur = nxt
+    return cur, parts[-1]
+
+
+def _get(state, dotted: str):
+    cur = state
+    for p in dotted.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return None
+        cur = cur[p]
+    return cur
+
+
 class Stub:
-    def __init__(self, tools: list[dict]):
+    """A stateful tool-bridge. Beyond serving tools, a tool may declare an
+    `effect` over a shared JSON `state` — the τ²-bench / MCP-Universe shape, where
+    write-actions mutate an environment and grading inspects the final state:
+      * {"set": "orders.o1.status" [, "value_arg": "status"]}  -> store args (or
+        one arg) at the dotted path;
+      * {"append": "cart.items" [, "value_arg": "item"]}       -> append to a list;
+      * {"return": "orders.o1"}                                -> read a value out.
+    After each mutating call the full state is written to `state_file` so the
+    runner's outcome grader can read the end-state.
+    """
+
+    def __init__(self, tools: list[dict], state_file: str | None = None):
         # Tool list as advertised on tools/list (name/description/inputSchema).
         self.tools = [
             {"name": t["name"],
@@ -94,8 +127,44 @@ class Stub:
              "inputSchema": t.get("inputSchema", {"type": "object"})}
             for t in tools
         ]
-        # name -> canned result (echoed if absent).
+        # name -> canned result (echoed if absent) and optional state effect.
         self.results = {t["name"]: t.get("result") for t in tools}
+        self.effects = {t["name"]: t.get("effect") for t in tools if t.get("effect")}
+        self.state_file = state_file
+        self.lock = threading.Lock()
+        # Seed the environment from the state file (the runner pre-populates it
+        # with the task's initial state), then own it in memory.
+        self.state = {}
+        if state_file and Path(state_file).exists():
+            try:
+                self.state = json.loads(Path(state_file).read_text() or "{}")
+            except json.JSONDecodeError:
+                self.state = {}
+
+    def _apply_effect(self, name: str, args: dict):
+        """Mutate/read state per the tool's effect; return an explicit read
+        payload or None. Caller holds no lock; we take it here."""
+        eff = self.effects.get(name)
+        if not eff:
+            return None
+        with self.lock:
+            value = args.get(eff["value_arg"]) if "value_arg" in eff else args
+            read = None
+            if "set" in eff:
+                parent, key = _dig(self.state, eff["set"])
+                parent[key] = value
+            elif "append" in eff:
+                parent, key = _dig(self.state, eff["append"])
+                lst = parent.get(key)
+                if not isinstance(lst, list):
+                    lst = []
+                    parent[key] = lst
+                lst.append(value)
+            elif "return" in eff:
+                read = _get(self.state, eff["return"])
+            if self.state_file:
+                Path(self.state_file).write_text(json.dumps(self.state))
+            return read
 
     def dispatch(self, req: dict) -> tuple[dict, bool]:
         method = req.get("method", "")
@@ -114,8 +183,13 @@ class Stub:
             params = req.get("params") or {}
             name = params.get("name")
             args = params.get("arguments") or {}
-            canned = self.results.get(name)
-            payload = canned if canned is not None else {"ok": True, "tool": name, "arguments": args}
+            read = self._apply_effect(name, args)      # stateful mutate/read
+            if read is not None:
+                payload = read
+            elif self.results.get(name) is not None:
+                payload = self.results[name]
+            else:
+                payload = {"ok": True, "tool": name, "arguments": args}
             return _ok(rid, {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "isError": False,
@@ -157,8 +231,8 @@ class Stub:
                 pass
 
 
-def serve(addr_file: str, tools: list[dict]) -> None:
-    stub = Stub(tools)
+def serve(addr_file: str, tools: list[dict], state_file: str | None = None) -> None:
+    stub = Stub(tools, state_file)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -173,10 +247,12 @@ def serve(addr_file: str, tools: list[dict]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="generic tool-bridge MCP stub (RFC 0024 §6)")
     ap.add_argument("--addr-file", required=True, help="write the bound host:port here")
-    ap.add_argument("--tools", required=True, help="JSON file: [{name, description, inputSchema, result?}]")
+    ap.add_argument("--tools", required=True, help="JSON file: [{name, description, inputSchema, result?, effect?}]")
+    ap.add_argument("--state-file", default=None,
+                    help="stateful env: seed from + persist the JSON environment state here")
     args = ap.parse_args()
     tools = json.loads(Path(args.tools).read_text())
-    serve(args.addr_file, tools)
+    serve(args.addr_file, tools, args.state_file)
     return 0
 
 

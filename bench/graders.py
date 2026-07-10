@@ -65,6 +65,31 @@ def _call_matches(call: dict, expected: dict) -> bool:
     return True
 
 
+def _subset(actual, expected) -> bool:
+    """Is `expected` contained in `actual`? Dicts match key-by-key recursively
+    (extra keys in `actual` are fine); lists must match element-for-element in
+    order; scalars must be equal. The outcome-grading primitive (τ²-bench shape:
+    did the environment reach the expected end-state)."""
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return False
+        return all(k in actual and _subset(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        if not isinstance(actual, list) or len(actual) != len(expected):
+            return False
+        return all(_subset(a, e) for a, e in zip(actual, expected))
+    return actual == expected
+
+
+def grade_state(final_state: dict, expected: dict) -> tuple[bool, str]:
+    """Outcome-based grading (τ²-bench / MCP-Universe): the write-actions the agent
+    took must have left the environment in the expected end-state. `expected` is a
+    partial spec — a subset of the final state."""
+    if _subset(final_state or {}, expected):
+        return True, "ok"
+    return False, f"final state did not satisfy {expected}; got {final_state}"
+
+
 def grade_tool_calls(telemetry: str, expected) -> tuple[bool, str]:
     """`expected` is a ground-truth call, a list of acceptable alternatives, or a
     list of REQUIRED calls (all must appear) when tagged {"all": [...]}."""
@@ -112,6 +137,19 @@ def _selftest() -> None:
     assert ok
     ok, _ = grade_tool_calls(tele, {"all": [{"name": "get_weather"}, {"name": "send"}]})
     assert not ok
+
+    # outcome / state grading (τ²-bench shape)
+    final = {"orders": {"o1": {"status": "cancelled", "total": 42}}, "log": ["a", "b"]}
+    ok, _ = grade_state(final, {"orders": {"o1": {"status": "cancelled"}}})
+    assert ok                                        # partial subset matches
+    ok, _ = grade_state(final, {"orders": {"o1": {"status": "shipped"}}})
+    assert not ok                                    # wrong value
+    ok, _ = grade_state(final, {"orders": {"o2": {}}})
+    assert not ok                                    # missing key
+    ok, _ = grade_state(final, {"log": ["a", "b"]})
+    assert ok
+    ok, _ = grade_state(final, {"log": ["a"]})
+    assert not ok                                    # list length must match
     print("graders: all self-checks passed")
 
 

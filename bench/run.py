@@ -72,16 +72,20 @@ def spawn_mock_mcp(agentd: str, uri: str, emit: bool, workdir: Path) -> tuple[su
     return proc, "http://" + addr_file.read_text().strip()
 
 
-def spawn_tool_stub(tools: list[dict], workdir: Path) -> tuple[subprocess.Popen, str]:
+def spawn_tool_stub(tools: list[dict], workdir: Path,
+                    state_file: Path | None = None) -> tuple[subprocess.Popen, str]:
     """Spawn the generic tool-bridge MCP stub (bench/mcp_stub.py) serving `tools`
-    — the reusable environment adapter (RFC 0024 §6). Returns (proc, http url)."""
+    — the reusable environment adapter (RFC 0024 §6). When `state_file` is given
+    the bridge is a stateful environment (seeds from + persists it). Returns
+    (proc, http url)."""
     stub = Path(__file__).resolve().parent / "mcp_stub.py"
     tools_file = workdir / "tools.json"
     tools_file.write_text(json.dumps(tools))
     addr_file = workdir / "stub.addr"
-    proc = subprocess.Popen(
-        [sys.executable, str(stub), "--addr-file", str(addr_file), "--tools", str(tools_file)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    argv = [sys.executable, str(stub), "--addr-file", str(addr_file), "--tools", str(tools_file)]
+    if state_file is not None:
+        argv += ["--state-file", str(state_file)]
+    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _wait_for_file(addr_file)
     return proc, "http://" + addr_file.read_text().strip()
 
@@ -138,8 +142,8 @@ class RunResult:
     timed_out: bool = False
 
 
-def _grade(stdout: str, telemetry: str, task: dict) -> tuple[bool, str]:
-    """Grade the deliverable (stdout) + telemetry assertions. Returns (pass, why)."""
+def _grade(stdout: str, telemetry: str, task: dict, final_state: dict) -> tuple[bool, str]:
+    """Grade the deliverable (stdout) + telemetry + end-state. Returns (pass, why)."""
     g = task.get("grade", {})
     if "contains" in g and g["contains"] not in stdout:
         return False, f'stdout missing {g["contains"]!r}'
@@ -152,6 +156,13 @@ def _grade(stdout: str, telemetry: str, task: dict) -> tuple[bool, str]:
     # so the args ride the telemetry (run_task_once adds it automatically).
     if "tool_calls" in g:
         ok, why = graders.grade_tool_calls(telemetry, g["tool_calls"])
+        if not ok:
+            return False, why
+
+    # Outcome / state grading (τ²-bench shape): the environment must have reached
+    # the expected end-state via the agent's write-actions.
+    if "state" in g:
+        ok, why = graders.grade_state(final_state, g["state"])
         if not ok:
             return False, why
 
@@ -195,9 +206,16 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
 
         # Tool-bridge: a benchmark that provides its own functions (BFCL) or a
         # stubbed environment serves them via the generic MCP stub (RFC 0024 §6).
+        # A stateful env (an initial `state` or any tool `effect`) persists to a
+        # state-file the outcome grader reads after the run (τ²-bench shape).
+        state_file = None
         if "tool_server" in task:
             ts = task["tool_server"]
-            stub_proc, stub_url = spawn_tool_stub(ts["tools"], workdir)
+            stateful = "state" in ts or any("effect" in t for t in ts["tools"])
+            if stateful:
+                state_file = workdir / "state.json"
+                state_file.write_text(json.dumps(ts.get("state", {})))
+            stub_proc, stub_url = spawn_tool_stub(ts["tools"], workdir, state_file)
             argv += ["--mcp", f'{ts.get("name", "bench")}={stub_url}']
 
         for k, flag in (("max_tokens", "--max-tokens"),
@@ -210,7 +228,13 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
         try:
             cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
             wall = time.time() - start
-            passed, why = _grade(cp.stdout, cp.stderr, task)
+            final_state = {}
+            if state_file is not None and state_file.exists():
+                try:
+                    final_state = json.loads(state_file.read_text() or "{}")
+                except json.JSONDecodeError:
+                    final_state = {}
+            passed, why = _grade(cp.stdout, cp.stderr, task, final_state)
             tokens, steps = _extract_usage(cp.stderr)
             return RunResult(passed, cp.returncode, wall, tokens, steps,
                              _count_tool_calls(cp.stderr),

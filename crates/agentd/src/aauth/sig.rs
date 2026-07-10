@@ -206,7 +206,10 @@ mod tests {
         assert!(sk.starts_with("sig=hwk;"), "got: {sk}");
         assert!(sk.contains(r#"kty="OKP""#), "got: {sk}");
         assert!(sk.contains(r#"crv="Ed25519""#), "got: {sk}");
-        assert!(!sk.contains("jwk="), "must not carry a jwk blob param: {sk}");
+        assert!(
+            !sk.contains("jwk="),
+            "must not carry a jwk blob param: {sk}"
+        );
         assert!(!sk.contains("alg="), "hwk must not carry alg: {sk}");
         // The presented `x` is this key's raw public key (b64url), so a verifier
         // reconstructs the exact key that signs the request.

@@ -203,16 +203,30 @@ pub(crate) fn call_for_workflow(name: &str, args: &Value) -> (Value, bool) {
     }
 }
 
+/// Serialize tests that mutate OR observe the process-global registry. Unit
+/// tests share a process and run in parallel, so a transient register/unregister
+/// in one test can otherwise perturb a catalogue-size assertion in another (a
+/// real cross-test race, seen intermittently under `--all-features`). Any test
+/// that registers/unregisters, or that asserts an exact tool-catalogue count,
+/// holds this for its duration. Poison-tolerant (a panicking test still frees it).
+#[cfg(test)]
+pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     // NOTE: the registry is process-global and unit tests share a process —
-    // every test uses UNIQUE tool names and cleans up after itself.
+    // every test uses UNIQUE tool names, cleans up after itself, and holds
+    // `test_registry_guard()` so it never races a catalogue-count assertion.
 
     #[test]
     fn register_dispatch_and_unregister_round_trip() {
+        let _guard = super::test_registry_guard();
         register(CodeTool::new(
             "t.echo",
             "echo",
@@ -246,6 +260,7 @@ mod tests {
 
     #[test]
     fn registration_refuses_duplicates_empties_and_self_tool_names() {
+        let _guard = super::test_registry_guard();
         register(CodeTool::new("t.dup", "", json!({}), |_| Ok(json!(1)))).unwrap();
         assert!(register(CodeTool::new("t.dup", "", json!({}), |_| Ok(json!(2)))).is_err());
         assert!(register(CodeTool::new("  ", "", json!({}), |_| Ok(json!(1)))).is_err());
@@ -261,6 +276,7 @@ mod tests {
 
     #[test]
     fn a_handler_error_is_a_tool_error_not_a_panic() {
+        let _guard = super::test_registry_guard();
         register(CodeTool::new("t.fail", "", json!({}), |_| {
             Err("deliberate".into())
         }))

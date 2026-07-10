@@ -23,6 +23,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// A handle to a running subagent process and the down side of its control
 /// channel. Upward messages arrive on the reactor's merged channel, not here.
@@ -68,7 +69,28 @@ pub fn spawn(
         }
     }
 
-    let mut child = cmd.spawn()?;
+    // Spawn, retrying a transient `EAGAIN` — the kernel refusing a `fork` under
+    // process/memory pressure (a wide fan-out starting many subagents at once, or
+    // a CPU-starved host). Bounded (~1s total, short backoff); a genuine error
+    // (ENOENT, EMFILE-persisted, …) still surfaces. Real robustness, not just a
+    // test artifact: a busy agent tree hits the same refusal. RFC 0003.
+    let mut child = {
+        let mut attempt = 0u32;
+        loop {
+            match cmd.spawn() {
+                Ok(c) => break c,
+                Err(e)
+                    if attempt < 10
+                        && (e.raw_os_error() == Some(libc::EAGAIN)
+                            || e.kind() == io::ErrorKind::WouldBlock) =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(u64::from(20 * attempt)));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
     let pgid = child.id() as i32;
     let mut writer = child
         .stdin

@@ -1774,12 +1774,14 @@ mod tests {
     #[cfg(feature = "workflow")]
     #[test]
     fn workflow_run_detach_hands_the_workflow_to_a_spawned_child() {
-        // `/bin/true` stands in for the agentd binary: the process SPAWN succeeds
-        // (which is all detach needs to mint a handle); the "child" then exits
-        // without speaking the protocol, which the async registry reports as a
-        // terminal failure — the plumbing under test is the workflow→spawn hand-off.
+        // `/bin/cat` stands in for the agentd binary: the process SPAWN succeeds
+        // (which is all detach needs to mint a handle) and the "child" stays alive
+        // reading stdin without ever speaking the protocol — the plumbing under
+        // test is the workflow→spawn hand-off. (`/bin/true` would exit instantly,
+        // racing the supervisor's payload write to a closed pipe → a `Broken pipe`
+        // flake under load; `cat` blocks on stdin, so the write always lands.)
         let mut root = Orchestrator::from_payload(
-            "/bin/true".into(),
+            "/bin/cat".into(),
             &payload(0, 4),
             Duration::from_secs(5),
             logger(),

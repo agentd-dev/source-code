@@ -1,0 +1,7 @@
+// An outcome-graded task for the workflow-lift ablation (RFC 0024 §5), runnable
+// OFFLINE. The mcp-call mock model invokes a write-action on a stateful env; the
+// grade is on the env END-STATE, so it is config-agnostic — the same task runs as
+// plain `once`, a linear workflow, and a fan-out (foreach) workflow, and the
+// ablation compares accuracy × cost. (Idempotent write, so all configs reach the
+// same end-state; the fan-out just costs N×, which is the point being measured.)
+{"id": "ablate-state", "instruction": "Record the query 'ping' in the environment.", "mock_llm": "mcp-call", "tool_server": {"name": "env", "state": {"last_query": null}, "tools": [{"name": "bench_echo", "description": "record the query", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}, "effect": {"set": "last_query", "value_arg": "query"}}]}, "grade": {"state": {"last_query": "ping"}}}

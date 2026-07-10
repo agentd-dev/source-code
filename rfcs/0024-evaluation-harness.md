@@ -188,8 +188,13 @@ The scorecard is machine-readable JSON + a printed table; it can back a served
   `grade.command`), the SWE-bench / Terminal-Bench substrate (proven offline).
   Next: seed a real SWE-bench-Verified instance (repo@commit + test command) +
   the mini-swe-agent baseline; GAIA (web/file bridge).
-- **Phase 3:** the workflow-lift ablation matrix (§5) across GAIA-L3 / τ² /
-  SWE-bench.
+- **Phase 3 (in progress):** ✅ the **workflow-lift ablation** (`bench/ablate.py`,
+  §5) — runs a suite as `once` vs a linear workflow vs a fan-out (`foreach`)
+  workflow and reports **accuracy × cost** per config with an honest verdict
+  (extra cost counts only when it buys accuracy). Cost is summed across the whole
+  subagent tree, so a fan-out's N× token cost is visible. Proven offline
+  (outcome-graded tasks, config-agnostic grading). Next: workflow+durability
+  (pass^k) and the ablation across decomposable real-model tasks (GAIA-L3 / τ²).
 
 ## 9. Phase-0 reference implementation (`bench/`)
 
@@ -207,6 +212,11 @@ A dependency-free (Python stdlib) runner lives at `bench/`:
   regressions/fixes. This is the thesis's core operation (a score is a
   *comparison*): model A vs B, agentd vs a reference scaffold, or plain `once`
   vs a fan-out `workflow` (the §5 ablation).
+- `bench/ablate.py` — the **workflow-lift ablation** (§5): runs a suite as
+  `once` / linear-workflow / fan-out-`foreach` and reports accuracy × cost per
+  config (cost summed across the subagent tree). agentd's most distinctive
+  evaluation — measuring what decomposition buys, honestly. Needs a
+  `--features workflow` build.
 - **Phase 1 (BFCL):** `bench/mcp_stub.py` — the **generic tool-bridge** (§6): a
   configurable MCP server that serves an arbitrary tool set to agentd, so a
   benchmark environment is a data file, not harness code. It is **stateful** — a

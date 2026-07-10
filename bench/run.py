@@ -320,9 +320,17 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
     llm_proc = mcp_proc = stub_proc = None
     with tempfile.TemporaryDirectory(prefix="agentd-bench-") as td:
         workdir = Path(td)
-        argv = [agentd, "--mode", task.get("mode", "once"),
-                "--instruction", task["instruction"],
-                "--log-level", "info"]
+        argv = [agentd, "--log-level", "info"]
+        # A `workflow` task runs an agent-authored graph (the ablation's decomposed
+        # variant, RFC 0024 §5); the graph carries the instruction, so `once` mode's
+        # --instruction is replaced by --mode workflow --workflow. Needs a
+        # `--features workflow` build of agentd.
+        if "workflow" in task:
+            wf = workdir / "workflow.json"
+            wf.write_text(json.dumps(task["workflow"]))
+            argv += ["--mode", "workflow", "--workflow", str(wf)]
+        else:
+            argv += ["--mode", task.get("mode", "once"), "--instruction", task["instruction"]]
         # Tool-call grading needs the arguments in telemetry.
         if "tool_calls" in task.get("grade", {}):
             argv += ["--log-content"]

@@ -277,6 +277,38 @@ SWE-bench run seeds the repo at the pre-fix commit and grades with its test
 command; the sandbox should be a container.) `python3 bench/mcp_stub.py --selftest`
 covers the bash/file builtins directly.
 
+## The workflow-lift ablation (agentd's distinctive evaluation)
+
+Most harnesses can't measure this: agentd has declarative **workflows**, so we
+can run the *same* task suite under progressively richer structures and ask what
+decomposition actually buys. `bench/ablate.py` runs each task as:
+
+- `once` — a single ReAct loop (baseline);
+- `workflow` — the task wrapped in a one-agent graph (orchestration overhead);
+- `fanout-N` — a `foreach` graph fanning the task across N parallel subagents.
+
+and reports **accuracy × cost** per config. Cost is summed across the whole
+subagent tree (every `loop.final`), so a fan-out's N× token cost is visible.
+
+```console
+$ cargo build -p agentd-cli --features workflow      # workflow mode needs this
+$ python3 bench/ablate.py --repeats 2
+config        pass@1  pass^k  tok/task  Δcost   verdict
+----------------------------------------------------------
+once           100%   100%     34.0    +0%   baseline
+workflow       100%   100%     34.0    +0%   ≈ baseline
+fanout-3       100%   100%    102.0  +200%   cost, no gain
+```
+
+The verdict is deliberately honest: the evidence on multi-agent systems is mixed
+(a single agent often matches a fan-out at a fraction of the cost; genuinely-wide
+tasks win big), so extra cost only counts as a win when it **buys accuracy**. On
+a trivial task the fan-out is pure cost (as shown); with a real model on a
+decomposable task it would read `+X% acc` — that curve is the deliverable. The
+ablation uses outcome-graded tasks (state/files), whose grading is
+config-agnostic (the env end-state is what matters, however the work is
+structured). Proven offline by `tasks/ablation_smoke.jsonl`.
+
 ## Roadmap (RFC 0024 §8)
 
 - **Phase 0 (done):** the runner + offline smoke suite — proves the plumbing.
@@ -290,6 +322,8 @@ covers the bash/file builtins directly.
   Terminal-Bench substrate. Next: seed a real SWE-bench-Verified instance
   (repo@commit + test command) and add the mini-swe-agent baseline; GAIA
   (web/file bridge).
-- **Phase 3:** the workflow-lift ablation — plain `once` vs a fan-out/subagent
-  workflow vs workflow+durability, reported cost-adjusted, to map *where*
-  decomposition pays off.
+- **Phase 3 (in progress):** ✅ the **workflow-lift ablation** (`ablate.py`) —
+  plain `once` vs a linear workflow vs a fan-out (`foreach`) workflow, reported
+  cost-adjusted (accuracy × cost), to map *where* decomposition pays off
+  (above). Next: workflow+durability (checkpointer) for pass^k, and running the
+  ablation on decomposable real-model tasks (GAIA-L3, τ²).

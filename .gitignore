@@ -10,6 +10,7 @@
 # OS noise
 .DS_Store
 
-# Bench runner output (generated scorecards)
+# Bench runner output (generated scorecards / ablation reports)
 /bench/scorecard.json
+/bench/ablation.json
 __pycache__/

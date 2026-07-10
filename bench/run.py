@@ -4,11 +4,12 @@
 
 Drives the `agentd` binary once per task, captures the deliverable (stdout) +
 telemetry (stderr) + exit code + wall-clock, grades against a per-task matcher,
-and aggregates pass@1 / pass^k / wall-clock / tool-calls into a scorecard.
+and aggregates pass@1 / pass^k plus **cost-adjusted** metrics (tokens, steps,
+cost-per-solved-task — RFC 0024 §7) into a scorecard.
 
 Phase 0 is deliberately offline: a task can boot agentd's built-in mock LLM /
 mock MCP, so the whole rig runs with NO API keys and NO external datasets. The
-point of Phase 0 is to prove the reusable core every later phase builds on —
+point is to prove the reusable core every later phase builds on —
 drive agentd -> capture deliverable -> grade -> aggregate telemetry.
 
 Pointing at a REAL model + REAL MCP servers is a *data* change, not a code
@@ -29,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 
@@ -78,6 +79,32 @@ def _kill(proc: subprocess.Popen | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Telemetry extraction.
+# ---------------------------------------------------------------------------
+
+def _count_tool_calls(telemetry: str) -> int:
+    return telemetry.count('"event":"tool.call"')
+
+
+def _extract_usage(telemetry: str) -> tuple[int, int]:
+    """Sum tokens + steps across every `loop.final` event in the (whole-tree)
+    telemetry — each subagent emits its own, so the sum is the run total. The
+    child loop already reports real usage here (agentloop/runner.rs), so cost is
+    captured with no runtime change. Returns (tokens, steps)."""
+    tokens = steps = 0
+    for line in telemetry.splitlines():
+        if '"event":"loop.final"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        tokens += int(ev.get("tokens", 0) or 0)
+        steps += int(ev.get("steps", 0) or 0)
+    return tokens, steps
+
+
+# ---------------------------------------------------------------------------
 # One run of one task.
 # ---------------------------------------------------------------------------
 
@@ -86,14 +113,12 @@ class RunResult:
     passed: bool
     exit_code: int
     wall_s: float
+    tokens: int
+    steps: int
     tool_calls: int
     completed: bool
     grade_reason: str
     timed_out: bool = False
-
-
-def _count_tool_calls(telemetry: str) -> int:
-    return telemetry.count('"event":"tool.call"')
 
 
 def _grade(stdout: str, telemetry: str, task: dict) -> tuple[bool, str]:
@@ -119,7 +144,7 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
     llm_proc = mcp_proc = None
     with tempfile.TemporaryDirectory(prefix="agentd-bench-") as td:
         workdir = Path(td)
-        argv = [agentd, "--mode", "once",
+        argv = [agentd, "--mode", task.get("mode", "once"),
                 "--instruction", task["instruction"],
                 "--log-level", "info"]
 
@@ -152,11 +177,12 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
             cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
             wall = time.time() - start
             passed, why = _grade(cp.stdout, cp.stderr, task)
-            return RunResult(passed, cp.returncode, wall,
+            tokens, steps = _extract_usage(cp.stderr)
+            return RunResult(passed, cp.returncode, wall, tokens, steps,
                              _count_tool_calls(cp.stderr),
                              '"status":"completed"' in cp.stderr, why)
         except subprocess.TimeoutExpired:
-            return RunResult(False, -1, time.time() - start, 0, False,
+            return RunResult(False, -1, time.time() - start, 0, 0, 0, False,
                              f"timed out after {timeout_s}s", timed_out=True)
         finally:
             _kill(llm_proc)
@@ -174,21 +200,29 @@ class TaskScore:
     pass_hat_k: bool           # solved on EVERY one of k runs (reliability)
     runs: int
     mean_wall_s: float
+    mean_tokens: float
+    mean_steps: float
     mean_tool_calls: float
     exit_codes: list[int]
     first_reason: str
 
 
+def _mean(xs) -> float:
+    xs = list(xs)
+    return sum(xs) / len(xs) if xs else 0.0
+
+
 def score_task(agentd: str, task: dict, repeats: int, timeout_s: float) -> TaskScore:
     results = [run_task_once(agentd, task, timeout_s) for _ in range(repeats)]
-    n = len(results)
     return TaskScore(
         id=task["id"],
         pass_at_1=results[0].passed,
         pass_hat_k=all(r.passed for r in results),
-        runs=n,
-        mean_wall_s=round(sum(r.wall_s for r in results) / n, 3),
-        mean_tool_calls=round(sum(r.tool_calls for r in results) / n, 2),
+        runs=len(results),
+        mean_wall_s=round(_mean(r.wall_s for r in results), 3),
+        mean_tokens=round(_mean(r.tokens for r in results), 1),
+        mean_steps=round(_mean(r.steps for r in results), 2),
+        mean_tool_calls=round(_mean(r.tool_calls for r in results), 2),
         exit_codes=[r.exit_code for r in results],
         first_reason=results[0].grade_reason,
     )
@@ -230,22 +264,28 @@ def main() -> int:
     scores = [score_task(args.agentd, t, args.repeats, args.timeout) for t in tasks]
 
     # Printed table.
-    w = max((len(s.id) for s in scores), default=4)
-    print(f'{"task".ljust(w)}  pass@1  pass^k  wall_s  tools  exits       why')
-    print("-" * (w + 48))
+    w = max([len(s.id) for s in scores] + [4])
+    print(f'{"task".ljust(w)}  pass@1  pass^k  tokens  steps  wall_s  tools  why')
+    print("-" * (w + 52))
     for s in scores:
         print(f'{s.id.ljust(w)}  '
               f'{"PASS" if s.pass_at_1 else "FAIL":>6}  '
               f'{"PASS" if s.pass_hat_k else "FAIL":>6}  '
-              f'{s.mean_wall_s:>6}  {s.mean_tool_calls:>5}  '
-              f'{str(s.exit_codes):<11} {"" if s.pass_at_1 else s.first_reason}')
+              f'{s.mean_tokens:>6}  {s.mean_steps:>5}  {s.mean_wall_s:>6}  '
+              f'{s.mean_tool_calls:>5}  {"" if s.pass_at_1 else s.first_reason}')
+    print("-" * (w + 52))
 
     n = len(scores) or 1
-    p1 = sum(s.pass_at_1 for s in scores) / n
+    solved = [s for s in scores if s.pass_at_1]
+    p1 = len(solved) / n
     pk = sum(s.pass_hat_k for s in scores) / n
-    print("-" * (w + 48))
+    total_tokens = sum(s.mean_tokens for s in scores)
+    # Cost-adjusted (RFC 0024 §7): tokens spent per task actually solved.
+    cost_per_solved = round(sum(s.mean_tokens for s in solved) / len(solved), 1) if solved else None
     print(f'\npass@1: {p1:.1%}   pass^{args.repeats}: {pk:.1%}   '
-          f'({sum(s.pass_at_1 for s in scores)}/{len(scores)} tasks)')
+          f'({len(solved)}/{len(scores)} tasks)')
+    print(f'tokens: {total_tokens:.0f} total   '
+          f'cost/solved: {cost_per_solved if cost_per_solved is not None else "n/a"} tokens')
 
     scorecard = {
         "stamp": {
@@ -255,7 +295,13 @@ def main() -> int:
             "tasks_file": args.tasks,
             "repeats_k": args.repeats,
         },
-        "summary": {"pass_at_1": p1, "pass_hat_k": pk, "tasks": len(scores)},
+        "summary": {
+            "pass_at_1": p1,
+            "pass_hat_k": pk,
+            "tasks": len(scores),
+            "total_tokens": round(total_tokens, 1),
+            "cost_per_solved_tokens": cost_per_solved,
+        },
         "tasks": [asdict(s) for s in scores],
     }
     Path(args.out).write_text(json.dumps(scorecard, indent=2) + "\n")

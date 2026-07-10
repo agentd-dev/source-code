@@ -35,14 +35,19 @@ $ python3 bench/run.py --repeats 3
 ```
 
 ```
-task             pass@1  pass^k  wall_s  tools  exits       why
----------------------------------------------------------------
-final-answer       PASS    PASS   0.208    0.0  [0, 0, 0]
-tool-call-cycle    PASS    PASS   0.212    1.0  [0, 0, 0]
----------------------------------------------------------------
+task             pass@1  pass^k  tokens  steps  wall_s  tools  why
+-----------------------------------------------------------------
+final-answer       PASS    PASS    16.0    1.0   0.209    0.0
+tool-call-cycle    PASS    PASS    34.0    2.0   0.213    1.0
+-----------------------------------------------------------------
 pass@1: 100.0%   pass^3: 100.0%   (2/2 tasks)
+tokens: 50 total   cost/solved: 25.0 tokens
 scorecard -> bench/scorecard.json
 ```
+
+Tokens and steps are real — the child loop already reports per-run usage in its
+`loop.final` telemetry (`agentloop/runner.rs`), which the runner sums across the
+whole subagent tree. No runtime change is needed to capture cost.
 
 Flags: `--agentd <path>` (or `AGENTD_BIN`), `--tasks <file.jsonl>`,
 `--repeats <k>` (k for pass^k), `--timeout <s>`, `--config <label>`,
@@ -96,13 +101,35 @@ takes. That is the on-ramp to the Phase-1 benchmarks.
 - **pass@1** — mean single-run success.
 - **pass^k** — solved on *every* one of `k` runs (reliability, not luck — a 90%
   pass@1 is only 57% pass^8). Use `--repeats k`.
-- **wall_s / tools / exits** — per-run wall-clock, tool-call count (from
-  telemetry), and the exit-code distribution (clean vs budget(7) vs error).
+- **tokens / steps** — real per-run usage, summed across the subagent tree from
+  `loop.final` telemetry.
+- **cost/solved** — tokens spent per task actually *solved* (RFC 0024 §7's
+  cost-adjusted metric — the one that separates production-ready from
+  demo-ready).
+- **wall_s / tools** — per-run wall-clock and tool-call count.
 
-Token/step capture in `once` mode is partial in the current build (RFC 0016 §6.4
-records usage honestly-or-not-at-all); real-model runs should read the served
-`/metrics` (`agent_tokens_total`) or a `--report-file` for cost-adjusted scoring.
-The runner degrades gracefully rather than faking numbers.
+## Comparing configurations
+
+The eval thesis is comparative — a score belongs to a `model × harness`
+*configuration*, so the useful output is a delta. `compare.py` diffs two
+scorecards side-by-side (model A vs B; agentd vs a reference scaffold; plain
+`once` vs a fan-out `workflow`):
+
+```console
+$ python3 bench/run.py --config opus   --out cardA.json   # model/config A
+$ python3 bench/run.py --config sonnet --out cardB.json   # model/config B
+$ python3 bench/compare.py cardA.json cardB.json
+```
+
+```
+metric                       A           B   B−A
+---------------------------------------------------
+pass@1                  100.0%      100.0%   → +0.0%
+cost/solved (tok)         25.0        25.0   → +0.0
+...
+  B fixes (2): task-7, task-9
+  B regresses (1): task-3
+```
 
 ## Roadmap (RFC 0024 §8)
 

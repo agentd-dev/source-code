@@ -1,0 +1,5 @@
+// A τ²-bench-shaped smoke task, runnable OFFLINE end to end: the tool-bridge is a
+// STATEFUL environment (an `effect` mutates a JSON store); the built-in mcp-call
+// mock model invokes the write-action; grading is OUTCOME-based — the environment
+// must have reached the expected end-state. No keys, no Rust change.
+{"id": "tau2-state-offline", "instruction": "Record the query in the environment.", "mock_llm": "mcp-call", "tool_server": {"name": "env", "state": {"last_query": null}, "tools": [{"name": "bench_echo", "description": "record the query into the environment", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}, "effect": {"set": "last_query", "value_arg": "query"}}]}, "grade": {"state": {"last_query": "ping"}}, "expect": {"completed": true}}

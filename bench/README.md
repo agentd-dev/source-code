@@ -216,17 +216,45 @@ reflects it). Two additions cover this:
 ```
 
 Proven offline by `tasks/tau2_smoke.jsonl`: a stateful env + the `mcp-call` mock
-model + an end-state assertion — no keys, no runtime change. This is the τ²-bench
-foundation; the remaining τ² piece is the simulated user (a second model), which
-maps onto agentd's A2A / `human` gate.
+model + an end-state assertion — no keys, no runtime change.
+
+## The simulated-user loop (multi-turn τ²-bench)
+
+τ²-bench is a *conversation*: the agent (with tools + a policy) talks to a
+**simulated user** (a second model given a hidden scenario) over several turns
+until the user's request is resolved. The harness runs it as a turn loop —
+elegantly, **both sides are agentd `once` runs**: the agent turn carries the
+policy + history + the stateful env bridge; the user turn is a second model with
+the scenario and no tools, whose reply is the next user message. The env state
+persists across turns, and grading is outcome-based on the end-state.
+
+```json
+{"id": "…", "policy": "You are a support agent. …the rules…",
+ "instruction": "Hi, I need to cancel order o1.",          // the first user message
+ "intelligence": "https://gw/v1", "model": "claude-opus-4-8",
+ "max_turns": 6,
+ "tool_server": {"name": "retail", "state": {…}, "tools": [{…, "effect": {…}}]},
+ "user_simulator": {"intelligence": "https://gw/v1", "model": "…",
+                    "scenario": "You are Ada; you want order o1 cancelled, …"},
+ "grade": {"state": {"orders": {"o1": {"status": "cancelled"}}}}}
+```
+
+The loop ends when the user emits `###STOP###` (resolved) or `max_turns` is hit;
+the metrics sum tokens/steps/tool-calls across every turn. A task with a
+`user_simulator` is automatically run as a conversation.
+
+Proven offline by `tasks/tau2_convo_smoke.jsonl` (agent = `mcp-call`, user =
+`final`, bounded by `max_turns`): a full agent↔user exchange with a stateful env,
+graded on the end-state — no keys, no runtime change.
 
 ## Roadmap (RFC 0024 §8)
 
 - **Phase 0 (done):** the runner + offline smoke suite — proves the plumbing.
 - **Phase 1 (in progress):** ✅ **BFCL** (converter + tool-bridge + tool-call
-  grader) and ✅ the **τ²-bench foundation** (stateful tool-bridge +
-  outcome/state grading, above). Next: point them at real datasets/servers
-  (MCP-Universe, τ²-retail) + the simulated-user loop.
+  grader), ✅ the **τ²-bench foundation** (stateful tool-bridge + outcome/state
+  grading), and ✅ the **simulated-user loop** (multi-turn agent↔user
+  conversations, outcome-graded). Next: point them at real datasets/servers
+  (MCP-Universe, τ²-retail) with a live model.
 - **Phase 2:** SWE-bench Verified (shell+fs MCP bridge; baseline vs
   mini-swe-agent) + GAIA (web/file MCP).
 - **Phase 3:** the workflow-lift ablation — plain `once` vs a fan-out/subagent

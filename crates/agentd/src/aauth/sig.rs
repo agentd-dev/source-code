@@ -34,11 +34,16 @@ impl SigKey<'_> {
     fn header_value(&self, key: &AgentKey) -> String {
         match self {
             SigKey::Jwt(tok) => format!("sig=jwt;jwt=\"{tok}\""),
-            // hwk: present the public JWK as a base64url string param so the
-            // verifier can check the signature without a prior enrollment.
+            // hwk: present the raw Ed25519 public key as INLINE structured-field
+            // params (`kty`/`crv`/`x`) — the form draft-hardt-httpbis-signature-key
+            // defines and Agent Providers parse. (An earlier `jwk="<b64url JSON>"`
+            // encoding was non-conformant: a conformant AP reads kty/crv/x
+            // directly and rejects the blob with `invalid_key`.) No `alg` on hwk.
             SigKey::Hwk => {
-                let jwk = serde_json::to_string(&key.public_jwk()).unwrap_or_default();
-                format!("sig=hwk;jwk=\"{}\"", b64::url_nopad(jwk.as_bytes()))
+                format!(
+                    "sig=hwk;kty=\"OKP\";crv=\"Ed25519\";x=\"{}\"",
+                    b64::url_nopad(key.public_bytes())
+                )
             }
         }
     }
@@ -191,17 +196,25 @@ mod tests {
     }
 
     #[test]
-    fn hwk_scheme_presents_the_public_jwk() {
+    fn hwk_scheme_presents_inline_okp_params() {
         let key = AgentKey::from_seed(&[9u8; 32]).unwrap();
         let hdrs = sign_request(&key, "POST", "apd.example", "/enroll", SigKey::Hwk, 1, None);
         let map: std::collections::HashMap<_, _> = hdrs.iter().cloned().collect();
-        assert!(map["Signature-Key"].starts_with("sig=hwk;jwk=\""));
-        // The presented jwk decodes back to this key's public JWK.
-        let raw = map["Signature-Key"]
-            .trim_start_matches("sig=hwk;jwk=\"")
-            .trim_end_matches('"');
-        let jwk_bytes = b64::url_decode(raw).unwrap();
-        let jwk: serde_json::Value = serde_json::from_slice(&jwk_bytes).unwrap();
-        assert_eq!(jwk, key.public_jwk());
+        let sk = &map["Signature-Key"];
+        // Inline structured-field params (draft-hardt-httpbis-signature-key),
+        // NOT a `jwk="<b64url JSON>"` blob — that form an AP rejects as invalid_key.
+        assert!(sk.starts_with("sig=hwk;"), "got: {sk}");
+        assert!(sk.contains(r#"kty="OKP""#), "got: {sk}");
+        assert!(sk.contains(r#"crv="Ed25519""#), "got: {sk}");
+        assert!(!sk.contains("jwk="), "must not carry a jwk blob param: {sk}");
+        assert!(!sk.contains("alg="), "hwk must not carry alg: {sk}");
+        // The presented `x` is this key's raw public key (b64url), so a verifier
+        // reconstructs the exact key that signs the request.
+        let x = sk
+            .split(r#"x=""#)
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("x param present");
+        assert_eq!(x, b64::url_nopad(key.public_bytes()));
     }
 }

@@ -46,6 +46,7 @@ export const DOCS = [
   { slug: "rfc-0021", file: "rfcs/0021-durable-workflows-and-parity-extensions.md", title: "rfc 0021 · durable workflows" },
   { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "rfc 0022 · embedding & code tools" },
   { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "rfc 0023 · aauth [draft]" },
+  { slug: "rfc-0024", file: "rfcs/0024-evaluation-harness.md", title: "rfc 0024 · evaluation harness" },
 ];
 
 // docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so

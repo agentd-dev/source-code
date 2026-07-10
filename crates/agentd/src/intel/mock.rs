@@ -139,6 +139,12 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
     match (script, saw_tool_result) {
         ("read", false) => tool_call("resource.read", r#"{"uri":"file:///in.json"}"#),
         ("read", true) => final_answer("read complete"),
+        // Call an MCP *server* tool by its (unprefixed) catalogue name — the
+        // bench harness (RFC 0024) points a stub MCP server that serves
+        // `bench_echo` so the eval rig exercises a real tools/call round-trip
+        // end to end (offline). Turn 2 answers once the tool result is seen.
+        ("mcp-call", false) => tool_call("bench_echo", r#"{"query":"ping"}"#),
+        ("mcp-call", true) => final_answer("bench tool called"),
         ("schedule", false) => tool_call(
             "schedule",
             r#"{"after_seconds":1,"instruction":"follow up"}"#,

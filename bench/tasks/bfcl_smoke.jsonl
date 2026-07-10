@@ -1,0 +1,5 @@
+// A BFCL-shaped smoke task, runnable OFFLINE end to end: the tool-bridge stub
+// serves the function `bench_echo`; the built-in `mcp-call` mock model calls it;
+// the tool-call grader scores the emitted call's name + arguments. This exercises
+// the full Phase-1 pipeline (serve tools -> model calls -> grade) with no keys.
+{"id": "bfcl-echo-offline", "instruction": "Call the echo tool with query=ping.", "mock_llm": "mcp-call", "tool_server": {"name": "bench", "tools": [{"name": "bench_echo", "description": "echo the query", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}, "result": {"echoed": "ping"}}]}, "grade": {"tool_calls": {"name": "bench_echo", "args": {"query": "ping"}}}, "expect": {"completed": true}}

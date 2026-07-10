@@ -5,11 +5,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased — the library split + code-registered tools (RFC 0022)
+## v1.3.0 — library split, code-registered tools, AAuth agent identity & lifetime budgets (RFC 0022/0023/0025)
 
 agentd is now consumable as a **library**. The workspace splits into four
 publishable crates around one engine; the stock binary is behaviorally
-unchanged.
+unchanged. Library crates step to `agentd-mcp` **0.3.0** / `agentd-net`
+**0.3.0** alongside the `1.3.0` binary.
 
 ### Added
 
@@ -73,6 +74,12 @@ unchanged.
   Case C over a real `McpClient`; `aauth_enroll_assertion_e2e` federated
   fresh-read; `aauth_intel_sign_e2e` signed model dial). **Draft**: the wire
   tracks the AAuth guide agentd was built against and may shift.
+- The `hwk` Signature-Key (enroll + single-key token refresh) presents the raw
+  Ed25519 key as **inline `kty`/`crv`/`x` structured-field params** per
+  `draft-hardt-httpbis-signature-key` — not a `jwk="<b64url JSON>"` blob, which a
+  conformant Agent Provider rejects (`invalid_key`). Verified by driving the real
+  binary against a real Agent Provider end to end (the mock-AP unit tests do not
+  parse the `hwk` form, so this surfaced only under real integration).
 
 ### Added (harness-tracked budgets, RFC 0025)
 

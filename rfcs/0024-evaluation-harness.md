@@ -175,9 +175,13 @@ The scorecard is machine-readable JSON + a printed table; it can back a served
   foundation** — the tool-bridge is now a **stateful environment** (tool
   `effect`s over a JSON store) and grading can be **outcome-based**
   (`grade.state`: the world must reach the expected end-state), the τ² grading
-  model. Both proven end-to-end offline. Remaining τ² piece: the simulated user
-  (a second model), which maps onto agentd's A2A / `human` gate. Next: point at
-  the real MCP-Universe servers + τ²-retail data.
+  model. ✅ The **simulated-user loop** — multi-turn agent↔user conversations
+  where both sides are agentd `once` runs (the agent with tools + policy; the
+  "user" a second model with a hidden scenario and no tools), the env persisting
+  across turns, outcome-graded, ending on `###STOP###` or `max_turns`. All proven
+  end-to-end offline. Next: point at the real MCP-Universe servers + τ²-retail
+  data with a live model (the cross-org agent-mesh variant maps onto A2A,
+  RFC 0020).
 - **Phase 2:** SWE-bench Verified (with the mini-swe-agent baseline) + GAIA — the
   shell/web bridges + headline credibility.
 - **Phase 3:** the workflow-lift ablation matrix (§5) across GAIA-L3 / τ² /
@@ -210,12 +214,13 @@ A dependency-free (Python stdlib) runner lives at `bench/`:
   tool-bridge tools, question → instruction, ground-truth → matcher). agentd
   exposes MCP tools by their verbatim catalogue name, so BFCL function names map
   straight through.
-- `bench/tasks/{smoke,bfcl_smoke,tau2_smoke}.jsonl` — offline suites: the
-  mechanics (pure-answer + tool-call ReAct), the **full BFCL pipeline**
-  (tool-bridge serves a function → the `mcp-call` mock model calls it → the
-  grader scores name + args), and the **τ²-shaped stateful pipeline** (a tool
-  `effect` mutates the environment → outcome grading on the end-state) — all with
-  no keys.
+- `bench/tasks/{smoke,bfcl_smoke,tau2_smoke,tau2_convo_smoke}.jsonl` — offline
+  suites: the mechanics (pure-answer + tool-call ReAct), the **full BFCL
+  pipeline** (tool-bridge serves a function → the `mcp-call` mock model calls it
+  → the grader scores name + args), the **τ²-shaped stateful pipeline** (a tool
+  `effect` mutates the environment → outcome grading on the end-state), and the
+  **multi-turn simulated-user conversation** (agent↔user turns → outcome
+  grading) — all with no keys.
 - A task's `intelligence` / `model` / `tool_server` (or `mcp`) fields make
   **pointing at a real model + real tools a data change**, not a code change.
 

@@ -1,0 +1,6 @@
+// A τ²-bench-shaped SIMULATED-USER conversation, runnable OFFLINE end to end. The
+// agent (agentd + the stateful env bridge, under a policy) and a simulated user (a
+// second model) alternate turns; grading is OUTCOME-based on the persisted env
+// state. Offline both models are built-in mocks (agent=mcp-call calls the write
+// action; user=final speaks), bounded by max_turns — no keys, no Rust change.
+{"id": "tau2-convo-offline", "policy": "You are a support agent. Record the customer's query, then confirm.", "instruction": "Hi, please log my query: ping.", "mock_llm": "mcp-call", "max_turns": 2, "tool_server": {"name": "env", "state": {"last_query": null}, "tools": [{"name": "bench_echo", "description": "record the customer query", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}}, "effect": {"set": "last_query", "value_arg": "query"}}]}, "user_simulator": {"mock_llm": "final", "scenario": "You want your query 'ping' logged, then you are done."}, "grade": {"state": {"last_query": "ping"}}}

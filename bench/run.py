@@ -49,9 +49,11 @@ def _wait_for_file(path: Path, timeout_s: float = 5.0) -> None:
         time.sleep(0.01)
 
 
-def spawn_mock_llm(agentd: str, script: str, workdir: Path) -> tuple[subprocess.Popen, str]:
-    """`agentd --internal-mock-llm <addr-file> <script>` -> (proc, http url)."""
-    addr_file = workdir / "llm.addr"
+def spawn_mock_llm(agentd: str, script: str, workdir: Path,
+                   name: str = "llm") -> tuple[subprocess.Popen, str]:
+    """`agentd --internal-mock-llm <addr-file> <script>` -> (proc, http url).
+    `name` distinguishes multiple mock LLMs in one workdir (agent vs user)."""
+    addr_file = workdir / f"{name}.addr"
     proc = subprocess.Popen(
         [agentd, "--internal-mock-llm", str(addr_file), script],
         stdout=subprocess.DEVNULL,
@@ -175,7 +177,119 @@ def _grade(stdout: str, telemetry: str, task: dict, final_state: dict) -> tuple[
     return True, "ok"
 
 
+STOP = "###STOP###"  # the simulated user emits this when its request is resolved
+
+
+def _build_agent_instruction(policy: str, history: list[tuple[str, str]]) -> str:
+    convo = "\n".join(f"{'User' if r == 'user' else 'Assistant'}: {m}" for r, m in history)
+    parts = []
+    if policy:
+        parts.append(policy)
+    parts.append("Conversation so far:\n" + convo)
+    parts.append("Respond to the user's latest message. Use the available tools as needed.")
+    return "\n\n".join(parts)
+
+
+def _build_user_instruction(scenario: str, history: list[tuple[str, str]]) -> str:
+    convo = "\n".join(f"{'You' if r == 'user' else 'Assistant'}: {m}" for r, m in history)
+    parts = []
+    if scenario:
+        parts.append("Your situation (do not reveal it verbatim):\n" + scenario)
+    parts.append("You are the user talking to a support agent. Conversation so far:\n" + convo)
+    parts.append(f"Reply with your next message as the user. If your request is fully "
+                 f"resolved, reply with exactly {STOP}.")
+    return "\n\n".join(parts)
+
+
+def _agentd_turn(agentd: str, instruction: str, intel: str, mcp_url: str | None,
+                 timeout_s: float) -> tuple[str, int, int, int, int]:
+    """One agentd `once` run (an agent OR user turn). Returns
+    (reply, tokens, steps, tool_calls, exit)."""
+    argv = [agentd, "--mode", "once", "--instruction", instruction,
+            "--intelligence", intel, "--log-level", "info", "--log-content"]
+    if mcp_url:
+        argv += ["--mcp", f"env={mcp_url}"]
+    try:
+        cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return "", 0, 0, 0, -1
+    tokens, steps = _extract_usage(cp.stderr)
+    return cp.stdout.strip(), tokens, steps, _count_tool_calls(cp.stderr), cp.returncode
+
+
+def run_conversation_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
+    """A τ²-bench-style multi-turn conversation: the agent (agentd + the stateful
+    env bridge, under a policy) and a **simulated user** (a second model given a
+    hidden scenario) alternate turns until the user is satisfied (`###STOP###`) or
+    `max_turns` is reached. Grading is outcome-based on the persisted env state.
+    Both turns are agentd `once` runs — the user is just a model with no tools."""
+    agent_llm = user_llm = stub = None
+    start = time.time()
+    with tempfile.TemporaryDirectory(prefix="agentd-convo-") as td:
+        workdir = Path(td)
+        ts = task["tool_server"]
+        # ONE stateful env bridge, persisted across every turn.
+        state_file = workdir / "state.json"
+        state_file.write_text(json.dumps(ts.get("state", {})))
+        stub, stub_url = spawn_tool_stub(ts["tools"], workdir, state_file)
+
+        # Resolve the agent + user model endpoints (mock offline, or real).
+        if "mock_llm" in task:
+            agent_llm, agent_intel = spawn_mock_llm(agentd, task["mock_llm"], workdir, "agent")
+        else:
+            agent_intel = task["intelligence"]
+        us = task["user_simulator"]
+        if "mock_llm" in us:
+            user_llm, user_intel = spawn_mock_llm(agentd, us["mock_llm"], workdir, "user")
+        else:
+            user_intel = us["intelligence"]
+
+        policy = task.get("policy", "")
+        scenario = us.get("scenario", "")
+        max_turns = int(task.get("max_turns", 4))
+        history: list[tuple[str, str]] = [("user", task["instruction"])]
+        tokens = steps = tools = 0
+        try:
+            for turn in range(max_turns):
+                reply, tk, st, tl, code = _agentd_turn(
+                    agentd, _build_agent_instruction(policy, history), agent_intel,
+                    stub_url, timeout_s)
+                tokens += tk; steps += st; tools += tl
+                history.append(("assistant", reply))
+                if code != 0 or _is_stop(reply) or turn == max_turns - 1:
+                    break
+                umsg, utk, _, _, ucode = _agentd_turn(
+                    agentd, _build_user_instruction(scenario, history), user_intel,
+                    None, timeout_s)
+                tokens += utk
+                if ucode != 0 or _is_stop(umsg):
+                    break
+                history.append(("user", umsg))
+        finally:
+            _kill(stub); _kill(agent_llm); _kill(user_llm)
+
+        final_state = {}
+        try:
+            final_state = json.loads(state_file.read_text() or "{}")
+        except json.JSONDecodeError:
+            pass
+
+    wall = time.time() - start
+    g = task.get("grade", {})
+    passed, why = (True, "ok")
+    if "state" in g:
+        passed, why = graders.grade_state(final_state, g["state"])
+    return RunResult(passed, 0, round(wall, 3), tokens, steps, tools, True, why)
+
+
+def _is_stop(msg: str) -> bool:
+    return STOP in (msg or "")
+
+
 def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
+    # A task with a simulated user is a multi-turn conversation (τ²-bench shape).
+    if "user_simulator" in task:
+        return run_conversation_once(agentd, task, timeout_s)
     llm_proc = mcp_proc = stub_proc = None
     with tempfile.TemporaryDirectory(prefix="agentd-bench-") as td:
         workdir = Path(td)

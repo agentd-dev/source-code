@@ -704,6 +704,7 @@ mod tests {
         // RFC 0022 §4: first-party (code-registered) beats a remote MCP tool of
         // the same name — in classification and therefore in dispatch. Unique
         // tool names: the registry is process-global and tests share a process.
+        let _guard = crate::tools::test_registry_guard();
         crate::tools::register(crate::tools::CodeTool::new(
             "runner.code_tool",
             "a native tool",
@@ -862,6 +863,10 @@ mod tests {
         // A handler whose advertised tool set CHANGES between turns: refresh
         // rebuilds the catalogue in place (the live warm-session refresh) and
         // leaves the transcript untouched.
+        // Hold the registry guard: `tools_len()` reads the process-global
+        // code-tool registry, so a concurrent register/unregister in another
+        // test must not perturb the exact +1 delta asserted below.
+        let _guard = crate::tools::test_registry_guard();
         struct GrowingHandler {
             grown: bool,
         }

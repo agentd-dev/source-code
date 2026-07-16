@@ -323,39 +323,44 @@ user is a second live model given a hidden scenario.
 ```
 config                 pass@1  pass^k  cost/solved(tok)  tasks
 -----------------------------------------------------------
-gpt-4o-mini_simple       96%    96%             3522     25
-gpt-4o-mini_multiple     88%    88%            11911     25
-gpt-4o-mini_parallel     92%    92%             3716     25
+gpt-4o-mini_simple      100%   100%             3519     25
+gpt-4o-mini_multiple     92%    92%            11631     25
+gpt-4o-mini_parallel     92%    92%             3720     25
 gpt-4o-mini_code        100%   100%            11854      5
 gpt-4o-mini_tau2        100%   100%             4748      5
-gpt-4.1-mini_simple      92%    92%             3600     25
-gpt-4.1-mini_multiple    84%    84%             3868     25
-gpt-4.1-mini_parallel    92%    92%             3724     25
+gpt-4.1-mini_simple      96%    96%             3652     25
+gpt-4.1-mini_multiple    92%    92%             3846     25
+gpt-4.1-mini_parallel    92%    92%             3715     25
 gpt-4.1-mini_code       100%   100%            11457      5
 gpt-4.1-mini_tau2       100%   100%             4726      5
 gpt-5.1_simple          100%   100%             3672     25
-gpt-5.1_multiple         80%    80%             4135     25
-gpt-5.1_parallel         88%    88%             8330     25
+gpt-5.1_multiple         92%    92%             4444     25
+gpt-5.1_parallel         88%    88%             8329     25
 gpt-5.1_code            100%   100%            10834      5
 gpt-5.1_tau2            100%   100%             6103      5
 ```
 
 Reproduce with `bench/matrix.py <scorecard.json> ...` over the per-cell
-scorecards (the `bench` GitHub workflow runs a single BFCL cell on demand).
+scorecards (the `bench` GitHub workflow runs a single BFCL cell on demand). The
+BFCL cells are graded by the faithful AST value-matcher (`graders._deep_eq`).
 
 **Reading it honestly.** The point of this run was to *prove the harness*, and it
-did — end to end it surfaced (and we fixed) two real agentd OpenAI-compat bugs:
-dotted tool names rejected on the wire, and reasoning models needing
-`max_completion_tokens`. The *rankings*, though, are noisy and should not be
-over-read:
+did — end to end it surfaced (and we fixed) three real agentd bugs that only a
+live provider exposes: dotted tool names rejected on the wire, reasoning models
+needing `max_completion_tokens`, and a transient 429/5xx becoming an immediate
+exit 4 in `once` mode (now a bounded same-endpoint retry). The *rankings*,
+though, are noisy and should not be over-read:
 
 - **Small samples.** 25 BFCL / 5 code / 5 τ² tasks per cell — a couple of tasks
   swing several points. Treat gaps under ~10pts as noise.
-- **The grader penalizes reasoning-model habits.** gpt-5.1 tops `simple` (100%)
-  but trails on `multiple`/`parallel` — not because it's worse at the task, but
-  because it emits extra/verbose calls and alternate arg formats that our subset
-  grader (a BFCL *subset*, not the full AST checker) marks wrong. This is a
-  grader-fidelity ceiling, not a model verdict.
+- **Grader fidelity matters — and was measured.** An earlier *subset* grader
+  compared arg values naively and marked cosmetic differences wrong ("New York"
+  vs `new_york`, `5` vs `5.0`, list ordering), which understated the models on
+  `multiple`/`parallel` by up to ~12pts (gpt-5.1 `multiple` read 80%). Swapping
+  in BFCL's AST value-matching rules (standardized strings, int/float coercion,
+  order-sensitive lists, recursive dicts) lifted the non-saturated cells to a
+  tight ~92% band across all three models and left the genuinely-failing cases
+  failing (gpt-5.1 `parallel` held at 88%) — a fidelity fix, not inflation.
 - **`code` and `tau2` saturate at 100%.** The coding tasks are small and the
   retail-policy scenarios are within reach of all three models, so accuracy
   can't separate them — the live signal there is **cost**: τ²'s
@@ -363,9 +368,9 @@ over-read:
   and 5.1 occasionally spends an extra tool call to reach the same end-state.
 
 The value is the *infrastructure*, verified against a real model: a stateful
-outcome grader, a multi-turn simulated user, execution grading, and cost-adjusted
-comparison all working against live OpenAI. Bigger, cleaner numbers are a matter
-of more tasks and a stricter (full-BFCL-AST) grader, not more plumbing.
+outcome grader, a multi-turn simulated user, execution grading, a faithful AST
+tool-call grader, and cost-adjusted comparison all working against live OpenAI.
+Bigger, cleaner numbers are now a matter of more tasks, not more plumbing.
 
 ## Roadmap (RFC 0024 §8)
 

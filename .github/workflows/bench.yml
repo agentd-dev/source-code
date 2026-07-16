@@ -39,8 +39,12 @@ jobs:
         run: |
           set -euo pipefail
           BASE="https://raw.githubusercontent.com/ShishirPatil/gorilla/main/berkeley-function-call-leaderboard/bfcl_eval/data"
-          curl -sSf "$BASE/BFCL_v4_simple_python.json"                 | head -n "${{ inputs.n_tasks }}" > q.json
-          curl -sSf "$BASE/possible_answer/BFCL_v4_simple_python.json" | head -n "${{ inputs.n_tasks }}" > a.json
+          # Download in full first — `curl | head` trips pipefail (head closes the
+          # pipe early → curl exit 23). Then slice N tasks (the files are JSON-lines).
+          curl -sSf "$BASE/BFCL_v4_simple_python.json"                 -o q_full.json
+          curl -sSf "$BASE/possible_answer/BFCL_v4_simple_python.json" -o a_full.json
+          head -n "${{ inputs.n_tasks }}" q_full.json > q.json
+          head -n "${{ inputs.n_tasks }}" a_full.json > a.json
           python3 bench/bfcl.py --questions q.json --answers a.json \
             --intelligence https://api.openai.com/v1/chat/completions \
             --model "${{ inputs.model }}" --out bench/tasks/bfcl_run.jsonl

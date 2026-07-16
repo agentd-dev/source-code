@@ -1,0 +1,63 @@
+name: bench
+
+# MANUAL ONLY. This workflow spends real API tokens (the OPENAI_API_KEY secret),
+# so it never runs on push/PR — only when a maintainer triggers it from the
+# Actions tab (workflow_dispatch). On a PUBLIC repo that is the safe posture: a
+# fork PR gets no secrets, and this never auto-runs. Put a spend cap on the key.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "OpenAI model id"
+        default: "gpt-4o-mini"
+      n_tasks:
+        description: "number of BFCL tasks (cost scales with this)"
+        default: "20"
+      repeats:
+        description: "runs per task (k for pass^k reliability)"
+        default: "1"
+
+permissions:
+  contents: read
+
+# One benchmark at a time (spend + rate-limit hygiene).
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+jobs:
+  bfcl:
+    name: BFCL simple × ${{ inputs.model }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # agentd talks MCP; the bench runner drives the real binary per task.
+      - name: Build agentd
+        run: cargo build -p agentd-cli --features workflow
+      - name: Fetch + convert a BFCL slice
+        run: |
+          set -euo pipefail
+          BASE="https://raw.githubusercontent.com/ShishirPatil/gorilla/main/berkeley-function-call-leaderboard/bfcl_eval/data"
+          curl -sSf "$BASE/BFCL_v4_simple_python.json"                 | head -n "${{ inputs.n_tasks }}" > q.json
+          curl -sSf "$BASE/possible_answer/BFCL_v4_simple_python.json" | head -n "${{ inputs.n_tasks }}" > a.json
+          python3 bench/bfcl.py --questions q.json --answers a.json \
+            --intelligence https://api.openai.com/v1/chat/completions \
+            --model "${{ inputs.model }}" --out bench/tasks/bfcl_run.jsonl
+          echo "converted $(wc -l < bench/tasks/bfcl_run.jsonl) tasks"
+      - name: Run the benchmark
+        env:
+          AGENT_INTELLIGENCE_TOKEN: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 bench/run.py --tasks bench/tasks/bfcl_run.jsonl \
+            --repeats "${{ inputs.repeats }}" --config "${{ inputs.model }}" \
+            --timeout 90 --out scorecard.json
+      - name: Summarize
+        if: always()
+        run: |
+          [ -f scorecard.json ] && python3 -c "import json;s=json.load(open('scorecard.json'))['summary'];print('::notice title=BFCL::pass@1=%.0f%% pass^k=%.0f%% cost/solved=%s tok over %d tasks'%(s['pass_at_1']*100,s['pass_hat_k']*100,s.get('cost_per_solved_tokens'),s['tasks']))" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bfcl-scorecard-${{ inputs.model }}
+          path: scorecard.json

@@ -244,16 +244,33 @@ wiring a *workload* agent needs. The applicable gaps, with disposition:
   the enroll/token *endpoints* are deliberately NOT discovered — the protocol
   keeps them out of metadata (informational bootstrap conventions), so the
   hardcoded `/enroll` + `/agent-token` paths are correct.
-- **G5 — Per-Person-Server token targeting** (deferred): the `ps` claim is fixed
-  at enroll; the draft issues per-PS tokens with `ps` on the issuance call. Only
-  matters once one agent serves multiple Person-Servers.
+- **G5 — Person-Server (`ps`) claim** (**DONE**): the *normative* protocol
+  (§5.2.1) makes `ps` a **per-agent-instance** claim ("configured per agent
+  instance"), enrolled from `person_server` config — NOT the per-request
+  targeting the informational bootstrap draft sketched. agentd already enrolls
+  it; the added delta is validation: `inspect_agent_token` now fails fast if the
+  token's `ps` claim ≠ the configured person server (a wrong `ps` would route the
+  Case-C exchange to the wrong PS). Per-*request* `ps` targeting is a non-goal
+  (one PS per agent instance is the protocol model).
 - **G2 — Self-hosted mode** (deferred, low priority): publish an
   `/.well-known/aauth-agent.json` + JWKS and self-issue tokens (be your own AP),
   for on-prem/air-gapped deploys with no separate provider.
-- **G3 — Two-key durable/ephemeral split + `jkt-jwt` scheme** (deferred,
-  hardening): the draft explicitly blesses agentd's single-key pattern for
-  self-hosted; a durable anchor + fresh per-token ephemeral would shrink the
-  blast radius of a leaked request-signing key. Pairs with G6.
+- **G3 — Two-key durable/ephemeral split + `jkt-jwt` scheme** (deferred —
+  **contingent on G6**): a durable enrollment anchor + a fresh per-token ephemeral
+  request-signing key (the token's `cnf.jwk`), the token request signed with the
+  `jkt-jwt` Signature-Key scheme (a durable-signed JWT naming the ephemeral in
+  `cnf`), per draft-hardt-httpbis-signature-key-07. Exact wire format is now
+  known and implementable: `Signature-Key: sig=jkt-jwt;jwt="<JWT>"`, JWT header
+  `{typ:"jkt-s256+jwt", alg:"EdDSA", jwk:<durable pub>}`, payload
+  `{iss:"urn:jkt:sha-256:<durable thumbprint>", iat, exp, cnf:{jwk:<ephemeral pub>}}`,
+  durable signs the JWT, ephemeral signs the RFC 9421 base.
+  **Why still deferred:** the security benefit is realized only when the durable
+  anchor lives somewhere the ephemeral does not — i.e. hardware (G6, WILL NOT
+  DO). Today the durable key is a `0600` file, so the two-key split gives ~no
+  marginal protection: the file leak that would expose a single key exposes the
+  durable anchor either way (and the anchor's leak is the worse compromise). Both
+  keys also share one process's memory. The protocol blesses single-key for
+  workload agents. Revisit only alongside G6 (durable in TPM/KMS).
 - **G6 — Hardware-backed / non-extractable key ("secure enclaves")**
   (**WILL NOT DO** — most likely): the durable key is a `0600` seed file, hence
   extractable. On a Linux server "Secure Enclave" means TPM 2.0 / PKCS#11-HSM /

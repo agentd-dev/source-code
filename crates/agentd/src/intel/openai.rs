@@ -48,12 +48,31 @@ pub fn parse_models(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The output-token-limit parameter name for `model`. OpenAI's reasoning models
+/// (`gpt-5*`, the `o1/o3/o4` series) require `max_completion_tokens` and REJECT
+/// the older `max_tokens`; everything else (gpt-4o/4.1, and self-hosted
+/// OpenAI-compatible servers that only implement the classic param) takes
+/// `max_tokens`. Choosing per model keeps both working.
+fn max_tokens_key(model: &str) -> &'static str {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("gpt-5")
+        || m.starts_with("chatgpt-5")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+    {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
 /// Build the request body (JSON bytes) and the HTTP headers for a chat
 /// completion. `token`, if present, becomes `Authorization: Bearer …`.
 pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(String, String)>) {
     let mut body = Map::new();
     body.insert("model".into(), json!(req.model));
-    body.insert("max_tokens".into(), json!(req.max_tokens));
+    body.insert(max_tokens_key(&req.model).into(), json!(req.max_tokens));
     if let Some(t) = req.temperature {
         body.insert("temperature".into(), json!(t));
     }
@@ -221,6 +240,20 @@ mod tests {
             max_tokens: 256,
             temperature: Some(0.0),
         }
+    }
+
+    #[test]
+    fn reasoning_models_switch_the_token_limit_param() {
+        // A reasoning model (gpt-5*/o-series) must use max_completion_tokens.
+        let mut r = req();
+        r.model = "gpt-5.1".into();
+        let v: Value = serde_json::from_slice(&build_request(&r, None).0).unwrap();
+        assert_eq!(v["max_completion_tokens"], 256);
+        assert!(v.get("max_tokens").is_none(), "{v}");
+        // An older / self-hosted model keeps the classic max_tokens (gpt-x here).
+        let v: Value = serde_json::from_slice(&build_request(&req(), None).0).unwrap();
+        assert_eq!(v["max_tokens"], 256);
+        assert!(v.get("max_completion_tokens").is_none(), "{v}");
     }
 
     #[test]

@@ -316,6 +316,22 @@ fn host_only(rest: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
+/// A tool name in provider-safe wire form: OpenAI/Anthropic require tool names to
+/// match `^[a-zA-Z0-9_-]+$`, so every other char — notably the `.` in agentd's
+/// namespaced self-tools (`resource.read`, `subagent.spawn`) — becomes `_`. A
+/// per-request reverse map restores the original name for routing.
+fn wire_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl Endpoint {
     /// AAuth (RFC 0023; agentctl RFC 0024 §7.1 — the modelgateway inbound
     /// posture): when a process AAuth identity is installed, **sign the
@@ -348,7 +364,50 @@ impl Endpoint {
     ) -> Result<(crate::wire::intel::Response, Duration), IntelError> {
         use super::{anthropic, openai};
         use crate::net::http;
+        use std::collections::HashMap;
         use std::time::Instant;
+
+        // Provider tool-name compatibility: real OpenAI/Anthropic reject tool names
+        // that aren't `^[a-zA-Z0-9_-]+$`, but agentd uses dotted namespaced names
+        // (`resource.read`, `subagent.spawn`, …). Sanitize every place a name rides
+        // the wire — the `tools` definitions AND the prior `tool_calls` in the
+        // assistant message history (which get re-sent each turn) — and map the
+        // returned `tool_calls` back to the originals so routing is unaffected.
+        // No-op (no clone) when every name is already wire-safe.
+        use crate::wire::intel::Message;
+        let dirty = |n: &str| wire_tool_name(n) != n;
+        let must_sanitize = req.tools.iter().any(|t| dirty(&t.name))
+            || req.messages.iter().any(|m| {
+                matches!(m, Message::Assistant { tool_calls, .. }
+                    if tool_calls.iter().any(|tc| dirty(&tc.name)))
+            });
+        let mut wire_to_orig: HashMap<String, String> = HashMap::new();
+        let owned_req;
+        let req: &crate::wire::intel::Request = if must_sanitize {
+            let mut r = req.clone();
+            for t in &mut r.tools {
+                let w = wire_tool_name(&t.name);
+                if w != t.name {
+                    wire_to_orig.insert(w.clone(), t.name.clone());
+                    t.name = w;
+                }
+            }
+            for m in &mut r.messages {
+                if let Message::Assistant { tool_calls, .. } = m {
+                    for tc in tool_calls {
+                        let w = wire_tool_name(&tc.name);
+                        if w != tc.name {
+                            wire_to_orig.insert(w.clone(), tc.name.clone());
+                            tc.name = w;
+                        }
+                    }
+                }
+            }
+            owned_req = r;
+            &owned_req
+        } else {
+            req
+        };
 
         let (body, mut headers) = match self.provider {
             Provider::OpenAiCompatible => openai::build_request(req, self.token.as_deref()),
@@ -387,11 +446,19 @@ impl Endpoint {
             return Err(IntelError::Http(resp.status, snippet));
         }
 
-        let parsed = match self.provider {
+        let mut parsed = match self.provider {
             Provider::OpenAiCompatible => openai::parse_response(&resp.body),
             Provider::Anthropic => anthropic::parse_response(&resp.body),
         }
         .map_err(IntelError::Parse)?;
+        // Undo the wire sanitization: route by the original (dotted) tool names.
+        if !wire_to_orig.is_empty() {
+            for tc in &mut parsed.tool_calls {
+                if let Some(orig) = wire_to_orig.get(&tc.name) {
+                    tc.name = orig.clone();
+                }
+            }
+        }
         Ok((parsed, latency))
     }
 
@@ -457,6 +524,24 @@ impl Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_tool_name_maps_only_illegal_chars() {
+        // The provider pattern is ^[a-zA-Z0-9_-]+$: dots (agentd's namespace
+        // separator) and anything else become `_`; legal names pass through.
+        assert_eq!(wire_tool_name("resource.read"), "resource_read");
+        assert_eq!(wire_tool_name("subagent.spawn"), "subagent_spawn");
+        assert_eq!(wire_tool_name("math.factorial"), "math_factorial");
+        // Already-legal names are untouched (so the fast path stays a no-op).
+        assert_eq!(wire_tool_name("get_weather"), "get_weather");
+        assert_eq!(wire_tool_name("list-files"), "list-files");
+        assert_eq!(
+            wire_tool_name("calculate_triangle_area"),
+            "calculate_triangle_area"
+        );
+        // Other illegal chars (spaces, slashes) also normalize.
+        assert_eq!(wire_tool_name("a b/c"), "a_b_c");
+    }
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k: &str| {

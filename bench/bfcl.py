@@ -58,11 +58,31 @@ def _instruction(question) -> str:
     return "\n".join(msgs) if msgs else str(question)
 
 
+# BFCL uses Python-ish type names in its schemas; providers want JSON Schema.
+_TYPE_MAP = {"dict": "object", "float": "number", "tuple": "array", "any": "string"}
+
+
+def _norm_schema(s):
+    """Recursively normalize a BFCL parameter schema to JSON Schema (dict→object,
+    float→number, tuple→array) so OpenAI/Anthropic accept it."""
+    if not isinstance(s, dict):
+        return s
+    out = dict(s)
+    t = out.get("type")
+    if isinstance(t, str):
+        out["type"] = _TYPE_MAP.get(t, t)
+    if isinstance(out.get("properties"), dict):
+        out["properties"] = {k: _norm_schema(v) for k, v in out["properties"].items()}
+    if "items" in out:
+        out["items"] = _norm_schema(out["items"])
+    return out
+
+
 def _tools(functions: list[dict]) -> list[dict]:
     return [{
         "name": f["name"],
         "description": f.get("description", ""),
-        "inputSchema": f.get("parameters", {"type": "object"}),
+        "inputSchema": _norm_schema(f.get("parameters", {"type": "object"})),
     } for f in functions]
 
 

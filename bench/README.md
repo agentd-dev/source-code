@@ -309,6 +309,64 @@ ablation uses outcome-graded tasks (state/files), whose grading is
 config-agnostic (the env end-state is what matters, however the work is
 structured). Proven offline by `tasks/ablation_smoke.jsonl`.
 
+## Live-model results (real OpenAI, 2026-07)
+
+The harness has been run end-to-end against live OpenAI models — the first proof
+that the plumbing works against a real provider, not just the offline mock. Three
+models across three benchmark *shapes* (five cells each): BFCL tool-calling
+(`simple`/`multiple`/`parallel`, 25 tasks each), the execution-graded `code`
+suite (5 tasks, graded by running the fixed module's test), and the `tau2`
+simulated-user conversation (5 retail-policy scenarios, outcome-graded on the
+persisted env state). Every agent turn drives the real `agentd` binary; the τ²
+user is a second live model given a hidden scenario.
+
+```
+config                 pass@1  pass^k  cost/solved(tok)  tasks
+-----------------------------------------------------------
+gpt-4o-mini_simple       96%    96%             3522     25
+gpt-4o-mini_multiple     88%    88%            11911     25
+gpt-4o-mini_parallel     92%    92%             3716     25
+gpt-4o-mini_code        100%   100%            11854      5
+gpt-4o-mini_tau2        100%   100%             4748      5
+gpt-4.1-mini_simple      92%    92%             3600     25
+gpt-4.1-mini_multiple    84%    84%             3868     25
+gpt-4.1-mini_parallel    92%    92%             3724     25
+gpt-4.1-mini_code       100%   100%            11457      5
+gpt-4.1-mini_tau2       100%   100%             4726      5
+gpt-5.1_simple          100%   100%             3672     25
+gpt-5.1_multiple         80%    80%             4135     25
+gpt-5.1_parallel         88%    88%             8330     25
+gpt-5.1_code            100%   100%            10834      5
+gpt-5.1_tau2            100%   100%             6103      5
+```
+
+Reproduce with `bench/matrix.py <scorecard.json> ...` over the per-cell
+scorecards (the `bench` GitHub workflow runs a single BFCL cell on demand).
+
+**Reading it honestly.** The point of this run was to *prove the harness*, and it
+did — end to end it surfaced (and we fixed) two real agentd OpenAI-compat bugs:
+dotted tool names rejected on the wire, and reasoning models needing
+`max_completion_tokens`. The *rankings*, though, are noisy and should not be
+over-read:
+
+- **Small samples.** 25 BFCL / 5 code / 5 τ² tasks per cell — a couple of tasks
+  swing several points. Treat gaps under ~10pts as noise.
+- **The grader penalizes reasoning-model habits.** gpt-5.1 tops `simple` (100%)
+  but trails on `multiple`/`parallel` — not because it's worse at the task, but
+  because it emits extra/verbose calls and alternate arg formats that our subset
+  grader (a BFCL *subset*, not the full AST checker) marks wrong. This is a
+  grader-fidelity ceiling, not a model verdict.
+- **`code` and `tau2` saturate at 100%.** The coding tasks are small and the
+  retail-policy scenarios are within reach of all three models, so accuracy
+  can't separate them — the live signal there is **cost**: τ²'s
+  `cost/solved` cleanly ranks 4.1-mini (4726) < 4o-mini (4748) < 5.1 (6103),
+  and 5.1 occasionally spends an extra tool call to reach the same end-state.
+
+The value is the *infrastructure*, verified against a real model: a stateful
+outcome grader, a multi-turn simulated user, execution grading, and cost-adjusted
+comparison all working against live OpenAI. Bigger, cleaner numbers are a matter
+of more tasks and a stricter (full-BFCL-AST) grader, not more plumbing.
+
 ## Roadmap (RFC 0024 §8)
 
 - **Phase 0 (done):** the runner + offline smoke suite — proves the plumbing.

@@ -111,6 +111,39 @@ def grade_state(final_state: dict, expected: dict) -> tuple[bool, str]:
     return False, f"final state did not satisfy {expected}; got {final_state}"
 
 
+def _at(state, dotted: str):
+    cur = state
+    for p in dotted.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return None
+        cur = cur[p]
+    return cur
+
+
+def grade_state_absent(final_state: dict, paths: list[str]) -> tuple[bool, str]:
+    """Policy-refusal grading (τ²-bench): each dotted path must be ABSENT / null in
+    the final state — the agent must NOT have taken a forbidden write-action (e.g.
+    cancelling a shipped order the policy forbids)."""
+    for p in paths:
+        if _at(final_state or {}, p) is not None:
+            return False, f"forbidden action was taken: {p} = {_at(final_state, p)!r}"
+    return True, "ok"
+
+
+def grade_env(final_state: dict, grade: dict) -> tuple[bool, str]:
+    """Combined environment grading: `state` (required end-state) AND `state_absent`
+    (forbidden actions). Both must hold."""
+    if "state" in grade:
+        ok, why = grade_state(final_state, grade["state"])
+        if not ok:
+            return ok, why
+    if "state_absent" in grade:
+        ok, why = grade_state_absent(final_state, grade["state_absent"])
+        if not ok:
+            return ok, why
+    return True, "ok"
+
+
 def grade_tool_calls(telemetry: str, expected) -> tuple[bool, str]:
     """`expected` is a ground-truth call, a list of acceptable alternatives, or a
     list of REQUIRED calls (all must appear) when tagged {"all": [...]}."""
@@ -183,6 +216,14 @@ def _selftest() -> None:
     assert ok
     ok, _ = grade_state(final, {"log": ["a"]})
     assert not ok                                    # list length must match
+
+    # policy-refusal grading: a forbidden action must be absent
+    assert grade_state_absent({"refunded": "A2"}, ["cancelled"])[0]      # cancel not taken -> ok
+    assert not grade_state_absent({"cancelled": "A2"}, ["cancelled"])[0]  # cancel taken -> fail
+    # combined env grading (state AND state_absent)
+    assert grade_env({"cancelled": "A1"}, {"state": {"cancelled": "A1"}, "state_absent": ["refunded"]})[0]
+    assert not grade_env({"cancelled": "A1", "refunded": "A1"},
+                         {"state": {"cancelled": "A1"}, "state_absent": ["refunded"]})[0]
     print("graders: all self-checks passed")
 
 

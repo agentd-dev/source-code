@@ -8,10 +8,15 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "OpenAI model id"
+        description: "OpenAI model id (gpt-4o-mini, gpt-4.1-mini, gpt-5.1, …)"
         default: "gpt-4o-mini"
+      category:
+        description: "BFCL category"
+        type: choice
+        default: "simple"
+        options: ["simple", "multiple", "parallel"]
       n_tasks:
-        description: "number of BFCL tasks (cost scales with this)"
+        description: "number of tasks (cost scales with this)"
         default: "20"
       repeats:
         description: "runs per task (k for pass^k reliability)"
@@ -27,7 +32,7 @@ concurrency:
 
 jobs:
   bfcl:
-    name: BFCL simple × ${{ inputs.model }}
+    name: BFCL ${{ inputs.category }} × ${{ inputs.model }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,10 +44,12 @@ jobs:
         run: |
           set -euo pipefail
           BASE="https://raw.githubusercontent.com/ShishirPatil/gorilla/main/berkeley-function-call-leaderboard/bfcl_eval/data"
+          # `simple` ships as BFCL_v4_simple_python.json; the rest as BFCL_v4_<cat>.json.
+          CAT="${{ inputs.category }}"; [ "$CAT" = "simple" ] && FILE="simple_python" || FILE="$CAT"
           # Download in full first — `curl | head` trips pipefail (head closes the
           # pipe early → curl exit 23). Then slice N tasks (the files are JSON-lines).
-          curl -sSf "$BASE/BFCL_v4_simple_python.json"                 -o q_full.json
-          curl -sSf "$BASE/possible_answer/BFCL_v4_simple_python.json" -o a_full.json
+          curl -sSf "$BASE/BFCL_v4_${FILE}.json"                 -o q_full.json
+          curl -sSf "$BASE/possible_answer/BFCL_v4_${FILE}.json" -o a_full.json
           head -n "${{ inputs.n_tasks }}" q_full.json > q.json
           head -n "${{ inputs.n_tasks }}" a_full.json > a.json
           python3 bench/bfcl.py --questions q.json --answers a.json \
@@ -54,7 +61,7 @@ jobs:
           AGENT_INTELLIGENCE_TOKEN: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python3 bench/run.py --tasks bench/tasks/bfcl_run.jsonl \
-            --repeats "${{ inputs.repeats }}" --config "${{ inputs.model }}" \
+            --repeats "${{ inputs.repeats }}" --config "${{ inputs.model }}_${{ inputs.category }}" \
             --timeout 90 --out scorecard.json
       - name: Summarize
         if: always()
@@ -63,5 +70,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bfcl-scorecard-${{ inputs.model }}
+          name: bfcl-${{ inputs.model }}-${{ inputs.category }}
           path: scorecard.json

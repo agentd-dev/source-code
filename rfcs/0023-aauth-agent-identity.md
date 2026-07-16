@@ -219,3 +219,41 @@ binary. What remains:
   integrity if a model gateway requires it.
 - **Signing the A2A client** (peer delegation is bearer/mTLS-only today —
   agentctl RFC 0024 §8).
+
+### 7.1 Bootstrap-draft gap analysis (2026-07-16)
+
+Reviewed against `draft-hardt-aauth-bootstrap-01`. That draft is *informational*
+guidance for **Agent Provider** and web/mobile **client-platform** implementers;
+much of it (Secure Enclave / StrongBox, WebAuthn / App Attest / Play Integrity,
+WebCrypto / IndexedDB, ephemeral browser keys) is platform machinery that does
+not apply to a headless server agent. agentd is conformant for the hosted-AP
+wiring a *workload* agent needs. The applicable gaps, with disposition:
+
+- **G4 — Agent-token claim awareness** (**DONE**, see §Step 2): the token is a
+  JWT; parse it best-effort to (a) drive refresh off its own `exp` and (b) fail
+  fast if `cnf.jwk` ≠ the signing key (a mismatch would otherwise be a silent
+  downstream 401 storm). Backward-compatible: a non-JWT/opaque token falls back
+  to `expires_in`.
+- **G1 — AP metadata discovery** (deferred): `/enroll` and `/agent-token` paths
+  are hardcoded; discover them (and the AP JWKS) from a provider metadata
+  document if/when a real AP advertises one. Interop hardening.
+- **G5 — Per-Person-Server token targeting** (deferred): the `ps` claim is fixed
+  at enroll; the draft issues per-PS tokens with `ps` on the issuance call. Only
+  matters once one agent serves multiple Person-Servers.
+- **G2 — Self-hosted mode** (deferred, low priority): publish an
+  `/.well-known/aauth-agent.json` + JWKS and self-issue tokens (be your own AP),
+  for on-prem/air-gapped deploys with no separate provider.
+- **G3 — Two-key durable/ephemeral split + `jkt-jwt` scheme** (deferred,
+  hardening): the draft explicitly blesses agentd's single-key pattern for
+  self-hosted; a durable anchor + fresh per-token ephemeral would shrink the
+  blast radius of a leaked request-signing key. Pairs with G6.
+- **G6 — Hardware-backed / non-extractable key ("secure enclaves")**
+  (**WILL NOT DO** — most likely): the durable key is a `0600` seed file, hence
+  extractable. On a Linux server "Secure Enclave" means TPM 2.0 / PKCS#11-HSM /
+  cloud KMS. The signing surface is already a tiny seam (`AgentKey::sign` +
+  `public_jwk`), so a `Signer` trait with a KMS/TPM backend is *mechanically*
+  cheap — but TPMs/most HSMs don't do Ed25519, so real hardware backing would
+  force adding ES256 (P-256) across the whole wire (`hwk` crv, `cnf.jwk` kty,
+  signature base). Not worth it while identities are short-lived and gated by a
+  rotating workload assertion (§5.1). Revisit only if a long-lived durable anchor
+  + KMS-Ed25519 (e.g. GCP, no wire change) becomes a concrete requirement.

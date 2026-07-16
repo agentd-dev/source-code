@@ -141,8 +141,11 @@ impl AAuthClient {
 
     /// Enroll + fetch the first token now, so a misconfig (unreachable apd, bad
     /// enrollment token) fails at startup rather than on the first MCP call.
-    /// Returns the resolved agent identity.
+    /// Returns the resolved agent identity. First validates the Agent-Provider
+    /// metadata document (RFC 0023 §7.1 G1): a host-poisoned `aauth-agent.json`
+    /// (issuer ≠ the configured provider) aborts here rather than after enroll.
     pub fn prime(&self) -> Result<String, String> {
+        self.apd.verify_provider_metadata()?;
         self.apd.token()?;
         Ok(self.apd.agent_id().unwrap_or_default())
     }

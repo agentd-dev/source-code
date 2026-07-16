@@ -146,6 +146,15 @@ impl ApdClient {
         Ok(())
     }
 
+    /// Validate the Agent-Provider metadata document (RFC 0023 §7.1 G1): if the
+    /// AP publishes `/.well-known/aauth-agent.json`, its `issuer` MUST match the
+    /// configured provider (§12.10 anti-host-poisoning). An absent document is
+    /// fine (the enroll/token endpoints are bootstrap conventions, not
+    /// advertised); a contradicting one is fatal. Called once at prime.
+    pub(super) fn verify_provider_metadata(&self) -> Result<(), String> {
+        super::discover::fetch_agent_provider(&self.config.base_url, self.timeout).map(|_| ())
+    }
+
     fn fetch_token(&self) -> Result<Cached, String> {
         let resp: TokenResp = self.signed_post("/agent-token", &serde_json::json!({}))?;
         if let Some(agent) = resp.agent {
@@ -153,11 +162,13 @@ impl ApdClient {
         }
         // Act on the token's own claims (RFC 0023 §7.1 G4): the agent token is a
         // JWT, so its `exp` is the authoritative refresh deadline (the AP may omit
-        // or disagree with `expires_in`), and its `cnf.jwk` MUST be our signing
-        // key — a mismatch is fatal (every signed request would be rejected), so
-        // we fail fast here rather than let it surface as a downstream 401 storm.
-        // Opaque / non-JWT tokens parse to `None` and fall back to `expires_in`.
-        let exp = inspect_agent_token(&resp.agent_token, &self.key)?;
+        // or disagree with `expires_in`), its `iss` MUST be the provider we
+        // enrolled with (G1 ties the token to the configured AP), and its
+        // `cnf.jwk` MUST be our signing key — a mismatch on either is fatal (every
+        // signed request would be rejected), so we fail fast here rather than let
+        // it surface as a downstream 401 storm. Opaque / non-JWT tokens parse to
+        // `None` and fall back to `expires_in`.
+        let exp = inspect_agent_token(&resp.agent_token, &self.key, Some(&self.config.base_url))?;
         let ttl = exp
             .map(|e| Duration::from_secs(e.saturating_sub(sig::now_secs())))
             .or_else(|| resp.expires_in.map(Duration::from_secs))
@@ -240,16 +251,22 @@ fn connect(url: &Url, timeout: Duration) -> Result<Box<dyn http::Stream>, String
 }
 
 /// Best-effort read of the claims we *act on* in the (JWT) agent token: the real
-/// `exp` and the `cnf.jwk` proof-of-possession binding. We do NOT verify the
-/// token signature — the downstream resource server / model gateway does that;
-/// we only react to claims we can use locally.
+/// `exp`, the `iss` (must be the configured provider), and the `cnf.jwk`
+/// proof-of-possession binding. We do NOT verify the token signature — the
+/// downstream resource server / model gateway does that; we only react to claims
+/// we can use locally.
 ///
-/// Returns the token `exp` (unix seconds) when present. Returns `Err` only on a
-/// definite `cnf.jwk` ≠ signing-key mismatch — which would make every signed
-/// request fail, so surfacing it here (at fetch) beats a silent 401 storm.
-/// An opaque / non-JWT token, or one we can't parse, yields `Ok(None)` and is
-/// treated exactly as before (caller falls back to `expires_in`).
-fn inspect_agent_token(token: &str, key: &AgentKey) -> Result<Option<u64>, String> {
+/// Returns the token `exp` (unix seconds) when present. Returns `Err` on a
+/// definite `iss` ≠ configured-provider or `cnf.jwk` ≠ signing-key mismatch —
+/// either would make every signed request fail, so surfacing it here (at fetch)
+/// beats a silent 401 storm. `expected_iss` is the provider we enrolled with;
+/// pass `None` to skip the issuer check. An opaque / non-JWT token, or one we
+/// can't parse, yields `Ok(None)` (caller falls back to `expires_in`).
+fn inspect_agent_token(
+    token: &str,
+    key: &AgentKey,
+    expected_iss: Option<&str>,
+) -> Result<Option<u64>, String> {
     // JWT = header.payload.signature; read only the payload segment.
     let Some(payload_b64) = token.split('.').nth(1) else {
         return Ok(None); // not JWT-shaped → opaque token, keep legacy behavior
@@ -260,6 +277,15 @@ fn inspect_agent_token(token: &str, key: &AgentKey) -> Result<Option<u64>, Strin
     let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(None);
     };
+    // iss: the token must come from the provider we enrolled with (G1) — a token
+    // issued by some other AP is not one we should present.
+    if let (Some(want), Some(iss)) = (expected_iss, claims.get("iss").and_then(|v| v.as_str()))
+        && !super::discover::issuer_matches(iss, want)
+    {
+        return Err(format!(
+            "aauth: agent token iss {iss:?} is not the configured provider {want:?}"
+        ));
+    }
     // cnf.jwk: agentd is single-key, so the token must bind our durable key (the
     // one we present + sign with). A mismatch never works — fail fast.
     if let Some(cnf) = claims.get("cnf").and_then(|c| c.get("jwk")) {
@@ -290,12 +316,14 @@ mod tests {
         AgentKey::from_seed(&[9u8; 32]).unwrap()
     }
 
+    const AP: Option<&str> = Some("https://ap.example");
+
     #[test]
     fn exp_is_read_from_the_token() {
         let key = test_key();
         let tok = jwt(serde_json::json!({ "exp": 1_800_000_000u64 }));
         assert_eq!(
-            inspect_agent_token(&tok, &key).unwrap(),
+            inspect_agent_token(&tok, &key, AP).unwrap(),
             Some(1_800_000_000)
         );
     }
@@ -305,10 +333,10 @@ mod tests {
         let key = test_key();
         // cnf.jwk == our public jwk → ok.
         let tok = jwt(serde_json::json!({ "exp": 42u64, "cnf": { "jwk": key.public_jwk() } }));
-        assert_eq!(inspect_agent_token(&tok, &key).unwrap(), Some(42));
+        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), Some(42));
         // no cnf at all → still ok (nothing to check).
         let tok = jwt(serde_json::json!({ "exp": 42u64 }));
-        assert_eq!(inspect_agent_token(&tok, &key).unwrap(), Some(42));
+        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), Some(42));
     }
 
     #[test]
@@ -316,19 +344,33 @@ mod tests {
         let key = test_key();
         let other = AgentKey::from_seed(&[1u8; 32]).unwrap();
         let tok = jwt(serde_json::json!({ "exp": 42u64, "cnf": { "jwk": other.public_jwk() } }));
-        let err = inspect_agent_token(&tok, &key).unwrap_err();
+        let err = inspect_agent_token(&tok, &key, AP).unwrap_err();
         assert!(err.contains("cnf.jwk"), "{err}");
+    }
+
+    #[test]
+    fn matching_iss_passes_mismatched_iss_hard_errors() {
+        let key = test_key();
+        // iss == configured provider (trailing slash tolerated) → ok.
+        let tok = jwt(serde_json::json!({ "exp": 42u64, "iss": "https://ap.example/" }));
+        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), Some(42));
+        // iss is a DIFFERENT provider → fail fast.
+        let tok = jwt(serde_json::json!({ "exp": 42u64, "iss": "https://evil.example" }));
+        let err = inspect_agent_token(&tok, &key, AP).unwrap_err();
+        assert!(err.contains("iss"), "{err}");
+        // expected_iss = None → issuer check skipped.
+        assert_eq!(inspect_agent_token(&tok, &key, None).unwrap(), Some(42));
     }
 
     #[test]
     fn opaque_or_unparseable_token_is_legacy_none() {
         let key = test_key();
         // not JWT-shaped (no dots) → None, no error.
-        assert_eq!(inspect_agent_token("opaque-token", &key).unwrap(), None);
+        assert_eq!(inspect_agent_token("opaque-token", &key, AP).unwrap(), None);
         // JWT-shaped but payload isn't valid base64/JSON → None, no error.
-        assert_eq!(inspect_agent_token("a.!!!.c", &key).unwrap(), None);
+        assert_eq!(inspect_agent_token("a.!!!.c", &key, AP).unwrap(), None);
         // JWT with no exp claim → None (caller falls back to expires_in).
         let tok = jwt(serde_json::json!({ "sub": "aauth:x@ap" }));
-        assert_eq!(inspect_agent_token(&tok, &key).unwrap(), None);
+        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), None);
     }
 }

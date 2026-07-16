@@ -12,9 +12,10 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// A minimal mock apd: answers POST /enroll and /agent-token. It records that
-/// each request arrived signed (a `Signature` header present) and returns canned
-/// JSON. Runs until it has served `serve` requests, then stops.
+/// A minimal mock apd: serves the G1 provider-metadata GET, then POST /enroll and
+/// /agent-token. It records that each *enroll/token* request arrived signed (a
+/// `Signature` header present) and returns canned JSON. Runs until it has served
+/// `serve` requests, then stops.
 fn spawn_mock_apd(serve: usize) -> (String, mpsc::Receiver<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
@@ -25,6 +26,18 @@ fn spawn_mock_apd(serve: usize) -> (String, mpsc::Receiver<bool>) {
                 break;
             };
             let (path, signed) = read_request(&mut s);
+            // G1: prime() first validates /.well-known/aauth-agent.json. Serve a
+            // document whose `issuer` == our own origin (the match case), and
+            // don't count it as a signed enroll/token call.
+            if path.contains(".well-known") {
+                let body = format!(r#"{{"issuer":"http://{addr}","name":"Mock AP"}}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                continue;
+            }
             tx.send(signed).ok();
             let body = if path.contains("enroll") {
                 r#"{"agent":"aauth:k7q3p9n2@apd.mock"}"#
@@ -75,7 +88,7 @@ fn read_request(s: &mut TcpStream) -> (String, bool) {
 
 #[test]
 fn enroll_token_and_sign_end_to_end() {
-    let (provider, rx) = spawn_mock_apd(2); // enroll + agent-token
+    let (provider, rx) = spawn_mock_apd(3); // metadata + enroll + agent-token
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("agent.key");
     let key = AgentKey::load_or_create(&key_path).expect("key");

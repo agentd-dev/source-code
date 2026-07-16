@@ -88,6 +88,16 @@ a response is `401 requirement=auth-token` (Case C, user-scoped), agentd runs th
 Person-Server exchange and presents the resulting user auth-token — all inside
 the same request, bounded so a mis-satisfied requirement can't spin.
 
+**agentd validates its provider and its token.** At startup it fetches the
+Agent-Provider metadata document (`/.well-known/aauth-agent.json`) and enforces
+the AAuth protocol's anti-host-poisoning rule: a document whose `issuer` isn't
+the configured provider aborts enrollment. A provider that publishes no document
+still works (best-effort). The agent token itself is then acted on, not treated
+as opaque: agentd refreshes against the token's own `exp`, and fails fast if the
+token's `iss` isn't the configured provider, its `ps` isn't the configured
+Person Server, or its `cnf.jwk` isn't the signing key — each a misconfiguration
+that would otherwise surface as a silent wall of downstream `401`s.
+
 ## Where the human sits
 
 You (or your operator) act **at setup only** for the common case (identity-based
@@ -127,12 +137,14 @@ All three access modes run end to end:
 - **Case C** (user-scoped) — run the Person-Server exchange on
   `401 requirement=auth-token` and present the user auth-token.
 
-Plus **discovery** (`/.well-known/aauth-resource.json`), **content-digest**
-covering when a server requires body integrity, **per-server opt-out**
-(`aauth: false` on a `--mcp` config entry), **federated enrollment**
-(`--aauth-enroll-assertion-file`), **signing the intelligence dial**, and
-**shipping in the release binary** (zero marginal dep — the crypto is already
-linked by the `tls` transport).
+Plus **resource discovery** (`/.well-known/aauth-resource.json`) and
+**provider discovery + issuer validation** (`/.well-known/aauth-agent.json`),
+**agent-token claim validation** (refresh off the token's `exp`; fail fast on an
+`iss` / `ps` / `cnf` mismatch), **content-digest** covering when a server
+requires body integrity, **per-server opt-out** (`aauth: false` on a `--mcp`
+config entry), **federated enrollment** (`--aauth-enroll-assertion-file`),
+**signing the intelligence dial**, and **shipping in the release binary** (zero
+marginal dep — the crypto is already linked by the `tls` transport).
 
 Still on the [roadmap](../rfcs/0023-aauth-agent-identity.md#7-deferred-roadmap):
 a server's own `202 requirement=interaction` (HITL elicitation) and AAuth Events

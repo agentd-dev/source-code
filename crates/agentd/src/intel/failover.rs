@@ -72,6 +72,14 @@ pub fn is_auth(err: &IntelError) -> bool {
     matches!(err, IntelError::Http(401 | 403, _))
 }
 
+/// HTTP statuses a **same-endpoint** retry may clear (RFC 0006 §7): a 429
+/// rate-limit or an upstream 5xx blip. Mirrors the failover-class split in
+/// [`classify`] so the two never drift — a non-transient 4xx (bad request, auth)
+/// is a caller error, identical on a re-dial, and must surface immediately.
+pub fn is_transient_status(code: u16) -> bool {
+    code == 429 || (500..600).contains(&code)
+}
+
 /// The result of one failover sweep, plus the side-channel of breaker/active
 /// transitions the caller surfaces as metrics/events (§4.3/§8) and the
 /// `agentd://intelligence` emission (§4.4).
@@ -243,6 +251,18 @@ mod tests {
         assert!(!is_auth(&io_err(io::ErrorKind::ConnectionRefused)));
     }
 
+    #[test]
+    fn transient_status_matches_the_failover_class_split() {
+        // The same-endpoint retry set (429 + all 5xx) must mirror `classify`'s
+        // failover-class HTTP codes so the two never drift.
+        for c in [429, 500, 502, 503, 504, 599] {
+            assert!(is_transient_status(c), "{c} should be transient");
+        }
+        for c in [200, 400, 401, 403, 404, 418] {
+            assert!(!is_transient_status(c), "{c} should NOT be transient");
+        }
+    }
+
     // --- Sweep integration tests over real TCP endpoints -------------------
     // A tiny single-shot HTTP server returns a fixed status (+ a canned
     // OpenAI-compatible body for 200) so the sweep dials a *real* endpoint via
@@ -260,6 +280,33 @@ mod tests {
             if let Ok((mut s, _)) = listener.accept() {
                 let mut buf = [0u8; 2048];
                 let _ = s.read(&mut buf); // drain the request
+                let body = if status == 200 {
+                    r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#
+                } else {
+                    r#"{"error":{"message":"boom"}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Bind `127.0.0.1:0` and serve one response per element of `statuses` on
+    /// successive connections — so a *same-endpoint* retry (which re-dials) walks
+    /// into the next status in the list. Returns the URI.
+    fn serve_sequence(statuses: Vec<u16>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for status in statuses {
+                let Ok((mut s, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
                 let body = if status == 200 {
                     r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#
                 } else {
@@ -373,5 +420,42 @@ mod tests {
         }
         assert!(list.all_down());
         assert!(list.attempt_order().is_empty());
+    }
+
+    #[test]
+    fn transient_5xx_is_retried_on_the_same_endpoint() {
+        // One 503 then a 200 on a SINGLE endpoint: complete_once's same-endpoint
+        // retry rides out the blip and succeeds in place — no failover, no exit 4.
+        // (This is the once-mode gap the retry closes: with no higher-level loop,
+        // the bare 503 used to propagate straight to exit 4.)
+        let ep = serve_sequence(vec![503, 200]);
+        let mut list = list_of(&[ep]);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        assert!(r.outcome.is_ok(), "same-endpoint retry cleared the 503");
+        assert_eq!(r.served_by, Some(0));
+        assert_eq!(r.failover, None, "handled in place, not failed over");
+    }
+
+    #[test]
+    fn transient_429_is_retried_then_succeeds() {
+        let ep = serve_sequence(vec![429, 200]);
+        let mut list = list_of(&[ep]);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        assert!(r.outcome.is_ok(), "429 rate-limit blip was retried");
+        assert_eq!(r.served_by, Some(0));
+    }
+
+    #[test]
+    fn non_transient_4xx_is_not_retried() {
+        // 400 then 200 on one endpoint: because a 4xx is NOT retried, the first
+        // (400) response surfaces immediately and the 200 is never consumed. If
+        // the retry wrongly fired on 4xx, this would spuriously succeed.
+        let ep = serve_sequence(vec![400, 200]);
+        let mut list = list_of(&[ep]);
+        let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
+        assert!(
+            matches!(r.outcome, Err(IntelError::Http(400, _))),
+            "4xx must surface on the first dial, not be retried"
+        );
     }
 }

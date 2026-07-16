@@ -429,22 +429,42 @@ impl Endpoint {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let start = Instant::now();
-        let mut stream = self.transport.connect(timeout)?;
-        let resp = http::send(
-            stream.as_mut(),
-            &self.host_header,
-            "POST",
-            &self.http_path,
-            &header_refs,
-            &body,
-        )?;
-        let latency = start.elapsed();
-
-        if !resp.is_success() {
+        // Same-endpoint transient retry (RFC 0006 §7: every dial is fresh, so a
+        // re-dial is safe). A 429/5xx is often a momentary provider blip; retry it
+        // a bounded number of times with short backoff BEFORE the error escapes to
+        // failover (across endpoints) or — in `once` mode, which arms no
+        // higher-level retry loop — straight to exit 4. A non-transient 4xx (bad
+        // request, auth) is a caller error, identical on a re-dial, so it surfaces
+        // immediately; retrying it would only burn the run deadline. The body +
+        // headers (incl. the AAuth signature over the body) are already built and
+        // unchanged across attempts, so re-dialing re-sends the same bytes.
+        const TRANSIENT_RETRIES: u32 = 2;
+        let mut attempt: u32 = 0;
+        let (resp, latency) = loop {
+            let start = Instant::now();
+            let mut stream = self.transport.connect(timeout)?;
+            let resp = http::send(
+                stream.as_mut(),
+                &self.host_header,
+                "POST",
+                &self.http_path,
+                &header_refs,
+                &body,
+            )?;
+            let latency = start.elapsed();
+            if resp.is_success() {
+                break (resp, latency);
+            }
+            if super::failover::is_transient_status(resp.status) && attempt < TRANSIENT_RETRIES {
+                attempt += 1;
+                // Short exponential backoff (250ms, 500ms) — enough to ride out a
+                // blip, bounded so total added wait stays well under a second.
+                std::thread::sleep(Duration::from_millis(250 * (1u64 << (attempt - 1))));
+                continue;
+            }
             let snippet: String = resp.body_str().chars().take(512).collect();
             return Err(IntelError::Http(resp.status, snippet));
-        }
+        };
 
         let mut parsed = match self.provider {
             Provider::OpenAiCompatible => openai::parse_response(&resp.body),

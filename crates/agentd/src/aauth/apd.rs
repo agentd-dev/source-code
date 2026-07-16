@@ -168,7 +168,12 @@ impl ApdClient {
         // signed request would be rejected), so we fail fast here rather than let
         // it surface as a downstream 401 storm. Opaque / non-JWT tokens parse to
         // `None` and fall back to `expires_in`.
-        let exp = inspect_agent_token(&resp.agent_token, &self.key, Some(&self.config.base_url))?;
+        let exp = inspect_agent_token(
+            &resp.agent_token,
+            &self.key,
+            Some(&self.config.base_url),
+            self.config.person_server.as_deref(),
+        )?;
         let ttl = exp
             .map(|e| Duration::from_secs(e.saturating_sub(sig::now_secs())))
             .or_else(|| resp.expires_in.map(Duration::from_secs))
@@ -251,21 +256,24 @@ fn connect(url: &Url, timeout: Duration) -> Result<Box<dyn http::Stream>, String
 }
 
 /// Best-effort read of the claims we *act on* in the (JWT) agent token: the real
-/// `exp`, the `iss` (must be the configured provider), and the `cnf.jwk`
-/// proof-of-possession binding. We do NOT verify the token signature — the
-/// downstream resource server / model gateway does that; we only react to claims
-/// we can use locally.
+/// `exp`, the `iss` (must be the configured provider), the `ps` (must be the
+/// configured person server), and the `cnf.jwk` proof-of-possession binding. We
+/// do NOT verify the token signature — the downstream resource server / model
+/// gateway does that; we only react to claims we can use locally.
 ///
 /// Returns the token `exp` (unix seconds) when present. Returns `Err` on a
-/// definite `iss` ≠ configured-provider or `cnf.jwk` ≠ signing-key mismatch —
-/// either would make every signed request fail, so surfacing it here (at fetch)
-/// beats a silent 401 storm. `expected_iss` is the provider we enrolled with;
-/// pass `None` to skip the issuer check. An opaque / non-JWT token, or one we
-/// can't parse, yields `Ok(None)` (caller falls back to `expires_in`).
+/// definite `iss` ≠ configured-provider, `ps` ≠ configured-person-server, or
+/// `cnf.jwk` ≠ signing-key mismatch — each would make a signed request fail (or
+/// route the PS exchange to the wrong server), so surfacing it here (at fetch)
+/// beats a silent downstream failure. `expected_iss` / `expected_ps` are the
+/// configured provider / person server; pass `None` to skip that check. An
+/// opaque / non-JWT token, or one we can't parse, yields `Ok(None)` (caller falls
+/// back to `expires_in`).
 fn inspect_agent_token(
     token: &str,
     key: &AgentKey,
     expected_iss: Option<&str>,
+    expected_ps: Option<&str>,
 ) -> Result<Option<u64>, String> {
     // JWT = header.payload.signature; read only the payload segment.
     let Some(payload_b64) = token.split('.').nth(1) else {
@@ -284,6 +292,16 @@ fn inspect_agent_token(
     {
         return Err(format!(
             "aauth: agent token iss {iss:?} is not the configured provider {want:?}"
+        ));
+    }
+    // ps: the protocol makes `ps` a per-agent-instance claim (§5.2.1), enrolled
+    // from our config; if the AP echoed a DIFFERENT person server, Case C would
+    // route the exchange to the wrong PS — reject it (G5).
+    if let (Some(want), Some(ps)) = (expected_ps, claims.get("ps").and_then(|v| v.as_str()))
+        && !super::discover::issuer_matches(ps, want)
+    {
+        return Err(format!(
+            "aauth: agent token ps {ps:?} is not the configured person server {want:?}"
         ));
     }
     // cnf.jwk: agentd is single-key, so the token must bind our durable key (the
@@ -317,13 +335,14 @@ mod tests {
     }
 
     const AP: Option<&str> = Some("https://ap.example");
+    const PS: Option<&str> = Some("https://ps.example");
 
     #[test]
     fn exp_is_read_from_the_token() {
         let key = test_key();
         let tok = jwt(serde_json::json!({ "exp": 1_800_000_000u64 }));
         assert_eq!(
-            inspect_agent_token(&tok, &key, AP).unwrap(),
+            inspect_agent_token(&tok, &key, AP, PS).unwrap(),
             Some(1_800_000_000)
         );
     }
@@ -333,10 +352,10 @@ mod tests {
         let key = test_key();
         // cnf.jwk == our public jwk → ok.
         let tok = jwt(serde_json::json!({ "exp": 42u64, "cnf": { "jwk": key.public_jwk() } }));
-        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), Some(42));
+        assert_eq!(inspect_agent_token(&tok, &key, AP, PS).unwrap(), Some(42));
         // no cnf at all → still ok (nothing to check).
         let tok = jwt(serde_json::json!({ "exp": 42u64 }));
-        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), Some(42));
+        assert_eq!(inspect_agent_token(&tok, &key, AP, PS).unwrap(), Some(42));
     }
 
     #[test]
@@ -344,7 +363,7 @@ mod tests {
         let key = test_key();
         let other = AgentKey::from_seed(&[1u8; 32]).unwrap();
         let tok = jwt(serde_json::json!({ "exp": 42u64, "cnf": { "jwk": other.public_jwk() } }));
-        let err = inspect_agent_token(&tok, &key, AP).unwrap_err();
+        let err = inspect_agent_token(&tok, &key, AP, PS).unwrap_err();
         assert!(err.contains("cnf.jwk"), "{err}");
     }
 
@@ -353,24 +372,41 @@ mod tests {
         let key = test_key();
         // iss == configured provider (trailing slash tolerated) → ok.
         let tok = jwt(serde_json::json!({ "exp": 42u64, "iss": "https://ap.example/" }));
-        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), Some(42));
+        assert_eq!(inspect_agent_token(&tok, &key, AP, PS).unwrap(), Some(42));
         // iss is a DIFFERENT provider → fail fast.
         let tok = jwt(serde_json::json!({ "exp": 42u64, "iss": "https://evil.example" }));
-        let err = inspect_agent_token(&tok, &key, AP).unwrap_err();
+        let err = inspect_agent_token(&tok, &key, AP, PS).unwrap_err();
         assert!(err.contains("iss"), "{err}");
         // expected_iss = None → issuer check skipped.
-        assert_eq!(inspect_agent_token(&tok, &key, None).unwrap(), Some(42));
+        assert_eq!(inspect_agent_token(&tok, &key, None, PS).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn matching_ps_passes_mismatched_ps_hard_errors() {
+        let key = test_key();
+        // ps == configured person server → ok (G5).
+        let tok = jwt(serde_json::json!({ "exp": 42u64, "ps": "https://ps.example" }));
+        assert_eq!(inspect_agent_token(&tok, &key, AP, PS).unwrap(), Some(42));
+        // ps is a DIFFERENT person server → fail fast.
+        let tok = jwt(serde_json::json!({ "exp": 42u64, "ps": "https://other-ps.example" }));
+        let err = inspect_agent_token(&tok, &key, AP, PS).unwrap_err();
+        assert!(err.contains("ps"), "{err}");
+        // no configured PS (identity-only, Case A) → ps check skipped.
+        assert_eq!(inspect_agent_token(&tok, &key, AP, None).unwrap(), Some(42));
     }
 
     #[test]
     fn opaque_or_unparseable_token_is_legacy_none() {
         let key = test_key();
         // not JWT-shaped (no dots) → None, no error.
-        assert_eq!(inspect_agent_token("opaque-token", &key, AP).unwrap(), None);
+        assert_eq!(
+            inspect_agent_token("opaque-token", &key, AP, PS).unwrap(),
+            None
+        );
         // JWT-shaped but payload isn't valid base64/JSON → None, no error.
-        assert_eq!(inspect_agent_token("a.!!!.c", &key, AP).unwrap(), None);
+        assert_eq!(inspect_agent_token("a.!!!.c", &key, AP, PS).unwrap(), None);
         // JWT with no exp claim → None (caller falls back to expires_in).
         let tok = jwt(serde_json::json!({ "sub": "aauth:x@ap" }));
-        assert_eq!(inspect_agent_token(&tok, &key, AP).unwrap(), None);
+        assert_eq!(inspect_agent_token(&tok, &key, AP, PS).unwrap(), None);
     }
 }

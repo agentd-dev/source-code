@@ -304,7 +304,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for status in statuses {
-                let Ok((mut s, _)) = listener.accept() else { break };
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
                 let mut buf = [0u8; 2048];
                 let _ = s.read(&mut buf);
                 let body = if status == 200 {

@@ -94,6 +94,21 @@ def spawn_tool_stub(tools: list[dict], workdir: Path, state_file: Path | None = 
     return proc, "http://" + addr_file.read_text().strip()
 
 
+def _run_agentd(argv: list[str], timeout_s: float, retries: int = 3) -> subprocess.CompletedProcess:
+    """Run agentd, retrying a transient intelligence failure (exit 4 = the
+    provider returned a 429/5xx) with backoff. Real benchmark runs hit occasional
+    transient API errors; a single one shouldn't fail the whole task. A genuinely
+    dead endpoint still surfaces (exit 4) after the retries. TimeoutExpired
+    propagates to the caller."""
+    cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    attempt = 0
+    while cp.returncode == 4 and attempt < retries:
+        attempt += 1
+        time.sleep(2 * attempt)
+        cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    return cp
+
+
 def _kill(proc: subprocess.Popen | None) -> None:
     if proc and proc.poll() is None:
         proc.kill()
@@ -165,9 +180,10 @@ def _grade(stdout: str, telemetry: str, task: dict, final_state: dict,
             return False, why
 
     # Outcome / state grading (τ²-bench shape): the environment must have reached
-    # the expected end-state via the agent's write-actions.
-    if "state" in g:
-        ok, why = graders.grade_state(final_state, g["state"])
+    # the expected end-state (`state`) and NOT have any forbidden action
+    # (`state_absent` — policy adherence).
+    if "state" in g or "state_absent" in g:
+        ok, why = graders.grade_env(final_state, g)
         if not ok:
             return False, why
 
@@ -229,15 +245,17 @@ def _build_user_instruction(scenario: str, history: list[tuple[str, str]]) -> st
 
 
 def _agentd_turn(agentd: str, instruction: str, intel: str, mcp_url: str | None,
-                 timeout_s: float) -> tuple[str, int, int, int, int]:
+                 timeout_s: float, model: str | None = None) -> tuple[str, int, int, int, int]:
     """One agentd `once` run (an agent OR user turn). Returns
     (reply, tokens, steps, tool_calls, exit)."""
     argv = [agentd, "--mode", "once", "--instruction", instruction,
             "--intelligence", intel, "--log-level", "info", "--log-content"]
+    if model:
+        argv += ["--model", model]
     if mcp_url:
         argv += ["--mcp", f"env={mcp_url}"]
     try:
-        cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        cp = _run_agentd(argv, timeout_s)
     except subprocess.TimeoutExpired:
         return "", 0, 0, 0, -1
     tokens, steps = _extract_usage(cp.stderr)
@@ -261,15 +279,18 @@ def run_conversation_once(agentd: str, task: dict, timeout_s: float) -> RunResul
         stub, stub_url = spawn_tool_stub(ts["tools"], workdir, state_file)
 
         # Resolve the agent + user model endpoints (mock offline, or real).
+        agent_model = user_model = None
         if "mock_llm" in task:
             agent_llm, agent_intel = spawn_mock_llm(agentd, task["mock_llm"], workdir, "agent")
         else:
             agent_intel = task["intelligence"]
+            agent_model = task.get("model")
         us = task["user_simulator"]
         if "mock_llm" in us:
             user_llm, user_intel = spawn_mock_llm(agentd, us["mock_llm"], workdir, "user")
         else:
             user_intel = us["intelligence"]
+            user_model = us.get("model")
 
         policy = task.get("policy", "")
         scenario = us.get("scenario", "")
@@ -280,14 +301,14 @@ def run_conversation_once(agentd: str, task: dict, timeout_s: float) -> RunResul
             for turn in range(max_turns):
                 reply, tk, st, tl, code = _agentd_turn(
                     agentd, _build_agent_instruction(policy, history), agent_intel,
-                    stub_url, timeout_s)
+                    stub_url, timeout_s, agent_model)
                 tokens += tk; steps += st; tools += tl
                 history.append(("assistant", reply))
                 if code != 0 or _is_stop(reply) or turn == max_turns - 1:
                     break
                 umsg, utk, _, _, ucode = _agentd_turn(
                     agentd, _build_user_instruction(scenario, history), user_intel,
-                    None, timeout_s)
+                    None, timeout_s, user_model)
                 tokens += utk
                 if ucode != 0 or _is_stop(umsg):
                     break
@@ -302,10 +323,7 @@ def run_conversation_once(agentd: str, task: dict, timeout_s: float) -> RunResul
             pass
 
     wall = time.time() - start
-    g = task.get("grade", {})
-    passed, why = (True, "ok")
-    if "state" in g:
-        passed, why = graders.grade_state(final_state, g["state"])
+    passed, why = graders.grade_env(final_state, task.get("grade", {}))
     return RunResult(passed, 0, round(wall, 3), tokens, steps, tools, True, why)
 
 
@@ -385,7 +403,7 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
 
         start = time.time()
         try:
-            cp = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+            cp = _run_agentd(argv, timeout_s)
             wall = time.time() - start
             final_state = {}
             if state_file is not None and state_file.exists():

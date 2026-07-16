@@ -465,6 +465,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=60.0, help="per-run wall-clock cap (s)")
     ap.add_argument("--config", default="once", help="label for this harness config (stamped)")
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent / "scorecard.json"))
+    ap.add_argument("--gate", action="store_true",
+                    help="exit non-zero unless pass@1 is 100%% (for offline smoke gating; "
+                         "a real benchmark run exits 0 — its accuracy is data, not a gate)")
     args = ap.parse_args()
 
     if not Path(args.agentd).exists():
@@ -525,7 +528,9 @@ def main() -> int:
     Path(args.out).write_text(json.dumps(scorecard, indent=2) + "\n")
     print(f"scorecard -> {args.out}")
 
-    return 0 if p1 == 1.0 else 1
+    # A completed benchmark run is a success — its pass rate is the result, not a
+    # pass/fail gate. `--gate` opts into the strict behavior for offline smokes.
+    return 1 if (args.gate and p1 < 1.0) else 0
 
 
 if __name__ == "__main__":

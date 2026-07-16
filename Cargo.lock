@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentd-cli"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "agentd-core",
  "libc",
@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-conformance"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "libc",
  "serde_json",
@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-core"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "agentd-mcp",
  "agentd-net",

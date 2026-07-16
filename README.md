@@ -94,15 +94,15 @@ transport and spawns no tool processes.
 **Release binaries** (static musl, amd64 + arm64, with `SHA256SUMS`):
 
 ```console
-$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v1.3.0/agentd-v1.3.0-x86_64-unknown-linux-musl.tar.gz
-$ tar xzf agentd-v1.3.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
-agentd 1.3.0
+$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v1.4.0/agentd-v1.4.0-x86_64-unknown-linux-musl.tar.gz
+$ tar xzf agentd-v1.4.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
+agentd 1.4.0
 ```
 
 **Container image** (multi-arch, cosign-signed, single layer, ~1.2 MiB pull):
 
 ```console
-$ docker run --rm ghcr.io/agentd-dev/agentd:1.3.0 --capabilities
+$ docker run --rm ghcr.io/agentd-dev/agentd:1.4.0 --capabilities
 ```
 
 **From source** (Rust stable; no C toolchain needed):
@@ -424,7 +424,7 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
 - **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: shell
   one-liners, Docker Compose, Kubernetes `Job`/`CronJob`/`Deployment`
   manifests, a systemd unit.
-- **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.3.0 current).
+- **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.4.0 current).
 - **Website:** [agentd.dev](https://agentd.dev) — rendered docs + RFCs.
 
 ## License

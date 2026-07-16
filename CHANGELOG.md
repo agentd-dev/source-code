@@ -5,6 +5,53 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.4.0 — OpenAI-compatibility fixes + AAuth provider/token validation
+
+Real-provider hardening. Proving the eval harness (RFC 0024) against live OpenAI
+surfaced three genuine compatibility bugs in the intelligence dial — all fixed —
+and the AAuth agent-identity client gained the provider/token validation the
+protocol calls for. The stock binary's behavior is otherwise unchanged; crates
+step to `agentd` / `agentd-cli` **1.4.0** (library crates `agentd-mcp` /
+`agentd-net` stay **0.3.0** — unchanged).
+
+### Fixed (intelligence dial — OpenAI/Anthropic compatibility)
+
+- **Dotted tool names are sanitized on the wire.** OpenAI/Anthropic reject tool
+  names that aren't `^[a-zA-Z0-9_-]+$`, but agentd uses namespaced names
+  (`resource.read`, `subagent.spawn`). Each name is now made wire-safe on the
+  outbound request (in the tool defs *and* the assistant message-history
+  `tool_calls`) and reverse-mapped on the response, so tool-calling against real
+  OpenAI works and routing is unaffected. No-op when every name is already legal.
+- **Reasoning models use `max_completion_tokens`.** gpt-5 / o-series reject
+  `max_tokens`; the request now selects the correct token-limit parameter by
+  model, so those models produce tool calls instead of an HTTP 400.
+- **Transient `429`/`5xx` are retried before failing.** `complete_once` now
+  retries a momentary provider blip on the same endpoint (bounded, short
+  backoff) before the error propagates. Previously, `once` mode — which arms no
+  higher-level retry loop — surfaced a single transient error as an immediate
+  exit 4. A non-transient `4xx` (bad request, auth) still surfaces immediately.
+
+### Added (AAuth [DRAFT], RFC 0023 §7.1 — `--features aauth`)
+
+- **Agent-Provider metadata discovery + issuer validation.** At startup agentd
+  fetches `/.well-known/aauth-agent.json` and enforces the AAuth protocol's
+  anti-host-poisoning rule (a document whose `issuer` ≠ the configured provider
+  aborts enrollment). Best-effort: a provider that publishes no document works.
+- **Agent-token claim validation.** The agent token is acted on rather than held
+  opaque: agentd refreshes against the token's own `exp`, and fails fast if the
+  token's `iss` isn't the configured provider, its `ps` isn't the configured
+  Person Server, or its `cnf.jwk` isn't the signing key — each a misconfiguration
+  that would otherwise be a silent wall of downstream `401`s.
+
+### Tooling
+
+- **Evaluation harness (RFC 0024, `bench/`).** A dependency-free (stdlib) rig
+  that drives the real binary per task and grades it: BFCL tool-calling with a
+  faithful AST value-matcher, a τ²-bench-style simulated-user conversation loop,
+  an execution-graded coding suite, a sandboxed shell/file environment, and a
+  workflow-lift ablation — plus a model×benchmark matrix, run live against
+  OpenAI. Not part of the shipped binary.
+
 ## v1.3.0 — library split, code-registered tools, AAuth agent identity & lifetime budgets (RFC 0022/0023/0025)
 
 agentd is now consumable as a **library**. The workspace splits into four

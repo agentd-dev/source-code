@@ -234,9 +234,16 @@ wiring a *workload* agent needs. The applicable gaps, with disposition:
   fast if `cnf.jwk` ≠ the signing key (a mismatch would otherwise be a silent
   downstream 401 storm). Backward-compatible: a non-JWT/opaque token falls back
   to `expires_in`.
-- **G1 — AP metadata discovery** (deferred): `/enroll` and `/agent-token` paths
-  are hardcoded; discover them (and the AP JWKS) from a provider metadata
-  document if/when a real AP advertises one. Interop hardening.
+- **G1 — AP metadata discovery + issuer validation** (**DONE**): at prime,
+  `discover::fetch_agent_provider` fetches `/.well-known/aauth-agent.json`
+  (protocol §12.10.1) and enforces the §12.10 anti-host-poisoning rule — a served
+  document whose `issuer` ≠ the configured provider aborts startup. The verified
+  issuer is then enforced per token: `inspect_agent_token` fails fast if the
+  agent token's `iss` isn't the configured provider (ties the token to the AP we
+  enrolled with). Best-effort: an AP that publishes no document still works. Note
+  the enroll/token *endpoints* are deliberately NOT discovered — the protocol
+  keeps them out of metadata (informational bootstrap conventions), so the
+  hardcoded `/enroll` + `/agent-token` paths are correct.
 - **G5 — Per-Person-Server token targeting** (deferred): the `ps` claim is fixed
   at enroll; the draft issues per-PS tokens with `ps` on the issuance call. Only
   matters once one agent serves multiple Person-Servers.

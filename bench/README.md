@@ -390,3 +390,30 @@ Bigger, cleaner numbers are now a matter of more tasks, not more plumbing.
   cost-adjusted (accuracy × cost), to map *where* decomposition pays off
   (above). Next: workflow+durability (checkpointer) for pass^k, and running the
   ablation on decomposable real-model tasks (GAIA-L3, τ²).
+
+## Backlog — more benchmark shapes
+
+The harness proves each *shape*; the backlog is breadth (more real datasets under
+the shapes we already run) plus a few genuinely new shapes. Roughly in priority
+order:
+
+- **Real BFCL categories at scale** — run the full `simple`/`multiple`/`parallel`
+  splits (hundreds of tasks, not 25-task slices) for stable rankings, and add the
+  categories the converter skips today: `irrelevance`/`relevance` (should the
+  agent call *any* tool?), `multi_turn`, and the Java/JavaScript function splits.
+- **τ²-bench proper** — the real `airline`/`retail`/`telecom` domains and policies
+  (we ship a hand-written retail stub); wire the official task files + user-goals
+  into the simulated-user loop.
+- **SWE-bench-Verified** — a real `repo@commit` + failing test seeded into the
+  shell/file sandbox, graded by the project's own test command; add the
+  mini-swe-agent baseline for a reference number.
+- **GAIA** — web/file multi-step tasks (needs a web/file bridge tool-server);
+  good fodder for the workflow-lift ablation (GAIA-L3 is decomposable).
+- **MCP-Universe / real MCP servers** — point the runner at live MCP servers
+  (not just the stub bridge) to grade against real tool surfaces.
+- **Terminal-Bench** — longer shell-task episodes over the existing `bash`
+  builtin, command-graded.
+- **Reliability shape** — pass^k at higher k (k≥5) with the durability
+  checkpointer, to separate flaky-but-capable from reliably-correct.
+
+Tracked as an open item (2026-07-16): "add other benchmark tests."

@@ -42,6 +42,70 @@ def _norm(v):
     return s
 
 
+# BFCL's `standardize_string`: strip the punctuation/whitespace the leaderboard
+# treats as insignificant, lowercase, and canonicalize quotes. This is what makes
+# the AST checker case- and formatting-agnostic ("New York" ≡ "new_york" ≡
+# "newyork"), so a model isn't marked wrong for cosmetic string differences.
+_STD_RE = re.compile(r"[ ,./\-_*^]")
+
+
+def _std(s: str) -> str:
+    return _STD_RE.sub("", s).lower().replace("'", '"')
+
+
+def _as_num(x):
+    """Return x as a float for numeric comparison, or None if it isn't a plain
+    number. Booleans are NOT numbers here (True != 1) so bool stays exact."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    return None
+
+
+def _deep_eq(actual, cand) -> bool:
+    """Faithful BFCL AST value comparison of a concrete model value against ONE
+    concrete acceptable value (the possible-answer alternatives are peeled off by
+    `_arg_matches` before this is called). Mirrors BFCL's checkers:
+      * numbers — int/float auto-convert (5 ≡ 5.0), bools stay exact;
+      * strings — `standardize_string` equality, with the calculus `_norm` as an
+        extra accepted form (`2x^2` ≡ `2x**2`);
+      * lists/tuples — order-sensitive, element-wise, recursive (tuple ≡ list);
+      * dicts — recursive; model keys must be expected, and every expected key
+        must be present unless its value marks it optional (`""`)."""
+    na, nc = _as_num(actual), _as_num(cand)
+    if na is not None and nc is not None:
+        return na == nc
+    # Booleans are type-strict: `True` matches only a boolean `True`, never the
+    # number 1 (Python's `True == 1` would otherwise leak through).
+    if isinstance(cand, bool) or isinstance(actual, bool):
+        return isinstance(cand, bool) and isinstance(actual, bool) and actual == cand
+    if cand is None or actual is None:
+        return actual == cand
+    if isinstance(cand, str) and isinstance(actual, str):
+        return _std(actual) == _std(cand) or _norm(actual) == _norm(cand)
+    if isinstance(cand, (list, tuple)) and isinstance(actual, (list, tuple)):
+        a, c = list(actual), list(cand)
+        return len(a) == len(c) and all(_deep_eq(x, y) for x, y in zip(a, c))
+    if isinstance(cand, dict) and isinstance(actual, dict):
+        if any(k not in cand for k in actual):          # model emitted an unexpected key
+            return False
+        for k, v in cand.items():
+            optional = v == "" or (isinstance(v, list) and "" in v)
+            if k not in actual:
+                if optional:
+                    continue
+                return False
+            # a nested value may itself carry scalar alternatives (BFCL lists)
+            if isinstance(v, list) and all(not isinstance(e, (list, dict)) for e in v):
+                if not any(_deep_eq(actual[k], e) for e in v if e != ""):
+                    return False
+            elif not _deep_eq(actual[k], v):
+                return False
+        return True
+    return actual == cand
+
+
 def extract_tool_calls(telemetry: str) -> list[dict]:
     """Parse every `tool.call` event -> [{"name", "args"}]. `args` needs the run
     to pass `--log-content` (else it is absent and treated as {})."""
@@ -67,12 +131,12 @@ def extract_tool_calls(telemetry: str) -> list[dict]:
 
 
 def _arg_matches(actual, accepted) -> bool:
+    """Does the model's arg value match any BFCL-acceptable value? `accepted` is
+    the possible-answer list of alternatives (a lone value is wrapped). Each is
+    compared with the faithful BFCL AST rules (`_deep_eq`): standardized strings,
+    int/float coercion, order-sensitive lists, recursive dicts."""
     accept = accepted if isinstance(accepted, list) else [accepted]
-    if actual in accept:
-        return True
-    # Lenient fallback: normalize function-string forms (`2x^2`≡`2x**2`, lambdas).
-    na = _norm(actual)
-    return any(_norm(a) == na for a in accept)
+    return any(_deep_eq(actual, cand) for cand in accept)
 
 
 def _call_matches(call: dict, expected: dict) -> bool:
@@ -203,6 +267,31 @@ def _selftest() -> None:
     # but a genuinely different expression still fails (no false positive)
     ok, _ = grade_tool_calls(ftele, {"name": "deriv", "args": {"f": ["3x**2"]}})
     assert not ok
+
+    # --- faithful BFCL AST value matching (the fidelity upgrade) ----------------
+    # string standardization: case + the punctuation/whitespace BFCL ignores.
+    stele = '{"event":"tool.call","tool":"f","args":"{\\"city\\":\\"New York\\"}"}\n'
+    for gt in ("new york", "new_york", "New-York", "newyork"):
+        ok, _ = grade_tool_calls(stele, {"name": "f", "args": {"city": [gt]}})
+        assert ok, gt
+    ok, _ = grade_tool_calls(stele, {"name": "f", "args": {"city": ["Boston"]}})
+    assert not ok                                    # a different string still fails
+    # int/float auto-conversion (5 ≡ 5.0), but bools stay exact (True ≢ 1).
+    ntele = '{"event":"tool.call","tool":"f","args":"{\\"n\\":5,\\"flag\\":true}"}\n'
+    ok, _ = grade_tool_calls(ntele, {"name": "f", "args": {"n": [5.0]}})
+    assert ok
+    ok, _ = grade_tool_calls(ntele, {"name": "f", "args": {"flag": [1]}})
+    assert not ok                                    # bool is not the number 1
+    # lists: order-sensitive, element-wise, with standardized string elements.
+    ltele2 = '{"event":"tool.call","tool":"f","args":"{\\"xs\\":[\\"Red\\",\\"Blue\\"]}"}\n'
+    ok, _ = grade_tool_calls(ltele2, {"name": "f", "args": {"xs": [["red", "blue"]]}})
+    assert ok
+    ok, _ = grade_tool_calls(ltele2, {"name": "f", "args": {"xs": [["blue", "red"]]}})
+    assert not ok                                    # order matters (BFCL AST)
+    # nested dict: recursive, and an unexpected key fails.
+    dtele = '{"event":"tool.call","tool":"f","args":"{\\"loc\\":{\\"city\\":\\"Paris\\"}}"}\n'
+    ok, _ = grade_tool_calls(dtele, {"name": "f", "args": {"loc": [{"city": ["paris"]}]}})
+    assert ok
 
     # outcome / state grading (τ²-bench shape)
     final = {"orders": {"o1": {"status": "cancelled", "total": 42}}, "log": ["a", "b"]}

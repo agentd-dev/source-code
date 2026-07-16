@@ -464,6 +464,9 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=1, help="runs per task (k for pass^k)")
     ap.add_argument("--timeout", type=float, default=60.0, help="per-run wall-clock cap (s)")
     ap.add_argument("--config", default="once", help="label for this harness config (stamped)")
+    ap.add_argument("--intelligence", default=None,
+                    help="default model endpoint for tasks that don't carry one (model-agnostic suites)")
+    ap.add_argument("--model", default=None, help="default model id for tasks that don't carry one")
     ap.add_argument("--out", default=str(Path(__file__).resolve().parent / "scorecard.json"))
     ap.add_argument("--gate", action="store_true",
                     help="exit non-zero unless pass@1 is 100%% (for offline smoke gating; "
@@ -477,6 +480,13 @@ def main() -> int:
 
     tasks = [json.loads(line) for line in Path(args.tasks).read_text().splitlines()
              if line.strip() and not line.lstrip().startswith("//")]
+    # Fill model endpoint defaults so a suite can be authored model-agnostic and
+    # run against any model with --intelligence/--model (mock tasks keep theirs).
+    for t in tasks:
+        if args.intelligence and "mock_llm" not in t:
+            t.setdefault("intelligence", args.intelligence)
+        if args.model and "mock_llm" not in t:
+            t.setdefault("model", args.model)
 
     print(f"agentd: {args.agentd}")
     print(f"version: {agentd_version(args.agentd)}")

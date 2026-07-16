@@ -23,6 +23,23 @@ Dependency-free (Python 3 stdlib).
 from __future__ import annotations
 
 import json
+import re
+
+
+def _norm(v):
+    """Normalize a value for lenient comparison. For strings this canonicalizes
+    the function-expression forms BFCL uses interchangeably — `x^2`≡`x**2`, an
+    optional `lambda x:` prefix, and incidental whitespace — so a model that
+    echoes the prompt's `2x^2` matches a ground truth of `2x**2`. Not the full
+    BFCL AST checker, but it closes the common function-string gap; numbers are
+    left to Python equality (1 == 1.0)."""
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    s = re.sub(r"^lambda\s+\w+\s*:\s*", "", s)   # drop a lambda prefix
+    s = s.replace("^", "**")                      # math power notation
+    s = re.sub(r"\s+", "", s)                      # incidental whitespace
+    return s
 
 
 def extract_tool_calls(telemetry: str) -> list[dict]:
@@ -51,7 +68,11 @@ def extract_tool_calls(telemetry: str) -> list[dict]:
 
 def _arg_matches(actual, accepted) -> bool:
     accept = accepted if isinstance(accepted, list) else [accepted]
-    return actual in accept
+    if actual in accept:
+        return True
+    # Lenient fallback: normalize function-string forms (`2x^2`≡`2x**2`, lambdas).
+    na = _norm(actual)
+    return any(_norm(a) == na for a in accept)
 
 
 def _call_matches(call: dict, expected: dict) -> bool:
@@ -136,6 +157,18 @@ def _selftest() -> None:
     ok, _ = grade_tool_calls(tele2, {"all": [{"name": "get_weather"}, {"name": "send"}]})
     assert ok
     ok, _ = grade_tool_calls(tele, {"all": [{"name": "get_weather"}, {"name": "send"}]})
+    assert not ok
+
+    # function-string normalization (BFCL calculus args): 2x^2 matches 2x**2, and
+    # a lambda form matches its bare expression.
+    ftele = '{"event":"tool.call","tool":"deriv","args":"{\\"f\\":\\"2x^2\\"}"}\n'
+    ok, _ = grade_tool_calls(ftele, {"name": "deriv", "args": {"f": ["2x**2", "lambda x: 2x**2"]}})
+    assert ok
+    ltele = '{"event":"tool.call","tool":"deriv","args":"{\\"f\\":\\"lambda x: x**3\\"}"}\n'
+    ok, _ = grade_tool_calls(ltele, {"name": "deriv", "args": {"f": ["x**3"]}})
+    assert ok
+    # but a genuinely different expression still fails (no false positive)
+    ok, _ = grade_tool_calls(ftele, {"name": "deriv", "args": {"f": ["3x**2"]}})
     assert not ok
 
     # outcome / state grading (τ²-bench shape)

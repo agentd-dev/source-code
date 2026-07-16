@@ -6,6 +6,7 @@
 //!
 //! Dependency-free beyond the in-house HTTP client + `ring` (via [`super::key`]).
 
+use super::b64;
 use super::key::AgentKey;
 use super::sig::{self, SigKey};
 use crate::net::http::{self, Url};
@@ -150,9 +151,16 @@ impl ApdClient {
         if let Some(agent) = resp.agent {
             *self.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent);
         }
-        let ttl = resp
-            .expires_in
-            .map(Duration::from_secs)
+        // Act on the token's own claims (RFC 0023 §7.1 G4): the agent token is a
+        // JWT, so its `exp` is the authoritative refresh deadline (the AP may omit
+        // or disagree with `expires_in`), and its `cnf.jwk` MUST be our signing
+        // key — a mismatch is fatal (every signed request would be rejected), so
+        // we fail fast here rather than let it surface as a downstream 401 storm.
+        // Opaque / non-JWT tokens parse to `None` and fall back to `expires_in`.
+        let exp = inspect_agent_token(&resp.agent_token, &self.key)?;
+        let ttl = exp
+            .map(|e| Duration::from_secs(e.saturating_sub(sig::now_secs())))
+            .or_else(|| resp.expires_in.map(Duration::from_secs))
             .unwrap_or(DEFAULT_TTL);
         Ok(Cached {
             token: resp.agent_token,
@@ -228,5 +236,99 @@ fn connect(url: &Url, timeout: Duration) -> Result<Box<dyn http::Stream>, String
         }
     } else {
         Ok(Box::new(tcp))
+    }
+}
+
+/// Best-effort read of the claims we *act on* in the (JWT) agent token: the real
+/// `exp` and the `cnf.jwk` proof-of-possession binding. We do NOT verify the
+/// token signature — the downstream resource server / model gateway does that;
+/// we only react to claims we can use locally.
+///
+/// Returns the token `exp` (unix seconds) when present. Returns `Err` only on a
+/// definite `cnf.jwk` ≠ signing-key mismatch — which would make every signed
+/// request fail, so surfacing it here (at fetch) beats a silent 401 storm.
+/// An opaque / non-JWT token, or one we can't parse, yields `Ok(None)` and is
+/// treated exactly as before (caller falls back to `expires_in`).
+fn inspect_agent_token(token: &str, key: &AgentKey) -> Result<Option<u64>, String> {
+    // JWT = header.payload.signature; read only the payload segment.
+    let Some(payload_b64) = token.split('.').nth(1) else {
+        return Ok(None); // not JWT-shaped → opaque token, keep legacy behavior
+    };
+    let Ok(bytes) = b64::url_decode(payload_b64) else {
+        return Ok(None);
+    };
+    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    // cnf.jwk: agentd is single-key, so the token must bind our durable key (the
+    // one we present + sign with). A mismatch never works — fail fast.
+    if let Some(cnf) = claims.get("cnf").and_then(|c| c.get("jwk")) {
+        let ours = key.public_jwk();
+        let matches = ["kty", "crv", "x"]
+            .iter()
+            .all(|f| cnf.get(*f) == ours.get(*f));
+        if !matches {
+            return Err("aauth: agent token cnf.jwk does not match the signing key".into());
+        }
+    }
+    Ok(claims.get("exp").and_then(|e| e.as_u64()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a JWT-shaped `header.payload.sig` string whose payload is `claims`.
+    /// The header + signature are dummies — `inspect_agent_token` reads only the
+    /// payload and never verifies the signature.
+    fn jwt(claims: serde_json::Value) -> String {
+        let payload = b64::url_nopad(serde_json::to_vec(&claims).unwrap().as_slice());
+        format!("e30.{payload}.sig") // header "e30" = {}
+    }
+
+    fn test_key() -> AgentKey {
+        AgentKey::from_seed(&[9u8; 32]).unwrap()
+    }
+
+    #[test]
+    fn exp_is_read_from_the_token() {
+        let key = test_key();
+        let tok = jwt(serde_json::json!({ "exp": 1_800_000_000u64 }));
+        assert_eq!(
+            inspect_agent_token(&tok, &key).unwrap(),
+            Some(1_800_000_000)
+        );
+    }
+
+    #[test]
+    fn matching_cnf_passes_and_absent_cnf_is_fine() {
+        let key = test_key();
+        // cnf.jwk == our public jwk → ok.
+        let tok = jwt(serde_json::json!({ "exp": 42u64, "cnf": { "jwk": key.public_jwk() } }));
+        assert_eq!(inspect_agent_token(&tok, &key).unwrap(), Some(42));
+        // no cnf at all → still ok (nothing to check).
+        let tok = jwt(serde_json::json!({ "exp": 42u64 }));
+        assert_eq!(inspect_agent_token(&tok, &key).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn mismatched_cnf_is_a_hard_error() {
+        let key = test_key();
+        let other = AgentKey::from_seed(&[1u8; 32]).unwrap();
+        let tok = jwt(serde_json::json!({ "exp": 42u64, "cnf": { "jwk": other.public_jwk() } }));
+        let err = inspect_agent_token(&tok, &key).unwrap_err();
+        assert!(err.contains("cnf.jwk"), "{err}");
+    }
+
+    #[test]
+    fn opaque_or_unparseable_token_is_legacy_none() {
+        let key = test_key();
+        // not JWT-shaped (no dots) → None, no error.
+        assert_eq!(inspect_agent_token("opaque-token", &key).unwrap(), None);
+        // JWT-shaped but payload isn't valid base64/JSON → None, no error.
+        assert_eq!(inspect_agent_token("a.!!!.c", &key).unwrap(), None);
+        // JWT with no exp claim → None (caller falls back to expires_in).
+        let tok = jwt(serde_json::json!({ "sub": "aauth:x@ap" }));
+        assert_eq!(inspect_agent_token(&tok, &key).unwrap(), None);
     }
 }

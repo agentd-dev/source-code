@@ -15,7 +15,7 @@ import React, {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { Box, Text, useApp, useInput, useStdin } from 'ink';
+import { Box, Text, useApp, useInput, useStdin, useWindowSize } from 'ink';
 import TextInput from 'ink-text-input';
 import {
   AgentdClient,
@@ -43,6 +43,12 @@ export interface AppProps {
   bearer?: string;
   /** Ask for the debug screen up front (still gated by the daemon). */
   debug?: boolean;
+  /**
+   * Fullscreen (the alternate screen) — the default. The app then owns the
+   * scroll, because the alternate screen has no scrollback of its own.
+   * `--inline` turns this off and hands history back to the terminal.
+   */
+  fullscreen?: boolean;
   /** Injection seam for tests. */
   client?: AgentdClient;
   mirror?: Mirror;
@@ -68,7 +74,11 @@ export function App(props: AppProps): React.JSX.Element {
   useSyncExternalStore(mirror.subscribe, mirror.getVersion);
   const s = mirror.getState();
 
+  const fullscreen = props.fullscreen !== false && isRawModeSupported;
+  const { rows, columns } = useWindowSize();
   const [screen, setScreen] = useState<Screen>(props.debug ? 'debug' : 'chat');
+  /** Entries hidden below the viewport (0 = following the live end). */
+  const [scroll, setScroll] = useState(0);
   const [input, setInput] = useState('');
   const [selected, setSelected] = useState(0);
   const [sugIndex, setSugIndex] = useState(0);
@@ -100,6 +110,15 @@ export function App(props: AppProps): React.JSX.Element {
 
   useEffect(() => setSugIndex(0), [input]);
 
+  // Scrolled up? New entries must not yank the view — hold position by
+  // counting them into the offset. At the bottom (offset 0) we follow.
+  const lastLen = useRef(s.transcript.length);
+  useEffect(() => {
+    const grew = s.transcript.length - lastLen.current;
+    lastLen.current = s.transcript.length;
+    if (grew > 0 && scroll > 0) setScroll((o) => o + grew);
+  }, [s.transcript.length, scroll]);
+
   // The debug log tail: poll the ring (cursored) while the pane is visible.
   useEffect(() => {
     if (screen !== 'debug' || !s.info?.debug) return;
@@ -130,6 +149,17 @@ export function App(props: AppProps): React.JSX.Element {
     const gate = active.find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED');
     inputTaskRef.current = gate?.id;
   });
+
+  // Rows the body may use: the terminal minus the chrome (top edge, composer,
+  // suggestions, bottom edge — which wraps on narrow terminals).
+  const bodyRows = Math.max(
+    3,
+    rows -
+      (3 +
+        (suggestions.length > 0 ? 1 : 0) +
+        // The bottom edge wraps to a second line only on a narrow terminal.
+        (columns < 100 && (s.info?.display?.bottom?.length ?? 8) > 6 ? 1 : 0)),
+  );
 
   const submit = useCallback(
     async (raw: string) => {
@@ -360,6 +390,18 @@ export function App(props: AppProps): React.JSX.Element {
           return;
         }
       }
+      // Scrolling the transcript (fullscreen owns its own scrollback).
+      if (screen === 'chat' && fullscreen) {
+        const page = Math.max(1, Math.floor(bodyRows / 2));
+        if (key.pageUp) {
+          setScroll((o) => Math.min(Math.max(0, s.transcript.length - 1), o + page));
+          return;
+        }
+        if (key.pageDown) {
+          setScroll((o) => Math.max(0, o - page));
+          return;
+        }
+      }
       if (key.tab) {
         setScreen((cur) => {
           const order: Screen[] = s.info?.debug
@@ -442,10 +484,14 @@ export function App(props: AppProps): React.JSX.Element {
       : null;
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" height={fullscreen ? rows : undefined}>
       <Edge items={top} ctx={chrome} />
       {screen === 'chat' ? (
-        <Transcript entries={s.transcript} working={workingRow} />
+        <Transcript
+          entries={s.transcript}
+          working={workingRow}
+          viewport={fullscreen ? { rows: bodyRows, columns, offset: scroll } : undefined}
+        />
       ) : screen === 'tasks' ? (
         <TaskList tasks={mirror.allTasks()} selected={selected} />
       ) : screen === 'subagents' ? (

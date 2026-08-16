@@ -64,8 +64,8 @@ agentd-ui  --endpoint http://127.0.0.1:8420 --open   # a local web UI
 ```
 
 - `agentd-tui` flags: `--endpoint` (or `AGENTD_ENDPOINT`), `--bearer` (or
-  `AGENTD_BEARER`), `--debug` (open on the debug screen), `--insecure`
-  (self-signed dev TLS).
+  `AGENTD_BEARER`), `--code` (pairing login, §4.3), `--debug` (open on the
+  debug screen), `--inline` (§3.1), `--insecure` (self-signed dev TLS).
 - `agentd-ui` serves the built web app on `127.0.0.1:4173` (`--port`) with the
   endpoint pre-filled; `--open` launches the browser. The page also takes
   `?endpoint=…` and remembers your last connection.
@@ -83,6 +83,22 @@ agentd-ui  --endpoint http://127.0.0.1:8420 --open   # a local web UI
 - Connecting to a **remote** daemon is the same `--endpoint https://…` plus its
   bearer; everything a client can see or do is decided by the daemon's
   principal rules, not by the client.
+
+### 3.1 Fullscreen (default) vs `--inline`
+
+The TUI takes over the terminal — the **alternate screen**, like `vim` or
+`htop` — so the layout is stable and your shell is restored untouched when you
+quit. Since the alternate screen has no scrollback of its own, the client
+owns it: **PgUp / PgDn** scroll the conversation, and a hint shows how many
+messages are above the fold. New messages follow the live end unless you have
+scrolled up, in which case your position holds until you PgDn back to the
+bottom.
+
+`agentd-tui --inline` (or `AGENTD_TUI_INLINE=1`) renders into the normal
+buffer instead: settled messages go into your terminal's **real scrollback**
+and stay there after you quit — handy for copying a session, piping, or
+keeping the transcript in your shell history. A non-interactive run (a pipe,
+CI) degrades to inline automatically.
 
 ## 4. What you can do
 

@@ -154,10 +154,14 @@ Not bundled into agentd; the Rust dependency moat is untouched.
   tasks kept off the conversation), and the **Observation** driver
   (bootstrap `status`+`ListTasks` → feed with cursor resume/reconnect →
   automatic poll fallback against a daemon without the surface).
-- **`@agentd/tui`** (bin `agentd-tui`) — Ink. Chat (transcript in `<Static>`,
-  one dynamic working row), Tasks, Debug (feed tail, runs, subagents/children,
-  log tail) — debug panes render only when the daemon says `debug: true`.
-  Degrades to a read-only live view without an interactive terminal.
+- **`@agentd/tui`** (bin `agentd-tui`) — Ink. Chat, Tasks, Subagents, Debug —
+  debug panes render only when the daemon says `debug: true`. **Fullscreen
+  (alternate screen) by default**: the client owns the scroll (PgUp/PgDn over
+  a bottom-anchored viewport, follow-the-tail unless scrolled up) because that
+  buffer has no scrollback; `--inline` renders into the normal buffer instead,
+  where settled rows ride `<Static>` into the terminal's own scrollback and
+  survive quitting. Degrades to a read-only inline view without an interactive
+  terminal.
 - **`@agentd/ui`** (bin `agentd-ui`) — the web UI in the format of the TUI
   (dark-terminal identity), same Mirror, statically hostable `dist/`;
   `agentd-ui` serves it locally with an injected endpoint and `--open`.

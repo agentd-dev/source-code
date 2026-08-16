@@ -7,6 +7,18 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Changed (TUI renders fullscreen by default)
+
+- `agentd-tui` now takes over the terminal (the **alternate screen**), so the
+  layout is stable and the shell is restored on exit. Because that buffer has
+  no scrollback, the client owns it: **PgUp/PgDn** scroll a bottom-anchored
+  transcript viewport, a hint reports what is above the fold, and new messages
+  follow the tail unless you have scrolled up (then your position holds).
+- **`--inline`** (or `AGENTD_TUI_INLINE=1`) keeps the previous behavior —
+  settled rows ride Ink's `<Static>` into the terminal's real scrollback and
+  survive quitting. Non-interactive runs (pipes, CI) degrade to inline
+  automatically (Ink gates the alternate screen behind an interactive TTY).
+
 ### Added (live activity — RFC 0032 §17)
 
 - **The working row now says what the agent is doing**: `thinking · 12s ·

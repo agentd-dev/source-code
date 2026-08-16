@@ -805,6 +805,101 @@ fn a_live_subagent_is_observable_and_drillable() {
 }
 
 #[test]
+fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
+    // A turn that calls a tool then answers: the feed must carry `activity`
+    // events naming the phase and the TOOL, with tokens accruing — the data
+    // behind the clients' working row (RFC 0032 §17).
+    let llm = spawn_mock_llm(&json!({
+        "turns": [
+            {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
+            {"content": "Stored it."}
+        ]
+    }));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&iface_config(&llm.uri, port, false, ""));
+    let _daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    // Attach FIRST so the activity events stream as they happen.
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&frames);
+    let addr2 = addr.clone();
+    std::thread::spawn(move || subscribe_events(&addr2, 0, sink));
+    wait_for(&frames, 5, |f| f.iter().any(|v| v.get("hello").is_some()));
+
+    let sent = rpc(
+        &addr,
+        1,
+        "SendMessage",
+        json!({"message": {"messageId": "m1", "parts": [{"text": "Remember k=1"}]}}),
+    );
+    assert_eq!(
+        sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{sent}"
+    );
+
+    let activity = |f: &[Value]| -> Vec<Value> {
+        f.iter()
+            .filter(|v| v["event"]["kind"] == "activity")
+            .map(|v| v["event"]["data"].clone())
+            .collect()
+    };
+    // The tool phase names the tool the model actually called.
+    wait_for(&frames, 10, |f| {
+        activity(f)
+            .iter()
+            .any(|a| a["phase"] == "tool" && a["tool"] == "memory.set")
+    });
+    // Thinking is reported too — and the unit answering the A2A message binds
+    // to its task (a workflow step turn reports alongside it, unbound).
+    wait_for(&frames, 10, |f| {
+        activity(f).iter().any(|a| a["phase"] == "thinking")
+    });
+    wait_for(&frames, 10, |f| {
+        activity(f)
+            .iter()
+            .any(|a| a["task"].as_str().is_some_and(|t| t.starts_with("task-")))
+    });
+    // …and the unit's record disappears when the turn ends.
+    wait_for(&frames, 10, |f| {
+        f.iter().any(|v| v["event"]["kind"] == "activity.removed")
+    });
+
+    let got = frames.lock().unwrap();
+    let acts = activity(&got);
+    assert!(
+        acts.iter()
+            .all(|a| a["started_ms"].as_u64().is_some_and(|t| t > 0)),
+        "clients tick elapsed from started_ms: {acts:#?}"
+    );
+    let bound = acts
+        .iter()
+        .find(|a| a["task"].as_str().is_some_and(|t| t.starts_with("task-")))
+        .expect("the A2A turn's activity binds to its task");
+    assert!(
+        bound["ctx"].as_str().is_some_and(|c| c.starts_with("a2a-")),
+        "…and to its conversation: {bound}"
+    );
+    // Tokens accrue on the record (the mock reports usage per round).
+    assert!(
+        acts.iter().any(|a| a["tokens_in"].as_u64().unwrap_or(0)
+            + a["tokens_out"].as_u64().unwrap_or(0)
+            > 0),
+        "activity carries the turn's spend: {acts:#?}"
+    );
+    // Deliberately COARSE: a handful of events, not a stream (the replay ring
+    // must stay meaningful — this is the property token streaming would break).
+    assert!(
+        acts.len() <= 24,
+        "activity is change-triggered, not a token stream: {} events",
+        acts.len()
+    );
+    drop(got);
+    std::fs::remove_file(&cfg).ok();
+}
+
+#[test]
 fn the_tui_passthrough_spawns_the_client_and_ties_lifetimes() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let port = free_port();

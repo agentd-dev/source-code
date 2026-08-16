@@ -14,7 +14,7 @@
  *        the text before sending; unknown `$words` are left alone; `$$` ⇒ `$`.
  */
 
-import { MirrorState, TERMINAL_STATES } from './types.js';
+import { Activity, MirrorState, TERMINAL_STATES } from './types.js';
 
 /** One completion the UI can apply. */
 export interface Suggestion {
@@ -170,4 +170,42 @@ export function prepare(input: string, s: MirrorState): Prepared {
   });
   out.text = text;
   return out;
+}
+
+
+/** A compact human duration (`8s`, `1m14s`, `2h03m`). */
+export function elapsed(sinceMs: number, nowMs: number = Date.now()): string {
+  const s = Math.max(0, Math.floor((nowMs - sinceMs) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
+}
+
+/** Compact token count (`940`, `1.2k`, `18k`). */
+export function tokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 100_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${Math.round(n / 1000)}k`;
+}
+
+/**
+ * The live working line (RFC 0032 §17) — what the agent is doing, how long it
+ * has been at it, and what it has spent: `thinking · 12s · 1.2k tok · round 2`
+ * or `read_file · 3s · 1.2k tok`. Elapsed ticks locally from `started_ms`, so
+ * the daemon emits nothing while a long think runs.
+ */
+export function activityLine(a: Activity | undefined, nowMs: number = Date.now()): string {
+  if (!a) return 'working';
+  const what =
+    a.phase === 'tool'
+      ? (a.tool ?? 'tool')
+      : a.phase === 'waiting'
+        ? `waiting · ${a.tool ?? 'wait'}`
+        : 'thinking';
+  const parts = [what, elapsed(a.started_ms, nowMs)];
+  const spent = a.tokens_in + a.tokens_out;
+  if (spent > 0) parts.push(`${tokens(spent)} tok`);
+  if (a.round > 1) parts.push(`round ${a.round}`);
+  return parts.join(' · ');
 }

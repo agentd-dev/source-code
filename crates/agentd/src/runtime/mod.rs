@@ -12,6 +12,7 @@
 
 #[cfg(feature = "a2a")]
 pub mod a2a_server;
+pub mod activity; // live per-turn activity for the display clients (RFC 0032 §17)
 pub mod artifacts;
 pub mod audit;
 pub mod children;
@@ -378,6 +379,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         a2a_feed: None,
         #[cfg(feature = "a2a")]
         a2a_pairing: None,
+        activity: BTreeMap::new(),
         #[cfg(feature = "a2a")]
         feed_marks: BTreeMap::new(),
         #[cfg(feature = "a2a")]

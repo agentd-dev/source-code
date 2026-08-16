@@ -8,10 +8,13 @@ export { Observation } from './observe.js';
 export type { ObserveOptions } from './observe.js';
 export {
   SYSTEM_COMMANDS,
+  activityLine,
   applySuggestion,
+  elapsed,
   prepare,
   skillNames,
   suggest,
+  tokens,
   triggerToken,
   workflowNames,
 } from './composer.js';

@@ -89,8 +89,26 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
   await tick();
   let frame = ui.lastFrame();
   assert.match(frame, /you › What is up\?/);
-  assert.match(frame, /working — 1 task live/);
+  // With no activity record yet, the working row degrades to a bare label.
+  assert.match(frame, /working/);
   assert.match(frame, /1 active/);
+  // The daemon's activity says what it is DOING — phase, elapsed, tokens.
+  mirror.apply({
+    seq: 3, ts: 25, kind: 'activity',
+    data: { id: '7', task: 't1', ctx: 'c1', phase: 'thinking', tool: null, round: 1, tokens_in: 900, tokens_out: 300, started_ms: Date.now() - 12_000, updated_ms: Date.now() },
+  });
+  await tick();
+  frame = ui.lastFrame();
+  assert.match(frame, /thinking/);
+  assert.match(frame, /1[12]s/, 'elapsed ticks locally from started_ms');
+  assert.match(frame, /1\.2k tok/);
+  // A tool call names itself.
+  mirror.apply({
+    seq: 4, ts: 26, kind: 'activity',
+    data: { id: '7', task: 't1', phase: 'tool', tool: 'read_file', round: 1, tokens_in: 900, tokens_out: 300, started_ms: Date.now() - 12_000, updated_ms: Date.now() },
+  });
+  await tick();
+  assert.match(ui.lastFrame(), /read_file/);
   // …and the reply lands as the task's terminal artifact.
   mirror.apply({ seq: 3, ts: 30, kind: 'task', data: { task: { id: 't1', contextId: 'c1', updated: 30, status: { state: 'TASK_STATE_COMPLETED', timestamp: 30 }, artifacts: [{ parts: [{ text: 'All good.' }] }] } } });
   await tick();

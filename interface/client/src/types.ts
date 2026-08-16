@@ -110,6 +110,26 @@ export interface PairedSession {
   agent: { name: string; instance: string; version: string };
 }
 
+/**
+ * What a working unit is doing right now (RFC 0032 §17). Elapsed time is NOT
+ * streamed — tick it locally from `started_ms`.
+ */
+export interface Activity {
+  /** The child node id (the record's key). */
+  id: string;
+  /** The A2A task this unit answers, when it has one. */
+  task?: string;
+  ctx?: string;
+  phase: 'thinking' | 'tool' | 'waiting';
+  /** The tool executing (phase `tool`) or the wait it parked on (`waiting`). */
+  tool?: string;
+  round: number;
+  tokens_in: number;
+  tokens_out: number;
+  started_ms: number;
+  updated_ms: number;
+}
+
 /** One entry of the rendered conversation transcript (a client-side view). */
 export interface TranscriptEntry {
   /** Stable key: the messageId (user) or taskId (agent/command). */
@@ -148,6 +168,8 @@ export interface MirrorState {
   conversations: Map<string, Json>;
   subagents: Map<string, Json>;
   children: Map<string, Json>;
+  /** Live per-unit activity (RFC 0032 §17), keyed by unit id. */
+  activity: Map<string, Activity>;
   transcript: TranscriptEntry[];
   /** Bounded feed tail for the debug pane. */
   feedLog: FeedEvent[];

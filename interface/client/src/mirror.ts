@@ -10,6 +10,7 @@
 
 import { normalizeTask } from './client.js';
 import {
+  Activity,
   ConnState,
   FeedEvent,
   FeedHello,
@@ -34,6 +35,7 @@ export class Mirror {
     conversations: new Map(),
     subagents: new Map(),
     children: new Map(),
+    activity: new Map(),
     transcript: [],
     feedLog: [],
     lastSeq: 0,
@@ -105,6 +107,13 @@ export class Mirror {
       for (const sub of s.subagents) {
         const h = (sub as { [k: string]: Json }).handle;
         if (typeof h === 'string') this.state.subagents.set(h, sub);
+      }
+    }
+    if (Array.isArray(s.activity)) {
+      this.state.activity.clear();
+      for (const a of s.activity) {
+        const rec = a as unknown as Activity;
+        if (rec?.id) this.state.activity.set(rec.id, rec);
       }
     }
     if (Array.isArray(s.children)) {
@@ -265,6 +274,15 @@ export class Mirror {
         if (typeof data.id === 'string') this.state.children.delete(data.id);
         break;
       }
+      case 'activity': {
+        const rec = ev.data as unknown as Activity;
+        if (rec?.id) this.state.activity.set(rec.id, rec);
+        break;
+      }
+      case 'activity.removed': {
+        if (typeof data.id === 'string') this.state.activity.delete(data.id);
+        break;
+      }
       case 'status': {
         this.state.status = ev.data;
         this.state.draining = data.draining === true;
@@ -378,6 +396,16 @@ export class Mirror {
     return [...this.state.tasks.values()]
       .filter((t) => !TERMINAL_STATES.has(t.state))
       .sort((a, b) => b.updated - a.updated);
+  }
+
+  /** The live activity for a task (or the newest overall when none given). */
+  activityFor(taskId?: string): Activity | undefined {
+    const all = [...this.state.activity.values()];
+    if (taskId) {
+      const hit = all.find((a) => a.task === taskId);
+      if (hit) return hit;
+    }
+    return all.sort((a, b) => b.updated_ms - a.updated_ms)[0];
   }
 
   /** All tasks, newest first. */

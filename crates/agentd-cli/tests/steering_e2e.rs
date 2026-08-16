@@ -14,14 +14,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn post_raw(addr: &str, body: &str) -> String {
     let mut s = TcpStream::connect(addr).expect("connect a2a http");
     s.set_read_timeout(Some(Duration::from_secs(130))).ok();
@@ -80,20 +72,6 @@ fn artifact_json(v: &Value) -> Value {
         .as_str()
         .and_then(|t| serde_json::from_str(t).ok())
         .unwrap_or(Value::Null)
-}
-
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// Poll `workflow.status` for one run until `pred` holds; returns the view.
@@ -173,10 +151,41 @@ fn spawn_daemon(config: &str) -> Daemon {
     Daemon { child, stderr_path }
 }
 
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 fn write_config(yaml: &str) -> String {
     let path = common::unique_path("agentd-steer", "yaml");
     std::fs::write(&path, yaml).unwrap();
     path
+}
+
+/// Spawn the daemon on a probed free port and return the authority IT actually
+/// bound. The probe→bind gap is a real race under parallel CI (another process
+/// can take the port), so a daemon whose bind lost is retried on a fresh port
+/// rather than leaving the test talking to a stranger's listener.
+fn spawn_bound(cfg_for: impl Fn(u16) -> String) -> (Daemon, String, String) {
+    spawn_bound_with(cfg_for, spawn_daemon)
+}
+
+fn spawn_bound_with(
+    cfg_for: impl Fn(u16) -> String,
+    spawn: impl Fn(&str) -> Daemon,
+) -> (Daemon, String, String) {
+    for _ in 0..5 {
+        let cfg = write_config(&cfg_for(free_port()));
+        let daemon = spawn(&cfg);
+        if let Some(addr) = common::try_a2a_bound(&daemon.stderr_path, Duration::from_secs(15)) {
+            return (daemon, addr, cfg);
+        }
+        std::fs::remove_file(&cfg).ok();
+    }
+    panic!("the daemon never bound an A2A listener (5 attempts)");
 }
 
 fn steer_config(llm: &str, port: u16, extra: &str) -> String {
@@ -194,13 +203,9 @@ fn steer_config(llm: &str, port: u16, extra: &str) -> String {
 #[test]
 fn a_signal_resumes_a_waiting_run() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // A run that WAITS for a named signal, then finishes with its payload.
     let extra = "workflows:\n  - name: waiter\n    steps:\n      s: {kind: manual}\n      w: {kind: wait, on: signal, signal: go, depends_on: [s]}\n      f: {kind: finish, depends_on: [w], output: \"released\"}\n";
-    let cfg = write_config(&steer_config(&llm.uri, port, extra));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
     let started = command(&addr, 1, "workflow.run", json!({"name": "waiter"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
@@ -235,13 +240,9 @@ fn a_signal_resumes_a_waiting_run() {
 #[test]
 fn a_single_run_pauses_and_resumes() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // A run with a 1s sleep between steps — enough of a window to pause it.
     let extra = "workflows:\n  - name: slow\n    steps:\n      s: {kind: manual}\n      z: {kind: sleep, duration: 1s, depends_on: [s]}\n      f: {kind: finish, depends_on: [z], output: \"done\"}\n";
-    let cfg = write_config(&steer_config(&llm.uri, port, extra));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
     command(&addr, 1, "workflow.run", json!({"name": "slow"}));
     let ws = command(&addr, 2, "workflow.status", json!({}));
@@ -278,11 +279,7 @@ fn a_single_run_pauses_and_resumes() {
 #[test]
 fn a_global_pause_holds_new_work_and_resume_releases_it() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "Answered after the hold."}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&steer_config(&llm.uri, port, ""));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, ""));
 
     // Pause the instance; intake continues but nothing dispatches.
     let paused = rpc(&addr, 1, "a2a.pause", json!({}));
@@ -338,11 +335,7 @@ fn subagent_send_injects_into_a_warm_subagent_and_plan_get_reads_the_plan() {
             {"when_contains": "You are agentd, an autonomous agent.", "content": "standing by"}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&steer_config(&llm.uri, port, ""));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, ""));
 
     let sent = rpc(
         &addr,

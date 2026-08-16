@@ -98,3 +98,46 @@ pub fn wait_for_file(path: &str) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// The A2A authority a daemon ACTUALLY bound, read from its telemetry.
+///
+/// Tests configure `a2a.listen: http://127.0.0.1:0` and learn the port here,
+/// instead of pre-picking one with a bind-and-drop probe: under parallel load
+/// another process can take that port in the gap, and the test then talks to a
+/// stranger's listener (or to nothing). The daemon logs the bound authority on
+/// its `a2a.listen` line, which is the only race-free source.
+pub fn wait_a2a_bound(stderr_path: &str) -> String {
+    try_a2a_bound(stderr_path, Duration::from_secs(20)).unwrap_or_else(|| {
+        let log = std::fs::read_to_string(stderr_path).unwrap_or_default();
+        panic!("no a2a.listen line; daemon stderr:\n{log}")
+    })
+}
+
+/// [`wait_a2a_bound`] that gives up instead of panicking — a caller retrying a
+/// stolen port needs to distinguish "not yet" from "this daemon is dead".
+pub fn try_a2a_bound(stderr_path: &str, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(log) = std::fs::read_to_string(stderr_path) {
+            for line in log.lines().rev() {
+                if !line.contains("\"a2a.listen\"") {
+                    continue;
+                }
+                if let Some(rest) = line.split("\"bound\":\"").nth(1)
+                    && let Some(addr) = rest.split('"').next()
+                {
+                    return Some(addr.to_string());
+                }
+            }
+            // A daemon whose bind lost the race exits at once — do not wait out
+            // the whole timeout for a process that is already gone.
+            if log.contains("a2a listen") || log.contains("a2a.listen:") {
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

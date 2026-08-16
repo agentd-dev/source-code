@@ -99,20 +99,6 @@ fn command(addr: &str, id: i64, op: &str, extra: Value) -> Value {
     )
 }
 
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 struct MockLlm {
     child: Child,
     addr_file: String,
@@ -182,6 +168,29 @@ fn write_config(yaml: &str) -> String {
     path
 }
 
+/// Spawn the daemon on a probed free port and return the authority IT actually
+/// bound. The probe→bind gap is a real race under parallel CI (another process
+/// can take the port), so a daemon whose bind lost is retried on a fresh port
+/// rather than leaving the test talking to a stranger's listener.
+fn spawn_bound(cfg_for: impl Fn(u16) -> String) -> (Daemon, String, String) {
+    spawn_bound_with(cfg_for, spawn_daemon)
+}
+
+fn spawn_bound_with(
+    cfg_for: impl Fn(u16) -> String,
+    spawn: impl Fn(&str) -> Daemon,
+) -> (Daemon, String, String) {
+    for _ in 0..5 {
+        let cfg = write_config(&cfg_for(free_port()));
+        let daemon = spawn(&cfg);
+        if let Some(addr) = common::try_a2a_bound(&daemon.stderr_path, Duration::from_secs(15)) {
+            return (daemon, addr, cfg);
+        }
+        std::fs::remove_file(&cfg).ok();
+    }
+    panic!("the daemon never bound an A2A listener (5 attempts)");
+}
+
 /// A loopback daemon (⇒ operator) with the interface on; `debug` + `extra`
 /// shape each test.
 fn iface_config(llm: &str, port: u16, debug: bool, extra: &str) -> String {
@@ -248,12 +257,8 @@ fn wait_for<F: Fn(&[Value]) -> bool>(sink: &Arc<Mutex<Vec<Value>>>, secs: u64, p
 #[test]
 fn interface_info_and_the_debug_reads_work_over_a2a() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "Hello from the mock."}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let extra = "workflows:\n  - name: greet\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], output: \"done\"}\n";
-    let cfg = write_config(&iface_config(&llm.uri, port, true, extra));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, true, extra));
 
     // Discovery: enabled + debug + the op list a client keys its panes off.
     let info = command(&addr, 1, "interface.info", json!({}));
@@ -350,11 +355,7 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
 #[test]
 fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "The reply."}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&iface_config(&llm.uri, port, false, ""));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
     // Client A: attach to the feed.
     let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -428,20 +429,18 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
 #[test]
 fn the_interface_is_gated_off_by_default() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // NO interface block: the surface must refuse, the core must be untouched.
-    let cfg = write_config(&format!(
-        "config_version: \"2\"\n\
+    let (_daemon, addr, cfg) = spawn_bound(|port| {
+        format!(
+            "config_version: \"2\"\n\
          agent:\n  name: iface-off\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
          a2a:\n  listen: http://127.0.0.1:{port}\n\
          lifecycle:\n  run_until: drained\n",
-        llm.uri
-    ));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+            llm.uri
+        )
+    });
 
     // The command ops refuse…
     let (code, msg) = rpc_err(
@@ -486,15 +485,13 @@ fn the_interface_is_gated_off_by_default() {
 #[test]
 fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let extra = "  origins: [\"https://ui.example\"]\n";
-    let cfg = write_config(&iface_config(&llm.uri, port, false, "").replace(
-        "interface:\n  enabled: true\n  debug: false\n",
-        &format!("interface:\n  enabled: true\n  debug: false\n{extra}"),
-    ));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| {
+        iface_config(&llm.uri, port, false, "").replace(
+            "interface:\n  enabled: true\n  debug: false\n",
+            &format!("interface:\n  enabled: true\n  debug: false\n{extra}"),
+        )
+    });
 
     let send = |req: String| -> (u16, Vec<(String, String)>) {
         let mut s = TcpStream::connect(&addr).unwrap();
@@ -568,33 +565,36 @@ fn rpc_raw_auth(addr: &str, id: i64, method: &str, params: Value, bearer: Option
 #[test]
 fn pairing_exchanges_the_rotating_code_for_a_session_token() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // A bearer-PROTECTED listener with pairing on: uncredentialed callers are
     // anonymous (may call exactly Pair + the card), the server bearer is the
     // operator, and a paired session becomes a first-class credential.
-    let cfg = write_config(&format!(
-        "config_version: \"2\"\n\
+    let (_daemon, addr, cfg) = spawn_bound_with(
+        |port| {
+            format!(
+                "config_version: \"2\"\n\
          agent:\n  name: pair-e2e\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
          a2a:\n  listen: http://127.0.0.1:{port}\n  bearer: \"{{{{secret:PAIRB}}}}\"\n\
          interface:\n  enabled: true\n  pairing:\n    enabled: true\n\
          lifecycle:\n  run_until: drained\n",
-        llm.uri
-    ));
-    let stderr_path = common::unique_path("pair-daemon", "log");
-    let errf = std::fs::File::create(&stderr_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg])
-        .env("PAIRB", "server-secret-bearer")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(errf))
-        .spawn()
-        .expect("spawn daemon");
-    let _daemon = Daemon { child, stderr_path };
-    wait_ready(&addr);
+                llm.uri
+            )
+        },
+        |cfg| {
+            let stderr_path = common::unique_path("pair-daemon", "log");
+            let errf = std::fs::File::create(&stderr_path).unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+                .args(["--config", cfg])
+                .env("PAIRB", "server-secret-bearer")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(errf))
+                .spawn()
+                .expect("spawn daemon");
+            Daemon { child, stderr_path }
+        },
+    );
 
     // 1. Anonymous: the card is public, work is refused.
     let card = rpc_raw_auth(&addr, 1, "GetAgentCard", json!({}), None);
@@ -668,12 +668,8 @@ fn pairing_exchanges_the_rotating_code_for_a_session_token() {
 #[test]
 fn config_set_toggles_debug_live_and_reshapes_the_display() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // Debug starts OFF.
-    let cfg = write_config(&iface_config(&llm.uri, port, false, ""));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
     // Debug reads refuse; info says so; the default display is served.
     let (code, _) = rpc_err(
@@ -747,11 +743,7 @@ fn a_live_subagent_is_observable_and_drillable() {
             {"when_contains": "You are agentd, an autonomous agent.", "content": "three"}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&iface_config(&llm.uri, port, true, ""));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, true, ""));
 
     // Missing handle → non-disclosing not-found.
     let (code, _) = rpc_err(
@@ -815,11 +807,7 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
             {"content": "Stored it."}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&iface_config(&llm.uri, port, false, ""));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
     // Attach FIRST so the activity events stream as they happen.
     let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -902,6 +890,9 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
 #[test]
 fn the_tui_passthrough_spawns_the_client_and_ties_lifetimes() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    // The one case that needs a FIXED port: the test asserts the endpoint the
+    // passthrough derives and hands to the client, and `:0` is refused there
+    // by design (a client cannot dial an ephemeral port it never learns).
     let port = free_port();
     // The stub "TUI": record the handed endpoint, then exit — which must drain
     // the daemon (client-exit ⇒ SIGTERM ⇒ graceful exit 0).

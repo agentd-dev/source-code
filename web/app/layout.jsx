@@ -42,23 +42,23 @@ function Nav() {
           agentd<span className="text-[var(--dim)]">@</span>
           <span className="text-[var(--green)]">~</span>
         </Link>
-        <Link href="/#a2a" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
-          a2a
-        </Link>
-        <Link href="/#aauth" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
-          aauth
-        </Link>
         <Link href="/#mcp" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
-          mcp
+          mcp + a2a
         </Link>
-        <Link href="/#capabilities" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
-          capabilities
+        <Link href="/#lifecycle" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          lifecycle
+        </Link>
+        <Link href="/#workflows" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
+          workflows
         </Link>
         <Link href="/#run" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
           run it
         </Link>
         <Link href="/docs/overview/" className="text-[var(--dim)] hover:text-[var(--fg-strong)]">
           docs
+        </Link>
+        <Link href="/editor/" className="text-[var(--dim)] hover:text-[var(--fg-strong)]">
+          editor
         </Link>
         <a
           href="https://github.com/agentd-dev/source-code"
@@ -84,7 +84,7 @@ function Footer() {
           <Link href="/docs/overview/" className="hover:text-[var(--fg-strong)]">
             docs
           </Link>
-          <Link href="/docs/rfc-0001/" className="hover:text-[var(--fg-strong)]">
+          <Link href="/docs/rfc-0026/" className="hover:text-[var(--fg-strong)]">
             rfcs
           </Link>
           <a

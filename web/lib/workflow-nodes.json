@@ -1,0 +1,979 @@
+{
+  "a2a": {
+    "category": "orchestration",
+    "fields": [
+      "command",
+      "roles",
+      "inputs"
+    ],
+    "implemented": false,
+    "kind": "a2a",
+    "required": [],
+    "start": true
+  },
+  "a2a.delegate": {
+    "category": "orchestration",
+    "fields": [
+      "peer",
+      "objective",
+      "output_contract",
+      "timeout"
+    ],
+    "implemented": true,
+    "kind": "a2a.delegate",
+    "required": [
+      "peer",
+      "objective"
+    ],
+    "start": false
+  },
+  "a2a.send": {
+    "category": "orchestration",
+    "fields": [
+      "to",
+      "parts",
+      "context"
+    ],
+    "implemented": false,
+    "kind": "a2a.send",
+    "required": [
+      "to"
+    ],
+    "start": false
+  },
+  "a2a.wait": {
+    "category": "orchestration",
+    "fields": [
+      "conversation",
+      "timeout"
+    ],
+    "implemented": false,
+    "kind": "a2a.wait",
+    "required": [],
+    "start": false
+  },
+  "agent": {
+    "category": "intelligence",
+    "fields": [
+      "instruction",
+      "output_contract",
+      "output_schema",
+      "tools",
+      "servers",
+      "limits",
+      "context",
+      "skills",
+      "system"
+    ],
+    "implemented": true,
+    "kind": "agent",
+    "required": [
+      "instruction"
+    ],
+    "start": false
+  },
+  "artifact.create": {
+    "category": "io",
+    "fields": [
+      "name",
+      "mime",
+      "content",
+      "from_step",
+      "sensitive"
+    ],
+    "implemented": true,
+    "kind": "artifact.create",
+    "required": [
+      "name"
+    ],
+    "start": false
+  },
+  "artifact.delete": {
+    "category": "io",
+    "fields": [
+      "id"
+    ],
+    "implemented": true,
+    "kind": "artifact.delete",
+    "required": [
+      "id"
+    ],
+    "start": false
+  },
+  "artifact.get": {
+    "category": "io",
+    "fields": [
+      "id"
+    ],
+    "implemented": true,
+    "kind": "artifact.get",
+    "required": [
+      "id"
+    ],
+    "start": false
+  },
+  "assert": {
+    "category": "control",
+    "fields": [
+      "condition",
+      "message"
+    ],
+    "implemented": true,
+    "kind": "assert",
+    "required": [
+      "condition"
+    ],
+    "start": false
+  },
+  "assign": {
+    "category": "data",
+    "fields": [
+      "value",
+      "writes",
+      "mode"
+    ],
+    "implemented": true,
+    "kind": "assign",
+    "required": [
+      "value"
+    ],
+    "start": false
+  },
+  "batch": {
+    "category": "control",
+    "fields": [
+      "over",
+      "body",
+      "by",
+      "size",
+      "parallel",
+      "rate",
+      "collect",
+      "on_error"
+    ],
+    "implemented": true,
+    "kind": "batch",
+    "required": [
+      "over",
+      "body"
+    ],
+    "start": false
+  },
+  "checkpoint": {
+    "category": "orchestration",
+    "fields": [
+      "name"
+    ],
+    "implemented": true,
+    "kind": "checkpoint",
+    "required": [],
+    "start": false
+  },
+  "chunk": {
+    "category": "data",
+    "fields": [
+      "value",
+      "by",
+      "size",
+      "overlap"
+    ],
+    "implemented": true,
+    "kind": "chunk",
+    "required": [
+      "value",
+      "size"
+    ],
+    "start": false
+  },
+  "classify": {
+    "category": "intelligence",
+    "fields": [
+      "input",
+      "classes",
+      "prompt",
+      "skills"
+    ],
+    "implemented": true,
+    "kind": "classify",
+    "required": [
+      "input",
+      "classes"
+    ],
+    "start": false
+  },
+  "dedupe": {
+    "category": "data",
+    "fields": [
+      "over",
+      "by"
+    ],
+    "implemented": true,
+    "kind": "dedupe",
+    "required": [
+      "over"
+    ],
+    "start": false
+  },
+  "emit": {
+    "category": "io",
+    "fields": [
+      "note",
+      "audit",
+      "metric",
+      "value"
+    ],
+    "implemented": true,
+    "kind": "emit",
+    "required": [],
+    "start": false
+  },
+  "event": {
+    "category": "trigger",
+    "fields": [
+      "on",
+      "filter",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "event",
+    "required": [
+      "on"
+    ],
+    "start": true
+  },
+  "extract": {
+    "category": "intelligence",
+    "fields": [
+      "input",
+      "output_schema",
+      "prompt",
+      "skills"
+    ],
+    "implemented": true,
+    "kind": "extract",
+    "required": [
+      "input",
+      "output_schema"
+    ],
+    "start": false
+  },
+  "fail": {
+    "category": "control",
+    "fields": [
+      "message",
+      "code"
+    ],
+    "implemented": true,
+    "kind": "fail",
+    "required": [],
+    "start": false
+  },
+  "filter": {
+    "category": "data",
+    "fields": [
+      "over",
+      "expr",
+      "as"
+    ],
+    "implemented": true,
+    "kind": "filter",
+    "required": [
+      "over",
+      "expr"
+    ],
+    "start": false
+  },
+  "finish": {
+    "category": "terminal",
+    "fields": [
+      "status",
+      "output",
+      "reason"
+    ],
+    "implemented": true,
+    "kind": "finish",
+    "required": [],
+    "start": false
+  },
+  "foreach": {
+    "category": "control",
+    "fields": [
+      "over",
+      "body",
+      "batch",
+      "collect",
+      "on_error",
+      "as"
+    ],
+    "implemented": true,
+    "kind": "foreach",
+    "required": [
+      "over",
+      "body"
+    ],
+    "start": false
+  },
+  "http": {
+    "category": "io",
+    "fields": [
+      "method",
+      "url",
+      "headers",
+      "query",
+      "body",
+      "json",
+      "timeout",
+      "expect",
+      "allow_private",
+      "sign"
+    ],
+    "implemented": true,
+    "kind": "http",
+    "required": [
+      "url"
+    ],
+    "start": false
+  },
+  "human": {
+    "category": "orchestration",
+    "fields": [
+      "question",
+      "schema",
+      "to",
+      "timeout",
+      "reply_uri"
+    ],
+    "implemented": true,
+    "kind": "human",
+    "required": [
+      "question"
+    ],
+    "start": false
+  },
+  "iterate": {
+    "category": "control",
+    "fields": [
+      "body",
+      "while",
+      "until",
+      "max_iterations",
+      "collect"
+    ],
+    "implemented": true,
+    "kind": "iterate",
+    "required": [
+      "body"
+    ],
+    "start": false
+  },
+  "join": {
+    "category": "orchestration",
+    "fields": [
+      "handles",
+      "timeout",
+      "min",
+      "partials"
+    ],
+    "implemented": true,
+    "kind": "join",
+    "required": [
+      "handles"
+    ],
+    "start": false
+  },
+  "judge": {
+    "category": "intelligence",
+    "fields": [
+      "input",
+      "rubric",
+      "prompt",
+      "skills"
+    ],
+    "implemented": true,
+    "kind": "judge",
+    "required": [
+      "input",
+      "rubric"
+    ],
+    "start": false
+  },
+  "knowledge.get": {
+    "category": "io",
+    "fields": [
+      "id",
+      "uri"
+    ],
+    "implemented": true,
+    "kind": "knowledge.get",
+    "required": [],
+    "start": false
+  },
+  "knowledge.search": {
+    "category": "io",
+    "fields": [
+      "query",
+      "top_k",
+      "filters"
+    ],
+    "implemented": true,
+    "kind": "knowledge.search",
+    "required": [
+      "query"
+    ],
+    "start": false
+  },
+  "loop": {
+    "category": "trigger",
+    "fields": [
+      "interval",
+      "delay",
+      "until",
+      "max_iterations",
+      "backoff",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "loop",
+    "required": [],
+    "start": true
+  },
+  "manual": {
+    "category": "trigger",
+    "fields": [
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "manual",
+    "required": [],
+    "start": true
+  },
+  "map": {
+    "category": "data",
+    "fields": [
+      "over",
+      "expr",
+      "as"
+    ],
+    "implemented": true,
+    "kind": "map",
+    "required": [
+      "over",
+      "expr"
+    ],
+    "start": false
+  },
+  "mcp.resource": {
+    "category": "io",
+    "fields": [
+      "server",
+      "op",
+      "uri",
+      "name",
+      "arguments",
+      "reference",
+      "argument"
+    ],
+    "implemented": true,
+    "kind": "mcp.resource",
+    "required": [
+      "server",
+      "op"
+    ],
+    "start": false
+  },
+  "mcp.tool": {
+    "category": "io",
+    "fields": [
+      "server",
+      "tool",
+      "args"
+    ],
+    "implemented": true,
+    "kind": "mcp.tool",
+    "required": [
+      "server",
+      "tool"
+    ],
+    "start": false
+  },
+  "memory.delete": {
+    "category": "io",
+    "fields": [
+      "key"
+    ],
+    "implemented": true,
+    "kind": "memory.delete",
+    "required": [
+      "key"
+    ],
+    "start": false
+  },
+  "memory.get": {
+    "category": "io",
+    "fields": [
+      "key"
+    ],
+    "implemented": true,
+    "kind": "memory.get",
+    "required": [
+      "key"
+    ],
+    "start": false
+  },
+  "memory.list": {
+    "category": "io",
+    "fields": [
+      "prefix",
+      "limit"
+    ],
+    "implemented": true,
+    "kind": "memory.list",
+    "required": [],
+    "start": false
+  },
+  "memory.set": {
+    "category": "io",
+    "fields": [
+      "key",
+      "value",
+      "ttl"
+    ],
+    "implemented": true,
+    "kind": "memory.set",
+    "required": [
+      "key",
+      "value"
+    ],
+    "start": false
+  },
+  "noop": {
+    "category": "control",
+    "fields": [],
+    "implemented": true,
+    "kind": "noop",
+    "required": [],
+    "start": false
+  },
+  "once": {
+    "category": "trigger",
+    "fields": [
+      "policy",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "once",
+    "required": [],
+    "start": true
+  },
+  "parallel": {
+    "category": "control",
+    "fields": [
+      "branches",
+      "on_error"
+    ],
+    "implemented": true,
+    "kind": "parallel",
+    "required": [
+      "branches"
+    ],
+    "start": false
+  },
+  "parse": {
+    "category": "data",
+    "fields": [
+      "text",
+      "format"
+    ],
+    "implemented": true,
+    "kind": "parse",
+    "required": [
+      "text"
+    ],
+    "start": false
+  },
+  "race": {
+    "category": "control",
+    "fields": [
+      "branches",
+      "timeout",
+      "min_success"
+    ],
+    "implemented": true,
+    "kind": "race",
+    "required": [
+      "branches"
+    ],
+    "start": false
+  },
+  "reduce": {
+    "category": "data",
+    "fields": [
+      "over",
+      "expr",
+      "initial",
+      "as",
+      "acc"
+    ],
+    "implemented": true,
+    "kind": "reduce",
+    "required": [
+      "over",
+      "expr"
+    ],
+    "start": false
+  },
+  "route": {
+    "category": "intelligence",
+    "fields": [
+      "input",
+      "choices",
+      "prompt",
+      "skills"
+    ],
+    "implemented": true,
+    "kind": "route",
+    "required": [
+      "input",
+      "choices"
+    ],
+    "start": false
+  },
+  "schedule": {
+    "category": "trigger",
+    "fields": [
+      "cron",
+      "every",
+      "tz",
+      "jitter",
+      "catch_up",
+      "at",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "schedule",
+    "required": [],
+    "start": true
+  },
+  "search.fetch": {
+    "category": "io",
+    "fields": [
+      "url",
+      "max_bytes"
+    ],
+    "implemented": true,
+    "kind": "search.fetch",
+    "required": [
+      "url"
+    ],
+    "start": false
+  },
+  "search.query": {
+    "category": "io",
+    "fields": [
+      "query",
+      "kind",
+      "limit",
+      "freshness"
+    ],
+    "implemented": true,
+    "kind": "search.query",
+    "required": [
+      "query"
+    ],
+    "start": false
+  },
+  "signal": {
+    "category": "trigger",
+    "fields": [
+      "name",
+      "filter",
+      "deliver",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "signal",
+    "required": [
+      "name"
+    ],
+    "start": true
+  },
+  "sleep": {
+    "category": "control",
+    "fields": [
+      "duration"
+    ],
+    "implemented": true,
+    "kind": "sleep",
+    "required": [
+      "duration"
+    ],
+    "start": false
+  },
+  "sort": {
+    "category": "data",
+    "fields": [
+      "over",
+      "by",
+      "order"
+    ],
+    "implemented": true,
+    "kind": "sort",
+    "required": [
+      "over"
+    ],
+    "start": false
+  },
+  "subagent": {
+    "category": "orchestration",
+    "fields": [
+      "instruction",
+      "mode",
+      "workflow",
+      "tools",
+      "servers",
+      "limits",
+      "context",
+      "output_contract",
+      "output_schema",
+      "skills"
+    ],
+    "implemented": true,
+    "kind": "subagent",
+    "required": [
+      "instruction"
+    ],
+    "start": false
+  },
+  "subgraph": {
+    "category": "control",
+    "fields": [
+      "body"
+    ],
+    "implemented": true,
+    "kind": "subgraph",
+    "required": [
+      "body"
+    ],
+    "start": false
+  },
+  "subscribe": {
+    "category": "trigger",
+    "fields": [
+      "server",
+      "uri",
+      "debounce_ms",
+      "coalesce",
+      "filter",
+      "claim",
+      "shard",
+      "deliver",
+      "on_no_listener",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "subscribe",
+    "required": [
+      "server",
+      "uri"
+    ],
+    "start": true
+  },
+  "summarize": {
+    "category": "intelligence",
+    "fields": [
+      "input",
+      "length",
+      "prompt",
+      "skills"
+    ],
+    "implemented": true,
+    "kind": "summarize",
+    "required": [
+      "input"
+    ],
+    "start": false
+  },
+  "switch": {
+    "category": "control",
+    "fields": [
+      "on",
+      "cases",
+      "default"
+    ],
+    "implemented": true,
+    "kind": "switch",
+    "required": [
+      "on",
+      "cases"
+    ],
+    "start": false
+  },
+  "template": {
+    "category": "data",
+    "fields": [
+      "text",
+      "value"
+    ],
+    "implemented": true,
+    "kind": "template",
+    "required": [],
+    "start": false
+  },
+  "think": {
+    "category": "intelligence",
+    "fields": [
+      "prompt",
+      "output_schema",
+      "reads",
+      "check",
+      "retries",
+      "skills",
+      "system"
+    ],
+    "implemented": true,
+    "kind": "think",
+    "required": [
+      "prompt"
+    ],
+    "start": false
+  },
+  "tool": {
+    "category": "io",
+    "fields": [
+      "name",
+      "args"
+    ],
+    "implemented": true,
+    "kind": "tool",
+    "required": [
+      "name"
+    ],
+    "start": false
+  },
+  "transform": {
+    "category": "data",
+    "fields": [
+      "value",
+      "writes",
+      "mode"
+    ],
+    "implemented": true,
+    "kind": "transform",
+    "required": [
+      "value"
+    ],
+    "start": false
+  },
+  "validate": {
+    "category": "data",
+    "fields": [
+      "value",
+      "schema"
+    ],
+    "implemented": true,
+    "kind": "validate",
+    "required": [
+      "value",
+      "schema"
+    ],
+    "start": false
+  },
+  "wait": {
+    "category": "orchestration",
+    "fields": [
+      "on",
+      "server",
+      "uri",
+      "condition",
+      "signal",
+      "run",
+      "subagent",
+      "conversation",
+      "webhook",
+      "timeout"
+    ],
+    "implemented": true,
+    "kind": "wait",
+    "required": [
+      "on"
+    ],
+    "start": false
+  },
+  "webhook": {
+    "category": "io",
+    "fields": [
+      "path",
+      "methods",
+      "auth",
+      "parallelism",
+      "on_overflow",
+      "idempotency",
+      "respond",
+      "filter",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "webhook",
+    "required": [
+      "path"
+    ],
+    "start": true
+  },
+  "workflow": {
+    "category": "orchestration",
+    "fields": [
+      "name",
+      "inputs",
+      "mode",
+      "start",
+      "version",
+      "cascade"
+    ],
+    "implemented": true,
+    "kind": "workflow",
+    "required": [
+      "name"
+    ],
+    "start": false
+  },
+  "workflow.cancel": {
+    "category": "orchestration",
+    "fields": [
+      "run",
+      "reason"
+    ],
+    "implemented": true,
+    "kind": "workflow.cancel",
+    "required": [
+      "run"
+    ],
+    "start": false
+  },
+  "workflow.signal": {
+    "category": "orchestration",
+    "fields": [
+      "name",
+      "payload",
+      "run"
+    ],
+    "implemented": true,
+    "kind": "workflow.signal",
+    "required": [
+      "name"
+    ],
+    "start": false
+  },
+  "workflow.wait": {
+    "category": "orchestration",
+    "fields": [
+      "run",
+      "timeout"
+    ],
+    "implemented": true,
+    "kind": "workflow.wait",
+    "required": [
+      "run"
+    ],
+    "start": false
+  }
+}

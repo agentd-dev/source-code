@@ -46,7 +46,7 @@ impl ToolCaller {
         format!("ctx:{}", self.ctx.as_deref().unwrap_or(ROOT))
     }
     /// The context whose plan/skills a `plan.*`/`skills.*` call addresses.
-    fn context_id(&self) -> String {
+    pub(crate) fn context_id(&self) -> String {
         self.ctx.clone().unwrap_or_else(|| ROOT.to_string())
     }
     fn ctx_value(&self, instance: &str) -> Value {
@@ -325,11 +325,19 @@ impl Runtime {
         let by = caller.label();
         match name {
             // ---- instruction ----
-            "instruction.read" => ok(json!({"text": self.instruction.text, "source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version.to_string()})),
+            "instruction.read" => ok(
+                json!({"text": self.instruction.text, "source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version.to_string()}),
+            ),
             "instruction.subscribe" => {
-                let uri = args.get("uri").and_then(Value::as_str).map(str::to_string).or_else(|| self.instruction.uri.clone());
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| self.instruction.uri.clone());
                 match uri {
-                    None => err("instruction.subscribe: the instruction is static text; give a uri".into()),
+                    None => err(
+                        "instruction.subscribe: the instruction is static text; give a uri".into(),
+                    ),
                     Some(u) => match self.subscribe_instruction(&u) {
                         Ok(()) => ok(json!({"subscribed": true, "uri": u})),
                         Err(e) => err(e),
@@ -337,7 +345,10 @@ impl Runtime {
                 }
             }
             // ---- memory ----
-            "memory.get" => match self.memory.get(&self.durable, args["key"].as_str().unwrap_or("")) {
+            "memory.get" => match self
+                .memory
+                .get(&self.durable, args["key"].as_str().unwrap_or(""))
+            {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
@@ -349,28 +360,58 @@ impl Runtime {
                     },
                     None => None,
                 };
-                match self.memory.set(&self.durable, args["key"].as_str().unwrap_or(""), args["value"].clone(), ttl, Some(&by)) {
+                match self.memory.set(
+                    &self.durable,
+                    args["key"].as_str().unwrap_or(""),
+                    args["value"].clone(),
+                    ttl,
+                    Some(&by),
+                ) {
                     Ok(v) => ok(v),
                     Err(e) => err(e),
                 }
             }
-            "memory.list" => match self.memory.list(&self.durable, args.get("prefix").and_then(Value::as_str), args.get("limit").and_then(Value::as_u64).map(|l| l as usize)) {
+            "memory.list" => match self.memory.list(
+                &self.durable,
+                args.get("prefix").and_then(Value::as_str),
+                args.get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|l| l as usize),
+            ) {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
-            "memory.delete" => match self.memory.delete(&self.durable, args["key"].as_str().unwrap_or("")) {
+            "memory.delete" => match self
+                .memory
+                .delete(&self.durable, args["key"].as_str().unwrap_or(""))
+            {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
             // ---- artifacts ----
             "artifact.create" => {
-                let content = match (args.get("content"), args.get("from_step").and_then(Value::as_str)) {
+                let content = match (
+                    args.get("content"),
+                    args.get("from_step").and_then(Value::as_str),
+                ) {
                     (Some(c), _) => c.clone(),
-                    (None, Some(step)) => match caller.run.as_ref().and_then(|r| self.runs.get(r)).and_then(|r| r.steps.get(step)).and_then(|s| s.output.clone()) {
+                    (None, Some(step)) => match caller
+                        .run
+                        .as_ref()
+                        .and_then(|r| self.runs.get(r))
+                        .and_then(|r| r.steps.get(step))
+                        .and_then(|s| s.output.clone())
+                    {
                         Some(o) => o,
-                        None => return err(format!("artifact.create: from_step {step:?} has no output")),
+                        None => {
+                            return err(format!(
+                                "artifact.create: from_step {step:?} has no output"
+                            ));
+                        }
                     },
-                    (None, None) => return err("artifact.create: content or from_step is required".into()),
+                    (None, None) => {
+                        return err("artifact.create: content or from_step is required".into());
+                    }
                 };
                 let owner = caller.run.clone().or_else(|| caller.ctx.clone());
                 match self.artifacts.create(
@@ -380,7 +421,10 @@ impl Runtime {
                         mime: args.get("mime").and_then(Value::as_str),
                         content,
                         created_by: Some(&by),
-                        sensitive: args.get("sensitive").and_then(Value::as_bool).unwrap_or(false),
+                        sensitive: args
+                            .get("sensitive")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                         owner: owner.as_deref(),
                     },
                 ) {
@@ -392,22 +436,38 @@ impl Runtime {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
-            "artifact.delete" => match self.artifacts.delete(&self.durable, args["id"].as_str().unwrap_or("")) {
+            "artifact.delete" => match self
+                .artifacts
+                .delete(&self.durable, args["id"].as_str().unwrap_or(""))
+            {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
-            "artifact.list" => ok(self.artifacts.list(args.get("prefix").and_then(Value::as_str), args.get("limit").and_then(Value::as_u64).map(|l| l as usize), None)),
+            "artifact.list" => ok(self.artifacts.list(
+                args.get("prefix").and_then(Value::as_str),
+                args.get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|l| l as usize),
+                None,
+            )),
             // ---- plan ----
             "plan.create" => {
                 let ctx_id = caller.context_id();
-                let max = self.settings.context.plan.max_items.unwrap_or(plan::DEFAULT_MAX_ITEMS as u32) as usize;
+                let max = self
+                    .settings
+                    .context
+                    .plan
+                    .max_items
+                    .unwrap_or(plan::DEFAULT_MAX_ITEMS as u32) as usize;
                 let items: Vec<Value> = args["items"].as_array().cloned().unwrap_or_default();
                 match Plan::create(args["goal"].as_str().unwrap_or(""), &items, max) {
                     Ok(p) => {
                         let v = p.to_value();
                         self.context_for(&ctx_id, caller.principal.as_deref()).plan = Some(p);
-                        self.context_for(&ctx_id, caller.principal.as_deref()).touch();
-                        self.log.info("plan.updated", json!({"ctx": ctx_id, "op": "create"}));
+                        self.context_for(&ctx_id, caller.principal.as_deref())
+                            .touch();
+                        self.log
+                            .info("plan.updated", json!({"ctx": ctx_id, "op": "create"}));
                         ok(v)
                     }
                     Err(e) => err(e),
@@ -422,7 +482,12 @@ impl Runtime {
             }
             "plan.update" => {
                 let ctx_id = caller.context_id();
-                let max = self.settings.context.plan.max_items.unwrap_or(plan::DEFAULT_MAX_ITEMS as u32) as usize;
+                let max = self
+                    .settings
+                    .context
+                    .plan
+                    .max_items
+                    .unwrap_or(plan::DEFAULT_MAX_ITEMS as u32) as usize;
                 let c = self.context_for(&ctx_id, caller.principal.as_deref());
                 match c.plan.as_mut() {
                     None => err("plan.update: no plan (call plan.create first)".into()),
@@ -431,7 +496,8 @@ impl Runtime {
                             let mut v = p.to_value();
                             v["progress"] = json!(p.progress());
                             c.touch();
-                            self.log.info("plan.updated", json!({"ctx": ctx_id, "op": "update"}));
+                            self.log
+                                .info("plan.updated", json!({"ctx": ctx_id, "op": "update"}));
                             ok(v)
                         }
                         Err(e) => err(e),
@@ -443,7 +509,8 @@ impl Runtime {
                 let c = self.context_for(&ctx_id, caller.principal.as_deref());
                 let had = c.plan.take().is_some();
                 c.touch();
-                self.log.info("plan.updated", json!({"ctx": ctx_id, "op": "clear"}));
+                self.log
+                    .info("plan.updated", json!({"ctx": ctx_id, "op": "clear"}));
                 ok(json!({"ok": had}))
             }
             // ---- skills ----
@@ -452,13 +519,24 @@ impl Runtime {
                 let ctx_id = caller.context_id();
                 let name = args["name"].as_str().unwrap_or("").to_string();
                 let mcp = self.mcp.clone();
-                let resolver = move |server: &str| -> Option<std::sync::Arc<dyn crate::context::skills::SkillServer>> { mcp.get(server).map(|c| c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>) };
-                match self.skills.load(&name, args.get("arguments").cloned(), &resolver) {
+                let resolver = move |server: &str| -> Option<
+                    std::sync::Arc<dyn crate::context::skills::SkillServer>,
+                > {
+                    mcp.get(server).map(|c| {
+                        c.clone() as std::sync::Arc<dyn crate::context::skills::SkillServer>
+                    })
+                };
+                match self
+                    .skills
+                    .load(&name, args.get("arguments").cloned(), &resolver)
+                {
                     Ok(body) => {
                         let max_loaded = self.settings.skills.max_loaded.unwrap_or(8) as usize;
                         let c = self.context_for(&ctx_id, caller.principal.as_deref());
                         match c.load_skill(&name, &body.hash, max_loaded) {
-                            Ok(()) => ok(json!({"loaded": true, "name": name, "hash": body.hash, "body": body.body})),
+                            Ok(()) => ok(
+                                json!({"loaded": true, "name": name, "hash": body.hash, "body": body.body}),
+                            ),
                             Err(e) => err(e),
                         }
                     }
@@ -474,37 +552,60 @@ impl Runtime {
             "status" => ok(self.status_value()),
             // ---- time ----
             "sleep" => {
-                let d = match crate::config::parse_duration(args["duration"].as_str().unwrap_or("")) {
+                let d = match crate::config::parse_duration(args["duration"].as_str().unwrap_or(""))
+                {
                     Ok(d) => d,
                     Err(e) => return err(format!("sleep: {e}")),
                 };
                 let deadline = now_ms() + d.as_millis() as u64;
                 let owner = match caller.node {
-                    Some(n) => json!({"kind": "tool", "node": n.0, "req": caller.req, "tool": "sleep"}),
+                    Some(n) => {
+                        json!({"kind": "tool", "node": n.0, "req": caller.req, "tool": "sleep"})
+                    }
                     None => json!({"kind": "step", "run": caller.run, "step": caller.step}),
                 };
-                match self.timers.arm(&self.durable, deadline, owner, json!({"slept_ms": d.as_millis() as u64})) {
+                match self.timers.arm(
+                    &self.durable,
+                    deadline,
+                    owner,
+                    json!({"slept_ms": d.as_millis() as u64}),
+                ) {
                     Ok(id) => ToolOutcome::Deferred(PendingKind::Timer { id }),
                     Err(e) => err(format!("sleep: {e}")),
                 }
             }
             "await" => {
                 let cond = args["condition"].as_str().unwrap_or("").to_string();
-                if let Err(e) = crate::cel::compile_check(cond.trim().trim_start_matches("CEL:").trim()) {
+                if let Err(e) =
+                    crate::cel::compile_check(cond.trim().trim_start_matches("CEL:").trim())
+                {
                     return err(format!("await: {e}"));
                 }
-                let timeout = args.get("timeout").and_then(Value::as_str).and_then(|t| crate::config::parse_duration(t).ok()).unwrap_or(Duration::from_secs(600));
-                ToolOutcome::Deferred(PendingKind::Await { condition: cond, deadline_ms: now_ms() + timeout.as_millis() as u64 })
+                let timeout = args
+                    .get("timeout")
+                    .and_then(Value::as_str)
+                    .and_then(|t| crate::config::parse_duration(t).ok())
+                    .unwrap_or(Duration::from_secs(600));
+                ToolOutcome::Deferred(PendingKind::Await {
+                    condition: cond,
+                    deadline_ms: now_ms() + timeout.as_millis() as u64,
+                })
             }
             // ---- context ----
             "context.compact" => {
                 let ctx_id = caller.context_id();
-                let keep_last = args.get("keep_last").and_then(Value::as_u64).map(|k| k as usize).unwrap_or(self.settings.context.keep_last.unwrap_or(12) as usize);
+                let keep_last = args
+                    .get("keep_last")
+                    .and_then(Value::as_u64)
+                    .map(|k| k as usize)
+                    .unwrap_or(self.settings.context.keep_last.unwrap_or(12) as usize);
                 let target = args.get("target_tokens").and_then(Value::as_u64);
                 match caller.node {
                     Some(node) => {
                         self.start_compaction(&ctx_id, keep_last, target, Some((node, caller.req)));
-                        ToolOutcome::Deferred(PendingKind::Think { child: NodeId(u64::MAX) })
+                        ToolOutcome::Deferred(PendingKind::Think {
+                            child: NodeId(u64::MAX),
+                        })
                     }
                     None => err("context.compact needs a calling turn".into()),
                 }
@@ -522,15 +623,24 @@ impl Runtime {
                 // runtime acknowledges. Steps: the `finish` kind.
                 ok(json!({"ok": true}))
             }
-            "ask_human" => err("ask_human: no human channel is configured (A2A conversations land with P5; map ask_human with tools.overrides to use another channel)".into()),
+            // Human-in-the-loop (RFC 0032 §16): gate through the interface, or
+            // apply the configured fallback (fail | wait | auto judge).
+            "ask_human" => self.ask_human_tool(caller, args),
             // ---- subagents ----
-            "subagent.run" | "subagent.send" | "subagent.kill" | "subagent.status" | "subagent.await" | "subagent.list" => self.subagent_tool(caller, name, args),
+            "subagent.run" | "subagent.send" | "subagent.kill" | "subagent.status"
+            | "subagent.await" | "subagent.list" => self.subagent_tool(caller, name, args),
             // ---- workflows ----
-            "workflow.run" | "workflow.list" | "workflow.status" | "workflow.cancel" | "workflow.wait" | "workflow.create" | "workflow.update" | "workflow.delete" | "workflow.pause" | "workflow.resume" | "workflow.signal" => self.workflow_tool(caller, name, args),
+            "workflow.run" | "workflow.list" | "workflow.status" | "workflow.cancel"
+            | "workflow.wait" | "workflow.create" | "workflow.update" | "workflow.delete"
+            | "workflow.pause" | "workflow.resume" | "workflow.signal" => {
+                self.workflow_tool(caller, name, args)
+            }
             // ---- guarded local command runner (RFC 0028 §exec; default-OFF) ----
             #[cfg(feature = "exec")]
             "exec" => self.exec_tool(caller, args),
-            other => err(format!("internal tool {other:?} has no built-in implementation")),
+            other => err(format!(
+                "internal tool {other:?} has no built-in implementation"
+            )),
         }
     }
 
@@ -737,13 +847,17 @@ impl Runtime {
                         done.push((i, json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error}), false));
                     }
                 }
-                PendingKind::Timer { .. } | PendingKind::Think { .. } => {}
+                // Human gates run their own pass (auto-judge + prune + timeout).
+                PendingKind::Timer { .. }
+                | PendingKind::Think { .. }
+                | PendingKind::Human { .. } => {}
             }
         }
         for (i, v, e) in done.into_iter().rev() {
             let p = self.pending.remove(i);
             self.reply(&p.target, v, e);
         }
+        self.poll_pending_human();
     }
 
     /// The variables an `await` condition sees: memory (by key), runs, subagents.

@@ -175,6 +175,28 @@ pub struct Agent {
     pub tools: AgentTools,
     pub max_parallel_turns: Option<u32>,
     pub conversation_budget: Option<Budget>,
+    /// What `ask_human` does when NO human channel can answer — the interface
+    /// is disabled — and, for `auto`, when a gate times out unanswered
+    /// (RFC 0032 §16): `fail` (default; the ask errors immediately), `wait`
+    /// (park until the ask timeout), or `auto` (an LLM judge answers on the
+    /// operator's behalf, conservatively, marked as auto).
+    pub ask_human_fallback: AskHumanFallback,
+}
+
+/// The `ask_human` fallback disposition (RFC 0032 §16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AskHumanFallback {
+    /// Park the ask until its timeout (then it fails).
+    #[serde(alias = "pause", alias = "idle")]
+    Wait,
+    /// Error immediately — the caller (model / workflow policy) decides.
+    #[default]
+    #[serde(alias = "finish", alias = "stop")]
+    Fail,
+    /// An LLM judge answers on the operator's behalf (also fires when an
+    /// interface-served gate times out unanswered). `UNDECIDED` ⇒ fail.
+    Auto,
 }
 
 impl Agent {

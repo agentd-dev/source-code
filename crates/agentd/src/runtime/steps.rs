@@ -404,6 +404,9 @@ impl Runtime {
 
     /// Every tick: advance every live run.
     pub(crate) fn schedule_runs(&mut self) {
+        if self.paused {
+            return; // operator hold (a2a.pause) — steps park until resume
+        }
         let ids: Vec<String> = self
             .runs
             .iter()
@@ -1153,6 +1156,11 @@ impl Runtime {
                         deadline_ms,
                     } => {
                         json!({"kind": "await", "condition": condition, "deadline_ms": deadline_ms})
+                    }
+                    PendingKind::Human {
+                        task, deadline_ms, ..
+                    } => {
+                        json!({"kind": "human", "task": task, "deadline_ms": deadline_ms})
                     }
                 };
                 self.runs

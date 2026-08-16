@@ -28,6 +28,7 @@ export class Mirror {
   private state: MirrorState = {
     conn: 'connecting',
     draining: false,
+    paused: false,
     tasks: new Map(),
     runs: new Map(),
     conversations: new Map(),
@@ -87,6 +88,7 @@ export class Mirror {
     const s = status as { [k: string]: Json };
     this.state.bootstrap = status;
     this.state.draining = s.draining === true;
+    this.state.paused = s.paused === true;
     if (Array.isArray(s.runs)) {
       for (const r of s.runs) {
         const id = (r as { [k: string]: Json }).id;
@@ -133,6 +135,36 @@ export class Mirror {
       taskId,
       pending: true,
     });
+    this.bump();
+  }
+
+  /**
+   * Hydrate the transcript from a conversation's stored history
+   * (`conversation.get`, debug) — used once at attach, only while the
+   * transcript is still empty, so live feed entries always win. Entries get
+   * stable `hist-` keys and settle immediately.
+   */
+  backfillTranscript(ctx: string, messages: Json[]): void {
+    if (this.state.transcript.length > 0) return;
+    let i = 0;
+    for (const m of messages) {
+      const o = m as { [k: string]: Json };
+      const role = o.role as string;
+      const ts = (o.ts as number) ?? 0;
+      if (role === 'user' && typeof o.text === 'string') {
+        this.upsertEntry({
+          key: `hist-${ctx}-${i++}`,
+          ctx,
+          ts,
+          kind: 'user',
+          text: o.text,
+          principal: (o.principal as string) ?? undefined,
+        });
+      } else if (role === 'assistant' && typeof o.text === 'string' && o.text.length > 0) {
+        this.upsertEntry({ key: `hist-${ctx}-${i++}`, ctx, ts, kind: 'agent', text: o.text });
+      }
+    }
+    if (i > 0) this.note(`(restored ${i} earlier messages of ${ctx})`);
     this.bump();
   }
 
@@ -236,12 +268,17 @@ export class Mirror {
       case 'status': {
         this.state.status = ev.data;
         this.state.draining = data.draining === true;
+        if (typeof data.paused === 'boolean') this.state.paused = data.paused;
         break;
       }
       case 'lifecycle': {
         if (data.draining === true) {
           this.state.draining = true;
           this.note(`agentd is draining (${(data.reason as string) ?? ''})`);
+        }
+        if (typeof data.paused === 'boolean') {
+          this.state.paused = data.paused;
+          this.note(data.paused ? `agentd paused (${(data.reason as string) ?? 'operator'})` : 'agentd resumed');
         }
         break;
       }

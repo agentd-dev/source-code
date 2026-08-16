@@ -69,6 +69,10 @@ function item(name: string, c: ChromeCtx): React.JSX.Element | null {
         <Text key={key} color={theme.warn} bold>
           DRAINING
         </Text>
+      ) : s.paused ? (
+        <Text key={key} color={theme.warn} bold>
+          PAUSED
+        </Text>
       ) : null;
     case 'active':
       return c.active > 0 ? (

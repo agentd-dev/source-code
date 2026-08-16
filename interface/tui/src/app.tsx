@@ -167,7 +167,7 @@ export function App(props: AppProps): React.JSX.Element {
         switch (cmd) {
           case 'help':
             mirror.note(
-              '/new · /tasks · /subagents · /debug · /status · /config [path] · /set <path> <value> · /workflow <name> · /cancel [task] · /pair · /drain · /quit — plus @skill, #target, $value in messages',
+              '/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow <name> · /signal <name> · /send <handle> <msg> · /pause [run] · /resume [run] · /plan · /cancel [task] · /pair · /drain · /quit — plus @skill, #target, $value in messages',
             );
             break;
           case 'new':
@@ -225,6 +225,54 @@ export function App(props: AppProps): React.JSX.Element {
             }
             const r = (await client.configSet(path, value)) as { [k: string]: Json };
             mirror.note(`set ${path} = ${JSON.stringify((r.set as { [k: string]: Json })?.value ?? value)}`);
+            break;
+          }
+          case 'signal': {
+            const [name, run] = rest;
+            if (!name) {
+              mirror.note('usage: /signal <name> [run]', 'error');
+              break;
+            }
+            const r = (await client.signal(name, undefined, run)) as { [k: string]: Json };
+            mirror.note(`signal ${name} → delivered ${(r as { delivered?: number }).delivered ?? '?'}`);
+            break;
+          }
+          case 'send': {
+            const [handle, ...msg] = rest;
+            if (!handle || msg.length === 0) {
+              mirror.note('usage: /send <handle> <message>', 'error');
+              break;
+            }
+            await client.subagentSend(handle, msg.join(' '));
+            mirror.note(`sent to ${handle}`);
+            break;
+          }
+          case 'pause': {
+            const r = (await client.pause(arg || undefined)) as { [k: string]: Json };
+            mirror.note(arg ? `paused ${arg}` : 'instance paused — /resume to release');
+            void r;
+            break;
+          }
+          case 'resume': {
+            await client.resume(arg || undefined);
+            mirror.note(arg ? `resumed ${arg}` : 'instance resumed');
+            break;
+          }
+          case 'conversations': {
+            const convs = [...s.conversations.values()] as { [k: string]: Json }[];
+            if (convs.length === 0) {
+              mirror.note('no conversations yet');
+              break;
+            }
+            const lines = convs
+              .map((c) => `#${c.id}  ${c.messages ?? 0} msgs · ${c.turns ?? 0} turns${c.principal ? ` · ${c.principal}` : ''}`)
+              .join('\n');
+            mirror.note(`conversations:\n${lines}\nstart a message with #<id> to address one`);
+            break;
+          }
+          case 'plan': {
+            const p = (await client.planGet(arg || undefined)) as { [k: string]: Json };
+            mirror.note(`plan: ${JSON.stringify(p.plan ?? null).slice(0, 800)}`);
             break;
           }
           case 'pair': {

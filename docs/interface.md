@@ -96,9 +96,10 @@ Both clients speak the same surface:
 - **The composer speaks four prefixes** (suggestions appear as you type; Tab
   accepts):
   - `/` — commands: `/help /new /tasks /subagents /debug /status
-    /config [path] /set <path> <value> /workflow <name> /cancel [task] /pair
-    /drain /quit` — **plus every workflow as a shortcut** (`/deploy` runs the
-    `deploy` workflow; system names win).
+    /config [path] /set <path> <value> /workflow <name> /signal <name> [run]
+    /send <handle> <text> /pause [run] /resume [run] /plan /cancel [task]
+    /pair /drain /quit` — **plus every workflow as a shortcut** (`/deploy`
+    runs the `deploy` workflow; system names win).
   - `@` — **skills**: `@release-notes` autocompletes from the daemon's
     catalogue and stays in the text (agentd preloads referenced skills).
   - `#` — **targets**: start a message with `#task-…` to answer/continue that
@@ -107,6 +108,20 @@ Both clients speak the same surface:
   - `$` — **live values**: `$model $instance $version $turns $tokens $tasks`
     interpolate daemon state into your message; `$$` escapes a dollar.
 - **Tasks** — every task your principal may see, live states, cancel.
+- **Approvals & questions (human-in-the-loop)** — when the agent (or a
+  workflow's `human` step) needs you, the transcript shows the question as an
+  answerable row (`[reply to continue]`); just type your answer (it targets
+  the newest gate; `#task-…` targets a specific one). Gates on workflow runs
+  survive daemon restarts. Configure what happens when NOBODY can answer with
+  `agent.ask_human_fallback`: `fail` (default), `wait` (park until the ask
+  timeout), or `auto` — an LLM judge answers on the operator's behalf,
+  conservatively, always marked as auto (it also fires when a rendered gate
+  times out unanswered).
+- **Steering** — `/signal <name> [run]` fires a workflow signal;
+  `/send <handle> <text>` messages a warm subagent; `/pause [run]` /
+  `/resume [run]` hold one run or the whole instance (reversible — intake
+  continues, execution parks; the status bar shows PAUSED); `/plan` reads a
+  conversation's working plan.
 - **Subagents** — the live list (handle · mode · status · tokens); select/click
   one for the detail view (instruction, result, attempts, errors — needs
   debug) and step back to the list. TUI: `↑/↓` + Enter, `Esc` back.
@@ -127,8 +142,9 @@ interface:
 ```
 
 Items: `name` `version` `instance` `model` `endpoint` `conn` `debug`
-`draining` `active` `turns` `tokens` `tool_calls` `runs` `subagents`
-`conversations` `screen` `keys` `clock`. Unknown items are skipped (a warning
+`draining` (the lifecycle notice — shows **DRAINING** or **PAUSED**) `active`
+`turns` `tokens` `tool_calls` `runs` `subagents` `conversations` `screen`
+`keys` `clock`. Unknown items are skipped (a warning
 at config validation); `screen`/`keys` are TUI-only. Omit `display` for the
 defaults. The layout is also **runtime-shapeable**:
 `/set interface.display.bottom ["conn","model","tokens"]` re-shapes every

@@ -151,6 +151,9 @@ other tools come from connected MCP servers. Be concise and factual; never inven
 
     /// Dispatch queued turns: per-context serialization + the parallel cap.
     pub(crate) fn dispatch_turns(&mut self) {
+        if self.paused {
+            return; // operator hold (a2a.pause) — turns queue until resume
+        }
         if self.draining || self.turn_queue.is_empty() {
             return;
         }

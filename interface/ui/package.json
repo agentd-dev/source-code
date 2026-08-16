@@ -29,5 +29,19 @@
   },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentd-dev/source-code.git",
+    "directory": "interface/ui"
+  },
+  "homepage": "https://agentd.dev",
+  "keywords": [
+    "agentd",
+    "agent",
+    "a2a",
+    "llm",
+    "web",
+    "ui"
+  ]
 }

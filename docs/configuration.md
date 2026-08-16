@@ -6,17 +6,30 @@ configuration is assembled and **validated before any side effect**: a bad flag,
 a missing endpoint, or an unresolvable secret reference exits `2` in
 milliseconds, not after an LLM round-trip or an MCP handshake.
 
-> **Build status.** The runtime is implemented: config validation, the agentic
-> loop, the supervisor + subagent tree, the MCP client, all five run modes, the
-> reactive router + self-scheduling, the served self-MCP, the declarative config
-> file (`--config`) with hot reload (SIGHUP + inotify), horizontal scaling
-> (`--shard`/`--claim`/`--standby`, `cluster` feature), and multi-endpoint
-> intelligence failover are all live (see [`docs/design/PLAN.md`](design/PLAN.md)).
-> The flag/env surface below is derived verbatim from the binary's `--help`
-> (`help_text()`) and the actual flag/env parsing in
-> [`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs). Where a flag
-> needs a build feature, that is called out — a feature-gated flag that is set
-> in a build without its feature exits `2`, never silently no-ops.
+> **agentd 2.0.** The runtime is a durable, single-writer event loop over a
+> remote state store (RFC 0025–0030). Configuration is the nested
+> **`config_version: "2"`** document, with sections `agent`, `intelligence`,
+> `mcp`, `tools`, `store`, `memory`, `context`, `knowledge`, `search`, `skills`,
+> `workflows`, `limits`, `lifecycle`, `a2a`, `observability`, `security`. Every
+> **path** in that schema is also an env var (`limits.max_runs` ⇒
+> `AGENTD_LIMITS_MAX_RUNS`) and a flag (`--limits.max-runs`); a handful of legacy
+> names survive as **aliases** (`--instruction`, `--intelligence`, `--model`,
+> `--mcp`, `--config`, `--log-level`, …). The authoritative machine-readable
+> schema is **`agentd --config-schema=2`**; **`agentd --capabilities`** prints the
+> effective configured surface; **`agentd --validate-config`** validates without
+> side effects (exit 2 on error).
+>
+> **Removed in 2.0.** The 1.x flat schema and the mode/trigger flags — `--mode`,
+> `--subscribe`, `--continue`, `--interval`, `--cron`, `--claim`
+> (`-ttl`/`-renew-fraction`), `--standby`, `--assign-from` — were removed in the
+> mode cut-over; each is **rejected with a migration hint** naming the workflow
+> start node that replaces it, and a 1.x *document* is likewise rejected.
+> **Repurposed, not removed:** `--serve-mcp` → `a2a.listen`, `--serve-bearer` →
+> `a2a.bearer`, `--serve-cert`/`--serve-key`/`--serve-client-ca` → `a2a.tls.*`,
+> `--shard` → `cluster.shard` all survive as aliases. The flag/env table and
+> §§3.4–3.6, §6, §13 below are retained as a **1.x migration reference** only; see
+> the 1.x → 2.0 migration table in
+> [`modes-and-triggers.md`](modes-and-triggers.md).
 
 ---
 
@@ -32,16 +45,56 @@ built-in default  <  config file  <  env var  <  CLI flag
 ```
 
 - **built-in default** — the compiled-in defaults (see the table below).
-- **config file** — a local-only JSON file (`--config <path>` / `AGENT_CONFIG`)
-  carrying verbose **structural** config (the MCP-server inventory, declared
-  subscriptions, A2A peers, limits, model/log knobs, intelligence endpoint list +
-  headers). **Live** (RFC 0017 §3). It slots between *default* and *env*, so env
-  and flags still override it. **Repeatable list flags ADD to the file's lists**
-  (`--mcp`/`--subscribe`/`--a2a-peer` append to what the file declares). Secrets
-  are **never** stored in the file — only `{{secret:NAME}}` / `{{secret-file:PATH}}`
-  *references* (§12). See §12 for the full file schema.
+- **config file(s)** — local-only **YAML or JSON** files (`--config <path>`,
+  repeatable; `AGENT_CONFIG=a.yaml:b.yaml`) carrying verbose **structural**
+  config (the MCP-server inventory, declared subscriptions, A2A peers, limits,
+  model/log knobs, intelligence endpoint list + headers). **Live** (RFC 0017
+  §3). Several files compose into **one document, in order — a later file
+  overrides the earlier ones** (§12.1). The merged document slots between
+  *default* and *env*, so env and flags still override it. **Repeatable list
+  flags ADD to the file's lists** (`--mcp`/`--subscribe`/`--a2a-peer` append to
+  what the files declare). Secrets are **never** stored in a file — only
+  `{{secret:NAME}}` / `{{secret-file:PATH}}` *references* (§12). See §12 for
+  the full file schema.
 - **env var** — every setting that has an env equivalent (12-factor). Live.
-- **CLI flag** — highest precedence; overrides env. Live.
+  Every **config-file path** is an env var too, named after the path
+  (`limits.max_steps` ⇒ `AGENTD_LIMITS_MAX_STEPS`; §1.1).
+- **CLI flag** — highest precedence; overrides env. Live. Every config-file
+  path is a flag too (`--limits.max-steps 5`; §1.1).
+
+### 1.1 Config paths — one name, three sources
+
+Every path in the config file's schema is settable from **all three** sources
+with a name derived mechanically from the path, so nothing needs per-field
+plumbing (`agentd --help` prints the full table under `CONFIG PATHS`):
+
+| source | name for the path `limits.max_steps` |
+|---|---|
+| file (YAML or JSON) | `limits: { max_steps: 5 }` |
+| env | `AGENTD_LIMITS_MAX_STEPS` › `AGENT_LIMITS_MAX_STEPS` › bare `LIMITS_MAX_STEPS` (first present wins) |
+| flag | `--limits.max_steps 5` = `--limits.max-steps 5` = `--limits-max-steps 5` |
+
+Values are **typed by the schema**: integers/numbers/booleans parse, enums are
+checked against their set, a list takes a `[a, b]` literal or a comma-separated
+`a, b`, an object takes a `{k: v}` (or JSON) literal, everything else is the
+verbatim string. A value that does not type is exit `2` naming the source
+(`invalid AGENTD_LIMITS_MAX_STEPS: expected an integer, got "many"`).
+
+**Setting a path SETS its value.** From env or a `--<path>` flag, a list or map
+path *replaces* what the files declared (`AGENTD_SUBSCRIBE=a,b` ⇒ exactly
+`[a, b]`; `--mcp-servers '[{name: q, endpoint: https://…}]'` ⇒ exactly that
+list). The **named repeatable flags** (`--mcp`, `--subscribe`, `--a2a-peer`,
+`AGENT_A2A_PEER`) *add* one element, as they always did. The named scalar
+flags/env vars in §3 (`--max-steps`, `AGENT_MAX_STEPS`, …) keep working
+unchanged.
+
+**Dotted flags reach into objects.** `--limits.max-steps 5` sets a nested
+schema path; `--intelligence_headers.x-team ops` sets ONE entry of a free-form
+map (the key keeps its exact spelling — `x-team` is not canonicalized) and
+merges with the map's other entries; `--intelligence-headers '{k: v}'` sets the
+whole map. Array elements are not addressable by path (`--mcp-servers.0.aauth`
+is refused with a clear message): set the whole list, or use the named
+repeatable flag.
 
 Example — a flag beats the environment:
 
@@ -81,22 +134,13 @@ Validations enforced at startup (each is also collected by `--validate-config`,
 | every `--mcp` has a name and a valid endpoint | `mcp server '<name>' has empty name or endpoint` / `mcp server '<name>': endpoint must be https:// (loopback http:// for dev)` |
 | `--max-steps` > 0 | `--max-steps must be > 0` |
 | `--events-ring` > 0 | `--events-ring must be > 0` |
-| `--mode reactive` has ≥1 `--subscribe`/`--continue` | `--mode reactive requires at least one --subscribe or --continue <uri>` |
-| `--continue` only with `--mode reactive` | `--continue is only valid with --mode reactive` |
-| `--mode schedule` has an interval or cron | `--mode schedule requires --interval <dur> or --cron <expr>` |
-| `--cron` only with `--mode schedule` | `--cron is only valid with --mode schedule` |
-| `--mode workflow` has a `--workflow <file>` (feature `workflow`) | `--mode workflow requires --workflow <file>` |
-| `--workflow` only with `--mode workflow` | `--workflow is only valid with --mode workflow` |
+| a **long-lived** instance (an `a2a.listen`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a` start node) configures a durable `store` | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: mcp \| http)` |
+| an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key` | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` |
+| no **removed** 1.x flag (`--mode`/`--subscribe`/`--continue`/`--interval`/`--cron`/`--claim*`/`--standby`/`--assign-from`/`--workflow-resume*`) and no `config_version: "1"` document | `<flag> was removed in agentd 2.0: <migration hint>` |
 | `--cgroup-memory-max`/`--cgroup-pids-max` need `--cgroup` | `--cgroup-memory-max/--cgroup-pids-max require --cgroup` |
 | `--cgroup-*-max` not `0` | `--cgroup-pids-max must be > 0 … or 'max'` / `--cgroup-memory-max must be > 0 or 'max'` |
 | `--serve-mcp` target scheme/port valid | `--serve-mcp: scheme unsupported …` |
-| `--shard K/N` well-formed (`N>0`, `K<N`) | `--shard: K must be < N (got K/N)` / `--shard: N must be > 0` |
-| `N>1` needs the `cluster` feature | `--shard requires the 'cluster' build feature` |
-| `--claim` needs the `cluster` feature | `--claim requires the 'cluster' build feature` |
-| each `--claim`/`--assign-from` server is a declared `--mcp` | `--claim route '<uri>' names coordination server '<srv>', which is not a declared --mcp server` |
-| `--claim-renew-fraction` in `(0, 1)` | `--claim-renew-fraction must be in (0, 1) (got: …)` |
-| `--standby`/`--assign-from` need the `cluster` feature | `--standby / --assign-from require the 'cluster' build feature` |
-| `--standby`/`--assign-from` only with `--mode reactive` | `--standby / --assign-from are only valid with --mode reactive` |
+| *(1.x `cluster` reference — §13)* `--shard K/N` well-formed + needs the `cluster` feature; `--claim`/`--standby`/`--assign-from` are **removed** | `--shard: N must be > 0` / `<flag> was removed in agentd 2.0` |
 | `--watch-config` needs the `config-watch` feature | `--watch-config requires the 'config-watch' build feature` |
 | `--watch-config` needs a `--config` file | `--watch-config requires a config file (--config / AGENT_CONFIG)` |
 | `--a2a-peer` needs the `a2a` feature; each endpoint scheme valid | `--a2a-peer requires the 'a2a' build feature` |
@@ -133,7 +177,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 | `--instruction <TEXT>` | `INSTRUCTION` (or `AGENT_INSTRUCTION`) | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule` (and reactive, which reuses it per reaction). A prefixed spelling wins over the bare one. |
 | `--instruction-file <PATH>` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). Sets `instruction`. |
 | `--intelligence <LIST>` | `AGENT_INTELLIGENCE` (or bare `INTELLIGENCE`) | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `https://host/…` (or a loopback `http://` for a same-host dev gateway) — see §4. A prefixed spelling wins over the bare one. |
-| `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative JSON config file (§12). |
+| `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). |
 
 ### 3.2 Intelligence
 
@@ -151,15 +195,15 @@ without the feature, they exit `2` (§2), never silently no-op.
 | Flag | Env | Default | Description |
 |---|---|---|---|
 | `--mcp name=<endpoint>` | — | *(none)* | Declare a remote MCP server, reached over **Streamable HTTP** — `name=https://host[:port][/path]` (or a loopback `http://` for dev). agentd spawns no local process. Repeatable. See §5. **Reloadable** (§11). |
-| `--serve-mcp <TARGET>` | `AGENT_SERVE_MCP` | *(off)* | Serve agent's own MCP so agents compose: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). Needs `--features serve-https`. |
+| `--serve-mcp <TARGET>` (→ `a2a.listen`) | `AGENT_SERVE_MCP` | *(off)* | Arm the A2A v2 listener (the external channel + operator control): `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). Retained alias for `--listen` / `a2a.listen`. Needs `--features a2a`. |
 | `--a2a-peer name=<ENDPOINT>` | `AGENT_A2A_PEER` | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`). Repeatable (the env channel declares one). Needs `--features a2a`. |
-| `--workflow <FILE>` | `AGENT_WORKFLOW` | *(none)* | Path to a pinned workflow JSON, driven by `--mode workflow`. Needs `--features workflow`. See [workflows.md](workflows.md). |
-| `--workflow-resume <REF>` | `AGENT_WORKFLOW_RESUME` | *(none)* | Resume a pinned workflow from a checkpoint (RFC 0021 §8.4): `<server>:<key>[@seq]` — `server` is a configured `--mcp` checkpointer, `@seq` pins a specific envelope (fork). Only with `--mode workflow`; validated pre-network (unknown server name is exit `2`). A workflow-hash mismatch at resume is a refusal (exit `5`). |
+| `--workflow <FILE>` | `AGENT_WORKFLOW` | *(none)* | Append a workflow definition (v3 dialect, RFC 0027) to `workflows:` — its start node is the trigger. Repeatable; the same as an inline `workflows:` entry. See [RFC 0027](../rfcs/0027-workflow-dialect-3.md). |
+| `--workflow-resume` *(removed in 2.0)* | — | — | Durable runs now **resume automatically** from the store on restart (RFC 0025); set `resume_policy` per workflow (`force` to always restart). The 1.x `--workflow-resume`/`--workflow-resume-force` flags are rejected with this hint. |
 | `--workflow-resume-force` | — | `false` | Override the resume hash check (deliberate graph-edit-and-continue): loop guards reset, board + budget keep. Requires `--workflow-resume`. |
 | `--mcp-tags name=tag,tag` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a `--mcp` server (order-independent). Repeatable. |
 | `--allow-trifecta` | `AGENT_ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
 
-### 3.4 Mode & triggers
+### 3.4 Mode & triggers — *1.x reference (removed in 2.0; see §14 and [modes-and-triggers.md](modes-and-triggers.md))*
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
@@ -196,7 +240,7 @@ unbounded — today's behaviour.
   fleet, `AGENT_BUDGET_TOKENS` is per-member (each pod carries its own instance
   budget); an aggregate fleet cap remains a gateway concern.
 
-### 3.5 Sharding / work-claim / standby (`--features cluster`)
+### 3.5 Sharding / work-claim / standby (`--features cluster`) — *1.x reference*
 
 Horizontal scaling (RFC 0019). All of these are **restart-only** (§11) and
 need the `cluster` build feature; set without it (with `N>1` for the shard),
@@ -237,7 +281,7 @@ each exits `2`. See §13 for the fleet model.
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative JSON config file (§12). The lowest non-default precedence layer. |
+| `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
 | `--validate-config` | — | — | Load + validate (file + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free; needs no instruction to validate. |
 | `--config-schema` | — | — | Print the config-file JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free (short-circuits before the file is even read). |
 | `--watch-config` | `AGENT_WATCH_CONFIG` | `false` | Watch the `--config` file's directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs `--features config-watch` **and** a `--config`/`AGENT_CONFIG` file (both validated, exit `2`). See §11. |
@@ -331,10 +375,17 @@ and a non-`https`/non-loopback-`http` endpoint is rejected at startup. All exit 
 
 ---
 
-## 6. Modes
+## 6. Modes — **removed in 2.0 (1.x migration reference)**
 
-`--mode` selects the exit predicate — one supervisor loop, four termination
-policies (RFC 0008). The lifecycle, config, and signal machinery are identical
+> `--mode` and the five modes were removed in the mode cut-over. In 2.0 the
+> process shape is `lifecycle.run_until` (job vs daemon) and the recurring/
+> reactive shapes are workflow **start nodes** (`once`/`loop`/`schedule`/
+> `subscribe`/`signal`/`event`/`manual`/`a2a`). See
+> [`modes-and-triggers.md`](modes-and-triggers.md) for the mapping. The 1.x
+> content below is retained only to explain what each old mode migrates to.
+
+`--mode` selected the exit predicate — one supervisor loop, four termination
+policies (RFC 0008). The lifecycle, config, and signal machinery were identical
 across modes.
 
 | Mode | Behavior | Extra requirement |
@@ -427,10 +478,9 @@ acts (RFC 0011 §6.4).
 lands.
 
 ```console
-$ agentd --instruction 'serve reactions' \
-    --intelligence https://gw.example/v1 \
-    --mode reactive --subscribe 'file:///data/in.json' \
-    --drain-timeout 20s
+# a daemon (an a2a.listen and/or a subscribe start node + a durable store — see §14),
+# with a bounded graceful drain:
+$ agentd --config daemon.yaml --drain-timeout 20s
 ```
 
 A **second** `SIGTERM`/`SIGINT` forces an immediate `SIGKILL` of all process
@@ -439,9 +489,10 @@ groups.
 **`SIGHUP` reloads** in a `--features hot-reload` build (§11): it re-reads the
 config file and applies the **reloadable subset** at a reactive quiesce boundary,
 validate-first. In a build **without** `hot-reload`, `SIGHUP` keeps its default
-disposition (terminates) — restart to reconfigure. Restart-only fields (mode,
-`run_id`, `serve_mcp`, `drain_timeout`, shard/claim/standby routing, `continue`
-topology) never reload (§11).
+disposition (terminates) — restart to reconfigure. Restart-only fields
+(`lifecycle.run_until`, `a2a.listen`/`a2a.tls`, `store`, `lifecycle.run_id`,
+`lifecycle.drain_timeout`, and the workflow start-node topology) never reload
+(§11).
 
 ---
 
@@ -515,14 +566,49 @@ it reports the reloadable-subset consistency errors an admission webhook needs).
 
 ## 12. The config file (`--config`, RFC 0017 §3)
 
-`--config <PATH>` / `AGENT_CONFIG` loads a single **JSON** document (JSON, not
-YAML — `serde_yaml` is a forbidden dependency; render a ConfigMap as JSON).
-`//` and `/* */` comments are tolerated. It is the **lowest non-default
-precedence layer**: env and flags override it, and repeatable list flags
+`--config <PATH>` (repeatable) / `AGENT_CONFIG` loads one or more documents in
+**YAML or JSON** (§12.1 for how several compose). The extension picks the syntax
+(`.yaml`/`.yml` ⇒ YAML, `.json`/`.jsonc` ⇒ JSON with `//`/`/* */` comments);
+any other extension is sniffed (a document starting with `{`/`[` is JSON, else
+YAML). YAML is read by agentd's own
+dependency-free subset reader (mappings, sequences, flow collections, quoted /
+plain / block `|` `>` scalars, comments, YAML 1.2 core typing — `yes`/`on` are
+strings, not booleans); anchors/aliases, tags, merge keys and multi-document
+streams are rejected with a line/column error, as are tab indentation and
+duplicate keys. Both syntaxes yield the same document, validated identically.
+It is the **lowest non-default precedence layer**: env and flags override it, and repeatable list flags
 (`--mcp`/`--subscribe`/`--a2a-peer`) **add to** the file's lists. An unknown key
 is a hard error (`deny_unknown_fields` → exit `2`) — the most common config typo,
 closed at parse time. Print the schema with `--config-schema` (Draft 2020-12,
 exit `0`); validate a candidate with `--validate-config`.
+
+### 12.1 Several files — later overrides earlier
+
+The files in play are, in order: every entry of `AGENT_CONFIG` (a `:`-separated,
+PATH-style list), then every `--config <path>` in argument order. They compose
+into **one document** with JSON-Merge-Patch semantics (RFC 7396): **objects
+merge key by key (recursively), scalars and lists are replaced by the later
+file, and an explicit `null` unsets a key**. Each file is type-checked on its
+own (an unknown key names the file it is in), then the merged document is
+applied as the file layer — env and flags still override it. `config.loaded`
+lists the merged files (`config_files`); with `--watch-config`, every file is
+watched and a change to any of them re-merges the whole set on reload.
+
+```console
+$ AGENT_CONFIG=/etc/agentd/base.yaml \
+    agentd --config /etc/agentd/site.yaml --config ./local-overrides.yml …
+# base.yaml < site.yaml < local-overrides.yml < env < flags
+```
+
+```yaml
+# base.yaml                    # site.yaml
+model: default-model           model: site-model        # replaces
+limits:                        limits:
+  max_steps: 50                  max_depth: 3           # merges: max_steps 50 kept
+  max_depth: 4
+subscribe: [queue://a]         subscribe: [queue://b]   # REPLACES: [queue://b]
+log_level: debug               log_level: null          # unsets → built-in default
+```
 
 **The file carries only structural config, never secrets.** Settable fields
 (everything else stays env/flag):
@@ -540,7 +626,12 @@ exit `0`); validate a candidate with `--validate-config`.
 | `subscribe[]` | `--subscribe` | Each string is one subscription URI. Seeds the list. |
 | `a2a_peers[]` | `--a2a-peer` | `{name, endpoint}`. Seeds the list. |
 | `log_level` | `--log-level` | Reloadable. |
-| `intelligence_headers{}` | *(file-only)* | Declared intelligence HTTP headers (RFC 0006 §3). **No flag/env equivalent** — settable only here. Values may carry `{{secret:NAME}}` / `{{secret-file:PATH}}` refs; a credential-shaped header (e.g. `Authorization`) with an *inline* value is rejected (exit `2`). |
+| `intelligence_headers{}` | `--intelligence-headers '{…}'` | Declared intelligence HTTP headers (RFC 0006 §3). Values may carry `{{secret:NAME}}` / `{{secret-file:PATH}}` refs; a credential-shaped header (e.g. `Authorization`) with an *inline* value is rejected (exit `2`). |
+
+Every row is also reachable by its **path** from env and flags (§1.1):
+`limits.max_steps` ⇒ `AGENTD_LIMITS_MAX_STEPS` / `--limits.max-steps`,
+`mcp_servers` ⇒ `AGENTD_MCP_SERVERS='[{name: fs, endpoint: https://…}]'`, and so
+on — `agentd --help` lists the full `CONFIG PATHS` table.
 
 **Secret references.** A header (or any file value that needs one) carries a
 secret by **reference**, never inline:
@@ -555,6 +646,36 @@ The intelligence **credential** itself is *not* a file field — use
 `--intelligence-token` / `AGENT_INTELLIGENCE_TOKEN`, `--intelligence-token-file` /
 `AGENT_INTELLIGENCE_TOKEN_FILE`, or the per-endpoint `_<N>` / `_<N>_FILE` env
 vars (§4).
+
+A YAML example (`/etc/agentd/config.yaml`):
+
+```yaml
+# structural config; secrets stay in env / mounted files
+config_version: "1.0"
+intelligence: https://primary.internal/v1,https://fallback.internal/v1
+model: my-model
+model_swap: finish-on-old
+limits:
+  max_steps: 80
+  max_depth: 3
+  deadline_secs: 300
+mcp_servers:
+  - name: fs
+    endpoint: https://mcp-fs.internal/mcp
+    tags:
+      "*": [sensitive]
+  - name: web
+    endpoint: https://mcp-web.internal/mcp
+    headers:
+      Authorization: "Bearer {{secret:WEB_TOKEN}}"   # a reference, never inline
+    tags:
+      "*": [untrusted_input, egress]
+subscribe:
+  - queue://inbox
+log_level: info
+```
+
+And a JSON one:
 
 ```jsonc
 // /etc/agentd/config.json — structural config; secrets stay in env / mounted files
@@ -586,7 +707,7 @@ For the reloadable-vs-restart-only partition of these fields, see §11.
 
 ---
 
-## 13. Horizontal scaling — sharding, work-claim, standby (`--features cluster`)
+## 13. Horizontal scaling — sharding, work-claim, standby (`--features cluster`) — *1.x reference*
 
 Three `cluster`-gated surfaces let a fleet of identical agentd replicas process a
 shared workload without duplicating it (RFC 0019). All are **restart-only** (§11).
@@ -647,45 +768,73 @@ $ agentd --mode reactive \
 
 ---
 
-## 14. A complete example
+## 14. A complete example (agentd 2.0)
 
-```console
-$ agentd \
-    --instruction-file /etc/agentd/task.txt \
-    --intelligence https://llm.internal/v1 \
-    --intelligence-token "$LLM_KEY" \
-    --model my-model \
-    --mcp fs=https://mcp-fs.internal/mcp \
-    --mcp queue=https://mcp-queue.internal/mcp \
-    --mode once \
-    --max-steps 80 --max-tokens 150000 --deadline 5m \
-    --max-depth 3 \
-    --run-id "$JOB_NAME" \
-    --drain-timeout 20s \
-    --log-level info \
-    --health-file /run/agent/health
+A **daemon** that serves A2A, watches a queue, and runs a durable workflow — the
+whole configuration in one `config_version: "2"` file:
+
+```yaml
+# /etc/agentd/agentd.yaml
+config_version: "2"
+
+agent:
+  name: triage
+  instruction: You triage incoming items and escalate the risky ones.
+  preflight: auto
+
+intelligence:
+  endpoints: [https://llm.internal/v1, https://llm-fallback.internal/v1]  # ordered failover
+  model: my-model
+  token: "{{secret:LLM_KEY}}"          # a reference, never the value
+  budget:
+    windows: [{ per: hour, tokens: 2000000 }]    # rate-limit the token burn
+
+mcp:
+  servers:
+    - { name: fs,    endpoint: https://mcp-fs.internal/mcp }
+    - { name: queue, endpoint: https://mcp-queue.internal/mcp }
+    - { name: state, endpoint: https://mcp-state.internal/mcp }
+
+store:                                  # a daemon must be durable (RFC 0025)
+  kind: mcp
+  mcp: { server: state }
+
+a2a:                                    # the external channel (RFC 0029)
+  listen: https://0.0.0.0:8443
+  tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/clients.pem }
+  principals:
+    - { match: { san: "spiffe://ops/*" },  role: operator }
+    - { match: { san: "spiffe://team/*" }, role: user, grants: [workflow.*] }
+
+workflows:
+  - name: watch-queue
+    steps:
+      s: { kind: subscribe, server: queue, uri: "queue://inbox" }   # the trigger
+      t: { kind: agent, depends_on: [s], instruction: "Triage the new item." }
+      f: { kind: finish, depends_on: [t] }
+
+limits:    { max_runs: 8, run: { steps: 80, tokens: 150000, deadline: 5m }, subagents: { depth: 3 } }
+lifecycle: { run_until: drained, drain_timeout: 20s }
+observability: { log_level: info, health_file: /run/agent/health, metrics_addr: "127.0.0.1:9090", audit: { sink: [log, store] } }
+security:  { cgroup: { spec: auto, memory_max: 2G } }
 ```
 
-Equivalent settings via environment (for the env-backed keys), with flags only
-where there is no env equivalent:
-
 ```console
-$ export INSTRUCTION="$(cat /etc/agentd/task.txt)"
-$ export AGENT_INTELLIGENCE=https://llm.internal/v1
-$ export AGENT_INTELLIGENCE_TOKEN="$LLM_KEY"
-$ export AGENT_MODEL=my-model
-$ export AGENT_MODE=once
-$ export AGENT_MAX_STEPS=80
-$ export AGENT_MAX_TOKENS=150000
-$ export AGENT_DEADLINE=5m
-$ export AGENT_RUN_ID="$JOB_NAME"
-$ export AGENT_DRAIN_TIMEOUT=20s
-$ export AGENT_LOG_LEVEL=info
-$ agentd \
-    --mcp fs=https://mcp-fs.internal/mcp \
-    --mcp queue=https://mcp-queue.internal/mcp \
-    --max-depth 3 \
-    --health-file /run/agent/health
+$ agentd --config /etc/agentd/agentd.yaml
 ```
 
-(`--mcp`, `--max-depth`, and `--health-file` are flag-only — no env equivalent.)
+Any path is also an env var and a flag, so a container overrides at deploy time
+without editing the file (`built-in < file < env < flag`):
+
+```console
+$ AGENTD_INTELLIGENCE_MODEL=my-other-model \
+  agentd --config /etc/agentd/agentd.yaml --limits.run.steps 120
+```
+
+The **job** shape (a CLI one-shot) is just the `--instruction` sugar — it expands
+to a `once → agent → finish` workflow, runs one turn, and exits:
+
+```console
+$ agentd --instruction "Summarise the incident." \
+    --intelligence https://llm.internal/v1 --model my-model
+```

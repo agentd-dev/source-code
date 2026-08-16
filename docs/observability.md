@@ -22,8 +22,9 @@ code + an optional `--health-file`). Everything heavier is feature-gated. Full
 rationale is in [RFC 0010](../rfcs/0010-observability-health-telemetry.md).
 
 > **Status.** The runtime is implemented: the supervisor reactor, MCP client,
-> intelligence client, the agentic loop, all five run modes, and therefore the
-> events below are all live. The examples here describe real behaviour.
+> intelligence client, the agentic loop, the v2 lifecycle + workflow triggers,
+> and therefore the events below are all live. The examples here describe real
+> behaviour.
 
 ---
 
@@ -105,7 +106,7 @@ the v1 set (build-gated surfaces add a few more, noted inline).
 | `mcp.connect` | `server`, `transport`, `tools` (count), `resources` (count) |
 | `mcp.connect.fail` | `server`, `transport`, `err` |
 | `mcp.disconnect` | `server`, `reason` |
-| `trigger.armed` | `kind` (`once`/`loop`/`reactive`/`schedule`), detail |
+| `trigger.armed` | `kind` (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`manual`), detail |
 | `trigger.fired` | `kind`, `resource_uri?`, `route` (`spawn`/`continue`) |
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |
@@ -114,15 +115,15 @@ the v1 set (build-gated surfaces add a few more, noted inline).
 | `subagent.ready` / `subagent.result` / `subagent.failed` / `subagent.exit` | the child's lifecycle: `Ready` → `Result`/`Failed` → reaped (`node`, `status`/`err`/`outcome`) |
 | `subagent.stuck` | `node` — liveness classification (not a deadline) condemned the child |
 | `subagent.drain` / `subagent.sigterm` / `subagent.sigkill` / `subagent.teardown` | the bounded kill ladder (`reason`, `live`) |
-| `drain.timeout` | `live`, `drain_ms` — the drain budget was exceeded; the ladder is forced |
+| `drain.start` / `drain.done` / `drain.abandon` | `live`, `drain_ms` — the SIGTERM drain began, completed, or exceeded its budget (the ladder is forced) |
 | `limit.exceeded` | `limit` (`tree_tokens`/…) — a tree budget tripped |
 | `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning (RFC 0012) |
-| `cgroup.detected` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
-| `mcp.serving` | `path`, `tools` — the served self-MCP is bound (`--serve-mcp`, RFC 0005) |
-| `mcp.spawn` | `handle`, `servers` — a peer delegated a run via served `subagent.spawn` |
-| `schedule.fired` · `run.completed`/`run.failed`/`run.killed` | the `loop`/`schedule` driver's per-fire run + outcome |
-| `reactive.handled`/`reactive.failed`/`reactive.killed` | one reaction's outcome (reactive mode) |
-| `health.armed` | `file` — the health-file heartbeat writer started |
+| `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
+| `a2a.connect` / `a2a.send` / `a2a.delegate` | `peer`/`principal`/`method` — a peer connected, an A2A message/command was served, or a peer delegated a run (RFC 0029, `--features a2a`) |
+| `a2a.drain` / `a2a.lameduck` / `a2a.pause` / `a2a.resume` / `a2a.cancel` / `a2a.denied` | an operator admin-command outcome, or an authorization refusal |
+| `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
+| `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
+| `health.json` | `file` — the health-file heartbeat writer started |
 
 ### Agentic loop (`comp:"agent"`; `intel.*` carry `comp:"intel"`)
 
@@ -154,17 +155,17 @@ introduces **no** new `event` strings.
 
 ### Operability: management, hot reload, intelligence swap
 
-These events come from the operability surfaces (the management transport, hot
-reload, the intelligence hot-swap). They are emitted only by the builds that
-serve them (`serve-mcp` / `hot-reload` / `config-watch`). The operator/control-
-plane framing for each lives in [`docs/operations.md`](operations.md).
+These events come from the operability surfaces (the A2A listener, hot reload,
+the intelligence hot-swap). They are emitted only by the builds that serve them
+(`a2a` / `hot-reload` / `config-watch`). The operator/control-plane framing for
+each lives in [`docs/operations.md`](operations.md).
 
 | Event | `comp` | Fields beyond canonical |
 |---|---|---|
-| `mcp.connect` / `mcp.disconnect` | `supervisor` | `origin` (`stdio`/`management`), `conn` — a peer joined/left the served transport |
-| `mcp.drain` | `supervisor` | `in_flight`, `eta_ms` — the `drain` operator tool tripped the drain latch |
-| `mcp.lame_duck` | `supervisor` | `ready` — the `lame-duck` tool flipped the readiness override |
-| `mcp.pause` / `mcp.resume` | `supervisor` | `affected` — the `pause`/`resume` tools suspended/continued N live subtrees |
+| `a2a.connect` | `supervisor` | `origin` (`stdio`/`management`), `principal`, `conn` — a peer joined the A2A listener |
+| `a2a.drain` | `supervisor` | `in_flight`, `eta_ms` — the `drain` admin command tripped the drain latch |
+| `a2a.lameduck` | `supervisor` | `ready` — the `lameduck` command flipped the readiness override |
+| `a2a.pause` / `a2a.resume` | `supervisor` | `affected` — the `pause`/`resume` commands suspended/continued N live subtrees |
 | `config.reload_requested` | `supervisor` | `trigger` (`sighup`/`watch`) — a reload was requested |
 | `config.reloaded` | `supervisor` | `changed` (the reloadable group labels), `applied_ms` — a reload was **applied** (a clean no-op with no material change still reports `changed:[]`) |
 | `config.reload_rejected` | `supervisor` | `reason` (`invalid`/`restart_required`), `field`, `diagnostics` — a reload was a clean no-op |
@@ -175,8 +176,8 @@ plane framing for each lives in [`docs/operations.md`](operations.md).
 
 > The intelligence-swap line carries the model *names* (non-secret identifiers),
 > the swap kind, and whether the endpoint list changed — **never** the endpoint
-> URL or credential. Endpoint identity is transport+index only, surfaced by the
-> `agent://intelligence` resource (§The served control resources), never inline.
+> URL or credential. Endpoint identity is transport+index only, carried by the
+> `intel.health` / `intel.swap` telemetry, never inline.
 
 ---
 
@@ -272,10 +273,10 @@ backend.
 
 **Ingest (mint-or-adopt):**
 
-- If an inbound `traceparent` arrives — on an inbound MCP request to agentd's
-  self-MCP server, or via the **`AGENT_TRACEPARENT`** env var when an
-  orchestrator starts the pod — adopt its `trace_id` and use its `span_id` as the
-  root `parent_span_id`.
+- If an inbound `traceparent` arrives — on an inbound A2A request to agentd's
+  listener, or via the **`AGENT_TRACEPARENT`** env var when an orchestrator starts
+  the pod — adopt its `trace_id` and use its `span_id` as the root
+  `parent_span_id`.
 - Otherwise **mint one `trace_id` per `run_id`** (16 random bytes) so the run is
   self-correlated. A malformed inbound header is ignored and we mint instead — a
   bad trace header never fails a run.
@@ -357,9 +358,10 @@ the pod is not "ready", so an orchestrator won't route work to it.
      periodSeconds: 5
    ```
 
-3. **Served-MCP readiness (when `--serve-mcp` is on).** A Management peer reads
-   `agent://status` / `agent://inventory` over the HTTP(S) management transport to
-   learn liveness + readiness — no separate health socket.
+3. **A2A readiness (when `a2a.listen` is on).** A `Management` peer reads the
+   instance status view via the A2A `status` command (and `ListTasks` for the live
+   subagent/run projection) over the HTTPS listener to learn liveness + readiness
+   — no separate health socket.
 
 4. **HTTP `/healthz` + `/readyz` (opt-in, `--features metrics`).** When an orchestrator
    wants real HTTP probes, served on `--metrics-addr` by the same hand-rolled blocking HTTP code on
@@ -372,24 +374,29 @@ run — a pure CLI invocation carries zero health machinery. HTTP and socket
 surfaces are opt-in and never on for a one-shot.
 
 > `--health-file`, `--log-level` (plus `AGENT_LOG_LEVEL`), `--log-content`,
-> `--serve-mcp`, and `--metrics-addr` (behind `metrics`) are all live; see
-> [`config.rs`](../crates/agentd/src/config.rs) for the authoritative flag/env
-> list. `--aggregate-logs` and `--health-http` remain roadmap items tracked in
-> [`docs/design/PLAN.md`](design/PLAN.md).
+> `--listen` (the A2A listener), and `--metrics-addr` (behind `metrics`) are all
+> live; see [`config/v2/`](../crates/agentd/src/config/v2/) for the authoritative
+> flag/env list. `--aggregate-logs` and `--health-http` remain roadmap items
+> tracked in [`docs/design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md).
 
 ---
 
-## The served control resources
+## Live state reads (the A2A surface)
 
-When the management transport is on (`--serve-mcp`, [`operations.md`](operations.md)),
-a control plane reads live state as `agent://` MCP resources rather than scraping
-metrics — each is a structured JSON read, most are **subscribable** (notify-then-
-read: a payload-free `notifications/resources/updated`, then a `resources/read`).
-Most are **Management-only** (a Stdio peer 404s on them). These complement the
-metrics above: metrics are for time-series/alerting, resources for point-in-time
-operator reads and event-driven control.
+> **Changed in agentd 2.0.** The 1.x served `agent://` MCP control resources were
+> removed with the self-MCP surface. A control plane now reads live state over
+> **A2A** (`a2a.listen`, RFC 0029): **`GetTask` / `ListTasks`** for durable
+> task/run state, a **`status`** command DataPart for the instance status view, a
+> **`config`** command for the effective (redacted) reloadable config, and
+> **`agent/card`** for identity — complemented by the **metrics** and **OTEL**
+> signals above for time-series/alerting. Every read resolves to a **principal**
+> and is authorized against the role matrix (a `Stdio`/anonymous caller is
+> refused), the same trust model the 1.x Management-only resources used.
 
-| Resource | Origin | Subscribable | Body |
+The retired 1.x resources and the state each carried (a migration reference — the
+same data is now reached via the A2A methods above):
+
+| 1.x resource (retired) | Origin | Subscribable | Body |
 |---|---|---|---|
 | `agent://status` | any | no | run id, mode, version, pid, uptime, spawn counts |
 | `agent://capabilities` | any | no | the live capabilities manifest (identity, `surfaces{}`, limits) |

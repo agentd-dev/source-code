@@ -174,8 +174,8 @@ pub(crate) fn dispatch(name: &str, args: &Value) -> Option<(String, bool)> {
     })
 }
 
-/// Call a registered tool directly — the PUBLIC entry an embedder's own
-/// [`GraphExec`](crate::graph::GraphExec) or dispatcher uses. `None` =
+/// Call a registered code tool directly — the PUBLIC entry the runtime's tool
+/// executor (`registry` route `code`) and an embedder's dispatcher use. `None` =
 /// unregistered; `Some(Ok(v))` / `Some(Err(reason))` mirror the handler. The
 /// handler runs outside the registry lock.
 pub fn call(name: &str, args: &Value) -> Option<Result<Value, String>> {
@@ -184,23 +184,6 @@ pub fn call(name: &str, args: &Value) -> Option<Result<Value, String>> {
         Arc::clone(&reg.get(name)?.handler)
     };
     Some(handler(args))
-}
-
-/// Dispatch a workflow `tool` node addressed to the reserved server `code`:
-/// `(result_value, is_error)` — an unregistered name is an error result (the
-/// node's `error` edge), mirroring an unknown MCP server/tool. (The production
-/// call site is `graph::exec`, so a non-`workflow` LIB build carries it only
-/// for its unit tests — hence the allow.)
-#[cfg_attr(not(feature = "workflow"), allow(dead_code))]
-pub(crate) fn call_for_workflow(name: &str, args: &Value) -> (Value, bool) {
-    match call(name, args) {
-        None => (
-            Value::String(format!("no such code tool {name:?} (register it in main)")),
-            true,
-        ),
-        Some(Ok(v)) => (v, false),
-        Some(Err(e)) => (Value::String(e), true),
-    }
 }
 
 /// Serialize tests that mutate OR observe the process-global registry. Unit
@@ -218,6 +201,17 @@ pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `(value, is_error)` shim over [`call`] — the shape the retired
+    /// `call_for_workflow` had; kept here so the code-tool dispatch tests read the
+    /// same regardless of the (now-removed) v1 workflow driver.
+    fn call_for_workflow(name: &str, args: &Value) -> (Value, bool) {
+        match call(name, args) {
+            None => (Value::String(format!("no such code tool {name:?}")), true),
+            Some(Ok(v)) => (v, false),
+            Some(Err(e)) => (Value::String(e), true),
+        }
+    }
     use serde_json::json;
 
     // NOTE: the registry is process-global and unit tests share a process —

@@ -21,15 +21,17 @@
 //!
 //! An A2A client does **not** send MCP `initialize` — A2A is its own surface, so
 //! the client just calls `a2a.*`. The wire (de)serialization is shared with the
-//! served side ([`crate::mcp::a2a`]) — one A2A vocabulary, no duplication.
+//! shared wire helpers ([`crate::mcp::a2a_wire`]) — one A2A vocabulary.
 //!
-//! Trust: agentd dials the peer over HTTP(S). (Presenting a client credential TO an
-//! authenticated peer — mTLS/bearer — is a follow-up; today it dials peers it
-//! already trusts, RFC 0012 §3.8.)
+//! Trust: agentd dials the peer over HTTP(S), presenting the peer client-auth
+//! material on every request (RFC 0031 §7) — a resolved **bearer/framing header**
+//! (static / oauth2 device-login / SPIFFE JWT-SVID), an **mTLS** client identity
+//! (SPIFFE X.509-SVID), a per-request **AWS SigV4** signature (`kind: aws`), and
+//! an ambient **AAuth** signature (RFC 0023) when a process identity is installed.
 
 use crate::config::A2aEndpoint;
 use crate::json::{Id, Request};
-use crate::mcp::a2a::{self, TaskState};
+use crate::mcp::a2a_wire::{self as a2a, TaskState};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -121,15 +123,22 @@ fn poll_task<C: Caller>(conn: &mut C, task_id: &str, deadline: Instant) -> Deleg
 
 /// The client credential presented TO a peer (RFC 0020 §auth): resolved bearer/
 /// framing headers (secrets ALREADY materialized — never logged; this struct has
-/// no Debug) and/or an mTLS client identity. Both empty = anonymous dial (a
+/// no Debug) and/or an mTLS client identity. All empty = anonymous dial (a
 /// loopback dev peer).
 #[derive(Default)]
 pub struct PeerAuth {
-    /// Resolved header (name, value) pairs sent on every request.
+    /// Resolved header (name, value) pairs sent on every request. These are
+    /// body-INDEPENDENT (a bearer / framing header), baked once at resolution.
     pub headers: Vec<(String, String)>,
     /// The mutual-TLS client identity presented during the handshake.
     #[cfg(feature = "tls")]
     pub identity: Option<crate::net::tls::ClientIdentity>,
+    /// A per-request signer (RFC 0031 §8: AWS SigV4) for an AWS-IAM-gated peer.
+    /// Unlike [`PeerAuth::headers`], its signature covers the exact request body,
+    /// so it is re-run on every POST. `None` = no SigV4 (bearer/mTLS/AAuth still
+    /// apply). Alongside it, an ambient process AAuth identity (RFC 0023) signs
+    /// every outbound A2A dial when configured.
+    pub signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
 }
 
 /// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
@@ -189,8 +198,9 @@ impl HttpEp {
 
 /// An HTTP(S) A2A caller: each unary call is one `POST` (Connection: close),
 /// mirroring the MCP client's dialer — server-auth TLS for `https://`, plaintext
-/// for a loopback `http://` peer. (Presenting a client credential TO the peer —
-/// mTLS/bearer — is a follow-up; today agentd dials peers it already trusts.)
+/// for a loopback `http://` peer. Presents the peer client-auth material on every
+/// request: static bearer/framing headers, and per-request AAuth/SigV4 signatures
+/// over the exact body ([`HttpConn::signature_headers`]); mTLS rides the handshake.
 struct HttpConn {
     ep: HttpEp,
     auth: PeerAuth,
@@ -204,6 +214,26 @@ impl HttpConn {
             auth,
             next_id: 1,
         }
+    }
+
+    /// Per-request signature headers (RFC 0023 AAuth + RFC 0031 SigV4) over the
+    /// exact `body` + request path — mirroring the intelligence dial. The static
+    /// bearer/framing headers ([`PeerAuth::headers`]) and the mTLS identity ride
+    /// separately; this covers only the signatures that depend on the payload.
+    /// Empty in the default (no-AAuth, no-SigV4) build, so the wire is unchanged.
+    fn signature_headers(&self, body: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        // AAuth: sign the outbound A2A dial (RFC 0023) so the peer attests the
+        // agent by signature — additive, identity-cover only (like the intel dial).
+        #[cfg(feature = "aauth")]
+        if let Some(signer) = crate::aauth::signer() {
+            out.extend(signer.sign("POST", &self.ep.host_header, &self.ep.path, body));
+        }
+        // SigV4 (RFC 0031 §8): an AWS-IAM-gated peer, signed over the exact body.
+        if let Some(signer) = &self.auth.signer {
+            out.extend(signer.sign("POST", &self.ep.host_header, &self.ep.path, body));
+        }
+        out
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
@@ -256,11 +286,15 @@ impl HttpConn {
             .min(Duration::from_secs(45))
             .max(Duration::from_millis(1));
         let stream = self.connect(timeout)?;
+        let sig = self.signature_headers(&body);
         let mut headers: Vec<(&str, &str)> = vec![
             ("Content-Type", "application/json"),
             ("Accept", "text/event-stream"),
         ];
         for (name, value) in &self.auth.headers {
+            headers.push((name.as_str(), value.as_str()));
+        }
+        for (name, value) in &sig {
             headers.push((name.as_str(), value.as_str()));
         }
         let resp = crate::net::http::send_streaming(
@@ -366,7 +400,7 @@ impl HttpConn {
                 // Terminate on a terminal task STATE (A2A spec §3.5.2 — the stream
                 // closes on terminal). agentd emits no non-spec `final` flag, and a
                 // conformant peer signals termination by the state + closing.
-                if crate::mcp::a2a::TaskState::from_wire(state).is_terminal() {
+                if crate::mcp::a2a_wire::TaskState::from_wire(state).is_terminal() {
                     let outcome = match state {
                         "TASK_STATE_COMPLETED" => match distillate {
                             Some(text) => DelegateOutcome::Distillate(text),
@@ -409,8 +443,12 @@ impl Caller for HttpConn {
         let req = Request::new(Id::Num(id), method, Some(params));
         let body = serde_json::to_vec(&req).map_err(|e| format!("a2a: encode {method}: {e}"))?;
         let mut stream = self.connect(timeout)?;
+        let sig = self.signature_headers(&body);
         let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
         for (name, value) in &self.auth.headers {
+            headers.push((name.as_str(), value.as_str()));
+        }
+        for (name, value) in &sig {
             headers.push((name.as_str(), value.as_str()));
         }
         let resp = crate::net::http::send(

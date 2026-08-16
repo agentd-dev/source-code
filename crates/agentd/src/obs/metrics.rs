@@ -385,6 +385,47 @@ pub fn record_config_reload(result: &str) {
     let _ = result;
 }
 
+/// A turn worker ran (`agent_turns_total{kind}`, agentd 2.0).
+pub fn record_turn(kind: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.record_turn(kind);
+    #[cfg(not(feature = "metrics"))]
+    let _ = kind;
+}
+
+/// A workflow step reached a terminal status (`agent_steps_total{status}`).
+pub fn record_step(status: &str) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.record_step(status);
+    #[cfg(not(feature = "metrics"))]
+    let _ = status;
+}
+
+/// A remote-store op completed (`agent_store_ops_total{result}` + latency sum).
+pub fn record_store_op(result: &str, latency_ms: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.record_store_op(result, latency_ms);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (result, latency_ms);
+}
+
+/// Point-in-time set of the durable inbox backlog (`agent_inbox_pending`).
+pub fn set_inbox_pending(n: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.set_inbox_pending(n);
+    #[cfg(not(feature = "metrics"))]
+    let _ = n;
+}
+
+/// Point-in-time set of the largest live context's token estimate
+/// (`agent_context_tokens`).
+pub fn set_context_tokens(n: u64) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.set_context_tokens(n);
+    #[cfg(not(feature = "metrics"))]
+    let _ = n;
+}
+
 /// Point-in-time set of the config-generation gauge (`agent_config_generation`,
 /// RFC 0017 §5.6): the count of successfully-applied reloads, so a scraper can
 /// detect "this instance has picked up generation N" against agentctl's desired
@@ -493,6 +534,20 @@ mod imp {
     /// catch-all that keeps the series bounded (RFC 0016 §4.2).
     const RELOAD_RESULTS: &[&str] = &["applied", "rejected", "other"];
 
+    /// `agent_turns_total{kind}` label domain (agentd 2.0, plan §3.11): a turn
+    /// worker's context kind — a `root`/conversation turn, a `preflight` think, a
+    /// `compaction` think — plus `other`.
+    const TURN_KINDS: &[&str] = &["root", "preflight", "compaction", "knowledge", "other"];
+
+    /// `agent_steps_total{status}` label domain (agentd 2.0): a workflow step's
+    /// terminal status — `done` / `failed` / `skipped` — plus `other`.
+    const STEP_STATUS: &[&str] = &["done", "failed", "skipped", "other"];
+
+    /// `agent_store_ops_total{result}` label domain (agentd 2.0, RFC 0025 §3.4):
+    /// a remote-store op outcome — `ok` / `conflict` (a CAS mismatch) / `error` —
+    /// plus `other`.
+    const STORE_RESULTS: &[&str] = &["ok", "conflict", "error", "other"];
+
     /// A fixed-domain labelled counter family: one atomic per known label value.
     /// `N` matches the backing domain slice length; the trailing slot is the
     /// `other` catch-all that keeps the cardinality bound (RFC 0016 §4.2).
@@ -590,6 +645,14 @@ mod imp {
 
         // --- RFC 0025 §3.4: per-instance lifetime-budget balance gauge --------
         pub(super) budget_tokens_remaining: AtomicU64,
+
+        // --- agentd 2.0 (plan §3.11): the v2 runtime series ------------------
+        turns_total: LabelCounter<{ TURN_KINDS.len() }>,
+        steps_total: LabelCounter<{ STEP_STATUS.len() }>,
+        store_ops: LabelCounter<{ STORE_RESULTS.len() }>,
+        store_latency_ms_sum: AtomicU64,
+        pub(super) inbox_pending: AtomicU64,
+        pub(super) context_tokens: AtomicU64,
     }
 
     impl Registry {
@@ -636,6 +699,12 @@ mod imp {
                 config_reloads: LabelCounter::new(),
                 config_generation: AtomicU64::new(0),
                 budget_tokens_remaining: AtomicU64::new(0),
+                turns_total: LabelCounter::new(),
+                steps_total: LabelCounter::new(),
+                store_ops: LabelCounter::new(),
+                store_latency_ms_sum: AtomicU64::new(0),
+                inbox_pending: AtomicU64::new(0),
+                context_tokens: AtomicU64::new(0),
             }
         }
 
@@ -705,6 +774,28 @@ mod imp {
 
         pub(super) fn record_config_reload(&self, result: &str) {
             self.config_reloads.inc(RELOAD_RESULTS, result);
+        }
+
+        pub(super) fn record_turn(&self, kind: &str) {
+            self.turns_total.inc(TURN_KINDS, kind);
+        }
+
+        pub(super) fn record_step(&self, status: &str) {
+            self.steps_total.inc(STEP_STATUS, status);
+        }
+
+        pub(super) fn record_store_op(&self, result: &str, latency_ms: u64) {
+            self.store_ops.inc(STORE_RESULTS, result);
+            self.store_latency_ms_sum
+                .fetch_add(latency_ms, Ordering::Relaxed);
+        }
+
+        pub(super) fn set_inbox_pending(&self, n: u64) {
+            self.inbox_pending.store(n, Ordering::Relaxed);
+        }
+
+        pub(super) fn set_context_tokens(&self, n: u64) {
+            self.context_tokens.store(n, Ordering::Relaxed);
         }
 
         pub(super) fn set_tree_shape(&self, active: u64, depth: u64, breadth: u64) {
@@ -1173,6 +1264,50 @@ mod imp {
                 "agent_restarts_tripped_total",
                 "Restart-governor breaker trips",
                 g(&self.restarts_tripped),
+            );
+
+            // --- agentd 2.0 runtime series (plan §3.11) ----------------------
+            labelled_counter(
+                &mut s,
+                "agent_turns_total",
+                "Turn-worker runs by context kind (agentd 2.0).",
+                "kind",
+                TURN_KINDS,
+                &self.turns_total,
+            );
+            labelled_counter(
+                &mut s,
+                "agent_steps_total",
+                "Workflow steps by terminal status (agentd 2.0, RFC 0027).",
+                "status",
+                STEP_STATUS,
+                &self.steps_total,
+            );
+            labelled_counter(
+                &mut s,
+                "agent_store_ops_total",
+                "Remote-store ops by result (agentd 2.0, RFC 0025).",
+                "result",
+                STORE_RESULTS,
+                &self.store_ops,
+            );
+            counter(
+                &mut s,
+                "agent_store_latency_ms_sum",
+                "Cumulative remote-store op latency (ms); divide by agent_store_ops_total for the mean.",
+                g(&self.store_latency_ms_sum),
+            );
+            gauge(
+                &mut s,
+                "agent_inbox_pending",
+                "Durable inbox events awaiting processing (agentd 2.0, RFC 0025).",
+                g(&self.inbox_pending),
+            );
+            gauge(
+                &mut s,
+                "agent_context_tokens",
+                "Estimated token size of the largest live conversation context (agentd 2.0).",
+                g(&self.context_tokens),
             );
             s
         }

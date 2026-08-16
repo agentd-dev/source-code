@@ -47,6 +47,13 @@ pub struct Endpoint {
     /// Structural address for the §4.4 resource body (`host[:port]`) — the host
     /// only, no secret, no scheme, no path.
     pub(super) addr: String,
+    /// Extra request headers (RFC 0031): the resolved `intelligence.headers`,
+    /// pushed on every dial. Empty by default (byte-identical legacy path).
+    pub(super) extra_headers: Vec<(String, String)>,
+    /// An optional per-request signer (RFC 0031): AWS SigV4 over the exact body,
+    /// added on every dial (like `aauth_headers`). `None` = the legacy path.
+    /// Shared across the sticky-primary endpoints of one client.
+    pub(super) signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
     /// Live health + circuit breaker (RFC 0018 §4).
     pub health: HealthRecord,
 }
@@ -106,6 +113,8 @@ impl EndpointList {
                 provider,
                 scheme,
                 addr,
+                extra_headers: Vec::new(),
+                signer: None,
                 health: HealthRecord::new(),
             });
         }
@@ -114,6 +123,36 @@ impl EndpointList {
             active: 0,
             breaker: BreakerConfig::default(),
         })
+    }
+
+    /// Apply extra request headers (RFC 0031 `intelligence.headers`) to every
+    /// endpoint. Cheap; called once after construction.
+    pub fn set_extra_headers(&mut self, headers: Vec<(String, String)>) {
+        for e in &mut self.eps {
+            e.extra_headers = headers.clone();
+        }
+    }
+
+    /// Attach a per-request signer (RFC 0031: AWS SigV4) to every endpoint.
+    pub fn set_signer(&mut self, signer: std::sync::Arc<dyn ::mcp::http::RequestSigner>) {
+        for e in &mut self.eps {
+            e.signer = Some(signer.clone());
+        }
+    }
+
+    /// Select the wire dialect for every endpoint (RFC 0031 §8 —
+    /// `intelligence.dialect`). A host-only endpoint resolved its path with the
+    /// OpenAI default, so re-point a still-defaulted path to the new dialect's
+    /// default (Bedrock overrides the path per-request regardless; an explicit
+    /// non-default path is left untouched).
+    pub fn set_provider(&mut self, provider: Provider) {
+        let default = provider.default_path();
+        for e in &mut self.eps {
+            e.provider = provider;
+            if e.http_path == super::openai::DEFAULT_PATH {
+                e.http_path = default.to_string();
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -409,20 +448,41 @@ impl Endpoint {
             req
         };
 
+        use super::bedrock;
         let (body, mut headers) = match self.provider {
             Provider::OpenAiCompatible => openai::build_request(req, self.token.as_deref()),
             Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
+            Provider::Bedrock => bedrock::build_request(req, self.token.as_deref()),
         };
+        // The effective request path (RFC 0031 §8): fixed for OpenAI/Anthropic;
+        // Bedrock derives `/model/{modelId}/converse` from the request. The SAME
+        // string is sent on the wire AND fed to the AAuth/SigV4 signers below, so
+        // the signature covers the exact request-target.
+        let path = self.provider.request_path(&self.http_path, req);
         if let Some(tid) = trace_id {
             headers.push((
                 "traceparent".into(),
                 crate::obs::trace::outbound_traceparent(tid),
             ));
         }
+        // RFC 0031: the configured `intelligence.headers` ride every dial (e.g.
+        // a gateway routing header). Pushed before AAuth so a signature covers a
+        // stable header set; a header already set by the dialect is not removed.
+        for (k, v) in &self.extra_headers {
+            headers.push((k.clone(), v.clone()));
+        }
         // AAuth: sign the dial over the exact body bytes (content-digest cover
         // applies when discovery flagged it) before we borrow `headers`.
-        for (k, v) in self.aauth_headers("POST", &self.http_path, &body) {
+        for (k, v) in self.aauth_headers("POST", &path, &body) {
             headers.push((k, v));
+        }
+        // RFC 0031: an AWS SigV4 signature over the exact body, when an `aws`
+        // intelligence auth is configured (native Bedrock, or a Bedrock/API-Gateway
+        // LLM endpoint). Signed over `path` — the dynamic Bedrock target included.
+        if let Some(signer) = &self.signer {
+            for (k, v) in signer.sign("POST", &self.host_header, &path, &body) {
+                headers.push((k, v));
+            }
         }
         let header_refs: Vec<(&str, &str)> = headers
             .iter()
@@ -447,7 +507,7 @@ impl Endpoint {
                 stream.as_mut(),
                 &self.host_header,
                 "POST",
-                &self.http_path,
+                &path,
                 &header_refs,
                 &body,
             )?;
@@ -469,6 +529,7 @@ impl Endpoint {
         let mut parsed = match self.provider {
             Provider::OpenAiCompatible => openai::parse_response(&resp.body),
             Provider::Anthropic => anthropic::parse_response(&resp.body),
+            Provider::Bedrock => bedrock::parse_response(&resp.body),
         }
         .map_err(IntelError::Parse)?;
         // Undo the wire sanitization: route by the original (dotted) tool names.
@@ -544,6 +605,25 @@ impl Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_headers_apply_to_every_endpoint() {
+        // RFC 0031: `intelligence.headers` (and a device-login bearer) reach the
+        // wire via `set_extra_headers`, applied to all failover endpoints.
+        let mut list = EndpointList::parse(
+            "https://a.example/v1,https://b.example/v1",
+            Some("tok".into()),
+        )
+        .unwrap();
+        assert!(list.eps.iter().all(|e| e.extra_headers.is_empty()));
+        list.set_extra_headers(vec![("X-Team".into(), "ops".into())]);
+        for e in &list.eps {
+            assert_eq!(
+                e.extra_headers,
+                vec![("X-Team".to_string(), "ops".to_string())]
+            );
+        }
+    }
 
     #[test]
     fn wire_tool_name_maps_only_illegal_chars() {

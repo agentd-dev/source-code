@@ -163,9 +163,9 @@ contract AROUND the model, do what `agentd-cli/src/main.rs` does: install the
 re-exec dispatch, build a `SpawnPayload`, and call
 `agentd::supervisor::reactor::supervise_once` — the reasoning then runs in a
 killable child of *your* binary, and everything in this documentation set
-(modes, workflows, serving, A2A) applies unchanged. The CLI's `main.rs` is
-deliberately small enough to read as the reference (~900 lines including all
-five modes).
+(the lifecycle, workflow triggers, and A2A) applies unchanged. The CLI's
+`main.rs` is deliberately small enough to read as the reference (~140 lines:
+the re-exec dispatch, the test mocks, and the `run_v2` entrypoint).
 
 ### Recipe 4 — just the pieces
 

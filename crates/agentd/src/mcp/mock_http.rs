@@ -27,11 +27,12 @@ use std::time::Duration;
 
 /// Cross-connection server state: a subscribe (on a POST) arms a one-shot push
 /// that the open `GET` SSE stream delivers. The mock also implements the RFC
-/// 0021 §8.3 **checkpointer tool profile** (`state.put`/`state.get`/`state.list`
-/// over an in-memory per-key history with the monotonic-seq guard) plus a
-/// `flaky` tool (fails on its first call, succeeds after) — together they let
-/// the e2e suite prove crash → `--workflow-resume` → complete with no external
-/// infrastructure.
+/// 0021 §8.3 / RFC 0025 §4.1 **checkpointer tool profile** (`state.put` /
+/// `state.get` / `state.list` / `state.delete` over an in-memory per-key history
+/// with the monotonic-seq guard) plus a `flaky` tool (fails on its first call,
+/// succeeds after) and a `mock.fault` control tool (fail the next N state calls)
+/// — together they let the e2e + chaos suites prove crash → restore → complete
+/// with no external infrastructure.
 struct State {
     uri: String,
     emit: bool,
@@ -42,6 +43,10 @@ struct State {
     >,
     /// `flaky` call counter (first call errors, later ones succeed).
     flaky_calls: std::sync::atomic::AtomicU64,
+    /// Fault injection: remaining `state.*` calls to fail with a tool error.
+    fail_next: std::sync::atomic::AtomicU64,
+    /// Every `state.*` call performed (tool name) — `mock.ops` reports it.
+    ops: std::sync::Mutex<Vec<String>>,
 }
 
 /// Serve the mock on loopback TCP until the process is killed, announcing the
@@ -64,6 +69,8 @@ pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
         pending_emit: AtomicBool::new(false),
         store: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         flaky_calls: std::sync::atomic::AtomicU64::new(0),
+        fail_next: std::sync::atomic::AtomicU64::new(0),
+        ops: std::sync::Mutex::new(Vec::new()),
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -110,7 +117,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 req.id,
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"resources": {"subscribe": true, "listChanged": true}, "tools": {}},
+                    "capabilities": {"resources": {"subscribe": true, "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
                     "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
                 }),
             ),
@@ -124,23 +131,102 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                     {"name": "state.put", "description": "checkpointer put", "inputSchema": {"type": "object"}},
                     {"name": "state.get", "description": "checkpointer get", "inputSchema": {"type": "object"}},
                     {"name": "state.list", "description": "checkpointer list", "inputSchema": {"type": "object"}},
+                    {"name": "state.delete", "description": "checkpointer delete", "inputSchema": {"type": "object"}},
                     {"name": "flaky", "description": "fails once, then succeeds", "inputSchema": {"type": "object"}},
+                    {"name": "mock.fault", "description": "fail the next N state.* calls", "inputSchema": {"type": "object"}},
+                    {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
+                    {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
+                    {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
+                    {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
+                    {"name": "search.query", "description": "mock web search", "inputSchema": {"type": "object"}},
+                    {"name": "search.fetch", "description": "mock page fetch", "inputSchema": {"type": "object"}},
                 ]}),
             ),
             false,
         ),
         "tools/call" => (handle_tool_call(req, state), false),
         "resources/list" => (
-            Response::ok(req.id, json!({"resources": [{"uri": uri, "name": "mock"}]})),
-            false,
-        ),
-        "resources/read" => (
             Response::ok(
                 req.id,
-                json!({"contents": [{"uri": uri, "mimeType": "text/plain", "text": "the watched resource changed"}]}),
+                json!({"resources": [
+                    {"uri": uri, "name": "mock"},
+                    {"uri": "skill://incident-runbook", "name": "incident-runbook", "description": "Handle a production incident. When to use: an alert or outage report", "mimeType": "text/x-skill+markdown"},
+                    {"uri": "mock://instruction", "name": "instruction", "mimeType": "text/plain"}
+                ]}),
             ),
             false,
         ),
+        "resources/read" => {
+            let asked = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let (mime, text) = match asked.as_str() {
+                "skill://incident-runbook" => ("text/x-skill+markdown", "# Incident runbook\n1. Acknowledge the alert. 2. Find the blast radius. 3. Mitigate first, root-cause later. 4. Write the timeline.".to_string()),
+                "mock://instruction" => ("text/plain", "You are the mock-served agent. Follow the served instruction.".to_string()),
+                _ => ("text/plain", "the watched resource changed".to_string()),
+            };
+            let uri_out = if asked.is_empty() { uri.clone() } else { asked };
+            (
+                Response::ok(
+                    req.id,
+                    json!({"contents": [{"uri": uri_out, "mimeType": mime, "text": text}]}),
+                ),
+                false,
+            )
+        }
+        // Skills as prompts (RFC 0028 §7): the catalogue + a body per skill.
+        "prompts/list" => (
+            Response::ok(
+                req.id,
+                json!({"prompts": [
+                    {"name": "review-pr", "description": "Review a pull request thoroughly. When to use: any code review request", "arguments": [{"name": "target", "description": "What to review", "required": false}]},
+                    {"name": "deploy-safely", "description": "Deploy with a rollback plan"}
+                ]}),
+            ),
+            false,
+        ),
+        "prompts/get" => {
+            let params = req.params.clone().unwrap_or(json!({}));
+            let name = params
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let target = params
+                .get("arguments")
+                .and_then(|a| a.get("target"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the change");
+            let body = match name {
+                "review-pr" => format!(
+                    "# Skill: review-pr\nReview {target}: read the diff, check tests, look for security issues, summarize findings as bullets."
+                ),
+                "deploy-safely" => {
+                    "# Skill: deploy-safely\nAlways deploy behind a flag with a rollback plan."
+                        .to_string()
+                }
+                _ => {
+                    return (
+                        Response::err(
+                            req.id,
+                            json::INVALID_PARAMS,
+                            format!("no such prompt: {name}"),
+                        ),
+                        false,
+                    );
+                }
+            };
+            (
+                Response::ok(
+                    req.id,
+                    json!({"description": "skill body", "messages": [{"role": "user", "content": {"type": "text", "text": body}}]}),
+                ),
+                false,
+            )
+        }
         "resources/unsubscribe" => (Response::ok(req.id, json!({})), false),
         "resources/subscribe" => {
             // Arm the one-shot push the GET SSE stream will deliver.
@@ -160,13 +246,16 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
     }
 }
 
-/// One MCP `tools/call` (the RFC 0021 §8.3 checkpointer profile + `flaky`).
-/// A tool result is standard MCP content: one text part carrying the JSON.
+/// One MCP `tools/call`: the RFC 0021 §8.3 / RFC 0025 §4.1 checkpointer profile
+/// plus `flaky` and the `mock.*` controls. A tool result is standard MCP content:
+/// one text part carrying the JSON **and** the same JSON as `structuredContent`
+/// (the modern shape — the store adapter's default mapping reads
+/// `result.structuredContent.*`, falling back to the text part).
 fn handle_tool_call(req: Request, state: &State) -> Response {
     fn tool_ok(id: json::Id, v: serde_json::Value) -> Response {
         Response::ok(
             id,
-            json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false}),
+            json!({"content": [{"type": "text", "text": v.to_string()}], "structuredContent": v, "isError": false}),
         )
     }
     fn tool_err(id: json::Id, msg: &str) -> Response {
@@ -184,7 +273,34 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
             .unwrap_or("")
             .to_string()
     };
+    if let Some(n) = name
+        && n.starts_with("state.")
+    {
+        state
+            .ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(n.to_string());
+        // Fault injection armed by `mock.fault`: the next N state calls fail.
+        let remaining = state.fail_next.load(Ordering::SeqCst);
+        if remaining > 0 {
+            state.fail_next.store(remaining - 1, Ordering::SeqCst);
+            return tool_err(req.id, &format!("injected fault on {n}"));
+        }
+    }
     match name {
+        Some("mock.fault") => {
+            let n = args
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            state.fail_next.store(n, Ordering::SeqCst);
+            tool_ok(req.id, json!({"ok": true, "count": n}))
+        }
+        Some("mock.ops") => {
+            let ops = state.ops.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            tool_ok(req.id, json!({"ops": ops}))
+        }
         Some("state.put") => {
             let seq = args
                 .get("seq")
@@ -220,11 +336,32 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
         }
         Some("state.list") => {
             let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(prefix) = args.get("prefix").and_then(serde_json::Value::as_str) {
+                // RFC 0025 §4.1: every live key under `prefix` with its latest
+                // seq (a tombstone — latest state null — is not listed).
+                let keys: Vec<serde_json::Value> = store
+                    .iter()
+                    .filter(|(k, h)| {
+                        k.starts_with(prefix)
+                            && h.values().next_back().is_some_and(|v| {
+                                !v.get("state").is_some_and(serde_json::Value::is_null)
+                            })
+                    })
+                    .map(|(k, h)| json!({"key": k, "seq": h.keys().next_back().copied()}))
+                    .collect();
+                return tool_ok(req.id, json!({"keys": keys}));
+            }
+            // RFC 0021 §8.3 (v1 checkpointer): the seqs of ONE key.
             let seqs: Vec<u64> = store
                 .get(&key())
                 .map(|h| h.keys().copied().collect())
                 .unwrap_or_default();
             tool_ok(req.id, json!({"seqs": seqs}))
+        }
+        Some("state.delete") => {
+            let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+            let existed = store.remove(&key()).is_some();
+            tool_ok(req.id, json!({"ok": true, "existed": existed}))
         }
         Some("flaky") => {
             // The crash-recovery shape (RFC 0021 §8.4 e2e): the FIRST call hangs
@@ -240,8 +377,92 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
                 tool_ok(req.id, json!({"ok": true, "attempt": n + 1}))
             }
         }
+        // RFC 0028 §5/§6 profiles: a canned corpus for the knowledge and search
+        // contracts (auto-context + tool e2e).
+        Some("knowledge.search") => {
+            let q = args
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let top_k = args
+                .get("top_k")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(5) as usize;
+            let hits: Vec<serde_json::Value> = corpus()
+                .iter()
+                .filter(|(_, title, body)| q.is_empty() || q.split_whitespace().any(|w| title.to_ascii_lowercase().contains(w) || body.to_ascii_lowercase().contains(w)))
+                .take(top_k)
+                .enumerate()
+                .map(|(i, (id, title, body))| json!({"id": id, "uri": format!("kb://{id}"), "title": title, "score": 1.0 - i as f64 * 0.1, "snippet": body.chars().take(120).collect::<String>(), "metadata": {"source": "mock"}}))
+                .collect();
+            tool_ok(req.id, json!({"hits": hits}))
+        }
+        Some("knowledge.get") => {
+            let want = args
+                .get("id")
+                .or_else(|| args.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim_start_matches("kb://")
+                .to_string();
+            match corpus().iter().find(|(id, _, _)| *id == want) {
+                Some((id, title, body)) => tool_ok(
+                    req.id,
+                    json!({"content": body, "mime": "text/markdown", "metadata": {"id": id, "title": title}}),
+                ),
+                None => tool_err(req.id, "no such document"),
+            }
+        }
+        Some("knowledge.list") => tool_ok(
+            req.id,
+            json!({"docs": corpus().iter().map(|(id, title, _)| json!({"id": id, "uri": format!("kb://{id}"), "title": title})).collect::<Vec<_>>()}),
+        ),
+        Some("search.query") => {
+            let q = args
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            tool_ok(
+                req.id,
+                json!({"results": [
+                    {"title": format!("Result for {q}"), "url": format!("https://example.test/{}", q.replace(' ', "-")), "snippet": format!("A mock search result about {q}."), "source": "mock"},
+                ]}),
+            )
+        }
+        Some("search.fetch") => {
+            let url = args
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            tool_ok(
+                req.id,
+                json!({"content": format!("<html><body>fetched {url}</body></html>"), "mime": "text/html", "final_url": url}),
+            )
+        }
         other => tool_err(req.id, &format!("no such tool: {other:?}")),
     }
+}
+
+/// The knowledge profile's canned corpus: `(id, title, body)`.
+fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "doc-1",
+            "Deployment policy",
+            "Deployments go through staging first; production deploys need a rollback plan and a canary of 5% for ten minutes.",
+        ),
+        (
+            "doc-2",
+            "Incident handbook",
+            "During an incident, mitigate before root-causing; page the on-call; write a timeline within 24 hours.",
+        ),
+        (
+            "doc-3",
+            "Vacation policy",
+            "Employees accrue 2 days of vacation per month; requests go to the manager two weeks ahead.",
+        ),
+    ]
 }
 
 /// The long-lived `GET` SSE stream: hold it open and deliver the one-shot

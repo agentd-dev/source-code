@@ -15,6 +15,7 @@
 //! child's JSON telemetry (inherited to the parent). stdin carries
 //! [`ControlMsg`] down.
 
+use crate::agentloop::action::SelfHandler;
 use crate::agentloop::runner::{LoopAbort, LoopInput, Session, run_loop};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::config::SwapPolicy;
@@ -22,11 +23,9 @@ use crate::intel::client::{IntelClient, IntelHealthReport};
 use crate::json::frame;
 use crate::mcp::client::McpClient;
 use crate::obs::log::{Comp, Level, LogCtx, Logger};
-use crate::subagent::orchestrator::Orchestrator;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, IntelActive, SpawnPayload, SwapIntel};
 use crate::supervisor::budget::Budget;
 use std::io::{self, BufReader, Stdin, Stdout};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -42,69 +41,21 @@ use std::time::{Duration, Instant};
 /// `Mutex<Option<…>>` is the whole seam; the loop never holds it across a turn.
 type PendingSwap = Arc<Mutex<Option<SwapIntel>>>;
 
-type Up = Arc<Mutex<Stdout>>;
+pub(crate) type Up = Arc<Mutex<Stdout>>;
 
-/// The child-process HUMAN-GATE bus (RFC 0021 §7) — process-global access to the
-/// control-channel writer + the `Inject` receiver, so the workflow engine (deep
-/// inside `graph::exec`, possibly under the orchestrator's `workflow.run`) can
-/// open a gate and poll for the human's reply without threading handles through
-/// every layer (the child-side parallel of `graph::live`). Installed once by
-/// [`run`] for NON-WARM children only: a warm session's `Inject` stream is its
-/// turn-input channel (`run_warm`), never a gate reply — a gate inside a warm
-/// turn degrades to `reply_uri`/timeout.
-#[cfg(feature = "workflow")]
-pub(crate) mod gatebus {
-    use super::{AgentMsg, Up, send_up};
-    use serde_json::Value;
-    use std::sync::mpsc::Receiver;
-    use std::sync::{Mutex, OnceLock};
-
-    struct Bus {
-        up: Up,
-        inject: Mutex<Receiver<String>>,
+/// The in-child self-handler for an agentd 2.0 subagent (RFC 0026 §6). A subagent
+/// is a **flat child of the reactor** — it runs a ReAct loop over its granted
+/// MCP + code tools and reports its result; it has **no** in-child orchestration
+/// self-tools (no nested `subagent.spawn`, `schedule`, `subscribe`, `workflow.*`,
+/// `a2a.delegate`). Delegation is the reactor's job, not a child's. (`finish` is
+/// handled by the loop itself, not the self-handler, so completion is unaffected.)
+struct NoSelfTools;
+impl SelfHandler for NoSelfTools {
+    fn tools(&self) -> Vec<crate::wire::intel::ToolDef> {
+        Vec::new()
     }
-    // SAFETY-BY-TYPES: Receiver is !Sync; the Mutex restores Sync for the static.
-    static BUS: OnceLock<Bus> = OnceLock::new();
-
-    /// Install the bus (once, at child startup). A second install is a no-op.
-    pub(crate) fn install(up: Up, inject: Receiver<String>) {
-        let _ = BUS.set(Bus {
-            up,
-            inject: Mutex::new(inject),
-        });
-    }
-
-    /// Report an opened gate UP the control channel.
-    pub(crate) fn open(node: &str, payload: &Value) {
-        if let Some(b) = BUS.get() {
-            send_up(
-                &b.up,
-                &AgentMsg::Gate {
-                    node: node.to_string(),
-                    payload: payload.clone(),
-                },
-            );
-        }
-    }
-
-    /// Poll (non-blocking) for a human reply delivered as `ControlMsg::Inject`.
-    pub(crate) fn try_reply() -> Option<String> {
-        let b = BUS.get()?;
-        let rx = b.inject.lock().unwrap_or_else(|e| e.into_inner());
-        rx.try_recv().ok()
-    }
-
-    /// Report the gate resolved (`via` = `"reply"` | `"uri"` | `"timeout"`).
-    pub(crate) fn close(node: &str, via: &str) {
-        if let Some(b) = BUS.get() {
-            send_up(
-                &b.up,
-                &AgentMsg::GateClosed {
-                    node: node.to_string(),
-                    via: via.to_string(),
-                },
-            );
-        }
+    fn handle(&mut self, _name: &str, _args: &serde_json::Value) -> Option<(String, bool)> {
+        None
     }
 }
 
@@ -171,6 +122,9 @@ pub fn run() -> i32 {
     // cheap empty check per turn.
     let pending_swap: PendingSwap = Arc::new(Mutex::new(None));
 
+    // agentd 2.0: the reply slots for ToolRequest/BudgetRequest round-trips.
+    let replies = Arc::new(crate::subagent::replies::Replies::new());
+
     // The control reader runs on its own thread and owns stdin from here on,
     // so Ping/Pong keeps flowing while the loop is busy — and so Resume/Cancel/
     // SwapIntel still arrive while the loop is suspended at a turn boundary.
@@ -181,23 +135,13 @@ pub fn run() -> i32 {
         Arc::clone(&paused),
         inject_tx,
         Arc::clone(&pending_swap),
+        Arc::clone(&replies),
         log.ctx().clone(),
     );
 
-    // A NON-WARM child hands its `Inject` stream to the gate bus (RFC 0021 §7):
-    // a workflow `human` node deep in this child polls it for the human's reply.
-    // A warm session keeps the stream — it is its turn-input channel.
-    #[cfg_attr(not(feature = "workflow"), allow(unused_mut))]
-    let mut inject_rx = Some(inject_rx);
-    #[cfg(feature = "workflow")]
-    if !payload.warm {
-        gatebus::install(
-            Arc::clone(&up),
-            inject_rx
-                .take()
-                .expect("inject_rx handed to the gate bus once"),
-        );
-    }
+    // A warm session keeps its `Inject` stream as its turn-input channel; a
+    // one-shot subagent never reads it.
+    let inject_rx = Some(inject_rx);
 
     send_up(&up, &AgentMsg::Ready);
     log.info(
@@ -209,7 +153,20 @@ pub fn run() -> i32 {
         &payload.intelligence.uri,
         payload.intelligence.token.clone(),
     ) {
-        Ok(mut c) => {
+        Ok(c) => {
+            // RFC 0031: the resolved `intelligence.headers` ride every dial.
+            #[allow(unused_mut)]
+            let mut c = c
+                .with_headers(payload.intelligence.headers.clone())
+                // RFC 0031 §8: select the wire dialect (bedrock ⇒ Converse).
+                .with_dialect(payload.intelligence.dialect.as_deref());
+            // RFC 0031: an `intelligence.auth: {kind: aws}` SigV4-signs the LLM dial.
+            #[cfg(feature = "oauth")]
+            if let Some(aws) = &payload.intelligence.aws_auth
+                && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, "intelligence")
+            {
+                c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
+            }
             // Outbound LLM calls join the run's distributed trace (RFC 0010).
             c.set_trace_id(payload.telemetry.trace_id.clone());
             // RFC 0018 §6: bridge this child's intel reachability UP to the
@@ -254,13 +211,13 @@ pub fn run() -> i32 {
         }
     }
 
-    // A payload carrying a WORKFLOW is driven by the graph engine instead of the
-    // ReAct loop (pivot Phase 7 · W4): same connections, same supervision, same
-    // exit contract — the parent handed this child a whole workflow. One-shot by
-    // construction (`warm` is ignored: a workflow terminates via its own graph).
-    #[cfg(feature = "workflow")]
-    if let Some(wf) = payload.workflow.clone() {
-        return run_workflow_child(&wf, &intel, &servers, &payload, &up, &log);
+    // agentd 2.0 (RFC 0026 §2): a TURN WORKER runs one turn over the supplied
+    // context slice; internal tools round-trip to the supervisor. Same
+    // connections + supervision as a subagent; a different loop.
+    if payload.role == crate::subagent::protocol::Role::Turn {
+        return crate::runtime::worker::run_turn_child(
+            &payload, &intel, &servers, &up, &cancel, &replies, &log,
+        );
     }
 
     let mut input = LoopInput {
@@ -278,10 +235,8 @@ pub fn run() -> i32 {
         cancel: Some(Arc::clone(&cancel)),
     };
 
-    // Self-orchestration: the model can delegate subtasks via subagent.spawn,
-    // which spawns + supervises a child agent (depth + 1, scoped) from here.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentd"));
-    let mut orch = Orchestrator::from_payload(exe, &payload, Duration::from_secs(25), log.clone());
+    // A subagent has no in-child orchestration self-tools (RFC 0026 §6 flat tree).
+    let mut orch = NoSelfTools;
 
     // A warm continue-session lives across many events; a one-shot runs once.
     // A warm session is the long-lived loop/reactive shape (RFC 0008), so it gets
@@ -353,7 +308,7 @@ fn run_warm(
     servers: &[McpClient],
     input: &LoopInput,
     payload: &SpawnPayload,
-    orch: &mut Orchestrator,
+    orch: &mut NoSelfTools,
     cancel: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     inject_rx: &Receiver<String>,
@@ -668,7 +623,7 @@ fn fail(up: &Up, log: &Logger, error: String, code: i32) -> i32 {
 /// the daemon relies on (subscriptions live on the DAEMON's own connections).
 fn refresh_tools_if_changed(
     session: &mut Session,
-    orch: &mut Orchestrator,
+    orch: &mut NoSelfTools,
     servers: &[McpClient],
     log: &Logger,
 ) {
@@ -693,327 +648,6 @@ fn refresh_tools_if_changed(
             log.warn("mcp.tools_refresh_failed", serde_json::json!({"err": msg}));
         }
     }
-}
-
-/// Drive a payload-carried workflow to its terminal outcome and map it onto the
-/// child result contract (pivot Phase 7 · W4): GraphStatus → TerminalStatus →
-/// the RFC 0011 exit table, the graph detail (status/reason/steps/tokens)
-/// carried in the result body, and the intelligence cost rolled up as Usage.
-#[cfg(feature = "workflow")]
-fn run_workflow_child(
-    graph: &crate::graph::Graph,
-    intel: &IntelClient,
-    servers: &[McpClient],
-    payload: &SpawnPayload,
-    up: &Up,
-    log: &Logger,
-) -> i32 {
-    use crate::graph::drive_connected;
-
-    // The graph crossed a process boundary — re-validate fail-closed (cheap, pure)
-    // even though the parent validated at the authoring boundary.
-    if let Err(errs) = graph.validate() {
-        return fail(
-            up,
-            log,
-            format!("workflow: invalid graph: {}", errs.join("; ")),
-            crate::exit::USAGE,
-        );
-    }
-    let wall = Duration::from_millis(payload.limits.deadline_ms.max(1));
-    let deadline = Some(Instant::now() + wall);
-    let model = payload.intelligence.model.clone().unwrap_or_default();
-    let factory = crate::graph::ExecFactory {
-        intel_uri: payload.intelligence.uri.clone(),
-        intel_token: payload.intelligence.token.clone(),
-        model: model.clone(),
-        server_specs: payload.mcp_servers.clone(),
-        max_steps: payload.limits.max_steps,
-        max_tokens: payload.limits.max_tokens,
-        node_timeout: wall,
-    };
-    // Async subgraphs spawn through the SAME orchestrator machinery a model's
-    // subagent.spawn uses — supervised children under this payload's caps.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentd"));
-    let mut orch = Orchestrator::from_payload(exe, payload, Duration::from_secs(25), log.clone());
-
-    // REACTIVE semantics (the daemon path): drive ONE step — a `Wait` suspends
-    // and this child EXITS with the serialized slice in its result; the daemon
-    // arms the watch and resumes a fresh child on the update/timeout. Token
-    // roll-up is the PER-CHILD delta (the cumulative pool rides the slice).
-    if payload.workflow_reactive {
-        let entry_tokens = payload
-            .workflow_resume
-            .as_ref()
-            .map(|r| r.state.tokens())
-            .unwrap_or(0);
-        let resume_from = payload.workflow_resume.clone().map(|r| {
-            let outcome = if r.timed_out {
-                crate::graph::WaitOutcome::TimedOut
-            } else {
-                crate::graph::WaitOutcome::Updated(r.content.unwrap_or(serde_json::Value::Null))
-            };
-            (r.state, outcome)
-        });
-        let factory = crate::graph::ExecFactory {
-            intel_uri: payload.intelligence.uri.clone(),
-            intel_token: payload.intelligence.token.clone(),
-            model: model.clone(),
-            server_specs: payload.mcp_servers.clone(),
-            max_steps: payload.limits.max_steps,
-            max_tokens: payload.limits.max_tokens,
-            node_timeout: wall,
-        };
-        let result = crate::graph::drive_connected_once(
-            graph,
-            resume_from,
-            intel,
-            servers,
-            &model,
-            payload.limits.max_steps,
-            payload.limits.max_tokens,
-            wall,
-            deadline,
-            Some(factory),
-            Some(&mut orch),
-            log,
-        );
-        return match result {
-            crate::graph::DriveResult::Done(o) => finish_workflow_child(o, entry_tokens, up, log),
-            crate::graph::DriveResult::Suspended(s) => {
-                log.info(
-                    "workflow.suspended",
-                    serde_json::json!({
-                        "on_uri": s.on_uri,
-                        "timeout_ms": s.timeout_ms,
-                        "steps": s.state.steps(),
-                        "tokens": s.state.tokens(),
-                    }),
-                );
-                send_up(
-                    up,
-                    &AgentMsg::Usage(crate::wire::intel::Usage {
-                        input_tokens: 0,
-                        output_tokens: s.state.tokens().saturating_sub(entry_tokens),
-                    }),
-                );
-                let outcome = crate::agentloop::stop::Outcome {
-                    status: crate::agentloop::stop::TerminalStatus::Completed,
-                    partial: false,
-                    result: serde_json::json!({
-                        "$workflow": { "suspended": {
-                            "on_uri": s.on_uri,
-                            "timeout_ms": s.timeout_ms,
-                            "state": s.state,
-                            // A HUMAN GATE's published face (RFC 0021 §7) rides
-                            // the suspension so the daemon can surface it.
-                            "gate": s.gate,
-                        }}
-                    }),
-                    scheduled: Vec::new(),
-                    subscriptions: Vec::new(),
-                };
-                send_up(up, &AgentMsg::Result { outcome });
-                crate::exit::SUCCESS
-            }
-        };
-    }
-
-    // Checkpoint resume (RFC 0021 §8.4): fetch the envelope from the named
-    // checkpointer server, verify the workflow hash, and drive from the restored
-    // slice — board, budget, and visit counts carry over. A hash mismatch is a
-    // REFUSAL (the graph is not the one the state was taken from), overridable
-    // only by the explicit `--workflow-resume-force`.
-    if let Some(r) = &payload.workflow_resume_ref {
-        let state = match fetch_resume_state(graph, r, intel, servers, &model, payload, log) {
-            Ok(s) => s,
-            Err(reason) => {
-                log.error(
-                    "workflow.resume.refused",
-                    serde_json::json!({"err": reason}),
-                );
-                let outcome = Outcome {
-                    status: TerminalStatus::Refused,
-                    partial: false,
-                    result: serde_json::Value::String(reason),
-                    scheduled: Vec::new(),
-                    subscriptions: Vec::new(),
-                };
-                send_up(up, &AgentMsg::Result { outcome });
-                return crate::exit::REFUSED;
-            }
-        };
-        log.info(
-            "workflow.resume",
-            serde_json::json!({
-                "server": r.server, "key": r.key, "seq": r.seq,
-                "at": state.at, "steps": state.steps(), "tokens": state.tokens(),
-            }),
-        );
-        let entry_tokens = state.tokens();
-        let o = crate::graph::drive_connected_from(
-            graph,
-            state,
-            r.force, // graph-edit-and-continue resets the progress guards
-            intel,
-            servers,
-            &model,
-            payload.limits.max_steps,
-            payload.limits.max_tokens,
-            wall,
-            deadline,
-            Some(factory),
-            Some(&mut orch),
-            log,
-        );
-        return finish_workflow_child(o, entry_tokens, up, log);
-    }
-
-    let o = drive_connected(
-        graph,
-        intel,
-        servers,
-        &model,
-        payload.limits.max_steps,
-        payload.limits.max_tokens,
-        wall,
-        deadline,
-        Some(factory),
-        Some(&mut orch),
-        log,
-    );
-
-    finish_workflow_child(o, 0, up, log)
-}
-
-/// Fetch + verify a checkpoint envelope (RFC 0021 §8.4): `state.get {key[,seq]}`
-/// on the checkpointer server, envelope version check, workflow-hash
-/// verification (skipped under `force`), and the run-slice extraction. Every
-/// failure is a REFUSAL string (exit 5) — resuming from nothing/a foreign graph
-/// is a semantic refusal, not a crash.
-#[cfg(feature = "workflow")]
-fn fetch_resume_state(
-    graph: &crate::graph::Graph,
-    r: &crate::subagent::protocol::WorkflowResumeRef,
-    intel: &IntelClient,
-    servers: &[McpClient],
-    model: &str,
-    payload: &SpawnPayload,
-    log: &Logger,
-) -> Result<crate::graph::GraphState, String> {
-    use crate::graph::{GraphExec, SessionExec};
-    let key = r.key.replace("{run_id}", &payload.telemetry.run_id);
-    let mut args = serde_json::json!({"key": key});
-    if let Some(seq) = r.seq {
-        args["seq"] = seq.into();
-    }
-    let wall = Duration::from_millis(payload.limits.deadline_ms.max(1));
-    let mut exec = SessionExec::new(
-        intel,
-        servers,
-        log,
-        model,
-        payload.limits.max_steps,
-        payload.limits.max_tokens,
-        wall,
-    );
-    let (val, is_err) = exec.call_tool(&r.server, "state.get", &args);
-    if is_err {
-        return Err(format!(
-            "workflow-resume: state.get on '{}' failed: {val}",
-            r.server
-        ));
-    }
-    let envelope = val.get("state").unwrap_or(&val);
-    if envelope.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err(format!(
-            "workflow-resume: unsupported envelope version (want v=1): {}",
-            envelope
-                .get("v")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null)
-        ));
-    }
-    let want = crate::graph::workflow_hash(graph);
-    let got = envelope
-        .get("workflow_hash")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if !r.force && got != want {
-        return Err(format!(
-            "workflow-resume: workflow hash mismatch (checkpoint {got}, supplied graph {want}) — \
-             the state was not taken from this graph; --workflow-resume-force overrides"
-        ));
-    }
-    serde_json::from_value(envelope.get("state").cloned().unwrap_or_default())
-        .map_err(|e| format!("workflow-resume: bad run slice in envelope: {e}"))
-}
-
-/// Map a terminal [`GraphOutcome`] onto the child result contract: GraphStatus →
-/// TerminalStatus → the exit table, the workflow detail in the result body, and
-/// the intelligence cost (LESS `entry_tokens` — a resumed reactive child rolls
-/// only ITS delta; the cumulative pool rides the persisted slice) as Usage.
-#[cfg(feature = "workflow")]
-fn finish_workflow_child(
-    o: crate::graph::GraphOutcome,
-    entry_tokens: u64,
-    up: &Up,
-    log: &Logger,
-) -> i32 {
-    use crate::agentloop::stop::{Outcome, TerminalStatus};
-    use crate::graph::GraphStatus;
-    let status = match o.status {
-        GraphStatus::Completed => TerminalStatus::Completed,
-        GraphStatus::Halted => o.terminal.unwrap_or(TerminalStatus::Crashed),
-        GraphStatus::Exhausted => {
-            let r = o.reason.as_deref().unwrap_or("");
-            if r.contains("deadline") {
-                TerminalStatus::Deadline
-            } else if r.contains("token") {
-                TerminalStatus::ExhaustedTokens
-            } else {
-                TerminalStatus::ExhaustedSteps
-            }
-        }
-        GraphStatus::LoopDetected => TerminalStatus::LoopDetected,
-        GraphStatus::Stalled => TerminalStatus::Stalled,
-        GraphStatus::Crashed => TerminalStatus::Crashed,
-    };
-    log.info(
-        "workflow.exit",
-        serde_json::json!({
-            "workflow_status": format!("{:?}", o.status),
-            "reason": o.reason,
-            "steps": o.steps,
-            "tokens": o.tokens,
-        }),
-    );
-    // Roll the workflow's intelligence cost up for hierarchical accounting
-    // (`agentd_tokens_total`) BEFORE the terminal Result — the input/output split
-    // is unknown at this layer, so the total rides output_tokens.
-    send_up(
-        up,
-        &AgentMsg::Usage(crate::wire::intel::Usage {
-            input_tokens: 0,
-            output_tokens: o.tokens.saturating_sub(entry_tokens),
-        }),
-    );
-    let code = crate::exit::once_exit(status, false);
-    let outcome = Outcome {
-        status,
-        partial: false,
-        result: serde_json::json!({
-            "workflow_status": format!("{:?}", o.status),
-            "reason": o.reason,
-            "steps": o.steps,
-            "tokens": o.tokens,
-            "result": o.result,
-        }),
-        scheduled: Vec::new(),
-        subscriptions: Vec::new(),
-    };
-    send_up(up, &AgentMsg::Result { outcome });
-    code
 }
 
 fn read_spawn(reader: &mut BufReader<Stdin>) -> Result<SpawnPayload, String> {
@@ -1044,6 +678,8 @@ fn control_msg_label(msg: &ControlMsg) -> &'static str {
         ControlMsg::Cancel { .. } => "cancel",
         ControlMsg::Inject { .. } => "inject",
         ControlMsg::SwapIntel(_) => "swap_intel",
+        ControlMsg::ToolResult { .. } => "tool_result",
+        ControlMsg::BudgetGrant { .. } => "budget_grant",
     }
 }
 
@@ -1064,7 +700,7 @@ fn build_logger(payload: &SpawnPayload) -> Logger {
     .with_content(t.log_content)
 }
 
-fn send_up(up: &Up, msg: &AgentMsg) {
+pub(crate) fn send_up(up: &Up, msg: &AgentMsg) {
     if let Ok(mut out) = up.lock() {
         // Best-effort: a dead parent means our writes fail; we don't crash.
         let _ = frame::write_frame(&mut *out, msg);
@@ -1110,6 +746,7 @@ fn spawn_control_thread(
     paused: Arc<AtomicBool>,
     inject_tx: Sender<String>,
     pending_swap: PendingSwap,
+    replies: Arc<crate::subagent::replies::Replies>,
     ctx: LogCtx,
 ) {
     let log = Logger::new(ctx, Level::Debug);
@@ -1119,6 +756,35 @@ fn spawn_control_thread(
             // Exits on Ok(None)/Err — the supervisor closed the channel.
             while let Ok(Some(bytes)) = frame::read_frame(&mut stdin) {
                 match serde_json::from_slice::<ControlMsg>(&bytes) {
+                    // agentd 2.0 round-trip answers: park them in the reply slots
+                    // the turn worker blocks on (RFC 0026 §2).
+                    Ok(ControlMsg::ToolResult {
+                        id,
+                        result,
+                        is_error,
+                    }) => {
+                        replies.deliver(
+                            id,
+                            crate::subagent::replies::Reply::Tool { result, is_error },
+                        );
+                    }
+                    Ok(ControlMsg::BudgetGrant {
+                        id,
+                        ok,
+                        wait_ms,
+                        model,
+                        reason,
+                    }) => {
+                        replies.deliver(
+                            id,
+                            crate::subagent::replies::Reply::Budget {
+                                ok,
+                                wait_ms,
+                                model,
+                                reason,
+                            },
+                        );
+                    }
                     Ok(ControlMsg::Ping { seq }) => send_up(&up, &AgentMsg::Pong { seq }),
                     Ok(ControlMsg::Cancel { reason }) => {
                         log.info("subagent.cancel", serde_json::json!({"reason": reason}));
@@ -1151,6 +817,8 @@ fn spawn_control_thread(
                     Ok(ControlMsg::Spawn(_)) | Err(_) => { /* unexpected/garbage — ignore */ }
                 }
             }
+            // The channel closed: wake any turn worker blocked on a reply.
+            replies.close();
         })
         .ok();
 }

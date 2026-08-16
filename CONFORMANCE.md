@@ -28,7 +28,7 @@ deferred.
 |---|---|
 | `cargo test -p agentd` (full feature matrix) | **579 passed / 0 failed** |
 | `cargo test -p agentd` (default features) | **406 passed / 0 failed** |
-| Black-box conformance suite (`cargo run -p agentd-conformance`) | **38 passed / 0 failed** |
+| Black-box conformance suite (`cargo run -p agentd-conformance`) | **15 passed / 0 failed** (rebuilt into the 2.0 families: supervisor, security, store, durability, tools, a2a-conversation) |
 | ACC schema+behavior harness (drives the real binary; see *Validation report*) | **22 passed / 0 failed** |
 | Golden `--capabilities` fixtures vs `manifest.schema.json` (all 4, agentctl-owned) | **4 / 4 valid** |
 | agentctl `agent-contract-client` fixture tests | **6 / 6 pass** (cross-repo consistency) |

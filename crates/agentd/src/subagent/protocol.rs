@@ -58,6 +58,28 @@ pub enum ControlMsg {
     /// `token` is a credential carried on the wire like [`SpawnPayload`]'s — it
     /// is NEVER logged (the swap event/logs carry transport+index only).
     SwapIntel(Box<SwapIntel>),
+    /// agentd 2.0 (RFC 0026 §2): the answer to an [`AgentMsg::ToolRequest`] —
+    /// the supervisor executed the internal tool; `result` is the tool's
+    /// output (or an error message when `is_error`).
+    ToolResult {
+        id: u64,
+        result: Value,
+        #[serde(default)]
+        is_error: bool,
+    },
+    /// agentd 2.0 (RFC 0026 §7): the answer to an [`AgentMsg::BudgetRequest`].
+    /// `ok` = proceed now; else wait `wait_ms` and ask again (`wait`/`slow`),
+    /// or the request is refused (`reason`); `model` = a degrade swap.
+    BudgetGrant {
+        id: u64,
+        ok: bool,
+        #[serde(default)]
+        wait_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// The intelligence config the child rebuilds its client from on a hot-swap (RFC
@@ -134,6 +156,17 @@ pub enum AgentMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active: Option<IntelActive>,
     },
+    /// agentd 2.0 (RFC 0026 §2): a turn worker / subagent asks the supervisor
+    /// to execute an **internal** tool (memory, plan, subagent.run, sleep…) —
+    /// state changes are made by the state owner. Answered by
+    /// [`ControlMsg::ToolResult`] with the same `id`.
+    ToolRequest { id: u64, name: String, args: Value },
+    /// agentd 2.0 (RFC 0026 §7): budget admission before a model call.
+    /// Answered by [`ControlMsg::BudgetGrant`].
+    BudgetRequest { id: u64, estimate: u64 },
+    /// agentd 2.0: a `Role::Turn` worker finished its turn (terminal for the
+    /// worker). Carries the transcript delta, the usage, and the outcome.
+    TurnDone { turn: Box<TurnResult> },
 }
 
 /// Which endpoint is serving the child's intelligence, for [`AgentMsg::IntelHealth`].
@@ -200,68 +233,131 @@ pub struct SpawnPayload {
     /// parseable.
     #[serde(default)]
     pub warm: bool,
-    /// Drive this WORKFLOW instead of the ReAct loop on `instruction` (pivot
-    /// Phase 7 · W4): the child validates the graph and drives it with the same
-    /// engine `--mode workflow` uses — so a parent can hand a whole workflow to a
-    /// supervised subagent. One-shot by construction (`warm` is ignored). The
-    /// graph is TRUSTED parent config, validated on both sides of the boundary.
-    #[cfg(feature = "workflow")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<crate::graph::Graph>,
-    /// REACTIVE workflow semantics (the daemon path): a `Wait` node SUSPENDS —
-    /// the child exits carrying the serialized run slice in its result, the
-    /// DAEMON arms the watch, and a fresh child resumes on the update/timeout.
-    /// `false` (one-shot semantics) blocks on waits in-process.
-    #[cfg(feature = "workflow")]
+    /// agentd 2.0 (RFC 0026 §2): the child's role. `agent` (default) is the
+    /// RFC 0009 subagent (ReAct loop / workflow driver); `turn` is a **turn
+    /// worker** driven by `turn` below. `#[serde(default)]` keeps older frames
+    /// parseable.
     #[serde(default)]
-    pub workflow_reactive: bool,
-    /// Resume a previously-suspended reactive workflow: the persisted run slice
-    /// plus how its `Wait` resolved. Minted ONLY by the daemon.
-    #[cfg(feature = "workflow")]
+    pub role: Role,
+    /// The turn worker's input (`role: turn`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_resume: Option<WorkflowResume>,
-    /// Resume from a CHECKPOINT (RFC 0021 §8.4, `--workflow-resume`): the child
-    /// fetches the envelope from the named checkpointer server after connecting,
-    /// verifies the workflow hash, and drives from the restored slice (board,
-    /// budget, and visit counts carry over). Minted from operator config only.
-    #[cfg(feature = "workflow")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_resume_ref: Option<WorkflowResumeRef>,
+    pub turn: Option<Box<TurnSpec>>,
 }
 
-/// A checkpoint-resume reference (RFC 0021 §8.4): `--workflow-resume
-/// <server>:<key>[@seq]` parsed. `force` (`--workflow-resume-force`) overrides
-/// the workflow-hash verification for deliberate graph-edit-and-continue (visit
-/// counts reset; board + budget keep).
+/// A checkpoint-resume reference (RFC 0021 §8.4). Retained for the (dead) v1
+/// `Config` `--workflow-resume` parsing until the full v1-`Config` deletion; the
+/// v1 in-child workflow driver that consumed it was removed with the mode
+/// cut-over.
 #[cfg(feature = "workflow")]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowResumeRef {
-    /// The configured MCP server implementing the checkpointer profile.
     pub server: String,
-    /// The state key (already `{run_id}`-interpolated by the supervisor).
     pub key: String,
-    /// A specific envelope seq (fork/time-travel); latest when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
-    /// Skip the workflow-hash verification (graph-edit-and-continue).
     #[serde(default)]
     pub force: bool,
 }
 
-/// How a suspended reactive workflow's `Wait` resolved — the daemon→child resume
-/// input (pivot Phase 7 follow-up: the reactive-daemon workflow).
-#[cfg(feature = "workflow")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowResume {
-    /// The suspended run slice (cursor + blackboard + budget), exactly as the
-    /// suspending child serialized it.
-    pub state: crate::graph::GraphState,
-    /// `true` = the wait timed out (the `timeout` edge); `false` = the resource
-    /// updated (the `updated` edge, with `content` freshly read).
+/// The child's role (agentd 2.0, RFC 0026 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// An RFC 0009 subagent: the ReAct loop on `instruction` (or a workflow).
+    #[default]
+    Agent,
+    /// A turn worker: ONE turn over a supplied context slice, internal tools
+    /// round-tripped to the supervisor (RFC 0026 §2).
+    Turn,
+}
+
+/// What kind of turn a `Role::Turn` worker runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnKind {
+    /// A root/conversation turn: tools, may act, ends with a reply.
+    #[default]
+    Turn,
+    /// A structured reasoning call: no tools, an object out (`think`, preflight,
+    /// compaction).
+    Think,
+    /// A bounded agentic run for a workflow `agent` step / subagent: tools,
+    /// output contract/schema, ends with a result.
+    Agent,
+}
+
+/// The turn worker's input (RFC 0026 §3.2). Everything the child needs to run
+/// one turn: the system prompt, the context slice, the tool definitions and
+/// which of them round-trip, the output schema, and the knobs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TurnSpec {
     #[serde(default)]
-    pub timed_out: bool,
+    pub kind: TurnKind,
+    /// The full system prompt (instruction + capabilities + skills + summary).
+    pub system: String,
+    /// The transcript slice (context messages incl. the triggering event).
+    #[serde(default)]
+    pub messages: Vec<crate::context::Msg>,
+    /// LLM-facing tool definitions (every class).
+    #[serde(default)]
+    pub tools: Vec<crate::wire::intel::ToolDef>,
+    /// Tool names that ROUND-TRIP to the supervisor (internal + mapped).
+    #[serde(default)]
+    pub internal: Vec<String>,
+    /// MCP-class tools the child calls itself: tool name → (server, wire tool).
+    #[serde(default)]
+    pub mcp_routes: std::collections::BTreeMap<String, (String, String)>,
+    /// Validate the final answer against this schema (structured turns).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<serde_json::Value>,
+    pub output_schema: Option<Value>,
+    /// Max model rounds in this turn (0 = the payload's `limits.max_steps`).
+    #[serde(default)]
+    pub max_rounds: u32,
+    /// Ask the supervisor for budget admission before every model call.
+    #[serde(default)]
+    pub budget_admission: bool,
+    /// The idempotency-key prefix for effects (`<ctx>/<turn>`), RFC 0025 §7.
+    #[serde(default)]
+    pub idempotency_prefix: String,
+    /// Extra `_meta` stamped on MCP tool calls (run/ctx/principal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_meta: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Per-response completion cap (0 = default).
+    #[serde(default)]
+    pub max_tokens_per_call: u32,
+    /// The turn id (for logs and idempotency).
+    #[serde(default)]
+    pub turn_id: String,
+}
+
+/// A finished turn (RFC 0026 §3.2 step 4). `messages` is the transcript delta
+/// (assistant/tool messages appended during the turn, in order).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TurnResult {
+    /// `completed` | `refused` | `exhausted_steps` | `exhausted_tokens` |
+    /// `deadline` | `loop_detected` | `cancelled` | `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub messages: Vec<crate::context::Msg>,
+    /// The final text (a reply / the answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The parsed structured value (structured turns / schema'd answers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default)]
+    pub usage: Usage,
+    #[serde(default)]
+    pub rounds: u32,
+    #[serde(default)]
+    pub tool_calls: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The `finish` call, if the model made one (`{status, output, reason, exit}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<Value>,
 }
 
 /// A single seed message — a minimal {role, content} pair. Roles mirror the
@@ -279,6 +375,21 @@ pub struct IntelConfig {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The resolved `intelligence.headers` (RFC 0031) — arbitrary per-dial
+    /// headers (e.g. a gateway routing header). Secret-free at rest is not
+    /// guaranteed (values may resolve secrets), so this rides the payload
+    /// resolved and is never logged. Empty by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// An `intelligence.auth: { kind: aws }` spec (RFC 0031) so the child can
+    /// SigV4-sign the LLM dial. Secret-free (creds come from env/imds/irsa/the
+    /// SSO cache at dial time). `None` for the non-AWS path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_auth: Option<crate::config::AuthSpec>,
+    /// The wire dialect (RFC 0031 §8): `openai` (default), `anthropic`, or
+    /// `bedrock`. `None` ⇒ OpenAI-compatible (the byte-identical legacy path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +439,9 @@ mod tests {
                 uri: "https://intel.example".into(),
                 token: Some("secret".into()),
                 model: Some("m".into()),
+                headers: Vec::new(),
+                aws_auth: None,
+                dialect: None,
             },
             mcp_servers: vec![McpServerSpec {
                 name: "fs".into(),
@@ -354,14 +468,8 @@ mod tests {
             },
             depth: 1,
             warm: false,
-            #[cfg(feature = "workflow")]
-            workflow: None,
-            #[cfg(feature = "workflow")]
-            workflow_reactive: false,
-            #[cfg(feature = "workflow")]
-            workflow_resume: None,
-            #[cfg(feature = "workflow")]
-            workflow_resume_ref: None,
+            role: crate::subagent::protocol::Role::Agent,
+            turn: None,
         }
     }
 

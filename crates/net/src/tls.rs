@@ -512,6 +512,17 @@ pub fn peer_presented_cert(stream: &ServerTlsStream) -> bool {
     stream.conn.peer_certificates().is_some()
 }
 
+/// The **verified** peer's identity fields (subject CN + SANs) from its mTLS leaf
+/// certificate, for surfacing to principal matching (RFC 0029 §10.3). `None` when
+/// no client cert was presented; rustls has already verified the chain, so this
+/// only *reads* fields (see [`crate::x509`]). A SPIFFE X.509-SVID's `spiffe://…`
+/// arrives as a URI SAN.
+pub fn peer_identity(stream: &ServerTlsStream) -> Option<crate::x509::PeerIdentity> {
+    let certs = stream.conn.peer_certificates()?;
+    let leaf = certs.first()?;
+    Some(crate::x509::parse(leaf.as_ref()))
+}
+
 /// Build a per-identity mTLS config (the same root store + ring provider, plus
 /// the client cert/key). Not cached — client identities vary per endpoint and
 /// connections are infrequent.

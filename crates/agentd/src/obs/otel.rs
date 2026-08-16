@@ -90,6 +90,24 @@ impl RunSpan {
     }
 }
 
+/// Buffer one log record for OTLP export (plan §3.11). A no-op unless
+/// [`arm_logs`] installed the exporter (and always a no-op without `otel`).
+pub fn capture_log(unix_nanos: u128, level: &str, event: &str, fields: &serde_json::Value) {
+    #[cfg(feature = "otel")]
+    imp::capture_log(unix_nanos, level, event, fields);
+    #[cfg(not(feature = "otel"))]
+    let _ = (unix_nanos, level, event, fields);
+}
+
+/// Arm the OTLP **logs** exporter: a bounded buffer drained by a background
+/// thread to `<endpoint>/v1/logs`. Idempotent; a no-op without `otel`.
+pub fn arm_logs(endpoint: &str, service: &str, version: &str) {
+    #[cfg(feature = "otel")]
+    imp::arm_logs(endpoint, service, version);
+    #[cfg(not(feature = "otel"))]
+    let _ = (endpoint, service, version);
+}
+
 #[cfg(feature = "otel")]
 mod imp {
     use crate::net::http::{self, Url};
@@ -286,6 +304,109 @@ mod imp {
         }
     }
 
+    // ---- OTLP logs (plan §3.11, optional) ----------------------------------
+    // A bounded buffer drained by a background thread to `<endpoint>/v1/logs`.
+    // The JSON-lines log surface is the primary one; this is the OTLP mirror.
+
+    use std::sync::{Mutex, OnceLock};
+
+    static LOGS: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
+
+    /// Buffer one log record (no-op unless [`arm_logs`] ran; bounded at 8192 so a
+    /// stalled/absent collector can never grow memory without bound).
+    pub(super) fn capture_log(unix_nanos: u128, level: &str, event: &str, fields: &Value) {
+        let Some(buf) = LOGS.get() else { return };
+        let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+        if b.len() >= 8192 {
+            return;
+        }
+        b.push(json!({
+            "timeUnixNano": unix_nanos.to_string(),
+            "severityText": level.to_ascii_uppercase(),
+            "body": { "stringValue": event },
+            "attributes": [ { "key": "log.fields", "value": { "stringValue": fields.to_string() } } ],
+        }));
+    }
+
+    /// Arm the OTLP logs exporter: install the buffer + spawn a background flush
+    /// thread. Idempotent (a second call no-ops).
+    pub(super) fn arm_logs(endpoint: &str, service: &str, version: &str) {
+        if LOGS.set(Mutex::new(Vec::new())).is_err() {
+            return; // already armed
+        }
+        let (endpoint, service, version) = (
+            endpoint.to_string(),
+            service.to_string(),
+            version.to_string(),
+        );
+        std::thread::Builder::new()
+            .name("otel-logs".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let batch = {
+                        let mut b = LOGS
+                            .get()
+                            .expect("armed")
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        std::mem::take(&mut *b)
+                    };
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    let body = to_otlp_logs_json(&batch, &service, &version);
+                    let _ = export_signal(&endpoint, "logs", &body);
+                }
+            })
+            .ok();
+    }
+
+    pub(super) fn to_otlp_logs_json(records: &[Value], service: &str, version: &str) -> Value {
+        json!({
+            "resourceLogs": [{
+                "resource": { "attributes": [
+                    { "key": "service.name", "value": { "stringValue": service } },
+                    { "key": "service.version", "value": { "stringValue": version } },
+                ]},
+                "scopeLogs": [{ "scope": { "name": "agentd" }, "logRecords": records }]
+            }]
+        })
+    }
+
+    /// POST an OTLP body to `<endpoint>/v1/<signal>` (`traces` | `logs`).
+    fn export_signal(endpoint: &str, signal: &str, body: &Value) -> Result<(), String> {
+        let base = endpoint.trim_end_matches('/');
+        let suffix = format!("/v1/{signal}");
+        let target = if base.ends_with(&suffix) {
+            base.to_string()
+        } else {
+            format!("{base}{suffix}")
+        };
+        let url = Url::parse(&target).map_err(|e| format!("otel: bad endpoint '{target}': {e}"))?;
+        if url.is_tls() {
+            return Err("otel: https OTLP endpoints need --features tls".into());
+        }
+        let bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+        let mut stream = http::connect_tcp(&url.host, url.port, Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        let headers = [("content-type", "application/json")];
+        let resp = http::send(
+            &mut stream,
+            &url.host_header(),
+            "POST",
+            &url.path,
+            &headers,
+            &bytes,
+        )
+        .map_err(|e| e.to_string())?;
+        if resp.is_success() {
+            Ok(())
+        } else {
+            Err(format!("otel: collector returned HTTP {}", resp.status))
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -375,6 +496,26 @@ mod imp {
             assert!(spans[2].get("parentSpanId").is_none()); // root
             // every child shares the run trace id
             assert_eq!(spans[0]["traceId"], spans[2]["traceId"]);
+        }
+
+        #[test]
+        fn otlp_logs_json_has_the_expected_shape() {
+            let rec = json!({
+                "timeUnixNano": "1700000000000000000",
+                "severityText": "INFO",
+                "body": { "stringValue": "turn.start" },
+                "attributes": [ { "key": "log.fields", "value": { "stringValue": "{}" } } ],
+            });
+            let v = to_otlp_logs_json(&[rec], "agentd", "2.0.0");
+            let rl = &v["resourceLogs"][0];
+            assert_eq!(
+                rl["resource"]["attributes"][0]["value"]["stringValue"],
+                "agentd"
+            );
+            let lr = &rl["scopeLogs"][0]["logRecords"][0];
+            assert_eq!(lr["body"]["stringValue"], "turn.start");
+            assert_eq!(lr["severityText"], "INFO");
+            assert_eq!(lr["timeUnixNano"], "1700000000000000000");
         }
     }
 }

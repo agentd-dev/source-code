@@ -142,7 +142,7 @@ reason, usage from `usage.{input_tokens,output_tokens}`.
 
 Gemini, Bedrock, Cohere, and other providers are **not** in the binary. Run a
 gateway that exposes an OpenAI-compatible `/chat/completions`, point
-`AGENT_INTELLIGENCE` at it (`unix:` or `https://`), and the canonical adapter
+`AGENT_INTELLIGENCE` at it (`https://`, or a loopback `http://` for dev), and the canonical adapter
 handles the rest. This keeps the binary thin and the provider matrix out of
 agentd's release cadence.
 
@@ -220,10 +220,10 @@ Rules:
   never persisted, never put in the transcript fed back to the model.
 - **Redacted everywhere.** The `Config` `Debug` impl prints the token as `***`;
   the secret-header allowlist keeps `authorization` / `x-api-key` out of the
-  JSON-lines logs and any span; `agent://intelligence` shows transport + index
-  only. There is a test asserting the raw value never appears.
-- **Optional for keyless endpoints.** A local vLLM/Ollama behind a `unix:` socket
-  needs no token at all.
+  JSON-lines logs and any span; the endpoint-health telemetry shows transport +
+  index only. There is a test asserting the raw value never appears.
+- **Optional for keyless endpoints.** A local vLLM/Ollama on a loopback `http://`
+  endpoint (dev) needs no token at all.
 - **File rotation.** A named-but-unset per-endpoint token *file* is caught at
   startup (exit 2) so a failover never discovers an unreadable secret. The
   `…_FILE` variants are read through the secret-file reader, the rotation-friendly
@@ -316,12 +316,15 @@ These transitions feed the metrics (`agent_intel_up`,
 `agent_intel_errors_total{reason}`) and the `intel.*` events — see
 [Observability](observability.md).
 
-### `agent://intelligence` — the live endpoint health view
+### Endpoint health — the failover snapshot
 
-When serving its self-MCP (`--serve-mcp`), agentd exposes a **management-only**,
-subscribable resource: **`agent://intelligence`**. It is the ordered endpoint
-list with **transport + index only — never the URL, host, cid, or credential**
-(RFC 0012 §3.7):
+agentd keeps a live view of every intelligence endpoint's health: the ordered
+endpoint list with **transport + index only — never the URL, host, cid, or
+credential** (RFC 0012 §3.7). It drives the failover breaker and is surfaced
+through **metrics** (`agent_intel_up`, `agent_intel_errors_total`) and the
+**`intel.*` events** (see [Observability](observability.md)) — the v1 self-MCP
+`agent://intelligence` resource was removed in the 2.0 mode cut-over, so the same
+information now travels over telemetry rather than a subscribable resource:
 
 ```jsonc
 {
@@ -343,10 +346,10 @@ list with **transport + index only — never the URL, host, cid, or credential**
 ```
 
 The `addr` is the bounded structural address (`host[:port]` with the path dropped)
-— enough to tell endpoints apart, never a secret. The resource fires
-`notifications/resources/updated` on a breaker/active/all-down transition, and on
-a hot-swap (below), so a subscriber re-reads it. (`swap_policy`, `discovery`, and
-`models` are covered in the next two sections.)
+— enough to tell endpoints apart, never a secret. A breaker/active/all-down
+transition, and a hot-swap (below), each emit a fresh `intel.*` event carrying
+this snapshot. (`swap_policy`, `discovery`, and `models` are covered in the next
+two sections.)
 
 ---
 
@@ -397,10 +400,10 @@ best-effort probe: one hand-rolled `GET /v1/models` over the **same** transport
 and bearer auth the chat call uses (no new client, no streaming, zero new deps).
 It is **lazy, cached, and silent-degrade**:
 
-- It runs **only** when the served `agent://intelligence` (or the live
-  `agent://capabilities`) surface is actually read — never on the hot path, and
-  **never at startup** (the one-shot `agentd --capabilities` probe stays
-  network-free). The result is cached supervisor-side with a short TTL.
+- It runs **lazily** — on first demand from the capabilities introspection or a
+  run that needs the model list — never on the hot path, and **never at startup**
+  (the one-shot `agentd --capabilities` probe stays network-free). The result is
+  cached supervisor-side with a short TTL.
 - **Any** failure — a `404` (discovery unsupported), a connection failure, a
   non-JSON body — yields no models and never flips `discovery` to true. It is
   never fatal and never a failover-class error: the configured model is always
@@ -408,8 +411,8 @@ It is **lazy, cached, and silent-degrade**:
 - The `anthropic` dialect has **no list endpoint**, so it contributes nothing —
   just the configured model.
 
-It surfaces two fields on `agent://intelligence` and the capabilities manifest's
-`intelligence` block:
+It surfaces two fields in the capabilities manifest's `intelligence` block (and
+the endpoint-health telemetry):
 
 - `discovery` — `true` if at least one endpoint answered `/v1/models`.
 - `models` — the **union of discovered ids across endpoints plus the configured
@@ -457,7 +460,7 @@ only.
 
 - [Configuration reference](configuration.md) (the full flag/env surface + the reloadable config file)
 - [Observability](observability.md) (the `intel.*` events, `agent_intel_*` metrics, the breaker signals)
-- [Horizontal scaling](scaling.md) (where `intelligence.warm`/`healthy` feeds `agent://capacity`)
+- [Deployment — scaling with replicas](deployment.md) (multiple daemon replicas coordinate through the durable store; `intelligence.warm`/`healthy` gate readiness)
 - [RFC 0006 — Intelligence transport & wire](../rfcs/0006-intelligence-transport-and-wire.md) (this channel, in full)
 - [RFC 0018 — Intelligence transport resilience](../rfcs/0018-intelligence-transport-resilience.md) (failover, the breaker, swap, discovery)
 - [RFC 0004 — MCP client subset & codec](../rfcs/0004-mcp-client-subset-and-codec.md) (where tools come from)

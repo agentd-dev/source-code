@@ -92,8 +92,17 @@ pub fn vars_of(map: &std::collections::BTreeMap<String, Value>) -> Vec<(&str, &V
 mod imp {
     use serde_json::Value;
 
+    /// Compile an expression. The upstream parser (`antlr4rust`) can PANIC on
+    /// some malformed inputs (an unfinished binary expression such as `1 +`
+    /// hits an `unreachable!` in its generated tree walker); a config/workflow
+    /// author's typo must never take the process down, so the parse runs
+    /// under `catch_unwind` and reports a parse error instead.
     pub fn compile(expr: &str) -> Result<cel_interpreter::Program, String> {
-        cel_interpreter::Program::compile(expr).map_err(|e| format!("CEL parse: {e}"))
+        let owned = expr.to_string();
+        match std::panic::catch_unwind(move || cel_interpreter::Program::compile(&owned)) {
+            Ok(r) => r.map_err(|e| format!("CEL parse: {e}")),
+            Err(_) => Err("CEL parse: malformed expression (the parser rejected it)".into()),
+        }
     }
 
     /// Convert JSON → CEL with CANONICAL number typing: JSON has one number
@@ -133,7 +142,12 @@ mod imp {
         for (name, value) in vars {
             ctx.add_variable_from_value(name.to_string(), to_cel(value));
         }
-        program.execute(&ctx).map_err(|e| format!("CEL eval: {e}"))
+        // Same panic guard on evaluation (defensive: the interpreter is a
+        // third-party dependency running author-supplied expressions).
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.execute(&ctx))) {
+            Ok(r) => r.map_err(|e| format!("CEL eval: {e}")),
+            Err(_) => Err("CEL eval: the interpreter failed on this expression".into()),
+        }
     }
 }
 

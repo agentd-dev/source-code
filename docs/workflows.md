@@ -1,861 +1,729 @@
 # Workflows
 
-A **workflow** lets an agent process work as an explicit graph of steps — with
-branches, loops, and waits — instead of one flat ReAct loop. agentd already *is*
-an implicit single-node graph executor (the loop is a hard-coded cycle, the
-reactive router is an event→action edge set); a workflow reifies that into an
-explicit graph the agent (or an operator) authors and agentd drives. Think
-LangGraph, but the agent builds and runs the graph **by itself**, over the same
-subagents, MCP tools, and structured data it already uses.
+A **workflow** is a durable, declarative graph of steps that agentd drives to
+completion — with branches, loops, fan-out, waits, and calls to tools, HTTP
+endpoints, subagents, and other workflows. It is the 2.0 way to express work that
+is more than a single ReAct turn: a pipeline, a scheduled job, an event reactor, a
+long-running integration.
 
-> **Feature-gated, opt-in.** Workflows compile only under `--features workflow`
-> (default **off** — an agentd built without it is byte-for-byte unchanged). It is
-> dependency-free (serde + `serde_json` only). The degenerate single-`agent`-node
-> graph reproduces today's one-shot behavior, so the graph is a superset, never a
-> replacement.
+Workflows are **RFC 0027 (dialect 3)**. This page is the guide — how they work,
+every node kind, the data model, durability, and worked examples. For the formal
+grammar and validation rules, see [RFC 0027](../rfcs/0027-workflow-dialect-3.md).
 
-## What a workflow can do — the capability map
-
-| Capability | Mechanism | Where |
-|---|---|---|
-| Mix intelligence and determinism per step | twelve node kinds: `agent` (a full reasoning turn), `infer` (one schema-checked structured ask), `tool`/`assign` (zero model tokens) | [Node kinds](#node-kinds) |
-| Route on data — or on judgement | `branch`: deterministic predicates (free), CEL expressions, one opt-in semantic tier | [Conditions](#conditions) |
-| Accumulate instead of overwrite | `writes_mode` reducers: `append` / `merge` / `union` | [Reducers](#writes_mode--reducers-rfc-0021-5) |
-| Process an array without feeding it through the LLM | `foreach`: one body × N items, up to 8 parallel lanes | [Fan-out](#foreach--deterministic-fan-out-over-an-array) |
-| Run *different* things at once, then continue | `parallel`: N named bodies, one result object, the same lane pool | [Parallel](#parallel--heterogeneous-branches) |
-| Run phases as isolated processes | `subgraph {async}` + `join`: supervised child workflows, fan-in later | [Async subgraphs](#async-subgraphs--join--parallel-phases-as-supervised-children) |
-| Wait for the world | `wait`: suspend on an MCP resource update, at zero idle cost | [Waits](#waits) |
-| **Ask a human** — over A2A | `human`: the task projects `input-required`; the reply is a spec-native `SendMessage` | [Human gates](#human-gates--a2a-input-required) |
-| Survive crashes; fork; time-travel | the **MCP checkpointer**: per-superstep durable state, `--workflow-resume` | [Durable state](#durable-state--the-mcp-checkpointer-rfc-0021-8) |
-| Loop safely | layered termination: step budget, shared token pool, wall deadline, visit caps, progress guard — each with a typed `reason` | [Termination](#termination-budgets-and-reasons) |
-| Grow the plan mid-run | `workflow.patch`: additive-only self-modification | [Patching](#patching-a-workflow-additive) |
-| Stay supervised | the driver runs in a killable child; the supervisor owns the kill ladder, cgroups, drain, and the exit-code contract | [Termination](#termination-budgets-and-reasons) |
-
-Everything below is the same graph language everywhere: what the model authors
-via `workflow.define` is exactly what an operator pins with `--workflow` — one
-dialect, advertised as `surfaces.workflow.dialect` in the capabilities manifest.
+> **The one-paragraph mental model.** A workflow is a set of named `steps`. Each
+> step declares what it `depends_on`; a step runs once all its dependencies have
+> completed. Steps that don't depend on each other run concurrently. Every state
+> transition is written to a **durable store** by a **single-writer reactor** loop
+> before it takes effect — so if the process is killed mid-run, it restarts and
+> resumes *exactly* where it left off. There is no separate workflow daemon: the
+> same reactor that runs the agent runs the graph.
 
 ---
 
-## The three ways to run a workflow
+## A first workflow
 
-A workflow is the same serde JSON object every way:
+A workflow lives inside a `config_version: "2"` document, under `workflows:`. The
+smallest useful one is a start node, a unit of work, and a finish:
 
-- **Operator-pinned** — run a workflow from a file to completion, then exit:
-  ```bash
-  agentd --mode workflow --workflow ./pipeline.json --intelligence https://gw.example/v1
-  ```
-  No `--instruction` is needed (the nodes carry the work), but intelligence is
-  still required for `agent`/`infer` nodes. The run is **supervised** exactly like
-  `--mode once`: the driver lives in a child process while the supervisor owns the
-  kill ladder, cgroup limits, liveness, drain, and the run report. The result
-  (with the workflow status, reason, steps, and token cost) prints to stdout and
-  the graph status maps onto the normal exit table (see
-  [Termination](#termination)).
+```yaml
+config_version: "2"
+agent:
+  name: hello
+  instruction: You summarize text.
+intelligence:
+  endpoints: [https://api.openai.com/v1]
+  model: gpt-5.1
+  token: "{{secret:OPENAI_KEY}}"
+store:
+  kind: memory            # dev/test; use an mcp/http store to survive restarts
+workflows:
+  - name: greet
+    steps:
+      start:  { kind: once }
+      say:    { kind: agent,  depends_on: [start], instruction: "Say hello in one line." }
+      done:   { kind: finish, depends_on: [say],   output: "{{steps.say.output}}" }
+lifecycle:
+  run_until: idle          # run the graph, then exit (a job)
+```
 
-- **Agent-authored** — the agent defines and runs a workflow itself,
-  mid-reasoning, via three self-tools (a root agent only):
-  - `workflow.define{workflow}` — validate + store a workflow, returns a `workflow_id`.
-  - `workflow.run{workflow_id}` — drive the stored workflow to completion
-    synchronously, returning its status + reason + result as the tool result.
-  - `workflow.run{workflow_id, detach: true}` — hand the workflow to a **spawned
-    subagent** and return a handle immediately; the child process drives it under
-    full supervision while the agent keeps working. Collect with
-    `subagent.await{handle}` (blocks) or peek with `subagent.status{handle}`.
-    Fan-out/fan-in = detach several, then await each.
-  - `workflow.patch{workflow_id, patch}` — grow a stored workflow **additively**
-    (see [Patching](#patching-a-workflow-additive)).
+Run it:
 
-  This is the "agent orchestrates by itself" path: the agent decides the shape of
-  the work, writes the workflow, and runs it — no operator or per-step
-  hand-holding.
+```console
+$ agentd --config greet.yaml
+```
 
-- **Delegated** — a parent agent hands a whole workflow to a child directly:
-  `subagent.spawn{workflow: {...}}` (the `instruction` becomes optional). The
-  child drives the graph instead of running a ReAct loop, with the usual scope
-  narrowing, depth/breadth/rate caps, and `async`/`detach` dispositions.
+`once` fires a single run at startup; `agent` takes a turn against the model;
+`finish` ends the run with an output. Because `run_until: idle`, the process exits
+0 once the run drains. Swap in `run_until: drained` and a start node like
+`schedule` or `webhook`, and the same binary becomes a long-lived daemon.
 
-All paths share one driver, so a workflow behaves identically wherever it runs.
+> **Validate before you run.** `agentd --validate-config --config greet.yaml`
+> loads, substitutes, types, and validates the whole document (including every
+> workflow) and prints a verdict — exit `0` valid, exit `2` with the first error.
+> `agentd --workflow-schema` prints the machine-readable node registry (the same
+> catalogue this page documents) as JSON Schema.
 
 ---
 
 ## The graph model
 
-A workflow is pure topology — a `start` node id and a map of `nodes`:
+### Steps and `depends_on`
 
-```json
-{
-  "start": "fetch",
-  "nodes": {
-    "fetch":  { "kind": "agent", "instruction": "fetch the next item", "writes": "item",
-                "edges": { "ok": "route", "error": "done" } },
-    "route":  { "kind": "branch",
-                "cases": [ { "when": {"op":"eq","key":"item","pointer":"/status","value":"pending"},
-                            "goto": "work" } ],
-                "default": "done" },
-    "work":   { "kind": "tool", "server": "fs", "tool": "process",
-                "args": { "id": { "$from": "item", "pointer": "/id" } },
-                "writes": "item", "edges": { "ok": "fetch", "error": "done" } },
-    "done":   { "kind": "halt", "status": "completed", "result_from": "item" }
-  }
-}
-```
-
-Every node carries its own out-edges as a `label → target` map (a `branch` uses
-per-case gotos instead). A target that points back to an ancestor is a **back-edge**
-— cycles are legal by construction (`work → fetch` above is a loop). The resume
-point, the blackboard, and the budget are **run state**, never part of the graph —
-the authored graph stays deterministic, replayable topology.
-
-### The blackboard
-
-All nodes share a **blackboard**: a string-keyed map of JSON values, threaded
-through the run. A node's `writes` key stores its result; `reads` lists fold named
-blackboard values into a model call's context; `{"$from": …}` references inject
-them into tool args and assign templates. This is how data flows between steps —
-one node's output becomes the next node's input.
-
-The blackboard is coordination state, not bulk transport: a single value is capped
-at 1 MiB (serialized). An oversized node result is replaced by a small error
-marker and takes the node's `error` edge — never an unbounded memory sink.
-
-### `$from` references — explicit data flow
-
-Anywhere in `tool.args` or `assign.value`, an object of the form
-
-```json
-{ "$from": "item", "pointer": "/id", "default": 0 }
-```
-
-is replaced (at node-execution time) by the blackboard value at `item` +
-RFC 6901 pointer `/id`. `pointer` and `default` are optional; a missing path
-**with** a `default` resolves to it, a missing path **without** one takes the
-node's `error` edge before any tool is called. An unknown extra key in a
-reference object is rejected (a typo shield).
-
-Pointers support **computed segments**: `{bbkey}` expands to the stringified
-scalar at `blackboard[bbkey]`, so `"pointer": "/items/{index}"` addresses a
-loop-carried position dynamically. Expanded string values are RFC-6901-escaped
-(a value containing `/` cannot smuggle in extra path levels); a missing or
-non-scalar placeholder takes the `error` edge.
-
-### Node kinds
-
-Every node has a `kind`. There are twelve (dialect 2, RFC 0021):
-
-| Kind | Does | Key fields | Emits |
-|---|---|---|---|
-| `agent` | Runs a full ReAct turn on `instruction` (with `reads` folded into context, honoring an optional `output_contract`) against the MCP tools. | `instruction`, `reads?`, `writes?`, `writes_mode?`, `output_contract?`, `retry?`, `edges` | `ok` / `error` |
-| `tool` | Calls one MCP `tool` on `server` with `args` (with `$from` references resolved). | `server`, `tool`, `args?`, `writes?`, `writes_mode?`, `retry?`, `edges` | `ok` / `error` |
-| `assign` | Pure data shaping — resolves a `value` template (with `$from` references) and writes it. No model, no tool. | `value`, `writes`, `writes_mode?`, `edges` | `ok` / `error` |
-| `infer` | ONE structured intelligence call: the model answers `prompt` as a JSON object satisfying `schema` (field → type); invalid answers are automatically re-asked with the validation errors, up to `retries` times. | `prompt`, `schema`, `reads?`, `writes?`, `writes_mode?`, `retries?`, `retry?`, `edges` | `ok` / `error` |
-| `branch` | Routes on the blackboard (see [Conditions](#conditions)). | `cases`, `default`, `semantic?` | (per-case goto) |
-| `foreach` | Fans out over an array (see [Fan-out](#foreach--deterministic-fan-out-over-an-array)): runs `body` once per item on a scoped board, collecting results positionally. | `items`, `body`, `parallel?`, `on_error?`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` |
-| `parallel` | Fans out over NAMED heterogeneous branches (see [Parallel](#parallel--heterogeneous-branches)): each branch body runs concurrently on a scoped board; results collect into ONE OBJECT keyed by branch name. | `branches`, `on_error?`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` |
-| `wait` | Suspends until `on_uri` updates or `timeout_ms` elapses, writing the read content. | `on_uri`, `timeout_ms`, `writes?`, `writes_mode?`, `edges` | `updated` / `timeout` |
-| `human` | A HUMAN GATE (see [Human gates](#human-gates--a2a-input-required)): publishes `payload`, flips the served A2A task to `input-required`, and suspends until an A2A reply / `reply_uri` update / timeout. | `payload`, `reply_uri?`, `timeout_ms`, `writes?`, `writes_mode?`, `edges` | `replied` / `timeout` / `error` |
-| `subgraph` | Runs a nested workflow inline (waits included) — or `async: true`: SPAWNS it as a supervised child process and writes `{"handle"}` immediately. | `graph`, `async?`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` |
-| `join` | Fans IN: awaits async-subgraph handles (a handle, a `{"handle"}` object, or an array), collecting results positionally. | `handles`, `timeout_ms`, `writes?`, `writes_mode?`, `edges` | `ok` / `error` / `timeout` |
-| `halt` | Terminates the workflow with an author-chosen status, projecting a result. | `status`, `result_from?` | — |
-
-A node that emits a label with no matching edge, an unhandled node, or a dangling
-edge fails **closed** to a `Crashed` outcome — a mis-authored workflow never runs
-away. **Unknown node fields are define-time errors** (RFC 0021 §4): a typo'd
-`writes_mode` is refused, never silently ignored. The manifest advertises the
-graph language as `surfaces.workflow.dialect` (currently `2`) — feature-detect
-from it, not the version string.
-
-### `writes_mode` — reducers (RFC 0021 §5)
-
-By default a node's `writes` **overwrites** its key. `writes_mode` folds instead:
-
-| Mode | Semantics | Type mismatch |
-|---|---|---|
-| `overwrite` *(default)* | replace | never errors |
-| `append` | absent → `[v]`; array → push | `error` edge |
-| `merge` | absent → `v`; object+object → shallow merge, incoming wins | `error` edge |
-| `union` | as `append`, skipping a deep-equal duplicate | `error` edge |
-
-```json
-{ "kind": "agent", "instruction": "find one more issue", "writes": "issues",
-  "writes_mode": "append", "edges": { "ok": "route", "error": "fail" } }
-```
-
-Reducers are pure (no model, no tool); the reduce happens **before** the 1 MiB
-clamp (the accumulated value is what must fit); a mismatch writes a readable
-error marker and takes the `error` edge — never a silent coercion. CEL
-`assign.expr` remains the escape hatch for custom folds.
-
-### `infer` — checked structured intelligence
-
-`infer` is how a workflow turns free-form intelligence into **checked structured
-data** the deterministic branches can route on:
-
-```json
-{ "kind": "infer", "prompt": "Classify this ticket.", "reads": ["ticket"],
-  "schema": { "category": "string", "urgency": "number", "escalate": "boolean" },
-  "writes": "triage", "edges": { "ok": "route", "error": "manual" } }
-```
-
-The schema is a minimal field → type map (`string` | `number` | `boolean` |
-`array` | `object` | `any`) — a floor, not a ceiling (extra fields are allowed).
-An answer missing a field or with a wrong type is re-asked with the exact
-validation errors folded in (default 1 re-ask, max 3); exhaustion takes the
-`error` edge with the reason. A downstream Tier-1 predicate can then branch on
-`triage/urgency` deterministically — no second model call.
-
-### `retry` — in-node fallback for flaky steps
-
-The effectful kinds (`agent`, `tool`, `infer`) accept a retry policy:
-
-```json
-{ "kind": "tool", "server": "q", "tool": "push", "args": {},
-  "retry": { "max": 2, "backoff_ms": 500 },
-  "edges": { "ok": "done", "error": "alert" } }
-```
-
-On an error result the node re-runs up to `max` more times (cap 5), sleeping
-`backoff_ms` between attempts (cap 60s), before following `error`. Retries happen
-**within one node visit**, so the loop/stall guards are not tripped by an
-intentionally-identical retry — but every retry charges the step budget, so a
-retry storm can never outrun the run's cap. (An authored self-edge is NOT a
-retry: re-entering a node with an unchanged blackboard is a stall by design —
-use `retry` for "try again", edges for "make progress".)
-
----
-
-## `foreach` — deterministic fan-out over an array
-
-The map primitive: a tool returns `{"items": [...]}` with hundreds of entries,
-and each needs the same processing — **without** feeding the array through the
-model (a big array through an `agent` node burns tokens per item and can blow
-the context):
-
-```json
-{ "kind": "foreach",
-  "items": { "$from": "scan", "pointer": "/items" },
-  "body": {
-    "start": "handle",
-    "nodes": {
-      "handle": { "kind": "tool", "server": "q", "tool": "process",
-                  "args": { "id": { "$from": "item", "pointer": "/id" } },
-                  "writes": "out", "edges": { "ok": "done", "error": "failed" } },
-      "done":   { "kind": "halt", "status": "completed", "result_from": "out" },
-      "failed": { "kind": "halt", "status": "crashed", "result_from": "out" }
-    }
-  },
-  "parallel": 4,
-  "on_error": "continue",
-  "writes": "results",
-  "edges": { "ok": "summarize", "error": "triage" } }
-```
-
-- `items` resolves against the blackboard (a `$from` reference or a literal
-  array; cap 1024 items). Each iteration runs `body` — a full nested workflow
-  (waits included) — on a **scoped** blackboard: a clone of the parent board
-  with the reserved keys `item` (the element) and `index` (its position)
-  seeded. Body writes never flow back; only each body's halt result does,
-  collected **positionally** into `writes`. A failed item's slot carries
-  `{"index", "error"}` so downstream consumers keep alignment.
-- `on_error: "fail_fast"` (default) stops at the first failing item and takes
-  the `error` edge with the partial results; `"continue"` processes everything,
-  records per-item markers in place, and takes `ok` — branch on the results
-  content (e.g. a `len`/`contains` predicate) to decide what failure means.
-- `parallel: N` (cap 8) runs items on N worker **lanes, each with its own
-  intelligence + MCP connections** — no client is shared across threads, and
-  every lane's model usage still lands on the workflow's shared token pool.
-  Default 1 = inline sequential (per-item budget/deadline checks between
-  items).
-- **Cost model**: every item charges one budget step; a body of pure
-  `tool`/`assign`/`branch` nodes makes **zero model calls per item** — the
-  whole fan-out is deterministic. Put an `infer`/`agent` node in the body only
-  where an item genuinely needs intelligence, and the shared pool still bounds
-  the total.
-
----
-
-## `parallel` — heterogeneous branches
-
-Where `foreach` maps **one body over N items**, `parallel` runs **N different
-bodies at once** — "run the security review AND the perf review, then continue"
-(RFC 0021 §6):
-
-```json
-{ "kind": "parallel",
-  "branches": {
-    "security": { "start": "s0", "nodes": { "…": "a full sub-graph" } },
-    "perf":     { "start": "p0", "nodes": { "…": "a different sub-graph" } }
-  },
-  "on_error": "continue",
-  "writes": "reviews",
-  "edges": { "ok": "synthesize", "error": "fail" } }
-```
-
-- Each branch runs on a **scoped board** (a clone of the parent's, with
-  `branch` = its name seeded); branch writes never flow back — the collected
-  result does: **one object keyed by branch name** (a failed branch's slot
-  carries `{"branch","error"}`).
-- **Bounds**: ≤ 16 branches; concurrency rides the SAME 8-lane pool `foreach`
-  uses — one pool, so composing `parallel` inside `foreach` (or vice versa)
-  never multiplies lanes. Every branch pre-charges a budget step; all branches
-  draw the one shared token pool.
-- `on_error`: `fail_fast` (default — any failed branch → the `error` edge) or
-  `continue` (`ok` iff at least one branch succeeded; markers stay in place).
-- `halt` inside a branch halts the **branch**, not the run.
-
----
-
-## Human gates — A2A `input-required`
-
-A `human` node is the **human-in-the-loop primitive** (RFC 0021 §7): publish
-something for a person (or any A2A peer) to inspect, suspend, and resume on
-their reply — **A2A is the conversation channel**.
-
-```json
-{ "kind": "human",
-  "payload": { "question": "Ship it?", "diff": { "$from": "patch" } },
-  "reply_uri": "approvals://deploy-42",
-  "timeout_ms": 86400000,
-  "writes": "verdict",
-  "edges": { "replied": "route_on_verdict", "timeout": "escalate" } }
-```
-
-What happens, in order:
-
-1. The resolved `payload` travels up to the supervisor; when the run is a
-   **served A2A task**, the task transitions to **`TASK_STATE_INPUT_REQUIRED`**
-   with the payload as its status message — a spec-conformant A2A client
-   (a human's UI, another agent) *sees* the wait via `GetTask`/`SubscribeToTask`.
-2. The workflow suspends. Three resume paths race, **first one wins**:
-   - **an A2A `SendMessage` carrying this task's `taskId`** — its text parts
-     become the reply (the spec-native human answer);
-   - an update on `reply_uri` (any MCP resource — the notify-then-read read
-     is the reply);
-   - the `timeout_ms` expiry (nothing written; the `timeout` edge).
-3. The reply lands on `writes` (through `writes_mode`) and the node takes
-   `replied`. The task returns to `working`.
-
-### The conversation on the wire
-
-What a human's UI (or any conformant A2A client) actually sees, end to end.
-Dispatch the work and note the task id:
-
-```jsonc
-// → SendMessage {"message":{"parts":[{"text":"run the gated deploy"}]},
-//                "configuration":{"returnImmediately":true}}
-// ← {"task":{"id":"a3","contextId":"ctx-a3","status":{"state":"TASK_STATE_WORKING", …}}}
-```
-
-Poll (`GetTask {"id":"a3"}`) or stream (`SubscribeToTask`). When the workflow
-reaches its `human` node, the task is **visibly waiting** — and the question is
-IN the task:
-
-```jsonc
-// ← {"id":"a3", "status":{
-//      "state": "TASK_STATE_INPUT_REQUIRED",
-//      "message": {"role":"agent","parts":[{"text":"{\"question\":\"Ship it?\",\"diff\":\"+1 -0\"}"}]},
-//      "timestamp": "…"}}
-```
-
-The human answers with a plain `SendMessage` that **continues the task by id**
-— no agentd-specific API, just the A2A spec's multi-turn shape:
-
-```jsonc
-// → SendMessage {"message":{"taskId":"a3","parts":[{"text":"yes"}]}}
-// ← {"task":{"id":"a3", …}}          // the reply is accepted; the run resumes
-```
-
-The reply text lands on the gate's `writes` key (parsed as JSON when it *is*
-JSON — reply `{"approve":true,"reason":"lgtm"}` and branch on `/approve`), the
-workflow takes `replied`, and the next `GetTask` shows `TASK_STATE_WORKING`,
-then the terminal state with the distillate artifact.
-
-The gate deliberately does **not** encode approve/reject — the reply is data,
-and routing on it is a `branch` (predicates or CEL on the verdict), so
-multi-approver schemes and rejection reasons stay authorable. Notes:
-
-- A reply while another is pending is refused (`-32004 UnsupportedOperation`);
-  an unknown `taskId` is `-32001 TaskNotFound`; a message to a live task with
-  **no open gate** is `-32004` (agentd runs are single-instruction — the gate
-  reply is the one supported mid-task continuation).
-- Without `--serve-mcp` the gate degrades to a plain wait on
-  `reply_uri`/timeout — never a hard serving requirement.
-- In the **reactive-daemon** shape the gate suspends the daemon's workflow like
-  a `wait` (the payload appears on `agent://workflow`); it resolves by
-  `reply_uri`/timeout — the A2A reply path serves **served async tasks**.
-- An unresolvable `$from` in `payload` emits `error` (route it or fail closed).
-
----
-
-## Conditions
-
-A `branch` decides where to go next. Conditions are **two-tier**:
-
-### Tier 1 — deterministic predicates (free)
-
-A `case` fires when its `when` predicate holds over the blackboard; the first
-matching case wins, else `default`. Predicates are cheap, total (a missing path is
-simply `false`), and never call the model:
-
-```json
-{ "op": "eq", "key": "item", "pointer": "/status", "value": "ready" }
-```
-
-`key` selects a blackboard entry; `pointer` is an RFC 6901 JSON Pointer into it
-(empty = the whole value). Operators:
-
-| Op | Holds when |
-|---|---|
-| `eq` / `ne` | the value deep-equals / does not equal `value` |
-| `lt` / `lte` / `gt` / `gte` | numeric comparison against `value` |
-| `in` | the value deep-equals one of `values` |
-| `exists` | the path resolves to a present, non-null value |
-| `contains` | a string contains the substring / an array contains the element |
-| `starts_with` / `ends_with` | string prefix / suffix |
-| `len` | the length of a string/array/object is within `[min, max]` |
-| `all` / `any` / `not` | composition |
-
-```json
-{ "op": "all", "preds": [
-  { "op": "gte", "key": "triage", "pointer": "/urgency", "value": 8 },
-  { "op": "in",  "key": "triage", "pointer": "/category", "values": ["ops", "security"] }
-] }
-```
-
-**Cross-key comparison**: the comparison `value` of `eq`/`ne`/`lt`/`lte`/`gt`/
-`gte`/`contains` (and elements of `in`) may itself be a `{"$from": key,
-"pointer": "/p"}` reference — branch on one blackboard value against another
-(`"is the retry count below the configured limit?"`) with no model call. An
-unresolvable reference makes the predicate `false` (fail-closed, even for
-`ne`).
-
-A predicate that can never hold (an empty `in` set, inverted `len` bounds) is
-rejected at define time, not silently routed around.
-
-### CEL expressions (`--features cel`)
-
-A build with the `cel` feature adds [CEL](https://cel.dev) — the expression
-language Kubernetes admission policies and Envoy use — wherever the structural
-ops run out (arithmetic, string functions, collection macros). CEL is
-non-Turing-complete, does no I/O, and always terminates, which makes it the one
-form of "code" a model can safely author and agentd can immediately execute.
-Three surfaces:
-
-- **Branch predicates** — `{"op": "cel", "expr": "..."}` (composable with
-  `all`/`any`/`not`); every blackboard key is a top-level identifier:
-  ```json
-  { "op": "cel", "expr": "results.filter(r, !has(r.error)).size() >= results.size() * 9 / 10" }
-  ```
-  Must return a bool; a non-bool, an eval error, or an unresolvable reference
-  is `false` (fail-closed).
-- **Computed `assign`** — `"expr"` instead of `"value"`: filter, map,
-  aggregate, and assemble deterministically, with zero model tokens:
-  ```json
-  { "kind": "assign", "expr": "scan.items.filter(i, i.ok).map(i, i.id)", "writes": "ids",
-    "edges": { "ok": "fan" } }
-  ```
-- **`infer` value constraints** — `"check"` runs over the (schema-valid)
-  answer's fields; a type-correct but out-of-bounds answer is re-asked with the
-  constraint named:
-  ```json
-  { "kind": "infer", "prompt": "score it", "schema": { "score": "number" },
-    "check": "score >= 0.0 && score <= 1.0", "writes": "s", "edges": { "ok": "next", "error": "manual" } }
-  ```
-
-Reactive subscriptions get the same power: a wake condition may be
-`{"op": "cel", "expr": "content.items.exists(i, i.urgent)"}` (the resource
-content — or the value at the condition's `pointer` — is `content`), so a
-daemon wakes only for the states it actually cares about.
-
-Every expression is compile-checked at define/parse time (length-capped at
-4 KiB), and a build **without** the feature rejects CEL right there with a
-clear message — never a silent mis-evaluation. JSON numbers are normalized to
-CEL ints/floats so `count + 1 > limit` behaves the way it reads. This is the
-one gated exception to the zero-dependency default build; `--features cel` is
-opt-in precisely so the moat holds everywhere else.
-
-### Tier 2 — a semantic branch (opt-in)
-
-When the deterministic cases all miss and a `branch` carries a `semantic` spec,
-agentd runs **one** tool-less model call to pick a labelled choice — a routing
-decision the predicates can't express ("is this document acceptable?"):
-
-```json
-{ "kind": "branch", "cases": [], "default": "reject",
-  "semantic": { "prompt": "Is the draft acceptable?", "reads": ["draft"],
-                "choices": { "approve": "publish", "revise": "rewrite" } } }
-```
-
-The model is asked to answer with one label (exact match first, else the longest
-contained label — so overlapping labels resolve to the specific one); an
-unrecognized answer falls through to `default`. On a build with no reachable
-intelligence, a semantic branch degrades safely to its `default`. Prefer an
-`infer` node + Tier-1 predicates when the decision can be made structural — one
-extraction can feed many cheap branches.
-
----
-
-## Waits
-
-A `wait` node pauses the workflow on an external dependency — a job finishing, a
-flag flipping — without burning a thread:
-
-```json
-{ "kind": "wait", "on_uri": "file:///inbox.json", "timeout_ms": 30000,
-  "writes": "event", "edges": { "updated": "handle", "timeout": "giveup" } }
-```
-
-agentd subscribes to `on_uri`, blocks until the resource updates (then reads its
-current content, notify-then-read) or the timeout elapses, and resumes on the
-`updated` or `timeout` edge. A back-edge into a `wait` is a long-lived reactive
-loop that costs nothing while idle. The suspended run state is serializable, so a
-long wait survives across a process boundary. Waits work inside `subgraph`s too.
-
-> **Scope.** All current paths resolve waits **in-process** (they block until the
-> wait resolves, inside the supervised child). A fully asynchronous, non-blocking
-> reactive-daemon workflow is a roadmap item.
-
----
-
-## Async subgraphs + `join` — parallel phases as supervised children
-
-`subgraph { async: true }` spawns the nested workflow as a **child process**
-through the same machinery `subagent.spawn` uses — the depth, breadth, and
-spawn-rate caps all apply — and writes `{"handle": …}` immediately. A later
-`join` collects:
-
-```json
-{ "start": "s1",
-  "nodes": {
-    "s1":     { "kind": "subgraph", "async": true, "graph": { "…": "phase A" },
-                "writes": "h1", "edges": { "ok": "s2", "error": "fail" } },
-    "s2":     { "kind": "subgraph", "async": true, "graph": { "…": "phase B" },
-                "writes": "h2", "edges": { "ok": "gather", "error": "fail" } },
-    "gather": { "kind": "assign", "value": [{ "$from": "h1" }, { "$from": "h2" }],
-                "writes": "hs", "edges": { "ok": "join" } },
-    "join":   { "kind": "join", "handles": { "$from": "hs" }, "timeout_ms": 60000,
-                "writes": "results", "edges": { "ok": "done", "error": "triage", "timeout": "late" } },
-    "…":      {}
-  } }
-```
-
-Both phases run **concurrently** while the parent workflow proceeds to the
-join. Results collect positionally (a failed child's slot carries
-`{"handle", "error"}`); stragglers at the timeout take the `timeout` edge with
-the partials written — they keep running and may be joined again. An async
-subgraph starts with an EMPTY blackboard (data flows OUT via its halt result,
-not in); use `foreach` when items must flow into parallel work.
-
----
-
-## The reactive-daemon workflow (`--mode reactive --workflow`)
-
-A long-lived workflow whose `wait` nodes hold **no process at all**:
-
-```bash
-agentd --mode reactive --workflow ./pipeline.json   --intelligence https://gw.example/v1 --mcp inbox=https://mcp-inbox.internal/mcp
-```
-
-The daemon drives the workflow in a supervised child; when it reaches a `wait`,
-the child **suspends** — it exits, serializing the run slice (cursor +
-blackboard + budget) into its result — and the DAEMON arms the subscription and
-the timeout clock. On the resource update (or the timeout) a fresh child
-resumes on the `updated`/`timeout` edge, budget continuing where it left off.
-No `--subscribe` or `--instruction` is needed: the workflow's waits are the
-subscriptions and its nodes are the work.
-
-The daemon's lifetime is the workflow's: a terminal workflow exits with its
-projected code, while an event-loop workflow (a back-edge into a `wait`) runs
-indefinitely — idling between events with zero child processes alive. The live
-state is observable at the Management-only **`agent://workflow`** resource:
-`driving`, `suspended` (with the watched uri and spent budget), or `terminal`.
-
-> **Cluster compatibility.** A reactive workflow daemon is a single-instance
-> shape: its wait uris are its *own dependencies*, not a partitioned work
-> stream — so `--shard N>1`, `--standby`, and `--assign-from` are rejected at
-> startup when combined with it (the shard filter would silently drop the
-> workflow's own wait updates). `--subscribe` routes may ride the same daemon
-> (they then require the usual `--instruction`), but don't point a `--claim`
-> route at a uri the workflow also waits on — a wait resolving consumes that
-> delivery before the claim gate.
-
----
-
-## Termination, budgets, and reasons
-
-Cyclic workflows need to stop. The guards, each with a distinct status **and a
-recorded `reason`** (which guard tripped, at which node):
-
-1. **Step budget** — a total node-visit cap → `Exhausted`.
-2. **Token pool** — one intelligence-token budget for the WHOLE workflow (every
-   `agent` turn, `infer` ask, and semantic judgement draws from it) → `Exhausted`.
-   N model-calling nodes share one pool; they never multiply a per-node grant.
-3. **Wall-clock deadline** — the whole workflow is bounded by the run's
-   `--deadline` (checked on every node entry) → `Exhausted`.
-4. **Per-node visit cap** — a node visited more than 100 times is a runaway cycle
-   → `LoopDetected` (a `wait` is exempt — it suspends, it does not spin).
-5. **Progress guard** — re-entering a node with an unchanged blackboard means the
-   cycle made no progress → `Stalled`.
-6. **Author-time validation** — before it ever runs, a workflow must have a
-   `start` that exists, no dangling edge, at least one `halt` reachable from
-   `start` (no-exit is rejected), every `wait` with a non-empty uri and non-zero
-   timeout, retry/infer caps within bounds, satisfiable predicates, and
-   node/edge/key/nesting counts within limits.
-
-The engine statuses are distinct from a node's `halt` status (which is one of the
-usual terminal statuses — `completed`, `refused`, …). Reaching a `halt` with
-`completed` is `Completed`; any other author status is `Halted`. Under
-`--mode workflow` the child projects the status onto the exit table:
-`Completed` → 0, `Halted` → its terminal code, `Exhausted` → 7 (deadline/tokens/
-steps distinguished by the `reason`), `LoopDetected` / `Stalled` → 3,
-`Crashed` → 1. The result body always carries
-`{workflow_status, reason, steps, tokens, result}` so the operator sees *why* and
-*at what cost*, not just the code.
-
----
-
-## Durable state — the MCP checkpointer (RFC 0021 §8)
-
-A workflow can persist its run slice **after every superstep** — crash-resume,
-state history, and fork/time-travel — with **zero new dependencies**: the
-checkpointer is *any MCP server* implementing a three-tool profile. Declare the
-policy at the graph root:
-
-```json
-{ "checkpoint": { "server": "state", "key": "run/{run_id}", "every": 1,
-                  "on_error": "continue" },
-  "start": "…", "nodes": { "…": "…" } }
-```
-
-- `server` names a configured `--mcp` server; `key` is the state lineage
-  (`{run_id}` interpolates — a **stable operator-chosen key** makes the run
-  resumable across pod replacements); `every` gates the periodic writes
-  (a suspension and a `halt` **always** checkpoint).
-- The **envelope** is versioned and self-describing:
-  `{v:1, seq, workflow_hash, state, ts_ms}` — `seq` is the superstep count
-  (monotonic, carried across resume), `workflow_hash` is the SHA-256 of the
-  canonical graph JSON (resume verifies it), and `state` is the same serialized
-  run slice a `wait` suspension produces (cursor, blackboard, budget, visit
-  counts). Its cursor is the next **unexecuted** node — resume is exactly-once
-  for checkpointed nodes, at-least-once for the one in flight.
-- **The server contract** (any language, any store): `state.put {key,seq,state}`
-  (MUST refuse `seq <=` latest with `{ok:false,latest}` — the split-brain
-  guard; a refused put is ALWAYS fatal for the run), `state.get {key[,seq]}`,
-  `state.list {key}`. Postgres, S3, sqlite, etcd — all are somebody's MCP
-  server; agentd links none of them.
-- `on_error`: `continue` (default — a failed write degrades durability, never
-  the run; `workflow.checkpoint.fail` telemetry records it) or `halt`.
-
-**Resume / fork:**
-
-```console
-$ agentd --mode workflow --workflow pipeline.json \
-    --mcp state=https://ckpt.internal/mcp \
-    --workflow-resume state:run/abc            # latest — the crash-recovery flow
-$ agentd … --workflow-resume state:run/abc@17  # a specific seq, under a NEW
-                                               # --run-id = a FORK (time-travel)
-```
-
-The child fetches the envelope after connecting, **verifies the workflow
-hash** (a mismatch is a refusal, exit `5` — the state was not taken from this
-graph; `--workflow-resume-force` overrides for deliberate
-graph-edit-and-continue, resetting the loop guards but keeping board and
-budget), and drives on. **Budgets carry over**: a resumed run does not get a
-fresh token pool — the budget is a property of the work, not the process.
-agentd never resumes implicitly: a `Job` with `restartPolicy: OnFailure` opts
-in by passing `--workflow-resume` with the stable key.
-
-### Crash recovery, mechanically
-
-A checkpoint's cursor is the next **unexecuted** node, so semantics after a
-hard kill (OOM, node loss, `kill -9`) are exactly what you want: every
-completed node is **exactly-once**; the one that was in flight when the
-process died is **at-least-once** (it re-runs — pair it with idempotent tools
-/ the `agent/run_id` dedup meta, RFC 0011 §7). A Kubernetes `Job` that
-survives pod replacement:
+A workflow is `steps: { <id>: <step> }`. Every step has a `kind` and may declare
+`depends_on: [<id>, …]`. The dependencies form a DAG:
 
 ```yaml
-spec:
-  backoffLimit: 3
-  template:
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: agent
-          image: ghcr.io/agentd-dev/agentd:latest
-          args:
-            - --mode=workflow
-            - --workflow=/etc/agent/pipeline.json     # checkpoint.key: "job/nightly-2026-07-04"
-            - --mcp=state=https://ckpt.internal/mcp
-            - --workflow-resume=state:job/nightly-2026-07-04   # see the subtlety below
+steps:
+  fetch:  { kind: http,   url: "https://api.example/data" }
+  parse:  { kind: parse,  depends_on: [fetch], text: "{{steps.fetch.output.body}}", format: json }
+  a:      { kind: agent,  depends_on: [parse], instruction: "Analyze A." }
+  b:      { kind: agent,  depends_on: [parse], instruction: "Analyze B." }
+  report: { kind: finish, depends_on: [a, b], output: "{{steps.a.output}} / {{steps.b.output}}" }
 ```
 
-One subtlety: `--workflow-resume` of a key that does not exist yet is a
-refusal (resuming *nothing* is a config error), so attempt 1 must run without
-the flag — an init step that checks `state.list` (or a wrapper that drops the
-flag when the key is empty) picks the variant. The explicitness is deliberate:
-agentd never silently resumes state you didn't name.
+`a` and `b` both depend only on `parse`, so they run **concurrently** the moment
+`parse` finishes. `report` waits for **both**. There is no explicit "edge" list —
+the edges are inferred from `depends_on`. A step with no `depends_on` (other than a
+start node) is a root and runs as soon as the run begins.
 
-### Fork and time-travel
-
-History is immutable and `@seq`-addressed; a **fork** is a resume from any
-recorded superstep under a **new run id** (and therefore a new checkpoint
-lineage — the original history is never rewritten):
-
-```console
-$ agentd … --workflow-resume state:run/abc@12 --run-id run-abc-fork1
+```mermaid
+flowchart LR
+  fetch["fetch · http"] --> parse["parse · parse"]
+  parse --> a["a · agent"]
+  parse --> b["b · agent"]
+  a --> report["report · finish"]
+  b --> report
+  classDef io fill:#0b3d2e,stroke:#10b981,color:#e6fffa;
+  classDef ai fill:#1e293b,stroke:#38bdf8,color:#e0f2fe;
+  classDef end1 fill:#3b0764,stroke:#a855f7,color:#f5e8ff;
+  class fetch io; class parse io; class a ai; class b ai; class report end1;
 ```
 
-Want to fork with an **edited blackboard** (the "what if the review had said
-no?" experiment)? The envelope is plain JSON behind a plain MCP server — fetch
-it with any MCP client, edit `state.blackboard`, `state.put` it under a new
-key, and resume from that. Time-travel needs no agentd surface at all; it
-falls out of state-behind-MCP.
+`a` and `b` sit at the same rank — the engine runs them at once; `report`'s two
+inbound edges make it a fan-in barrier.
+
+### The three string mini-languages
+
+This is the single most important thing to internalize. A string value in a
+workflow can be interpreted three different ways, and they compose:
+
+| Syntax | Resolved… | By | Example |
+|---|---|---|---|
+| `{{ … }}` templating | at step execution | the run's live data | `"{{steps.fetch.output.body}}"` |
+| `CEL: …` expression | at step execution | CEL over the run's data | `"CEL: item * 2 > threshold"` |
+| `${VAR}` / `${VAR:-def}` | at **config load**, before parsing | the process environment | `"https://api.${REGION:-us}.example"` |
+
+And a fourth, for credentials only:
+
+| `{{secret:NAME}}` / `{{secret-file:PATH}}` | at step execution, **redacted** | the secret resolver | `"Bearer {{secret:API_TOKEN}}"` |
+
+They are deliberately distinct. `${VAR}` is for **loggable** per-environment values
+(hosts, ports, paths) and is expanded into the document before it is even typed.
+`{{secret:…}}` is for **credentials** — it is never expanded by the templater (it
+passes through verbatim) and is resolved only by the node that needs it, through a
+resolver that keeps it out of logs and step outputs. Never put a secret in a
+`${VAR}`.
+
+#### `{{ … }}` templating
+
+Placeholders read the run's data by dotted path:
+
+- `{{vars.NAME}}` — a blackboard variable (see below).
+- `{{steps.ID.output}}` — the output of a completed step. Navigate into it:
+  `{{steps.fetch.output.json.total}}`.
+- `{{item}}`, `{{index}}`, `{{batch}}` — the current element inside a `foreach`/`map`.
+- `{{env.NAME}}` — a value from `agent.env` / the environment (distinct from
+  `${VAR}`: `{{env.…}}` is read at execution, `${VAR}` is substituted at load).
+- `{{ path | default }}` — a fallback when the path is unset (`default` is parsed
+  as JSON if it can be, else a literal string).
+
+A string that is **exactly one** placeholder yields the *typed* value (an object,
+array, or number), not its string form:
+
+```yaml
+output: "{{steps.fetch.output}}"          # the whole {status,ok,headers,body,json} object
+count:  "{{steps.tally.output.json.n}}"    # the number 42, not "42"
+```
+
+A string with surrounding text stringifies each placeholder and concatenates.
+
+#### `CEL:` expressions
+
+Prefix a string with `CEL:` to evaluate a [CEL](https://cel.dev) expression
+(requires a build with `--features cel`). CEL is used wherever a workflow needs a
+computed value or predicate — element transforms, conditions, reducers:
+
+```yaml
+double: { kind: assign, value: "CEL: item * 2" }
+big:    { kind: filter, over: "{{vars.items}}", expr: "CEL: item > 3" }
+sum:    { kind: reduce, over: "{{steps.big.output}}", expr: "CEL: acc + item", initial: 0 }
+when:   "CEL: status.runs_active == 0 && has(vars.ready)"
+```
+
+The variables in scope depend on the node: `item`/`index` in element expressions,
+`acc` in `reduce`, `result`/`last` in loops, `payload` in event filters,
+`status`/`state` in conditions and goal checks.
+
+#### `${VAR}` environment substitution
+
+Any string in the config **or a workflow** may contain `${VAR}` or
+`${VAR:-default}`. Substitution happens once, at config load, over the merged
+document before it is typed and validated:
+
+```yaml
+intelligence:
+  endpoints: ["https://intel.${REGION:-us-east}.example/v1"]
+steps:
+  fetch: { kind: http, url: "https://api.${REGION:-us-east}.example/builds/${BUILD_ID}" }
+```
+
+Rules:
+
+- **Braces are required.** A bare `$VAR` and a lone `$` pass through unchanged, so
+  shell snippets and prices (`$5`) survive.
+- `${VAR:-default}` uses `default` when `VAR` is unset or empty.
+- An **unset** variable with **no** default is a hard error — the process refuses to
+  start (`exit 2`) rather than run with a hole. This is fail-closed by design.
+- Write `$${` for a literal `${`.
+- Because substitution runs on the *parsed* document, a value containing `:` (like
+  `${VAR:-x}`) must be **quoted** in YAML, and `${VAR}` can only fill **string**
+  fields (a bare numeric/enum field is typed before substitution would apply — put
+  the reference inside a string, e.g. a URL, or use a `{{env.…}}` template at
+  execution instead).
+
+### The blackboard (`vars`)
+
+Beyond per-step outputs, a run has a shared key–value **blackboard**. A step writes
+to it with `writes: <name>`, and any later step reads it with `{{vars.<name>}}` or
+in CEL as `vars.<name>`:
+
+```yaml
+items: { kind: assign, depends_on: [start], value: [1,2,3,4,5,6], writes: items }
+each:  { kind: foreach, depends_on: [items], over: "{{vars.items}}", body: { … } }
+```
+
+When two concurrent branches write the same variable, `writes_mode` decides how
+they combine (last-write, append, merge, numeric add) — see RFC 0027 §5. Blackboard
+state is part of the durable snapshot, so it survives a restart.
+
+### Per-step controls
+
+Every step, regardless of kind, accepts a common envelope:
+
+| Field | Meaning |
+|---|---|
+| `depends_on` | prerequisites (the DAG edges) |
+| `when` | a `CEL:`/`{{…}}` guard; if falsy the step is skipped (its dependents still run) |
+| `retry` | `{ max, backoff }` — re-run the step on failure with backoff |
+| `timeout` | wall-clock budget for the step (e.g. `30s`) |
+| `on_error` | `fail` (default) \| `continue` — whether a failure fails the run |
+| `idempotent` / `on_replay` | how the step behaves when replayed after a crash (`retry`\|`skip`\|`fail`) |
+| `cache` | `{ key }` — memoize the step's output by an input key |
+| `output_schema` | JSON Schema the output is validated against |
+| `budget` | token budget for an intelligence step |
 
 ---
 
-## Patching a workflow (additive)
+## Start nodes — how runs begin
 
-`workflow.patch` lets an agent elaborate its own plan at runtime — add nodes and
-edges to a stored workflow as it learns more, without redefining the whole thing:
+A **start node** is a step whose `kind` is a trigger. It doesn't "run" like a
+normal step; it produces runs of the workflow in response to time, events, or
+messages. A workflow has one or more start nodes; every other step is reachable
+from them via `depends_on`.
 
-```json
-{ "workflow_id": "w1",
-  "patch": { "add_nodes": { "verify": { "kind": "agent", "instruction": "double-check",
-                                         "edges": { "ok": "done" } } },
-             "add_edges": [ { "from": "work", "label": "error", "to": "verify" } ] } }
+| Kind | Fires a run… | Key fields |
+|---|---|---|
+| `once` | once, at startup | — |
+| `manual` | when explicitly invoked (A2A / operator) | `inputs` |
+| `schedule` | on a clock | `cron`, `every`, `at` |
+| `loop` | repeatedly, self-paced | `interval`, `until`, `max_iterations`, `backoff` |
+| `subscribe` | on an MCP resource notification | `server`, `uri`, `debounce`, `filter` |
+| `signal` | on an in-process signal | `signal` |
+| `event` | on a lifecycle event | `on` (`workflow.finished`/`failed`), `filter` |
+| `webhook` | on an inbound HTTP request | `path`, `methods`, `auth`, … (see below) |
+| `a2a` | on an inbound A2A message *(planned)* | — |
+
+```yaml
+# A daemon that runs every 5 minutes:
+steps:
+  every:  { kind: schedule, every: "5m" }
+  work:   { kind: agent, depends_on: [every], instruction: "Reconcile open deploys." }
+lifecycle:
+  run_until: drained        # stay alive; schedule keeps firing
 ```
 
-Patches are **additive only** — never overwrite a node or retarget an existing edge
-— so a patch can't strip reachability or a termination guarantee out from under a
-run. The grown workflow is re-validated; a rejected patch leaves the stored one
-untouched.
+`run_until` ties the process lifetime to the start nodes: `idle` runs the graph
+once and exits (a **job**); `drained` keeps the process alive to serve long-lived
+starts (a **daemon**); `auto` picks by whether any long-lived start or listener is
+present. See [Lifecycle & triggers](modes-and-triggers.md).
 
 ---
 
-## A worked example: structured triage with a review loop
+## The node registry
 
-Extract structured data once, branch on it deterministically, loop a draft until
-a judge approves — bounded by the budget, the token pool, and the deadline:
+Below is the full catalogue — 58 step kinds and 9 start kinds. Generate the
+authoritative, always-current version for your build with `agentd
+--workflow-schema` (each entry lists `fields`, `required`, and `implemented`).
 
-```json
-{
-  "start": "classify",
-  "nodes": {
-    "classify": { "kind": "infer", "prompt": "Classify the ticket.", "reads": ["ticket"],
-                  "schema": { "category": "string", "urgency": "number" },
-                  "writes": "triage", "edges": { "ok": "route", "error": "manual" } },
-    "route":    { "kind": "branch",
-                  "cases": [ { "when": { "op": "gte", "key": "triage", "pointer": "/urgency", "value": 8 },
-                               "goto": "page" } ],
-                  "default": "draft" },
-    "page":     { "kind": "tool", "server": "pager", "tool": "page",
-                  "args": { "category": { "$from": "triage", "pointer": "/category" } },
-                  "retry": { "max": 2, "backoff_ms": 1000 },
-                  "writes": "paged", "edges": { "ok": "done", "error": "manual" } },
-    "draft":    { "kind": "agent", "instruction": "draft a response", "reads": ["ticket", "triage"],
-                  "writes": "draft", "edges": { "ok": "judge", "error": "manual" } },
-    "judge":    { "kind": "branch", "cases": [], "default": "revise",
-                  "semantic": { "prompt": "Is the response ready to send?", "reads": ["draft"],
-                                "choices": { "yes": "done", "no": "revise" } } },
-    "revise":   { "kind": "agent", "instruction": "revise the response", "reads": ["draft"],
-                  "writes": "draft", "edges": { "ok": "judge", "error": "manual" } },
-    "done":     { "kind": "halt", "status": "completed", "result_from": "draft" },
-    "manual":   { "kind": "halt", "status": "refused" }
-  }
-}
-```
+### Intelligence
 
-The `revise → judge` back-edge is the loop; the semantic branch decides when to
-exit; the visit cap + progress guard stop a draft that never converges; the
-`infer` output feeds a **free** deterministic branch.
+| Kind | Purpose | Key fields |
+|---|---|---|
+| `agent` | take an agent turn (ReAct over granted tools) | `instruction`, `input`, `tools`, `budget` |
+| `think` | a preset intelligence call | `preset`, `input` |
+| `classify` | label an input into one of `classes` | `input`, `classes` |
+| `extract` | pull structured data against a schema | `input`, `schema` |
+| `summarize` | condense text | `input`, `max_tokens` |
+| `judge` | score/verify a claim | `input`, `criteria` |
+| `route` | choose a branch by semantic match | `input`, `routes` |
+
+### Control flow
+
+| Kind | Purpose | Key fields |
+|---|---|---|
+| `switch` | route to one dependent by value | `on`, `cases`, `default` |
+| `parallel` | run named branches concurrently, fan-in | `branches`, `min_success`, `on_error` |
+| `race` | first branch to finish wins; cancel the rest | `branches`, `timeout` |
+| `foreach` | fan out over an array (nested body) | `over`, `batch`, `body`, `collect`, `rate` |
+| `iterate` | loop a body while/until a condition | `body`, `while`/`until`, `max_iterations` |
+| `subgraph` | run an inline sub-DAG | `steps` |
+| `assert` / `fail` / `noop` | guard / force-fail / do-nothing | `expr` / `message` / — |
+| `sleep` | pause for a duration | `duration` |
+
+### Data
+
+| Kind | Purpose | Key fields |
+|---|---|---|
+| `assign` | compute and store a value | `value`, `writes` |
+| `template` | render a string | `text` |
+| `map` | transform each element | `over`, `expr` |
+| `filter` | keep elements matching a predicate | `over`, `expr` |
+| `reduce` | fold to a single value | `over`, `expr`, `initial` |
+| `sort` | order an array | `over`, `order`, `by` |
+| `dedupe` | remove duplicates | `over` |
+| `chunk` | split into batches | `value`, `by`, `size` |
+| `parse` | parse CSV/JSON/YAML/lines | `text`, `format` |
+| `transform` | shape an object | `input`, `expr` |
+| `validate` | check against a schema | `input`, `schema` |
+
+### I/O & integration
+
+| Kind | Purpose | Key fields |
+|---|---|---|
+| `http` | outbound REST call / webhook emit | `method`, `url`, `headers`, `query`, `json`/`body`, `sign`, … |
+| `webhook` | **inbound** HTTP trigger (start node) | `path`, `methods`, `auth`, `respond`, … |
+| `emit` | publish an event/notification | `event`, `payload` |
+| `mcp.tool` | call an MCP tool | `name`, `args` |
+| `mcp.resource` | read/list an MCP resource | `op`, `server`, `uri` |
+| `search.query` / `search.fetch` | web search / fetch | `query` / `url` |
+| `knowledge.search` / `knowledge.get` | RAG over the knowledge store | `query` / `id` |
+| `artifact.create` / `.get` / `.delete` | large-object store | `content` / `id` |
+| `memory.set` / `.get` / `.list` / `.delete` | durable KV memory | `key`, `value` |
+
+### Orchestration
+
+| Kind | Purpose | Key fields |
+|---|---|---|
+| `wait` | suspend until a condition/signal/event | `on`, `signal`, `condition`, `run`, `webhook`, `timeout` |
+| `join` | barrier over multiple runs/branches | `of`, `min_success` |
+| `workflow` | run a child workflow | `name`, `mode` (`sync`/`async`/`detached`), `inputs`, `cascade` |
+| `workflow.signal` / `.wait` / `.cancel` | coordinate with other runs | `signal`/`run` |
+| `subagent` | spawn a scoped subagent | `role`, `instruction`, `tools` |
+| `human` | request human input (A2A `input-required`) | `prompt`, `schema` |
+| `a2a.delegate` | delegate to a remote A2A agent | `to`, `parts` |
+| `checkpoint` | force a durable snapshot | — |
+| `cache` | memoize a sub-computation | `key` |
+
+### Terminal
+
+| Kind | Purpose | Key fields |
+|---|---|---|
+| `finish` | end the run successfully | `status`, `output`, `reason` |
+| `fail` | end the run as failed | `message` |
+
+> **`implemented: false`.** A few kinds are reserved in the schema but not yet
+> wired by the executor (currently the direct `a2a` / `a2a.send` / `a2a.wait`
+> send-primitives — use `a2a.delegate` today). `--workflow-schema` is the source of
+> truth for what your build actually runs.
 
 ---
 
-## A worked example: the gated release pipeline (everything composed)
+## Node deep-dives
 
-The dialect-2 surface in one graph — review a change **three ways at once**
-(`parallel`), fold the verdicts into one object (`merge` reducers inside the
-branches, one object out), **ask a human over A2A** with the full evidence
-(`human`), branch on the answer, and survive a mid-pipeline crash
-(`checkpoint`):
+### `agent` — an intelligence turn
 
-```json
-{
-  "dialect": 2,
-  "checkpoint": { "server": "state", "key": "release/{run_id}" },
-  "start": "reviews",
-  "nodes": {
-    "reviews": { "kind": "parallel",
-      "branches": {
-        "security": { "start": "s", "nodes": {
-          "s": { "kind": "agent", "instruction": "security-review the change", "reads": ["change"],
-                 "writes": "r", "edges": { "ok": "h", "error": "hf" } },
-          "h": { "kind": "halt", "status": "completed", "result_from": "r" },
-          "hf": { "kind": "halt", "status": "crashed", "result_from": "r" } } },
-        "perf": { "start": "p", "nodes": {
-          "p": { "kind": "infer", "prompt": "Estimate the perf impact.", "reads": ["change"],
-                 "schema": { "risk": "string", "p99_delta_ms": "number" },
-                 "writes": "r", "edges": { "ok": "h", "error": "hf" } },
-          "h": { "kind": "halt", "status": "completed", "result_from": "r" },
-          "hf": { "kind": "halt", "status": "crashed", "result_from": "r" } } },
-        "tests": { "start": "t", "nodes": {
-          "t": { "kind": "tool", "server": "ci", "tool": "run_suite",
-                 "args": { "ref": { "$from": "change", "pointer": "/ref" } },
-                 "retry": { "max": 2, "backoff_ms": 5000 },
-                 "writes": "r", "edges": { "ok": "h", "error": "hf" } },
-          "h": { "kind": "halt", "status": "completed", "result_from": "r" },
-          "hf": { "kind": "halt", "status": "crashed", "result_from": "r" } } }
-      },
-      "on_error": "continue",
-      "writes": "evidence", "edges": { "ok": "gate", "error": "gate" } },
+The workhorse. Runs a full ReAct loop against the model over the tools granted to
+the run, then returns its final text (or a structured object if `output_schema` is
+set). Inputs come from `instruction` (the task) and `input` (data), both templated:
 
-    "gate": { "kind": "human",
-      "payload": { "question": "Ship it?", "evidence": { "$from": "evidence" } },
-      "timeout_ms": 86400000,
-      "writes": "verdict",
-      "edges": { "replied": "route", "timeout": "abort" } },
-
-    "route": { "kind": "branch",
-      "cases": [ { "when": { "op": "eq", "key": "verdict", "pointer": "/approve", "value": true },
-                   "goto": "ship" } ],
-      "default": "abort" },
-
-    "ship":  { "kind": "tool", "server": "deploy", "tool": "rollout",
-               "args": { "ref": { "$from": "change", "pointer": "/ref" } },
-               "writes": "rollout", "edges": { "ok": "done", "error": "abort" } },
-    "done":  { "kind": "halt", "status": "completed", "result_from": "rollout" },
-    "abort": { "kind": "halt", "status": "refused", "result_from": "evidence" }
-  }
-}
+```yaml
+triage:
+  kind: agent
+  depends_on: [fetch]
+  instruction: "Classify this issue and draft a one-line reply."
+  input: "{{steps.fetch.output.json}}"
+  output_schema: { type: object, properties: { label: {type: string}, reply: {type: string} } }
 ```
 
-What each capability buys here:
+### `http` — outbound REST (and webhook emit)
 
-- The three reviews run **concurrently on the lane pool** — an agent turn, a
-  structured `infer`, and a plain CI tool call, each in the shape it deserves;
-  `on_error: continue` means one failed review does not blind the human — its
-  error marker lands in `evidence` alongside the others.
-- The human sees **everything** (`evidence` rides the A2A task's status
-  message), replies `{"approve": true}` from any A2A client, and the
-  deterministic branch routes on `/approve` — free, no model call.
-- Durability: the fan-out completes as one superstep (no mid-lane checkpoints
-  — a deliberate v1 simplification), so a pod lost during the reviews re-runs
-  them; a pod lost **after** them resumes at `gate` with the evidence intact —
-  the human is never re-asked for already-gathered facts, and a crash while
-  *waiting on the human* resumes the wait (suspensions always checkpoint).
-- The whole run stays inside the step budget / token pool / deadline, and the
-  operator reads its live face on `agent://workflow` and the A2A task states.
+Make a `GET`/`POST`/`PUT`/`PATCH`/`DELETE` call over the one SSRF-guarded HTTP
+client. The response is a structured object — `{status, ok, headers, body, json}` —
+that flows into dependent steps:
+
+```yaml
+fetch:
+  kind: http
+  method: GET
+  url: "https://api.example/builds/latest"
+  query: { project: "{{vars.service}}" }
+  headers: { Authorization: "Bearer {{secret:API_TOKEN}}" }   # resolved, never logged
+  expect: [200]              # acceptable statuses (default: any 2xx/3xx is ok)
+  timeout: 20s
+notify:
+  kind: http
+  depends_on: [fetch]
+  method: POST
+  url: "https://hooks.example/deploy"
+  json: { service: "{{vars.service}}", state: "{{steps.fetch.output.json.state}}" }
+  sign: { secret: "{{secret:EMIT_SECRET}}" }                  # HMAC-sign the body
+```
+
+- **Body:** `json` serializes an object and sets `Content-Type: application/json`;
+  `body` sends a raw string. `json` wins if both are present.
+- **Secrets:** `{{secret:…}}` in any header value (e.g. `Authorization`) is resolved
+  through the redacting resolver — the credential never passes through the templater
+  or a log line.
+- **`sign`:** `{ secret, header?, prefix? }` HMAC-SHA256-signs the exact request
+  body and adds `X-Signature: sha256=<hex>` (configurable header/prefix). This makes
+  the node a **verifiable webhook emitter**, symmetric with the inbound `webhook`
+  node's `hmac` verify.
+- **SSRF:** the resolved host is classified; private/loopback/link-local targets are
+  **refused** unless the node sets `allow_private: true` (for a declared internal
+  API). `https://` verifies the server certificate.
+
+### `webhook` — inbound HTTP trigger
+
+A `webhook` **start node** turns an inbound HTTP request into a workflow run. It is
+served by a dedicated listener bound at `webhooks.listen`:
+
+```yaml
+webhooks:
+  listen: http://127.0.0.1:8088        # loopback (front with a TLS proxy); a public
+                                       # bind must be https:// + webhooks.tls
+workflows:
+  - name: on-ci
+    steps:
+      hook:
+        kind: webhook
+        path: /hooks/ci
+        methods: [POST]
+        auth:
+          hmac: { secret: "{{secret:HOOK_SECRET}}" }   # verify X-Signature: sha256=…
+        idempotency: header             # dedupe on Idempotency-Key
+        parallelism: 4                  # max concurrent runs from this hook
+        on_overflow: queue              # queue | drop | replace when saturated
+      build: { kind: agent, depends_on: [hook], instruction: "Handle the CI event." }
+      done:  { kind: finish, depends_on: [build] }
+lifecycle:
+  run_until: drained
+```
+
+- **Auth** is per-node and configurable: `hmac` (verify an `X-Signature` HMAC over
+  the body — the best practice), `header` (require a header equals a secret),
+  `bearer` (a bearer token), or `none`. A bad signature is rejected `401` before any
+  run starts. A default can be set once at `webhooks.default_auth`.
+- **Idempotency:** with `idempotency: header`, a repeated `Idempotency-Key` is
+  deduplicated — the replay returns `200 duplicate` and fires **no** second run. The
+  dedupe set is durable.
+- **Backpressure:** `parallelism` caps concurrent runs; `on_overflow` chooses what
+  happens when saturated.
+- **Response mode:** `respond: ack` (default) returns `202 Accepted` immediately;
+  `respond: sync` holds the HTTP response open until the run reaches a terminal
+  state and returns its status + output inline.
+
+You can also **await** a webhook *inside* a run, rather than start one — see `wait`.
+
+### `wait` — suspend until something happens
+
+`wait` pauses a run (durably — it costs nothing while suspended) until its condition
+is met, then resumes. The `on` field selects what it waits for:
+
+```yaml
+# wait for an in-process signal
+hold:  { kind: wait, on: signal, signal: child-done, timeout: 5m }
+
+# wait for a CEL condition over live state
+ready: { kind: wait, on: condition, condition: "CEL: status.runs_active == 0" }
+
+# wait for an inbound callback to a dynamic URL (webhook await)
+cb:
+  kind: wait
+  on: webhook
+  webhook: { path: /hooks/cb/{{run.id}} }
+  emit_url_to: callback_url        # writes the public callback URL to vars.callback_url
+  timeout: 30m
+```
+
+`on:` accepts `signal`, `condition`, `run` (another run finishing), `subagent`,
+`conversation`, `webhook`, or a `deadline`. The webhook-await variant registers a
+one-shot callback path and (optionally) publishes the resolved public URL into a
+blackboard variable via `emit_url_to`, so a preceding `http` step can hand that URL
+to an external system that will call back.
+
+### `foreach` / `batch` — durable fan-out
+
+`foreach` runs a nested `body` sub-DAG once per element of `over`, with bounded
+parallelism and **per-batch durable progress** (a crash mid-fan-out resumes at the
+next unfinished batch, never re-running completed ones):
+
+```yaml
+each:
+  kind: foreach
+  over: "{{vars.items}}"
+  batch: { size: 2, parallel: 2 }      # 2 items per batch, 2 batches in flight
+  rate: "10/s"                          # optional pacing
+  on_error: continue                    # a failed element doesn't fail the run
+  body:
+    steps:
+      double: { kind: assign, value: "CEL: item * 2" }
+      tag:    { kind: template, depends_on: [double], text: "{{index}}={{steps.double.output}}" }
+  collect: "{{steps.tag.output}}"       # gather each iteration's result into the output array
+```
+
+Inside the body, `{{item}}`, `{{index}}`, and `{{batch}}` refer to the current
+element.
+
+### `parallel` / `race` / `switch`
+
+```yaml
+par:
+  kind: parallel
+  on_error: continue
+  branches:
+    a: { steps: { x: { kind: agent, instruction: "Path A" } } }
+    b: { steps: { y: { kind: http,  url: "https://b.example" } } }
+  min_success: 1                        # succeed if at least one branch does
+
+route:
+  kind: switch
+  depends_on: [par]
+  on: "{{steps.par.output.winner}}"
+  cases: { fast: took_fast, slow: took_slow }
+  default: took_default
+```
+
+`parallel` is a fan-in barrier (all branches, subject to `min_success`); `race`
+returns the first to finish and cancels the rest; `switch` enables exactly one
+dependent by matching `on` against `cases`.
+
+### `workflow` — child runs
+
+Call another workflow as a step, synchronously (block for its result), async (start
+it and get a handle), or detached (fire-and-forget). `cascade` propagates cancel:
+
+```yaml
+spawn: { kind: workflow, name: enrich, mode: sync, inputs: { id: "{{vars.id}}" } }
+use:   { kind: agent, depends_on: [spawn], input: "{{steps.spawn.output}}", instruction: "Use the enrichment." }
+```
+
+---
+
+## The goal watchdog
+
+Separately from any single workflow, a daemon can carry a **goal** — a standing
+objective it periodically checks and self-corrects toward. This is a top-level
+`goal:` block, not a workflow node:
+
+```yaml
+goal:
+  statement: All open deploys are reconciled.
+  check:
+    every: 30s
+    condition: "CEL: status.runs_active == 0"   # cheap deterministic gate first…
+    via: llm                                     # …then an LLM judge confirms
+  stuck_after: 5            # checks with no progress before it's "stuck"
+  on_achieved: finish       # finish | idle | { workflow: <name> }
+  on_stuck: replan          # replan | escalate | idle | { workflow: <name> }
+```
+
+On each tick the reactor evaluates the CEL `condition`; if it passes (and `via:
+llm`/`both`), it asks the model to **judge** whether the goal is truly met. If met,
+it takes `on_achieved` (finish the process, idle, or trigger a workflow). If checks
+keep failing with no progress, after `stuck_after` it takes `on_stuck` — by default
+`replan`, which re-plans and retries. The judge runs asynchronously off the reactor
+so the loop never blocks. See [RFC 0026](../rfcs/0026-agent-loop-and-lifecycle.md).
+
+---
+
+## Durability & resume
+
+Every workflow run is durable. The reactor is a **single writer**: it appends each
+state transition (a step starting, a step's output, a blackboard write, a batch
+completing) to the durable store *before* the effect is observable. On restart it
+restores the run set and **replays** any step that was mid-flight.
+
+```mermaid
+sequenceDiagram
+  participant T as Trigger
+  participant R as Reactor (single writer)
+  participant S as Durable store
+  participant X as Executor thread
+  T->>R: event (start / step done)
+  R->>S: append transition (write-ahead)
+  S-->>R: durable
+  R->>X: dispatch ready step
+  Note over R,X: crash here → restart restores from S,<br/>replays the in-flight step, skips completed ones
+  X-->>R: StepDone(output)
+  R->>S: append output + next transitions
+```
+
+What this buys you:
+
+- **Crash recovery.** SIGKILL the process at any point; on restart every run
+  continues from its last durable point. Completed steps are not re-run; an
+  in-flight `foreach` resumes at the next unfinished batch.
+- **Idempotency knobs.** For steps with external side effects, `idempotent: true`
+  plus `on_replay: skip` avoids re-issuing an effect that may have already landed
+  before the crash.
+- **Exactly-once triggers.** Webhook idempotency keys and schedule deadlines are
+  durable, so a restart doesn't double-fire.
+
+The store is configured once under `store:` (`kind: mcp` or `http` for a real
+durable backend; `memory` for dev/test, which does **not** survive the process).
+Long-lived features (daemons, webhooks, goals, schedules) require a store.
+
+---
+
+## Worked examples
+
+### 1. Webhook → enrich → signed callback
+
+A CI system posts a signed webhook; the workflow fetches build details, asks the
+model to summarize, and posts a signed result back:
+
+```yaml
+config_version: "2"
+agent: { name: ci, instruction: You summarize builds. }
+intelligence: { endpoints: ["https://api.openai.com/v1"], model: gpt-5.1, token: "{{secret:OPENAI_KEY}}" }
+mcp:
+  servers:
+    - name: state
+      endpoint: "${STATE_MCP_URL}"          # the durable store backend
+store:
+  kind: mcp
+  mcp: { server: state }
+webhooks:
+  listen: "https://0.0.0.0:${HOOK_PORT:-8443}"   # public bind → TLS required
+  tls:
+    cert: "{{secret-file:/etc/agentd/webhook.crt}}"
+    key: "{{secret-file:/etc/agentd/webhook.key}}"
+workflows:
+  - name: ci-summary
+    steps:
+      hook:
+        kind: webhook
+        path: /hooks/ci
+        methods: [POST]
+        auth: { hmac: { secret: "{{secret:HOOK_SECRET}}" } }
+        idempotency: header
+      fetch:
+        kind: http
+        depends_on: [hook]
+        url: "https://api.example/builds/{{steps.hook.output.json.build_id}}"
+        headers: { Authorization: "Bearer {{secret:API_TOKEN}}" }
+      brief:
+        kind: summarize
+        depends_on: [fetch]
+        input: "{{steps.fetch.output.json}}"
+      post:
+        kind: http
+        depends_on: [brief]
+        method: POST
+        url: "https://chat.example/notify"
+        json: { text: "Build summary: {{steps.brief.output}}" }
+        sign: { secret: "{{secret:NOTIFY_SECRET}}" }
+      done: { kind: finish, depends_on: [post] }
+lifecycle: { run_until: drained }
+```
+
+### 2. Scheduled durable fan-out
+
+Every hour, pull a work list and process it in bounded, resumable batches:
+
+```yaml
+workflows:
+  - name: nightly
+    steps:
+      tick:  { kind: schedule, every: "1h" }
+      list:  { kind: http, depends_on: [tick], url: "https://api.example/queue" }
+      each:
+        kind: foreach
+        depends_on: [list]
+        over: "{{steps.list.output.json.items}}"
+        batch: { size: 10, parallel: 3 }
+        on_error: continue
+        body:
+          steps:
+            handle: { kind: agent, instruction: "Process {{item.id}}." }
+      done: { kind: finish, depends_on: [each] }
+lifecycle: { run_until: drained }
+```
+
+### 3. Triage with a review loop
+
+Classify, draft, and iterate until a judge is satisfied:
+
+```yaml
+steps:
+  start: { kind: once }
+  cls:   { kind: classify, depends_on: [start], input: "{{env.ticket}}", classes: [bug, question, chore] }
+  draft: { kind: agent, depends_on: [cls], instruction: "Draft a reply for a {{steps.cls.output}}." }
+  review:
+    kind: iterate
+    depends_on: [draft]
+    max_iterations: 3
+    until: "CEL: result.approved"
+    body:
+      steps:
+        judge: { kind: judge, input: "{{vars.reply | steps.draft.output}}", criteria: "clear, correct, kind" }
+        fix:   { kind: agent, depends_on: [judge], when: "CEL: !steps.judge.output.approved",
+                 instruction: "Revise: {{steps.judge.output.reason}}", writes: reply }
+  done:  { kind: finish, depends_on: [review], output: "{{vars.reply}}" }
+```
+
+---
+
+## Nuances & gotchas
+
+- **Quote `${VAR:-x}` in YAML.** The `:` makes an unquoted scalar ambiguous;
+  substitution runs on the parsed document, so the YAML must be valid first.
+- **`${VAR}` fills strings, `{{env.…}}` fills at runtime.** For a numeric or enum
+  field driven by the environment, template it at execution (`{{env.N}}`) rather
+  than substituting at load.
+- **`{{secret:…}}` ≠ `${VAR}`.** Secrets are redacted and resolved per-node; env
+  vars are loggable and substituted globally. Don't cross them.
+- **`allow_private` is off by default.** An `http` node to a loopback/private host
+  is refused unless you opt in — this is the SSRF guard, not a bug.
+- **A public `webhooks.listen` needs TLS.** Plaintext `http://` binds are allowed
+  for **loopback only**; a `0.0.0.0`/public bind must be `https://` with
+  `webhooks.tls: { cert, key }` — or bind loopback and terminate TLS in a proxy.
+- **`memory` store is not durable.** It warns at startup and loses all runs on exit.
+  Use an `mcp`/`http` store for anything long-lived.
+- **A skipped `when` doesn't skip dependents.** `when: false` skips *that* step; its
+  dependents still run (reading an empty output). Gate a whole branch with `switch`.
+- **Concurrency is implicit.** Independent steps run at once. If you need ordering,
+  add a `depends_on`; if you need mutual exclusion, serialize through a shared
+  dependency or the blackboard.
 
 ---
 
 ## See also
 
-- [modes-and-triggers.md](modes-and-triggers.md) — the four base modes and reactive
-  routing (a workflow is the explicit form of the same event→action machinery).
-- [subagents.md](subagents.md) — the `agent` node runs a subagent turn;
-  `subagent.spawn{workflow}` / `workflow.run{detach}` delegate whole workflows to
-  children; the spawn caps still apply.
-- [configuration.md](configuration.md) — `--workflow` / `--mode workflow` and the run
-  limits a workflow inherits (`--max-steps`, `--max-tokens` = the shared token
-  pool, `--deadline` = the whole-workflow wall clock).
+- [RFC 0027 — Workflow dialect 3](../rfcs/0027-workflow-dialect-3.md) — the formal spec.
+- [RFC 0025 — Durable state & store adapters](../rfcs/0025-durable-state-and-store-adapters.md).
+- [RFC 0026 — Agent loop & lifecycle](../rfcs/0026-agent-loop-and-lifecycle.md) — turns, the goal watchdog.
+- [Lifecycle & triggers](modes-and-triggers.md) — job vs daemon, start nodes.
+- [Configuration](configuration.md) — every key, precedence, secrets, `--validate-config`.
+- [Security](security.md) — no local execution, SSRF, the Rule-of-Two, secret handling.
+- `agentd --workflow-schema` — the authoritative node registry for your build.

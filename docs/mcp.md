@@ -68,7 +68,8 @@ The exact flag surface (from `agentd --help`):
 ```
 TOOLS / MCP:
   --mcp name=<endpoint>       declare a remote MCP server (repeatable; Streamable HTTP)
-  --serve-mcp <https://host:port>  serve agentd's own MCP (HTTP(S), mTLS/bearer auth)
+  # the external channel is A2A, not a served MCP surface:
+  a2a.listen: https://host:port   the A2A v2 HTTPS listener (RFC 0029, `--features a2a`)
 ```
 
 There is no `--mcp` env var; servers are a structural list. (A config-file layer
@@ -222,19 +223,25 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
 | the *set* of resources changed | `resources.listChanged` | none (capability-implied) | `notifications/resources/list_changed` | none |
 | the *set* of tools changed | `tools.listChanged` | none | `notifications/tools/list_changed` | none |
 
-You wire a subscription to a run with `--subscribe` plus `--mode reactive`:
+You wire a subscription to a run with a **`subscribe` start node** in a workflow
+(agentd 2.0):
 
-```bash
-agentd \
-  --instruction "When the inbox changes, triage new items" \
-  --intelligence https://gw.example/v1 \
-  --mcp fs=https://mcp-fs.internal/mcp \
-  --mode reactive \
-  --subscribe file:///work/inbox
+```yaml
+config_version: "2"
+intelligence: { endpoints: https://gw.example/v1, model: my-model }
+store: { kind: mcp, mcp: { server: state } }
+mcp: { servers: [ { name: fs, endpoint: https://mcp-fs.internal/mcp }, { name: state, endpoint: https://mcp-state.internal/mcp } ] }
+workflows:
+  - name: triage
+    steps:
+      s: { kind: subscribe, server: fs, uri: "file:///work/inbox" }
+      w: { kind: agent, depends_on: [s], instruction: "Triage new items in the inbox." }
+      f: { kind: finish, depends_on: [w] }
+lifecycle: { run_until: drained }
 ```
 
-`--mode reactive` *requires* at least one `--subscribe <uri>`; without it the
-config is rejected at startup (exit `2`).
+The runtime issues `resources/subscribe` for the URI, then idles and fires a run
+on each update (notify-then-read).
 
 > **Reactivity rides Streamable HTTP.** Subscriptions are `resources/subscribe`
 > against the owning MCP server; the client holds the SSE stream open and processes
@@ -258,36 +265,31 @@ whole drain counts inside `--drain-timeout` (default `25s`).
 
 ---
 
-## 2. agentd as MCP server (self-MCP)
+## 2. agentd as an A2A endpoint (the external channel)
 
-agentd is *also* an MCP server. A parent agent, a peer, or any MCP-aware harness
-can `initialize` against it and get a real, capability-negotiated catalogue: five
-tools to spawn and steer subagents (`subagent.spawn` / `.send` / `.status` /
-`.cancel`) plus a `status` tool, and the subscribable `agent://` state resources
-(this agent's `status`, and a per-run `agent://subagent/<handle>`).
+agentd 2.0's external channel is **A2A** (RFC 0029), not a served MCP surface —
+the v1 self-MCP server (the `subagent.*`/`status` tools + `agent://` resources
+over Streamable HTTP) was removed in the mode cut-over. Set `a2a.listen` and a
+parent agent, a peer, or an operator drives it over A2A JSON-RPC: `SendMessage`
+(natural language → a conversation turn, or a command DataPart → a registry
+action such as `status` / `workflow.run` / `config`), `GetTask` / `ListTasks` /
+`CancelTask`, and `SendStreamingMessage` (SSE) — each resolved to a **principal**
+(mTLS / bearer → `operator` / `user` / `agent` / `anonymous`) and authorized
+against a role matrix.
 
-It serves this over **Streamable HTTP(S)** when you pass `--serve-mcp`, with trust
-minted per request by mutual-TLS (primary) or a constant-time bearer token
-(alternative) — never by the transport:
-
-```bash
-agentd \
-  --instruction "Be a reusable code-review worker" \
-  --intelligence https://gw.example/v1 \
-  --mcp fs=https://mcp-fs.internal/mcp \
-  --serve-mcp https://0.0.0.0:8443 \
-  --serve-cert /etc/agentd/tls/server.crt \
-  --serve-key /etc/agentd/tls/server.key \
-  --serve-client-ca /etc/agentd/tls/clients-ca.crt
+```yaml
+a2a:
+  listen: https://0.0.0.0:8443
+  tls: { cert: /etc/agentd/tls/server.crt, key: /etc/agentd/tls/server.key, client_ca: /etc/agentd/tls/clients-ca.crt }
 ```
 
-> **The served surface is HTTP.** The self-MCP is a full Streamable-HTTP server
-> (POST for unary calls, `subscriptions/listen` over SSE) — the framing lives in
-> the reusable `mcp` crate. A non-loopback bind **must** configure mTLS and/or a
-> bearer (`--serve-bearer`); an unauthenticated non-loopback listener is a startup
-> error. A loopback `http://` bind with no auth is allowed only for local dev. The
-> in-process caller (the agent's own loop / the supervisor↔subagent control path)
-> is the `Stdio` origin; an authenticated HTTP request is the `Management` origin.
+> **Trust is per request, never the transport.** A non-loopback bind **must**
+> configure mTLS and/or a bearer; an unauthenticated non-loopback listener is a
+> startup error. A loopback `http://` bind with no auth is allowed only for local
+> dev. See [RFC 0029](../rfcs/0029-a2a-v2.md).
+
+The subsections below (§2.1+) describe the **retired 1.x self-MCP** surface, kept
+only as a migration reference.
 
 ### 2.1 Declared capabilities
 
@@ -479,69 +481,76 @@ This keeps the public surface a single, clean MCP dialect.
 ## 3. Composition: one agent driving another
 
 Because agentd is symmetric, composition needs no new protocol. A **worker** agentd
-is deployed as its own service, serving its self-MCP over HTTPS:
+is deployed as its own service, exposing the A2A v2 channel (RFC 0029) over HTTPS:
 
+```yaml
+# reviewer.yaml — the worker, an A2A endpoint (build with --features a2a).
+# The listener makes it a daemon: it needs a durable store (RFC 0025) and TLS.
+agent: { instruction: "Be a reusable code-review worker" }
+intelligence: { endpoints: https://gw.example/v1 }
+store: { kind: mcp, mcp: { server: state } }
+mcp:   { servers: [ { name: state, endpoint: https://mcp-state.internal/mcp } ] }
+a2a:
+  listen: https://0.0.0.0:8443
+  tls:    { cert: /tls/cert.pem, key: /tls/key.pem }
+  bearer: "{{secret:REVIEWER_TOKEN}}"
+```
 ```bash
-# the worker — a reusable reviewer, serving its self-MCP over HTTPS with auth
-agentd \
-  --instruction "Be a reusable code-review worker" \
-  --intelligence https://gw.example/v1 \
-  --mode reactive --subscribe file:///nowhere \
-  --serve-mcp https://0.0.0.0:8443 --serve-bearer "$REVIEWER_TOKEN"
+agentd --config reviewer.yaml
 ```
 
-A **parent** agentd then declares that worker as just another MCP server (or, with
-`--features a2a`, as an `--a2a-peer` it delegates to via `a2a.delegate`):
+A **parent** agentd (a job) declares that worker as an `--a2a-peer` it delegates
+to (over A2A, emitting `a2a.delegate`):
 
 ```bash
 agentd \
   --instruction "Orchestrate the nightly review across the repo" \
   --intelligence https://gw.example/v1 \
-  --mcp reviewer=https://reviewer.internal:8443
+  --a2a-peer reviewer=https://reviewer.internal:8443
 ```
 
-From the parent's point of view the child is a normal MCP server: it
-`initialize`s, lists the `subagent.*` and `status` tools, calls them, and reads /
-subscribes the child's `agent://` resources via the `resources/read` /
-`resources/subscribe` methods. Two patterns fall out:
+The parent drives the worker over A2A JSON-RPC, resolved to a **principal**
+(mTLS/bearer) and authorized against the worker's role matrix. Two patterns fall
+out:
 
-**Drive** — the parent calls `subagent.spawn` (or `subagent.send` to a warm
-session) on the child and gets back a distilled result. The parent never reasons
-about the child's internal steps; it gets a clean, bounded answer.
+**Ask** — the parent `SendMessage`s the worker a task (a natural-language turn, or
+a `workflow.run` command DataPart) and gets back a durable A2A **task**; it reads
+the returned artifact (or polls `GetTask`) for a clean, bounded result — never
+reasoning about the worker's internal steps.
 
-**Subscribe** — the parent spawns `{async}` and subscribes to
-`agent://subagent/{handle}` on the child. When the child reaches a terminal
-status, the child emits `notifications/resources/updated` on that URI; the parent
-(woken by its reactive router) `resources/read`s it to collect the distillate.
-This is exactly how an **async** subagent closes the loop — the same
-notify-then-read machinery, just across a process boundary.
+**Stream** — the parent `SendStreamingMessage`s and the worker streams incremental
+task status + artifacts over SSE, closing the loop as the run progresses. The
+durable task **survives a worker restart** (RFC 0025), so a parent that reconnects
+resumes with `GetTask`.
 
-A worked picture of the reactive close-the-loop:
+A worked picture of the streaming close-the-loop:
 
+```mermaid
+sequenceDiagram
+    participant P as parent agent
+    participant W as worker (A2A endpoint)
+    P->>W: message/stream {task: "review PR 42"}
+    W-->>P: task t-7f3 · state=submitted
+    Note over W: worker runs (supervised, bounded)
+    W-->>P: status-update · state=working (SSE)
+    W-->>P: artifact-update · { distilled review } (SSE)
+    W-->>P: status-update · state=completed (SSE, final)
+    Note over P,W: dropped connection? GetTask t-7f3 re-reads current state
 ```
-parent agent                              child agent (self-MCP, https://reviewer.internal:8443)
-  │  tools/call subagent.spawn{async}  ──▶
-  │  ◀── ack: handle=served.2  (read agent://subagent/served.2)
-  │  resources/subscribe{uri:agent://subagent/served.2}  ──▶
-  │                                            … child works …
-  │  ◀── notifications/resources/updated{uri:agent://subagent/served.2}
-  │  resources/read{uri:agent://subagent/served.2}  ──▶
-  │  ◀── contents[]: { distilled result }
-```
 
-Because every notification is payload-free and the parent always re-reads current
-state, redelivery is safe and the parent converges on the child's actual
-terminal result. No exactly-once gymnastics, no diff bookkeeping — the same
-discipline agentd applies to every MCP resource, applied to agents themselves.
+Because every task is durable and re-readable with `GetTask`, a dropped connection
+is recovered by re-reading current task state — no exactly-once gymnastics, no diff
+bookkeeping, the same converge-on-current-state discipline agentd applies to every
+resource, applied to agents themselves.
 
 ---
 
 ## See also
 
 - [RFC 0004 — MCP client subset & wire codec](../rfcs/0004-mcp-client-subset-and-codec.md)
-- [RFC 0005 — Self-MCP server & control protocol](../rfcs/0005-self-mcp-server-and-control-protocol.md)
-- [RFC 0008 — Execution modes & reactive routing](../rfcs/0008-execution-modes-and-reactive-routing.md)
+- [RFC 0029 — A2A conversations, principals & commands](../rfcs/0029-a2a-conversations-principals-commands.md) — the external channel (replaces the retired self-MCP of RFC 0005)
+- [RFC 0026 — Agent loop & lifecycle](../rfcs/0026-agent-loop-and-lifecycle.md) · [RFC 0027 — Workflow dialect v3](../rfcs/0027-workflow-dialect-3.md)
 - [RFC 0009 — Subagent process model](../rfcs/0009-subagent-process-model.md)
+- [RFC 0025 — Durable state & store adapters](../rfcs/0025-durable-state-and-store-adapters.md)
 - [RFC 0012 — Security posture](../rfcs/0012-security-posture.md)
-- [RFC 0013 — Deferred v2 surface](../rfcs/0013-deferred-v2-surface.md)
-- [Build plan & progress](design/PLAN.md)
+- [2.0 build plan & progress](design/01-durable-agent-plan.md)

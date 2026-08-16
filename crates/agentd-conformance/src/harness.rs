@@ -3,9 +3,7 @@
 //! as a peer would — a served-MCP JSON-RPC client, a once-mode runner, the mock
 //! LLM / mock MCP helpers — with no link against the agentd library.
 
-use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -43,82 +41,38 @@ impl Drop for TempDir {
 
 /// The resolved binary paths the suite drives.
 struct Bins {
-    /// The default agentd (serve-mcp + internal-mocks) most checks run.
+    /// The default agentd (the a2a listener + the mock LLM/MCP re-exec) the
+    /// checks run.
     agentd: PathBuf,
-    /// A `cluster`-featured agentd (adds sharding + the `--claim`/`--standby`
-    /// path), built into a SEPARATE target dir so it never clobbers `agentd`.
-    /// Used by the work-claim family, whose `--claim` route exits 2 on a
-    /// non-cluster build (RFC 0019 §3.6 / RFC 0015 §5.6).
-    agentd_cluster: PathBuf,
-    /// The recording reference MCP server (MCP-client conformance).
+    /// The recording reference MCP server (kept for the P7 v2 client family).
     confmcp: PathBuf,
-    /// The mock work-claim coordination server (work-claim conformance).
-    workmcp: PathBuf,
 }
 
 /// Build the binaries the suite needs once, then resolve their paths.
 fn binaries() -> &'static Bins {
     static BINS: OnceLock<Bins> = OnceLock::new();
     BINS.get_or_init(|| {
-        // Ensure the agentd binary (with serve-https + the mock LLM / mock MCP the
-        // suite drives) and our reference MCP servers all exist, regardless of
-        // whether we were invoked via `cargo test` (which builds them) or `cargo
-        // run` (which may not). `internal-mocks` is implicit in a debug build but
-        // we ask for it explicitly so a `--release` conformance run still ships
-        // the mock re-exec modes.
+        // Ensure the agentd binary (with the a2a listener + the mock LLM / mock
+        // MCP the suite drives) and the reference MCP server exist, whether we
+        // were invoked via `cargo test` (which builds them) or `cargo run` (which
+        // may not). `internal-mocks` is implicit in a debug build but we ask for
+        // it explicitly so a `--release` conformance run still ships the mocks.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "serve-https,internal-mocks",
+            "a2a,cron,internal-mocks",
         ]);
         build(&["build", "-p", "agentd-conformance", "--bin", "confmcp"]);
-        build(&["build", "-p", "agentd-conformance", "--bin", "workmcp"]);
         let dir = target_dir();
         let agentd = dir.join("agentd");
         let confmcp = dir.join("confmcp");
-        let workmcp = dir.join("workmcp");
-        // The `cluster`-featured agentd. The `--claim` path (RFC 0019 §3) is
-        // `cluster`-gated, so the work-claim e2e check NEEDS a cluster build — a
-        // default build exits 2 on `--claim`. We build it with the SAME feature
-        // set as the default (serve-https + internal-mocks) PLUS `cluster`, into a
-        // dedicated `--target-dir` so the resulting `agentd` does not overwrite
-        // the default one (both are named `agentd`). The dir is a sibling of the
-        // shared target so it inherits the same toolchain/deps cache.
-        let cluster_target = cluster_target_dir(&dir);
-        build_with_target_dir(
-            &[
-                "build",
-                "-p",
-                "agentd-cli",
-                "--features",
-                "serve-https,internal-mocks,cluster",
-            ],
-            &cluster_target,
-        );
-        let agentd_cluster = cluster_target.join("debug").join("agentd");
-        for (p, what) in [
-            (&agentd, "agentd"),
-            (&agentd_cluster, "agentd (cluster)"),
-            (&confmcp, "confmcp"),
-            (&workmcp, "workmcp"),
-        ] {
+        for (p, what) in [(&agentd, "agentd"), (&confmcp, "confmcp")] {
             assert!(p.exists(), "{what} binary not found at {}", p.display());
         }
-        Bins {
-            agentd,
-            agentd_cluster,
-            confmcp,
-            workmcp,
-        }
+        Bins { agentd, confmcp }
     })
-}
-
-/// Where the `cluster`-featured agentd is built: `<target>/conf-cluster/` (its
-/// own `--target-dir`, so the cluster `agentd` never clobbers the default one).
-fn cluster_target_dir(shared_target: &Path) -> PathBuf {
-    shared_target.join("conf-cluster")
 }
 
 fn build(args: &[&str]) {
@@ -127,18 +81,6 @@ fn build(args: &[&str]) {
         .status()
         .unwrap_or_else(|e| panic!("failed to run cargo {args:?}: {e}"));
     assert!(status.success(), "cargo {args:?} failed");
-}
-
-/// Build into a dedicated `--target-dir` (so a differently-featured variant of a
-/// same-named binary doesn't overwrite the shared one).
-fn build_with_target_dir(args: &[&str], target_dir: &Path) {
-    let status = Command::new(env!("CARGO"))
-        .args(args)
-        .arg("--target-dir")
-        .arg(target_dir)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run cargo {args:?}: {e}"));
-    assert!(status.success(), "cargo {args:?} (cluster) failed");
 }
 
 /// The `target/<profile>/` dir, derived from our own executable's location
@@ -156,9 +98,7 @@ fn target_dir() -> PathBuf {
 /// every spawn gets its own temp dir + sockets so checks never collide.
 pub struct Harness {
     agentd: PathBuf,
-    agentd_cluster: PathBuf,
     confmcp: PathBuf,
-    workmcp: PathBuf,
 }
 
 impl Default for Harness {
@@ -172,9 +112,7 @@ impl Harness {
         let b = binaries();
         Harness {
             agentd: b.agentd.clone(),
-            agentd_cluster: b.agentd_cluster.clone(),
             confmcp: b.confmcp.clone(),
-            workmcp: b.workmcp.clone(),
         }
     }
 
@@ -182,22 +120,10 @@ impl Harness {
         &self.agentd
     }
 
-    /// Path to a `cluster`-featured agentd (sharding + the `--claim`/`--standby`
-    /// path). The default `agentd()` exits 2 on `--claim`; the work-claim e2e
-    /// check spawns THIS one instead.
-    pub fn agentd_cluster(&self) -> &Path {
-        &self.agentd_cluster
-    }
-
-    /// Path to the recording reference MCP server (for client conformance).
+    /// Path to the recording reference MCP server (kept for the P7 v2 client
+    /// conformance family).
     pub fn confmcp(&self) -> &Path {
         &self.confmcp
-    }
-
-    /// Path to the mock work-claim coordination server (for work-claim
-    /// conformance — the frozen `work.*` contract with atomic single-grant).
-    pub fn workmcp(&self) -> &Path {
-        &self.workmcp
     }
 
     /// Launch the built-in agentd Streamable HTTP mock MCP server, serving one
@@ -224,27 +150,26 @@ impl Harness {
         ConfServer::spawn_http(&self.confmcp, &[addr_file, rec, Path::new(uri)], addr_file)
     }
 
-    /// Launch `workmcp` as a Streamable HTTP MCP server (loopback TCP, announcing
-    /// through the `addr_file`), backed by the shared lease `state` file and
-    /// serving item `uri`. Blocks until announced; the guard kills it on drop.
-    pub fn spawn_workmcp(&self, addr_file: &Path, state: &Path, uri: &str) -> ConfServer {
-        ConfServer::spawn_http(
-            &self.workmcp,
-            &[addr_file, state, Path::new(uri)],
-            addr_file,
-        )
-    }
-
     pub fn tempdir(&self) -> TempDir {
         TempDir::new()
     }
 
     /// Run agentd to completion with `args`; capture the exit code + streams.
     pub fn run(&self, args: &[&str]) -> RunResult {
-        let out = Command::new(&self.agentd)
-            .args(args)
-            .output()
-            .expect("spawn agentd");
+        self.run_env(args, &[])
+    }
+
+    /// Like [`Harness::run`], but with extra environment variables — the durable
+    /// test hooks (`AGENTD_TEST_KILL_AT` for a SIGKILL at a kill point,
+    /// `AGENTD_TEST_INBOX_FILE` to seed the durable inbox) the chaos/restore
+    /// conformance drives.
+    pub fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> RunResult {
+        let mut cmd = Command::new(&self.agentd);
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn agentd");
         RunResult {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -278,12 +203,6 @@ impl Harness {
         self.spawn_exe(&self.agentd, args)
     }
 
-    /// Spawn the `cluster`-featured agentd as a daemon (for the `--claim` /
-    /// `--standby` paths the default build rejects with exit 2).
-    pub fn spawn_cluster(&self, args: &[&str]) -> Daemon {
-        self.spawn_exe(&self.agentd_cluster, args)
-    }
-
     /// Spawn an arbitrary agentd binary as a daemon, capturing nothing.
     fn spawn_exe(&self, exe: &Path, args: &[&str]) -> Daemon {
         let child = Command::new(exe)
@@ -293,40 +212,6 @@ impl Harness {
             .spawn()
             .expect("spawn agentd daemon");
         Daemon { child: Some(child) }
-    }
-
-    /// Start an idle daemon that serves MCP on a fresh unix socket and does
-    /// nothing else (reactive, subscribed to a URI no server owns). Returns a
-    /// connected, initialized JSON-RPC client.
-    pub fn serve(&self) -> Served {
-        let tmp = TempDir::new();
-        let port = free_loopback_port();
-        let addr = format!("127.0.0.1:{port}");
-        let child = Command::new(&self.agentd)
-            .args([
-                "--mode",
-                "reactive",
-                "--subscribe",
-                "file:///noop",
-                "--instruction",
-                "stand by",
-                "--intelligence",
-                "http://127.0.0.1:9",
-                "--serve-mcp",
-                &format!("http://{addr}"),
-                "--log-level",
-                "warn",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn served daemon");
-        let client = Client::connect(&addr, Duration::from_secs(5));
-        Served {
-            child,
-            client,
-            _tmp: tmp,
-        }
     }
 }
 
@@ -480,128 +365,6 @@ impl RunResult {
     pub fn saw_event(&self, name: &str) -> bool {
         self.events().iter().any(|e| e["event"] == name)
     }
-}
-
-/// A running served daemon + its client; SIGTERM'd on drop.
-pub struct Served {
-    child: Child,
-    pub client: Client,
-    _tmp: TempDir,
-}
-
-impl Served {
-    pub fn client(&mut self) -> &mut Client {
-        &mut self.client
-    }
-}
-
-impl Drop for Served {
-    fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGTERM);
-        }
-        // Bounded wait so a wedged daemon can't hang the suite.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// A JSON-RPC client over agentd's HTTP control plane — one `POST /mcp` per call
-/// (Connection: close). Built around raw JSON so it never agrees with agentd's own
-/// codec — a conformance checker, not a peer.
-pub struct Client {
-    addr: String,
-    id: i64,
-}
-
-impl Client {
-    fn connect(addr: &str, timeout: Duration) -> Client {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if TcpStream::connect(addr).is_ok() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "served HTTP port never connectable: {addr}"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let mut c = Client {
-            addr: addr.to_string(),
-            id: 0,
-        };
-        // Every served session opens with the MCP handshake.
-        let _ = c.call("initialize", json!({}));
-        c
-    }
-
-    /// The id that the next [`Client::call`] will use.
-    pub fn next_id(&self) -> i64 {
-        self.id + 1
-    }
-
-    /// Send a JSON-RPC request and return the parsed response object.
-    pub fn call(&mut self, method: &str, params: Value) -> Value {
-        self.id += 1;
-        let line = json!({"jsonrpc": "2.0", "id": self.id, "method": method, "params": params})
-            .to_string();
-        self.raw(&line)
-            .unwrap_or_else(|| panic!("no response to {method}"))
-    }
-
-    /// POST a raw JSON-RPC body verbatim (for malformed-input / envelope checks)
-    /// and return the parsed reply, or `None` for a `202` no-reply (a notification)
-    /// / an empty body.
-    pub fn raw(&mut self, body: &str) -> Option<Value> {
-        // Retry the connect briefly: under the heavily-parallel `--all-features`
-        // CI run this process-heavy served agentd can transiently refuse (a
-        // starved accept queue), which a single `connect` would flake on.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut stream = loop {
-            match TcpStream::connect(&self.addr) {
-                Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(e) => panic!("connect served http {}: {e}", self.addr),
-            }
-        };
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(req.as_bytes()).expect("write request");
-        stream.flush().ok();
-        let mut reader = BufReader::new(stream);
-        // Skip status + headers.
-        loop {
-            let mut l = String::new();
-            if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
-                break;
-            }
-        }
-        let mut payload = String::new();
-        reader.read_to_string(&mut payload).ok();
-        serde_json::from_str(payload.trim()).ok()
-    }
-}
-
-/// Grab a free loopback port (bind :0 then drop). agentd rebinds within ms.
-fn free_loopback_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// Block until `path` exists (a socket has bound), or panic past `timeout`.

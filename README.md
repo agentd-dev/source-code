@@ -6,9 +6,9 @@ runs the agentic loop — think, call a tool, observe, repeat — until the task
 reaches a terminal status or a new event wakes it. Every tool comes from a
 **remote MCP server** over HTTPS (agentd ships none of its own and **never runs
 local code**), it reacts to the world through **MCP resource subscriptions**,
-speaks **A2A** to other agents, and can drive **agent-authored workflows**. It
+speaks **A2A** to other agents, and can drive **durable DAG workflows**. It
 is built to be a cloud-native unit of work — drop it into a `Job`, a `CronJob`,
-or a long-lived reactive `Deployment`.
+or a long-lived A2A `Deployment`.
 
 ```
 binary 3.0 MiB static (musl, FROM scratch) · image ~1.2 MiB pull · cold start <1 ms
@@ -43,19 +43,20 @@ idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · AGPL-3.0
    server** you declare with `--mcp name=https://…`. One protocol in, one
    protocol out — tools and resources are all MCP, and agentd itself is
    addressable as an MCP server.
-3. **Reactivity via resource subscriptions.** Instead of polling, a reactive
-   agentd **idles at near-zero CPU and wakes when an MCP resource it subscribed
-   to changes** (notify-then-read). An upstream change is the trigger; an agent
-   can even subscribe itself mid-reasoning to schedule its own future wake.
+3. **Reactivity via resource subscriptions.** Instead of polling, an agentd with
+   a `subscribe` start node **idles at near-zero CPU and wakes when an MCP
+   resource it subscribed to changes** (notify-then-read). An upstream change is
+   the trigger; a workflow can also schedule its own future wakes (`loop`,
+   `schedule`).
 4. **Two loops, strictly separated.** A tiny **supervisor** owns lifecycle,
    triggers, limits, and the kill ladder — and **never talks to the LLM**. The
    reasoning lives in **subagent child processes** (the same binary, re-exec'd)
    the supervisor can always `SIGKILL`. A runaway or crashing model is contained
    by construction; limits are enforced by a process that cannot be prompted.
-5. **Composability, three ways.** An agentd **serves its own MCP**
-   (`--serve-mcp`), so one agent is just another tool/resource surface a second
-   agent connects to. It **delegates over A2A** (`--a2a-peer`) to remote agents
-   as spec-conformant Tasks. And it **nests subagents** as an OS process tree
+5. **Composability, three ways.** An agentd **serves an A2A endpoint**
+   (`a2a.listen`, RFC 0029), so one agent is just another agent a second one
+   sends messages/commands to. It **delegates over A2A** (`a2a.peers`) to remote
+   agents as spec-conformant Tasks. And it **nests subagents** as an OS process tree
    with narrowed, per-child context and trust. Agents compose like Unix
    processes.
 
@@ -131,86 +132,85 @@ endpoint speaks the OpenAI-compatible wire with native tool-calling; a
 comma-list of endpoints is a failover order. See
 [docs/getting-started.md](docs/getting-started.md).
 
-## Five modes
+## Lifecycle & triggers
+
+agentd 2.0 has **one durable runtime** — no modes. A run is either a one-shot
+**job** or a long-lived **daemon** (`lifecycle.run_until`), and what *triggers*
+runs is a workflow **start node**.
 
 ```console
-# once (default): run to a terminal status, then exit — Job / CLI shape
-$ agentd --instruction "…" --intelligence https://gw.example/v1 --mode once
-
-# loop: re-enter on a cadence until a bound or a drain signal
-$ agentd --instruction "…" --intelligence https://gw.example/v1 \
-    --mode loop --interval 5m --deadline 24h
-
-# reactive: idle, wake on MCP resource changes (requires ≥1 --subscribe)
-$ agentd --instruction "…" --intelligence https://gw.example/v1 \
-    --mcp queue=https://mcp-q.internal/mcp \
-    --mode reactive --subscribe "queue://inbox"
-
-# schedule: built-in interval/cron timer (--features cron for --cron)
-$ agentd --instruction "…" --intelligence https://gw.example/v1 \
-    --mode schedule --cron "0 8 * * *"
-
-# workflow: drive a pinned workflow graph, supervised like any run
-$ agentd --mode workflow --workflow ./pipeline.json \
-    --intelligence https://gw.example/v1 --mcp fs=https://mcp-fs.internal/mcp
+# a job (the quickstart): the --instruction sugar expands to a
+# `once → agent → finish` workflow; run one turn, map the outcome to an exit
+# code, then exit.
+$ agentd --instruction "…" --intelligence https://gw.example/v1
 ```
 
-Reactive extras: `--continue <uri>` routes a subscription into one **warm
-session** (context persists across wakes, tool lists refresh live);
-`--traceparent` continues an upstream W3C trace. See
-[docs/modes-and-triggers.md](docs/modes-and-triggers.md).
+Recurring / reactive shapes are **workflow start nodes** in a
+`config_version: "2"` document (see
+[docs/modes-and-triggers.md](docs/modes-and-triggers.md)):
+
+```yaml
+config_version: "2"
+intelligence: { endpoints: https://gw.example/v1, model: gpt-… }
+store: { kind: mcp, mcp: { server: state } }         # a daemon needs a durable store
+a2a:   { listen: https://0.0.0.0:8443, tls: { cert: …, key: … } }   # the external channel
+workflows:
+  - name: watch
+    steps:
+      s:  { kind: subscribe, server: queue, uri: "queue://inbox" }  # loop|schedule|subscribe|signal|event
+      do: { kind: agent, depends_on: [s], instruction: "Handle the item." }
+      f:  { kind: finish, depends_on: [do] }
+lifecycle: { run_until: drained }                    # a daemon
+```
+
+The 1.x `--mode once|loop|reactive|schedule|workflow` flags (and the flat v1
+schema) were removed; a 1.x configuration is rejected with a migration hint.
+`--traceparent` still continues an upstream W3C trace.
 
 ## Workflows
 
-With `--features workflow`, agentd runs **agent-authored cyclic workflows**: a
-serde-only graph the model authors for itself at runtime (`workflow.define` /
-`workflow.run` self-tools) or an operator pins from a file (`--mode workflow`).
-Deterministic steps cost **zero model tokens** — the graph walker measured at
-~146k steps/sec:
+agentd runs **durable DAG workflows** (RFC 0027, always compiled — no feature
+flag): a declarative graph of `steps` in the `config_version: "2"` document,
+driven by the same reactor over durable state, so a run survives a restart and
+resumes exactly where it died. Deterministic steps (`assign` / `map` / `filter` /
+`switch` / …) cost **zero model tokens**; `agent` / `think` steps run turn
+workers:
 
-```json
-{
-  "start": "fetch",
-  "nodes": {
-    "fetch":  { "kind": "agent", "instruction": "fetch the next item", "writes": "item",
-                "edges": { "ok": "route", "error": "done" } },
-    "route":  { "kind": "branch",
-                "cases": [ { "when": {"op":"eq","key":"item","pointer":"/status","value":"pending"},
-                            "goto": "work" } ],
-                "default": "done" },
-    "work":   { "kind": "tool", "server": "fs", "tool": "process",
-                "args": { "id": { "$from": "item", "pointer": "/id" } },
-                "writes": "item", "edges": { "ok": "fetch", "error": "done" } },
-    "done":   { "kind": "halt", "status": "completed", "result_from": "item" }
-  }
-}
+```yaml
+workflows:
+  - name: process
+    steps:
+      s:     { kind: once }
+      fetch: { kind: agent, depends_on: [s], instruction: "fetch the next item", writes: item }
+      route: { kind: switch, depends_on: [fetch], on: "{{vars.item.status}}",
+               cases: { pending: [work] }, default: [done] }
+      work:  { kind: mcp.tool, depends_on: [route], server: fs, tool: process,
+               args: { id: "{{vars.item.id}}" } }
+      done:  { kind: finish, depends_on: [work] }
 ```
 
-- **Twelve node kinds:** `agent` (a full agentic sub-run), `tool` (direct MCP
-  call), `assign` (pure data shaping), `infer` (schema-checked structured
-  intelligence), `branch` (JSON-pointer predicates + one semantic tier),
-  `foreach` (deterministic fan-out, ≤1024 items, ≤8 parallel lanes),
-  `parallel` (named heterogeneous branches, one result object), `subgraph`
-  (sync or `async: true` → spawned child), `join` (fan-in of async handles),
-  `wait`, `human` (a **human gate**: the served A2A task projects
-  `input-required` and resumes on a spec-native `SendMessage` reply), `halt`.
-- **A blackboard** threads data between nodes (`writes` / `reads` /
-  `{"$from": …}` JSON-pointer references; 1 MiB per-value clamp), with
-  **reducers** (`writes_mode: append|merge|union`) to accumulate instead of
-  overwrite.
-- **Durable state — the MCP checkpointer:** per-superstep envelopes to any MCP
-  server implementing a 3-tool profile; `--workflow-resume` gives crash-resume
-  with budgets carried over, and `@seq` under a new run-id is a fork
-  (time-travel). No database is linked — the store is behind MCP.
-- **Cycles are legal, runaways are not:** layered termination — step budget,
-  shared token pool, wall deadline, per-node visit caps, and a progress guard —
-  each with a distinct `reason` in the result.
-- **Optional CEL** (`--features cel` — the one gated dependency exception):
-  `{"op":"cel"}` predicates, computed `assign.expr`, `infer.check` constraints,
-  and reactive wake conditions. Hermetic, terminating, compile-checked at
-  define time; a non-CEL build rejects CEL graphs fail-closed.
-- **Reactive workflows:** `--mode reactive --workflow` suspends on a `wait`
-  node and resumes on the trigger — a durable, event-driven pipeline.
+- **A rich node catalogue** (RFC 0027 §5): `agent` / `think` (turn workers),
+  `mcp.tool` (direct MCP), data steps (`assign` / `map` / `filter` / `reduce` /
+  `sort` / `parse`), `switch` routing, nested bodies (`foreach` / `batch` with
+  bounded parallelism + `rate` pacing, `iterate`, `parallel`, `race`, `subgraph`),
+  orchestration (`wait` on resource / condition / signal / run / subagent /
+  message / deadline, `join`, child `workflow` runs, `subagent`, `human` gates
+  that project A2A `input-required`, `a2a.delegate`), and `finish`.
+- **Variables + templates** thread data between steps (`writes` /
+  `{{vars.…}}` / `{{steps.x.output}}` / `CEL:` expressions); large step outputs
+  spill to durable artifacts and dereference transparently.
+- **Durable + crash-resumable:** every step's progress is a durable envelope in
+  the remote store (RFC 0025) — a run restores and resumes exactly where it died
+  (proven by the chaos-matrix e2e), with idempotency keys so at-least-once
+  effects run once. No database is linked — the store is behind MCP tools or HTTP.
+- **Triggers are start nodes** (`once` / `loop` / `schedule` / `subscribe` /
+  `signal` / `event` / `manual` / `a2a`) — the recurring/reactive shapes,
+  durable across restarts.
+- **Bounded by construction:** step / token / deadline budgets, concurrency
+  policies (`queue` / `drop` / `replace`), and per-node caps — each terminal
+  with a distinct `status` / `reason`.
+- **Optional CEL** (`--features cel`): `CEL:` step conditions, computed values,
+  and data-step element expressions; a non-CEL build fails those closed.
 
 See [docs/workflows.md](docs/workflows.md).
 
@@ -254,27 +254,33 @@ the embedder obligations (the re-exec dispatch!), and the API-stability tiers:
 
 ## Composition: serving, subagents, A2A
 
-**Serve your agent as MCP** — tools `status` / `subagent.spawn` / `subagent.send`
-/ `subagent.status` / `subagent.cancel`, plus live `agent://` resources
-(`status`, `capabilities`, `inventory`, `intelligence`, `events`, `workflow`,
-`run/<id>`, `config/effective`):
+**Serve your agent over A2A** (RFC 0029, `--features a2a`) — set `a2a.listen` and
+peers call `SendMessage` (natural language → a conversation turn, or a command
+DataPart → a registry action like `status` / `workflow.run` / `config`),
+`GetTask` / `ListTasks` / `CancelTask`, and `SendStreamingMessage` (SSE) on the
+listener, each resolved to a **principal** (mTLS / bearer → `operator` / `user` /
+`agent` / `anonymous`) and authorized against a role matrix, and (optionally)
+audited:
 
-```console
-$ agentd --mode reactive --subscribe "queue://inbox" --instruction "…" \
-    --intelligence https://gw.example/v1 \
-    --serve-mcp https://0.0.0.0:8443 --serve-cert tls.crt --serve-key tls.key \
-    --serve-client-ca clients.crt          # and/or --serve-bearer <token>
+```yaml
+a2a:
+  listen: https://0.0.0.0:8443
+  tls: { cert: tls.crt, key: tls.key, client_ca: clients.crt }   # and/or a bearer:
+  bearer: "{{secret:A2A_BEARER}}"
+  principals:
+    - match: { san: "spiffe://team/*" }
+      role: user
+      grants: [knowledge.*]
 ```
 
-**Delegate over A2A** (`--features a2a`) — a served run *is* a spec-conformant
-A2A Task; peers call `SendMessage` / `GetTask` / `CancelTask` /
-`SendStreamingMessage` (SSE) on the same listener, and an agent delegates
-outward with `--a2a-peer name=https://…` (bearer and/or mTLS client identity):
+**Delegate over A2A** — a workflow `a2a.delegate` step (or a subagent) calls a
+declared peer as a spec-conformant Task:
 
-```console
-$ agentd --instruction "delegate the analysis to the research agent" \
-    --intelligence https://gw.example/v1 \
-    --a2a-peer research=https://research-agent.internal:8443
+```yaml
+a2a:
+  peers:
+    - name: research
+      endpoint: https://research-agent.internal:8443
 ```
 
 **Nest subagents** — a parent spawns a child by re-exec'ing the same binary
@@ -378,11 +384,9 @@ time. A flag whose feature is absent exits `2` loudly — never a silent no-op.
 | Feature | What it adds | Extra deps |
 |---|---|---|
 | `tls` *(default)* | rustls + ring + bundled roots — direct `https://` everywhere | rustls stack |
-| `serve-https` | serve agentd's own MCP over HTTP(S) with mTLS/bearer | — |
-| `a2a` | A2A Task surface + outbound delegation peers | — |
-| `workflow` | agent-authored cyclic workflows (all ten node kinds) | — |
-| `cel` | CEL predicates/expressions in workflows + reactive conditions | `cel-interpreter` (the one exception) |
-| `events` | the `agent://events` live ring resource | — |
+| `a2a` | the A2A v2 HTTPS listener + outbound delegation peers (RFC 0029) | — |
+| `cel` | CEL step conditions / computed values / data-step expressions | `cel-interpreter` (the one exception) |
+| `otel` | OTLP traces + logs export (hand-rolled JSON) | — |
 | `metrics` | hand-written Prometheus text + health endpoints | — |
 | `otel` | hand-rolled OTLP/HTTP span export, GenAI semconv | — |
 | `cron` | 5-field UTC cron scheduling (hand-rolled parser) | — |

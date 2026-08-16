@@ -15,17 +15,17 @@ permissions:
 
 # Release artifacts ship the full cloud-native surface on the HTTPS-everywhere
 # transport (`tls` is a default feature — rustls/ring with bundled roots, so the
-# static binary trusts public CAs with no system bundle): the served self-MCP +
-# A2A control plane over HTTP(S) with mTLS/bearer, /healthz+/readyz+/metrics,
-# UTC-cron, OTLP, horizontal scaling (sharding + work-claim + autoscaling
-# signals), SIGHUP/inotify config hot-reload, agent-authored workflows, and the
+# static binary trusts public CAs with no system bundle): the A2A v2 HTTPS
+# listener with mTLS/bearer principals (RFC 0029), /healthz+/readyz+/metrics,
+# UTC-cron scheduling, OTLP traces+logs, SIGHUP/inotify config hot-reload, and the
 # AAuth [DRAFT] agent-identity client (`--features aauth`). AAuth ships in the
 # artifact because its crypto (`ring`) is ALREADY linked by rustls (the `tls`
 # default) — zero marginal dependency, so the minimalism moat is untouched.
 # CEL (`--features cel`) is the one dependency-BEARING opt-in and stays
-# build-from-source by design (the moat holds in shipped artifacts).
+# build-from-source by design (the moat holds in shipped artifacts). (The 1.x
+# serve-mcp/serve-https/events/cluster/workflow features were removed in 2.0.)
 env:
-  FEATURES: "serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow,aauth"
+  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

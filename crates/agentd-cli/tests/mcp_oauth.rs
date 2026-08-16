@@ -100,3 +100,31 @@ fn client_credentials_fetches_then_caches() {
 
     unsafe { std::env::remove_var("MCP_OAUTH_TEST_SECRET") };
 }
+
+#[test]
+fn oauth_bearer_signer_injects_a_refreshing_authorization_header() {
+    // The RFC 0031 wiring: an `mcp.servers[].oauth` block becomes a transport
+    // `RequestSigner` that fetches + injects `Authorization: Bearer <token>` on
+    // every request — proving OAuth client-credentials is now *live*, not inert.
+    use agentd::mcp::http::RequestSigner;
+    // SAFETY: single-threaded test; unique var name.
+    unsafe { std::env::set_var("MCP_OAUTH_SIGNER_SECRET", "sec") };
+    let (token_url, bodies) = spawn_token_endpoint();
+    let spec = agentd::config::McpOauthSpec {
+        token_url,
+        client_id: "agentd".into(),
+        client_secret: "{{secret:MCP_OAUTH_SIGNER_SECRET}}".into(),
+        scope: None,
+    };
+    let signer = agentd::mcp::oauth::OAuthBearerSigner::new(spec, Duration::from_secs(5));
+
+    let headers = signer.sign("POST", "mcp.example", "/mcp", b"{}");
+    assert_eq!(headers.len(), 1, "exactly the Authorization header");
+    assert_eq!(headers[0].0, "Authorization");
+    assert_eq!(headers[0].1, "Bearer tok-1");
+    // A second request rides the cached token — no second token round-trip.
+    let _ = signer.sign("POST", "mcp.example", "/mcp", b"{}");
+    assert_eq!(bodies.lock().unwrap().len(), 1, "the bearer is cached");
+
+    unsafe { std::env::remove_var("MCP_OAUTH_SIGNER_SECRET") };
+}

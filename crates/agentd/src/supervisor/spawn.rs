@@ -37,6 +37,10 @@ pub struct Subagent {
     /// Set once the reactor has reaped this child — suppresses Drop signalling.
     reaped: bool,
     _reader: JoinHandle<()>,
+    /// The child's own cgroup leaf (`security.cgroup`), held for its lifetime —
+    /// its Drop writes `cgroup.kill` + removes the leaf (the atomic teardown
+    /// backstop). `None` when cgroups are not configured. RFC 0009 §cgroup.
+    _cgroup: Option<crate::supervisor::cgroup::CgroupGuard>,
 }
 
 /// Spawn a subagent that re-execs `exe` (normally `std::env::current_exe()`),
@@ -92,6 +96,12 @@ pub fn spawn(
         }
     };
     let pgid = child.id() as i32;
+    // Place the child in its own cgroup leaf (best-effort; `None` unless
+    // `security.cgroup` armed the parent). The guard is held on the Subagent so
+    // teardown (`cgroup.kill` + rmdir) fires when the child is reaped.
+    let cgroup = crate::supervisor::cgroup::CgroupGuard::for_run().inspect(|g| {
+        g.place(pgid);
+    });
     let mut writer = child
         .stdin
         .take()
@@ -128,6 +138,7 @@ pub fn spawn(
         pgid,
         reaped: false,
         _reader: reader,
+        _cgroup: cgroup,
     })
 }
 

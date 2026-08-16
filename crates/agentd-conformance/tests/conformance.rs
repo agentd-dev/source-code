@@ -25,23 +25,8 @@ fn run_family(name: &str, family: Vec<Check>) {
 }
 
 #[test]
-fn mcp_server_conformance() {
-    run_family("mcp-server", checks::mcp_server::checks());
-}
-
-#[test]
-fn mcp_client_conformance() {
-    run_family("mcp-client", checks::mcp_client::checks());
-}
-
-#[test]
 fn supervisor_conformance() {
     run_family("supervisor", checks::supervisor::checks());
-}
-
-#[test]
-fn agent_loop_conformance() {
-    run_family("agent-loop", checks::agent_loop::checks());
 }
 
 #[test]
@@ -50,6 +35,21 @@ fn security_conformance() {
 }
 
 #[test]
-fn work_claim_conformance() {
-    run_family("work-claim", checks::work_claim::checks());
+fn store_conformance() {
+    run_family("store", checks::store::checks());
+}
+
+#[test]
+fn durability_conformance() {
+    run_family("durability", checks::durability::checks());
+}
+
+#[test]
+fn tools_conformance() {
+    run_family("tools", checks::tools::checks());
+}
+
+#[test]
+fn a2a_conversation_conformance() {
+    run_family("a2a-conversation", checks::a2a_conversation::checks());
 }

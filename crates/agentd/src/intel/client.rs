@@ -21,22 +21,50 @@ use std::fmt;
 use std::time::Duration;
 
 use super::endpoints::EndpointList;
-use super::{anthropic, failover, openai};
+use super::{anthropic, bedrock, failover, openai};
 
 /// Which in-binary adapter speaks to the endpoint. OpenAI-compatible is the
-/// canonical default; anthropic is the only other in-binary dialect. Anything
-/// else lives behind a gateway (RFC 0006 §two-adapters).
+/// canonical default; anthropic and Bedrock Converse (RFC 0031 §8 — native
+/// Bedrock) are the other in-binary dialects. Anything else lives behind a
+/// gateway (RFC 0006 §two-adapters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenAiCompatible,
     Anthropic,
+    /// Amazon Bedrock Converse — the model id rides the URL path, not the body,
+    /// and auth is SigV4 (an `intelligence.auth: {kind: aws}`), not a bearer.
+    Bedrock,
 }
 
 impl Provider {
-    fn default_path(self) -> &'static str {
+    pub(super) fn default_path(self) -> &'static str {
         match self {
             Provider::OpenAiCompatible => openai::DEFAULT_PATH,
             Provider::Anthropic => anthropic::DEFAULT_PATH,
+            Provider::Bedrock => bedrock::DEFAULT_PATH,
+        }
+    }
+
+    /// Map the config `intelligence.dialect` selector to a provider. `None`/empty
+    /// ⇒ the OpenAI-compatible default; an unknown value ⇒ `None` (the caller
+    /// keeps the default — validation rejects it earlier at the config layer).
+    pub fn from_dialect(dialect: Option<&str>) -> Option<Provider> {
+        match dialect.map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("openai") | Some("openai-compatible") => Some(Provider::OpenAiCompatible),
+            Some("anthropic") => Some(Provider::Anthropic),
+            Some("bedrock") => Some(Provider::Bedrock),
+            Some(_) => None,
+        }
+    }
+
+    /// The effective request path for THIS request. Fixed for OpenAI/Anthropic
+    /// (the configured/default path); Bedrock puts the URI-encoded model id in
+    /// the path — `/model/{modelId}/converse` — so the signer and the wire share
+    /// one dynamic target (RFC 0031 §8).
+    pub(super) fn request_path(self, configured: &str, req: &Request) -> String {
+        match self {
+            Provider::Bedrock => bedrock::converse_path(&req.model),
+            _ => configured.to_string(),
         }
     }
 }
@@ -170,6 +198,39 @@ impl IntelClient {
             health_reporter: None,
             last_all_down: std::cell::Cell::new(false),
         })
+    }
+
+    /// Attach the configured `intelligence.headers` (RFC 0031), applied to every
+    /// endpoint dial. Builder-style; call before use. Empty = the legacy path.
+    pub fn with_headers(self, headers: Vec<(String, String)>) -> IntelClient {
+        if !headers.is_empty() {
+            self.list.borrow_mut().set_extra_headers(headers);
+        }
+        self
+    }
+
+    /// Attach a per-request signer (RFC 0031: AWS SigV4), applied to every dial.
+    /// Builder-style; call before use.
+    pub fn with_signer(
+        self,
+        signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
+    ) -> IntelClient {
+        if let Some(s) = signer {
+            self.list.borrow_mut().set_signer(s);
+        }
+        self
+    }
+
+    /// Select the wire dialect (RFC 0031 §8 — `intelligence.dialect`), applied to
+    /// every endpoint. `None` keeps the OpenAI-compatible default. Builder-style;
+    /// call before use.
+    pub fn with_dialect(self, dialect: Option<&str>) -> IntelClient {
+        if let Some(p) = Provider::from_dialect(dialect)
+            && p != Provider::OpenAiCompatible
+        {
+            self.list.borrow_mut().set_provider(p);
+        }
+        self
     }
 
     /// Install the edge-triggered all-down reachability reporter (RFC 0018 §6): the

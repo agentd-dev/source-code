@@ -1,97 +1,71 @@
 # Deploying agentd
 
-`agentd` is one binary that runs **one agent**. An external scheduler starts,
-stops, replicates, and watches it; the binary itself owns no control plane
-(RFC 0011 §1). This page is a set of deployment recipes for the v1 target:
+`agentd` 2.0 is one binary that runs **one durable agent**. An external scheduler
+starts, stops, replicates, and watches it; the binary owns no control plane
+(RFC 0011 §1). This page is a set of deployment recipes:
 
-1. [Standalone CLI — one-shot](#1-standalone-cli--one-shot)
-2. [Long-lived reactive daemon](#2-long-lived-reactive-daemon)
+1. [Standalone CLI — one-shot job](#1-standalone-cli--one-shot)
+2. [Long-lived A2A daemon](#2-long-lived-reactive-daemon)
 3. [Container — minimal scratch/distroless image](#3-container--minimal-scratchdistroless-image)
 4. [Scheduled by an external orchestrator (Kubernetes)](#4-scheduled-by-an-external-orchestrator-kubernetes)
 
-The same supervisor loop backs every shape; they differ only in the **exit
-predicate** — and therefore in which exit codes are reachable (RFC 0011 §7). A
-unit of work (`once`) goes empty-and-final and exits; a reactive daemon
-(`reactive`) idles on a subscription stream and exits only on signal or a fatal
-class.
+The **same durable runtime** backs every shape (RFC 0026); they differ only in the
+lifecycle shape (`lifecycle.run_until`) and what triggers runs. A one-shot **job**
+goes empty-and-final and exits, mapping its outcome to the exit-code table
+(RFC 0011 §7); a **daemon** idles on its triggers (an A2A listener, a `subscribe` /
+`schedule` / `loop` start node) and exits only on a SIGTERM drain.
 
-> **Build status.** The runtime is implemented — config precedence +
-> validate-at-startup (exit `2`), the agentic loop, the supervisor + subagent
-> process tree, the MCP client, all five run modes (`once`/`loop`/`reactive`/
-> `schedule`/`workflow`), reactive routing, and the served self-MCP all ship. The examples
-> below describe real behaviour.
-
-Every flag and env var on this page is taken verbatim from
-[`crates/agentd/src/config.rs`](../crates/agentd/src/config.rs) (`agentd --help`).
-If a flag is not in `--help`, it does not exist. See
-[`configuration.md`](configuration.md) for the **complete** flag/env reference,
-the config-file schema, and the reloadable-vs-restart-only partition.
+> **agentd 2.0.** Configuration is the nested `config_version: "2"` document (see
+> [`configuration.md`](configuration.md)); the 1.x flat schema and the `--mode` /
+> `--serve-mcp` / `--shard` / `--claim` flags were **removed** in the mode
+> cut-over. The examples below use v2 config files.
 
 ---
 
 ## The config surface you will actually use
 
-Precedence, top wins: **built-in default < config file < env var < CLI flag**.
-The config file (`--config`/`AGENT_CONFIG`) is **live** (RFC 0017) — a local JSON
-document for structural config (MCP inventory, subscriptions, limits, the
-intelligence endpoint list + headers). Everything else is env-settable;
-**secrets are env/flag/mounted-file only, never inline in the config file**
-(RFC 0011 §3.2; the file may carry `{{secret:NAME}}` / `{{secret-file:PATH}}`
-*references*).
+Configuration is a `config_version: "2"` document (`--config` / `AGENT_CONFIG`,
+YAML or JSON, repeatable + merged). **Every path in the schema is also an env var
+and a flag** (`limits.run.max_steps` ⇒ `AGENTD_LIMITS_RUN_MAX_STEPS` /
+`--limits.run.max-steps`), so a container overrides at deploy time without editing
+the file. Precedence, top wins: **built-in default < config file < env < flag**.
+Secrets are **references** only (`{{secret:NAME}}` / `{{secret-file:PATH}}`),
+resolved from env / mounted files — never inline values.
 
-| Concern | Env | Flag |
+| Concern | Section / path | Legacy alias |
 |---|---|---|
-| Instruction | `INSTRUCTION` | `--instruction <TEXT>` / `--instruction-file <PATH>` |
-| Config file | `AGENT_CONFIG` | `--config <PATH>` |
-| Intelligence list | `AGENT_INTELLIGENCE` | `--intelligence https://…` (loopback `http://` for dev; comma-list = failover) |
-| Intelligence creds | `AGENT_INTELLIGENCE_TOKEN` / `…_FILE`, `…_<N>` / `…_<N>_FILE` | `--intelligence-token <T>` / `--intelligence-token-file <PATH>` |
-| Model / swap policy | `AGENT_MODEL` / `AGENT_MODEL_SWAP` | `--model <NAME>` / `--model-swap finish-on-old│restart-turn` |
-| MCP server | — | `--mcp name=<endpoint>` (repeatable; remote Streamable HTTP) |
-| Serve self-MCP | `AGENT_SERVE_MCP` | `--serve-mcp https://host:port` + `--serve-cert`/`--serve-key`/`--serve-client-ca` or `--serve-bearer` (`serve-https` feat.) |
-| A2A peer | `AGENT_A2A_PEER` | `--a2a-peer name=https://endpoint` (repeatable; `a2a` feat.) |
-| Run-graph | `AGENT_WORKFLOW` | `--workflow <FILE>` with `--mode workflow` (`workflow` feat.) |
-| Mode | `AGENT_MODE` | `--mode once│loop│reactive│schedule│workflow` |
-| Subscriptions | — | `--subscribe <uri>` / `--continue <uri>` (repeatable; reactive) |
-| Interval / cron | `AGENT_CRON` | `--interval <dur>` / `--cron <5-field>` (`cron` feat.) |
-| **Sharding** | `AGENT_SHARD`, `AGENT_SHARD_TIMER` | `--shard K/N` (`cluster` feat.) |
-| **Work-claim** | `AGENT_CLAIM_TTL`, `AGENT_CLAIM_RENEW_FRACTION` | `--claim <uri>=<srv>[:tool]`, `--claim-ttl`, `--claim-renew-fraction` (`cluster` feat.) |
-| **Standby** | `AGENT_STANDBY`, `AGENT_ASSIGN_FROM`, `AGENT_WARM_INTEL` | `--standby`, `--assign-from <srv>:<uri>` (`cluster` feat.) |
-| Max steps | `AGENT_MAX_STEPS` | `--max-steps <N>` (default 50) |
-| Max tokens | `AGENT_MAX_TOKENS` | `--max-tokens <N>` (default 200000) |
-| Deadline | `AGENT_DEADLINE` | `--deadline <dur>` (default 600s) |
-| Max depth | — | `--max-depth <N>` (default 4) |
-| **Run ID** | `AGENT_RUN_ID` | `--run-id <ID>` (idempotency key) |
-| Log level | `AGENT_LOG_LEVEL` | `--log-level trace│debug│info│warn│error` |
-| Log content | `AGENT_LOG_CONTENT` | `--log-content` |
-| **Drain timeout** | `AGENT_DRAIN_TIMEOUT` | `--drain-timeout <dur>` (default 25s) |
-| Health file | — | `--health-file <PATH>` |
-| Metrics/probes | `AGENT_METRICS_ADDR` | `--metrics-addr host:port` (`metrics` feat.) |
-| Per-run cgroup | `AGENT_CGROUP` / `…_MEMORY_MAX` / `…_PIDS_MAX` | `--cgroup auto│PATH`, `--cgroup-memory-max`, `--cgroup-pids-max` |
-| Report / events | `AGENT_REPORT_FILE`, `AGENT_EVENTS_RING` | `--report-file <PATH>`, `--events-ring <N>` |
-| **Hot reload** | `AGENT_WATCH_CONFIG` | `--watch-config` (`config-watch` feat.) + SIGHUP (`hot-reload` feat.) |
+| Instruction | `agent.instruction` (text or a resource URI) | `--instruction` / `--instruction-file` |
+| Intelligence | `intelligence.endpoints` (ordered failover), `.model`, `.token` | `--intelligence` / `--model` / `--intelligence-token` |
+| Token budget | `intelligence.budget.windows` (rate-limit the burn, RFC 0025) | — |
+| MCP servers | `mcp.servers: [{name, endpoint}]` | `--mcp name=<endpoint>` |
+| Durable store | `store.kind: mcp\|http\|memory`, `store.mcp.server` | — |
+| **A2A listener** | `a2a.listen`, `a2a.tls`, `a2a.principals`, `a2a.bearer` | — |
+| **A2A peers** | `a2a.peers: [{name, endpoint}]` | — |
+| Workflows / triggers | `workflows: [{name, steps}]` (start nodes: once/loop/schedule/subscribe/signal/event/a2a) | — |
+| Limits | `limits.max_runs`, `limits.run.{max_steps,max_tokens,deadline}`, `limits.subagents.max_depth` | `--max-steps` / `--deadline` |
+| Lifecycle | `lifecycle.run_until` (idle\|drained\|auto), `lifecycle.drain_timeout` | `--drain-timeout` |
+| Run ID | `lifecycle.run_id` (idempotency key) | `--run-id` |
+| Observability | `observability.log_level`, `.health_file`, `.metrics_addr`, `.audit`, `.otel` | `--log-level` |
+| Security | `security.tls_ca`, `security.aauth`, `security.cgroup.{spec,memory_max,pids_max}` | — |
 
-Durations accept `ms`/`s`/`m`/`h` or a bare integer (seconds): `600s`, `5m`,
-`2h`, `250ms`, `30`. Each intelligence list element must be `https://host/…` (or a
-**loopback** `http://` for a same-host dev gateway); the same https-only rule holds
-for `--mcp`, `--serve-mcp`, and `--a2a-peer`. Config is validated **before any side
-effect** — a typo'd flag, a feature-gated flag in a build without its feature, or an
-unresolvable secret reference exits `2` in milliseconds, not after an LLM round-trip.
+Durations accept `ms`/`s`/`m`/`h` or a bare integer (seconds). Each intelligence /
+MCP endpoint must be `https://…` (or loopback `http://` for a same-host dev
+gateway). Config is validated **before any side effect**:
+`agentd --validate-config` (exit 2 on error), `agentd --config-schema=2` (the
+machine-readable schema), `agentd --capabilities` (the effective surface).
 
-> **Scope markers.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions;
-> self-MCP serving is over HTTP(S) with mTLS/bearer auth (loopback `http://` for
-> dev); MCP tasks/sampling/roots are deferred (RFC 0013). The
-> `cluster` work-claim `:resource` style is a stub (`:tool` is the working
-> style), and `AGENT_WARM_INTEL` is forward-compat only — see
-> [`configuration.md`](configuration.md) §13. Items below are tagged where they
-> do not ship.
+> **Scope markers.** The external channel is **A2A** (`a2a.listen`, RFC 0029) —
+> the v1 self-MCP server and the `cluster` sharding/work-claim path were removed.
+> MCP tasks/sampling/roots are deferred (RFC 0013).
 
 ---
 
 ## 1. Standalone CLI — one-shot
 
-The default mode (`--mode once`, the default). Run an instruction to a terminal
-status, emit the result on **stdout**, write telemetry to **stderr**, exit with
-a code from the [exit-code table](#the-exit-code-contract).
+A **job** (the default, `lifecycle.run_until: auto` with no listener). Run an
+instruction to a terminal status, emit the result on **stdout**, write telemetry
+to **stderr**, exit with a code from the
+[exit-code table](#the-exit-code-contract).
 
 ```bash
 agentd \
@@ -142,33 +116,41 @@ construction.
 
 ---
 
-## 2. Long-lived reactive daemon
+## 2. Long-lived daemon (A2A + reactive triggers)
 
-`--mode reactive` idles cheaply and wakes on MCP **resource subscription**
-updates (RFC 0008). It exits only on a signal or a fatal class — never on an
-individual reaction failing.
+A **daemon** (`lifecycle.run_until: drained`) idles cheaply and wakes on its
+triggers — an A2A message/command, or a `subscribe` / `schedule` / `loop` start
+node. It exits only on a SIGTERM drain, never on an individual run failing. A
+daemon needs a **durable store** (RFC 0025) so state survives a restart.
 
+```yaml
+# /etc/agentd/triage.yaml
+config_version: "2"
+agent: { instruction: "When a ticket is filed, triage it and assign an owner." }
+intelligence: { endpoints: https://gw.example/v1, model: my-model }
+mcp:
+  servers:
+    - { name: tickets, endpoint: https://mcp-tickets.internal/mcp }
+    - { name: state,   endpoint: https://mcp-state.internal/mcp }
+store: { kind: mcp, mcp: { server: state } }
+a2a:   { listen: https://0.0.0.0:8443, tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/ca.pem } }
+workflows:
+  - name: triage
+    steps:
+      s: { kind: subscribe, server: tickets, uri: "tickets://queue/inbound" }
+      t: { kind: agent, depends_on: [s], instruction: "Triage the new ticket." }
+      f: { kind: finish, depends_on: [t] }
+lifecycle: { run_until: drained, drain_timeout: 25s }
+observability: { health_file: /run/agent/health }
+```
 ```bash
-agentd \
-  --mode reactive \
-  --instruction "When a ticket is filed, triage it and assign an owner." \
-  --intelligence https://gw.example/v1 \
-  --model my-model \
-  --mcp tickets=https://mcp-tickets.internal/mcp \
-  --subscribe "tickets://queue/inbound" \
-  --drain-timeout 25s \
-  --health-file /run/agent/health
+agentd --config /etc/agentd/triage.yaml
 ```
 
-`--mode reactive` **requires at least one `--subscribe <uri>`** (validated;
-omitting it exits `2`). On restart the daemon re-reads config, re-handshakes
-MCP, re-subscribes every declared subscription, and does a mandatory
-read-after-subscribe so a change that happened while it was down is still acted
-on (RFC 0003 §3.11). No persistence layer — a restart is a cold start that
-reconciles.
-
-> Reactivity rides the MCP servers' **Streamable-HTTP** subscriptions: the client
-> subscribes and processes pushed `notifications/resources/updated` over HTTP/SSE.
+On restart the daemon **restores its durable state** (runs, timers, subscriptions,
+inbox), re-handshakes MCP, re-subscribes, and does a read-after-subscribe so a
+change that happened while it was down is still acted on. A `subscribe` trigger
+is notify-then-read over the MCP servers' **Streamable-HTTP** subscriptions.
 
 ### Graceful shutdown
 
@@ -198,16 +180,9 @@ Description=agent ticket triage (reactive)
 After=network.target
 
 [Service]
-Environment=AGENT_INTELLIGENCE=https://gw.example/v1
-Environment=AGENT_INTELLIGENCE_TOKEN=
-EnvironmentFile=/etc/agentd/triage.env
-ExecStart=/usr/local/bin/agentd \
-  --mode reactive \
-  --instruction-file /etc/agentd/triage.txt \
-  --mcp tickets=https://mcp-tickets.internal/mcp \
-  --subscribe tickets://queue/inbound \
-  --drain-timeout 25s
-# Give the drain room: must exceed AGENT_DRAIN_TIMEOUT.
+EnvironmentFile=/etc/agentd/triage.env       # e.g. AGENT_INTELLIGENCE_TOKEN=…
+ExecStart=/usr/local/bin/agentd --config /etc/agentd/triage.yaml
+# Give the drain room: must exceed lifecycle.drain_timeout.
 TimeoutStopSec=30
 KillSignal=SIGTERM
 Restart=on-failure
@@ -229,27 +204,27 @@ toolchain, and **no built-in tools** — so the image is tiny (~1.3 MB on
 `PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
 own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
 
-The published image (`Dockerfile` at the repo root) ships the **dependency-free
-cloud-native feature set** by default —
-`FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch"`. Every
-one is hand-rolled and adds **no** dependency (serde/serde_json + libc only, 3
-deps; no async runtime, no TLS, no C toolchain), so the binary stays the
-minimalism target. What each adds:
+The published image (`Dockerfile` at the repo root) ships the **cloud-native
+feature set** by default —
+`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch"`. All but `a2a`
+(which pulls the TLS stack for the HTTPS listener) are hand-rolled and
+dependency-free (serde/serde_json + libc + the two workspace crates), so the
+binary stays the minimalism target. What each adds:
 
 | Feature | Adds |
 |---|---|
-| `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`--metrics-addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
-| `serve-mcp` | agentd serving its own MCP (`--serve-mcp`) so other agents compose with it; also the substrate for `events`/`a2a`/the capacity surface. |
-| `cron` | UTC 5-field cron scheduling for `--mode schedule` (`--cron`). |
-| `otel` | OTLP-over-HTTP/JSON span export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
-| `cluster` | Horizontal scaling: `--shard K/N` partitioning, work-claim leases (`--claim`), standby pools (`--standby`/`--assign-from`), the autoscaling signal set, and the `agent://capacity` read surface. |
-| `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a reactive quiesce boundary. |
-| `config-watch` | The `inotify` file-watch reload trigger (`--watch-config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
+| `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`observability.metrics_addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
+| `a2a` | The A2A v2 HTTPS listener (`a2a.listen`, RFC 0029) — the external channel + outbound delegation peers. Pulls the TLS stack. |
+| `cron` | UTC 5-field cron scheduling for the `schedule` start node. |
+| `otel` | OTLP-over-HTTP/JSON trace + log export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
+| `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a quiesce boundary. |
+| `config-watch` | The `inotify` file-watch reload trigger (`lifecycle.watch_config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
 
 Build a narrower (or wider) surface with `--build-arg FEATURES=…`. `tls` is in the
-**default** set (it is the transport — every network surface is HTTPS); the served
-self-MCP is `serve-https`, and `events`/`a2a` ride it. `--no-default-features` drops
-TLS for the loopback-`http://`-to-a-sidecar posture.
+**default** set (it is the transport — every network surface is HTTPS); `a2a`
+rides it. `--no-default-features` drops TLS for the loopback-`http://`-to-a-sidecar
+posture. (The 1.x `serve-mcp` / `serve-https` / `events` / `cluster` / `workflow`
+features were removed with the mode cut-over.)
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -316,17 +291,15 @@ Two options, both live:
   an exec-style probe can `test` its freshness. Useful where you do not want an
   HTTP listener at all.
 
-`/healthz` returns 200 while the **supervisor** tick is fresh and 503 once it
-goes stale; `/readyz` flips to not-ready on drain so the pod leaves rotation. An
-idle reactive agentd is healthy — liveness tracks the supervisor, not whether work
-is flowing.
+`/healthz` returns 200 while the **runtime** tick is fresh and 503 once it goes
+stale; `/readyz` flips to not-ready on drain so the pod leaves rotation. An idle
+daemon is healthy — liveness tracks the runtime, not whether work is flowing.
 
-> **Self-MCP scope.** `--serve-mcp` lets other agents compose with this one over
-> **HTTP(S)** (`serve-https` feature), with trust minted per request by mTLS or a
-> bearer token — never by the transport; a non-loopback bind must authenticate. The
-> same listener carries the management transport and (with `--features a2a`) the A2A
-> method surface — see [the management transport](#management-over-https--a-node-agent)
-> below.
+> **External channel.** The way other agents (and operators) reach this one is
+> **A2A** (`a2a.listen`, `--features a2a`, RFC 0029) — an HTTPS listener with
+> trust minted per request by mTLS or a bearer token, resolved to a **principal**
+> and authorized against a role matrix; a non-loopback bind must authenticate.
+> The 1.x self-MCP server was removed.
 
 ---
 
@@ -387,8 +360,9 @@ spec:
 
 ### 4a. Job — run once
 
-`--mode once`; the Job runs to a terminal status and exits. Use
-`podFailurePolicy` to turn the exit-code table into retry decisions:
+A **job** (the default lifecycle — no `--mode` in 2.0); it runs to a terminal
+status and exits. Use `podFailurePolicy` to turn the exit-code table into retry
+decisions:
 
 ```yaml
 apiVersion: batch/v1
@@ -410,14 +384,12 @@ spec:
       containers:
         - name: agent
           image: ghcr.io/example/agent:1.0.0
-          args:
-            - --mode=once
+          args:                          # a bare instruction = a `once` job
             - --instruction-file=/etc/agentd/task.txt
             - --intelligence=https://gw.example/v1
-            - --drain-timeout=25s
           env:
             - { name: AGENT_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
-            - { name: AGENT_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
+            - { name: AGENT_LIFECYCLE_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
 ```
 
 Pin `AGENT_RUN_ID` to a stable per-unit-of-work value (e.g. derived from the
@@ -425,9 +397,9 @@ Job name) so retries dedupe through your MCP backing services.
 
 ### 4b. CronJob — on a schedule
 
-Prefer an **external** `CronJob` firing `--mode once` per tick over the internal
-`--mode schedule`/`--interval` — it is more robust, observable, and 12-factor
-(RFC 0011 §9). agentd's internal scheduler is a standalone convenience, not a
+Prefer an **external** `CronJob` firing a `once` job per tick over an in-agent
+`schedule` start node — it is more robust, observable, and 12-factor (RFC 0011
+§9). agentd's internal `schedule` node is a standalone convenience, not a
 calendar (no DST/missed-tick catch-up; UTC).
 
 ```yaml
@@ -448,16 +420,15 @@ spec:
             - name: agent
               image: ghcr.io/example/agent:1.0.0
               args:
-                - --mode=once
                 - --instruction-file=/etc/agentd/nightly.txt
                 - --intelligence=https://gw.example/v1
-                - --drain-timeout=25s
 ```
 
-### 4c. Deployment — reactive daemon
+### 4c. Deployment — a long-lived daemon
 
-`--mode reactive`. A long-lived Pod that idles on subscriptions and survives
-rolls cleanly because a clean drain exits `0`.
+A long-lived Pod (`lifecycle.run_until: drained`) that idles on its triggers (an
+A2A listener, a `subscribe` start node) and survives rolls cleanly because a
+clean drain exits `0`. It mounts a v2 config (see §2, incl. a durable `store`).
 
 ```yaml
 apiVersion: apps/v1
@@ -475,12 +446,7 @@ spec:
         - name: agent
           image: ghcr.io/example/agent:1.0.0
           args:
-            - --mode=reactive
-            - --instruction-file=/etc/agentd/triage.txt
-            - --intelligence=https://gw.example/v1
-            - --subscribe=tickets://queue/inbound
-            - --drain-timeout=25s
-            - --health-file=/run/agent/health
+            - --config=/etc/agentd/triage.yaml   # the §2 daemon config (store + subscribe workflow)
           livenessProbe:
             # The reactor heartbeats the health file; a wedged reactor goes stale.
             exec: { command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/agent/health) )) -lt 30"] }
@@ -497,62 +463,20 @@ liveness (RFC 0003 §3.4, RFC 0010). Set `resources.limits.memory` deliberately:
 aggregate subtree memory is a cgroup/pod concern, not enforced in-binary, so an
 OOM surfaces as `137` and means "raise the limit" (RFC 0003 §3.8).
 
-### 4d. StatefulSet — a sharded reactive fleet (`cluster` feature)
+### 4d. StatefulSet — a fleet (client-side sharding removed in 2.0)
 
-To process a shared workload across N replicas without duplicating it, run a
-**sharded fleet** (RFC 0019; needs an image built with `--features cluster`). The
-idiom maps a **StatefulSet pod ordinal → `AGENT_SHARD=K/N`**: each pod owns shard
-`K` of `N`, and `replicas` is `N`. The ordinal is in the pod's hostname
-(`agent-shard-0`, `-1`, …), so the container derives `K` from it; agentctl
-injects `AGENT_SHARD` the same way. Shard identity is **restart-only** — a
-reload never changes it (a re-shard is a rolling restart).
-
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: agent-shard
-spec:
-  serviceName: agent-shard
-  replicas: 8                       # == N (the shard count)
-  selector: { matchLabels: { app: agent-shard } }
-  template:
-    metadata: { labels: { app: agent-shard } }
-    spec:
-      terminationGracePeriodSeconds: 30   # > --drain-timeout
-      containers:
-        - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.0.0   # built with `cluster`
-          # Derive K from the StatefulSet ordinal (the trailing -N of the hostname)
-          # and export AGENT_SHARD=K/8 before exec'ing agent.
-          command: ["/bin/sh", "-c"]   # use a shell image, or bake this into an entrypoint
-          args:
-            - |
-              K="${HOSTNAME##*-}"
-              exec /agentd --mode reactive \
-                --instruction-file /etc/agentd/task.txt \
-                --intelligence https://gw.example/v1 \
-                --subscribe tickets://queue/inbound \
-                --metrics-addr :9090 --drain-timeout 25s
-          env:
-            - name: AGENT_SHARD
-              value: "0/8"            # overwritten below from the ordinal…
-          # …or, on the scratch image (no shell), set AGENT_SHARD directly per
-          # pod via a small admission/operator that reads the ordinal. The shard
-          # gate is the only sharding wiring agentd needs.
-```
-
-Because shard ownership is a pure FNV-1a gate over the resource URI/key, the
-replicas are share-nothing: each independently subscribes to the full set and
-**processes only the items hashing to its shard**. For at-most-once processing of
-an item that more than one replica could see, layer **work-claim** on top
-(`--claim <uri>=<coord-server>`, [`configuration.md`](configuration.md) §13) so a
-lease — not just the hash — decides ownership. `AGENT_SHARD_TIMER` (`shard0` |
-`keyed`) controls timer firing for a sharded `schedule`/`loop` fleet.
+> The 1.x `cluster` feature — `--shard K/N` hash partitioning, work-claim leases,
+> and standby pools (RFC 0019) — was **removed** in the mode cut-over. In 2.0,
+> scale by running multiple daemon replicas that coordinate through their
+> **durable store** — each work item is a durable entity with CAS, so two workers
+> cannot both commit it (RFC 0025 §3.4) — and the **A2A** channel, rather than a
+> client-side shard gate. A `StatefulSet` (stable identity, a distinct
+> `lifecycle.run_id` per ordinal) is still the right shape for a fleet of stateful
+> daemons; give each the same `--config` and let the store arbitrate ownership.
 
 ### 4e. Hot reload via a ConfigMap (`hot-reload` / `config-watch` features)
 
-A reactive daemon can apply a new **structural** config without a restart
+A daemon can apply a new **reloadable** config subset without a restart
 (RFC 0017 §5; see [`configuration.md`](configuration.md) §11 for the
 reloadable-vs-restart-only partition). Mount the config file from a ConfigMap and
 either send `SIGHUP` or run `--watch-config`:

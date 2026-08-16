@@ -40,6 +40,10 @@ pub enum Category {
     /// A2A conversations (RFC 0029): the JSON-RPC surface — command DataParts,
     /// natural-language turns landing as task artifacts, GetTask/ListTasks, card.
     A2aConversation,
+    /// The display-client interface (RFC 0032): the default-OFF gate, the
+    /// SubscribeToEvents feed (hello + ring replay), and the human-in-the-loop
+    /// gate round-trip.
+    Interface,
 }
 
 impl Category {
@@ -51,6 +55,7 @@ impl Category {
             Category::Durability => "durability",
             Category::Tools => "tools",
             Category::A2aConversation => "a2a-conversation",
+            Category::Interface => "interface",
         }
     }
 }
@@ -136,5 +141,6 @@ pub fn all_checks() -> Vec<Check> {
     v.extend(checks::durability::checks());
     v.extend(checks::tools::checks());
     v.extend(checks::a2a_conversation::checks());
+    v.extend(checks::interface::checks());
     v
 }

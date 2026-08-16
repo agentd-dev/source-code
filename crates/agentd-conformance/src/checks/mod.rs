@@ -10,6 +10,7 @@
 
 pub mod a2a_conversation;
 pub mod durability;
+pub mod interface;
 pub mod security;
 pub mod store;
 pub mod supervisor;

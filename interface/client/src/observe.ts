@@ -50,6 +50,36 @@ export class Observation {
     const [status, tasks] = await Promise.all([this.client.status(), this.client.listTasks()]);
     this.mirror.bootstrap(status);
     this.mirror.adoptTasks(tasks);
+    void this.backfill();
+  }
+
+  /**
+   * One-shot transcript hydration at attach (debug daemons only): read the
+   * most recently updated conversation's stored history so the operator
+   * doesn't start from a blank screen. Best-effort — a non-debug daemon
+   * simply refuses the read.
+   */
+  private backfilled = false;
+  private async backfill(): Promise<void> {
+    if (this.backfilled) return;
+    this.backfilled = true;
+    const s = this.mirror.getState();
+    if (!s.info?.debug || s.transcript.length > 0 || s.conversations.size === 0) return;
+    const newest = [...s.conversations.values()]
+      .map((c) => c as { id?: string; updated?: number; kind?: string })
+      .filter((c) => typeof c.id === 'string' && c.kind !== 'root')
+      .sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))[0];
+    if (!newest?.id) return;
+    try {
+      const conv = (await this.client.conversationGet(newest.id, 100)) as {
+        messages?: unknown[];
+      } | null;
+      if (Array.isArray(conv?.messages)) {
+        this.mirror.backfillTranscript(newest.id, conv.messages as never[]);
+      }
+    } catch {
+      /* debug off / not owner — start blank */
+    }
   }
 
   private async run(): Promise<void> {

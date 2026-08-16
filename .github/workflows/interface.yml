@@ -35,11 +35,13 @@ jobs:
           cache-dependency-path: interface/package-lock.json
       - run: npm ci
         working-directory: interface
+      # Build FIRST: the TUI/UI resolve `@agentd/client` through its published
+      # `dist/` types, which do not exist on a fresh checkout.
+      - run: npm run build
+        working-directory: interface
       - run: npm run typecheck
         working-directory: interface
       - run: npm test
-        working-directory: interface
-      - run: npm run build
         working-directory: interface
 
   # The TS client against the REAL daemon (the interface contract end to end).

@@ -1,0 +1,34 @@
+{
+  "name": "@agentd/tui",
+  "version": "0.1.0",
+  "description": "The agentd terminal UI (Ink): a thin display client over the A2A interface surface — agentd hosts the state, this renders it.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "agentd-tui": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('fs');const p='dist/cli.js';fs.writeFileSync(p,'#!/usr/bin/env node\\n'+fs.readFileSync(p));fs.chmodSync(p,0o755)\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@agentd/client": "0.1.0",
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

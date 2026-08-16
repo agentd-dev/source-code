@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agentd</title>
+    <link rel="stylesheet" href="./style.css" />
+    <!-- serve.mjs injects window.AGENTD_DEFAULTS here when serving locally -->
+    <script src="./config.js" onerror="window.AGENTD_DEFAULTS={}"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

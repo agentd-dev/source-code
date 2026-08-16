@@ -101,6 +101,8 @@ impl Runtime {
         match self.execute_tool(&caller, name, args) {
             ToolOutcome::Ready(v, err) => self.reply_tool(node, id, v, err),
             ToolOutcome::Deferred(kind) => {
+                // The unit is parked on a wait, not thinking (RFC 0032 §17).
+                self.activity_park(node, name);
                 self.pending.push(PendingTool {
                     target: Target::Child(node, id),
                     name: name.to_string(),

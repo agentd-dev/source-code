@@ -107,6 +107,11 @@ Both clients speak the same surface:
     to address that conversation. Inline `#…` is plain text.
   - `$` — **live values**: `$model $instance $version $turns $tokens $tasks`
     interpolate daemon state into your message; `$$` escapes a dollar.
+- **The working row** — while the agent is busy you see *what it is doing*,
+  live: `⣾ thinking · 12s · 1.2k tok · round 2`, `⣾ read_file · 3s · 1.2k tok`,
+  `⣾ waiting · subagent · 40s`. The daemon reports phase/tool/round/tokens on
+  change; elapsed ticks in the client, so a long think costs no traffic. (This
+  is deliberately not token-by-token streaming — see RFC 0032 §17/§19.)
 - **Tasks** — every task your principal may see, live states, cancel.
 - **Approvals & questions (human-in-the-loop)** — when the agent (or a
   workflow's `human` step) needs you, the transcript shows the question as an

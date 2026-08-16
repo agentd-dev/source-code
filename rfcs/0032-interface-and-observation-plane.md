@@ -97,6 +97,7 @@ Kinds and sources:
 | `lifecycle` | `{draining?, paused?, reason}` | all | drain; `a2a.pause`/`a2a.resume` |
 | `config` | `{path, value}` | operator | a runtime `config.set` (§14) — every attached client re-shapes live |
 | `pairing` | `{paired, sessions}` | operator | a client paired (§13) |
+| `activity` / `activity.removed` | the unit's live activity | owner (unbound: operator) | §17 — change-triggered only |
 | `audit` | the audit record | operator, **debug only** | every audited action — except the taskless interface reads, which would feed-loop their own polling |
 
 The reply to a prompt is not a special frame: it arrives as the task's
@@ -302,7 +303,36 @@ times out unanswered (default ask timeout 24 h, per-ask `timeout` arg):
 a day; `auto`'s marking exists because a judge's guess must never be mistaken
 for a human decision.
 
-## 17. Bounds & failure modes
+## 17. Live activity (the working row)
+
+What the agent is doing *right now*, for the clients' working row:
+`thinking · 12s · 1.2k tok · round 2` / `read_file · 3s · 1.2k tok` /
+`waiting · subagent · 40s`.
+
+The turn worker already reported coarse progress upward (`AgentMsg::Event`);
+the supervisor dropped those frames. It now folds them into a per-unit
+**activity** record — phase (`thinking` | `tool` | `waiting`), current tool,
+round, tokens spent, `started_ms` — published as `activity` /
+`activity.removed` feed events and mirrored in `status.activity` for the
+poll-fallback path. Sources: the child's `turn.think` / `turn.round` (carrying
+that round's usage) / `turn.tool` (the ONLY signal that names an MCP tool —
+the supervisor never sees those calls, the child holds its own connections),
+plus a supervisor-side park when a tool defers (sleep, subagent, human gate).
+
+Two properties make this cheap where token streaming would not be:
+
+1. **Change-triggered.** An event is emitted only when something an operator
+   would notice changes — phase, tool, round. Token-only updates are silent.
+2. **Elapsed is never streamed.** The record carries `started_ms` and clients
+   tick their own clock, so a five-minute think emits *nothing*.
+
+A turn therefore produces a handful of activity events, not one per second —
+the feed's replay ring stays a record of state, which is exactly the property
+a token stream would have destroyed (RFC 0032 §18). Activity is ephemeral and
+operator/owner-scoped: it is never persisted, never an artifact, and the
+task's terminal artifact remains the only truth about the reply.
+
+## 18. Bounds & failure modes
 
 - The feed ring holds 1024 events; overrun evicts oldest and `hello.resync`
   tells a stale cursor to re-bootstrap. Feed frames stop early when the peer
@@ -315,11 +345,18 @@ for a human decision.
 - Debug reads truncate strings (4 KiB / 2 KiB) and cap windows (1000 msgs,
   500 log lines) — a display client cannot balloon a reply.
 
-## 18. Non-goals (unchanged invariants)
+## 19. Non-goals (unchanged invariants)
 
 - **No token-level streaming.** The reply is the task's terminal artifact
-  (status/artifact-level streaming, RFC 0009). An operator-channel token
-  stream would be a separate, explicitly-flagged future RFC.
+  (status/artifact-level streaming, RFC 0009). agentd does not even request a
+  stream from the provider — the intel `Request` has no `stream` flag — so
+  this is a wire-layer change across three dialects plus a new
+  child→supervisor→client transport, NOT a matter of forwarding something
+  already in hand. §17's live activity deliberately covers the perceived-
+  liveness gap instead. If it is ever built it must be: operator-channel only
+  (never the subagent→parent boundary, RFC 0009), display-only (never a
+  context, artifact, or persisted state), and carried on a channel that
+  BYPASSES the reactor and the replay ring.
 - Steering is now first-class, not a non-goal: `workflow.signal`,
   `subagent.send`/`kill`/`status` and `plan.get` dispatch as command ops, and
   `a2a.pause`/`a2a.resume` hold one run or the whole instance (reversible;

@@ -25,6 +25,7 @@ import {
   RpcError,
   Suggestion,
   TERMINAL_STATES,
+  activityLine,
   applySuggestion,
   prepare,
   suggest,
@@ -89,7 +90,8 @@ export function App(props: AppProps): React.JSX.Element {
   const active = mirror.activeTasks();
   const suggestions: Suggestion[] = screen === 'chat' ? suggest(input, s) : [];
 
-  // Spinner ticks only while something is actually working.
+  // Spinner ticks only while something is actually working — it also drives
+  // the working row's elapsed clock (nothing is streamed for that).
   useEffect(() => {
     if (active.length === 0) return;
     const t = setInterval(() => setSpin((n) => n + 1), 90);
@@ -424,13 +426,17 @@ export function App(props: AppProps): React.JSX.Element {
   const top = info?.display?.top ?? DEFAULT_TOP;
   const bottom = info?.display?.bottom ?? DEFAULT_BOTTOM;
   const chrome = { s, endpoint: props.endpoint, screen, active: active.length };
+  // The live working line (RFC 0032 §17): what the daemon is doing, ticking
+  // its own clock off the activity record's `started_ms` (the spinner interval
+  // already re-renders us, so elapsed advances for free).
   const workingRow =
     active.length > 0
       ? {
           text:
             active[0].state === 'TASK_STATE_INPUT_REQUIRED'
               ? 'waiting for your answer'
-              : `working — ${active.length} task${active.length > 1 ? 's' : ''} live`,
+              : activityLine(mirror.activityFor(active[0].id)) +
+                (active.length > 1 ? ` · ${active.length} tasks` : ''),
           frame: spin,
         }
       : null;

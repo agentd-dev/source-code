@@ -869,6 +869,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
     }
 
     pub(crate) fn on_turn_done(&mut self, node: NodeId, turn: TurnResult) {
+        self.activity_end(node);
         let Some(child) = self.children.get(node) else {
             return;
         };
@@ -914,6 +915,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
     }
 
     pub(crate) fn on_turn_failed(&mut self, node: NodeId, error: String) {
+        self.activity_end(node);
         let Some(child) = self.children.get(node) else {
             return;
         };

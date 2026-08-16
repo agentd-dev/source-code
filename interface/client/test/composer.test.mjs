@@ -70,3 +70,42 @@ test('a config feed event updates the live info every surface renders from', () 
   assert.deepEqual(m.getState().info.display.bottom, ['conn', 'model']);
   assert.ok(m.getState().transcript.some((e) => e.kind === 'info' && e.text.includes('interface.debug')));
 });
+
+test('the activity line says what the agent is doing, for how long, at what cost', async () => {
+  const { activityLine, elapsed, tokens } = await import('../dist/index.js');
+  const now = 1_000_000;
+  const base = { id: '7', round: 1, tokens_in: 0, tokens_out: 0, started_ms: now - 12_000, updated_ms: now };
+  // Thinking, with elapsed only (no tokens spent yet).
+  assert.equal(activityLine({ ...base, phase: 'thinking' }, now), 'thinking · 12s');
+  // A tool names itself and the spend shows.
+  assert.equal(
+    activityLine({ ...base, phase: 'tool', tool: 'read_file', tokens_in: 900, tokens_out: 300 }, now),
+    'read_file · 12s · 1.2k tok',
+  );
+  // A later round is worth showing; a parked unit says what it waits on.
+  assert.match(activityLine({ ...base, phase: 'thinking', round: 3 }, now), /round 3$/);
+  assert.match(activityLine({ ...base, phase: 'waiting', tool: 'subagent' }, now), /^waiting · subagent/);
+  // No record yet ⇒ a bare label, never a crash.
+  assert.equal(activityLine(undefined, now), 'working');
+  // Formatting.
+  assert.equal(elapsed(now - 8_000, now), '8s');
+  assert.equal(elapsed(now - 74_000, now), '1m14s');
+  assert.equal(elapsed(now - 3_723_000, now), '1h02m');
+  assert.deepEqual([tokens(940), tokens(1200), tokens(18_000), tokens(250_000)], ['940', '1.2k', '18k', '250k']);
+});
+
+test('the mirror folds activity events and finds the record for a task', async () => {
+  const { Mirror } = await import('../dist/index.js');
+  const m = new Mirror();
+  m.apply({ seq: 1, ts: 1, kind: 'activity', data: { id: '7', task: 't1', phase: 'thinking', round: 1, tokens_in: 10, tokens_out: 5, started_ms: 1, updated_ms: 1 } });
+  assert.equal(m.activityFor('t1').phase, 'thinking');
+  // A later frame replaces it in place (one record per unit).
+  m.apply({ seq: 2, ts: 2, kind: 'activity', data: { id: '7', task: 't1', phase: 'tool', tool: 'grep', round: 1, tokens_in: 10, tokens_out: 5, started_ms: 1, updated_ms: 2 } });
+  assert.equal(m.getState().activity.size, 1);
+  assert.equal(m.activityFor('t1').tool, 'grep');
+  // Unknown task falls back to the newest record; removal clears it.
+  assert.equal(m.activityFor('nope').id, '7');
+  m.apply({ seq: 3, ts: 3, kind: 'activity.removed', data: { id: '7' } });
+  assert.equal(m.getState().activity.size, 0);
+  assert.equal(m.activityFor('t1'), undefined);
+});

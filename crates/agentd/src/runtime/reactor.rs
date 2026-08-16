@@ -263,6 +263,8 @@ pub struct Runtime {
     /// Pairing-code login (RFC 0032 §13; None ⇒ pairing disabled).
     #[cfg(feature = "a2a")]
     pub(crate) a2a_pairing: Option<std::sync::Arc<super::a2a_server::PairingState>>,
+    /// Live per-unit activity (RFC 0032 §17), keyed by child node id.
+    pub(crate) activity: BTreeMap<u64, super::activity::Activity>,
     /// Per-item fingerprints behind the feed's section diffing (`feed_tick`).
     #[cfg(feature = "a2a")]
     pub(crate) feed_marks: BTreeMap<String, u64>,
@@ -513,9 +515,11 @@ impl Runtime {
         match msg {
             AgentMsg::Ready
             | AgentMsg::Pong { .. }
-            | AgentMsg::Event { .. }
             | AgentMsg::Gate { .. }
             | AgentMsg::GateClosed { .. } => {}
+            // Coarse progress from the child (RFC 0032 §17): what this unit is
+            // doing right now, for the display clients' working row.
+            AgentMsg::Event { event, fields } => self.on_child_progress(node, &event, &fields),
             AgentMsg::Usage(u) => {
                 self.counters.tokens_in += u.input_tokens;
                 self.counters.tokens_out += u.output_tokens;
@@ -551,6 +555,7 @@ impl Runtime {
         let Some((node, child)) = self.children.on_reaped(&r) else {
             return;
         };
+        self.activity_end(node);
         self.log.info("child.exit", json!({"node": node.0, "pid": r.pid, "kind": super::children::kind_label(&child.kind), "outcome": format!("{:?}", r.outcome)}));
         // A child that died without its terminal frame: fail its unit.
         match child.kind {
@@ -831,6 +836,7 @@ impl Runtime {
             "counters": {"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out},
             "instruction": {"source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version, "bytes": self.instruction.text.len()},
             "model": self.model,
+            "activity": self.activity_value(),
         })
     }
 

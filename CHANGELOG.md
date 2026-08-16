@@ -7,6 +7,22 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Added (live activity — RFC 0032 §17)
+
+- **The working row now says what the agent is doing**: `thinking · 12s ·
+  1.2k tok · round 2`, `read_file · 3s`, `waiting · subagent · 40s`. The turn
+  worker's coarse progress frames (`AgentMsg::Event`) were previously dropped
+  by the supervisor; they now fold into a per-unit activity record (phase,
+  tool, round, tokens, `started_ms`) published as `activity` /
+  `activity.removed` feed events and mirrored in `status.activity`. New
+  child-side signals `turn.think` / `turn.tool` (the only way an MCP tool call
+  is visible to the supervisor — the child holds its own connections) and
+  `turn.round` now carries per-round usage; a deferred tool parks the unit.
+- Deliberately coarse: events fire only on a change an operator would notice,
+  and elapsed is never streamed (clients tick from `started_ms`), so a long
+  think emits nothing and the feed's replay ring stays a record of state.
+  `activityLine()` in `@agentd/client` renders it identically in both UIs.
+
 ### Added (human-in-the-loop + steering — RFC 0032 §16, RFC 0029 §5/§7)
 
 - **`ask_human` is real** (was a stub): an ask — the model's tool call, or a

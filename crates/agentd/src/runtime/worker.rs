@@ -322,7 +322,13 @@ pub fn run_turn(
                 }
             }
         }
-        // The model call.
+        // The model call. Announce it first (RFC 0032 §17): the supervisor turns
+        // this into the display clients' live activity — `thinking` from here
+        // until the response lands.
+        bridge.progress(
+            "turn.think",
+            json!({"turn": spec.turn_id, "round": result.rounds + 1}),
+        );
         let req = Request {
             model: model.clone(),
             messages: messages.clone(),
@@ -353,7 +359,10 @@ pub fn run_turn(
                 chat_start,
             );
         }
-        bridge.progress("turn.round", json!({"turn": spec.turn_id, "round": result.rounds, "tool_calls": resp.tool_calls.len()}));
+        // Carry the round's token usage upward too — the supervisor attributes
+        // it to this turn's live activity (the instance counters are settled
+        // separately from the terminal usage, so this never double-counts).
+        bridge.progress("turn.round", json!({"turn": spec.turn_id, "round": result.rounds, "tool_calls": resp.tool_calls.len(), "tokens_in": resp.usage.input_tokens, "tokens_out": resp.usage.output_tokens}));
         log.debug("turn.round", json!({"turn": spec.turn_id, "round": result.rounds, "tokens_in": resp.usage.input_tokens, "tokens_out": resp.usage.output_tokens, "tool_calls": resp.tool_calls.len()}));
 
         if resp.wants_tools() {
@@ -383,6 +392,13 @@ pub fn run_turn(
                 }
                 let call_start = Instant::now();
                 let tool_span_start = crate::obs::otel::now_unix_nanos();
+                // The one signal that says WHAT it is doing right now — for MCP
+                // tools the supervisor never sees the call otherwise (the child
+                // holds its own MCP connections).
+                bridge.progress(
+                    "turn.tool",
+                    json!({"turn": spec.turn_id, "tool": tc.name, "i": i + 1, "of": resp.tool_calls.len()}),
+                );
                 let (content, is_error) = execute_call(spec, limits, tc, i, mcp, bridge, log);
                 if let Some(rs) = run_span.as_mut() {
                     rs.record_tool(&tc.name, !is_error, tool_span_start);

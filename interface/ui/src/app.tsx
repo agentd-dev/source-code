@@ -17,6 +17,7 @@ import {
   TERMINAL_STATES,
   TaskView,
   TranscriptEntry,
+  activityLine,
   applySuggestion,
   prepare,
   suggest,
@@ -141,6 +142,14 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
   const s = mirror.getState();
   const [input, setInput] = useState('');
   const [sugIndex, setSugIndex] = useState(0);
+  // Local clock for the working row's elapsed (never streamed).
+  const [tick, setTick] = useState(() => Date.now());
+  const working = mirror.activeTasks().length > 0;
+  useEffect(() => {
+    if (!working) return;
+    const t = setInterval(() => setTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [working]);
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -157,7 +166,12 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
         ))}
         {active.length > 0 ? (
           <div className="working">
-            ⠿ working — {active.length} task{active.length > 1 ? 's' : ''} live<span className="cursor">▌</span>
+            ⠿{' '}
+            {active[0].state === 'TASK_STATE_INPUT_REQUIRED'
+              ? 'waiting for your answer'
+              : activityLine(mirror.activityFor(active[0].id), tick)}
+            {active.length > 1 ? ` · ${active.length} tasks` : ''}
+            <span className="cursor">▌</span>
           </div>
         ) : null}
       </div>

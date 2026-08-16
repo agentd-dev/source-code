@@ -1,0 +1,23 @@
+{
+  "name": "@agentd/client",
+  "version": "0.1.0",
+  "description": "The agentd thin-client core: A2A JSON-RPC transport, the SubscribeToEvents feed, and the state mirror both the TUI and the web UI render from. Framework-free.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

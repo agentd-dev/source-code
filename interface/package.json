@@ -1,0 +1,19 @@
+{
+  "name": "agentd-interface",
+  "private": true,
+  "description": "The agentd display clients: a shared thin-client core (@agentd/client), the terminal UI (@agentd/tui), and the web UI (@agentd/ui). Separate Node projects — agentd hosts all state; these only render it.",
+  "license": "AGPL-3.0-only",
+  "workspaces": [
+    "client",
+    "tui",
+    "ui"
+  ],
+  "scripts": {
+    "build": "npm run build -w @agentd/client && npm run build -w @agentd/tui && npm run build -w @agentd/ui",
+    "test": "npm test -w @agentd/client && npm test -w @agentd/tui",
+    "typecheck": "npm run typecheck -w @agentd/client && npm run typecheck -w @agentd/tui && npm run typecheck -w @agentd/ui"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

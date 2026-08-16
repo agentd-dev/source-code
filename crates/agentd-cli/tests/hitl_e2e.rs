@@ -17,14 +17,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn post_raw(addr: &str, body: &str) -> String {
     let mut s = TcpStream::connect(addr).expect("connect a2a http");
     s.set_read_timeout(Some(Duration::from_secs(130))).ok();
@@ -72,20 +64,6 @@ fn command(addr: &str, id: i64, op: &str, extra: Value) -> Value {
         "SendMessage",
         json!({"message": {"messageId": format!("m-{id}"), "parts": [{"data": {"agentd": data}}]}}),
     )
-}
-
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// Poll GetTask until `pred` holds (returns the task).
@@ -169,10 +147,41 @@ fn spawn_daemon(config: &str) -> Daemon {
     Daemon { child, stderr_path }
 }
 
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 fn write_config(yaml: &str) -> String {
     let path = common::unique_path("agentd-hitl", "yaml");
     std::fs::write(&path, yaml).unwrap();
     path
+}
+
+/// Spawn the daemon on a probed free port and return the authority IT actually
+/// bound. The probe→bind gap is a real race under parallel CI (another process
+/// can take the port), so a daemon whose bind lost is retried on a fresh port
+/// rather than leaving the test talking to a stranger's listener.
+fn spawn_bound(cfg_for: impl Fn(u16) -> String) -> (Daemon, String, String) {
+    spawn_bound_with(cfg_for, spawn_daemon)
+}
+
+fn spawn_bound_with(
+    cfg_for: impl Fn(u16) -> String,
+    spawn: impl Fn(&str) -> Daemon,
+) -> (Daemon, String, String) {
+    for _ in 0..5 {
+        let cfg = write_config(&cfg_for(free_port()));
+        let daemon = spawn(&cfg);
+        if let Some(addr) = common::try_a2a_bound(&daemon.stderr_path, Duration::from_secs(15)) {
+            return (daemon, addr, cfg);
+        }
+        std::fs::remove_file(&cfg).ok();
+    }
+    panic!("the daemon never bound an A2A listener (5 attempts)");
 }
 
 fn base_config(llm: &str, port: u16, interface: bool, extra: &str) -> String {
@@ -201,11 +210,7 @@ fn a_turn_ask_gates_as_input_required_and_the_reply_resumes_the_turn() {
             {"content": "Done — the badge is set."}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&base_config(&llm.uri, port, true, ""));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, ""));
 
     // Send the prompt WITHOUT blocking; the task must reach input-required
     // with the QUESTION as its status message.
@@ -257,12 +262,8 @@ fn a_turn_ask_gates_as_input_required_and_the_reply_resumes_the_turn() {
 #[test]
 fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the deploy?\", depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"shipped\"}\n";
-    let cfg = write_config(&base_config(&llm.uri, port, true, extra));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
 
     // Start the workflow; ITS task (linking the run) becomes the gate.
     let started = command(&addr, 1, "workflow.run", json!({"name": "approve"}));
@@ -323,11 +324,7 @@ fn fallback_fail_errors_the_ask_immediately_and_the_model_carries_on() {
             {"content": "Proceeding without a human."}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&base_config(&llm.uri, port, false, ""));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, false, ""));
     let sent = rpc(
         &addr,
         1,
@@ -368,15 +365,13 @@ fn fallback_auto_lets_the_judge_answer_on_the_operators_behalf() {
             {"when_contains": "answering ON BEHALF OF the unavailable human operator", "content": "blue"}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let extra = "";
-    let cfg = write_config(&base_config(&llm.uri, port, false, extra).replace(
-        "  preflight: never\n",
-        "  preflight: never\n  ask_human_fallback: auto\n",
-    ));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| {
+        base_config(&llm.uri, port, false, extra).replace(
+            "  preflight: never\n",
+            "  preflight: never\n  ask_human_fallback: auto\n",
+        )
+    });
     let sent = rpc(
         &addr,
         1,
@@ -413,14 +408,12 @@ fn fallback_wait_parks_the_ask_until_its_timeout() {
             {"content": "Timed out; proceeding."}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&base_config(&llm.uri, port, false, "").replace(
-        "  preflight: never\n",
-        "  preflight: never\n  ask_human_fallback: wait\n",
-    ));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| {
+        base_config(&llm.uri, port, false, "").replace(
+            "  preflight: never\n",
+            "  preflight: never\n  ask_human_fallback: wait\n",
+        )
+    });
     let sent = rpc(
         &addr,
         1,
@@ -457,14 +450,12 @@ fn auto_fires_as_the_safety_net_when_an_interface_gate_times_out_unanswered() {
             {"when_contains": "answering ON BEHALF OF the unavailable human operator", "content": "green"}
         ]
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&base_config(&llm.uri, port, true, "").replace(
-        "  preflight: never\n",
-        "  preflight: never\n  ask_human_fallback: auto\n",
-    ));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| {
+        base_config(&llm.uri, port, true, "").replace(
+            "  preflight: never\n",
+            "  preflight: never\n  ask_human_fallback: auto\n",
+        )
+    });
     let sent = rpc(
         &addr,
         1,
@@ -497,12 +488,8 @@ fn auto_fires_as_the_safety_net_when_an_interface_gate_times_out_unanswered() {
 #[test]
 fn cancelling_a_gate_unblocks_the_asker_with_an_error() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let extra = "workflows:\n  - name: gated\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Proceed?\", depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"done\"}\n";
-    let cfg = write_config(&base_config(&llm.uri, port, true, extra));
-    let _daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
     let started = command(&addr, 1, "workflow.run", json!({"name": "gated"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     wait_task(&addr, &task_id, 10, "gate", |t| {

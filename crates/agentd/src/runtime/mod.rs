@@ -20,6 +20,7 @@ pub mod events;
 pub mod exec; // guarded local command runner behind the `exec` tool (RFC 0028; default-OFF)
 pub mod goal;
 pub mod http_node;
+pub mod human; // human-in-the-loop: ask_human gates + fallbacks (RFC 0032 §16)
 pub mod nested;
 pub mod reactor;
 pub mod reload;
@@ -350,6 +351,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         job_shape: false,
         exit: None,
         draining: false,
+        paused: false,
         drain_started: None,
         drain_reason: String::new(),
         idle_since: None,
@@ -741,6 +743,11 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             "workflow.run",
             "workflow.status",
             "workflow.cancel",
+            "workflow.signal",
+            "subagent.send",
+            "subagent.kill",
+            "subagent.status",
+            "plan.get",
         ];
         if s.interface.enabled {
             methods.push("SubscribeToEvents");
@@ -755,7 +762,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             "mtls": s.a2a.tls.client_ca.is_some(),
             "bearer": s.a2a.bearer.is_some(),
             "methods": methods,
-            "admin": ["a2a.drain", "a2a.lameduck", "a2a.cancel"],
+            "admin": ["a2a.drain", "a2a.lameduck", "a2a.cancel", "a2a.pause", "a2a.resume"],
             "command_ops": command_ops,
             "principals": principals,
             "loopback_operator": s.a2a.principals.is_empty(),

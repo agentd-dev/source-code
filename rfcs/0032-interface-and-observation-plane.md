@@ -92,9 +92,9 @@ Kinds and sources:
 |---|---|---|---|
 | `task` / `task.removed` | the full A2A task (+ link, principal) | owner | every task transition (`task_sync`) |
 | `message` | `{contextId, taskId, messageId, principal, text}` | owner | every NL send — **the cross-client transcript** |
-| `command` | `{op, principal, contextId}` | owner | mutating command ops only (`workflow.run`/`workflow.cancel`); reads stay off the feed |
+| `command` | `{op, principal, contextId}` | owner | mutating command ops only (`workflow.run`/`cancel`/`signal`, `subagent.send`/`kill`); reads stay off the feed |
 | `run`, `conversation`, `subagent`, `child`, `status` (+ `.removed`) | the section item | operator (run/conversation: owner) | the loop's **section diff**: a 4 Hz fingerprint pass over runs/conversations/subagents/children/slim-status that emits only what changed (moving fields like `age_ms` excluded from the fingerprint) |
-| `lifecycle` | `{draining, reason}` | all | drain |
+| `lifecycle` | `{draining?, paused?, reason}` | all | drain; `a2a.pause`/`a2a.resume` |
 | `config` | `{path, value}` | operator | a runtime `config.set` (§14) — every attached client re-shapes live |
 | `pairing` | `{paired, sessions}` | operator | a client paired (§13) |
 | `audit` | the audit record | operator, **debug only** | every audited action — except the taskless interface reads, which would feed-loop their own polling |
@@ -193,8 +193,9 @@ attached client re-lays-out live when it changes. Unknown items are skipped
 web renderer.
 
 Item vocabulary: `name` `version` `instance` `model` `endpoint` `conn` `debug`
-`draining` `active` `turns` `tokens` `tool_calls` `runs` `subagents`
-`conversations` `screen` `keys` `clock`. Unknown names in the config draw a
+`draining` (the lifecycle notice: DRAINING or PAUSED) `active` `turns`
+`tokens` `tool_calls` `runs` `subagents` `conversations` `screen` `keys`
+`clock`. Unknown names in the config draw a
 validation **warning**, not an error.
 
 ## 13. Pairing-code login (`interface.pairing`)
@@ -264,7 +265,44 @@ Both shipped UIs speak the same input language (implemented once in
   `$tokens` `$tasks` interpolate from the mirror before sending; unknown
   `$words` are untouched; `$$` escapes a literal dollar.
 
-## 16. Bounds & failure modes
+## 16. Human-in-the-loop (`ask_human` + the `human` node)
+
+The interaction loop the interface exists for. An ask — the model calling
+`ask_human`, or a workflow reaching a `human` step — flips (or creates) the
+owning A2A task to **`input-required`** with the question as its status
+message: every attached client renders an answerable gate. A `SendMessage`
+carrying that `taskId` resolves the suspended asker with the reply text — the
+tool call returns it to the model; the `human` step completes with it as its
+output (so later steps template on `steps.<gate>.output`). The answer is
+broadcast as a `message` feed event (all clients see who answered what), and
+both ask and answer are audited.
+
+Task selection: the ask binds to the A2A task behind the asking turn, or the
+task tracking the asking run; a unit with NO A2A owner (a scheduled turn, a
+subagent) gets a standalone gate task so attached operators still see and
+answer it. One live gate per task; asks within one unit are sequential.
+
+Durability: tasks are durable, so a **run's** gate survives a restart (the
+pending ask is rebuilt from the suspended `human` step and the reply path
+works across lives). A **turn's** gate degrades gracefully — the asking child
+died with the old process, so an answer simply continues the conversation as a
+fresh turn. Cancelling a gate task unblocks its asker with an error.
+
+**Fallback** (`agent.ask_human_fallback`) when NO human channel exists
+(`interface.enabled` off) — and, for `auto`, when an interface-served gate
+times out unanswered (default ask timeout 24 h, per-ask `timeout` arg):
+
+| value (aliases) | behavior |
+|---|---|
+| `fail` (default; `finish`, `stop`) | the ask errors immediately — the model / the workflow's failure policy decides |
+| `wait` (`pause`, `idle`) | park until the ask timeout, then fail |
+| `auto` | an LLM judge answers **on the operator's behalf** — prompted conservatively (safe/reversible choices only, `UNDECIDED` ⇒ fail), and always **marked as auto** in the task status, the log and the audit stream |
+
+`fail` is the default because a headless deployment must not silently hang for
+a day; `auto`'s marking exists because a judge's guess must never be mistaken
+for a human decision.
+
+## 17. Bounds & failure modes
 
 - The feed ring holds 1024 events; overrun evicts oldest and `hello.resync`
   tells a stale cursor to re-bootstrap. Feed frames stop early when the peer
@@ -277,13 +315,15 @@ Both shipped UIs speak the same input language (implemented once in
 - Debug reads truncate strings (4 KiB / 2 KiB) and cap windows (1000 msgs,
   500 log lines) — a display client cannot balloon a reply.
 
-## 17. Non-goals (unchanged invariants)
+## 18. Non-goals (unchanged invariants)
 
 - **No token-level streaming.** The reply is the task's terminal artifact
   (status/artifact-level streaming, RFC 0009). An operator-channel token
   stream would be a separate, explicitly-flagged future RFC.
-- **No inbound control beyond RFC 0029.** Pause/resume, `subagent.send`,
-  `workflow.signal` over A2A remain future work; the interface renders what
-  exists.
+- Steering is now first-class, not a non-goal: `workflow.signal`,
+  `subagent.send`/`kill`/`status` and `plan.get` dispatch as command ops, and
+  `a2a.pause`/`a2a.resume` hold one run or the whole instance (reversible;
+  intake continues, dispatch parks). What remains out: any control that would
+  bypass the principal matrix.
 - The interface is not an MCP surface; `agent://` resources stay unserved
   (RFC 0029 §8 D7) — the taskless reads cover the display need without them.

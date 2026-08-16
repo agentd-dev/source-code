@@ -64,6 +64,20 @@ pub enum PendingKind {
     Run { run: String, deadline_ms: u64 },
     /// A CEL condition polled each tick (`await`).
     Await { condition: String, deadline_ms: u64 },
+    /// A human's answer (`ask_human` / the `human` node — RFC 0032 §16): the
+    /// A2A task `task` sits in `input-required`; a `SendMessage` carrying its
+    /// `taskId` resolves this with the reply text. With no interface to answer
+    /// on, `task` is a synthetic ask id (no A2A task exists).
+    Human {
+        task: String,
+        question: String,
+        deadline_ms: u64,
+        /// The task exists ONLY for this ask (no A2A caller/run owns it) —
+        /// complete it when the answer lands.
+        standalone: bool,
+        /// The `auto` fallback judge is running (or already ran) for this ask.
+        auto_fired: bool,
+    },
 }
 
 /// A queued root/conversation turn (RFC 0026 §3.2), waiting for a slot and
@@ -205,6 +219,9 @@ pub struct Runtime {
     pub(crate) job_shape: bool,
     pub(crate) exit: Option<i32>,
     pub(crate) draining: bool,
+    /// Operator-held (a2a.pause): intake continues; no new turns dispatch and
+    /// no steps schedule until a2a.resume. Reversible, unlike drain.
+    pub(crate) paused: bool,
     pub(crate) drain_started: Option<Instant>,
     pub(crate) drain_reason: String,
     pub(crate) idle_since: Option<Instant>,
@@ -370,6 +387,10 @@ impl Runtime {
             #[cfg(feature = "a2a")]
             Event::Webhook(req) => self.on_webhook_request(*req),
             Event::Background { id, result } if id == "goal.judge" => self.on_goal_judge(&result),
+            Event::Background { id, result } if id.starts_with("human.judge:") => {
+                let ask = id.trim_start_matches("human.judge:").to_string();
+                self.on_human_judge(&ask, &result);
+            }
             Event::Background { .. } | Event::Tick => {}
         }
     }
@@ -664,7 +685,8 @@ impl Runtime {
         if !idle_policy {
             return None;
         }
-        let busy = !self.children.is_empty()
+        let busy = self.paused // a paused instance never idle-exits underneath the operator
+            || !self.children.is_empty()
             || !self.turn_queue.is_empty()
             || !self.staged_turns.is_empty()
             || !self.inbox_queue.is_empty()
@@ -794,6 +816,7 @@ impl Runtime {
             "uptime_ms": self.started.elapsed().as_millis() as u64,
             "job_shape": self.job_shape,
             "draining": self.draining,
+            "paused": self.paused,
             "store": {"kind": self.durable.store_kind(), "degraded": self.durable.is_degraded(), "generation": self.durable.manifest().generation},
             "workflows": self.workflows.values().map(|w| json!({"name": w.name, "hash": w.hash, "armed": w.armed, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
             "runs": self.runs.values().map(RunState::summary).collect::<Vec<_>>(),

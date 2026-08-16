@@ -142,6 +142,7 @@ export interface MirrorState {
   /** The slim live status (feed `status` events). */
   status?: Json;
   draining: boolean;
+  paused: boolean;
   tasks: Map<string, TaskView>;
   runs: Map<string, Json>;
   conversations: Map<string, Json>;

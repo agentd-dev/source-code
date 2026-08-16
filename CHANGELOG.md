@@ -7,6 +7,35 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Added (human-in-the-loop + steering — RFC 0032 §16, RFC 0029 §5/§7)
+
+- **`ask_human` is real** (was a stub): an ask — the model's tool call, or a
+  workflow `human` step — flips the owning A2A task to `input-required` with
+  the question as its status message; every attached display client renders an
+  answerable gate, and a `SendMessage` carrying the `taskId` resolves the
+  suspended asker with the reply (tool result to the model; step output to the
+  workflow — later steps template on `steps.<gate>.output`). Answers broadcast
+  on the feed; ask + answer are audited. Run-linked gates are rebuilt after a
+  restart (durable HITL); turn gates degrade to conversation continuation.
+  Cancelling a gate unblocks its asker with an error.
+- **`agent.ask_human_fallback`** when no human channel exists (and, for
+  `auto`, when a rendered gate times out unanswered): `fail` (default),
+  `wait` (park until the ask timeout), or `auto` — an LLM judge answers on
+  the operator's behalf (conservative prompt, `UNDECIDED` ⇒ fail), always
+  marked as auto in the task/log/audit.
+- **Steering command ops now dispatch** (were `UNSUPPORTED_OPERATION`):
+  `workflow.signal` (resumes `wait: {on: signal}` steps), `subagent.send`
+  (inject into a warm subagent), `subagent.kill`, `subagent.status`,
+  `plan.get`.
+- **`a2a.pause` / `a2a.resume`** (operator): with `{run}`, flip one run
+  between Paused and Running; without, hold the WHOLE instance — intake
+  continues (inbox, tasks), no new turns dispatch and no steps schedule until
+  resume. Reversible, unlike drain; a paused instance never idle-exits;
+  `status.paused` + a `lifecycle` feed event keep every client honest (the
+  UIs show PAUSED).
+- Clients: `/signal /send /pause /resume /plan` in both UIs (+
+  `signal()/subagentSend()/pause()/resume()/planGet()` on `@agentd/client`).
+
 ### Added (the display-client interface & observation plane — RFC 0032, `docs/interface.md`)
 
 - **`interface:` config** (default OFF): `enabled` serves the display-client

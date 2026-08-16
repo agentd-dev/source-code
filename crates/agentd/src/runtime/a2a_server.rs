@@ -28,7 +28,7 @@ use crate::a2a::tasks::{Link, State, Task};
 use crate::a2a::{CallerIdentity, Principal, Resolver};
 use crate::obs::log::Logger;
 use crate::runtime::events::{Event, kinds};
-use crate::runtime::reactor::Runtime;
+use crate::runtime::reactor::{PendingKind, Runtime};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -1188,6 +1188,26 @@ impl Runtime {
                 .get(tid)
                 .map(|t| (tid.to_string(), t.context_id.clone(), t.principal.clone()))
         });
+        // A LIVE human gate on the addressed task (RFC 0032 §16): the reply
+        // resolves the suspended asker directly — the tool call returns the
+        // text to the model, the `human` step completes with it — instead of
+        // becoming a new conversation turn.
+        if let Some((tid, ctx, owner)) = &existing
+            && (owner.as_deref() == Some(principal.id.as_str()) || principal.is_operator())
+            && let Some(i) = self
+                .pending
+                .iter()
+                .position(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == tid))
+        {
+            // Every attached client sees the answer (the cross-client transcript).
+            self.feed_push(
+                "message",
+                FeedVis::Owner(Some(principal.id.clone())),
+                json!({"contextId": ctx, "taskId": tid, "messageId": message_id, "principal": principal.id, "text": text}),
+            );
+            self.human_answer(i, &text, "human");
+            return json!({"task": self.tasks.get(tid).map(Task::to_a2a).unwrap_or(Value::Null)});
+        }
         let (task_id, ctx_id) = match existing {
             Some((tid, ctx, owner))
                 if owner.as_deref() == Some(principal.id.as_str()) || principal.is_operator() =>
@@ -1265,7 +1285,14 @@ impl Runtime {
         // (`status`, `config`, `workflow.status`) stay off the feed — they are
         // the observation plumbing itself, and N clients polling them would
         // spam every transcript.
-        if matches!(op, "workflow.run" | "workflow.cancel") {
+        if matches!(
+            op,
+            "workflow.run"
+                | "workflow.cancel"
+                | "workflow.signal"
+                | "subagent.send"
+                | "subagent.kill"
+        ) {
             self.feed_push(
                 "command",
                 FeedVis::Owner(Some(principal.id.clone())),
@@ -1375,6 +1402,76 @@ impl Runtime {
                 }
                 _ => err_obj(TASK_NOT_FOUND, "no such run"),
             },
+            // ---- steering (RFC 0029 §5 — now dispatched) ------------------
+            "workflow.signal" => {
+                let name = data["name"].as_str().unwrap_or("").to_string();
+                if name.is_empty() {
+                    return err_obj(::mcp::rpc::INVALID_PARAMS, "workflow.signal needs a name");
+                }
+                let payload = data.get("payload").cloned().unwrap_or(Value::Null);
+                let target = data["run"].as_str().map(str::to_string);
+                let delivered =
+                    self.deliver_signal(&name, payload, target.as_deref(), Some(&principal.id));
+                self.task_complete_now(
+                    &ctx,
+                    principal,
+                    Link::Turn { ctx: ctx.clone() },
+                    State::Completed,
+                    Some(format!("signal {name:?} delivered to {delivered}")),
+                    Some(json!({"signal": name, "delivered": delivered})),
+                )
+            }
+            "subagent.send" | "subagent.kill" | "subagent.status" => {
+                // Reuse the internal tool implementations verbatim.
+                let mut args = data.clone();
+                if op == "subagent.send"
+                    && args.get("message").is_none()
+                    && let Some(t) = data["text"].as_str()
+                {
+                    args["message"] = json!(t);
+                }
+                let tool_caller = crate::runtime::tools::ToolCaller {
+                    principal: Some(principal.id.clone()),
+                    ..Default::default()
+                };
+                match self.subagent_tool(&tool_caller, op, args) {
+                    crate::runtime::tools::ToolOutcome::Ready(v, false) => self.task_complete_now(
+                        &ctx,
+                        principal,
+                        Link::Turn { ctx: ctx.clone() },
+                        State::Completed,
+                        None,
+                        Some(v),
+                    ),
+                    crate::runtime::tools::ToolOutcome::Ready(v, true) => err_obj(
+                        ::mcp::rpc::INVALID_PARAMS,
+                        v.as_str().unwrap_or("subagent op failed"),
+                    ),
+                    _ => err_obj(rpc_internal(), "unexpected deferred subagent op"),
+                }
+            }
+            "plan.get" => {
+                let id = data["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::context::ROOT.to_string());
+                match self.contexts.get(&id) {
+                    Some(c)
+                        if principal.is_operator()
+                            || c.principal.as_deref() == Some(principal.id.as_str()) =>
+                    {
+                        self.task_complete_now(
+                            &ctx,
+                            principal,
+                            Link::Turn { ctx: ctx.clone() },
+                            State::Completed,
+                            None,
+                            Some(json!({"conversation": id, "plan": c.plan, "progress": c.plan.as_ref().map(|p| p.progress())})),
+                        )
+                    }
+                    _ => err_obj(TASK_NOT_FOUND, "no such conversation"),
+                }
+            }
             other => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!(
@@ -1858,6 +1955,15 @@ impl Runtime {
         if self.tasks.get(&id).is_some_and(|t| t.state.is_terminal()) {
             return self.tasks.get(&id).map(Task::to_a2a).unwrap_or(Value::Null);
         }
+        // A live human gate on this task: unblock the asker with an error so
+        // the turn/step resolves instead of dangling (RFC 0032 §16).
+        if let Some(i) = self
+            .pending
+            .iter()
+            .position(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == &id))
+        {
+            self.human_fail(i, "ask_human: the gate task was cancelled");
+        }
         match self.tasks.get(&id).map(|t| t.link.clone()) {
             Some(Link::Run { id: run }) if self.runs.contains_key(&run) => {
                 self.cancel_run(&run, "task cancelled over A2A")
@@ -1896,10 +2002,54 @@ impl Runtime {
                     err_obj(::mcp::rpc::INVALID_PARAMS, "cancel needs a run id")
                 }
             }
-            "pause" | "a2a.pause" | "resume" | "a2a.resume" => err_obj(
-                UNSUPPORTED_OPERATION,
-                "pause/resume is not implemented in this build",
-            ),
+            // Pause/resume (RFC 0029 §7): with a `run`, flip that run between
+            // Paused and Running (the scheduler already skips Paused runs);
+            // without one, hold the WHOLE instance — intake continues (inbox,
+            // tasks), but no new turns dispatch and no steps schedule until
+            // resume. Reversible, unlike drain.
+            "pause" | "a2a.pause" => match params.get("run").and_then(Value::as_str) {
+                Some(run) => match self.runs.get_mut(run) {
+                    Some(r) if r.status.is_terminal() => {
+                        err_obj(::mcp::rpc::INVALID_PARAMS, "the run is already terminal")
+                    }
+                    Some(r) => {
+                        r.status = crate::engine::RunStatus::Paused;
+                        r.touch();
+                        self.log
+                            .info("run.paused", json!({"run": run, "reason": reason}));
+                        json!({"ok": true, "paused": run})
+                    }
+                    None => err_obj(TASK_NOT_FOUND, "no such run"),
+                },
+                None => {
+                    self.paused = true;
+                    self.log.info("agent.paused", json!({"reason": reason}));
+                    self.feed_push(
+                        "lifecycle",
+                        FeedVis::All,
+                        json!({"paused": true, "reason": reason}),
+                    );
+                    json!({"ok": true, "state": "paused", "reason": reason})
+                }
+            },
+            "resume" | "a2a.resume" => match params.get("run").and_then(Value::as_str) {
+                Some(run) => match self.runs.get_mut(run) {
+                    Some(r) if r.status == crate::engine::RunStatus::Paused => {
+                        r.status = crate::engine::RunStatus::Running;
+                        r.touch();
+                        self.log.info("run.resumed", json!({"run": run}));
+                        json!({"ok": true, "resumed": run})
+                    }
+                    Some(_) => err_obj(::mcp::rpc::INVALID_PARAMS, "the run is not paused"),
+                    None => err_obj(TASK_NOT_FOUND, "no such run"),
+                },
+                None => {
+                    self.paused = false;
+                    self.log.info("agent.resumed", json!({}));
+                    self.feed_push("lifecycle", FeedVis::All, json!({"paused": false}));
+                    json!({"ok": true, "state": "running"})
+                }
+            },
             other => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!("unknown admin op {other:?}"),
@@ -1941,7 +2091,7 @@ impl Runtime {
     // ---- task lifecycle ----------------------------------------------------
 
     /// Create + persist a fresh task; publish it to the shared view.
-    fn task_create(&mut self, ctx: &str, principal: &Principal, link: Link) -> String {
+    pub(crate) fn task_create(&mut self, ctx: &str, principal: &Principal, link: Link) -> String {
         let id = self.next_id("task");
         let task = Task::new(&id, ctx, Some(&principal.id), link);
         self.tasks.insert(id.clone(), task);
@@ -2075,7 +2225,8 @@ impl Runtime {
         self.task_sync(id);
     }
 
-    /// Restore durable tasks (called at startup); seed the shared view.
+    /// Restore durable tasks (called at startup); seed the shared view and
+    /// re-arm run-linked human gates (RFC 0032 §16).
     pub(crate) fn restore_a2a_tasks(&mut self, envs: &[crate::store::Envelope]) {
         for env in envs {
             match serde_json::from_value::<Task>(env.state.clone()) {
@@ -2090,6 +2241,7 @@ impl Runtime {
                 ),
             }
         }
+        self.rebuild_human_asks();
     }
 }
 

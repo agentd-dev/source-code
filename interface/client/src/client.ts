@@ -227,10 +227,40 @@ export class AgentdClient {
     return (await rpc(this.ep, 'Pair', { code })) as unknown as PairedSession;
   }
 
+  // ---- steering (RFC 0029 §5/§7) -----------------------------------------
+
+  /** Fire a named workflow signal (resumes `wait: {on: signal}` steps). */
+  async signal(name: string, payload?: Json, run?: string): Promise<Json> {
+    const args: { [k: string]: Json } = { name };
+    if (payload !== undefined) args.payload = payload;
+    if (run) args.run = run;
+    return this.commandResult('workflow.signal', args);
+  }
+
+  /** Inject a message into a WARM subagent. */
+  async subagentSend(handle: string, message: string): Promise<Json> {
+    return this.commandResult('subagent.send', { handle, message });
+  }
+
+  /** A conversation's working plan. */
+  async planGet(id?: string): Promise<Json> {
+    return this.commandResult('plan.get', id ? { id } : {});
+  }
+
   // ---- admin -------------------------------------------------------------
 
   async drain(reason = 'requested from the interface'): Promise<Json> {
     return rpc(this.ep, 'a2a.drain', { reason });
+  }
+
+  /** Pause one run, or (no arg) hold the whole instance. Reversible. */
+  async pause(run?: string): Promise<Json> {
+    return rpc(this.ep, 'a2a.pause', run ? { run } : {});
+  }
+
+  /** Resume a paused run / the instance. */
+  async resume(run?: string): Promise<Json> {
+    return rpc(this.ep, 'a2a.resume', run ? { run } : {});
   }
 
   // ---- streams -----------------------------------------------------------

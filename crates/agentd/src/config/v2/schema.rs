@@ -92,7 +92,8 @@ fn top_level_properties(
                     "tools": { "type": "object", "additionalProperties": false, "properties": {
                         "internal": tool_select, "mcp": tool_select, "code": tool_select } },
                     "max_parallel_turns": { "type": "integer", "minimum": 1 },
-                    "conversation_budget": budget
+                    "conversation_budget": budget,
+                    "ask_human_fallback": { "enum": ["wait", "pause", "idle", "fail", "finish", "stop", "auto"], "description": "what ask_human does with no human channel (and, for auto, on an unanswered gate timeout): wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto)" }
                 }
             }));
     m.insert("intelligence".to_string(), json!({

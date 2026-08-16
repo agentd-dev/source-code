@@ -77,7 +77,11 @@ function EdgeItem({ name, mirror, endpoint, active }: { name: string; mirror: Mi
     case 'debug':
       return s.info?.debug ? <span className="badge">debug</span> : null;
     case 'draining':
-      return s.draining ? <span className="drain">DRAINING</span> : null;
+      return s.draining ? (
+        <span className="drain">DRAINING</span>
+      ) : s.paused ? (
+        <span className="drain">PAUSED</span>
+      ) : null;
     case 'active':
       return active > 0 ? <span className="live">{active} active</span> : null;
     case 'turns': {
@@ -521,7 +525,7 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
             const [cmd, ...rest] = text.slice(1).split(/\s+/);
             const arg = rest.join(' ');
             if (cmd === 'help')
-              mirror.note('/new · /tasks · /subagents · /debug · /status · /config [path] · /set <path> <value> · /workflow <name> · /cancel [task] · /pair · /drain · /disconnect — plus @skill, #target, $value');
+              mirror.note('/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow · /signal · /send · /pause [run] · /resume [run] · /plan · /cancel · /pair · /drain · /disconnect — plus @skill, #target, $value');
             else if (cmd === 'new') {
               ctxRef.current = undefined;
               mirror.note('new conversation');
@@ -552,6 +556,30 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
                 value = valueParts.join(' ');
               }
               await client.configSet(path, value);
+            } else if (cmd === 'signal') {
+              const [name, run] = rest;
+              const r = (await client.signal(name, undefined, run)) as { delivered?: number };
+              mirror.note(`signal ${name} → delivered ${r.delivered ?? '?'}`);
+            } else if (cmd === 'send') {
+              const [handle, ...msg] = rest;
+              await client.subagentSend(handle, msg.join(' '));
+              mirror.note(`sent to ${handle}`);
+            } else if (cmd === 'pause') {
+              await client.pause(rest[0]);
+              mirror.note(rest[0] ? `paused ${rest[0]}` : 'instance paused — /resume to release');
+            } else if (cmd === 'resume') {
+              await client.resume(rest[0]);
+              mirror.note(rest[0] ? `resumed ${rest[0]}` : 'instance resumed');
+            } else if (cmd === 'conversations') {
+              const convs = [...mirror.getState().conversations.values()] as { [k: string]: Json }[];
+              mirror.note(
+                convs.length === 0
+                  ? 'no conversations yet'
+                  : `conversations:\n${convs.map((c) => `#${c.id}  ${c.messages ?? 0} msgs · ${c.turns ?? 0} turns`).join('\n')}\nstart a message with #<id> to address one`,
+              );
+            } else if (cmd === 'plan') {
+              const p = (await client.planGet(rest[0])) as { plan?: Json };
+              mirror.note(`plan: ${JSON.stringify(p.plan ?? null).slice(0, 800)}`);
             } else if (cmd === 'pair') {
               const p = await client.pairingCode();
               mirror.note(`pairing code: ${p.code} (valid ${Math.ceil(p.expires_in_ms / 1000)}s, role ${p.role}, ${p.sessions} sessions)`);

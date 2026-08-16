@@ -9,15 +9,16 @@ own and runs no local code. It reaches exactly **one** LLM endpoint, the
 subscriptions** — a resource changing upstream is what triggers a run.
 
 This page gets you from a checkout to a first end-to-end run, then shows the same
-instruction in `loop` and `reactive` modes. For the full knob list see
+instruction as a recurring **loop** and a **reactive** daemon. For the full knob list see
 [configuration.md](configuration.md); for how triggers and modes work in depth
 see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 [RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md).
 
-> **Build status.** The agent runtime is fully implemented — config
+> **Build status — agentd 2.0.** The runtime is fully implemented — config
 > validation, the agentic loop, the supervisor + subagent process tree, the
-> MCP client, the intelligence client, and all five run modes. The examples on
-> this page run as written.
+> MCP client, the intelligence client, the v2 lifecycle (`lifecycle.run_until`)
+> and workflow triggers, and the A2A v2 external channel (RFC 0029). The examples
+> on this page run as written.
 
 ---
 
@@ -47,9 +48,9 @@ only transport agentd uses. Turn on the rest only when you need them (each is ga
 so it never weighs down a minimal build):
 
 ```console
-$ cargo build -p agentd-cli --release                                 # default: tls (https)
-$ cargo build -p agentd-cli --release --features serve-https,a2a      # served self-MCP + A2A
-$ cargo build -p agentd-cli --release --features serve-https,cluster,workflow
+$ cargo build -p agentd-cli --release                                  # default: tls (https)
+$ cargo build -p agentd-cli --release --features a2a                   # + the A2A v2 listener (RFC 0029)
+$ cargo build -p agentd-cli --release --features a2a,cron,metrics,otel  # + scheduling, metrics, OTLP traces
 ```
 
 To keep TLS out of the binary entirely, terminate it at a same-host sidecar and
@@ -82,18 +83,24 @@ environment — see [configuration.md](configuration.md).
 
 Two loops, deliberately separated:
 
-```
-  agentd (main process) = SUPERVISOR       ── never talks to the LLM
-    • parse + validate config (exits 2 on bad config, before any side effect)
-    • connect declared MCP servers (as a CLIENT) ── this is where ALL tools come from
-    • arm the trigger: once | loop | reactive | schedule
-    • subscribe to MCP resources; idle in recv_timeout until something happens
-    • spawn + supervise subagent child processes; reap, kill, restart
-        │ spawn (OS process tree)
-        ▼
-  subagent (child process) = the AGENTIC LOOP   ── where intelligence lives
-    think → call MCP tool → observe → … → terminal status, return a result
-    (may spawn its own children → agents nest as a process tree)
+```mermaid
+flowchart TB
+  subgraph sup["agentd main process · SUPERVISOR — never talks to the LLM"]
+    direction TB
+    s1["parse + validate config<br/>(exit 2 before any side effect)"]
+    s2["connect MCP servers — the only source of tools"]
+    s3["arm start nodes · subscribe · idle until a trigger fires"]
+    s4["spawn + supervise subagents · reap · kill · restart"]
+    s1 --> s2 --> s3 --> s4
+  end
+  sup -->|"spawn (OS process tree)"| loop
+  subgraph loop["subagent child process · the AGENTIC LOOP — where intelligence lives"]
+    direction LR
+    think["think"] --> tool["call MCP tool"] --> obs["observe"] --> think
+    obs -.->|done| term["terminal status<br/>→ result"]
+  end
+  classDef accent stroke:#22c55e,stroke-width:1.5px,color:#f4f4f5;
+  class loop accent;
 ```
 
 Three facts are the whole design:
@@ -198,78 +205,68 @@ table above).
 
 ---
 
-## The same instruction in `loop` mode
+## The same instruction as a `loop`
 
-`loop` re-enters the agent on a timer or after each completion — the shape for a
-polling or continuously-working agent. It is the *same* supervisor and *same*
-inner loop as `once`; only the exit predicate differs. It stops on a bound (max
-iterations / wall-clock deadline / tree-wide token ceiling) or a `SIGTERM`.
+A **loop** re-runs the agent on a timer — the shape for a polling or
+continuously-working agent. In 2.0 that is a workflow with a **`loop` start
+node**; the run is durable, and the loop's iteration state survives a restart:
 
+```yaml
+# poll.yaml
+config_version: "2"
+intelligence: { endpoints: https://gw.example/v1, model: my-model }
+store: { kind: mcp, mcp: { server: state } }
+mcp:
+  servers:
+    - { name: fs,    endpoint: https://mcp-fs.internal/mcp }
+    - { name: state, endpoint: https://mcp-state.internal/mcp }
+workflows:
+  - name: poll
+    steps:
+      s: { kind: loop, every: 5m, max_iterations: 288 }   # every 5m; stop after a day
+      w: { kind: agent, depends_on: [s], instruction: "Check /data/inbox; process each file into /data/done." }
+      f: { kind: finish, depends_on: [w] }
+lifecycle: { run_until: drained }
+```
 ```console
-$ agentd \
-    --instruction "Check /data/inbox for new files; process each into /data/done" \
-    --intelligence https://gw.example/v1 \
-    --mcp fs=https://mcp-fs.internal/mcp \
-    --mode loop \
-    --interval 5m \
-    --deadline 24h
+$ agentd --config poll.yaml
 ```
 
-- **`--interval 5m`** sets the re-entry cadence: re-run every 5 minutes.
-  `--interval 0` re-enters immediately on completion (work-until-done) instead of
-  polling.
-- **`--deadline 24h`** caps the daemon's lifetime; the token ceiling
-  (`--max-tokens`) and a `SIGTERM` are the other ways it stops.
-
-A healthy idle loop (nothing to do) backs off exponentially rather than spinning
-hot. This is a `Deployment`-shaped or `Job-with-deadline`-shaped workload.
+- **`every: 5m`** is the cadence; `every: 0` re-runs immediately on completion
+  (work-until-done). `max_iterations`, `until` (a CEL condition), and `backoff`
+  bound it; a `SIGTERM` drains it. A healthy idle loop backs off rather than
+  spinning hot — a `Deployment`-shaped workload.
 
 ---
 
-## The same instruction in `reactive` mode
+## The same instruction, reactive — a `subscribe` start node
 
-`reactive` is the signature mode: the agentd **idles at near-zero CPU and wakes
-when an MCP resource it subscribed to changes**. Instead of polling on a timer,
-you subscribe to concrete resource URIs; an upstream change is the trigger.
+Instead of polling, an agentd **idles at near-zero CPU and wakes when an MCP
+resource it subscribed to changes**. In 2.0 that is a **`subscribe` start node**:
 
-```console
-$ agentd \
-    --instruction "When a file appears in the inbox, process it into /data/done" \
-    --intelligence https://gw.example/v1 \
-    --mcp fs=https://mcp-fs.internal/mcp \
-    --mode reactive \
-    --subscribe "file:///data/inbox"
+```yaml
+workflows:
+  - name: react
+    steps:
+      s: { kind: subscribe, server: fs, uri: "file:///data/inbox" }
+      w: { kind: agent, depends_on: [s], instruction: "Process the new inbox item into /data/done." }
+      f: { kind: finish, depends_on: [w] }
 ```
 
-- **`--mode reactive` requires at least one `--subscribe`** (validated at
-  startup; omitting it exits 2). `--subscribe` is repeatable, one concrete
-  resource URI each.
-- The supervisor issues MCP `resources/subscribe` for each URI (gated on the
-  server advertising `resources.subscribe`), then idles in `recv_timeout`. When
-  the server emits `notifications/resources/updated{uri}`, the reactive router
-  maps it to exactly one action — spawn a fresh subagent for the event, or
-  continue a warm session — and the agentd wakes, re-reads current state, and
-  works.
+- The runtime issues MCP `resources/subscribe` for the URI (gated on the server
+  advertising `resources.subscribe`), then idles. On
+  `notifications/resources/updated{uri}` it **re-reads** the resource
+  (notify-then-read — the notification carries only the `{uri}`) and fires a run;
+  bursts are **debounced and coalesced** (newest-wins).
+- Subscribe to **concrete URIs**, not templates — enumerate via `resources/list`
+  and add one `subscribe` node per URI.
 
-Two facts worth knowing up front, both detailed in
-[modes-and-triggers.md](modes-and-triggers.md):
-
-- **Notify-then-read.** The update notification carries only the `{uri}` — no
-  diff, no payload. The agentd re-reads the resource on wake to learn what
-  changed. Bursts are debounced and coalesced (newest-wins) per route.
-- **You can only subscribe to concrete URIs, not templates.** To react to "any
-  new row," enumerate concrete URIs via `resources/list` and subscribe per-URI.
-
-An agentd can even subscribe **itself** to a resource mid-reasoning (via the
-`subscribe` self-tool) to schedule its own future wake — the capability the
-runtime is built around.
-
-> **Scope notes.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions;
-> serving agentd's own MCP (`--serve-mcp`) is over HTTP(S) with mTLS/bearer auth
-> (loopback `http://` for dev). Subagent spawning defaults to **synchronous**;
-> `{async}`/`{detach}` dispositions also ship. Agent-authored cyclic **workflows**
-> ship under `--features workflow` ([workflows.md](workflows.md)). MCP
-> tasks/sampling/roots are deferred ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).
+> **Scope notes.** The external channel is **A2A** (`a2a.listen`, RFC 0029) — an
+> HTTPS listener with mTLS/bearer **principals** and a role matrix — not a served
+> MCP surface (the v1 self-MCP server was removed). Subagents are RFC 0026
+> flat-tree leaves. Workflows are the RFC 0027 **v3** engine (always compiled).
+> MCP tasks/sampling/roots are deferred
+> ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).
 
 ---
 
@@ -277,9 +274,10 @@ runtime is built around.
 
 - **[configuration.md](configuration.md)** — every flag and env var, precedence
   (`default < config file < env < flag`), limits, secrets, exit codes.
-- **[modes-and-triggers.md](modes-and-triggers.md)** — the five modes as exit
-  predicates, reactive routing (exactly-one-owner, spawn-vs-continue,
-  debounce/coalesce), self-subscribe, and internal `schedule`/cron.
+- **[modes-and-triggers.md](modes-and-triggers.md)** — the v2 lifecycle
+  (`lifecycle.run_until`) and workflow start-node triggers as exit predicates,
+  reactive routing (exactly-one-owner, spawn-vs-continue, debounce/coalesce),
+  self-subscribe, and `schedule`/cron.
 - **[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md)** — the architecture
   front door; sub-RFCs 0002–0013 cover each mechanism in depth.
 - **[docs/design/PLAN.md](design/PLAN.md)** — the design plan and milestone

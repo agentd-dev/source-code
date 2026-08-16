@@ -1,5 +1,17 @@
 # Horizontal scaling
 
+> **Removed in agentd 2.0.** The `cluster` feature described on this page —
+> `--shard K/N` hash partitioning, work-claim leases, standby pools, and the
+> `agent://capacity` surface (RFC 0019) — was removed in the mode cut-over. In
+> 2.0, scale by running multiple daemon replicas that coordinate through their
+> **durable store** (each work item is a durable entity with CAS, so two workers
+> cannot both commit it — RFC 0025 §3.4) and the **A2A** channel, rather than a
+> client-side shard gate. See [deployment.md §4d](deployment.md). This page is
+> retained for historical reference only.
+
+---
+
+
 A single `agentd` is one process running one agent. To handle more load you run
 **more replicas of the same binary** — a fleet. But a reactive fleet has a
 correctness problem the moment it has more than one member: every replica is

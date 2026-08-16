@@ -13,5 +13,11 @@ pub mod unixsock;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+// A minimal X.509 field extractor (subject CN + SANs) for surfacing an mTLS
+// peer's verified identity to principal matching (RFC 0029 §10.3). Only needed
+// under TLS; pure DER parsing, no new dependency.
+#[cfg(feature = "tls")]
+pub mod x509;
+
 #[cfg(feature = "vsock")]
 pub mod vsock;

@@ -143,6 +143,47 @@ impl OAuthClient {
     }
 }
 
+/// Adapts an [`OAuthClient`] (client-credentials) to the transport's
+/// [`::mcp::http::RequestSigner`] seam (RFC 0031 §4): injects a refreshing
+/// `Authorization: Bearer …` on every request. A token-fetch failure yields no
+/// header, so the request rides unauthenticated and the server answers `401` —
+/// surfacing the real error rather than hanging (fail-closed, RFC 0031 §2).
+pub struct OAuthBearerSigner {
+    client: OAuthClient,
+}
+
+impl OAuthBearerSigner {
+    /// Build from the runtime spec (`crate::config::McpOauthSpec`).
+    pub fn new(spec: crate::config::McpOauthSpec, timeout: Duration) -> OAuthBearerSigner {
+        OAuthBearerSigner {
+            client: OAuthClient::new(
+                OAuthConfig {
+                    token_url: spec.token_url,
+                    client_id: spec.client_id,
+                    client_secret: spec.client_secret,
+                    scope: spec.scope,
+                },
+                timeout,
+            ),
+        }
+    }
+}
+
+impl ::mcp::http::RequestSigner for OAuthBearerSigner {
+    fn sign(
+        &self,
+        _method: &str,
+        _authority: &str,
+        _path: &str,
+        _body: &[u8],
+    ) -> Vec<(String, String)> {
+        match self.client.bearer() {
+            Ok(tok) => vec![("Authorization".to_string(), format!("Bearer {tok}"))],
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 /// The subset of an RFC 6749 §5.1 token response we consume.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {

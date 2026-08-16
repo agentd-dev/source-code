@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod anthropic;
+// Amazon Bedrock Converse dialect (RFC 0031 §8 — native Bedrock). Pure
+// translation; the SigV4 signing that authenticates the dial is a separate axis
+// (`crate::auth::aws`). Compiled always (dependency-free); reached when the
+// `intelligence.dialect: bedrock` selector is set.
+pub mod bedrock;
 pub mod client;
 // RFC 0018 intelligence transport resilience — the endpoint list, per-endpoint
 // health + circuit breaker, and the sticky-primary failover policy. Core

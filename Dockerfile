@@ -2,13 +2,13 @@
 #
 # agentd cloud-native appliance image — a fully static musl binary on `scratch`.
 #
-# The image ships the **dependency-free cloud-native feature set**
-# (`metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch`): the `/healthz`+
-# `/readyz`+`/metrics` HTTP probe surface (so k8s liveness/readiness probes work),
-# agentd serving its own MCP for composability, UTC-cron scheduling, OTLP trace
-# export, horizontal scaling (sharding + work-claim leases + autoscaling signals +
-# the capacity surface), and SIGHUP + inotify config hot-reload (a ConfigMap volume
-# swap reloads in place). Every one of those is hand-rolled and adds NO dependency.
+# The image ships the **cloud-native feature set**
+# (`a2a,metrics,cron,otel,hot-reload,config-watch`): the A2A v2 HTTPS listener
+# (RFC 0029, the external channel + delegation peers), the `/healthz`+`/readyz`+
+# `/metrics` HTTP probe surface (so k8s liveness/readiness probes work), UTC-cron
+# scheduling, OTLP trace+log export, and SIGHUP + inotify config hot-reload (a
+# ConfigMap volume swap reloads in place). All but `a2a` (which pulls the TLS
+# stack) are hand-rolled and add NO dependency.
 # As of v2.0.0, HTTPS is the primary transport for both intelligence and MCP, so
 # `tls` is ON by DEFAULT: the binary carries pure-Rust rustls (`ring`, no cmake/C)
 # + bundled webpki roots — serde/serde_json + libc + rustls/ring/webpki-roots, no
@@ -16,7 +16,7 @@
 # empty base: ~few MB, no shell, no libc, no package manager. Nothing to attack.
 #
 # Change the capability surface at build time with FEATURES, e.g.:
-#   docker build --build-arg FEATURES=metrics,serve-mcp,cron,otel,vsock .
+#   docker build --build-arg FEATURES=a2a,metrics,cron,otel .
 #   docker build --build-arg FEATURES= .          # the flag-free build (still TLS via default)
 # `tls` (default) needs no system CA bundle — the webpki roots are bundled. To drop
 # TLS entirely (reach https only via a `unix:` TLS-terminating sidecar), build with
@@ -24,7 +24,7 @@
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.88-alpine AS builder
-ARG FEATURES="metrics,serve-mcp,cron,otel,cluster,hot-reload,config-watch,aauth"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one

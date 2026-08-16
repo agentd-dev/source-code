@@ -67,8 +67,7 @@ and exits.
 $ agentd \
     --instruction "summarize the open PRs and post a digest" \
     --intelligence https://gw.example/v1 \
-    --mcp github=https://mcp-github.internal/mcp \
-    --mode once
+    --mcp github=https://mcp-github.internal/mcp
 ```
 
 The loop and supervisor process tree are implemented.
@@ -204,9 +203,22 @@ together without a collector.
 
 ## 4. Supervisor-minted depth & identity (the trust boundary)
 
-`depth`, `agent_id`, `agent_path`, and the parent edge are **minted by the
-supervisor from its own supervision record** — never read from the child's
-request:
+```mermaid
+flowchart TB
+  root["root · depth 0<br/>scope {fs, github, db}"]
+  root -->|"spawn · scope ∩ subset"| c1["depth 1<br/>scope {fs, github}"]
+  root -->|spawn| c2["depth 1<br/>scope {db}"]
+  c1 -->|"narrows again"| g1["depth 2<br/>scope {fs}"]
+  classDef accent stroke:#22c55e,stroke-width:1.5px,color:#f4f4f5;
+  class root accent;
+```
+
+Scope only ever **narrows** down the tree — a child's grant is the intersection
+of its request with its parent's, so no subtree can re-acquire a capability the
+root was refused. Depth, identity, and the caps (depth ≤ 4, breadth ≤ 8/node,
+≤ 64/tree) are **minted by the supervisor from its own supervision record** —
+`depth`, `agent_id`, `agent_path`, and the parent edge are never read from the
+child's request:
 
 ```rust
 // inside the subagent.spawn handler, running IN the supervisor
@@ -559,7 +571,6 @@ Knobs that exist on the CLI/env surface today (`config.rs`):
 | `--max-tokens N` | `AGENT_MAX_TOKENS` | 200000 | token budget |
 | `--deadline <dur>` | `AGENT_DEADLINE` | 600s | wall-clock deadline |
 | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | 25s | whole-tree drain budget (`< pod grace`) |
-| `--mode <m>` | `AGENT_MODE` | once | `once` / `loop` / `reactive` / `schedule` / `workflow` |
 | `--run-id <id>` | `AGENT_RUN_ID` | generated | idempotency key for re-trigger |
 
 RFC-level chokepoint and detector defaults (not CLI flags in v1):

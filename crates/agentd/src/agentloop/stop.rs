@@ -92,9 +92,10 @@ pub struct SubscriptionRequest {
     /// Optional content predicate (raw self-tool args, e.g.
     /// `{"pointer":"/status","op":"eq","value":"ready"}`) for a conditional
     /// `await_resource` subscribe — the route fires only when the resource content
-    /// satisfies it. Validated at tool-call time; re-parsed to a
-    /// [`Condition`](crate::triggers::router::Condition) when the daemon arms the
-    /// route. `None` = fire on any update (plain `subscribe`). Skipped in the wire
+    /// satisfies it. Validated at tool-call time; re-parsed to a content-predicate
+    /// condition when the daemon arms the route (the v1 `triggers::router` that
+    /// consumed it was removed with the mode cut-over). `None` = fire on any update
+    /// (plain `subscribe`). Skipped in the wire
     /// form when absent, so an `unsubscribe`/plain `subscribe` carries no extra key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<serde_json::Value>,

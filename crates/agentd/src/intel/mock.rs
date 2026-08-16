@@ -21,6 +21,21 @@
 //! a rapid burst of spawns that trips the spawn-rate limiter, RFC 0009 §3.6);
 //! `slow`/`hang` hold the response to exercise the stuck/deadline detectors.
 //! Small enough to ship; it makes the loop + self-* tools observable end to end.
+//!
+//! **Programmable scripts** (agentd 2.0 e2e): `file:<path>` loads a JSON
+//! playbook so a test scripts any conversation without a new built-in:
+//!
+//! ```json
+//! { "turns": [ {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
+//!              {"content": "done", "usage": {"prompt_tokens": 100, "completion_tokens": 20}} ],
+//!   "match": [ {"when_contains": "\"preflight\"", "content": "{\"intent\":\"task\"}"} ] }
+//! ```
+//!
+//! `match[]` rules are tried first (the first whose `when_contains` substring
+//! appears in the request body answers); otherwise `turns[i]` answers where `i`
+//! is the number of `role: tool` messages already in the transcript (clamped to
+//! the last turn). A turn carries `content` (final text) or `tool_calls`, an
+//! optional `usage`, and an optional `delay_ms`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -56,6 +71,23 @@ fn handle(mut stream: TcpStream, script: &str) {
     let Some(body) = read_request_body(&mut stream) else {
         return;
     };
+    if let Some(path) = script.strip_prefix("file:") {
+        let payload = match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()))
+        {
+            Ok(playbook) => playbook_response(&playbook, &body),
+            Err(e) => final_answer(&format!("mock-llm: cannot load playbook {path}: {e}")),
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
     // A `role:tool` message means the model already called a tool, so the next
     // turn is a final answer. The `gate` script needs the COUNT (define → run →
     // final is a three-phase conversation).
@@ -180,6 +212,71 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
     }
 }
 
+/// Answer from a `file:` playbook (see the module doc): a `match` rule by
+/// request-body substring first, else the turn indexed by the number of tool
+/// results already in the transcript.
+fn playbook_response(playbook: &serde_json::Value, body: &str) -> String {
+    let tool_results =
+        body.matches("\"role\":\"tool\"").count() + body.matches("\"role\": \"tool\"").count();
+    let turn = playbook
+        .get("match")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|rules| {
+            rules.iter().find(|r| {
+                r.get("when_contains")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|needle| body.contains(needle))
+            })
+        })
+        .or_else(|| {
+            let turns = playbook.get("turns")?.as_array()?;
+            turns.get(tool_results.min(turns.len().saturating_sub(1)))
+        });
+    let Some(turn) = turn else {
+        return final_answer("mock-llm: empty playbook");
+    };
+    if let Some(ms) = turn.get("delay_ms").and_then(serde_json::Value::as_u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    let usage = turn.get("usage").cloned();
+    let mut resp: serde_json::Value = if let Some(calls) =
+        turn.get("tool_calls").and_then(serde_json::Value::as_array)
+    {
+        let tool_calls: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let args = c.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                let args = match args {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                serde_json::json!({"id": format!("call_{}", i + 1), "type": "function",
+                    "function": {"name": c.get("name").and_then(serde_json::Value::as_str).unwrap_or(""), "arguments": args}})
+            })
+            .collect();
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": serde_json::Value::Null, "tool_calls": tool_calls},
+                         "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+        })
+    } else {
+        let content = match turn.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => "mock-llm done".to_string(),
+        };
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 5}
+        })
+    };
+    if let Some(u) = usage {
+        resp["usage"] = u;
+    }
+    resp.to_string()
+}
+
 fn final_answer(text: &str) -> String {
     serde_json::json!({
         "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
@@ -250,6 +347,51 @@ mod tests {
                 "do a trivial subtask"
             );
         }
+    }
+
+    #[test]
+    fn a_playbook_answers_by_match_rule_then_by_turn_index() {
+        let pb: serde_json::Value = serde_json::json!({
+            "turns": [
+                {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
+                {"content": "all done", "usage": {"prompt_tokens": 500, "completion_tokens": 50}}
+            ],
+            "match": [{"when_contains": "PREFLIGHT", "content": {"intent": "status"}}]
+        });
+        // Turn 0: the scripted tool call (arguments serialized as a JSON string).
+        let t0 = openai::parse_response(
+            playbook_response(&pb, r#"{"messages":[{"role":"user","content":"hi"}]}"#).as_bytes(),
+        )
+        .unwrap();
+        assert!(t0.wants_tools());
+        assert_eq!(t0.tool_calls[0].name, "memory.set");
+        assert_eq!(t0.tool_calls[0].arguments["value"], 1);
+        // Turn 1 (one tool result seen): the final answer with the scripted usage.
+        let t1 = openai::parse_response(
+            playbook_response(&pb, r#"{"messages":[{"role":"tool","content":"ok"}]}"#).as_bytes(),
+        )
+        .unwrap();
+        assert!(!t1.wants_tools());
+        assert_eq!(t1.text.as_deref(), Some("all done"));
+        assert_eq!(t1.usage.input_tokens, 500);
+        assert_eq!(t1.usage.output_tokens, 50);
+        // Beyond the last turn: clamps to the last.
+        let t9 = openai::parse_response(
+            playbook_response(&pb, r#"[{"role":"tool"},{"role":"tool"},{"role":"tool"}]"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(t9.text.as_deref(), Some("all done"));
+        // A match rule wins over the turn index; object content is serialized.
+        let m = openai::parse_response(
+            playbook_response(
+                &pb,
+                r#"{"messages":[{"role":"system","content":"PREFLIGHT"}]}"#,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(m.text.as_deref(), Some(r#"{"intent":"status"}"#));
     }
 
     #[test]

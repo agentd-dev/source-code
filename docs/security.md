@@ -37,12 +37,15 @@ Concretely, the posture has eight load-bearing parts:
 3. **Process isolation + distilled returns** form an injection firewall.
 4. **All MCP server content is untrusted** — including tool descriptions (tool poisoning).
 5. **SSRF defenses** live in the one hand-rolled HTTP client.
-6. **No local execution.** agentd runs no code of its own — no `exec`/shell tool exists; the
-   only process it launches is a re-exec of the trusted agentd binary itself (a subagent),
-   never a user- or model-supplied argv.
+6. **No local execution by default.** agentd runs no code of its own; the only process it
+   launches is a re-exec of the trusted agentd binary itself (a subagent), never a user- or
+   model-supplied argv. The `exec` tool exists as a *contract* but is **mapping-only** — it
+   does nothing unless you either delegate it off-box (map it to an MCP server via
+   `tools.overrides`) or explicitly opt into a **guarded local runner** (§exec below). The
+   default binary can't run local commands at all.
 7. **Every network surface is HTTPS with authenticated identity** — intelligence, the MCP
-   client, the served self-MCP, A2A, and operator control are all HTTP(S) with mTLS/bearer
-   auth (loopback `http://` for dev); agentd links no unix/vsock transport.
+   client, the A2A listener (the external channel + operator control) are all HTTP(S) with
+   mTLS/bearer auth (loopback `http://` for dev); agentd links no unix/vsock transport.
 8. **Secrets are env/flag only**, behind a `resolve()` front door, never logged.
 
 ---
@@ -233,8 +236,8 @@ Concrete rules:
 ## 5. SSRF defenses in the hand-rolled HTTP client
 
 agentd's single hand-rolled HTTP/1.1 + SSE client is the **only** outbound network primitive,
-and therefore the only SSRF chokepoint. It carries every network surface — the `https://`
-intelligence transport, the MCP client, A2A, and the served self-MCP. Guards apply **after DNS
+and therefore the only SSRF chokepoint. It carries every outbound network surface — the
+`https://` intelligence transport, the MCP client, and the A2A client. Guards apply **after DNS
 resolution and on every redirect hop**:
 
 - **HTTPS in prod.** Plaintext `http://` targets are rejected by default; loopback dev may relax
@@ -331,7 +334,7 @@ These security-relevant knobs exist in the binary today
 | `--mcp-tags name=tag,tag` | — | — | tag a server's tools `untrusted_input` / `sensitive` / `egress` for the Rule-of-Two |
 | `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | — | bearer/key for the intelligence endpoint (redacted in logs) |
 | `--intelligence <URI>` | `AGENT_INTELLIGENCE` | — | `https://host/…` (loopback `http://` for a same-host dev gateway; any other scheme is exit 2) |
-| `--serve-mcp <https://host:port>` | `AGENT_SERVE_MCP` | off | serve agent's own MCP over HTTP(S) with mTLS/bearer auth (loopback `http://` for dev) |
+| `--serve-mcp <https://host:port>` (→ `a2a.listen`) | `AGENT_SERVE_MCP` | off | arm the A2A v2 listener — the external channel + operator control — over HTTP(S) with mTLS/bearer auth (loopback `http://` for dev) |
 | `--mcp name=<endpoint>` | — | — | declare a remote MCP server over Streamable HTTP (repeatable; operator-only, never model-derived) |
 | `--max-steps <N>` | `AGENT_MAX_STEPS` | 50 | per-run step cap (a bound on a runaway/injected loop) |
 | `--max-tokens <N>` | `AGENT_MAX_TOKENS` | 200000 | token budget |
@@ -340,15 +343,18 @@ These security-relevant knobs exist in the binary today
 
 The intelligence-URI validator rejects any scheme outside `https://` (or a **loopback**
 `http://`) and exits **2** on a bad value — before any side effect, including any LLM
-round-trip. The same https-only rule holds for `--mcp`, `--serve-mcp`, and `--a2a-peer`.
+round-trip. The same https-only rule holds for `--mcp` servers and the `a2a.listen` /
+`a2a.peers` endpoints.
 
 ---
 
-## 9. Self-MCP serving: HTTPS with authenticated identity
+## 9. The A2A listener: HTTPS with authenticated identity
 
-The self-MCP — `subagent.*`, the `agent://` state resources, and the operator control family —
-is served over **Streamable HTTP(S)**. Trust is **never derived from the transport**; it is
-established per request by an authenticated identity:
+agentd 2.0's external channel is the **A2A listener** (`a2a.listen`, RFC 0029) — the
+conversation surface plus the operator control family (the v1 served self-MCP was removed in
+the mode cut-over). It is served over **HTTPS**. Trust is **never derived from the transport**;
+it is established per request by an authenticated identity, resolved to a **principal**
+(`operator` / `user` / `agent` / `anonymous`) and authorized against a role matrix:
 
 - **mTLS is the primary identity.** With `--serve-cert`/`--serve-key`/`--serve-client-ca`, the
   TLS acceptor verifies the client certificate against the pinned CA; a presented, verified cert
@@ -384,6 +390,60 @@ Stated plainly so you size the surrounding environment correctly:
   constrained-shape returns are a documented defense-in-depth recommendation (§3).
 - **No dynamic / network-supplied config.** Config is never read from the network; the model can
   never register an MCP server or an `exec` binary.
+
+---
+
+## 11. The `exec` tool — a guarded local command runner (default-OFF)
+
+Sometimes an operator genuinely wants the agent to run a local command. `exec`
+(RFC 0028 §exec) exists for that — but it inverts to the safe default and is
+**off at two independent layers**:
+
+1. **Build** — the runner compiles only with `--features exec`. The default binary
+   cannot run a local command at all; `exec` is a *mapping-only contract*.
+2. **Runtime** — even in an `exec` build it does nothing until `security.exec.enabled: true`.
+
+Without both, `exec` behaves like any mapping-only contract: unavailable unless you
+**delegate it off-box** by mapping it to an MCP server (`tools.overrides`), which
+keeps the no-local-execution posture (the command runs in the MCP server's sandbox,
+not agentd's process).
+
+When you *do* enable the local runner, every call is fenced:
+
+```yaml
+security:
+  exec:
+    enabled: true
+    allow: [git, ls, cat]       # allow-list of argv[0]; EMPTY = deny everything
+    workdir: /workspace         # commands run here; a requested cwd must resolve inside it
+    timeout: 30s                # a longer requested timeout is clamped; the child is killed
+    max_output: 1048576         # stdout+stderr are truncated to this many bytes
+    env: [PATH, HOME]           # ONLY these env vars reach the child — never the agent's secrets
+```
+
+The controls, and why:
+
+- **argv, never a shell.** `exec` runs `{cmd, args}` via `execve` directly — there is
+  no `sh -c`, so no metacharacters, globbing, `$(…)`, or pipes, and **no command
+  injection**. If you truly need a shell, allow-list `bash` and call it explicitly
+  (`{cmd: bash, args: ["-c", "…"]}`) — a conscious operator choice.
+- **Allow-list.** `argv[0]` must be in `allow`; an empty list denies everything, so
+  `enabled: true` alone runs nothing.
+- **Workdir confinement.** A requested `cwd` is canonicalized and must resolve inside
+  `workdir` — no `..` or symlink escape.
+- **Timeout + output cap.** Long commands are killed at the deadline; captured output
+  is bounded.
+- **Minimal environment.** The child inherits only the named `env` variables — the
+  agent's own environment (and its secrets) is never passed through.
+- **Rule-of-Two.** `exec` carries the `sensitive` + `egress` trifecta tags, so the
+  validation authority (§2) refuses to grant it to an agent that also has untrusted
+  input, unless `--allow-trifecta` is set explicitly.
+- **A2A principals can't call it.** `exec` is granted to the root agent, workflows,
+  and subagents — never to external `user`/`agent` A2A callers.
+
+Output: `{ stdout, stderr, exit_code, timed_out }`. Every run is logged
+(`exec.run{cmd, cwd, timeout_ms, caller}`) — the command and its confinement, never
+its output.
 
 ---
 

@@ -18,35 +18,39 @@ pub mod report;
 pub use harness::Harness;
 pub use report::Report;
 
-/// The conformance families.
+/// The conformance families. agentd 2.0: the v1-only families (`mcp-server`,
+/// `mcp-client`, `work-claim`) were retired with the mode cut-over and rebuilt as
+/// the v2 families below (P7): the durable-store contract, the crash/restore
+/// durability contract, the internal tool registry, and A2A conversations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
-    /// agentd as an MCP **server** (`--serve-mcp`): the JSON-RPC 2.0 + MCP
-    /// protocol it must speak to peers.
-    McpServer,
-    /// agentd as an MCP **client**: the requests it sends a backing server.
-    McpClient,
     /// The supervisor contract: the exit-code table, drain, fail-fast.
     Supervisor,
-    /// The agentic ReAct loop end-to-end: tool calls → execution → final answer.
-    AgentLoop,
     /// Security posture: trifecta refusal, secret redaction, tool scoping.
     Security,
-    /// The work-claim / lease convention (RFC 0019 §3, the frozen `work.*`
-    /// contract RFC 0015 §5.6): atomic single-grant + the claim→ack lifecycle a
-    /// `cluster` agentd drives against a coordination server.
-    WorkClaim,
+    /// The durable-store contract (RFC 0025): boot against a store, persist the
+    /// manifest/runs, and resume a completed `once` start after restart.
+    Store,
+    /// The crash-durability contract (RFC 0025/0026 §4.4): a SIGKILL at a kill
+    /// point is recovered — the pending inbox event and running step replay.
+    Durability,
+    /// The tool registry (RFC 0028): internal tools round-trip to the supervisor,
+    /// an unknown tool is answered as an error, and the introspected surface.
+    Tools,
+    /// A2A conversations (RFC 0029): the JSON-RPC surface — command DataParts,
+    /// natural-language turns landing as task artifacts, GetTask/ListTasks, card.
+    A2aConversation,
 }
 
 impl Category {
     pub fn as_str(self) -> &'static str {
         match self {
-            Category::McpServer => "mcp-server",
-            Category::McpClient => "mcp-client",
             Category::Supervisor => "supervisor",
-            Category::AgentLoop => "agent-loop",
             Category::Security => "security",
-            Category::WorkClaim => "work-claim",
+            Category::Store => "store",
+            Category::Durability => "durability",
+            Category::Tools => "tools",
+            Category::A2aConversation => "a2a-conversation",
         }
     }
 }
@@ -126,11 +130,11 @@ pub fn run_check(h: &Harness, check: &Check) -> Outcome {
 /// Every conformance check across all families, in a stable order.
 pub fn all_checks() -> Vec<Check> {
     let mut v = Vec::new();
-    v.extend(checks::mcp_server::checks());
-    v.extend(checks::mcp_client::checks());
     v.extend(checks::supervisor::checks());
-    v.extend(checks::agent_loop::checks());
     v.extend(checks::security::checks());
-    v.extend(checks::work_claim::checks());
+    v.extend(checks::store::checks());
+    v.extend(checks::durability::checks());
+    v.extend(checks::tools::checks());
+    v.extend(checks::a2a_conversation::checks());
     v
 }

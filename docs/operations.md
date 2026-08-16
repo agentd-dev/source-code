@@ -1,5 +1,18 @@
 # Operations
 
+> **agentd 2.0.** The 1.x control plane described below — the served self-MCP
+> management transport and the `agent://` resource surface — was removed. In 2.0
+> the control/observability plane is **A2A** (`a2a.listen`, RFC 0029): the
+> operator admin family is `a2a.drain` / `a2a.lameduck` / `a2a.cancel`; the read
+> surface is the A2A `status` and `config` commands (plus `--capabilities`,
+> `--config-schema=2`, `--validate-config`); and the durable **audit stream**
+> (`observability.audit`) records every principal action. Hot reload (SIGHUP +
+> `lifecycle.watch_config`) is unchanged. The 1.x specifics below are retained as
+> a migration reference.
+
+---
+
+
 `agentd` is one process running one agent, but a fleet of them is a *control
 plane*. This page is for the operator (and the `agentctl` it drives): how to
 talk to a running instance, the tools that steer it without restarting it, how a

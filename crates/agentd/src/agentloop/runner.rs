@@ -373,7 +373,7 @@ impl<'a> Session<'a> {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .trim();
-                        if crate::agentd_uri::is_agentd(uri) {
+                        if uri.starts_with("agentd://") || uri.starts_with("agent://") {
                             self_handler.read_resource(uri).unwrap_or_else(|| {
                                 (format!("unknown agentd resource: {uri}"), true)
                             })

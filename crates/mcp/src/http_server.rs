@@ -42,12 +42,30 @@ const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 /// Cap on a request body (JSON-RPC frames are small; this bounds a hostile peer).
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// A verified mTLS peer's identity, surfaced to trust classification (RFC 0029
+/// §10.3). All-empty for a plain / no-client-cert connection. rustls has already
+/// verified the chain; these fields are only *read* from the leaf certificate.
+#[derive(Default, Clone)]
+pub struct PeerId {
+    /// A verified client certificate was presented (mutual TLS).
+    pub cert: bool,
+    /// The leaf certificate's subject CN, if any.
+    pub subject: Option<String>,
+    /// The leaf certificate's SANs (DNS / URI / IP); a SPIFFE X.509-SVID's
+    /// `spiffe://…` arrives here as a URI SAN.
+    pub sans: Vec<String>,
+}
+
 /// The parts of an inbound request an [`HttpAuth`] classifies trust from.
 pub struct RequestParts<'a> {
     /// The request's headers (lowercased names), e.g. to read `authorization`.
     pub headers: &'a [(String, String)],
     /// Whether the peer presented a verified client certificate (mutual TLS).
     pub peer_cert: bool,
+    /// The verified mTLS leaf subject CN (RFC 0029 §10.3), if any.
+    pub peer_subject: Option<&'a str>,
+    /// The verified mTLS leaf SANs (DNS / URI / IP); empty without a client cert.
+    pub peer_sans: &'a [String],
 }
 
 impl RequestParts<'_> {
@@ -75,6 +93,18 @@ impl HttpAuth for AllowAll {
     fn authenticate(&self, _parts: &RequestParts) -> Option<PeerOrigin> {
         Some(PeerOrigin::Management)
     }
+}
+
+/// Per-listener serving options beyond the handler/auth pair.
+#[derive(Default, Clone)]
+pub struct ServeOptions {
+    /// Extra allowed browser `Origin` values (`scheme://host[:port]`, exact
+    /// match) beyond the always-allowed loopback origins. A request from an
+    /// allowed origin is served **with CORS response headers** (and its
+    /// `OPTIONS` preflight answered), so a browser client on that origin can
+    /// actually read the reply; any other cross-site origin stays 403
+    /// (DNS-rebinding defense).
+    pub extra_origins: Vec<String>,
 }
 
 /// How accepted TCP connections are wrapped: plaintext (loopback dev) or TLS
@@ -109,6 +139,31 @@ pub fn spawn_accept_http(
     conn_counter: Arc<AtomicU64>,
     write_timeout: Duration,
 ) -> io::Result<()> {
+    spawn_accept_http_opts(
+        listener,
+        acceptor,
+        handler,
+        auth,
+        subs,
+        conn_counter,
+        write_timeout,
+        ServeOptions::default(),
+    )
+}
+
+/// [`spawn_accept_http`] with explicit [`ServeOptions`] (extra browser origins).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_accept_http_opts(
+    listener: TcpListener,
+    acceptor: Arc<HttpAcceptor>,
+    handler: Arc<dyn Handler>,
+    auth: Arc<dyn HttpAuth>,
+    subs: SubRegistry,
+    conn_counter: Arc<AtomicU64>,
+    write_timeout: Duration,
+    opts: ServeOptions,
+) -> io::Result<()> {
+    let opts = Arc::new(opts);
     thread::Builder::new()
         .name("serve-http".into())
         .spawn(move || {
@@ -118,6 +173,7 @@ pub fn spawn_accept_http(
                 let auth = Arc::clone(&auth);
                 let subs = Arc::clone(&subs);
                 let conn_counter = Arc::clone(&conn_counter);
+                let opts = Arc::clone(&opts);
                 thread::Builder::new()
                     .name("serve-http-conn".into())
                     .spawn(move || {
@@ -129,6 +185,7 @@ pub fn spawn_accept_http(
                             &subs,
                             &conn_counter,
                             write_timeout,
+                            &opts,
                         );
                     })
                     .ok();
@@ -137,6 +194,7 @@ pub fn spawn_accept_http(
         .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_and_serve(
     tcp: TcpStream,
     acceptor: &HttpAcceptor,
@@ -145,21 +203,44 @@ fn accept_and_serve(
     subs: &SubRegistry,
     conn_counter: &AtomicU64,
     write_timeout: Duration,
+    opts: &ServeOptions,
 ) {
     let _ = tcp.set_write_timeout(Some(write_timeout));
     let _ = tcp.set_read_timeout(Some(write_timeout));
     match acceptor {
         HttpAcceptor::Plain => {
-            serve_conn(tcp, false, handler, auth, subs, conn_counter);
+            serve_conn(
+                tcp,
+                PeerId::default(),
+                handler,
+                auth,
+                subs,
+                conn_counter,
+                opts,
+            );
         }
         // A failed TLS/mTLS handshake never reaches the protocol layer.
         #[cfg(feature = "tls")]
         HttpAcceptor::Tls(tls) => {
             if let Ok(stream) = tls.accept(tcp) {
-                let peer_cert = net::tls::peer_presented_cert(&stream);
-                serve_conn(stream, peer_cert, handler, auth, subs, conn_counter);
+                let peer = peer_id(&stream);
+                serve_conn(stream, peer, handler, auth, subs, conn_counter, opts);
             }
         }
+    }
+}
+
+/// Lift the verified mTLS peer's identity (subject CN + SANs) for trust
+/// classification (RFC 0029 §10.3). `default()` when no client cert was presented.
+#[cfg(feature = "tls")]
+fn peer_id(stream: &net::tls::ServerTlsStream) -> PeerId {
+    match net::tls::peer_identity(stream) {
+        Some(id) => PeerId {
+            cert: true,
+            subject: id.subject_cn,
+            sans: id.sans,
+        },
+        None => PeerId::default(),
     }
 }
 
@@ -167,11 +248,12 @@ fn accept_and_serve(
 /// concrete stream so plain TCP and the TLS stream share one code path.
 fn serve_conn<S: Read + Write + Send + 'static>(
     stream: S,
-    peer_cert: bool,
+    peer: PeerId,
     handler: &Arc<dyn Handler>,
     auth: &Arc<dyn HttpAuth>,
     subs: &SubRegistry,
     conn_counter: &AtomicU64,
+    opts: &ServeOptions,
 ) {
     let mut reader = BufReader::new(stream);
     let Some(req) = read_request(&mut reader) else {
@@ -181,17 +263,31 @@ fn serve_conn<S: Read + Write + Send + 'static>(
     // DNS-rebinding defense (Streamable HTTP security MUST / RFC 0005): a browser
     // always sends `Origin`, so a page tricked into POSTing to a local agentd
     // carries its own site there. Reject any request whose `Origin` is present and
-    // NOT a loopback origin — a non-browser control-plane / mesh caller sends no
-    // `Origin` and is unaffected. This is a transport-level guard, applied BEFORE
-    // auth (a rebind presents no credential either, but defense-in-depth covers the
-    // loopback `AllowAll` dev path where auth alone would let it through).
-    if !origin_allowed(&req.headers) {
-        let _ = write_simple(
-            reader.get_mut(),
-            403,
-            "Forbidden",
-            b"cross-origin request rejected",
-        );
+    // NOT a loopback origin (or a configured `ServeOptions::extra_origins` entry) —
+    // a non-browser control-plane / mesh caller sends no `Origin` and is
+    // unaffected. This is a transport-level guard, applied BEFORE auth (a rebind
+    // presents no credential either, but defense-in-depth covers the loopback
+    // `AllowAll` dev path where auth alone would let it through). An ALLOWED
+    // browser origin is echoed back as CORS headers so the page can read replies.
+    let cors = match check_origin(&req.headers, &opts.extra_origins) {
+        OriginCheck::NoBrowser => None,
+        OriginCheck::Allowed(o) => Some(o),
+        OriginCheck::Denied => {
+            let _ = write_simple(
+                reader.get_mut(),
+                403,
+                "Forbidden",
+                b"cross-origin request rejected",
+                None,
+            );
+            return;
+        }
+    };
+    // A CORS preflight (`OPTIONS`) carries no credential and never reaches the
+    // handler — answer it before auth so a browser on an allowed origin can
+    // proceed to the real POST.
+    if req.method.eq_ignore_ascii_case("OPTIONS") {
+        let _ = write_preflight(reader.get_mut(), cors.as_deref());
         return;
     }
 
@@ -199,12 +295,14 @@ fn serve_conn<S: Read + Write + Send + 'static>(
     let origin = {
         let parts = RequestParts {
             headers: &req.headers,
-            peer_cert,
+            peer_cert: peer.cert,
+            peer_subject: peer.subject.as_deref(),
+            peer_sans: &peer.sans,
         };
         auth.authenticate(&parts)
     };
     let Some(origin) = origin else {
-        let _ = write_simple(reader.get_mut(), 401, "Unauthorized", b"");
+        let _ = write_simple(reader.get_mut(), 401, "Unauthorized", b"", cors.as_deref());
         return;
     };
 
@@ -216,6 +314,7 @@ fn serve_conn<S: Read + Write + Send + 'static>(
             405,
             "Method Not Allowed",
             b"POST a JSON-RPC request, or POST subscriptions/listen for the SSE stream",
+            cors.as_deref(),
         );
         return;
     }
@@ -226,21 +325,36 @@ fn serve_conn<S: Read + Write + Send + 'static>(
     let incoming: Result<Incoming, _> = serde_json::from_slice(&req.body);
     match incoming {
         Ok(Incoming::Request(rpc_req)) if rpc_req.method == method::SUBSCRIPTIONS_LISTEN => {
-            serve_listen(reader, rpc_req, origin, conn, handler, subs);
+            serve_listen(
+                reader,
+                rpc_req,
+                origin,
+                conn,
+                handler,
+                subs,
+                cors.as_deref(),
+            );
         }
         // A server-streaming method (the embedder declares them — e.g. the A2A
         // streaming pair): the response is an SSE stream of JSON-RPC frames.
         Ok(Incoming::Request(rpc_req)) if handler.streams(&rpc_req.method) => {
-            serve_stream(reader, rpc_req, origin, conn, handler);
+            serve_stream(reader, rpc_req, origin, conn, handler, cors.as_deref());
             remove_and_disconnect(subs, conn, origin, handler);
         }
         Ok(Incoming::Request(rpc_req)) => {
-            serve_unary(reader.get_mut(), rpc_req, origin, conn, handler);
+            serve_unary(
+                reader.get_mut(),
+                rpc_req,
+                origin,
+                conn,
+                handler,
+                cors.as_deref(),
+            );
             remove_and_disconnect(subs, conn, origin, handler);
         }
         // A notification POST (e.g. notifications/initialized) → 202, no body.
         Ok(Incoming::Notification(_)) | Ok(Incoming::Response(_)) => {
-            let _ = write_simple(reader.get_mut(), 202, "Accepted", b"");
+            let _ = write_simple(reader.get_mut(), 202, "Accepted", b"", cors.as_deref());
             remove_and_disconnect(subs, conn, origin, handler);
         }
         Err(_) => {
@@ -249,6 +363,7 @@ fn serve_conn<S: Read + Write + Send + 'static>(
                 400,
                 "Bad Request",
                 b"invalid JSON-RPC frame",
+                cors.as_deref(),
             );
             remove_and_disconnect(subs, conn, origin, handler);
         }
@@ -266,9 +381,13 @@ fn serve_stream<S: Read + Write + Send + 'static>(
     origin: PeerOrigin,
     conn: u64,
     handler: &Arc<dyn Handler>,
+    cors: Option<&str>,
 ) {
     let mut stream = reader.into_inner();
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n{}Connection: close\r\n\r\n",
+        cors_headers(cors)
+    );
     if stream
         .write_all(head.as_bytes())
         .and_then(|_| stream.flush())
@@ -321,6 +440,7 @@ fn serve_unary<S: Write>(
     origin: PeerOrigin,
     conn: u64,
     handler: &Arc<dyn Handler>,
+    cors: Option<&str>,
 ) {
     // A null sink for the dispatch's `writer` arg: unary methods don't push, and
     // a stray write must never corrupt the HTTP response.
@@ -334,7 +454,8 @@ fn serve_unary<S: Write>(
         String::new()
     };
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session}{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        cors_headers(cors),
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -354,11 +475,15 @@ fn serve_listen<S: Read + Write + Send + 'static>(
     conn: u64,
     handler: &Arc<dyn Handler>,
     subs: &SubRegistry,
+    cors: Option<&str>,
 ) {
     let uris = listen_uris(&req);
     let mut stream = reader.into_inner();
     // SSE response head.
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n{}Connection: close\r\n\r\n",
+        cors_headers(cors)
+    );
     if stream
         .write_all(head.as_bytes())
         .and_then(|_| stream.flush())
@@ -423,13 +548,199 @@ fn remove_and_disconnect(
 }
 
 /// A minimal status-only HTTP response (no JSON-RPC body).
-fn write_simple<S: Write>(stream: &mut S, code: u16, reason: &str, body: &[u8]) -> io::Result<()> {
+fn write_simple<S: Write>(
+    stream: &mut S,
+    code: u16,
+    reason: &str,
+    body: &[u8],
+    cors: Option<&str>,
+) -> io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        cors_headers(cors),
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
+    stream.flush()
+}
+
+/// The CORS response headers for an allowed browser origin (empty otherwise).
+/// The origin is echoed (never `*`) so a credentialed fetch works, and
+/// `Mcp-Session-Id` is exposed for the initialize handshake.
+fn cors_headers(origin: Option<&str>) -> String {
+    match origin {
+        Some(o) => format!(
+            "Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\nAccess-Control-Expose-Headers: Mcp-Session-Id\r\n"
+        ),
+        None => String::new(),
+    }
+}
+
+/// Answer a CORS preflight (`OPTIONS`). An allowed origin gets the grant; a
+/// non-browser `OPTIONS` (no `Origin`) gets a plain 204.
+fn write_preflight<S: Write>(stream: &mut S, origin: Option<&str>) -> io::Result<()> {
+    let grant = match origin {
+        Some(o) => format!(
+            "Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: content-type, authorization, last-event-id, mcp-session-id\r\nAccess-Control-Max-Age: 600\r\n"
+        ),
+        None => String::new(),
+    };
+    let head =
+        format!("HTTP/1.1 204 No Content\r\n{grant}Content-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.flush()
+}
+
+// ---- raw-HTTP surface (non-JSON-RPC embedders, e.g. the webhook listener) ----
+
+/// A raw inbound HTTP request handed straight to a [`RawHandler`]: method, target
+/// (path + optional query), lowercased headers, and the raw body. Unlike the
+/// [`Handler`] path this does no JSON-RPC parsing and no transport-level auth —
+/// the embedder routes by [`RawRequest::path`] and authenticates itself (e.g. a
+/// per-webhook HMAC over the raw body). The DNS-rebind `Origin` guard and TLS
+/// termination still apply.
+pub struct RawRequest {
+    pub method: String,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Whether the peer presented a verified client certificate (mutual TLS).
+    pub peer_cert: bool,
+    /// The verified mTLS leaf subject CN (RFC 0029 §10.3), if any.
+    pub peer_subject: Option<String>,
+    /// The verified mTLS leaf SANs (DNS / URI / IP); empty without a client cert.
+    pub peer_sans: Vec<String>,
+}
+
+impl RawRequest {
+    /// Header `name` (compare lowercased), if present.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+    /// The path portion of the target (any `?query` dropped).
+    pub fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or(&self.target)
+    }
+}
+
+/// A raw HTTP response a [`RawHandler`] returns.
+pub struct RawResponse {
+    pub status: u16,
+    pub reason: &'static str,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    /// A JSON response.
+    pub fn json(status: u16, reason: &'static str, body: impl Into<Vec<u8>>) -> RawResponse {
+        RawResponse {
+            status,
+            reason,
+            content_type: "application/json",
+            body: body.into(),
+        }
+    }
+    /// A short text response.
+    pub fn text(status: u16, reason: &'static str, body: impl Into<Vec<u8>>) -> RawResponse {
+        RawResponse {
+            status,
+            reason,
+            content_type: "text/plain",
+            body: body.into(),
+        }
+    }
+}
+
+/// A raw-HTTP embedder surface (the agentd webhook listener). One call per
+/// request; the embedder routes and authenticates itself.
+pub trait RawHandler: Send + Sync + 'static {
+    fn handle(&self, req: &RawRequest) -> RawResponse;
+}
+
+/// Spawn a raw-HTTP accept loop — TLS-terminated like [`spawn_accept_http`], with
+/// the same DNS-rebind `Origin` guard — dispatching each request to `handler`.
+pub fn spawn_accept_raw(
+    listener: TcpListener,
+    acceptor: Arc<HttpAcceptor>,
+    handler: Arc<dyn RawHandler>,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("serve-webhook".into())
+        .spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let acceptor = Arc::clone(&acceptor);
+                let handler = Arc::clone(&handler);
+                thread::Builder::new()
+                    .name("webhook-conn".into())
+                    .spawn(move || {
+                        let _ = tcp.set_write_timeout(Some(write_timeout));
+                        let _ = tcp.set_read_timeout(Some(write_timeout));
+                        match &*acceptor {
+                            HttpAcceptor::Plain => serve_conn_raw(tcp, PeerId::default(), &handler),
+                            #[cfg(feature = "tls")]
+                            HttpAcceptor::Tls(tls) => {
+                                if let Ok(stream) = tls.accept(tcp) {
+                                    let peer = peer_id(&stream);
+                                    serve_conn_raw(stream, peer, &handler);
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+            }
+        })
+        .map(|_| ())
+}
+
+fn serve_conn_raw<S: Read + Write + Send + 'static>(
+    stream: S,
+    peer: PeerId,
+    handler: &Arc<dyn RawHandler>,
+) {
+    let mut reader = BufReader::new(stream);
+    let Some(req) = read_request(&mut reader) else {
+        return;
+    };
+    // Webhook callers are servers, not browsers — loopback-only origins here.
+    if matches!(check_origin(&req.headers, &[]), OriginCheck::Denied) {
+        let _ = write_simple(
+            reader.get_mut(),
+            403,
+            "Forbidden",
+            b"cross-origin request rejected",
+            None,
+        );
+        return;
+    }
+    let raw = RawRequest {
+        method: req.method,
+        target: req.target,
+        headers: req.headers,
+        body: req.body,
+        peer_cert: peer.cert,
+        peer_subject: peer.subject,
+        peer_sans: peer.sans,
+    };
+    let resp = handler.handle(&raw);
+    let _ = write_raw(reader.get_mut(), &resp);
+}
+
+fn write_raw<S: Write>(stream: &mut S, resp: &RawResponse) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        resp.status,
+        resp.reason,
+        resp.content_type,
+        resp.body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&resp.body)?;
     stream.flush()
 }
 
@@ -442,15 +753,29 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-/// Read one HTTP/1.1 request (request line, headers, `Content-Length` body).
-/// Returns `None` on EOF-before-request or a malformed head.
-/// Whether a request's `Origin` (if any) is acceptable — the DNS-rebinding gate.
-/// No `Origin` header → allowed (a non-browser caller). Present → it must name a
-/// loopback origin.
-fn origin_allowed(headers: &[(String, String)]) -> bool {
+/// The DNS-rebinding gate's verdict on a request's `Origin` header.
+enum OriginCheck {
+    /// No `Origin` header — a non-browser caller; no CORS needed.
+    NoBrowser,
+    /// An acceptable browser origin (loopback, or configured) — echo it as CORS.
+    Allowed(String),
+    /// A cross-site browser origin — reject 403.
+    Denied,
+}
+
+/// Classify a request's `Origin` (if any) — the DNS-rebinding gate. No `Origin`
+/// header → a non-browser caller, allowed with no CORS. Present → it must name a
+/// loopback origin or an exact `extra` entry (a configured web-UI origin).
+fn check_origin(headers: &[(String, String)], extra: &[String]) -> OriginCheck {
     match headers.iter().find(|(k, _)| k == "origin") {
-        None => true,
-        Some((_, origin)) => origin_is_loopback(origin),
+        None => OriginCheck::NoBrowser,
+        Some((_, origin)) => {
+            if origin_is_loopback(origin) || extra.iter().any(|e| e == origin) {
+                OriginCheck::Allowed(origin.clone())
+            } else {
+                OriginCheck::Denied
+            }
+        }
     }
 }
 
@@ -483,6 +808,8 @@ fn next_session_id() -> String {
     format!("s-{millis:x}-{n:x}")
 }
 
+/// Read one HTTP/1.1 request (request line, headers, `Content-Length` body).
+/// Returns `None` on EOF-before-request or a malformed head.
 fn read_request<S: Read>(reader: &mut BufReader<S>) -> Option<HttpRequest> {
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).ok()? == 0 {
@@ -694,6 +1021,116 @@ mod tests {
             200
         );
         assert_eq!(http_post_origin(&addr, Some("http://127.0.0.1"), call), 200);
+    }
+
+    /// A server with an extra allowed origin configured.
+    fn spawn_server_with_origins(extra: &[&str]) -> String {
+        let subs: SubRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let listener = bind_tcp("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        spawn_accept_http_opts(
+            listener,
+            Arc::new(HttpAcceptor::Plain),
+            Arc::new(TestHandler {
+                subs: Arc::clone(&subs),
+            }),
+            Arc::new(AllowAll),
+            Arc::clone(&subs),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_secs(5),
+            ServeOptions {
+                extra_origins: extra.iter().map(|s| s.to_string()).collect(),
+            },
+        )
+        .unwrap();
+        addr
+    }
+
+    /// A raw request; returns (status code, lowercased headers).
+    fn http_raw(addr: &str, req: &str) -> (u16, Vec<(String, String)>) {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut reader = BufReader::new(s);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let code = status
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let mut headers = Vec::new();
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).unwrap_or(0) == 0 {
+                break;
+            }
+            if l.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = l.split_once(':') {
+                headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        (code, headers)
+    }
+
+    #[test]
+    fn a_configured_extra_origin_is_served_with_cors_headers() {
+        let addr = spawn_server_with_origins(&["https://ui.example"]);
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x"}}"#;
+        // The configured origin is allowed AND gets the CORS grant echoed.
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{call}",
+            call.len()
+        );
+        let (code, headers) = http_raw(&addr, &req);
+        assert_eq!(code, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| { k == "access-control-allow-origin" && v == "https://ui.example" }),
+            "CORS echo missing: {headers:?}"
+        );
+        // A different cross-site origin stays rejected.
+        let bad = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{call}",
+            call.len()
+        );
+        assert_eq!(http_raw(&addr, &bad).0, 403);
+        // A loopback origin also gets the CORS echo (a local web UI on another port).
+        let local = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nOrigin: http://127.0.0.1:5173\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{call}",
+            call.len()
+        );
+        let (code, headers) = http_raw(&addr, &local);
+        assert_eq!(code, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-origin" && v == "http://127.0.0.1:5173")
+        );
+    }
+
+    #[test]
+    fn a_cors_preflight_options_is_answered_before_auth() {
+        let addr = spawn_server_with_origins(&["https://ui.example"]);
+        let req = "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nAccess-Control-Request-Method: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (code, headers) = http_raw(&addr, req);
+        assert_eq!(code, 204);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-origin" && v == "https://ui.example")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "access-control-allow-headers" && v.contains("authorization"))
+        );
+        // A preflight from a denied origin is 403 (the rebind gate holds).
+        let bad = "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        assert_eq!(http_raw(&addr, bad).0, 403);
     }
 
     #[test]

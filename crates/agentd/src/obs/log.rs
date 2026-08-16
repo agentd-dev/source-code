@@ -342,6 +342,14 @@ impl Logger {
         // (one relaxed atomic load) unless a ring is installed. Best-effort:
         // capture never blocks and never fails the log write (§8.4).
         capture_to_ring(level.as_str(), event, &value);
+        // Mirror to the OTLP logs exporter (plan §3.11) — a no-op (one atomic
+        // load) unless `otel.logs` armed it. Best-effort, never blocks the write.
+        crate::obs::otel::capture_log(
+            crate::obs::otel::now_unix_nanos(),
+            level.as_str(),
+            event,
+            &value,
+        );
         // Build the whole line, then one locked write.
         let mut line = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
         line.push(b'\n');

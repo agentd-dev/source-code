@@ -5,6 +5,292 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Added (the display-client interface & observation plane — RFC 0032, `docs/interface.md`)
+
+- **`interface:` config** (default OFF): `enabled` serves the display-client
+  surface on the existing A2A listener; `debug` exposes the extra reads;
+  `origins` allowlists hosted web-UI origins (CORS + preflight; loopback
+  origins always pass; every other cross-site origin stays 403).
+- **`SubscribeToEvents`** — the global observation feed (SSE): a seq-cursored,
+  principal-scoped event ring (`hello`/`event`/`goodbye`) carrying task
+  transitions (with artifacts), every NL prompt (`message` — the cross-client
+  transcript), mutating commands, run/conversation/subagent/child/status
+  section deltas (a 4 Hz fingerprint diff in the loop), lifecycle, and (debug)
+  audit records. N attached clients converge with no client-to-client sync;
+  reconnect resumes from the cursor.
+- **Taskless interface reads** (command ops that create no durable task):
+  `interface.info` (discovery — the client keys its debug panes off the
+  daemon), and under `debug`: `conversation.get` (transcripts with message
+  bodies), `run.get` (per-step run detail), `debug.events` (the live log ring,
+  revived from RFC 0016 §7.2 and installed when debug is on).
+- **`agentd tui` / `agentd ui`** (unix): run the daemon AND its display client
+  as one command — forces `--interface.enabled` (argv, reload-safe), redirects
+  daemon logs to a file, hands the tty to the client (`AGENTD_TUI_BIN`/
+  `AGENTD_UI_BIN` override), ties lifetimes (client exit ⇒ graceful drain).
+- **`interface/` — the display clients** (separate Node projects; the Rust
+  3-dependency moat is untouched): `@agentd/client` (the shared thin-client
+  core: wire, task normalization, the event-sourced Mirror, the Observation
+  driver with automatic poll fallback), `@agentd/tui` (Ink terminal UI: chat
+  with `<Static>` transcript, tasks, daemon-gated debug screen; degrades to a
+  read-only view without a tty), `@agentd/ui` (the web UI in the format of the
+  TUI; statically hostable `dist/`; `agentd-ui` local server with `--open`).
+- The agent card advertises `urn:agentd:interface` when enabled;
+  `--capabilities` reports the interface block and the extra methods/ops.
+- **Pairing-code login** (`interface.pairing`, RFC 0032 §13): the daemon
+  derives a 6-digit code per 60 s window (HMAC over a per-process
+  `/dev/urandom` seed); an operator reads it (`pairing.code` / the TUI's
+  `/pair`), and an UNAUTHENTICATED client exchanges it (`Pair {code}` — the one
+  anonymous method) for an in-memory session token (constant-time verify,
+  previous-window grace, 5-fail/window lockout, configurable role
+  operator|user + TTL, revoked on restart). Clients: `agentd-tui --code`, the
+  web connect form's code field. On a non-loopback listener pairing counts as
+  client auth (validation + 401→anonymous admission).
+- **Daemon-driven client chrome** (`interface.display`, RFC 0032 §12): ordered
+  item lists for the top/bottom edges every attached client renders (`name
+  version instance model endpoint conn debug draining active turns tokens
+  tool_calls runs subagents conversations screen keys clock`); served in
+  `interface.info`, defaults preserved, unknown items warn + are skipped.
+- **Runtime `config.set`** (operator, RFC 0032 §14): whitelisted knobs only —
+  `interface.debug` (live debug toggle; installs the log ring) and
+  `interface.display.top|bottom` — echoed as a `config` feed event so every
+  client re-shapes at once; everything else names the whitelist and stays with
+  the config file + SIGHUP (deliberate: no wire path forks config provenance).
+- **`subagent.get {handle}`** (debug): one subagent's drill-down — instruction,
+  status, mode, attempts, tokens, truncated result/error, requested_by —
+  behind the new subagents screen (TUI: list → Enter → detail → Esc back;
+  web: clickable rows → detail → back), fed live by `subagent` events.
+- **Composer affordances** (shared `@agentd/client` rules, both UIs, with
+  as-you-type suggestions): `/` system commands **plus every workflow as a
+  shortcut**; `@skill` catalogue completion (inline — agentd preloads
+  references); leading `#task-…`/`#ctx` message targeting (answer a specific
+  input-required gate / address a conversation); `$model $instance $version
+  $turns $tokens $tasks` live-value interpolation (`$$` escapes). New TUI
+  commands: `/pair`, `/set`, `/config [path]`, `/subagents`; `status_value`
+  now carries `model`.
+
+### Added (configuration mechanism — RFC 0017 §3, `docs/configuration.md` §1.1/§12)
+
+- **YAML config files.** `--config <file>` accepts **YAML** (`.yaml`/`.yml`)
+  alongside JSON/jsonc (`.json`/`.jsonc`; other extensions are sniffed). YAML is
+  read by a hand-rolled, dependency-free subset reader (`config::yaml`) —
+  mappings, sequences, flow collections, quoted/plain/block scalars, comments,
+  YAML 1.2 core typing — into the same document the JSON path yields, so
+  validation, `--config-schema`, `--validate-config` and **hot reload** (SIGHUP
+  / `--watch-config`) are format-agnostic. Anchors/aliases, tags, merge keys,
+  multi-document streams, tabs and duplicate keys are rejected with a
+  line/column error. The default build stays at exactly three direct deps.
+- **Path-derived env vars.** Every config-file path is an env var named after
+  the path: `limits.max_steps` ⇒ `AGENTD_LIMITS_MAX_STEPS` ›
+  `AGENT_LIMITS_MAX_STEPS` › bare `LIMITS_MAX_STEPS` (first present wins);
+  values are typed by the schema (integers, enums, `[a, b]` / comma lists,
+  `{k: v}` objects). Derived from the config schema, so a changed parameter set
+  needs no per-field plumbing. The named `AGENT_*` variables keep working.
+- **Generic path flags.** Every config-file path is a flag too —
+  `--limits.max-steps 5` (also `--limits-max-steps`, `--limits.max_steps`),
+  applied in argument order like any flag; a dotted flag reaches into a
+  free-form map (`--intelligence_headers.x-team ops` sets one entry, exact
+  spelling kept); `agentd --help` lists the full `CONFIG PATHS` table (path ·
+  flag · env). Precedence is unchanged: `built-in < file < env < flag`.
+- **Multiple config files.** `--config` is repeatable and `AGENT_CONFIG` takes a
+  `:`-separated list; the files compose into one document **in order, a later
+  file overriding the earlier ones** (JSON Merge Patch, RFC 7396: objects merge,
+  scalars/lists replace, `null` unsets). Each file is type-checked on its own so
+  an unknown key names its file; `config.loaded` lists the merged
+  `config_files`; `--watch-config` watches every file.
+- **Set vs add.** Setting a path from env or a `--<path>` flag *sets* its value
+  (a list/map path replaces the files' value); the named repeatable flags
+  (`--mcp`, `--subscribe`, `--a2a-peer`) keep adding one element.
+
+### Added (agentd 2.0 track — in development, RFC 0025–0030)
+
+- **Config schema v2** (`config::v2`, RFC 0030): the nested settings document
+  (`agent` / `intelligence` / `mcp` / `tools` / `store` / `memory` / `context` /
+  `knowledge` / `search` / `skills` / `workflows` / `limits` / `lifecycle` /
+  `a2a` / `observability` / `security` / `cluster`) with a hand-written JSON
+  Schema (`--config-schema=2`), path-derived env/flags (`AGENTD_INTELLIGENCE_MODEL`,
+  `--limits.run.steps`), an alias table for the 1.x quickstart flags, v1/v2
+  detection, collected validation (`--validate-config`), and the
+  `--instruction` sugar workflow. A v2 document selects the 2.0 runtime (below);
+  `--capabilities` for a v2 configuration lands with the A2A v2 phase.
+- **Durable state core** (`store`, `state`; RFC 0025): the 4-op remote-store
+  contract (`put(key, seq, envelope)` with a seq compare-and-set, `get`, `list`,
+  `delete`) with adapters over **MCP tools** (the default checkpointer profile
+  `state.put/get/list/delete`, or any server via template/CEL argument and
+  result mappings), **HTTP** (templated REST with `Idempotency-Key` and
+  secret-ref headers) and an in-process **memory** store; envelope v2 under
+  `<prefix>/<instance>/<kind>/<id>`; the entity model (manifest with a live
+  index + generation, write-ahead inbox, timers, contexts, runs, subagents,
+  tasks, artifacts, memory, audit); the `Durable` façade — per-key sequence
+  tracking, a conflict on an owned key is a fatal split-brain signal, debounced
+  manifest flush, `store.on_error: halt|degrade`, and the restore protocol
+  (manifest → indexed entities → `list` reconciliation → generation bump);
+  dependency-free ULIDs. The built-in mock MCP server (`--internal-mock-mcp-http`)
+  gained `state.list {prefix}`, `state.delete`, `structuredContent` results
+  and `mock.fault`/`mock.ops` for chaos tests; `AGENTD_TEST_KILL_AT=<point>`
+  (debug / `internal-mocks` builds) SIGKILLs the process at a named kill point.
+- **The 2.0 runtime — agent loop v2** (`runtime`, `registry`, `context`,
+  `governor`, `engine`, `jsonschema`; RFC 0026–0028, in development): a v2
+  configuration document (or `--config-version 2` / `AGENTD_CONFIG_VERSION=2`
+  with the quickstart flags) now runs the **new event loop** — a single-writer
+  reactor over durable state with a **flat child tree** of **turn workers**
+  (one model turn per child; internal tools round-trip to the supervisor as
+  `ToolRequest`/`ToolResult`; budget admission per model call) and subagents.
+  Landed: the **tool registry** (every RFC 0028 §3 internal contract with input/
+  output JSON Schemas and grants; internal > code > MCP; `tools.overrides` map a
+  contract onto any MCP tool with template/CEL args+result mappings, validated at
+  startup; `tools.disabled`; knowledge/search profile servers); **contexts**
+  (root + per-conversation durable transcripts, structured summaries, the
+  conversation **plan** (`plan.*`), **compaction** by a summarizer think,
+  **skills** discovered from MCP prompts/resources with `@skill:` preloading,
+  **memory** KV with TTL, artifacts); the **conversation preflight**
+  (`agent.preflight`) with `status`/`clarify` short-circuits, plan seeding and
+  skill preloading; **knowledge auto-context** (`knowledge.auto_context`); the
+  **token governor** (`intelligence.budget`: unit-aligned windows incl. calendar
+  resets, requests + tokens, sub-budgets per conversation/run, tactics `wait |
+  slow | degrade | refuse | fail`, the lifetime ceiling, counters durable in the
+  manifest); the **workflow engine core** (dialect-3 model + strict validation
+  over the full RFC 0027 catalogue, `{{path | default}}`/`CEL:` templates,
+  durable run records, the scheduler with `when` guards and `on_error`
+  fail/continue/goto, retries with backoff, `once`/`manual` start nodes, the
+  step kinds `noop checkpoint assign transform template validate assert fail
+  emit finish sleep tool memory.* artifact.* knowledge.* search.* mcp.tool
+  agent think` — the rest of the catalogue lands with the P4 engine); the
+  **subagent registry** (`subagent.run` sync/async/detached/warm, caps, the
+  trifecta gate, durable records + re-spawn on restore); durable **timers**;
+  **restore** of runs (running steps replayed with the same idempotency key),
+  contexts, subagents, timers, artifacts and pending inbox events; the
+  **lifecycle** (`lifecycle.run_until`: job shape ⇒ idle exit with the finish
+  status mapped to the RFC 0011 exit code; daemon ⇒ SIGTERM drain via the kill
+  ladder); **hot reload** of the v2 reloadable partition on SIGHUP /
+  `lifecycle.watch_config` (intelligence, budgets, instruction, MCP servers,
+  registry, skills, workflow definitions — live runs stay pinned to their
+  hash; restart-only paths refuse); the instruction as static text or an MCP
+  resource (read + subscribed, re-read on update); `context.model_window`.
+  Test scaffolding: mock-LLM `file:<playbook.json>` scripts, mock-MCP
+  `knowledge.*`/`search.*` profiles + skills as prompts/resources,
+  `AGENTD_TEST_INBOX_FILE` (debug builds) to inject inbox events; e2e suites
+  `runtime_v2_e2e.rs` (job through the loop, overrides, SIGKILL/restore across
+  four lives, preflight+skills+knowledge conversation, status intent +
+  subagent delegation, budget `fail` exit 7, compaction + restore) and
+  `runtime_v2_reload_e2e.rs` (SIGHUP apply / restart-required / SIGTERM drain).
+  A2A v2 intake/commands/principals now land the HTTPS listener (see the A2A v2
+  transport binding entry below). Not yet: the mode cut-over (removing the 1.x
+  surfaces), `--capabilities` for v2, docs.
+- **Workflow engine v3 — the full node catalogue + start-node triggers** (RFC
+  0027, in development): the dialect-3 workflow language now executes end to end
+  through the 2.0 runtime. Nested bodies — `foreach`/`batch` (bounded
+  parallelism, `rate` pacing, per-batch durable progress that resumes after a
+  crash, positional `collect`, `on_error: continue` element slots, `batch.by`
+  grouping, artifact-backed item lists), `iterate` (`while`/`until`/
+  `max_iterations`), `parallel` (fan-in object, `min_success`), `race`
+  (first-branch-wins with cancellation + timeout), `subgraph`; `switch`
+  routing; the pure data steps `map`/`filter`/`reduce`/`sort`/`dedupe`/
+  `chunk`/`parse` (CEL or `{{…}}` element expressions; CSV/YAML/JSON/lines);
+  orchestration steps `wait` (on a resource update, a CEL condition, a signal,
+  a run, a subagent, a conversation message or a deadline), `join`, `workflow`
+  (a child run — `sync`/`async`/`detached` with `cascade`),
+  `workflow.signal`/`wait`/`cancel`, `subagent`, `human`, `mcp.resource`
+  (read/list/prompt/complete/templates) and `a2a.delegate` (the RFC 0020 client,
+  feature-gated); the `think` presets `classify`/`extract`/`summarize`/`judge`/
+  `route`; and per-step `cache` (memoized by input hash). Large step outputs
+  spill to artifacts (`{"$artifact": id}`) and dereference transparently in
+  templates. **Start nodes as triggers**: `loop` (re-run on completion with
+  `interval`/`until`/`max_iterations`/backoff), `schedule` (5-field cron /
+  `every` / one-shot `at`), `subscribe` (an MCP resource update, notify-then-read,
+  `debounce`/`coalesce`/`filter`), `signal` and `event` (`workflow.finished`/
+  `failed`) — start-node state (last fired, iteration, next deadline, debounce)
+  is durable in the manifest, and the reactor tick is now adaptive to the
+  nearest deadline so time-based work fires promptly. The run registry gained
+  concurrency policies (`queue`/`drop`/`replace`), pause/resume, cascade
+  cancellation, the `workflow.*` tools and `--workflow-schema`; restored runs
+  replay their in-flight steps with the same idempotency key.
+- **A2A v2 transport binding** (RFC 0029; `--features a2a`) — the 2.0 daemon's
+  only external channel. When `a2a.listen` is set, the runtime binds the real
+  HTTPS listener and turns A2A JSON-RPC into runtime work: **principals & roles**
+  (mTLS / bearer → `operator | user | agent | anonymous`) with a `may` /
+  `may_command` authorization matrix; **natural-language messages** become
+  conversation turns whose answer lands as the task artifact; **command
+  DataParts** (`{"data":{"agentd":{"op":…}}}`) run `status` and `workflow.run` /
+  `workflow.status` / `workflow.cancel`; **durable tasks** (`Kind::Task`) that
+  survive a restart, with `GetTask` / `ListTasks` / `CancelTask` (ownership
+  scoped) and `SendStreamingMessage` / `SubscribeToTask` streaming
+  `working`→status/artifact→terminal frames; the operator admin family
+  (`a2a.drain` / `lameduck` / `cancel`) and a public `GetAgentCard` (workflows
+  advertised as A2A skills). The listener runs off the single-writer loop —
+  requests cross as a new loop event and blocking/streaming reads are served
+  from a shared task snapshot the loop keeps current, so the loop never stalls.
+  A task started by `workflow.run` tracks its run to completion. Built additively
+  beside the 1.x surfaces (removed at the P5 cut-over). Current limits: the serve
+  framework surfaces only whether a client cert was presented (no SAN/subject),
+  so `san`/`sub` principal matchers need a bearer and mTLS conveys *operator*
+  until the subject is exposed; command DataParts cover the `status`/`workflow.*`
+  subset (the NL path reaches every internal tool); `pause`/`resume` admin is a
+  stub. The default build is unaffected (feature-gated; deps unchanged).
+- **Audit stream** (plan §3.11) — an append-only *who-did-what* trail:
+  `{ts, instance, principal, role, action, target, outcome, request_id, trace}`
+  to the configured `observability.audit.sink`s — `log` (a closed-vocabulary
+  `audit` log line) and/or `store` (a durable, ULID-keyed, append-only
+  `Kind::Audit` record that is never rewritten). Every A2A call is audited with
+  its principal, method + command op, and outcome; config reloads and durable
+  restores (with the `lost`-entity count) are audited too. Off by default (no
+  sink configured ⇒ no overhead).
+- **Observability serving in the 2.0 runtime.** The Prometheus `/metrics`
+  surface (`observability.metrics_addr`, `metrics` feature) and the health-file
+  liveness heartbeat (`observability.health_file`) are now started by the 2.0
+  runtime (their 1.x wiring was removed with the mode cut-over).
+- **OTEL traces from the 2.0 turn worker** (`otel` feature): a turn opens an
+  `invoke_agent` span with a `chat` child span per model call and an
+  `execute_tool` child span per tool call, exported as one OTLP trace — matching
+  the 1.x agent loop's tracing on the 2.0 path.
+- **OTLP logs export** (`otel` feature, `observability.otel.logs`): the JSON-lines
+  log surface is mirrored to `<endpoint>/v1/logs` by a bounded background buffer,
+  hooked at the logger's single emit point (a no-op when unarmed).
+- **Per-child cgroup placement in the 2.0 runtime** (`security.cgroup`): the
+  runtime arms the process-tree cgroup at startup, and every spawned child (turn
+  workers + subagents) is placed in its own leaf with the configured
+  `memory.max`/`pids.max` and `cgroup.kill` atomic teardown on reap.
+- **v2 runtime metrics** (plan §3.11): `agent_turns_total{kind}`,
+  `agent_steps_total{status}`, `agent_store_ops_total{result}` +
+  `agent_store_latency_ms_sum`, and the `agent_inbox_pending` /
+  `agent_context_tokens` gauges — bounded closed-label series on the existing
+  `/metrics` surface.
+- **`agent://` read surface over A2A.** The A2A `status` command already returns
+  a comprehensive runtime view (store, workflows, runs, conversations, subagents,
+  timers, inbox, budget, tools, skills, counters); added a `config` command that
+  returns the effective merged configuration (secret **references**, never
+  values), operator-gated.
+
+### Changed
+
+- **The mode cut-over: agentd 2.0 is v2-only.** The 1.x mode drivers and the flat
+  v1 schema are gone (~32,000 lines removed). The CLI routes every configuration
+  through the 2.0 runtime (`runtime::run`); a 1.x document — the flat schema or a
+  `--mode` invocation — is rejected at the gate with a migration hint (exit 2).
+  Removed the entire v1 surface: the mode drivers (`once`/`loop`/`reactive`/
+  `schedule`/`workflow`), the v1 self-MCP server and its v1 A2A binding (replaced
+  by the RFC 0029 A2A v2 listener; the A2A client wire helpers were preserved),
+  the v1 capabilities manifest + run-report backends (replaced by `--capabilities`
+  over the v2 loader + the durable A2A task model), RFC 0019 cluster sharding, the
+  v1 cyclic-workflow graph engine (superseded by the v3 engine), the in-child
+  orchestrator + the v1 supervisor reactor/gate/restart/swap, and the v1 lifetime
+  budget ledger (superseded by the v2 governor). **Subagents are now RFC 0026
+  flat-tree leaves** — a subagent runs a ReAct loop over its granted MCP/code tools
+  and reports its result, with no in-child nesting/scheduling/delegation (that is
+  the reactor's job). The `serve-mcp` / `serve-https` / `events` build features were
+  retired (`a2a` now rides `tls` directly — the v2 listener needs no v1 server);
+  `cel` no longer implies `workflow`. **Zero change to v2 behavior** (verified by
+  the full v2 e2e suite, incl. subagent spawn/delegation, staying green). The
+  black-box conformance suite was reduced to its v2-viable families (supervisor,
+  security); a full v2 conformance rebuild (A2A, the durable store, the v3 engine)
+  is planned. The now-unreachable v1 `Config` (and `config::Mode` + the vestigial
+  `workflow` feature) remain as dead code, slated for a follow-up deletion.
+- `config.rs` / `config_file.rs` / `config_watch.rs` moved into a `config/`
+  module directory (`config::{file, yaml, paths, watch}`); the public
+  `agentd::config` surface is unchanged. Config-layer error messages now name
+  their source (`config file` / `env` / the flag).
+
 ## v1.4.0 — OpenAI-compatibility fixes + AAuth provider/token validation
 
 Real-provider hardening. Proving the eval harness (RFC 0024) against live OpenAI

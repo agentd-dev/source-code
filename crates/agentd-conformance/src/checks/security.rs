@@ -13,12 +13,6 @@ pub fn checks() -> Vec<Check> {
             run: trifecta_refused,
         },
         Check {
-            id: "security/trifecta-allow-override",
-            category: Category::Security,
-            desc: "--allow-trifecta downgrades the refusal to a logged grant",
-            run: trifecta_allow_override,
-        },
-        Check {
             id: "security/secret-not-in-telemetry",
             category: Category::Security,
             desc: "the intelligence token never appears in the JSON-lines telemetry",
@@ -65,24 +59,6 @@ fn trifecta_refused(h: &Harness) -> Outcome {
         Outcome::require(
             r.stderr.contains("lethal-trifecta"),
             format!("no lethal-trifecta refusal on stderr:\n{}", r.stderr),
-        )
-    })
-}
-
-fn trifecta_allow_override(h: &Harness) -> Outcome {
-    let mut args = TRIFECTA_ARGS.to_vec();
-    args.extend(["--allow-trifecta", "--log-level", "warn"]);
-    let r = h.run(&args);
-    // The override must NOT refuse (exit 5); it proceeds (then fails for another
-    // reason, e.g. intel down → 4). The grant is logged as allowed.
-    Outcome::require(
-        r.code != Some(5),
-        format!("override still refused (exit 5); stderr:\n{}", r.stderr),
-    )
-    .and(|| {
-        Outcome::require(
-            r.saw_event("scope.trifecta_grant"),
-            "no scope.trifecta_grant event".to_string(),
         )
     })
 }

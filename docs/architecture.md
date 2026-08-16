@@ -11,14 +11,17 @@ agentic loop, …) and the binding decisions in
 [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md).
 Where this overview simplifies, those win.
 
-> **Build status (2026-06):** the agent runtime is implemented — config
-> validation, the agentic ReAct loop, the supervisor + subagent process tree
-> (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, all five
-> run modes (once/loop/reactive/schedule/workflow), the reactive router, the
-> self-scheduling/self-subscribe self-tools, and the served self-MCP
-> (`--serve-mcp`), with the serve-https/a2a/cron/metrics/workflow surfaces
-> feature-gated. Every network surface is HTTPS (the default `tls` build); agentd
-> links no unix/vsock transport. The example runs below describe live behavior.
+> **Build status — agentd 2.0:** the runtime is implemented — config validation,
+> the agentic ReAct loop, the supervisor + subagent process tree
+> (spawn/reap/liveness/kill-ladder/restart-governor), the MCP client, the v2
+> **lifecycle** (`lifecycle.run_until` job/daemon), the **workflow triggers**
+> (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`manual`/`a2a` start
+> nodes) and the durable DAG engine, the self-scheduling/self-subscribe
+> self-tools, and the **A2A v2** external channel (`a2a.listen`, RFC 0029), with
+> the a2a/cron/metrics/otel/hot-reload surfaces feature-gated. Every network
+> surface is HTTPS (the default `tls` build); agentd links no unix/vsock
+> transport. The v1 served self-MCP surface was removed in the mode cut-over. The
+> example runs below describe live behavior.
 
 ---
 
@@ -92,40 +95,34 @@ whole tree collapses from the leaves up rather than leaking orphans (RFC 0003).
 
 ### The picture
 
-```
-                  ┌──────────────────────────────────────────────┐
-  INSTRUCTION ───▶│            agentd (main process)            │
-  intelligence ──▶│            = SUPERVISOR  (a REACTOR)         │
-  MCP defs ──────▶│            no LLM dependency, never reasons  │
-                  │                                              │
-                  │  • parse + validate config (exit 2 on bad)   │
-                  │  • connect MCP servers .................. as CLIENT ──┐
-                  │  • serve agentd's own MCP .............. as SERVER ◀─┘
-                  │  • arm triggers: once│loop│reactive│schedule │
-                  │  • subscribe MCP resources ◀──── notifications/resources/
-                  │  • recv_timeout(merged mpsc): ONE blocking   │   updated {uri}
-                  │    wait over every reader thread + timers    │   (uri only → re-read)
-                  │  • spawn + supervise subagent processes      │
-                  │  • detect dead/stuck, reap, kill, restart    │
-                  └───────────────┬──────────────────────────────┘
-                                  │ spawn / control (OS process tree)
-              ┌───────────────────┼───────────────────┐
-              ▼                   ▼                   ▼
-     ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-     │  subagent A    │  │  subagent B    │  │  subagent C    │
-     │  (process,     │  │  (process)     │  │  spawns its    │
-     │   own pgroup)  │  │                │  │  own children  │
-     │  AGENTIC LOOP: │  │  AGENTIC LOOP  │  │   ▼      ▼      │
-     │  think→tool→   │  │                │  │   D      E      │
-     │  observe→…     │  │                │  │                │
-     │  + control thr │  │                │  │                │
-     └───────┬────────┘  └────────────────┘  └────────────────┘
-             │ tool calls (scoped MCP subset)
-             ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  MCP servers (external): filesystem, github, db, …        │
-   │  + agent's own self-MCP (subagent.*, subscribe, graph.*)  │
-   └──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+  in["instruction · intelligence<br/>MCP defs · config"]
+  ext["A2A peer / operator"]
+  subgraph main["agentd — main process"]
+    sup["SUPERVISOR · a reactor<br/>no LLM, never reasons<br/>config · triggers · subscriptions<br/>spawn · reap · kill · restart"]
+  end
+  subgraph tree["subagent processes — the agentic loop"]
+    A["subagent A<br/>own pgroup<br/>think → tool → observe"]
+    B["subagent B"]
+    C["subagent C"]
+    C -->|spawn| D["D"]
+    C -->|spawn| E["E"]
+  end
+  mcp[("MCP servers<br/>fs · github · db · …")]
+  llm[["intelligence · LLM"]]
+
+  in --> sup
+  ext <-->|"A2A · mTLS / bearer"| sup
+  sup -->|"spawn / control<br/>(OS process tree)"| A
+  sup --> B
+  sup --> C
+  A -->|"tool calls · scoped MCP subset"| mcp
+  B --> mcp
+  A -->|"complete · HTTPS"| llm
+
+  classDef accent stroke:#22c55e,stroke-width:1.5px,color:#f4f4f5;
+  class sup accent;
 ```
 
 Note the two channels into each subagent: tool calls go *out* to MCP servers,
@@ -206,10 +203,11 @@ intelligence + 1 signal reader ≈ **60–65 threads, ~130 fds** — three order
 magnitude inside default Linux limits. At 50 subagents the dominant cost is the
 50 *child processes*, not the reader threads.
 
-The one sanctioned exception to thread-per-fd is the optional `serve-mcp`
-listener, where many *idle* peer connections would waste a thread each; there a
-`mio`/`libc::poll` loop is allowed behind the `serve-mcp` feature.
-The core supervision path stays thread-per-fd unconditionally.
+The one sanctioned exception to thread-per-fd is the optional `a2a` listener,
+where many *idle* peer connections would waste a thread each; there a
+`mio`/`libc::poll` loop is allowed behind the `a2a` feature (the accept/serve
+framing is reused from the `crates/mcp` server). The core supervision path stays
+thread-per-fd unconditionally.
 
 ---
 
@@ -221,71 +219,69 @@ The crate layout (from assessment §4.0):
 
 ```
 crates/agentd/src/
-  main.rs            arg parse → mode dispatch (supervisor vs subagent re-exec)
-  config.rs          precedence (default<file<env<flag), validate-at-startup, exit 2
+  lib.rs             library root: re-exec dispatch, `run_v2` entrypoint, config routing
   exit.rs            the public exit-code table + terminal-status→code mapping
-  json/              shared JSON-RPC 2.0 codec — wire types in ONE module
-    frame.rs           NDJSON (MCP stdio) + length-prefix (control channel) framing
-  wire/
-    mcp.rs             MCP 2025-11-25 request/result/notification types + capability map
-    intel.rs           intelligence Request/Response/Usage (+ tool-calling fields)
-  net/
-    http.rs            hand-rolled HTTP/1.1 + SSE client over Read+Write (+ SSRF guards)
-    tls.rs             rustls/ring wiring                            [feature: tls]
-    unixsock.rs        UnixStream transport
-    vsock.rs           VsockStream transport                         [feature: vsock]
-  mcp/
-    client.rs          reader-thread + pending-request map + notification dispatch
-    registry.rs        name→server-handle map; resolve(); per-server caps cache
-    server.rs          self-MCP request/dispatch (tools/resources) + HTTP serving
-  intel/
+  config/            v2 config: precedence (default<file<env<flag), validate-at-startup (exit 2)
+    v2/                the 2.0 document model (lifecycle, workflows, a2a, observability)
+    watch.rs           SIGHUP + ConfigMap file-watch                  [feature: config-watch]
+  wire/intel.rs      intelligence Request/Response/Usage (+ tool-calling fields)
+  intel/             the intelligence client
     client.rs          HTTPS transport (loopback http for dev) + request timeout
     openai.rs          openai-compatible adapter (+ native tool-calls)
-    anthropic.rs       anthropic adapter
+    anthropic.rs       anthropic adapter; failover.rs / health.rs / discovery.rs
+  mcp/               the client-side MCP + A2A surface (server framing lives in crates/mcp)
+    a2a_client.rs      the A2A v2 client (SendMessage / GetTask / streaming)   [feature: a2a]
+    a2a_wire.rs        A2A wire types (TaskState, message params, artifact text)
+    auth.rs, oauth.rs  MCP/A2A client credential handling
+  a2a/               the durable A2A model
+    tasks.rs           the durable a2a::Task (Kind::Task, restored across restart)
+    principals.rs      operator/user/agent/anonymous + the role/command matrix
   agentloop/          the ReAct loop (subagent side)
-    agent.rs           the turn driver
-    stop.rs            terminal-status disjunction + content-hash/no-progress/repeat-cap
-    context.rs         transcript + compaction levers + resource catalogue
+    runner.rs          the turn driver
     action.rs          native tool-call dispatch + JSON-action fallback parser
-  supervisor/
-    reactor.rs         the single recv_timeout loop; merged mpsc; timers
-    tree.rs            Child records, parent edges, depth, budgets
+    stop.rs            terminal-status disjunction + no-progress / repeat-cap
+  context/            transcript + compaction + memory/plan/skills + token accounting
+  engine/             the durable DAG workflow engine (RFC 0027): model / run / template
+  triggers/           workflow start-node drivers (once/loop/schedule/…) + timer   [feature: cron]
+  runtime/            the v2 daemon runtime
+    worker.rs          `run_turn`: the per-run ReAct turn + RunSpan tracing
+    a2a_server.rs      the A2A v2 HTTPS listener + durable task lifecycle    [feature: a2a]
+    audit.rs           the audit stream → log + append-only Kind::Audit
+    reactor.rs         the reactor loop; reload.rs (hot reload); steps/turns/timers/waits
+  supervisor/         the process tree
     spawn.rs           re-exec subagent spawn; setpgid; pre_exec rlimit+PDEATHSIG
-    reap.rs            SIGCHLD waitpid loop; subreaper; classify exit
+    cgroup.rs          per-child cgroup (CgroupGuard::for_run + .place(pid))
+    reaper.rs          SIGCHLD waitpid loop; subreaper; classify exit
     liveness.rs        deadline + no-progress + ping/pong; EOF×pong classifier
     kill.rs            bounded depth-first SIGTERM→SIGKILL ladder; drain budget
-    restart.rs         backoff + jitter + circuit breaker + crash-on-spawn
-    budget.rs          hierarchical token/step accounting to the tree root
-  triggers/
-    mode.rs            once/loop/reactive/schedule drivers (exit predicates)
-    router.rs          reactive routing: exactly-one-owner, debounce/coalesce, queues
-    timer.rs           interval + cron event source             [cron: hand-rolled 5-field UTC parser, feature]
+    tree.rs, budget.rs Child records/edges/depth + hierarchical token/step budgets
   subagent/
-    control.rs         control-channel reader thread (decoupled from loop) + ping/pong
+    control.rs         control-channel reader thread + the `NoSelfTools` leaf handler
     protocol.rs        spawn payload, control messages, upward events, result
-  obs/
+  store/, state/      the durable store (Envelope/Kind, CAS put) + ULID ids
+  obs/                observability
     log.rs             hand-rolled JSON-lines logger + LogCtx + closed event vocabulary
-    health.rs          heartbeat, --health-file, /healthz+/readyz   [http surface opt-in]
-    trace.rs           W3C context propagation (default) + OTLP export [feature: otel]
-    metrics.rs         atomic counters → Prometheus text          [feature: metrics]
-  graph/             agent-authored workflow: model + validation + driver [feature: workflow]
-  sec/
-    secret.rs          resolve(name) env/file front door; Debug=***
-    scope.rs           tool-scope grant + Rule-of-Two tag check
-  signals.rs           sigaction (no SA_RESTART) + self-pipe; SIGTERM/INT/CHLD/PIPE
+    metrics.rs         atomic counters → Prometheus text              [feature: metrics]
+    otel.rs            RunSpan traces + OTLP logs export              [feature: otel]
+    health.rs, serve.rs  heartbeat, --health-file, /healthz + /readyz
+  sec/                secret resolve(name) (Debug=***) + tool-scope Rule-of-Two
+  aauth/              AAuth agent identity: Ed25519 key + AP token + RFC 9421   [feature: aauth]
+  tools.rs            code-registered tools (embedding) + reserved `code` workflow server
+  signals.rs          sigaction (no SA_RESTART) + self-pipe; SIGTERM/INT/CHLD/PIPE
 ```
 
 The transport primitives (`http`/`tls`/`unixsock`/`vsock` and the MCP wire/server
 framing) now live in the reusable **`crates/net`** and **`crates/mcp`** — they
 retain the unix/vsock capability for reuse, but **agentd itself uses only HTTP(S)**.
 There is **no `exec` module** — agentd runs no local code. The default build links
-`tls` (HTTPS is the transport); `serve-https`/`a2a`/`cron`/`metrics`/`otel`/`cluster`/
-`workflow` are opt-in. The default Linux build is single-digit first-party crates —
-no async runtime, no C toolchain.
+`tls` (HTTPS is the transport); `a2a`/`cron`/`metrics`/`otel`/`hot-reload`/
+`config-watch`/`aauth`/`cel` are opt-in. The default Linux build is single-digit
+first-party crates — no async runtime, no C toolchain.
 
 Two boundaries are worth internalizing as a contributor:
 
-- **`json/` is the one place wire types live**, so swapping the JSON
+- **The `wire/` + `crates/net`/`crates/mcp` codecs are the one place wire types
+  live**, so swapping the JSON
   implementation (the minimalism audit may revisit `serde_json`) stays
   mechanical. The MCP codec and the control-channel codec **share** parse/
   serialize but differ in framing — HTTP bodies (+ SSE) for the Streamable-HTTP
@@ -311,7 +307,7 @@ A single `once` invocation, end to end:
               MCP `initialize` handshake, negotiate the protocol version, and store
               its advertised capabilities. Every later call is gated on those
               caps; every */list follows pagination cursors.
-              (Optionally serve agentd's own MCP over --serve-mcp https://… with mTLS/bearer auth.)
+              (Optionally arm the A2A listener — a2a.listen: https://… — with mTLS/bearer auth.)
 
 3. SPAWN      the supervisor spawns the ROOT subagent (re-exec of argv[0]) with:
                 · instruction + output contract (objective, format, boundaries)
@@ -386,8 +382,8 @@ $ agentd \
     --max-steps 40 --deadline 600s
 ```
 
-- **stdout** carries only the agent's result (a `once` run keeps stdout for its
-  result; serving the self-MCP on stdout is mutually exclusive with that).
+- **stdout** carries only the agent's result (a `once` run writes its result to
+  stdout; the A2A channel is a separate HTTP(S) listener, never stdout).
 - **stderr** carries structured JSON-lines telemetry, one event per line:
 
 ```json
@@ -410,21 +406,24 @@ See [`docs/design/PLAN.md`](design/PLAN.md).
 
 ---
 
-## 6. Execution modes — one loop, four exit predicates
+## 6. Lifecycle & triggers — one loop, a few exit predicates
 
-There is **one** supervisor loop and **one** inner agentic loop. The execution
-modes are not divergent code paths; they differ **only by exit predicate**
-(RFC 0008). This is the load-bearing cloud-native simplification — the daemon
-and the one-shot job never fork into separate engines.
+There is **one** supervisor loop and **one** inner agentic loop. In agentd 2.0 a
+config's **`lifecycle.run_until`** picks the daemon-vs-job shape and its
+**workflow start-node triggers** decide *when* a run begins; these are not
+divergent code paths — they differ **only by exit predicate** (RFC 0027). This is
+the load-bearing cloud-native simplification — the daemon and the one-shot job
+never fork into separate engines. (The 1.x `--mode once/loop/reactive/schedule`
+flag was removed in the mode cut-over; see [modes-and-triggers.md](modes-and-triggers.md).)
 
-| Mode | Exit predicate | Deploy shape |
+| Trigger (start node) | Exit predicate | Deploy shape |
 |---|---|---|
 | `once` (default) | first root subagent reaches a terminal status | Job, CLI |
-| `loop` | a bound hit (iterations / global deadline / tree-token ceiling) or signal | Job-with-deadline or Deployment |
-| `reactive` | never on its own; only signal or fatal/limit | Deployment |
+| `loop` | a bound hit (iterations / global deadline / tree-token ceiling) or signal | Job-with-deadline or long-lived daemon |
+| `subscribe` | never on its own; only signal or fatal/limit | long-lived daemon |
 | `schedule` | per-fire identical to `once`, driven by an interval/cron | external CronJob (recommended) or internal |
 
-**Reactive mode** is the signature capability. The supervisor issues MCP
+The **`subscribe` trigger** is the signature capability. The supervisor issues MCP
 `resources/subscribe` for concrete resource URIs (gated on each server
 advertising `resources.subscribe`) and then idles in `recv_timeout`. When a
 server emits `notifications/resources/updated`, the reactive router maps it to
@@ -565,7 +564,8 @@ default). There is **no `exec` tool** — agentd runs no local code. Secrets com
 - **The reactor & concurrency model:** [`rfcs/0002-supervisor-reactor-and-concurrency.md`](../rfcs/0002-supervisor-reactor-and-concurrency.md)
 - **Supervision, dead/stuck detection, recovery:** [`rfcs/0003-process-supervision-and-recovery.md`](../rfcs/0003-process-supervision-and-recovery.md)
 - **The agentic loop & terminal statuses:** [`rfcs/0007-agentic-loop-and-terminal-status.md`](../rfcs/0007-agentic-loop-and-terminal-status.md)
-- **All RFCs:** [`rfcs/`](../rfcs/) — 0004 MCP client, 0005 self-MCP + control, 0006 intelligence, 0008 modes/routing, 0009 subagents, 0010 observability, 0011 cloud-native, 0012 security, 0013 deferred v2.
+- **agentd 2.0 specs:** [`rfcs/`](../rfcs/) — 0026 agent-loop & lifecycle, 0027 workflow dialect v3 (durable DAG), 0029 A2A conversations/principals/commands, 0025 durable state & store adapters, 0022 embedding & code tools, 0023 AAuth agent identity.
+- **1.x foundations (still normative for the base):** 0004 MCP client, 0005 control tools, 0006 intelligence, 0009 subagents, 0010 observability, 0011 cloud-native, 0012 security.
 - **Binding decisions:** [`docs/design/00-architecture-assessment.md`](design/00-architecture-assessment.md)
-- **Build plan & current status:** [`docs/design/PLAN.md`](design/PLAN.md)
+- **2.0 build plan & status:** [`docs/design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md)
 ```

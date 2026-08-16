@@ -99,6 +99,12 @@ impl ApdClient {
     /// A currently-valid agent token, refreshing when the cached one is within
     /// [`REFRESH_SKEW`] of expiry (or absent). Enrolls first if needed. This is
     /// the whole "fully automatic, the user is never involved" refresh path.
+    ///
+    /// The cache is **in-memory by design** (RFC 0031 §15 P5 — a deliberate
+    /// non-goal): the agent *key* is durable and `/enroll` is idempotent, so a
+    /// restart costs only one cheap signed `/agent-token`. Persisting this
+    /// short-lived JWT would add a secret-at-rest surface to save a round-trip
+    /// that is usually already inside [`REFRESH_SKEW`] on the next start.
     pub fn token(&self) -> Result<String, String> {
         {
             let cache = self.cached.lock().unwrap_or_else(|e| e.into_inner());

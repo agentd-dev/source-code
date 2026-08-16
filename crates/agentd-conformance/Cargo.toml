@@ -11,7 +11,7 @@
 #   cargo run  -p agentd-conformance      # the same checks → a PASS/FAIL report
 [package]
 name = "agentd-conformance"
-version = "1.4.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Black-box conformance suite for the agent runtime (MCP client/server + supervisor + agent loop)"
@@ -28,18 +28,11 @@ path = "src/lib.rs"
 name = "agentd-conformance"
 path = "src/main.rs"
 
-# A minimal recording MCP reference server, used by the MCP-client conformance
-# family to capture exactly what agent sends a backing server.
+# A minimal recording MCP reference server (a reference MCP endpoint for the
+# suite and future v2 conformance families).
 [[bin]]
 name = "confmcp"
 path = "src/bin/confmcp.rs"
-
-# A mock work-claim coordination server (the frozen work.* contract, RFC 0015
-# §5.6) with atomic single-grant lease semantics, used by the work-claim
-# conformance family to test the cross-instance claim convention end-to-end.
-[[bin]]
-name = "workmcp"
-path = "src/bin/workmcp.rs"
 
 [dependencies]
 serde_json = "1"

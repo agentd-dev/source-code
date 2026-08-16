@@ -26,6 +26,9 @@ fn bogus_payload() -> SpawnPayload {
             uri: "http://127.0.0.1:9".into(),
             token: None,
             model: Some("test-model".into()),
+            headers: Vec::new(),
+            aws_auth: None,
+            dialect: None,
         },
         mcp_servers: Vec::new(),
         a2a_peers: Vec::new(),
@@ -47,14 +50,8 @@ fn bogus_payload() -> SpawnPayload {
         },
         depth: 0,
         warm: false,
-        #[cfg(feature = "workflow")]
-        workflow: None,
-        #[cfg(feature = "workflow")]
-        workflow_reactive: false,
-        #[cfg(feature = "workflow")]
-        workflow_resume: None,
-        #[cfg(feature = "workflow")]
-        workflow_resume_ref: None,
+        role: agentd::subagent::protocol::Role::Agent,
+        turn: None,
     }
 }
 
@@ -112,6 +109,9 @@ fn recv_kind(rx: &mpsc::Receiver<(NodeId, AgentMsg)>, kind: &str, deadline: Inst
                     AgentMsg::IntelHealth { .. } => "intel_health",
                     AgentMsg::Gate { .. } => "gate",
                     AgentMsg::GateClosed { .. } => "gate_closed",
+                    AgentMsg::ToolRequest { .. } => "tool_request",
+                    AgentMsg::BudgetRequest { .. } => "budget_request",
+                    AgentMsg::TurnDone { .. } => "turn_done",
                 };
                 if m == kind {
                     return true;

@@ -169,6 +169,7 @@ impl Runtime {
     /// The unit finished: drop the record and tell clients it is gone.
     pub(crate) fn activity_end(&mut self, node: NodeId) {
         if self.activity.remove(&node.0).is_some() {
+            #[cfg(feature = "a2a")]
             self.feed_push(
                 "activity.removed",
                 crate::runtime::a2a_server::FeedVis::Operator,
@@ -177,11 +178,19 @@ impl Runtime {
         }
     }
 
-    /// The A2A task + conversation a child answers, when it has one.
+    /// The A2A task + conversation a child answers, when it has one. Without
+    /// the `a2a` feature there are no tasks to bind to — the record still
+    /// tracks the unit's phase for `status`.
     fn unit_of(&self, node: NodeId) -> (Option<String>, Option<String>) {
         match self.children.get(node).map(|c| c.kind.clone()) {
             Some(ChildKind::RootTurn { ctx, event, .. }) => {
+                #[cfg(feature = "a2a")]
                 let task = event.and_then(|e| self.event_to_task.get(&e).cloned());
+                #[cfg(not(feature = "a2a"))]
+                let task = {
+                    let _ = event;
+                    None
+                };
                 (task, Some(ctx))
             }
             Some(ChildKind::StepTurn { run, .. }) => {
@@ -195,18 +204,24 @@ impl Runtime {
         }
     }
 
+    /// Publish to the interface feed — a no-op without the `a2a` feature (no
+    /// feed exists to publish to; `status.activity` still carries the record).
+    #[allow(unused_mut, unused_variables)]
     fn publish_activity(&self, node: NodeId, mut v: Value) {
-        v["id"] = json!(node.0.to_string());
-        // Owner-scoped when the unit answers a task; else operator-only.
-        let owner = v["task"]
-            .as_str()
-            .and_then(|t| self.tasks.get(t))
-            .and_then(|t| t.principal.clone());
-        let vis = match owner {
-            Some(p) => crate::runtime::a2a_server::FeedVis::Owner(Some(p)),
-            None => crate::runtime::a2a_server::FeedVis::Operator,
-        };
-        self.feed_push("activity", vis, v);
+        #[cfg(feature = "a2a")]
+        {
+            v["id"] = json!(node.0.to_string());
+            // Owner-scoped when the unit answers a task; else operator-only.
+            let owner = v["task"]
+                .as_str()
+                .and_then(|t| self.tasks.get(t))
+                .and_then(|t| t.principal.clone());
+            let vis = match owner {
+                Some(p) => crate::runtime::a2a_server::FeedVis::Owner(Some(p)),
+                None => crate::runtime::a2a_server::FeedVis::Operator,
+            };
+            self.feed_push("activity", vis, v);
+        }
     }
 
     /// The live activity view for `status` (the poll-fallback path sees the

@@ -130,3 +130,46 @@ test('draining and input-required surface prominently', async () => {
   assert.match(frame, /DRAINING/);
   ui.unmount();
 });
+
+test('fullscreen windows the transcript from the bottom and reports what is above', async () => {
+  const { windowEntries } = await import('../dist/parts/transcript.js');
+  const entries = Array.from({ length: 20 }, (_, i) => ({
+    key: `k${i}`, ctx: 'c', ts: i, kind: 'user', text: `line ${i}`,
+  }));
+  // Following the tail: the last N that fit, nothing hidden below.
+  const bottom = windowEntries(entries, { rows: 5, columns: 80, offset: 0 });
+  assert.equal(bottom.visible.length, 5);
+  assert.equal(bottom.visible.at(-1).text, 'line 19', 'anchored at the live end');
+  assert.equal(bottom.above, 15);
+  // Scrolled up by 10: the window moves back, the tail is hidden below.
+  const up = windowEntries(entries, { rows: 5, columns: 80, offset: 10 });
+  assert.equal(up.visible.at(-1).text, 'line 9');
+  assert.equal(up.above, 5);
+  // Wrapped entries take more rows, so fewer fit.
+  const long = [{ key: 'l', ctx: 'c', ts: 0, kind: 'user', text: 'x'.repeat(300) }, ...entries];
+  const wrapped = windowEntries(long, { rows: 4, columns: 40, offset: 20 });
+  assert.equal(wrapped.visible.length, 1, 'one 300-char entry fills a 40-col window');
+  // A single entry taller than the window still renders (never a blank screen).
+  const huge = windowEntries([{ key: 'h', ctx: 'c', ts: 0, kind: 'user', text: 'y'.repeat(1000) }], { rows: 2, columns: 40, offset: 0 });
+  assert.equal(huge.visible.length, 1);
+  assert.equal(huge.above, 0);
+});
+
+test('fullscreen renders a scroll hint instead of terminal scrollback', async () => {
+  const mirror = new Mirror();
+  const ui = render(
+    React.createElement(App, {
+      endpoint: 'http://127.0.0.1:1', client: {}, mirror, observe: false, fullscreen: true,
+    }),
+  );
+  mirror.setConn('ready');
+  for (let i = 0; i < 40; i++) {
+    mirror.apply({ seq: i + 1, ts: i, kind: 'message', data: { messageId: `m${i}`, contextId: 'c', text: `msg ${i}` } });
+  }
+  await tick();
+  const frame = ui.lastFrame();
+  assert.match(frame, /msg 39/, 'anchored at the newest message');
+  assert.match(frame, /earlier messages/, 'says how much is above the fold');
+  assert.doesNotMatch(frame, /msg 0\b/, 'older messages are outside the viewport');
+  ui.unmount();
+});

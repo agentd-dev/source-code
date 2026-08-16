@@ -1,0 +1,65 @@
+name: interface
+
+# The display clients (interface/ — RFC 0032): a separate Node workspace, so a
+# separate gate. Typecheck + unit/render tests on the supported Node lines,
+# plus the LIVE cross-language e2e: the TypeScript client driving a real
+# cargo-built daemon over the actual wire (feed convergence, pairing,
+# config.set propagation).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "interface/**"
+      - ".github/workflows/interface.yml"
+  pull_request:
+    paths:
+      - "interface/**"
+      - ".github/workflows/interface.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+      - run: npm ci
+        working-directory: interface
+      - run: npm run typecheck
+        working-directory: interface
+      - run: npm test
+        working-directory: interface
+      - run: npm run build
+        working-directory: interface
+
+  # The TS client against the REAL daemon (the interface contract end to end).
+  live-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+      - run: cargo build -p agentd-cli --features a2a,internal-mocks
+      - run: npm ci
+        working-directory: interface
+      - run: npm run build
+        working-directory: interface
+      - run: node --test test/live.e2e.mjs
+        working-directory: interface/client
+        env:
+          AGENTD_E2E_BIN: ${{ github.workspace }}/target/debug/agentd

@@ -53,3 +53,8 @@ fn tools_conformance() {
 fn a2a_conversation_conformance() {
     run_family("a2a-conversation", checks::a2a_conversation::checks());
 }
+
+#[test]
+fn interface_conformance() {
+    run_family("interface", checks::interface::checks());
+}

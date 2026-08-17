@@ -41,7 +41,7 @@ jobs:
       fail-fast: false
       matrix:
         features:
-          - "" # default (tls only — the 3-external-dep minimalism build)
+          - "" # default: tls + the official MCP SDK
           - "--features a2a" # the A2A v2 HTTPS listener — agentd 2.0's only external channel (RFC 0029)
           - "--features cron"
           - "--features metrics"

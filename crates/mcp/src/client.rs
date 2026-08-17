@@ -118,17 +118,15 @@ pub struct McpClient {
     /// modern (stateless per-request `_meta`). Governs how every request is built.
     era: Era,
     timeout: Duration,
-    /// When compiled with `rmcp-client`, the official SDK answers every
-    /// operation instead of the hand-rolled path below. Held here rather than
-    /// behind an enum so callers keep taking `&[McpClient]` and nothing else in
-    /// the tree has to know which backend is live.
-    #[cfg(feature = "rmcp-client")]
+    /// The official SDK, which answers every operation. `None` before
+    /// `initialize`; this type is a connection *builder* until then, and every
+    /// operation on an unconnected client is a transport error rather than a
+    /// panic.
     rmcp: Option<crate::rmcp_client::RmcpClient>,
-    /// The endpoint + headers the SDK backend needs to build its own transport.
-    /// Only carried when that backend is compiled in.
-    #[cfg(feature = "rmcp-client")]
+    /// What the SDK needs to build its side of the connection. The socket
+    /// itself is `http` above — that is how a request signer, an mTLS identity
+    /// and the SSRF guard survive the SDK owning the protocol.
     endpoint: String,
-    #[cfg(feature = "rmcp-client")]
     extra_headers: Vec<(String, String)>,
     /// Server→client requests we advertise an ability to answer, and the host
     /// callback that answers them. `ping` is answered regardless.
@@ -180,7 +178,6 @@ impl McpClient {
     ) -> Result<McpClient, McpError> {
         let ep = McpEndpoint::parse(endpoint)
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
-        #[cfg(feature = "rmcp-client")]
         Ok(McpClient {
             name: name.to_string(),
             http: Arc::new(HttpTransport::new(ep, headers.clone()).with_signer(signer)),
@@ -193,11 +190,8 @@ impl McpClient {
             // Established on connect; legacy is the safe default until then.
             era: Era::Legacy,
             timeout,
-            #[cfg(feature = "rmcp-client")]
             rmcp: None,
-            #[cfg(feature = "rmcp-client")]
             endpoint: endpoint.to_string(),
-            #[cfg(feature = "rmcp-client")]
             extra_headers: headers,
             inbound_caps: inbound::Capabilities::default(),
             inbound_handler: None,
@@ -318,7 +312,6 @@ impl McpClient {
         // connection's transport, so a request signer (AAuth's challenge loop,
         // AWS SigV4), an mTLS client identity and the SSRF guard all still
         // apply. Adopting the SDK cost none of them.
-        #[cfg(feature = "rmcp-client")]
         {
             let mut b = crate::rmcp_client::RmcpBuilder::new(
                 &self.name,
@@ -375,7 +368,6 @@ impl McpClient {
     /// applied to EACH page (each pagination round-trip is bounded), matching the
     /// per-request contract of [`Self::request_with_timeout`].
     pub fn list_tools_within(&self, _timeout: Duration) -> Result<Vec<Tool>, McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -394,7 +386,6 @@ impl McpClient {
     ) -> Result<CallToolResult, McpError> {
         // The tool call is the hot path; the SDK owns the whole round trip
         // (including its own `_meta` handling) when it is the live backend.
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -437,7 +428,6 @@ impl McpClient {
         extra_meta: Value,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -451,7 +441,6 @@ impl McpClient {
     }
 
     pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -463,7 +452,6 @@ impl McpClient {
     /// `prompts/list`, following cursor pagination to completion. Empty when the
     /// server doesn't advertise `prompts`.
     pub fn list_prompts(&self) -> Result<Vec<Prompt>, McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -615,7 +603,6 @@ impl McpClient {
         uri: &str,
         _timeout: Duration,
     ) -> Result<ReadResourceResult, McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -633,7 +620,6 @@ impl McpClient {
     /// bound, RFC 0016 §10) — for the reactor-thread reload re-handshake, where a
     /// slow-but-alive server arming a subscription must not block the reactor.
     pub fn subscribe_within(&self, uri: &str, _timeout: Duration) -> Result<(), McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -651,7 +637,6 @@ impl McpClient {
     /// unsubscribe, both best-effort: a slow server here must not block the reactor
     /// or the drain past the liveness window / drain budget.
     pub fn unsubscribe_within(&self, uri: &str, _timeout: Duration) -> Result<(), McpError> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
                 "the MCP connection is not established".into(),
@@ -664,7 +649,6 @@ impl McpClient {
     /// `notifications/resources/updated`). The reactive router
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
-        #[cfg(feature = "rmcp-client")]
         let Some(c) = &self.rmcp else {
             return Vec::new();
         };

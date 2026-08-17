@@ -25,10 +25,8 @@ pub mod http;
 pub mod http_server;
 pub mod inbound;
 pub mod modern;
-#[cfg(feature = "rmcp-client")]
 pub mod rmcp_client;
 /// agentd's credentialed socket under the SDK's transport trait.
-#[cfg(feature = "rmcp-client")]
 pub mod rmcp_transport;
 pub mod rpc;
 pub mod server;

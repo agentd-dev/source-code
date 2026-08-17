@@ -12,11 +12,9 @@
 //! unconditionally, and that an `elicitation/create` reaches the host handler
 //! and its decision reaches the server.
 //!
-//! Scoped to the **native** backend. With `--features rmcp-client` the SDK owns
-//! the connection and answers these itself over `subscriptions/listen` rather
-//! than the legacy event stream these mocks speak; that configuration is
-//! covered by `rmcp_backend.rs`.
-#![cfg(not(feature = "rmcp-client"))]
+//! The SDK answers these now, so what is really being asserted is that adopting
+//! it did not lose the behaviour: the wire is checked from the server's side,
+//! which is the only side that can tell.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -64,6 +62,20 @@ fn read_http(s: &mut BufReader<TcpStream>) -> Option<(String, Vec<u8>)> {
         s.read_exact(&mut body).ok()?;
     }
     Some((start, body))
+}
+
+/// An `initialize` reply that assigns a session, as a Streamable-HTTP server
+/// does. The client opens the server→client SSE channel for a session, so
+/// without one there is nowhere for a server request to arrive.
+fn json_response_with_session(body: &Value) -> Vec<u8> {
+    let b = serde_json::to_vec(body).unwrap();
+    let mut out = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        b.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&b);
+    out
 }
 
 fn json_response(body: &Value) -> Vec<u8> {
@@ -140,7 +152,11 @@ fn spawn_server(seen: Shared, push: Option<Value>) -> String {
                         seen.lock().unwrap().init_capabilities = msg["params"]["capabilities"]
                             .as_object()
                             .map(|_| msg["params"]["capabilities"].clone());
-                        let _ = w.write_all(&json_response(&json!({
+                        // A session id, as a Streamable-HTTP server assigns on
+                        // initialize. The client opens the server→client SSE
+                        // channel for a session, so without this there is no
+                        // channel for the pushes below to arrive on.
+                        let _ = w.write_all(&json_response_with_session(&json!({
                             "jsonrpc": "2.0", "id": msg["id"],
                             "result": {
                                 "protocolVersion": "2025-11-25",

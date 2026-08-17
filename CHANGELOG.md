@@ -20,8 +20,9 @@ below); that was the argument.
 - **MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)**, the
   official Rust SDK: the handshake, the typed requests and notifications,
   capability negotiation, the streaming rules, the error mapping, the version
-  table. `rmcp-client` is a default feature; the hand-rolled client, era probe
-  and modern-dialect implementation are gone.
+  table. It is not a feature you can turn off — there is no second
+  implementation to fall back to; the hand-rolled client, the era probe and the
+  modern-dialect implementation are gone, and so is the `rmcp-client` flag.
 - **A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs)**, generated from
   the specification's protocol buffers: method dispatch, the typed shapes, SSE
   framing, the blocking-send rule, the error codes. agentd supplies the ports —

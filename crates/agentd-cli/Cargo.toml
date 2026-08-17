@@ -22,16 +22,12 @@ name = "agentd"
 path = "src/main.rs"
 
 # Each feature forwards to the library AND mirrors the library's internal
-# feature graph locally (serve-https implies serve-mcp, a2a rides serve-https,
-# …), because `src/main.rs`'s own `#[cfg(feature = …)]` gates evaluate against
-# THIS crate's features. The two graphs must stay isomorphic — CI's per-feature
-# matrix compiles both crates per row, so a drift fails loudly.
+# feature graph locally (a2a rides tls, …), because `src/main.rs`'s own
+# `#[cfg(feature = …)]` gates evaluate against THIS crate's features. The two
+# graphs must stay isomorphic — CI's per-feature matrix compiles both crates per
+# row, so a drift fails loudly.
 [features]
 default = ["tls"]
-# Use the OFFICIAL Rust MCP SDK for outbound MCP instead of the hand-rolled
-# client. Upstream spec-tracking in exchange for ~77 crates and tokio;
-# the default build keeps the minimal client. See docs/mcp.md.
-rmcp-client = ["agentd/rmcp-client"]
 tls = ["agentd/tls"]
 a2a = ["tls", "agentd/a2a"]
 cron = ["agentd/cron"]

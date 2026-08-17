@@ -354,14 +354,17 @@ authoritative, always-current version for your build with `agentd
 
 The workhorse. Runs a full ReAct loop against the model over the tools granted to
 the run, then returns its final text (or a structured object if `output_schema` is
-set). Inputs come from `instruction` (the task) and `input` (data), both templated:
+set). The task is `instruction`, templated — fold the data straight into it (or
+seed messages with `context`):
 
 ```yaml
 triage:
   kind: agent
   depends_on: [fetch]
-  instruction: "Classify this issue and draft a one-line reply."
-  input: "{{steps.fetch.output.json}}"
+  instruction: |
+    Classify this issue and draft a one-line reply.
+
+    {{steps.fetch.output.json}}
   output_schema: { type: object, properties: { label: {type: string}, reply: {type: string} } }
 ```
 
@@ -461,7 +464,6 @@ cb:
   kind: wait
   on: webhook
   webhook: { path: /hooks/cb/{{run.id}} }
-  emit_url_to: callback_url        # writes the public callback URL to vars.callback_url
   timeout: 30m
 ```
 
@@ -482,7 +484,6 @@ each:
   kind: foreach
   over: "{{vars.items}}"
   batch: { size: 2, parallel: 2 }      # 2 items per batch, 2 batches in flight
-  rate: "10/s"                          # optional pacing
   on_error: continue                    # a failed element doesn't fail the run
   body:
     steps:
@@ -503,7 +504,6 @@ par:
   branches:
     a: { steps: { x: { kind: agent, instruction: "Path A" } } }
     b: { steps: { y: { kind: http,  url: "https://b.example" } } }
-  min_success: 1                        # succeed if at least one branch does
 
 route:
   kind: switch
@@ -513,8 +513,9 @@ route:
   default: took_default
 ```
 
-`parallel` is a fan-in barrier (all branches, subject to `min_success`); `race`
-returns the first to finish and cancels the rest; `switch` enables exactly one
+`parallel` is a fan-in barrier (every branch runs; `on_error: continue` tolerates
+a failing one); `race` returns the first to finish and cancels the rest, and takes
+`min_success` to require more than one; `switch` enables exactly one
 dependent by matching `on` against `cases`.
 
 ### `workflow` — child runs
@@ -524,7 +525,7 @@ it and get a handle), or detached (fire-and-forget). `cascade` propagates cancel
 
 ```yaml
 spawn: { kind: workflow, name: enrich, mode: sync, inputs: { id: "{{vars.id}}" } }
-use:   { kind: agent, depends_on: [spawn], input: "{{steps.spawn.output}}", instruction: "Use the enrichment." }
+use:   { kind: agent, depends_on: [spawn], instruction: "Use the enrichment: {{steps.spawn.output}}" }
 ```
 
 ---

@@ -236,7 +236,7 @@ mcp:
 workflows:
   - name: poll
     steps:
-      s: { kind: loop, every: 5m, max_iterations: 288 }   # every 5m; stop after a day
+      s: { kind: loop, interval: 5m, max_iterations: 288 }   # every 5m; stop after a day
       w: { kind: agent, depends_on: [s], instruction: "Check /data/inbox; process each file into /data/done." }
       f: { kind: finish, depends_on: [w] }
 lifecycle: { run_until: drained }

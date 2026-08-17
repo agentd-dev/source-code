@@ -667,14 +667,13 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // lifecycle question: `auto` stays up iff something long-lived is armed.
     if let Some(prompt) = rt.settings.agent.prompt.clone()
         && !prompt.trim().is_empty()
-    {
-        if let Err(err) = rt.accept_event(
+        && let Err(err) = rt.accept_event(
             events::kinds::A2A_MESSAGE,
             Some("operator".into()),
             json!({"text": prompt, "context_id": crate::context::ROOT}),
-        ) {
-            log.warn("prompt.reject", json!({"err": err}));
-        }
+        )
+    {
+        log.warn("prompt.reject", json!({"err": err}));
     }
     // A debug-only seam (`AGENTD_TEST_INBOX_FILE`): inject inbox events from a
     // JSON file — the e2e suite's stand-in for the A2A server until P5.

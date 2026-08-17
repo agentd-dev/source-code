@@ -229,11 +229,12 @@ workflows:
   - name: process
     steps:
       s:     { kind: once }
-      fetch: { kind: agent, depends_on: [s], instruction: "fetch the next item", writes: item }
-      route: { kind: switch, depends_on: [fetch], on: "{{vars.item.status}}",
+      fetch: { kind: agent, depends_on: [s], instruction: "fetch the next item",
+               output_schema: { type: object, properties: { id: {type: string}, status: {type: string} } } }
+      route: { kind: switch, depends_on: [fetch], on: "{{steps.fetch.output.status}}",
                cases: { pending: [work] }, default: [done] }
       work:  { kind: mcp.tool, depends_on: [route], server: fs, tool: process,
-               args: { id: "{{vars.item.id}}" } }
+               args: { id: "{{steps.fetch.output.id}}" } }
       done:  { kind: finish, depends_on: [work] }
 ```
 

@@ -7,6 +7,36 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Fixed (`--validate-config` missed workflow errors — and the docs had some)
+
+- **`--validate-config` now parses workflow definitions**, the same strict parse
+  the runtime runs at startup. It used to check only the config *around* the
+  workflows: a typo'd step field (`prompt:` on an `agent` node, which takes
+  `instruction`) validated **clean** and then exited `2` on the first real
+  start. A pre-flight check that passes what production refuses is worse than
+  none — this is the split it existed to prevent. Structural errors are still
+  reported first, so the more basic message keeps leading.
+- **Audited every command and workflow sample in the docs against the binary**
+  (flags against `--help`, node fields against `--workflow-schema`, whole blocks
+  through `--validate-config`) and fixed what was wrong: `prompt:` on `agent`
+  steps, `writes:`/`input:` on `agent` (they belong to `assign` / nowhere),
+  `rate:` on `foreach` (a `batch` field), `min_success:` on `parallel` (a `race`
+  field), `emit_url_to` on `wait` (never existed), `every:` on `loop` (it is
+  `interval`; `every` is `schedule`'s), and `debounce:` on `subscribe` (it is
+  `debounce_ms`). `docs/scaling.md` still taught the removed 1.x
+  `--mode`/`--continue`/`--claim` flags for continue-claim; it now shows the 2.0
+  `subscribe` + `deliver: wait` + `claim` shape. Every workflow block in the docs
+  now passes the real validator. (`--model` was suspected and is fine — it is a
+  documented alias for `intelligence.model`.)
+
+### Changed (landing page: each idea in one place)
+
+- The MCP/A2A pitch appeared three times — hero, "shape of a run", and its own
+  section — so the page repeated itself instead of building. The hero now says
+  what agentd *is*, "shape of a run" covers the two-loop architecture, and the
+  protocol section owns where capability comes from. The example model id was
+  refreshed too.
+
 ### Added (`--prompt`: a one-shot job, or a self-setup)
 
 - **`agentd --prompt "…" --intelligence <url>`** asks, answers on stdout, and

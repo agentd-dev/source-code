@@ -267,96 +267,14 @@ stops with it, and the whole drain counts inside `lifecycle.drain_timeout`
 
 ---
 
-## 2. agentd as an A2A endpoint (the external channel)
+## 2. The other direction
 
-agentd's external channel is **A2A** (RFC 0029). Set `a2a.listen` and a parent
-agent, a peer, or an operator drives it over A2A JSON-RPC: `SendMessage`
-(natural language → a conversation turn, or a command DataPart → a registry
-action such as `status` / `workflow.run` / `config`), `GetTask` / `ListTasks` /
-`CancelTask`, and `SendStreamingMessage` (SSE) — each resolved to a **principal**
-(mTLS / bearer → `operator` / `user` / `agent` / `anonymous`) and authorized
-against a role matrix.
+MCP is how agentd reaches *out* for capability. How something reaches *in* — a
+peer agent, an operator, the TUI — is a different protocol on a different
+listener: see **[a2a.md](a2a.md)**. Keeping them apart matters when reasoning
+about trust: an MCP server is a dependency you chose, while an A2A caller is a
+stranger you authenticate.
 
-```yaml
-a2a:
-  listen: https://0.0.0.0:8443
-  tls: { cert: /etc/agentd/tls/server.crt, key: /etc/agentd/tls/server.key, client_ca: /etc/agentd/tls/clients-ca.crt }
-```
-
-> **Trust is per request, never the transport.** A non-loopback bind **must**
-> configure mTLS and/or a bearer; an unauthenticated non-loopback listener is a
-> startup error. A loopback `http://` bind with no auth is allowed only for local
-> dev. See [RFC 0029](../rfcs/0029-a2a-conversations-principals-commands.md).
-
----
-
-## 3. Composition: one agent driving another
-
-Composition needs no new protocol: the channel a parent dials is the channel a
-worker serves. A **worker** agentd is deployed as its own service, exposing the
-A2A v2 channel (RFC 0029) over HTTPS:
-
-```yaml
-# reviewer.yaml — the worker, an A2A endpoint (build with --features a2a).
-# The listener makes it a daemon: it needs a durable store (RFC 0025) and TLS.
-agent: { instruction: "Be a reusable code-review worker" }
-intelligence: { endpoints: https://gw.example/v1 }
-store: { kind: mcp, mcp: { server: state } }
-mcp:   { servers: [ { name: state, endpoint: https://mcp-state.internal/mcp } ] }
-a2a:
-  listen: https://0.0.0.0:8443
-  tls:    { cert: /tls/cert.pem, key: /tls/key.pem }
-  bearer: "{{secret:REVIEWER_TOKEN}}"
-```
-```bash
-agentd --config reviewer.yaml
-```
-
-A **parent** agentd (a job) declares that worker as an `--a2a-peer` it delegates
-to (over A2A, emitting `a2a.delegate`):
-
-```bash
-agentd \
-  --instruction "Orchestrate the nightly review across the repo" \
-  --intelligence https://gw.example/v1 \
-  --a2a-peer reviewer=https://reviewer.internal:8443
-```
-
-The parent drives the worker over A2A JSON-RPC, resolved to a **principal**
-(mTLS/bearer) and authorized against the worker's role matrix. Two patterns fall
-out:
-
-**Ask** — the parent `SendMessage`s the worker a task (a natural-language turn, or
-a `workflow.run` command DataPart) and gets back a durable A2A **task**; it reads
-the returned artifact (or polls `GetTask`) for a clean, bounded result — never
-reasoning about the worker's internal steps.
-
-**Stream** — the parent `SendStreamingMessage`s and the worker streams incremental
-task status + artifacts over SSE, closing the loop as the run progresses. The
-durable task **survives a worker restart** (RFC 0025), so a parent that reconnects
-resumes with `GetTask`.
-
-A worked picture of the streaming close-the-loop:
-
-```mermaid
-sequenceDiagram
-    participant P as parent agent
-    participant W as worker (A2A endpoint)
-    P->>W: message/stream {task: "review PR 42"}
-    W-->>P: task t-7f3 · state=submitted
-    Note over W: worker runs (supervised, bounded)
-    W-->>P: status-update · state=working (SSE)
-    W-->>P: artifact-update · { distilled review } (SSE)
-    W-->>P: status-update · state=completed (SSE, final)
-    Note over P,W: dropped connection? GetTask t-7f3 re-reads current state
-```
-
-Because every task is durable and re-readable with `GetTask`, a dropped connection
-is recovered by re-reading current task state — no exactly-once gymnastics, no diff
-bookkeeping, the same converge-on-current-state discipline agentd applies to every
-resource, applied to agents themselves.
-
----
 
 ## See also
 

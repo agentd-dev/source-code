@@ -73,9 +73,16 @@ export const DOCS = [
   {
     slug: "mcp",
     file: "docs/mcp.md",
-    title: "MCP & A2A surface",
+    title: "MCP — tools & events",
     group: "concepts",
     blurb: "MCP as the substrate — the client subset, the transport, and the A2A endpoint.",
+  },
+  {
+    slug: "a2a",
+    file: "docs/a2a.md",
+    title: "A2A — the inbound channel",
+    group: "concepts",
+    blurb: "How peers, operators and the display clients reach in: principals, tasks, and the agent card.",
   },
   {
     slug: "subagents",

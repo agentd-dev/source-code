@@ -1,6 +1,6 @@
 import Link from "next/link";
 import Mermaid from "./components/Mermaid";
-import Console from "./components/Console";
+import ConsoleDemos from "./components/ConsoleDemos";
 
 /* ── page furniture ──────────────────────────────────────────────── */
 
@@ -49,26 +49,6 @@ function Card({ tag, title, children }) {
 }
 
 /* ── content ─────────────────────────────────────────────────────── */
-
-// The hero demo: a one-shot job, typed out in the page.
-const DEMO = [
-  { t: "in", text: 'agentd --prompt "triage the newest issue and label it" \\' },
-  { t: "out", text: "         --mcp github=https://mcp-github.internal/mcp \\", cls: "out" },
-  { t: "out", text: "         --intelligence https://gateway.internal/v1", cls: "out" },
-  { t: "out", text: "", ms: 240 },
-  { t: "out", text: '{"event":"mcp.connect","server":"github","proto":"2025-11-25"}', cls: "comment" },
-  { t: "out", text: '{"event":"run.start","tools":11,"servers":1}', cls: "comment" },
-  { t: "spin", text: "thinking · 1.2k tok", ms: 1100 },
-  { t: "out", text: '{"event":"tool.call","tool":"list_issues"}', cls: "comment" },
-  { t: "spin", text: "list_issues · 0.4s", ms: 700 },
-  { t: "out", text: '{"event":"tool.call","tool":"add_labels","args":{"labels":["bug"]}}', cls: "comment" },
-  { t: "spin", text: "thinking · 2.6k tok", ms: 900 },
-  { t: "out", text: "", ms: 120 },
-  { t: "out", text: "Labelled #482 as bug: the stack trace shows a nil deref in" },
-  { t: "out", text: "parse_config, not a usage error. Assigned to the api team." },
-  { t: "out", text: "", ms: 120 },
-  { t: "out", text: '{"event":"run.done","status":"completed","steps":4,"exit_code":0}', cls: "comment" },
-];
 
 const INSTALL_CMD = `$ curl -fsSL https://agentd.dev/install.sh | sh
 agentd  checksum ok
@@ -215,11 +195,7 @@ export default function Home() {
         </div>
 
         <div className="lg:pt-6">
-          <Console title="agentd — a one-shot job" script={DEMO} />
-          <p className="mt-3 text-xs text-[var(--dim)]">
-            stdout carries the answer; stderr carries JSON-lines telemetry; the exit code is the
-            terminal status.
-          </p>
+          <ConsoleDemos />
         </div>
       </section>
 
@@ -273,30 +249,67 @@ export default function Home() {
         </div>
       </Section>
 
-      {/* ── capability & connection ──────────────────────────── */}
+      {/* ── reaching out: MCP ─────────────────────────────────── */}
       <Section
         id="mcp"
-        eyebrow="capability &amp; connection"
-        title="Where its abilities come from"
-        intro="Two protocols, each doing one job. MCP is not an integration here but the substrate: every tool, and every event worth waking for, arrives from a server you named. A2A is the door in the other direction — a served run is an A2A Task, so agentd is a first-class citizen of an agent mesh rather than a leaf."
+        eyebrow="reaching out"
+        title="Every ability comes from a server you named"
+        intro="agentd ships no tools. MCP is not an integration here but the substrate: the tools a model may call, and the events worth waking for, arrive from remote servers you declare — so the blast radius of a run is exactly what you wired, and you can read it off the config."
       >
         <div className="grid gap-4 md:grid-cols-3">
-          <Card tag="01 · tools" title="Tools come from MCP">
-            Declare a server with <span className="kbd">--mcp name=https://host/mcp</span>. agentd
-            connects over Streamable HTTP, negotiates the version, discovers the tools, and offers
-            exactly that set to the model. It spawns no process and runs no local code.
+          <Card tag="declare" title="A server, not a plugin">
+            <span className="kbd">--mcp name=https://host/mcp</span>. agentd connects over
+            Streamable HTTP, negotiates the protocol version, discovers the tools, and offers
+            exactly that set to the model. No process is spawned, no local code runs.
           </Card>
-          <Card tag="02 · reacts" title="Reactive on resources">
+          <Card tag="react" title="Wake on a resource, don't poll">
             A <span className="kbd">subscribe</span> start node idles until a server pushes{" "}
-            <span className="kbd">notifications/resources/updated</span> — then it reads the resource
-            and runs. Event-driven agents, no polling, no glue.
+            <span className="kbd">notifications/resources/updated</span> — then it reads the
+            resource and runs. Event-driven, with no glue to maintain.
           </Card>
-          <Card tag="03 · speaks A2A" title="The external channel">
-            Set <span className="kbd">a2a.listen</span> and a peer or operator drives it:{" "}
+          <Card tag="answer" title="The direction clients forget">
+            MCP is bidirectional. agentd answers a server&apos;s <span className="kbd">ping</span>,
+            and a server can ask the operator a question —{" "}
+            <span className="kbd">elicitation/create</span> becomes a gate in every attached client
+            and the answer goes back.
+          </Card>
+        </div>
+        <div className="mt-4">
+          <Link href="/docs/mcp/" className="text-sm text-[var(--green)] hover:underline">
+            How agentd uses MCP →
+          </Link>
+        </div>
+      </Section>
+
+      {/* ── reaching in: A2A ──────────────────────────────────── */}
+      <Section
+        id="a2a"
+        eyebrow="reaching in"
+        title="A door for other agents, and for you"
+        intro="A2A is the opposite direction: how something reaches in. A parent agent delegating work, a peer in a mesh, and the terminal on your desk all speak the same protocol to the same listener — authenticated per request, never by the transport."
+      >
+        <div className="grid gap-4 md:grid-cols-3">
+          <Card tag="drive" title="Messages and tasks">
+            Set <span className="kbd">a2a.listen</span> and a caller drives it:{" "}
             <span className="kbd">SendMessage</span> becomes a conversation turn,{" "}
-            <span className="kbd">GetTask</span> reads the durable result — mTLS or bearer, resolved
-            to a principal.
+            <span className="kbd">GetTask</span> reads the durable result, and a streaming send
+            answers with live update frames.
           </Card>
+          <Card tag="authenticate" title="A principal, per request">
+            An mTLS certificate or a bearer resolves to operator / user / agent, checked against a
+            role matrix before anything runs. A non-loopback listener without auth is a startup
+            error, not a warning.
+          </Card>
+          <Card tag="discover" title="The card is a promise">
+            <span className="kbd">GetAgentCard</span> advertises what this build actually does.
+            What it claims is exercisable and what it disclaims is refused cleanly — both
+            directions are covered by the conformance suite.
+          </Card>
+        </div>
+        <div className="mt-4">
+          <Link href="/docs/a2a/" className="text-sm text-[var(--green)] hover:underline">
+            The inbound channel in full →
+          </Link>
         </div>
       </Section>
 

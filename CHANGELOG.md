@@ -5,6 +5,55 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.1.0 — a project config, and a build that needs no C toolchain
+
+### Added
+
+- **`.agentd.yml` is discovered.** An invocation that names no config — no
+  `--config`, no `AGENT_CONFIG` — now loads `.agentd.yml` (or `.agentd.yaml`)
+  from the working directory, the way a linter or a formatter finds its
+  dotfile, so a project with a checked-in config stops repeating the flag.
+  It is only ever a fallback: naming a config means you have decided, and the
+  dotfile is not consulted, merged, or layered underneath it. Only the working
+  directory — no walk to a parent, no `$HOME`, no `/etc`. Both spellings
+  present is an error (exit `2`) rather than a silent pick between them.
+  `--help`, `--version`, `--config-schema` and `--workflow-schema` never
+  discover a config, so a malformed dotfile cannot stop you reading the help.
+  (`docs/configuration.md` §12.1.)
+
+### Fixed
+
+- **The build no longer needs a C toolchain.** `connectrpc`, a hard dependency
+  of `a2a-rs`, declared rustls, tokio-rustls and hyper-rustls with their default
+  features, which selects the C/assembly `aws-lc-rs` provider — and because
+  Cargo unifies features additively and globally, that one default applied to
+  the whole graph however carefully agentd, `agentd-net` and `a2a-rs` itself
+  asked for `ring`. It put `cmake`, `make`, `perl` and a C++ compiler in the
+  builder image, and it hung the v2.0.0 release's cross-compiled amd64 job for
+  **90 minutes** while the *emulated* arm64 job finished in three. A vendored
+  `connectrpc` with three corrected dependency entries and no Rust source
+  changes removes it (`third_party/connectrpc/PATCH.md`); `aws-lc-rs`,
+  `aws-lc-sys` and `rustls-native-certs` leave the graph. `Cross.toml` existed
+  only to install `cmake` and is gone, the Dockerfile is back to `musl-dev`
+  alone, and cross-building arm64 now takes 2 minutes. CI asserts `aws-lc`
+  stays out, from the job that installs no `cmake`.
+
+  This does **not** reach `cargo install agentd-cli` or crates.io consumers of
+  `agentd-core`: `[patch.crates-io]` is workspace-local, and a published crate
+  cannot turn off a transitive dependency's features. Those builds still need
+  `cmake` until the fix is upstream. Every artifact we ship is unaffected.
+
+- **The v2.0.0 amd64 release asset was stale.** The `SHA256SUMS` and the
+  `x86_64` tarball on the v2.0.0 release dated from an earlier build of that
+  tag and did not contain the 2.0 runtime, so an amd64 user installing v2.0.0
+  received the older binary while `--version` reported `2.0.0`. Both are
+  rebuilt from the tag and replaced, verified by behaviour rather than by
+  `--version`. arm64 was always correct.
+
+- **The documented binary size was wrong** — 2.98 MiB, measured on that stale
+  asset. The shipped binary is **6.57 MiB** on amd64 and **4.98 MiB** on arm64
+  (3.00 / 2.79 MiB compressed).
+
 ## v2.0.0 — the durable agent: A2A, workflows, display clients, and protocols from their own SDKs
 
 The rewrite lands. agentd 2.0 is a daemon you can attach to, hand work to, and

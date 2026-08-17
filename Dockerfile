@@ -12,10 +12,11 @@
 # HTTPS is the primary transport for both intelligence and MCP, so `tls` is ON by
 # DEFAULT: rustls with the `ring` provider + bundled webpki roots, so there is no
 # system CA bundle to mount. MCP and A2A are the official/published protocol
-# implementations (`rmcp`, `a2a-rs`), which bring an async runtime and a C
-# toolchain into the BUILD — and change nothing about what ships: one static
-# musl binary on an empty base, a few MB, no shell, no libc, no package manager.
-# Nothing to attack.
+# implementations (`rmcp`, `a2a-rs`), which bring an async runtime into the BUILD
+# — but no C: the crypto provider is `ring` everywhere, so the build is pure Rust
+# and needs no cmake or C++ compiler (see third_party/connectrpc/PATCH.md). What
+# ships is one static musl binary on an empty base, a few MB, no shell, no libc,
+# no package manager. Nothing to attack.
 #
 # Change the capability surface at build time with FEATURES, e.g.:
 #   docker build --build-arg FEATURES=a2a,metrics,cron,otel .
@@ -32,10 +33,9 @@ ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
 # that host target, which is exactly what each buildx platform wants — so one
 # Dockerfile produces native-static amd64 AND arm64 images.
 #
-# The protocol SDKs (`rmcp` for MCP, `a2a-rs` for A2A) bring `aws-lc-sys`, which
-# is C compiled at build time — hence a real toolchain here. It is a *builder*
-# cost only: what ships is still one static binary on an empty base.
-RUN apk add --no-cache musl-dev cmake make perl g++
+# `musl-dev` is the only build package needed: `ring` ships prebuilt assembly and
+# the rest of the graph is pure Rust. No cmake, no C++ compiler.
+RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY . .
 # Release profile (workspace Cargo.toml): LTO'd, stripped, size-optimized,

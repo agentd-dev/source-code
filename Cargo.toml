@@ -9,8 +9,8 @@ resolver = "3"
 members = ["crates/net", "crates/mcp", "crates/agentd", "crates/agentd-cli", "crates/agentd-conformance"]
 # `crates/a2a-oracle` checks our A2A wire against an INDEPENDENT implementation
 # of the spec, and is deliberately NOT a member: that implementation brings ~179
-# crates and a C toolchain (`cmake`), which is right for an on-demand check and
-# wrong for every `cargo test` and for the `FROM scratch` release build. It is
+# crates, which is right for an on-demand check and wrong for every `cargo test`
+# and for the `FROM scratch` release build. It is
 # its own workspace with its own target dir, so it also cannot race the shared
 # `target/debug/agentd` other suites drive. Run it deliberately:
 #
@@ -32,3 +32,13 @@ lto = true
 strip = true
 panic = "abort"
 codegen-units = 1
+
+# `connectrpc` (a hard dependency of `a2a-rs`) declares rustls, tokio-rustls and
+# hyper-rustls with their default features, which selects the `aws-lc-rs`
+# provider. Feature unification is additive and global, so that one crate drags
+# the C/assembly `aws-lc-sys` into a graph where every other crate — agentd,
+# agentd-net and a2a-rs itself — already asked for `ring`. The vendored copy
+# changes three dependency entries and no Rust source. Remove it when the fix
+# is upstream; see third_party/connectrpc/PATCH.md.
+[patch.crates-io]
+connectrpc = { path = "third_party/connectrpc" }

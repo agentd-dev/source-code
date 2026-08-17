@@ -46,7 +46,16 @@ See `examples/embedded-agent.rs` in the repository for a complete one.
 Capability is a compile-time decision. `tls` is on by default; `a2a`, `workflow`,
 `cron`, `metrics`, `otel`, `oauth`, `aauth`, `hot-reload`, `config-watch`, `cel`
 and `exec` are opt-in, and a flag whose feature is absent exits `2` loudly rather
-than being ignored. Building needs a C toolchain (`cmake`, a C++ compiler) for
-the protocol SDKs; MSRV is 1.96.
+than being ignored. MSRV is 1.96.
+
+With the `a2a` feature, building this crate **from crates.io** needs `cmake` and
+a C++ compiler: `a2a-rs` depends on `connectrpc`, which requests `rustls` with
+its default features and so selects the C `aws-lc-rs` provider for the whole
+graph. A build from [the repository] does not — it carries a vendored
+`connectrpc` with that corrected, which a published crate cannot do for its own
+dependencies. Until the fix is upstream, use the repository (or the release
+binaries) if you want a pure-Rust build.
+
+[the repository]: https://github.com/agentd-dev/source-code
 
 Full documentation: <https://agentd.dev/docs/>. Licensed under Apache-2.0.

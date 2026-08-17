@@ -30,9 +30,9 @@ the directory (`--dir ~/bin`). Release binaries are Linux/musl, amd64 and arm64;
 **`exec` and `cel` are not compiled into them** — those need the source build
 below.
 
-Building from source: agentd is a single Cargo crate in a workspace. The default
-build needs a C toolchain (`cmake` and a C++ compiler) for the `aws-lc-sys`
-underneath the MCP and A2A SDKs; what it produces is one static binary.
+Building from source: agentd is a single Cargo crate in a workspace. The build
+is pure Rust — no C toolchain, no `cmake` — and needs Rust 1.96 or newer. What
+it produces is one static binary.
 
 ```console
 $ git clone <repo> agent && cd agent

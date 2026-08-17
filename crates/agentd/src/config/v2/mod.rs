@@ -169,6 +169,12 @@ pub struct Agent {
     /// Static text, or a single-token URI a configured MCP server serves
     /// (read + subscribed) — one field, parsed (RFC 0028 §3).
     pub instruction: Option<String>,
+    /// A **one-shot task** (`--prompt`). With no workflows configured this is
+    /// what the generated run executes, while `instruction` stays the standing
+    /// policy (it becomes the run's system prompt). Given alone, the prompt is
+    /// the whole job — `agentd --prompt "…" --intelligence …` runs it once and
+    /// exits with the answer on stdout.
+    pub prompt: Option<String>,
     pub preflight: Preflight,
     pub wake_on: Option<Vec<WakeEvent>>,
     pub on_workflow_finished: OnWorkflowFinished,
@@ -1472,6 +1478,16 @@ pub const ALIASES: &[Alias] = &[
         kind: AliasKind::SetFromFile,
     },
     Alias {
+        flag: "--prompt",
+        path: "agent.prompt",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt-file",
+        path: "agent.prompt",
+        kind: AliasKind::SetFromFile,
+    },
+    Alias {
         flag: "--intelligence",
         path: "intelligence.endpoints",
         kind: AliasKind::Set,
@@ -1688,6 +1704,7 @@ pub const ALIASES: &[Alias] = &[
 /// working). Branded (`AGENTD_`) and neutral (`AGENT_`) prefixes both apply.
 pub const ENV_ALIASES: &[(&str, &str)] = &[
     ("INSTRUCTION", "agent.instruction"),
+    ("PROMPT", "agent.prompt"),
     ("INTELLIGENCE", "intelligence.endpoints"),
     ("INTELLIGENCE_TOKEN", "intelligence.token"),
     ("INTELLIGENCE_TOKEN_FILE", "intelligence.token_file"),
@@ -2156,18 +2173,34 @@ fn append_at(doc: &mut Value, path: &str, element: Value) {
 
 /// `agentd --instruction X` (or `agent.instruction` alone) with no workflows ⇒
 /// the one-node workflow `once → agent → finish` (RFC 0030 §7).
+///
+/// A `--prompt` deliberately does NOT come here: a prompt is a **message to
+/// the agent**, delivered into its root context at startup, not a canned
+/// workflow step. That is what lets it set itself up — workflow-authoring
+/// tools are root-scoped, so a prompt running as a step could never define the
+/// loop/schedule it was asked for (`Caller::Workflow` vs `Caller::Root` in
+/// the registry).
 fn apply_instruction_sugar(doc: &mut Value) {
     let has_workflows = doc
         .pointer("/workflows")
         .and_then(Value::as_array)
         .is_some_and(|w| !w.is_empty());
-    let has_instruction = doc
-        .pointer("/agent/instruction")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.trim().is_empty());
-    if has_workflows || !has_instruction {
+    let nonblank = |p: &str| {
+        doc.pointer(p)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let has_instruction = nonblank("/agent/instruction");
+    // A prompt runs as a root turn, so an instruction+prompt pair needs no
+    // sugar workflow at all — the prompt IS the job.
+    if has_workflows || !has_instruction || nonblank("/agent/prompt") {
         return;
     }
+    let work = json!({
+        "kind": "agent",
+        "depends_on": ["start"],
+        "instruction": "{{env.instruction}}",
+    });
     let mut patch = Value::Object(Map::new());
     paths::set_path(
         &mut patch,
@@ -2177,7 +2210,7 @@ fn apply_instruction_sugar(doc: &mut Value) {
             "version": 3,
             "steps": {
                 "start": { "kind": "once" },
-                "work":  { "kind": "agent", "depends_on": ["start"], "instruction": "{{env.instruction}}" },
+                "work":  work,
                 "done":  { "kind": "finish", "depends_on": ["work"], "status": "completed", "output": "{{steps.work.output}}" }
             }
         }]),
@@ -3191,6 +3224,7 @@ pub fn help_text() -> String {
          \n\
          USAGE:\n\
          \x20 agentd --config <settings.yaml> [--config <overlay.yaml> …] [--<path> <value> …]\n\
+         \x20 agentd --prompt <TEXT> --intelligence <URL>                    # one-shot: ask, answer, exit\n\
          \x20 agentd --instruction <TEXT> --intelligence <URL> [--mcp name=endpoint …]   # one-shot sugar\n\
          \x20 agentd tui|ui --config <settings.yaml> [--<path> <value> …]   # + a display client\n\
          \n\
@@ -3525,6 +3559,42 @@ mod tests {
     }
 
     // ---- load: layering, aliases, sugar --------------------------------------
+
+    #[test]
+    fn a_prompt_is_a_message_not_a_sugar_workflow() {
+        // A prompt is delivered into the agent's ROOT context at startup, so
+        // it authors no workflow — that is what gives it root-scoped tools and
+        // lets it set the instance up (workflow.create) rather than only
+        // answering a canned step.
+        let (l, ask) = load(&args(&["--prompt", "do the thing"]), &base_env()).unwrap();
+        assert_eq!(ask, Ask::Run);
+        assert_eq!(l.settings.agent.prompt.as_deref(), Some("do the thing"));
+        assert!(
+            l.settings.workflows.is_empty(),
+            "a prompt needs no workflow: {:?}",
+            l.settings.workflows
+        );
+
+        // An instruction alone still gets the one-shot sugar workflow…
+        let (only_instr, _) = load(&args(&["--instruction", "be terse"]), &base_env()).unwrap();
+        assert_eq!(only_instr.settings.workflows.len(), 1);
+
+        // …but a prompt alongside it means the prompt is the job: the
+        // instruction stays standing policy, and no step is synthesized.
+        let (both, _) = load(
+            &args(&["--prompt", "do the thing", "--instruction", "be terse"]),
+            &base_env(),
+        )
+        .unwrap();
+        assert!(both.settings.workflows.is_empty());
+        assert_eq!(both.settings.agent.instruction.as_deref(), Some("be terse"));
+
+        // The env spelling works too (12-factor).
+        let mut env = base_env();
+        env.push(("AGENTD_AGENT_PROMPT".into(), "from env".into()));
+        let (from_env, _) = load(&args(&[]), &env).unwrap();
+        assert_eq!(from_env.settings.agent.prompt.as_deref(), Some("from env"));
+    }
 
     #[test]
     fn minimal_instruction_run_gets_the_sugar_workflow() {

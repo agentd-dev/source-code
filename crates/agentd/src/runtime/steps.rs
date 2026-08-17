@@ -560,7 +560,12 @@ impl Runtime {
     /// of the keys the workflow references would be nicer; here the whole
     /// (bounded) memory listing is offered lazily as `{key: value}`.
     pub(crate) fn run_data(&mut self, run_id: &str) -> template::Data {
-        let env = env_view(&self.instance, run_id, Some(&self.instruction.text));
+        let env = env_view(
+            &self.instance,
+            run_id,
+            Some(&self.instruction.text),
+            self.settings.agent.prompt.as_deref(),
+        );
         // Memory read-through: resolve every `memory.<key>` the definition names.
         let mut memory = Map::new();
         if let Some(wf) = self.definition_for_run(run_id) {

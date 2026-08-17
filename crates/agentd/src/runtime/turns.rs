@@ -995,6 +995,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         if let Some(t) = &reply_text
             && !t.is_empty()
         {
+            // The one-shot (`--prompt`) contract: this is the job's answer.
+            self.last_root_reply = Some(t.clone());
             // P5 delivers over A2A; the reply is recorded + logged here.
             self.log.info("turn.reply", json!({"ctx": ctx_id, "chars": t.chars().count(), "text": if self.log.content_capture() { Value::String(t.clone()) } else { Value::Null }}));
         }

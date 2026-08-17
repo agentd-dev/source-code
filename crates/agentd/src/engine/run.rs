@@ -526,8 +526,20 @@ pub fn deadline_passed(run: &RunState) -> bool {
 }
 
 /// The `env` view (curated, secret-free) the templates see.
-pub fn env_view(instance: &str, run_id: &str, instruction: Option<&str>) -> Value {
-    json!({"instance": instance, "run": run_id, "ts": now_ms(), "instruction": instruction})
+pub fn env_view(
+    instance: &str,
+    run_id: &str,
+    instruction: Option<&str>,
+    prompt: Option<&str>,
+) -> Value {
+    json!({
+        "instance": instance,
+        "run": run_id,
+        "ts": now_ms(),
+        "instruction": instruction,
+        // The one-shot task (`--prompt`); the sugar workflow reads it.
+        "prompt": prompt,
+    })
 }
 
 /// Render a step's spec against the run data (every field, recursively).
@@ -583,7 +595,7 @@ mod tests {
         );
         assert_eq!(run.steps["s"].status, StepStatus::Done);
         assert_eq!(run.steps["s"].output, Some(json!({"p": 1})));
-        let data = run.data(env_view("i", "r1", None), json!({}));
+        let data = run.data(env_view("i", "r1", None, None), json!({}));
         // a is ready; b's guard is false → skipped; c waits on a.
         assert_eq!(
             schedule(&w, &mut run, &data).unwrap(),
@@ -591,10 +603,10 @@ mod tests {
         );
         assert_eq!(run.steps["b"].status, StepStatus::Skipped);
         run.begin_step("a");
-        let data = run.data(env_view("i", "r1", None), json!({}));
+        let data = run.data(env_view("i", "r1", None, None), json!({}));
         assert_eq!(schedule(&w, &mut run, &data).unwrap(), Next::Waiting);
         run.end_step("a", StepStatus::Done, Some(json!("A")), None);
-        let data = run.data(env_view("i", "r1", None), json!({}));
+        let data = run.data(env_view("i", "r1", None, None), json!({}));
         assert_eq!(
             schedule(&w, &mut run, &data).unwrap(),
             Next::Ready(vec!["c".to_string()])
@@ -607,11 +619,11 @@ mod tests {
         run.begin_step("fix");
         run.end_step("fix", StepStatus::Done, None, None);
         // f depends on c which FAILED (not satisfied) → nothing ready, nothing in flight → stalled.
-        let data = run.data(env_view("i", "r1", None), json!({}));
+        let data = run.data(env_view("i", "r1", None, None), json!({}));
         assert_eq!(schedule(&w, &mut run, &data).unwrap(), Next::Stalled);
         run.finish(RunStatus::Stalled, None, Some("stalled".into()));
         assert!(run.status.is_terminal());
-        let data = run.data(env_view("i", "r1", None), json!({}));
+        let data = run.data(env_view("i", "r1", None, None), json!({}));
         assert_eq!(schedule(&w, &mut run, &data).unwrap(), Next::Terminal);
         // Continue policy marks done-with-error.
         let mut run2 = RunState::new(
@@ -658,7 +670,7 @@ mod tests {
         assert!(!back.dirty);
         assert_eq!(back.summary()["workflow"], json!("w"));
         // A rendered spec.
-        let data = run.data(env_view("inst", "r", Some("brief")), json!({"k": "v"}));
+        let data = run.data(env_view("inst", "r", Some("brief"), None), json!({"k": "v"}));
         let mut s = w.step("f").unwrap().clone();
         s.spec
             .insert("extra".into(), json!("{{env.instruction}}/{{memory.k}}"));

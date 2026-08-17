@@ -1,0 +1,74 @@
+name: npm
+
+# Publish the display clients (`@agentd-dev/cli` — the `agentd-tui` and
+# `agentd-ui` binaries plus the client library) to npm.
+#
+# Runs on a release tag, alongside the binary/container release, and can be
+# dispatched by hand. Publishing is deliberately gated on the tag: pushing to
+# main never publishes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and validate without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance (a signed link from package to this build)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+
+      - run: npm ci
+        working-directory: interface
+      - run: npm run build
+        working-directory: interface
+      - run: npm run typecheck
+        working-directory: interface
+      - run: npm test
+        working-directory: interface
+
+      # A tag publishes exactly what it says: refuse a mismatch rather than
+      # shipping a version nobody asked for.
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: interface
+        run: |
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match interface/package.json version ${pkg}"
+            exit 1
+          fi
+          echo "publishing @agentd-dev/cli@${pkg}"
+
+      - name: Pack (always — the tarball is the artifact under review)
+        working-directory: interface
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+
+      - name: Publish
+        if: github.event_name == 'push' || inputs.dry_run == false
+        working-directory: interface
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: ${{ runner.temp }}/*.tgz

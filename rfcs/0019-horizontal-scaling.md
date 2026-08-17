@@ -1,11 +1,22 @@
 # RFC 0019: Horizontal scaling — work-claim leases, sharding, and autoscaling signals
 
-> **⚠ SUPERSEDED — transport (target-vision pivot, 2026-07-02).** References to a
-> unix/vsock transport in this RFC are superseded by **HTTPS** (mTLS/bearer auth;
-> loopback `http://` for dev); operator control is the `a2a.*` method family. The
-> contracts still hold — only the transport does not. See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
+> **⚠ WITHDRAWN — not built, and not going to be.** Shard identity, work-claim
+> leases and the standby pool were declared in the config schema for a long time
+> and wired to nothing. They were removed rather than finished, because the
+> premise here is wrong for agentd: coordination needs a shared source of truth,
+> and agentd already talks to two that are better placed to own it — the MCP
+> server the work comes from, and the store. A queue can hand an item to somebody
+> else when a lease expires; no agentd-side hash can.
+>
+> A fleet partitions **upstream** instead: one subscription per replica, or the
+> queue's own claim/lease semantics called from a workflow step. Both are
+> described with working config in [`../docs/scaling.md`](../docs/scaling.md).
+>
+> Kept for the reasoning, not the design. The autoscaling *signals* it argued for
+> (§5) partly survive as the metrics in
+> [`../docs/observability.md`](../docs/observability.md).
 
-**Status:** Proposed (agentctl control-plane track)
+**Status:** Withdrawn (was: Proposed, agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — control-plane track (RFC 0014); extends execution modes & reactive routing (RFC 0008)

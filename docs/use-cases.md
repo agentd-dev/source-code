@@ -204,8 +204,8 @@ finish.
 
 Good fits: audit a repository across independent dimensions (security, perf,
 API-compat, docs) in parallel; summarize 200 documents into one briefing;
-evaluate several candidate designs against the same rubric; shard a large
-backfill and reconcile the shard reports.
+evaluate several candidate designs against the same rubric; split a large
+backfill across subagents and reconcile their reports.
 
 ```bash
 agentd \

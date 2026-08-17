@@ -7,10 +7,11 @@ state. Scaling it goes in two directions, and they are not interchangeable —
 2. **across instances**, by giving each replica a slice of the work that no
    other replica also sees.
 
-agentd never changes its own replica count. It bounds the work it is pointed at
-and exposes the state a control plane (an HPA, KEDA, an operator) scales on.
-Everything below is verified against the shipped binary; the surfaces that are
-declared but inert are called out by name in §4.
+agentd never changes its own replica count, and it has no coordination protocol
+of its own (§4). It bounds the work it is pointed at, exposes the state a control
+plane (an HPA, KEDA, an operator) scales on, and leaves ownership to the systems
+that can actually arbitrate it. Everything below is verified against the shipped
+binary.
 
 ---
 
@@ -246,48 +247,22 @@ to someone else when the lease expires.
 
 ---
 
-## 3a. Timer starts are sharded
+## 4. agentd has no cluster-coordination surface
 
-A `schedule`, `loop`, `cron` or `once` start fires on **exactly one replica**.
-This is the case where getting it wrong is not a risk but a certainty: three
-replicas arming the same nightly job run it three times.
+There is no shard flag, no claim route, no standby pool, and no `cluster` build
+feature. A version of agentd carried declarations for all of them — parsed,
+validated, and read by nothing — and they were removed rather than finished.
 
-```yaml
-cluster:
-  shard: "0/3"        # this replica's identity; each gets its own K
-  timer_shard: shard0 # or: keyed
-```
+That is a deliberate boundary, not a gap waiting to be filled. Coordination
+needs a shared source of truth, and agentd already talks to two: the MCP server
+the work comes from, and the store. Both are better placed to own it than a
+replica is — the queue can hand an item to somebody else when a lease expires,
+and no agentd-side hash can do that. §2 is the whole answer, and every mechanism
+in it exists today.
 
-- **`shard0`** (default) — replica 0 owns every timer. The answer does not
-  depend on `N`, so resizing the fleet cannot move a job mid-flight.
-- **`keyed`** — each start hashes to a replica (FNV-1a of `workflow/node`), so a
-  fleet with many scheduled workflows spreads them instead of piling them all
-  onto replica 0. Resizing re-hashes, which is fine for a periodic job and is
-  why it is not the default.
-
-A skipped start is counted in `agent_shard_skipped_total` and logged at debug as
-`start.not_ours`. Unsharded (`N == 1`, the default) owns everything, so a
-single-replica deployment is unaffected.
-
-## 4. Declared but inert: the delivery path and the `subscribe` claim fields
-
-Some scaling surfaces are accepted by the config loader without having any
-runtime behaviour. They validate, so a config carrying them starts; nothing
-reads them. **Do not build a fleet on them.**
-
-| Surface | Status |
-|---|---|
-| `cluster.shard` (alias `--shard K/N`, env `AGENTD_CLUSTER_SHARD` / `AGENT_SHARD`) | **Live for timer starts** (below). Still inert in the *delivery* path: every replica sees every MCP notification regardless of the value. |
-| `cluster.timer_shard` (`shard0` \| `keyed`) | **Live.** See "Timer starts are sharded" below. |
-| `claim` on a `subscribe` start node | Accepted as a field of the node. No claim is taken and no coordination call is made. |
-| `shard` on a `subscribe` start node | **Refused at validation.** It promised partitioned deliveries and never filtered anything, so a fleet built on it processed everything N times while looking configured. Failing to start is the honest answer; use `claim`, or shard the timer starts. |
-| The `cluster` build feature | Still declared in `Cargo.toml`, gates nothing in the runtime, and is not in the release feature set. Building with it changes no behaviour. |
-
-The frozen design these surfaces were reserved for — hash partitioning at
-routing intake, a `work.*` lease convention against a coordination server, and a
-standby claim-pull pool — lives in
-[RFC 0019](../rfcs/0019-horizontal-scaling.md). Until it is implemented, §2
-covers the same ground with mechanisms that exist.
+If you want partitioned timers across a fleet, give each replica a different
+config: replica 0 arms the nightly `schedule`, the others do not. That is one
+line of Helm values, and it is legible in a way `timer_shard: keyed` never was.
 
 ---
 
@@ -316,12 +291,10 @@ scales **in** on a sustained-empty backlog, then relies on the drain contract fo
 safety: `SIGTERM` finishes in-flight runs within `lifecycle.drain_timeout` and
 exits `0`.
 
-The `/metrics` output also renders a set of names reserved by the frozen metrics
-schema that this build never writes to — `agent_saturation`,
-`agent_pending_events`, `agent_inflight_reactions`, `agent_reaction_lag_ms`,
-`agent_subscriptions_active`, `agent_active_subagents`, `agent_shard_skipped_total`
-and the `agent_claims_*` counters. They are present and flat at zero. Do not
-target an HPA at them.
+A few reserved names remain in the `/metrics` output that this build never
+writes to — `agent_pending_events`, `agent_inflight_reactions`,
+`agent_reaction_lag_ms`, `agent_subscriptions_active`, `agent_active_subagents`.
+They are present and flat at zero. Do not target an HPA at them.
 
 ---
 

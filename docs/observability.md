@@ -571,21 +571,6 @@ Point-in-time gauges a horizontal scaler reads:
 - **`agent_inflight_reactions`** — reactions currently executing.
 - **`agent_subscriptions_active`** — reconciled declared subscriptions.
 - **`agent_reaction_lag_ms`** — age of the oldest un-routed pending event.
-- **`agent_saturation`** *(float gauge in `[0,1]`)* — in-flight / capacity
-  utilization — the HPA "utilization" target. A zero capacity reads `0.0` and an
-  over-cap in-flight clamps to `1.0` (never a div-by-zero, never `> 1`).
-
-#### Horizontal-scaling counters (`cluster` build)
-
-Wired by the `cluster` build's shard gate and claim gate:
-
-- **`agent_shard_skipped_total`** *(counter)* — items dropped as out-of-shard by
-  the routing pre-filter.
-- **`agent_claims_lost_total`** *(counter)* — work claims lost to another replica
-  — the over-provision signal (high & rising under low backlog ⇒ scale down).
-- **`agent_claims_granted_total`** / **`agent_claims_released_total`**
-  *(counters)* — claims this replica won, and held claims handed back on a non-
-  terminal wind-down or drain.
 
 (The legacy bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
 `agent_reactions_total`, etc. — are retained alongside the frozen set, additive

@@ -59,7 +59,7 @@ Three properties make it different from an agent framework:
 | [observability.md](observability.md) | Structured telemetry, the correlation tuple, health and metrics. |
 | [deployment.md](deployment.md) | Job, CronJob, long-lived Deployment, systemd — and drain choreography. |
 | [operations.md](operations.md) | Driving a live daemon: the admin surface, capabilities, hot reload. |
-| [scaling.md](scaling.md) | Many replicas over one queue: sharding, work-claim leases, idempotency. |
+| [scaling.md](scaling.md) | Many replicas over one queue: partitioning at the source, queue-side leases, idempotency. |
 
 **Extend & embed**
 

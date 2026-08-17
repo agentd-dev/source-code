@@ -108,249 +108,6 @@ impl SwapPolicy {
     }
 }
 
-/// Timer-route shard behaviour (RFC 0019 §4.1, `AGENTD_SHARD_TIMER`). Stored on
-/// [`Config`] in ALL feature combos (so `Config` stays uniform), but only
-/// consulted by the `cluster`-feature timer driver. `shard0` ⇒ one fleet-wide
-/// ticker (only shard 0 fires); `keyed` ⇒ every replica fires (the per-tick key
-/// gate is applied elsewhere / deferred).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimerShardMode {
-    #[default]
-    Shard0,
-    Keyed,
-}
-
-impl TimerShardMode {
-    fn parse(s: &str) -> Option<TimerShardMode> {
-        match s {
-            "shard0" => Some(TimerShardMode::Shard0),
-            "keyed" => Some(TimerShardMode::Keyed),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TimerShardMode::Shard0 => "shard0",
-            TimerShardMode::Keyed => "keyed",
-        }
-    }
-}
-
-/// The wire shape a `claim` route uses to talk to its coordination server
-/// (RFC 0015 §5.6 "two styles", RFC 0019 §3.3). Always-compiled (so [`Config`]
-/// stays uniform across feature combos); only the `cluster`-gated claim client
-/// acts on it. `Tool` (the default) calls the four `work.*` tools directly;
-/// `Resource` models items as resources carrying a `lease` field and degenerates
-/// `work.claim` to a compare-and-set (the CAS path is a documented stub in v1 —
-/// see `cluster::claim`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ClaimStyle {
-    #[default]
-    Tool,
-    Resource,
-}
-
-impl ClaimStyle {
-    /// Parse the `:tool|:resource` suffix of a `--claim` value. `None` on an
-    /// unknown value (the caller maps it to a [`ConfigError::Usage`], exit 2).
-    fn parse(s: &str) -> Option<ClaimStyle> {
-        match s {
-            "tool" => Some(ClaimStyle::Tool),
-            "resource" => Some(ClaimStyle::Resource),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ClaimStyle::Tool => "tool",
-            ClaimStyle::Resource => "resource",
-        }
-    }
-}
-
-/// A declared work-claim route (`--claim <uri>=<server>[:tool|resource]`, RFC
-/// 0019 §3, RFC 0015 §5.6). Before a reactive worker processes `uri`, it claims
-/// it against the coordination MCP server named `server` (a declared `--mcp`
-/// server) and proceeds only on a granted lease. Always-compiled (no dependency
-/// on the gated `cluster` types) so `Config` is uniform; the live, server-bound
-/// `ClaimSpec` is built in `run_reactive` under the `cluster` feature. A claim
-/// route's `uri` is ALSO added to the `subscribe` set (subscribed + routed as a
-/// Spawn) at load. **Exact-URI in v1** (prefix/glob-claim is a documented
-/// follow-up).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimRoute {
-    /// The exact resource URI this route claims before processing.
-    pub uri: String,
-    /// The `--mcp` server name that advertises the `work.*` coordination tools.
-    pub server: String,
-    /// The wire style (`tool` default | `resource` CAS stub).
-    pub style: ClaimStyle,
-    /// Whether this claim route delivers into a warm `--continue` session
-    /// (`Disposition::Continue`) rather than a fresh `Spawn` per event (RFC 0019
-    /// §3.4). Set at load when the route's `uri` is ALSO a `--continue` URI: the
-    /// claim is held for the session's life (claimed on the session's first
-    /// delivery, renewed by the heartbeat while live, acked/released when the
-    /// session ends/drains) instead of claimed→settled within one delivery.
-    pub continue_session: bool,
-}
-
-/// A standby worker's assignment channel (`--assign-from <server>:<uri>`, RFC
-/// 0019 §7.2 mechanism 1). The shared "pending work" resource a standby pool
-/// races `work.claim` on: on its `updated`, every standby member claims, exactly
-/// one wins. Always-compiled (uniform `Config`, no dependency on the gated
-/// `cluster` types); a non-`None` value needs the `cluster` build feature
-/// (validated, exit 2). At load it is desugared into a [`ClaimRoute`] on
-/// `(uri, server)` + folded into `subscribe`, so the standby pool reuses the
-/// EXISTING claim machinery — "no new code, just a claim route whose source is
-/// the assignment channel" (RFC 0019 §7.2 mechanism 1). `server` must be a
-/// declared `--mcp` server (the same exit-2 gate as a `--claim` route).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssignFrom {
-    /// The `--mcp` server that owns the shared assignment resource + the `work.*`
-    /// coordination tools the standby pool races on.
-    pub server: String,
-    /// The shared "pending work" resource URI the pool subscribes to and claims.
-    pub uri: String,
-}
-
-impl AssignFrom {
-    /// Parse a `--assign-from <server>:<uri>` value. The split is on the FIRST
-    /// `:` — the server name carries no colon, and the rest (a `scheme://…` URI)
-    /// keeps its own colons intact. Rejects an empty server or URI with a
-    /// [`ConfigError::Usage`] (exit 2, before any side effect).
-    fn parse(spec: &str) -> Result<AssignFrom, ConfigError> {
-        let (server, uri) = spec.split_once(':').ok_or_else(|| {
-            usage(format!(
-                "--assign-from must be <server>:<uri> (got: {spec})"
-            ))
-        })?;
-        if server.is_empty() || uri.is_empty() {
-            return Err(usage(format!(
-                "--assign-from '{spec}' has an empty server or uri"
-            )));
-        }
-        Ok(AssignFrom {
-            server: server.to_string(),
-            uri: uri.to_string(),
-        })
-    }
-}
-
-/// Shard identity (`--shard K/N`, RFC 0019 §4). Held on [`Config`] in ALL feature
-/// combos as primitive fields (no dependency on the feature-gated `cluster`
-/// module's types), so `Config::load` compiles uniformly. The default `0/1` is a
-/// single logical shard that owns everything — byte-for-byte RFC 0008 behaviour.
-/// Without the `cluster` feature a requested `N > 1` is rejected at validation
-/// (exit 2): a silently-ignored shard directive would cause duplicate processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShardCfg {
-    /// Shard ordinal `K` (`0 <= k < n`).
-    pub k: u32,
-    /// Shard count `N` (`>= 1`). `1` is unsharded (the default).
-    pub n: u32,
-    /// Timer-route behaviour for a sharded `schedule`/`loop` fleet.
-    pub timer: TimerShardMode,
-}
-
-impl Default for ShardCfg {
-    fn default() -> Self {
-        ShardCfg {
-            k: 0,
-            n: 1,
-            timer: TimerShardMode::Shard0,
-        }
-    }
-}
-
-impl ShardCfg {
-    /// Parse the `K/N` value of `--shard` / `AGENTD_SHARD` into `(k, n)`, leaving
-    /// `timer` at its current value. Rejects `N == 0`, `K >= N`, and any
-    /// non-numeric / malformed form with a [`ConfigError::Usage`] (exit 2, before
-    /// any side effect). Mirrors the hand-rolled-FNV shard contract (RFC 0019 §4.1)
-    /// without pulling in the gated `cluster` module.
-    fn parse_into(&mut self, spec: &str) -> Result<(), ConfigError> {
-        let (k_str, n_str) = spec
-            .split_once('/')
-            .ok_or_else(|| usage(format!("--shard must be K/N (got: {spec})")))?;
-        let k: u32 = k_str
-            .trim()
-            .parse()
-            .map_err(|_| usage(format!("--shard: invalid K '{k_str}' (want a number)")))?;
-        let n: u32 = n_str
-            .trim()
-            .parse()
-            .map_err(|_| usage(format!("--shard: invalid N '{n_str}' (want a number)")))?;
-        if n == 0 {
-            return Err(usage("--shard: N must be > 0".into()));
-        }
-        if k >= n {
-            return Err(usage(format!("--shard: K must be < N (got {k}/{n})")));
-        }
-        self.k = k;
-        self.n = n;
-        Ok(())
-    }
-
-    /// Set `K/N` from a validated spec, leaving the timer mode alone. A
-    /// malformed spec is ignored: validation has already rejected it, and
-    /// "unsharded" is the safe reading of a value that should not exist.
-    pub fn set(&mut self, spec: &str) {
-        let _ = self.parse_into(spec);
-    }
-
-    /// Whether *this* replica owns a time-driven start (`schedule`, `loop`,
-    /// `cron`, `once`).
-    ///
-    /// This is the case where getting it wrong is not a risk but a certainty:
-    /// three replicas arming the same nightly `schedule` run it three times.
-    /// The two modes answer differently on purpose —
-    ///
-    /// * `shard0` — replica 0 owns every timer. Simple, and correct even when
-    ///   the fleet is resized, because the answer does not depend on `N`.
-    /// * `keyed` — each start is hashed to a replica, so a fleet with many
-    ///   scheduled workflows spreads them instead of piling them all on one.
-    ///   Resizing the fleet re-hashes, which is fine for a periodic job and is
-    ///   why this is not the default.
-    ///
-    /// Unsharded (`N == 1`) always owns everything, so the default deployment
-    /// is unaffected by any of this.
-    pub fn owns_timer(&self, workflow: &str, node: &str) -> bool {
-        if self.n <= 1 {
-            return true;
-        }
-        match self.timer {
-            TimerShardMode::Shard0 => self.k == 0,
-            TimerShardMode::Keyed => {
-                fnv1a(&format!("{workflow}/{node}")) % (self.n as u64) == self.k as u64
-            }
-        }
-    }
-
-    /// The `"K/N"` identity for the capabilities manifest / capacity resource
-    /// (RFC 0019 §9). `None` for the unsharded `N == 1` case (reported as null).
-    pub fn label(&self) -> Option<String> {
-        if self.n == 1 {
-            None
-        } else {
-            Some(format!("{}/{}", self.k, self.n))
-        }
-    }
-}
-
-/// FNV-1a, for the keyed shard assignment. Hand-rolled and stable across
-/// releases on purpose: a hash that changed would silently re-assign every
-/// scheduled workflow on upgrade.
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    h
-}
-
 /// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
 /// implicit default (no `--serve-mcp`). The sole transport is
 /// [`Http`](ServeTarget::Http) — `https://HOST:PORT` (TLS, the control plane) or
@@ -885,54 +642,6 @@ pub struct Config {
     /// stored here or logged. An inline secret-shaped value is rejected at
     /// validation (§3.1). A `BTreeMap` so the order is deterministic.
     pub intelligence_headers: std::collections::BTreeMap<String, String>,
-    /// Shard identity (`--shard K/N` / `AGENTD_SHARD`, RFC 0019 §4) +
-    /// timer-shard behaviour (`AGENTD_SHARD_TIMER`). Always present (default
-    /// `0/1`, unsharded) so `Config` is uniform across feature combos; a
-    /// requested `N > 1` needs the `cluster` build feature (validated, exit 2).
-    pub shard: ShardCfg,
-    /// Declared work-claim routes (`--claim <uri>=<server>[:style]`, RFC 0019 §3
-    /// / RFC 0015 §5.6). Each route's `uri` is also added to `subscribe` at load.
-    /// Always-compiled (uniform `Config`); a non-empty list needs the `cluster`
-    /// build feature (validated, exit 2) and each `server` must be a declared
-    /// `--mcp` server. The live claim client is built in `run_reactive`.
-    pub claim_routes: Vec<ClaimRoute>,
-    /// Requested lease TTL for `work.claim` (`--claim-ttl` / `AGENTD_CLAIM_TTL`,
-    /// default 30s, RFC 0019 §3.6). The server is the authority; this is the
-    /// requested value. Always present (claim routes consult it under `cluster`).
-    pub claim_ttl: Duration,
-    /// The renew heartbeat fraction (`--claim-renew-fraction` /
-    /// `AGENTD_CLAIM_RENEW_FRACTION`, default 0.33, RFC 0019 §3.6): a long run
-    /// renews at `ttl * fraction`. In the synchronous-spawn v1 renew is a
-    /// documented no-op (see `run_reactive`); the value is carried for forward
-    /// compatibility and the manifest.
-    pub claim_renew_fraction: f64,
-    /// Standby mode (`--standby` / `AGENTD_STANDBY`, RFC 0019 §7). A standby
-    /// worker is a reactive worker held warm and driven by an **assignment
-    /// channel** (`assign_from`) rather than its own content subscriptions: on
-    /// the shared pending resource's `updated`, it races `work.claim` (claim-pull,
-    /// §7.2 mechanism 1) and processes only what it wins. Always-compiled (uniform
-    /// `Config`); `true` needs the `cluster` build feature (validated, exit 2) and
-    /// is only meaningful in reactive mode. Reflected in `surfaces.standby` and
-    /// `agentd://capacity.standby`.
-    pub standby: bool,
-    /// The assignment channel a standby worker claim-pulls from
-    /// (`--assign-from <server>:<uri>` / `AGENTD_ASSIGN_FROM`, RFC 0019 §7.2
-    /// mechanism 1). At load it is desugared into a [`ClaimRoute`] on `(uri,
-    /// server)` and its `uri` is folded into `subscribe` — so the standby pool
-    /// reuses the existing claim machinery with NO new code path. `None` ⇒ no
-    /// assignment channel. Implies reactive mode (validated). Needs the `cluster`
-    /// build feature (the desugared claim route's gate).
-    pub assign_from: Option<AssignFrom>,
-    /// Keep the intelligence session warm while idle in standby
-    /// (`AGENTD_WARM_INTEL`, RFC 0019 §7.3; default `true` when `--standby`, else
-    /// `false`). **Forward-compat only in v1**: agentd's supervisor runs no LLM
-    /// loop — each reaction re-execs and connects its own intelligence — so there
-    /// is no supervisor-held intel session to keep warm and **no warm-child pool**
-    /// (that is a documented RFC 0019 §7 follow-up). The flag is accepted, stored,
-    /// and reported, but does not yet pre-warm anything; it exists so a future
-    /// warm-child-pool build honours the operator's intent without a config
-    /// break.
-    pub warm_intel: bool,
     /// Watch the config file for changes and reload (`--watch-config` /
     /// `AGENTD_WATCH_CONFIG`, RFC 0017 §5.2). When set, the reactive supervisor
     /// arms a raw `inotify` watch on the config file's PARENT DIRECTORY (so a
@@ -1000,15 +709,8 @@ impl Default for Config {
             budget_exit_code: None,
             events_ring: crate::obs::log::EVENTS_RING_DEFAULT,
             intelligence_headers: std::collections::BTreeMap::new(),
-            shard: ShardCfg::default(),
-            claim_routes: Vec::new(),
-            claim_ttl: Duration::from_secs(30),
-            claim_renew_fraction: 0.33,
-            standby: false,
-            assign_from: None,
             // Off by default; flipped to `true` when `--standby` is set unless
             // `AGENTD_WARM_INTEL` explicitly overrides (resolved in `load`).
-            warm_intel: false,
             watch_config: false,
             config_files: Vec::new(),
         }
@@ -1081,13 +783,6 @@ impl fmt::Debug for Config {
                 "intelligence_headers",
                 &self.intelligence_headers.keys().collect::<Vec<_>>(),
             )
-            .field("shard", &self.shard)
-            .field("claim_routes", &self.claim_routes)
-            .field("claim_ttl", &self.claim_ttl)
-            .field("claim_renew_fraction", &self.claim_renew_fraction)
-            .field("standby", &self.standby)
-            .field("assign_from", &self.assign_from)
-            .field("warm_intel", &self.warm_intel)
             .field("watch_config", &self.watch_config)
             .field("config_files", &self.config_files)
             .finish()
@@ -1325,41 +1020,6 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_BEARER") {
             c.serve_bearer = Some((*v).to_string());
         }
-        // Shard identity (RFC 0019 §4.2): agentctl injects `AGENTD_SHARD=K/N`
-        // from the StatefulSet ordinal; a `--shard` flag below overrides it.
-        if let Some(v) = envmap.get("AGENTD_SHARD") {
-            c.shard.parse_into(v)?;
-        }
-        // Timer-route shard behaviour (RFC 0019 §4.1): `shard0` (default) | `keyed`.
-        if let Some(v) = envmap.get("AGENTD_SHARD_TIMER") {
-            c.shard.timer = TimerShardMode::parse(v)
-                .ok_or_else(|| usage(format!("invalid AGENTD_SHARD_TIMER: {v}")))?;
-        }
-        // Work-claim lease knobs (RFC 0019 §3.6). The requested TTL + the renew
-        // heartbeat fraction; the routes themselves are flag-only (`--claim`,
-        // repeatable + structured). A flag below overrides either.
-        if let Some(v) = envmap.get("AGENTD_CLAIM_TTL") {
-            c.claim_ttl = parse_duration(v).map_err(usage)?;
-        }
-        if let Some(v) = envmap.get("AGENTD_CLAIM_RENEW_FRACTION") {
-            c.claim_renew_fraction = parse_claim_fraction(v)?;
-        }
-        // Standby mode + its assignment channel (RFC 0019 §7). `AGENTD_STANDBY`
-        // is a bool; `AGENTD_ASSIGN_FROM` is `<server>:<uri>`. A `--standby` /
-        // `--assign-from` flag below overrides either.
-        if let Some(v) = envmap.get("AGENTD_STANDBY") {
-            c.standby = truthy(v);
-        }
-        if let Some(v) = envmap.get("AGENTD_ASSIGN_FROM") {
-            c.assign_from = Some(AssignFrom::parse(v)?);
-        }
-        // `AGENTD_WARM_INTEL` (RFC 0019 §7.3) — accepted + stored, forward-compat
-        // only in v1 (no warm-child pool). Tracked as an explicit override so the
-        // standby default (`true` when `--standby`) only applies when it is unset.
-        let mut warm_intel_env: Option<bool> = None;
-        if let Some(v) = envmap.get("AGENTD_WARM_INTEL") {
-            warm_intel_env = Some(truthy(v));
-        }
         // File-watch reload trigger (RFC 0017 §5.2). `AGENTD_WATCH_CONFIG` is a
         // bool; a `--watch-config` flag below overrides it. Needs the
         // `config-watch` build feature + a config file (validated, exit 2).
@@ -1560,32 +1220,6 @@ impl Config {
                 "--aauth-person-server" => {
                     aauth_person_server = Some(take("--aauth-person-server")?)
                 }
-                // Shard identity (RFC 0019 §4): `--shard K/N` overrides AGENTD_SHARD.
-                "--shard" => {
-                    let v = take("--shard")?;
-                    c.shard.parse_into(&v)?;
-                }
-                // Work-claim route (RFC 0019 §3 / RFC 0015 §5.6): `--claim
-                // <uri>=<server>[:tool|resource]`. The URI is also subscribed
-                // (routed as a Spawn) below. Repeatable.
-                "--claim" => {
-                    let v = take("--claim")?;
-                    c.claim_routes.push(parse_claim_route(&v)?);
-                }
-                "--claim-ttl" => {
-                    c.claim_ttl = parse_duration(&take("--claim-ttl")?).map_err(usage)?
-                }
-                "--claim-renew-fraction" => {
-                    c.claim_renew_fraction = parse_claim_fraction(&take("--claim-renew-fraction")?)?
-                }
-                // Standby mode (RFC 0019 §7): a warm, assignment-driven reactive
-                // worker. `--assign-from <server>:<uri>` names the shared pending
-                // resource it claim-pulls from (desugared into a claim route +
-                // subscribe below).
-                "--standby" => c.standby = true,
-                "--assign-from" => {
-                    c.assign_from = Some(AssignFrom::parse(&take("--assign-from")?)?)
-                }
                 // File-watch reload trigger (RFC 0017 §5.2): watch the config
                 // file's directory and reload on a change. Needs the
                 // `config-watch` build feature + a `--config`/`AGENTD_CONFIG`
@@ -1688,56 +1322,6 @@ impl Config {
 
         if c.run_id.is_empty() {
             c.run_id = generate_run_id();
-        }
-
-        // Resolve standby warm-intel (RFC 0019 §7.3): an explicit
-        // `AGENTD_WARM_INTEL` wins; otherwise default to ON when `--standby`, OFF
-        // otherwise. Forward-compat only in v1 — see the field doc + `warm_intel`.
-        c.warm_intel = warm_intel_env.unwrap_or(c.standby);
-
-        // Desugar a standby assignment channel into a claim route (RFC 0019 §7.2
-        // mechanism 1: "no new code, just a claim route whose source is the
-        // assignment channel"). The standby pool subscribes to the shared pending
-        // resource and races `work.claim` on it via the existing claim machinery.
-        // Default style is `tool`. Dedup against an explicit `--claim` of the same
-        // URI so the same channel isn't claimed twice.
-        if let Some(a) = &c.assign_from
-            && !c.claim_routes.iter().any(|r| r.uri == a.uri)
-        {
-            c.claim_routes.push(ClaimRoute {
-                uri: a.uri.clone(),
-                server: a.server.clone(),
-                style: ClaimStyle::Tool,
-                continue_session: false,
-            });
-        }
-
-        // continue-claim (RFC 0019 §3.4): a claim route whose URI is ALSO a
-        // `--continue` URI delivers into the warm session (Disposition::Continue),
-        // holding the lease for the session's life, rather than claiming→settling
-        // a fresh Spawn per event. We mark it here (after both `--claim` and
-        // `--continue` are parsed) so the subscribe-fold below routes it to the
-        // CONTINUE set, not the spawn set, and `run_reactive` keys its held claim
-        // by session id. Picking the idiom "honor a claim on an existing
-        // `--continue` URI" keeps the surface minimal — no new flag.
-        for r in &mut c.claim_routes {
-            if c.continue_subscribe.contains(&r.uri) {
-                r.continue_session = true;
-            }
-        }
-
-        // A claim route's URI is subscribed + routed as a Spawn (RFC 0019 §3.4):
-        // fold each spawn-style route's URI into the subscribe set so it is
-        // subscribed and the router delivers it; the claim gate runs before the
-        // spawn acts (wired in `run_reactive`). Dedup against an explicit
-        // `--subscribe` of the same URI so it is not subscribed twice. A
-        // continue-claim route is SKIPPED here — its URI is already in
-        // `continue_subscribe` (routed as Disposition::Continue), so folding it
-        // into `subscribe` would double-route it as a Spawn.
-        for r in &c.claim_routes {
-            if !r.continue_session && !c.subscribe.contains(&r.uri) {
-                c.subscribe.push(r.uri.clone());
-            }
         }
 
         // `--capabilities`: the v1 manifest was retired with the mode cut-over —
@@ -1990,19 +1574,6 @@ impl Config {
         if self.events_ring == 0 {
             return Err(usage("--events-ring must be > 0".into()));
         }
-        // Standby mode + its assignment channel (RFC 0019 §7). Checked BEFORE the
-        // reactive-subscribe + `--claim` validations so the operator gets a
-        // message that names the flag they actually wrote (`--standby` /
-        // `--assign-from`), not a downstream "needs a subscribe" / desugared-claim
-        // error. A standby worker claim-pulls (§7.2 mechanism 1), so it is a
-        // `cluster` surface — mirroring the `--shard`/`--claim` gates; a
-        // silently-ignored `--standby` would mislead the operator into thinking
-        // the pool is warm-and-claiming when it isn't.
-        if (self.standby || self.assign_from.is_some()) && !cfg!(feature = "cluster") {
-            return Err(usage(
-                "--standby / --assign-from require the 'cluster' build feature".into(),
-            ));
-        }
         // File-watch reload trigger (`--watch-config`, RFC 0017 §5.2) needs the
         // `config-watch` build feature — mirroring the `--shard`/`--standby`
         // gates. A silently-ignored `--watch-config` would leave the operator
@@ -2011,27 +1582,6 @@ impl Config {
             return Err(usage(
                 "--watch-config requires the 'config-watch' build feature".into(),
             ));
-        }
-        // Standby is mode-orthogonal but only MEANINGFUL in reactive mode (RFC
-        // 0019 §7.3): it is `--mode reactive` + `--standby` + `--assign-from`. An
-        // assignment channel drives reactions, which only the reactive driver
-        // serves — so `--standby`/`--assign-from` outside reactive is a
-        // misconfiguration (the channel would never be claimed). Exit 2.
-        if (self.standby || self.assign_from.is_some()) && self.mode != Mode::Reactive {
-            return Err(usage(
-                "--standby / --assign-from are only valid with --mode reactive".into(),
-            ));
-        }
-        // `--assign-from`'s server must be a declared `--mcp` server (exit 2). The
-        // desugared claim route below validates this too, but this names the
-        // assignment flag the operator wrote for a clearer diagnostic.
-        if let Some(a) = &self.assign_from
-            && !self.mcp_servers.iter().any(|s| s.name == a.server)
-        {
-            return Err(usage(format!(
-                "--assign-from names server '{}', which is not a declared --mcp server",
-                a.server
-            )));
         }
         {
             #[cfg(feature = "workflow")]
@@ -2099,26 +1649,6 @@ impl Config {
                 return Err(usage(
                     "--workflow is only valid with --mode workflow or --mode reactive".into(),
                 ));
-            }
-            // A reactive WORKFLOW daemon is a single-instance shape: its wait uris
-            // are its OWN dependencies, not a partitioned work stream. `--shard`
-            // would silently drop out-of-shard wait updates at notification intake
-            // (the workflow would limp along on timeouts), and standby/assignment
-            // is a different operating identity — both are wiring mistakes, so
-            // they exit 2 like every other incoherent combo.
-            if self.mode == Mode::Reactive && self.workflow_file.is_some() {
-                if self.shard.n > 1 {
-                    return Err(usage(
-                        "--shard cannot be combined with a reactive --workflow (the workflow's                          wait updates would be shard-filtered; run one unsharded instance)"
-                            .into(),
-                    ));
-                }
-                if self.standby || self.assign_from.is_some() {
-                    return Err(usage(
-                        "--standby / --assign-from cannot be combined with a reactive --workflow                          (assignment-driven and workflow-driven daemons are different shapes)"
-                            .into(),
-                    ));
-                }
             }
         }
         // The per-run limits do nothing without a cgroup to apply them to, so a
@@ -2200,44 +1730,6 @@ impl Config {
                 crate::net::tls::validate_ca_pem(&pem)
                     .map_err(|e| usage(format!("--tls-ca {ca}: {e}")))?;
             }
-        }
-        // Sharding (`--shard K/N`, RFC 0019 §4) needs the `cluster` build feature.
-        // A requested `N > 1` without it is rejected at startup (exit 2) — NOT
-        // silently ignored: a dropped scaling directive would make this replica
-        // own every item, duplicating the work the operator meant to partition.
-        // `N == 1` (the unsharded default / absent flag) is always fine.
-        if self.shard.n > 1 && !cfg!(feature = "cluster") {
-            return Err(usage("--shard requires the 'cluster' build feature".into()));
-        }
-        // Work-claim routes (`--claim`, RFC 0019 §3 / RFC 0015 §5.6) need the
-        // `cluster` build feature — mirroring the `--shard` gate. A silently
-        // ignored claim directive would let every replica process every item
-        // unclaimed (the cross-instance-ownership bug claim exists to prevent).
-        if !self.claim_routes.is_empty() && !cfg!(feature = "cluster") {
-            return Err(usage("--claim requires the 'cluster' build feature".into()));
-        }
-        // Each claim route's coordination server MUST be a declared `--mcp`
-        // server (exit 2, RFC 0015 §5.6). The "server is up + advertises work.*"
-        // check is LIVE (post-handshake, in `run_reactive`) — exit 6 if down,
-        // exit 2 if up-but-missing-the-tools. Here we only resolve the wiring.
-        for r in &self.claim_routes {
-            if r.uri.is_empty() {
-                return Err(usage("--claim has an empty URI".into()));
-            }
-            if !self.mcp_servers.iter().any(|s| s.name == r.server) {
-                return Err(usage(format!(
-                    "--claim route '{}' names coordination server '{}', which is not a declared --mcp server",
-                    r.uri, r.server
-                )));
-            }
-        }
-        // The renew fraction must be a sane heartbeat ratio in (0, 1) (RFC 0019
-        // §3.6): 0 would never renew, >= 1 would renew only at/after expiry.
-        if !(self.claim_renew_fraction > 0.0 && self.claim_renew_fraction < 1.0) {
-            return Err(usage(format!(
-                "--claim-renew-fraction must be in (0, 1) (got: {})",
-                self.claim_renew_fraction
-            )));
         }
         // Declared A2A delegation peers (RFC 0020 §3) need the `a2a` build
         // feature, and each endpoint scheme is validated up front (exit 2 before
@@ -2414,10 +1906,6 @@ pub const RESTART_ONLY_FIELDS: &[&str] = &[
     "run_id",             // instance identity / idempotency key
     "serve_mcp",          // a live control socket must not rebind mid-flight
     "drain_timeout",      // validated against the pod grace at startup
-    "shard",              // shard identity is immutable (RFC 0019 §4.3)
-    "claim_routes",       // claim/assignment routing is restart-only
-    "standby",            // standby pool membership is restart-only
-    "assign_from",        // the assignment channel is restart-only
     "continue_subscribe", // warm-session routing topology is restart-only
 ];
 
@@ -2508,10 +1996,6 @@ impl Config {
             "run_id" => self.run_id != running.run_id,
             "serve_mcp" => self.serve_mcp != running.serve_mcp,
             "drain_timeout" => self.drain_timeout != running.drain_timeout,
-            "shard" => self.shard != running.shard,
-            "claim_routes" => self.claim_routes != running.claim_routes,
-            "standby" => self.standby != running.standby,
-            "assign_from" => self.assign_from != running.assign_from,
             "continue_subscribe" => self.continue_subscribe != running.continue_subscribe,
             _ => false,
         }
@@ -2570,28 +2054,11 @@ fn check_unique_server_names(cfg: &Config, diags: &mut Vec<Diag>) {
 /// server — they bind to whichever connected server supports them — so only the
 /// claim/assignment subset is checked, exactly as `validate()` does.)
 fn check_subscriptions_reference_declared_servers(cfg: &Config, diags: &mut Vec<Diag>) {
-    for r in &cfg.claim_routes {
-        if !cfg.mcp_servers.iter().any(|s| s.name == r.server) {
-            diags.push(Diag::error(
-                "claim_routes",
-                format!(
-                    "claim route '{}' references undeclared coordination server '{}'",
-                    r.uri, r.server
-                ),
-            ));
-        }
-    }
-    if let Some(a) = &cfg.assign_from
-        && !cfg.mcp_servers.iter().any(|s| s.name == a.server)
-    {
-        diags.push(Diag::error(
-            "assign_from",
-            format!(
-                "assignment channel references undeclared server '{}'",
-                a.server
-            ),
-        ));
-    }
+    // Plain `--subscribe` URIs bind to whichever connected server supports them,
+    // so there is no server reference here to resolve. The hook stays because
+    // §5.4 check 3 is about the reloadable subset being self-consistent, and a
+    // future field that DOES name a server would belong here.
+    let _ = (cfg, diags);
 }
 
 /// Heuristic: is this header name credential-shaped (RFC 0011 §3.2 / RFC 0017
@@ -2745,58 +2212,6 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
         endpoint: endpoint.to_string(),
         ..Default::default()
     })
-}
-
-/// Parse `--claim <uri>=<server>[:tool|resource]` into a [`ClaimRoute`] (RFC
-/// 0019 §3 / RFC 0015 §5.6). The URI is everything before the FIRST `=` (so a
-/// URI containing `=` in a query is unusual but the URIs claim routes target are
-/// resource ids without one). The remainder is `<server>` or `<server>:<style>`;
-/// the style defaults to `tool`. A `claim.style` other than `tool|resource` is
-/// exit 2. The server's existence is checked later in [`Config::validate`].
-fn parse_claim_route(spec: &str) -> Result<ClaimRoute, ConfigError> {
-    let (uri, rhs) = spec.split_once('=').ok_or_else(|| {
-        usage(format!(
-            "--claim must be <uri>=<server>[:style] (got: {spec})"
-        ))
-    })?;
-    if uri.is_empty() || rhs.is_empty() {
-        return Err(usage(format!(
-            "--claim '{spec}' has an empty URI or server"
-        )));
-    }
-    // Split the optional `:style` suffix off the server. The server name carries
-    // no `:`, so the first `:` (if any) begins the style.
-    let (server, style) = match rhs.split_once(':') {
-        Some((s, sty)) => {
-            let style = ClaimStyle::parse(sty).ok_or_else(|| {
-                usage(format!(
-                    "--claim '{spec}': unknown claim style '{sty}' (want tool|resource)"
-                ))
-            })?;
-            (s, style)
-        }
-        None => (rhs, ClaimStyle::Tool),
-    };
-    if server.is_empty() {
-        return Err(usage(format!("--claim '{spec}' has an empty server")));
-    }
-    Ok(ClaimRoute {
-        uri: uri.to_string(),
-        server: server.to_string(),
-        style,
-        // Defaults to spawn-claim; `load` flips this on when the URI is also a
-        // `--continue` URI (continue-claim, RFC 0019 §3.4).
-        continue_session: false,
-    })
-}
-
-/// Parse a `--claim-renew-fraction` value as an `f64`, mapping a non-numeric
-/// value to a [`ConfigError::Usage`] (exit 2). The `(0, 1)` range itself is
-/// enforced in [`Config::validate`] so `--validate-config` collects it uniformly.
-fn parse_claim_fraction(v: &str) -> Result<f64, ConfigError> {
-    v.trim()
-        .parse::<f64>()
-        .map_err(|_| usage(format!("invalid claim renew fraction: {v}")))
 }
 
 /// Parse `--a2a-peer name=endpoint` into an [`A2aPeerSpec`] (RFC 0020 §3). The
@@ -3177,12 +2592,6 @@ fn help_text() -> String {
          \x20 --continue <uri>            subscribe, routed to one warm session (repeatable)\n\
          \x20 --interval <dur>            loop/schedule interval (e.g. 5m)\n\
          \x20 --cron <5-field>           schedule on a UTC cron expr (needs --features cron)\n\
-         \x20 --shard K/N                 partition the URI/key space across a fleet (needs --features cluster; or AGENT_SHARD)\n\
-         \x20 --claim <uri>=<srv>[:style] claim an item before processing it (style tool|resource; needs --features cluster; repeatable)\n\
-         \x20 --claim-ttl <dur>           requested lease TTL (default 30s; or AGENT_CLAIM_TTL)\n\
-         \x20 --claim-renew-fraction <F>  renew heartbeat at ttl*F, F in (0,1) (default 0.33; or AGENT_CLAIM_RENEW_FRACTION)\n\
-         \x20 --standby                   warm, assignment-driven reactive worker (needs --features cluster; or AGENT_STANDBY)\n\
-         \x20 --assign-from <srv>:<uri>   shared assignment resource the standby pool claim-pulls (needs --features cluster; or AGENT_ASSIGN_FROM)\n\
          \n\
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
@@ -3329,41 +2738,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("--workflow is only valid"), "{e}");
-    }
-
-    #[cfg(all(feature = "workflow", feature = "cluster"))]
-    #[test]
-    fn a_reactive_workflow_rejects_cluster_partitioning_combos() {
-        // --shard would silently filter the workflow's own wait updates.
-        let e = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--workflow",
-                "/tmp/wf.json",
-                "--shard",
-                "1/4",
-            ]),
-            &base_env(),
-        )
-        .unwrap_err();
-        assert!(format!("{e}").contains("--shard cannot be combined"), "{e}");
-        // standby/assignment is a different daemon identity.
-        let e = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--workflow",
-                "/tmp/wf.json",
-                "--standby",
-            ]),
-            &base_env(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{e}").contains("--standby / --assign-from cannot"),
-            "{e}"
-        );
     }
 
     #[cfg(feature = "workflow")]
@@ -3793,517 +3167,9 @@ mod tests {
 
     // ───────────────────────── RFC 0019 — sharding (§4) ───────────────────────
 
-    /// The gate that makes `--shard` mean something: in a fleet of three, a
-    /// nightly `schedule` must fire once, not three times.
-    #[test]
-    fn a_time_driven_start_belongs_to_exactly_one_replica() {
-        // Unsharded: everything is ours, which is the default deployment.
-        let solo = ShardCfg::default();
-        assert!(solo.owns_timer("nightly", "tick"));
-
-        // shard0: replica 0 owns every timer, and the others own none — an
-        // answer that does not change when the fleet is resized.
-        let fleet: Vec<ShardCfg> = (0..3)
-            .map(|k| ShardCfg {
-                k,
-                n: 3,
-                timer: TimerShardMode::Shard0,
-            })
-            .collect();
-        let owners = fleet
-            .iter()
-            .filter(|s| s.owns_timer("nightly", "tick"))
-            .count();
-        assert_eq!(owners, 1, "exactly one replica runs the nightly job");
-        assert!(fleet[0].owns_timer("nightly", "tick"));
-
-        // keyed: still exactly one owner per start, but different starts land
-        // on different replicas instead of piling onto replica 0.
-        let keyed: Vec<ShardCfg> = (0..3)
-            .map(|k| ShardCfg {
-                k,
-                n: 3,
-                timer: TimerShardMode::Keyed,
-            })
-            .collect();
-        for start in ["nightly/tick", "hourly/tick", "weekly/tick", "audit/tick"] {
-            let (w, node) = start.split_once('/').unwrap();
-            let owners = keyed.iter().filter(|s| s.owns_timer(w, node)).count();
-            assert_eq!(owners, 1, "{start} must have exactly one owner");
-        }
-        let spread: std::collections::BTreeSet<u32> = ["a", "b", "c", "d", "e", "f", "g", "h"]
-            .iter()
-            .map(|w| {
-                keyed
-                    .iter()
-                    .find(|s| s.owns_timer(w, "tick"))
-                    .map(|s| s.k)
-                    .unwrap()
-            })
-            .collect();
-        assert!(spread.len() > 1, "keyed should spread across the fleet");
-    }
-
-    #[test]
-    fn shard_defaults_to_unsharded() {
-        // Absent --shard ⇒ 0/1 (single shard, owns everything), no feature needed.
-        let c = Config::load(&args(&[]), &base_env()).unwrap();
-        assert_eq!(c.shard, ShardCfg::default());
-        assert_eq!(c.shard.n, 1);
-        assert_eq!(c.shard.label(), None);
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn shard_parses_from_flag_and_env_with_precedence() {
-        // Env sets a shard; a flag overrides it (precedence: flag > env).
-        let mut env = base_env();
-        env.push(("AGENTD_SHARD".into(), "1/4".into()));
-        let c = Config::load(&args(&[]), &env).unwrap();
-        assert_eq!((c.shard.k, c.shard.n), (1, 4));
-        assert_eq!(c.shard.label(), Some("1/4".into()));
-
-        let c = Config::load(&args(&["--shard", "3/8"]), &env).unwrap();
-        assert_eq!((c.shard.k, c.shard.n), (3, 8));
-        assert_eq!(c.shard.label(), Some("3/8".into()));
-
-        // AGENTD_SHARD_TIMER parses; default is shard0.
-        assert_eq!(c.shard.timer, TimerShardMode::Shard0);
-        let mut env2 = base_env();
-        env2.push(("AGENTD_SHARD".into(), "0/2".into()));
-        env2.push(("AGENTD_SHARD_TIMER".into(), "keyed".into()));
-        let c = Config::load(&args(&[]), &env2).unwrap();
-        assert_eq!(c.shard.timer, TimerShardMode::Keyed);
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn shard_malformed_or_out_of_range_is_usage_error() {
-        for bad in ["8/3", "0/0", "x/8", "3/y", "3", "", "5/5"] {
-            assert!(
-                matches!(
-                    Config::load(&args(&["--shard", bad]), &base_env()),
-                    Err(ConfigError::Usage(_))
-                ),
-                "--shard {bad} must be a usage error"
-            );
-        }
-        // A bad AGENTD_SHARD_TIMER is exit 2 too.
-        let mut env = base_env();
-        env.push(("AGENTD_SHARD".into(), "0/2".into()));
-        env.push(("AGENTD_SHARD_TIMER".into(), "nonsense".into()));
-        assert!(matches!(
-            Config::load(&args(&[]), &env),
-            Err(ConfigError::Usage(_))
-        ));
-    }
-
-    #[cfg(not(feature = "cluster"))]
-    #[test]
-    fn shard_n_gt_1_requires_cluster_feature() {
-        // A scaling directive must NOT be silently ignored: N>1 without the
-        // feature is exit 2. N==1 (the default / explicit 0/1) is always fine.
-        let e = Config::load(&args(&["--shard", "3/8"]), &base_env()).unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => assert!(
-                msg.contains("--shard requires the 'cluster' build feature"),
-                "got: {msg}"
-            ),
-            other => panic!("expected a Usage error, got {other:?}"),
-        }
-        // The parse itself still works (so the message is the feature one, not a
-        // parse error), and 0/1 validates with no feature.
-        let c = Config::load(&args(&["--shard", "0/1"]), &base_env()).unwrap();
-        assert_eq!(c.shard.n, 1);
-    }
-
     // ───────────────────── RFC 0019 — work-claim leases (§3) ──────────────────
 
-    #[test]
-    fn claim_route_parses_styles_and_defaults_to_tool() {
-        assert_eq!(
-            parse_claim_route("file:///inbox/42.json=coord").unwrap(),
-            ClaimRoute {
-                uri: "file:///inbox/42.json".into(),
-                server: "coord".into(),
-                style: ClaimStyle::Tool,
-                continue_session: false,
-            }
-        );
-        assert_eq!(
-            parse_claim_route("db://orders/7=coord:tool").unwrap().style,
-            ClaimStyle::Tool
-        );
-        assert_eq!(
-            parse_claim_route("db://orders/7=coord:resource")
-                .unwrap()
-                .style,
-            ClaimStyle::Resource
-        );
-        // Unknown style / malformed forms are usage errors (exit 2).
-        assert!(matches!(
-            parse_claim_route("x://y=coord:bogus"),
-            Err(ConfigError::Usage(_))
-        ));
-        assert!(matches!(
-            parse_claim_route("no-equals"),
-            Err(ConfigError::Usage(_))
-        ));
-        assert!(matches!(
-            parse_claim_route("x://y="),
-            Err(ConfigError::Usage(_))
-        ));
-    }
-
-    #[test]
-    fn claim_ttl_and_fraction_parse_from_flag_and_env() {
-        // Defaults.
-        let c = Config::load(&args(&[]), &base_env()).unwrap();
-        assert_eq!(c.claim_ttl, Duration::from_secs(30));
-        assert!((c.claim_renew_fraction - 0.33).abs() < 1e-9);
-
-        // Env sets both; a flag overrides the ttl (precedence: flag > env).
-        let mut env = base_env();
-        env.push(("AGENTD_CLAIM_TTL".into(), "45s".into()));
-        env.push(("AGENTD_CLAIM_RENEW_FRACTION".into(), "0.5".into()));
-        let c = Config::load(&args(&["--claim-ttl", "1m"]), &env).unwrap();
-        assert_eq!(c.claim_ttl, Duration::from_secs(60));
-        assert!((c.claim_renew_fraction - 0.5).abs() < 1e-9);
-
-        // An out-of-range fraction is exit 2.
-        let bad = Config::load(&args(&["--claim-renew-fraction", "1.5"]), &base_env()).unwrap_err();
-        assert!(matches!(bad, ConfigError::Usage(_)));
-        let zero = Config::load(&args(&["--claim-renew-fraction", "0"]), &base_env()).unwrap_err();
-        assert!(matches!(zero, ConfigError::Usage(_)));
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn claim_route_subscribes_its_uri_and_requires_declared_server() {
-        let env = vec![
-            ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
-        ];
-        // A claim route against a declared server validates and folds its URI
-        // into the subscribe set (so it is subscribed + routed as a Spawn).
-        let c = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--mcp",
-                "coord=https://coord.example",
-                "--claim",
-                "file:///inbox/42.json=coord",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(c.claim_routes.len(), 1);
-        assert_eq!(c.claim_routes[0].server, "coord");
-        assert!(c.subscribe.contains(&"file:///inbox/42.json".to_string()));
-
-        // A claim route whose server is not a declared --mcp server is exit 2.
-        let e = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--claim",
-                "file:///inbox/42.json=ghost",
-            ]),
-            &env,
-        )
-        .unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => {
-                assert!(msg.contains("not a declared --mcp server"), "got: {msg}")
-            }
-            other => panic!("expected Usage, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn claim_route_on_a_continue_uri_is_a_continue_claim_not_a_spawn() {
-        let env = vec![
-            ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
-        ];
-        // A `--claim` URI that is ALSO a `--continue` URI is a continue-claim:
-        // marked `continue_session`, kept in `continue_subscribe` (routed as
-        // Disposition::Continue), and NOT double-folded into `subscribe`.
-        let c = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--mcp",
-                "coord=https://coord.example",
-                "--continue",
-                "file:///inbox/42.json",
-                "--claim",
-                "file:///inbox/42.json=coord",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(c.claim_routes.len(), 1);
-        assert!(
-            c.claim_routes[0].continue_session,
-            "a claim on a --continue URI must be a continue-claim"
-        );
-        assert!(
-            c.continue_subscribe
-                .contains(&"file:///inbox/42.json".to_string()),
-            "the URI stays a continue route"
-        );
-        assert!(
-            !c.subscribe.contains(&"file:///inbox/42.json".to_string()),
-            "a continue-claim URI must NOT be double-routed as a Spawn"
-        );
-
-        // A `--claim` URI with no matching `--continue` is a spawn-claim (the
-        // existing behaviour): folded into subscribe, not marked continue.
-        let c2 = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--mcp",
-                "coord=https://coord.example",
-                "--claim",
-                "file:///inbox/42.json=coord",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert!(!c2.claim_routes[0].continue_session);
-        assert!(c2.subscribe.contains(&"file:///inbox/42.json".to_string()));
-    }
-
-    #[cfg(not(feature = "cluster"))]
-    #[test]
-    fn claim_route_requires_cluster_feature() {
-        let env = vec![
-            ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
-        ];
-        let e = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--mcp",
-                "coord=https://coord.example",
-                "--claim",
-                "file:///inbox/42.json=coord",
-            ]),
-            &env,
-        )
-        .unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => assert!(
-                msg.contains("--claim requires the 'cluster' build feature"),
-                "got: {msg}"
-            ),
-            other => panic!("expected Usage, got {other:?}"),
-        }
-    }
-
     // ───────────────────── RFC 0019 — standby / assignment (§7) ───────────────
-
-    #[test]
-    fn assign_from_parses_first_colon_split_and_rejects_empties() {
-        // The split is on the FIRST `:`; the URI keeps its own `scheme://` colons.
-        assert_eq!(
-            AssignFrom::parse("coord:work://pending").unwrap(),
-            AssignFrom {
-                server: "coord".into(),
-                uri: "work://pending".into(),
-            }
-        );
-        // No colon at all → usage error (the `<server>:<uri>` shape is required).
-        assert!(matches!(
-            AssignFrom::parse("noseparator"),
-            Err(ConfigError::Usage(_))
-        ));
-        // Empty server (leading colon) and empty uri (trailing colon) → exit 2.
-        assert!(matches!(
-            AssignFrom::parse(":work://pending"),
-            Err(ConfigError::Usage(_))
-        ));
-        assert!(matches!(
-            AssignFrom::parse("coord:"),
-            Err(ConfigError::Usage(_))
-        ));
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn standby_and_assign_from_parse_from_flag_and_env() {
-        // `--standby`/`--assign-from` desugar into a claim route + reactive
-        // subscribe, so a valid full config needs reactive mode + the declared
-        // coordination server (`Config::load` validates).
-        let mcp_env = || {
-            vec![
-                ("INSTRUCTION".to_string(), "x".to_string()),
-                (
-                    "AGENTD_INTELLIGENCE".to_string(),
-                    "https://intel.example".to_string(),
-                ),
-            ]
-        };
-        let reactive = |extra: &[&str]| -> Vec<String> {
-            let mut a = vec!["--mode", "reactive", "--mcp", "coord=https://coord.example"];
-            a.extend_from_slice(extra);
-            args(&a)
-        };
-
-        // Defaults: not standby, no assignment channel, warm_intel off.
-        let c = Config::load(&args(&[]), &base_env()).unwrap();
-        assert!(!c.standby);
-        assert!(c.assign_from.is_none());
-        assert!(!c.warm_intel);
-
-        // Flags set both; warm_intel defaults ON when --standby (no env override).
-        let c = Config::load(
-            &reactive(&["--standby", "--assign-from", "coord:work://pending"]),
-            &mcp_env(),
-        )
-        .unwrap();
-        assert!(c.standby);
-        assert_eq!(c.assign_from.as_ref().unwrap().server, "coord");
-        assert_eq!(c.assign_from.as_ref().unwrap().uri, "work://pending");
-        assert!(c.warm_intel, "warm_intel defaults true when --standby");
-
-        // Env sets standby + assignment; an explicit AGENTD_WARM_INTEL=0 wins over
-        // the standby default.
-        let mut env = mcp_env();
-        env.push(("AGENTD_STANDBY".into(), "1".into()));
-        env.push(("AGENTD_ASSIGN_FROM".into(), "coord:work://q".into()));
-        env.push(("AGENTD_WARM_INTEL".into(), "0".into()));
-        let c = Config::load(&reactive(&[]), &env).unwrap();
-        assert!(c.standby);
-        assert_eq!(c.assign_from.as_ref().unwrap().uri, "work://q");
-        assert!(
-            !c.warm_intel,
-            "explicit AGENTD_WARM_INTEL=0 overrides default"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn assign_from_becomes_a_claim_route_and_subscribed_uri() {
-        // RFC 0019 §7.2 mechanism 1: --assign-from desugars into a claim route on
-        // (uri, server) AND its URI is folded into subscribe — the standby pool
-        // claim-pulls via the EXISTING machinery, no new path.
-        let env = vec![
-            ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
-        ];
-        let c = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--standby",
-                "--mcp",
-                "coord=https://coord.example",
-                "--assign-from",
-                "coord:work://pending",
-            ]),
-            &env,
-        )
-        .unwrap();
-        // Exactly one claim route, on the assignment channel, default `tool` style.
-        assert_eq!(c.claim_routes.len(), 1);
-        assert_eq!(c.claim_routes[0].uri, "work://pending");
-        assert_eq!(c.claim_routes[0].server, "coord");
-        assert_eq!(c.claim_routes[0].style, ClaimStyle::Tool);
-        // And the URI is subscribed (routed as a Spawn; the claim gate precedes it).
-        assert!(c.subscribe.contains(&"work://pending".to_string()));
-
-        // An explicit --claim on the SAME uri is not duplicated by the desugar.
-        let c = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--standby",
-                "--mcp",
-                "coord=https://coord.example",
-                "--claim",
-                "work://pending=coord:resource",
-                "--assign-from",
-                "coord:work://pending",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(c.claim_routes.len(), 1, "no duplicate claim route");
-        // The explicit --claim's style is preserved (the desugar didn't overwrite).
-        assert_eq!(c.claim_routes[0].style, ClaimStyle::Resource);
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn standby_requires_reactive_and_a_declared_server() {
-        let env = vec![
-            ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
-        ];
-        // --assign-from naming an undeclared server is exit 2 (clear message).
-        let e = Config::load(
-            &args(&[
-                "--mode",
-                "reactive",
-                "--standby",
-                "--assign-from",
-                "ghost:work://pending",
-            ]),
-            &env,
-        )
-        .unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => assert!(
-                msg.contains("--assign-from names server 'ghost'"),
-                "got: {msg}"
-            ),
-            other => panic!("expected Usage, got {other:?}"),
-        }
-        // --standby outside reactive mode is exit 2 (the channel would never be
-        // claimed). Default mode is `once`.
-        let e = Config::load(
-            &args(&[
-                "--standby",
-                "--mcp",
-                "coord=https://coord.example",
-                "--assign-from",
-                "coord:work://pending",
-            ]),
-            &env,
-        )
-        .unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => assert!(
-                msg.contains("only valid with --mode reactive"),
-                "got: {msg}"
-            ),
-            other => panic!("expected Usage, got {other:?}"),
-        }
-    }
-
-    #[cfg(not(feature = "cluster"))]
-    #[test]
-    fn standby_requires_cluster_feature() {
-        // A standby directive must NOT be silently ignored without the feature.
-        let env = vec![
-            ("INSTRUCTION".into(), "x".into()),
-            ("AGENTD_INTELLIGENCE".into(), "https://intel.example".into()),
-        ];
-        let e = Config::load(&args(&["--mode", "reactive", "--standby"]), &env).unwrap_err();
-        match e {
-            ConfigError::Usage(msg) => assert!(
-                msg.contains("--standby / --assign-from require the 'cluster' build feature"),
-                "got: {msg}"
-            ),
-            other => panic!("expected Usage, got {other:?}"),
-        }
-    }
 
     #[test]
     fn trifecta_grant_tags_defaults_untagged_to_untrusted() {
@@ -5782,19 +4648,11 @@ intelligence_headers:
     #[test]
     fn coherence_rejects_a_differing_restart_only_field() {
         // RFC 0017 §5.4 check 2: a restart-only field that DIFFERS on a live
-        // reload is a hard reject naming the field. mode/run_id/shard
-        // are all restart-only.
+        // reload is a hard reject naming the field.
         let running = reactive_base();
         for mutate in [
             (|c: &mut Config| c.mode = Mode::Loop) as fn(&mut Config),
             |c: &mut Config| c.run_id = "different-run-id".into(),
-            |c: &mut Config| {
-                c.shard = ShardCfg {
-                    k: 1,
-                    n: 4,
-                    timer: TimerShardMode::Shard0,
-                }
-            },
             |c: &mut Config| c.serve_mcp = Some("https://a.example:8443".into()),
             |c: &mut Config| c.drain_timeout = Duration::from_secs(99),
         ] {
@@ -5917,27 +4775,6 @@ intelligence_headers:
     }
 
     #[test]
-    fn coherence_rejects_subscription_referencing_undeclared_server() {
-        // RFC 0017 §5.4 check 3: a claim route referencing an undeclared server is
-        // an internal-consistency ERROR (independent of any running baseline).
-        let mut cfg = reactive_base();
-        cfg.claim_routes = vec![ClaimRoute {
-            uri: "file:///in.json".into(),
-            server: "ghost".into(),
-            style: ClaimStyle::Tool,
-            continue_session: false,
-        }];
-        let diags = Config::reload_coherence_check(&cfg, None, false)
-            .expect_err("an undeclared coordination server must be an error");
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.is_error() && d.msg.contains("undeclared")),
-            "expected an undeclared-server error, got {diags:?}"
-        );
-    }
-
-    #[test]
     fn coherence_rejects_duplicate_server_names() {
         let mut cfg = reactive_base();
         cfg.mcp_servers = vec![
@@ -5964,7 +4801,7 @@ intelligence_headers:
     #[test]
     fn restart_only_set_pins_the_immutable_fields() {
         // The BINDING partition (RFC 0017 §5.1): mode/identity/transport/
-        // shard/claim must all be restart-only; each named field is diff-detected
+        // each named field is diff-detected
         // by `restart_only_field_differs` (a field listed but not compared would
         // silently reload — guard against that regression).
         for &f in RESTART_ONLY_FIELDS {
@@ -5976,28 +4813,6 @@ intelligence_headers:
                 "run_id" => a.run_id = "x".into(),
                 "serve_mcp" => a.serve_mcp = Some("https://s.example:8443".into()),
                 "drain_timeout" => a.drain_timeout = Duration::from_secs(123),
-                "shard" => {
-                    a.shard = ShardCfg {
-                        k: 1,
-                        n: 2,
-                        timer: TimerShardMode::Shard0,
-                    }
-                }
-                "claim_routes" => {
-                    a.claim_routes = vec![ClaimRoute {
-                        uri: "u".into(),
-                        server: "s".into(),
-                        style: ClaimStyle::Tool,
-                        continue_session: false,
-                    }]
-                }
-                "standby" => a.standby = true,
-                "assign_from" => {
-                    a.assign_from = Some(AssignFrom {
-                        server: "s".into(),
-                        uri: "u".into(),
-                    })
-                }
                 "continue_subscribe" => a.continue_subscribe = vec!["u".into()],
                 other => panic!("RESTART_ONLY_FIELDS has an unmapped field '{other}'"),
             }
@@ -6036,29 +4851,5 @@ intelligence_headers:
             view["intelligence_headers"],
             serde_json::json!(["x-api-key"])
         );
-    }
-
-    #[test]
-    fn validate_config_reports_undeclared_claim_server_via_coherence() {
-        // The admission path (`--validate-config`) runs `reload_coherence_check`
-        // with running=None, so an inconsistent reloadable subset is exit 2 even
-        // without the cluster feature gate (this is the coherence layer, not the
-        // feature gate). We assert the verdict is the Err (invalid) variant.
-        // Build a config that is otherwise valid but has an undeclared claim ref
-        // by going through the same Config and calling the collect path directly.
-        let mut cfg = reactive_base();
-        cfg.claim_routes = vec![ClaimRoute {
-            uri: "file:///in.json".into(),
-            server: "ghost".into(),
-            style: ClaimStyle::Tool,
-            continue_session: false,
-        }];
-        let verdict = cfg.validate_collect_all(true);
-        assert!(
-            verdict.is_err(),
-            "an undeclared claim server must be invalid"
-        );
-        let lines = verdict.unwrap_err();
-        assert!(lines.contains("undeclared") || lines.contains("not a declared"));
     }
 }

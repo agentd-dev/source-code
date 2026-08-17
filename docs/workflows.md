@@ -136,7 +136,7 @@ counts as satisfied, so a step depending on any of them still runs.
 | `manual` | `inputs` |
 | `loop` | `interval`, `delay`, `until`, `max_iterations`, `backoff`, `inputs` |
 | `schedule` | `cron`, `every`, `tz`, `jitter`, `catch_up`, `at`, `inputs` |
-| `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `claim`, `shard`, `deliver`, `on_no_listener`, `inputs` |
+| `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `inputs` |
 | `signal` | **`name`**, `filter`, `deliver`, `inputs` |
 | `event` | **`on`**, `filter`, `inputs` |
 | `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `idempotency`, `respond`, `filter`, `inputs` |

@@ -13,8 +13,8 @@ A2A `Deployment` — and when you want to *work with* it, attach a terminal or a
 browser: `agentd tui -c agent.yaml`.
 
 ```
-binary 2.98 MiB static (musl, FROM scratch) · 1.5 MiB download · cold start <1 ms
-idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · AGPL-3.0
+binary 6.6 MiB static (musl, FROM scratch) · 3.0 MiB download · cold start <1 ms
+idle daemon ~2 MiB RSS · protocols from their own SDKs · HTTPS everywhere · AGPL-3.0
 ```
 
 - [Why agentd](#why-agentd)
@@ -42,7 +42,7 @@ idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · AGPL-3.0
    request signing, mTLS and the SSRF guard survive the adoption. Everything
    small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
    export, the inotify watch — is still hand-rolled on `std` + `libc`. What
-   ships is one 2.98 MiB static binary that starts in under a millisecond, idles
+   ships is one 6.6 MiB static binary that starts in under a millisecond, idles
    at ~2 MiB, and lands as a single-layer `FROM scratch` image with no shell, no
    libc, and nothing to CVE-scan but agentd itself.
 2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
@@ -450,8 +450,8 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
 
 | Metric | Value |
 |---|---|
-| Binary (static-PIE, runs on `scratch`) | **3.0 MiB** (1.5 MiB gzipped) |
-| Release download (amd64) | **1.5 MiB** `.tar.gz` → 2.98 MiB binary |
+| Binary (static-PIE, runs on `scratch`) | **6.6 MiB** amd64 · 5.0 MiB arm64 |
+| Release download (amd64) | **3.0 MiB** `.tar.gz` → 6.6 MiB binary |
 | Cold start (`--version` / `--capabilities`) | **< 1 ms** |
 | Idle serving daemon RSS | **~2 MiB**, flat under load |
 | Served request overhead (`tools/call`, loopback, fresh conn) | **p50 0.26 ms** |

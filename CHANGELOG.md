@@ -113,15 +113,20 @@ that never wakes), and the SDK ran on a current-thread runtime that only
 advances inside `block_on` (so dispatch happened only while agentd was already
 busy). Both fixed.
 
-**What this costs.** The dependency graph went from 26 crates to 187 in the
-shipped feature set; the build needs a C toolchain (`cmake`, a C++ compiler) for
-`aws-lc-sys`; and the MSRV moves to **1.96**, which `a2a-rs` sets. The
-`Dockerfile` and a new `Cross.toml` install what the builders need. The CI job that asserted three direct dependencies
-is retired, replaced by one that guards what a user actually receives: the
-release binary is still a statically linked musl artifact on `scratch` —
-2.98 MiB, no shell, no libc, nothing to scan but agentd itself. The docs that claimed the
-old posture (`README`, `architecture.md`, `why-rust.md`, `mcp.md`, the landing
-page) say this instead.
+**What this costs.** The dependency graph went from 26 crates to 182 in the
+shipped feature set, and the MSRV moves to **1.96**, which `a2a-rs` sets. The
+build stays pure Rust: `connectrpc` (under `a2a-rs`) asks for rustls with
+default features, which would have selected the C/assembly `aws-lc-rs` provider
+for the entire graph, so a vendored copy with three corrected dependency entries
+keeps it on `ring` — see `third_party/connectrpc/PATCH.md`. Building this
+repository needs no `cmake` and no C++ compiler; building `agentd-core` *from
+crates.io* still does, because a published crate cannot turn off a transitive
+dependency's features. The CI job that asserted three direct dependencies is
+retired, replaced by one that guards what a user actually receives: the release
+binary is still a statically linked musl artifact on `scratch` — about 6.5 MiB,
+no shell, no libc, nothing to scan but agentd itself — and asserts `aws-lc` has
+not come back. The docs that claimed the old posture (`README`,
+`architecture.md`, `why-rust.md`, `mcp.md`, the landing page) say this instead.
 
 **What this changes on the wire.** The modern/stateless MCP revision now follows
 rmcp's schedule — it pins `LATEST` to the legacy revision today, and agentd gains
@@ -163,12 +168,12 @@ The TUI and web clients read the new shape and still accept the old one.
   published schema. Our own tests were written from our own reading of the spec
   and so cannot catch a *plausible* misreading; this is a second reader that
   can, and it is what found everything in the section above. It is deliberately
-  **outside the workspace** (it brings ~180 crates and a C toolchain, which
-  would end the `FROM scratch` static build) with its own target dir, and runs
+  **outside the workspace** (it brings ~180 crates, which have no place in the
+  `FROM scratch` static build) with its own target dir, and runs
   as its own CI job: `cargo test --manifest-path crates/a2a-oracle/Cargo.toml`.
 - The conformance suite gained
   `a2a-conversation/tasks-are-proto3-json-on-every-path`, so the shapes stay
-  fixed in ordinary CI, without the C toolchain.
+  fixed by the fast suite in ordinary CI.
 
 [a2a-rs]: https://github.com/emillindfors/a2a-rs
 

@@ -222,13 +222,17 @@ The artifact that ships is a static-PIE musl build (LTO, stripped,
 
 | | amd64 | arm64 |
 |---|---|---|
-| binary | 3,126,304 B (2.98 MiB) | 2.79 MiB |
-| `.tar.gz` download | 1,547,037 B (1.48 MiB) | 2.79 MiB |
+| binary | 6,886,888 B (6.57 MiB) | 5,219,160 B (4.98 MiB) |
+| `.tar.gz` download | 3,143,992 B (3.00 MiB) | 2,926,502 B (2.79 MiB) |
 
-Measured on the **published v2.0.0 artifacts**, not a local build — a local
-`cargo build --release` of the same feature set comes out around 6.9 MiB, and
-the released binary is what a user actually receives. That is the whole image
-too: `FROM scratch` plus this file.
+That is the whole image too: `FROM scratch` plus this file.
+
+An earlier revision of this table read 2.98 MiB, measured by downloading the
+published v2.0.0 asset on the reasoning that a released artifact beats a local
+build. The asset was six weeks stale — built before the protocol SDKs landed —
+so the figure described code nobody was running, and the local build it was
+"correcting" had been right. Provenance is part of a measurement: an artifact is
+only authoritative once you know what it was built from.
 
 An idle daemon running a schedule workflow: `Threads: 1`, `VmRSS` 3.8–3.9 MiB,
 and **0 CPU ticks** over 10 seconds at `CLK_TCK=100` — under 0.1% of a core,

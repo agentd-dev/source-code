@@ -79,13 +79,18 @@ integration.
 An earlier version of this page counted three direct dependencies and had CI
 fail the build if that number moved. That gate is gone, replaced by one that
 guards what actually reaches a user: the release binary is still a **statically
-linked musl artifact that runs on `scratch`** — 2.98 MiB, a 1.5 MiB download,
+linked musl artifact that runs on `scratch`** — about 6.5 MiB, a 3 MiB download,
 no shell, no libc, no package manager. The dependency count moved by two orders of
 magnitude; the attack surface of the thing that ships did not.
 
-The build gained a C toolchain, because `aws-lc-sys` arrives underneath the SDKs
-and compiles C at build time. That is a builder-image cost (`cmake`, `g++`), not
-a runtime one.
+The build nearly gained a C toolchain. `connectrpc`, underneath `a2a-rs`, asks
+for `rustls` with default features, which selects the C/assembly `aws-lc-rs`
+provider — and because Cargo unifies features additively, that single default
+applies to the entire graph no matter how carefully every other crate asks for
+`ring`. It cost a release build 90 minutes of hanging under `cross` before it
+was tracked down. Three corrected dependency entries in a vendored copy
+(`third_party/connectrpc/PATCH.md`) removed it; CI now fails if `aws-lc`
+reappears.
 
 Quarantine survives as a habit rather than a rule: third-party code still
 reaches the engine through `crates/net` and `crates/mcp`, and `deny.toml` still
@@ -150,9 +155,9 @@ not need one. And `net::http` is generic over `Read + Write`, so
 Two things are deliberately *not* in that table, and the reason is the same one:
 you hand-roll where the specification is small, frozen, and only partly needed —
 and neither TLS nor a wire protocol with a live specification is any of those.
-TLS is `rustls`; MCP and A2A are their SDKs. Both compile C at build time
-(`ring`'s `cc`, `aws-lc-sys`'s `cmake`), which is a builder cost and not a
-shipping one.
+TLS is `rustls`; MCP and A2A are their SDKs. `ring` ships prebuilt assembly with
+a small `cc` step and needs no external toolchain, so the build stays pure Rust
+end to end.
 
 ## No async runtime
 

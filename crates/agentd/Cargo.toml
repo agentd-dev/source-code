@@ -129,8 +129,14 @@ aauth = ["tls", "dep:ring"]
 # The A2A protocol itself (feature `a2a`): domain types generated from the
 # specification's protocol buffers, the JSON-RPC method dispatch, the streaming
 # events and the error mapping. agentd implements its ports; it does not
-# re-implement the protocol. `jsonrpc-client` is the outbound half (peer calls).
-a2a-rs = { version = "0.6", optional = true, default-features = false, features = ["jsonrpc-server", "jsonrpc-client"] }
+# re-implement the protocol.
+#
+# `jsonrpc-client` is deliberately NOT enabled: agentd's outbound A2A builds the
+# spec's types over its own credentialed transport (`a2a::peer`), because
+# a2a-rs's client is reqwest with a static bearer and would drop request
+# signing, mTLS and the SSRF guard. Leaving it off keeps reqwest and four other
+# crates out of the tree.
+a2a-rs = { version = "0.6", optional = true, default-features = false, features = ["jsonrpc-server"] }
 # a2a-rs's protobuf runtime, pinned to the version it builds its domain types
 # with. agentd constructs those types directly rather than hand-writing their
 # JSON, so `MessageField`/`Struct`/`Timestamp` have to be the same types — a

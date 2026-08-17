@@ -22,17 +22,15 @@ cargo test --manifest-path crates/a2a-oracle/Cargo.toml
 
 ## Why it is not part of the workspace
 
-a2a-rs pulls ~180 crates and needs `cmake` (via `aws-lc-sys`). That is fine for
-a check you run deliberately and wrong for the shipped binary, which is a
-three-dependency static musl build on `FROM scratch`. So this is its own
-workspace, excluded from the parent — which also gives it its own target dir, so
-its build of `agentd` cannot overwrite the one the conformance suite and the CLI
-tests drive with a different feature set.
+a2a-rs pulls ~180 crates. That is fine for a check you run deliberately and
+wrong for every `cargo test`. So this is its own workspace, excluded from the
+parent — which also gives it its own target dir, so its build of `agentd` cannot
+overwrite the one the conformance suite and the CLI tests drive with a different
+feature set.
 
 The findings are folded back into the ordinary CI path as conformance checks
 (`a2a-conversation/tasks-are-proto3-json-on-every-path`) and unit tests, so a
-regression is caught without the C toolchain. This crate is what *discovers*
-them.
+regression is caught by the fast suite. This crate is what *discovers* them.
 
 ## What it found
 

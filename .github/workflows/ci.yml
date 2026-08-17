@@ -79,8 +79,8 @@ jobs:
   # cannot catch a *plausible* misreading — a field named the way we assumed, an
   # enum spelled the way we guessed. This boots the real daemon and parses its
   # responses with `a2a-rs`, whose types come from the published schema by way of
-  # a different author. It lives outside the workspace (it brings ~180 crates and
-  # `cmake`), so it needs its own job.
+  # a different author. It lives outside the workspace (it brings ~180 crates),
+  # so it needs its own job.
   a2a-spec-oracle:
     runs-on: ubuntu-latest
     steps:
@@ -94,9 +94,12 @@ jobs:
 
   # What ships is one static binary on an empty base. That is now the claim
   # worth guarding: MCP and A2A are the official/published implementations
-  # (`rmcp`, `a2a-rs`), which bring an async runtime and a C toolchain into the
-  # *build*, so "few dependencies" stopped being the thing to assert — while
-  # "no runtime, no shell, no libc, nothing to attack" did not.
+  # (`rmcp`, `a2a-rs`), which bring an async runtime into the *build*, so "few
+  # dependencies" stopped being the thing to assert — while "no runtime, no
+  # shell, no libc, nothing to attack" did not. `musl-tools` is the only build
+  # package: the crypto provider is `ring` throughout, so no C is compiled
+  # (see third_party/connectrpc/PATCH.md) — this job is also what would catch
+  # `aws-lc-sys` returning, since it installs no cmake.
   static-binary:
     runs-on: ubuntu-latest
     steps:
@@ -105,7 +108,21 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools cmake
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # A single transitive crate that forgets `default-features = false` on
+      # rustls turns `aws-lc-rs` back on for the whole graph — feature
+      # unification is additive, so no amount of care in our own manifests
+      # prevents it. That drags in the C/assembly `aws-lc-sys`, which is what
+      # made a release build hang for 90 minutes under `cross`. The build below
+      # would then fail for want of cmake, but slowly and confusingly; assert it
+      # here instead, where the message says what to do.
+      - name: Assert the crypto provider is still ring
+        run: |
+          if cargo tree -p agentd-cli --features a2a --target x86_64-unknown-linux-musl \
+               | grep -qE 'aws-lc'; then
+            echo "::error::aws-lc is back in the dependency graph — a crate is pulling rustls with default features. See third_party/connectrpc/PATCH.md; run 'cargo tree -i aws-lc-sys' to find it."
+            exit 1
+          fi
       - name: Build the release binary the image ships
         run: |
           cargo build --release --locked -p agentd-cli \

@@ -363,11 +363,15 @@ claim it protected — *you can hold the whole trust boundary in your head* — 
 longer one agentd can make, and pretending otherwise would be worse than
 retiring it. What replaced it is a gate on the thing a user actually receives:
 the release binary must still be a statically linked musl artifact that runs on
-`scratch`, 2.98 MiB with no shell, no libc and no package manager.
+`scratch` — about 6.5 MiB for the shipped feature set, with no shell, no libc
+and no package manager.
 
-The build now needs a C toolchain — `cmake` and a C++ compiler, for the
-`aws-lc-sys` that arrives underneath the SDKs. That is a builder-image cost, not
-a shipping one.
+The build stays pure Rust. The SDKs pull `rustls` with its default features,
+which selects the C/assembly `aws-lc-rs` provider; because feature unification
+is additive, that one default would have imposed `cmake` and a C++ compiler on
+every build, however carefully our own manifests ask for `ring`. A vendored
+`connectrpc` with three corrected dependency entries removes it — see
+`third_party/connectrpc/PATCH.md`. CI asserts `aws-lc` stays out of the graph.
 
 Two gates remain: the feature matrix compiles, clippies and tests 17 combinations
 including every shipped feature solo, because `--all-features` unification hides

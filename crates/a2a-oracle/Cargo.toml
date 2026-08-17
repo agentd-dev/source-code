@@ -6,9 +6,9 @@
 # `a2a-rs` — an unrelated implementation by a different author — so two
 # independent readings have to agree.
 #
-# Excluded from the workspace's default members: a2a-rs brings ~179 crates and a
-# C toolchain (aws-lc-sys/cmake), which is acceptable for an on-demand check and
-# not for the shipped binary. Run it deliberately:
+# Excluded from the workspace's default members: a2a-rs brings ~179 crates,
+# which is acceptable for an on-demand check and not for every `cargo test`.
+# Run it deliberately:
 #
 #     cargo test --manifest-path crates/a2a-oracle/Cargo.toml
 # Its own workspace: a separate target dir means this crate's build of agentd
@@ -35,3 +35,11 @@ a2a-rs = { version = "0.6", default-features = false, features = ["jsonrpc-serve
 # For the method table — the one thing worth reading out of the source rather
 # than off the wire, so a renamed constant fails the build.
 agentd = { package = "agentd-core", path = "../agentd", features = ["a2a"] }
+
+# Same vendored `connectrpc` the parent workspace uses: three dependency entries
+# corrected so `rustls` resolves to `ring` instead of the C `aws-lc-rs`. This is
+# a build-toolchain fix and touches no a2a-rs type or code path, so the
+# independence this crate exists for is unaffected — it just no longer needs
+# `cmake` on the runner. See third_party/connectrpc/PATCH.md.
+[patch.crates-io]
+connectrpc = { path = "../../third_party/connectrpc" }

@@ -121,9 +121,9 @@ $ tar xzf agentd-$TAG-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
 $ docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
 ```
 
-**From source** (Rust stable; needs a C toolchain — `cmake` and a C++ compiler —
-because the protocol SDKs build `aws-lc-sys`). Features are compile-time,
-so `--capabilities` tells you what a given binary can actually do:
+**From source** (Rust stable, 1.96+; no C toolchain — the build is pure Rust and
+the crypto provider is `ring`). Features are compile-time, so `--capabilities`
+tells you what a given binary can actually do:
 
 ```console
 $ cargo build -p agentd-cli --release

@@ -2023,6 +2023,7 @@ impl Runtime {
                 },
                 None => {
                     self.paused = true;
+                    crate::obs::metrics::set_paused(true);
                     self.log.info("agent.paused", json!({"reason": reason}));
                     self.feed_push(
                         "lifecycle",
@@ -2045,6 +2046,7 @@ impl Runtime {
                 },
                 None => {
                     self.paused = false;
+                    crate::obs::metrics::set_paused(false);
                     self.log.info("agent.resumed", json!({}));
                     self.feed_push("lifecycle", FeedVis::All, json!({"paused": false}));
                     json!({"ok": true, "state": "running"})

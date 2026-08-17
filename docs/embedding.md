@@ -42,15 +42,16 @@ fn main() {
         },
     )).expect("unique tool name");
 
-    // 3. RUN — either the full stock stack (parse a Config and drive a mode,
-    //    exactly like agentd-cli/src/main.rs), or the engine directly.
+    // 3. RUN — either the full stock stack (load a v2 settings document and
+    //    hand it to agentd::runtime::run, exactly like agentd-cli/src/main.rs),
+    //    or the agent loop directly.
     // …
 }
 ```
 
 One more rule: **one process = one agent runtime.** The tool registry, signal
-handling, metrics, and the live-workflow slot are process-global by design (the
-re-exec model requires it).
+handling, and metrics are process-global by design (the re-exec model requires
+it).
 
 ## What a registered tool can do
 
@@ -59,24 +60,26 @@ Once registered, `shout` is:
 - **in the agent loop's catalogue** — the model calls it like any tool; if a
   remote MCP server publishes a colliding name, **your code tool wins** (a
   server cannot steal a first-party tool's calls);
-- **addressable from workflows** as the reserved server name `code`:
+- **addressable from a workflow** as a `tool` step, by the name you registered:
 
-  ```json
-  { "kind": "tool", "server": "code", "tool": "shout",
-    "args": { "text": { "$from": "input", "pointer": "/text" } },
-    "writes": "loud", "edges": { "ok": "next", "error": "fail" } }
+  ```yaml
+  shout:
+    kind: tool
+    depends_on: [start]
+    name: shout
+    args: { text: "{{steps.start.output.text}}" }
   ```
 
-- **callable by your own executors** via `agentd::tools::call(name, &args)`;
-- **visible in the manifest** — `--capabilities` shows
-  `surfaces.code_tools: N` (absent on the stock CLI, which registers nothing —
-  its no-local-code posture is preserved by construction).
+- **callable by your own code** via `agentd::tools::call(name, &args)`;
+- **counted by `agentd::tools::count()`** — zero on the stock CLI, which
+  registers nothing, so its no-local-code posture is preserved by construction.
 
 Handlers are plain Rust (`Fn(&Value) -> Result<Value, String> + Send + Sync`),
 may run concurrently (loop + workflow lanes), and `Err(reason)` is the normal
-tool-error path — the model sees a failed call; a workflow takes the `error`
-edge. Registration refuses duplicates and agentd's own self/control names
-(`subagent.*`, `workflow.*`, …) — the orchestration surface is unshadowable.
+tool-error path — the model sees a failed call; a workflow step applies its
+`on_error` (`fail` | `continue` | `goto:<step>`) and any `retry`. Registration
+refuses duplicates and agentd's own internal names (`subagent.*`, `workflow.*`,
+…) — the orchestration surface is unshadowable.
 
 Trust: a code tool is **your compiled code** — first-party like the rest of
 your binary, outside the `--mcp-tags` trifecta accounting. You own what it
@@ -84,8 +87,8 @@ touches.
 
 ## Recipes — agentic logic inside your app
 
-Four levels, thinnest first. The first two are shipped as **compile-guaranteed
-examples** (CI builds them; the snippets below are excerpts of real files).
+Four levels, thinnest first. Recipe 1 is shipped as a **compile-guaranteed
+example** (CI builds it; the snippet below is an excerpt of the real file).
 
 ### Recipe 1 — one agentic run as a function call
 
@@ -124,48 +127,56 @@ runs **in your process** — no supervisor isolation; when you want the kill
 ladder around the model, use Recipe 3. (CI compiles this example; it was
 verified end-to-end against the built-in mock intelligence.)
 
-### Recipe 2 — a workflow (deterministic + intelligent steps) in your app
+### Recipe 2 — workflows as data in your app
 
-Author a dialect-2 graph as data, drive it with your own executor — the whole
-RFC 0021 surface (reducers, `parallel`, `human` gates, the checkpointer) works
-from an embedder. Full file:
-[`crates/agentd/examples/embedded-agent.rs`](../crates/agentd/examples/embedded-agent.rs).
+A workflow is a dialect-3 JSON/YAML document, and the engine that owns it is
+`agentd::engine`: `parse_workflow` validates a document into a `Workflow` (or
+returns every error at once), `workflow_schema()` hands you the same JSON Schema
+`agentd --workflow-schema` prints, and `engine::run` is the **pure scheduler** —
+`RunState` is the durable run record, `schedule(&wf, &mut run, &data)` answers
+`Ready(ids)` / `Waiting` / `Stalled` / `Terminal`.
 
 ```rust
-let graph = agentd::graph::parse_graph(&json!({
-    "start": "seed",
-    "nodes": {
-        "seed":  { "kind": "assign", "value": { "text": "ship it" }, "writes": "input",
-                   "edges": { "ok": "shout", "error": "fail" } },
-        "shout": { "kind": "tool", "server": "code", "tool": "shout",
-                   "args": { "text": { "$from": "input", "pointer": "/text" } },
-                   "writes": "loud", "edges": { "ok": "done", "error": "fail" } },
-        "done":  { "kind": "halt", "status": "completed", "result_from": "loud" },
-        "fail":  { "kind": "halt", "status": "crashed" }
+use agentd::engine::{parse_workflow, run::{schedule, Next, RunState, Start}};
+
+let wf = parse_workflow(&json!({
+    "name": "shouty",
+    "steps": {
+        "start": { "kind": "once" },
+        "shout": { "kind": "tool", "depends_on": ["start"], "name": "shout",
+                   "args": { "text": "{{steps.start.output.text}}" } },
+        "done":  { "kind": "finish", "depends_on": ["shout"],
+                   "output": "{{steps.shout.output}}" }
     }
-}))?;
-match agentd::graph::drive(&graph, &mut my_exec, 50) {
-    DriveResult::Done(outcome) => println!("{:?}: {}", outcome.status, outcome.result),
-    DriveResult::Suspended(s) => { /* arm s.on_uri / s.gate, resume() later */ }
+})).map_err(|errs| errs.join("; "))?;
+
+let mut run = RunState::new("run-1", &wf, Start::default(), json!({}));
+let data = agentd::engine::template::Data::new();   // the template view: steps, vars, env
+match schedule(&wf, &mut run, &data)? {
+    Next::Ready(ids) => { /* execute these steps, record their outcomes */ }
+    Next::Waiting | Next::Stalled | Next::Terminal => {}
 }
 ```
 
-Your executor implements `GraphExec` — two required methods (`run_agent`,
-`call_tool`; everything else has safe defaults), so you decide what an `agent`
-node or an MCP call means in your app. The production executor
-(`agentd::graph::SessionExec`) is available when you want the stock behavior,
-including checkpointing and parallel lanes.
+Step **execution** — turn workers, MCP calls, internal tools, timers,
+checkpoints — is the runtime's job, not the engine's. Embedding a workflow that
+actually runs therefore means Recipe 3: hand the document to `agentd::runtime`
+and let it drive the same durable machinery the stock CLI uses. Use the engine
+directly when you want validation, the schema, or the scheduler's decisions
+without owning a runtime.
 
 ### Recipe 3 — the full supervised stack (the stock posture)
 
-When you want the kill ladder, cgroup limits, liveness, and the exit-code
-contract AROUND the model, do what `agentd-cli/src/main.rs` does: install the
-re-exec dispatch, build a `SpawnPayload`, and call
-`agentd::supervisor::reactor::supervise_once` — the reasoning then runs in a
-killable child of *your* binary, and everything in this documentation set
-(the lifecycle, workflow triggers, and A2A) applies unchanged. The CLI's
-`main.rs` is deliberately small enough to read as the reference (~140 lines:
-the re-exec dispatch, the test mocks, and the `run_v2` entrypoint).
+When you want the kill ladder, cgroup limits, liveness, the durable store, and
+the exit-code contract AROUND the model, do what `agentd-cli/src/main.rs` does:
+install the re-exec dispatch, load a `config_version: "2"` document with
+`agentd::config::v2::load`, and call `agentd::runtime::run(&loaded, args, env)`
+— the reasoning then runs in killable children of *your* binary, and everything
+in this documentation set (the lifecycle, workflow triggers, and A2A) applies
+unchanged. The CLI's `main.rs` is deliberately small enough to read as the
+reference: the re-exec dispatch, the early-exit asks (`--help`,
+`--config-schema`, `--validate-config`, `--capabilities`, `--login`/`--logout`),
+and the `run_v2` entrypoint.
 
 ### Recipe 4 — just the pieces
 
@@ -180,7 +191,7 @@ the re-exec dispatch, the test mocks, and the `run_v2` entrypoint).
 ```toml
 [dependencies]
 # lib name is `agentd`, so code reads `use agentd::…`
-agentd = { package = "agentd-core", version = "1.2", features = ["workflow"] }
+agentd = { package = "agentd-core", version = "2.0", features = ["a2a", "metrics"] }
 ```
 
 (The crates.io name `agentd` belongs to an unrelated project — hence the
@@ -193,7 +204,8 @@ same one the stock CLI forwards.
 - **Frozen with the product**: the process contract (exit codes, reports), the
   wire contracts (MCP/A2A), the workflow dialect JSON, the manifest shape.
 - **Semver-honored embedding seams**: `agentd::tools::*`, the workflow engine
-  (`parse_graph`/`drive`/`GraphExec`/…), the re-exec dispatch pair
-  (`SUBAGENT_ENV` + `subagent::control::run`), `Config::load`, `exit::*`.
+  (`engine::{parse_workflow, workflow_schema, Workflow, RunState}`), the re-exec
+  dispatch pair (`SUBAGENT_ENV` + `subagent::control::run`),
+  `config::v2::load`, `runtime::run`, `exit::*`.
 - **Everything else `pub`** is visible but unstable — it exists for the CLI
   and the test suites. Pin a version. RFC 0022 §5 is the authoritative list.

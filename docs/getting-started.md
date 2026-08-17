@@ -14,14 +14,6 @@ instruction as a recurring **loop** and a **reactive** daemon. For the full knob
 see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 [RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md).
 
-> **Build status — agentd 2.0.** The runtime is fully implemented — config
-> validation, the agentic loop, the supervisor + subagent process tree, the
-> MCP client, the intelligence client, the v2 lifecycle (`lifecycle.run_until`)
-> and workflow triggers, and the A2A v2 external channel (RFC 0029). The examples
-> on this page run as written.
-
----
-
 ## Install / build
 
 The fastest path is the installer — it picks the right architecture, verifies
@@ -221,8 +213,8 @@ table above).
 ## The same instruction as a `loop`
 
 A **loop** re-runs the agent on a timer — the shape for a polling or
-continuously-working agent. In 2.0 that is a workflow with a **`loop` start
-node**; the run is durable, and the loop's iteration state survives a restart:
+continuously-working agent. It is a workflow with a **`loop` start node**; the
+run is durable, and the loop's iteration state survives a restart:
 
 ```yaml
 # poll.yaml
@@ -254,8 +246,8 @@ $ agentd --config poll.yaml
 
 ## The same instruction, reactive — a `subscribe` start node
 
-Instead of polling, an agentd **idles at near-zero CPU and wakes when an MCP
-resource it subscribed to changes**. In 2.0 that is a **`subscribe` start node**:
+Instead of polling, an agent can **idle at near-zero CPU and wake when an MCP
+resource it subscribed to changes**. That is a **`subscribe` start node**:
 
 ```yaml
 workflows:

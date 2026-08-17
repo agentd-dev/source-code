@@ -159,7 +159,7 @@ $ agentd tui --config agent.yaml     # or: agentd ui -c agent.yaml (browser)
 ```
 
 ```
-agentd 2.0.0 · prod-agent                        chat  tasks  subagents  debug
+agentd · prod-agent                              chat  tasks  subagents  debug
 you › Deploy api-gateway to staging
 agent › Deploy checks passed. Rolling out v2.4.1 — 3 pods cycling, ETA 90s.
 ⣾ read_file · 3s · 1.2k tok
@@ -182,9 +182,9 @@ pair-programming agent for a repository.
 
 ## Lifecycle & triggers
 
-agentd 2.0 has **one durable runtime** — no modes. A run is either a one-shot
-**job** or a long-lived **daemon** (`lifecycle.run_until`), and what *triggers*
-runs is a workflow **start node**.
+agentd has **one durable runtime** — there are no modes to pick between. A run
+is either a one-shot **job** or a long-lived **daemon** (`lifecycle.run_until`),
+and what *triggers* runs is a workflow **start node**.
 
 ```console
 # a job (the quickstart): the --instruction sugar expands to a
@@ -211,9 +211,7 @@ workflows:
 lifecycle: { run_until: drained }                    # a daemon
 ```
 
-The 1.x `--mode once|loop|reactive|schedule|workflow` flags (and the flat v1
-schema) were removed; a 1.x configuration is rejected with a migration hint.
-`--traceparent` still continues an upstream W3C trace.
+`--traceparent` continues an upstream W3C trace.
 
 ## Workflows
 

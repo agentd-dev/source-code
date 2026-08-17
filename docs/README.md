@@ -1,66 +1,79 @@
-# agentd documentation
+# Overview
 
-`agentd` is a small, dependency-light Rust binary that runs **one agent**: you
-give it an instruction and a single LLM endpoint (the *intelligence*), and it
-runs an agentic loop — think, call a tool, observe, repeat — until the job
-reaches a terminal status or a new event wakes it. Every task tool it can call
-comes from an **MCP server** — agentd ships none of its own and never runs local
-code; its only built-in tools are its *self/control* orchestration primitives
-(spawn a subagent, subscribe to a resource, run a graph). It reacts to the world
-through **MCP resource subscriptions**. A tiny supervisor owns lifecycle,
-triggers, limits, and the process tree; the reasoning lives in isolated subagent
-child processes it can always kill.
+`agentd` is a small Rust binary that runs **one agent**. You give it an
+instruction and one LLM endpoint, and it runs the agentic loop — think, call a
+tool, observe, repeat — until the work reaches a terminal status or a new event
+wakes it.
 
-These pages are the task-oriented guide. The **normative specifications** live in
-[`../rfcs/`](../rfcs/README.md) (RFC 0001 is the narrative front door; 0002–0013
-specify each mechanism). The **architecture decision record + build plan** live
-in [`design/`](design/) — [`00-architecture-assessment.md`](design/00-architecture-assessment.md)
-is the binding decision record and [`PLAN.md`](design/PLAN.md) tracks build
-status and the M1–M3 milestones.
+Three properties make it different from an agent framework:
 
-> **Status — agentd 2.0.** The runtime is implemented: config validation, the
-> agentic loop, the supervisor + subagent process tree, the MCP client, the v2
-> **lifecycle** (`lifecycle.run_until` job/daemon) and **workflow triggers**
-> (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`manual`/`a2a` start
-> nodes), the self/control tools, and the **A2A v2** external channel (RFC 0029)
-> all run today. Transport is **HTTPS everywhere** — intelligence, the MCP client,
-> A2A, and operator control are all HTTP(S) with mTLS/bearer auth (loopback
-> `http://` allowed for dev); agentd links no unix/vsock transport. The external
-> channel and operator control are unified into the **A2A method family**
-> (`a2a.listen`, `--features a2a`); the 1.x served self-MCP surface was removed in
-> the mode cut-over. The durable **DAG workflow** engine (RFC 0027) is configured
-> under `workflows:`. See [`design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md)
-> for the 2.0 build plan and [`design/00-target-vision-pivot.md`](design/00-target-vision-pivot.md)
-> for the transport pivot.
+- **It ships no tools.** Every capability an agent has comes from a remote
+  **MCP server** you name. There is no built-in filesystem, shell or HTTP tool
+  library, so the blast radius of a run is exactly the set of servers you wired.
+  Local command execution exists, but it is off at two independent layers and
+  fenced when on.
+- **The reasoning runs where it can be killed.** A supervisor that never talks
+  to a model owns lifecycle, limits and the process tree; the loop itself runs
+  in child processes. A model that loops, overspends or is jailbroken is
+  contained by a process that cannot be prompted.
+- **It is a daemon, not a script.** State lives in a store, so a restart
+  resumes rather than restarts. Terminals and browsers attach to a running
+  agent as thin views; several can watch the same session at once.
 
-## Pages
+## Where to start
+
+| If you want to… | Read |
+|---|---|
+| get something running | [Getting started](getting-started.md) |
+| see what people build with it | [Use cases](use-cases.md) |
+| understand the design | [Architecture](architecture.md), then [The harness](harness.md) |
+| build a coding agent | [Coding agent](coding-agent.md) |
+| know every setting | [Configuration](configuration.md) |
+| review the security posture | [Security](security.md) |
+
+## The documentation
+
+**How it works** — the concepts, in the order they build on each other.
 
 | Page | What it covers |
 |---|---|
-| [getting-started.md](getting-started.md) | Checkout to a first end-to-end run; the 60-second mental model; the same instruction in `once` / `loop` / `reactive` modes. |
-| [use-cases.md](use-cases.md) | What agentd is *for*: worked end-to-end scenarios (jobs, reactive services, meshes of agents) with the flags and manifests that realize them. |
-| [configuration.md](configuration.md) | Every flag and env var, precedence (`default < config file < env < flag`), validate-at-startup, intelligence URIs, durations, run-id, drain, exit codes. |
-| [architecture.md](architecture.md) | The two-loop split (supervisor vs. agentic loop), components, the process tree, and how the pieces fit. |
-| [mcp.md](mcp.md) | MCP as the universal interface: the client subset (tools/resources/subscribe, notify-then-read) and the Streamable HTTP transport. agentd's own external channel is now **A2A** (RFC 0029), not a served self-MCP. |
-| [intelligence.md](intelligence.md) | The single LLM endpoint — the HTTPS transport (loopback `http://` for dev), the OpenAI-compatible wire, native tool-calling, and credential handling. |
-| [modes-and-triggers.md](modes-and-triggers.md) | agentd 2.0's **lifecycle** (`lifecycle.run_until` job/daemon) and **triggers** — workflow start nodes (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`manual`/`a2a`), the A2A daemon channel, and a 1.x→2.0 migration table. |
-| [workflows.md](workflows.md) | *(1.x — superseded.)* The v3 **durable DAG engine** (RFC 0027) is now configured under `workflows:` in the v2 document; see the [README](../README.md#workflows) and RFC 0027. This page describes the retired v1 cyclic-graph dialect. |
-| [embedding.md](embedding.md) | Build your own CLI on the `agentd-core` library: the re-exec dispatch, **code-registered tools** (native Rust in the agent), the reserved `code` workflow server, and the API-stability tiers (RFC 0022). |
-| [subagents.md](subagents.md) | The same-binary re-exec subagent model, the rich spawn payload + output contract, narrowed seeds, the spawn chokepoint, and depth/breadth/rate caps. |
-| [interface.md](interface.md) | The **display clients** (RFC 0032): the terminal UI + web UI, one daemon and many synchronized surfaces — pairing-code login, live activity, approvals, steering, debug mode. |
-| [coding-agent.md](coding-agent.md) | **agentd for software engineering**: the full recipe for a pair-programming agent on a repository — giving it hands (`exec` vs MCP), approvals, budgets, and working practices. |
-| [observability.md](observability.md) | JSON-lines telemetry, the line schema + event vocabulary, the correlation tuple / `agent_path` subtree trick, health, and metrics-from-logs. |
-| [aauth.md](aauth.md) | **AAuth [DRAFT]** (`--features aauth`): agent identity for AAuth-protected MCP servers — an Ed25519 key + Agent-Provider token + RFC 9421 request signing (RFC 0023). |
-| [security.md](security.md) | The granted-MCP-subset trust budget (Rule-of-Two), untrusted-content stance, SSRF defenses, the no-local-execution posture, and secrets handling. |
-| [deployment.md](deployment.md) | Deployment shapes — standalone CLI job, Kubernetes Job/CronJob, long-lived A2A Deployment, systemd — drain choreography, and the exit-code contract. |
-| [operations.md](operations.md) | *(largely 1.x — superseded.)* In 2.0 the control plane is **A2A** (`a2a.listen`, RFC 0029): the operator admin family (`a2a.drain`/`lameduck`/`cancel`), `--capabilities` / `--config-schema=2`, the durable-task read surface, and hot reload (SIGHUP + ConfigMap file-watch). |
-| ~~scaling.md~~ | *(removed in 2.0.)* The 1.x `cluster` sharding / work-claim / standby feature was removed. In 2.0, scale with multiple daemon replicas coordinating through their **durable store** (CAS per work item) — see [deployment.md §4d](deployment.md). |
+| [architecture.md](architecture.md) | The two-loop split, the components, and how a run flows from config to result. |
+| [harness.md](harness.md) | The supervisor: the process tree, the kill ladder, budgets, checkpoints, and recovery. |
+| [agent-loop.md](agent-loop.md) | One turn end to end — context assembly, the round loop, tool dispatch, termination. |
+| [subagents.md](subagents.md) | Delegation as a process tree: narrowed context, distilled returns, depth limits. |
+| [workflows.md](workflows.md) | Durable DAGs: start nodes, the node catalogue, data flow, waits, resume. |
+| [modes-and-triggers.md](modes-and-triggers.md) | Job or daemon, and the start nodes that decide when a run fires. |
+| [mcp.md](mcp.md) | Where tools and events come from: the client subset and the Streamable HTTP transport. |
+| [why-rust.md](why-rust.md) | The dependency moat, what is hand-rolled, and where the choice costs something. |
 
-## See also
+**Build & operate** — using it for real.
 
-- **[`../rfcs/README.md`](../rfcs/README.md)** — the normative RFC set (0001–0020,
-  including the agentctl control-plane track 0014–0020).
-- **[design/](design/)** — the binding [architecture assessment](design/00-architecture-assessment.md),
-  the [build plan](design/PLAN.md), and the supporting research/review notes.
-- **[`../examples/SAMPLES.md`](../examples/SAMPLES.md)** — runnable samples for the
-  three operational shapes (once / reactive / loop) plus manifests.
+| Page | What it covers |
+|---|---|
+| [configuration.md](configuration.md) | Every setting, the three spellings, precedence, and validation. |
+| [experience.md](experience.md) | Validate before anything runs; exit codes as an API; telemetry you can filter. |
+| [interface.md](interface.md) | The terminal and web clients: one daemon, many synchronized surfaces. |
+| [coding-agent.md](coding-agent.md) | A pair-programming agent on a repository — tools, approvals, budgets, practices. |
+| [security.md](security.md) | Capability scoping, the Rule of Two, the exec fence, secrets, and the limits of all of it. |
+| [authentication.md](authentication.md) | Authenticating outbound to model, MCP and A2A endpoints. |
+| [observability.md](observability.md) | Structured telemetry, the correlation tuple, health and metrics. |
+| [deployment.md](deployment.md) | Job, CronJob, long-lived Deployment, systemd — and drain choreography. |
+| [operations.md](operations.md) | Driving a live daemon: the admin surface, capabilities, hot reload. |
+| [scaling.md](scaling.md) | Many replicas over one queue: sharding, work-claim leases, idempotency. |
+
+**Extend & embed**
+
+| Page | What it covers |
+|---|---|
+| [embedding.md](embedding.md) | Build your own CLI on `agentd-core`, with native Rust tools registered in-process. |
+| [intelligence.md](intelligence.md) | The model endpoint: the wire, failover, budgets, credentials. |
+| [aauth.md](aauth.md) | Agent identity for AAuth-protected servers — an Ed25519 key and signed requests. |
+
+## Specifications
+
+The **normative specs** live in [`../rfcs/`](../rfcs/README.md) — read those when
+you need the exact contract rather than an explanation of it.
+[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md) is the narrative front door.
+
+The **decision records** live in [`design/`](design/): they record why the
+system is shaped this way, including options that were considered and rejected.

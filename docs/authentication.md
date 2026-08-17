@@ -8,8 +8,8 @@ use a static secret, an **interactive OAuth login**, **AWS SigV4**, or a
 
 > **The rule that ties it together — fail-closed.** A daemon never blocks waiting
 > for a human. If an interactive credential is missing and can't be refreshed, the
-> process exits with `run: agentd login <target>` rather than hanging. Secrets are
-> always `{{secret:…}}` references — never inline, never logged.
+> process exits telling you to run `agentd --login <target>` rather than hanging.
+> Secrets are always `{{secret:…}}` references — never inline, never logged.
 
 ## Two contexts
 
@@ -20,9 +20,9 @@ use a static secret, an **interactive OAuth login**, **AWS SigV4**, or a
 
 ## The `auth:` block
 
-Every endpoint accepts `auth: { kind: …, … }`. The existing shortcuts
-(`intelligence.token`, `mcp.servers[].headers`, `a2a.peers[].client_cert`) still
-work and are equivalent to `kind: static`.
+Every endpoint accepts `auth: { kind: …, … }`. The shortcuts
+(`intelligence.token`, `mcp.servers[].headers`, `a2a.peers[].client_cert`) are
+equivalent to `kind: static`.
 
 ```yaml
 intelligence:
@@ -72,12 +72,12 @@ auth:
   scopes: [llm.invoke, offline_access]
 ```
 
-- **`device`** (the default) — the interactive flow (see [`agentd login`](#agentd-login)).
+- **`device`** (the default) — the interactive flow (see [`agentd --login`](#agentd-login)).
   Works headless / over SSH; no browser or open port. The token endpoints are
   discovered from `issuer` (RFC 8414 / OIDC) unless pinned.
 - **`client_credentials`** — a headless machine-to-machine grant (needs
   `client_secret`); refreshes on its own, no login.
-- **`authorization_code`** — a **browser + PKCE** loopback flow. `agentd login`
+- **`authorization_code`** — a **browser + PKCE** loopback flow. `agentd --login`
   prints the authorization URL (it never shells out to a browser), captures the
   redirect on a one-shot `127.0.0.1` listener, verifies `state`, and exchanges the
   code. Use it when a desktop browser is handier than typing a device code.
@@ -109,7 +109,7 @@ auth:
   role_name: AgentdBedrock
 ```
 
-`agentd login mcp:<name>` runs the SSO device flow and caches **temporary AWS
+`agentd --login mcp:<name>` runs the SSO device flow and caches **temporary AWS
 credentials**; the signer reloads them per request (a re-login refreshes them with
 no restart).
 
@@ -170,7 +170,7 @@ intelligence:
     scopes: ["https://www.googleapis.com/auth/cloud-platform"]
 ```
 
-Complete either once with `agentd login intelligence`; the daemon refreshes the
+Complete either once with `agentd --login intelligence`; the daemon refreshes the
 token on its own thereafter.
 
 **AWS Bedrock (native)** — talk to the Bedrock runtime directly, no gateway. Set
@@ -195,20 +195,22 @@ intelligence:
     role_name: AgentdBedrock
 ```
 
-For `source: sso`, run `agentd login intelligence` once (the IAM Identity Center
+For `source: sso`, run `agentd --login intelligence` once (the IAM Identity Center
 device flow → temporary credentials); the daemon refreshes them thereafter. On EC2
 (`imds`) or EKS (`irsa`) the credentials are ambient — no login step. The same
 `kind: aws` block also fronts an **AWS-IAM-guarded OpenAI-compatible gateway**
 (leave `dialect` unset, set `service: execute-api`); a bearer-guarded gateway takes
 `oauth2`/`static` instead.
 
-## <a id="agentd-login"></a>`agentd login` — the interactive flow
+## <a id="agentd-login"></a>`agentd --login` — the interactive flow
 
 When a provider needs a human (an `oauth2` `device`/`authorization_code` grant),
-complete it once with `agentd login`; the token is cached and the daemon uses it.
+complete it once with `agentd --login`; the token is cached and the daemon uses
+it. The flag needs a binary built with `--features oauth` (the release binaries
+and the published image have it).
 
 ```console
-$ agentd login mcp:github --config app.yaml
+$ agentd --login mcp:github --config app.yaml
 ┌─ authorize agentd ──────────────────────────────
 │  target   mcp:github
 │  visit    https://github.com/login/device
@@ -218,14 +220,15 @@ $ agentd login mcp:github --config app.yaml
 logged in to mcp:github — token cached in ~/.local/state/agentd/creds
 ```
 
-- `agentd login <target>` — run the flow for `intelligence` or `mcp:<name>`.
-- `agentd logout <target>` — evict the cached credential.
+- `agentd --login <target>` — run the flow for `intelligence` or `mcp:<name>`.
+- `agentd --logout <target>` — evict the cached credential (no feature needed).
 
 The token (and its refresh token) is cached in a per-user file (`0600`, under
-`$AGENTD_CRED_DIR` / `$XDG_STATE_HOME/agentd/creds`). The daemon reads it at
-startup and **refreshes** in memory before expiry — so a long-running agent keeps
-a live credential without re-prompting. A restart re-reads the cache; only an
-expired token with no refresh token needs a fresh `agentd login`.
+`$AGENTD_CRED_DIR`, else `$XDG_STATE_HOME/agentd/creds`, else
+`~/.local/state/agentd/creds`). The daemon reads it at startup and **refreshes**
+in memory before expiry — so a long-running agent keeps a live credential without
+re-prompting. A restart re-reads the cache; only an expired token with no refresh
+token needs a fresh `agentd --login`.
 
 > **Never printed.** The device prompt shows the URL and short code, never the
 > token. The cache file holds live tokens and is excluded from all logs, audit,
@@ -236,13 +239,13 @@ expired token with no refresh token needs a fresh `agentd login`.
 | | static | oauth2 device | oauth2 client-creds | aws (SigV4) | spiffe jwt | spiffe x509 |
 |---|---|---|---|---|---|---|
 | **MCP server** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (mTLS) |
-| **intelligence** | ✓ | ✓ | ✓ | follow-up | ✓ | — |
-| **A2A peer** | ✓ | ✓ | ✓ | follow-up | ✓ | ✓ (`client_cert`/`key`) |
+| **intelligence** | ✓ | ✓ | ✓ | ✓ (incl. `dialect: bedrock`) | ✓ | — |
+| **A2A peer** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (`client_cert`/`key`) |
 
 ## Security
 
 - **Fail-closed:** a daemon never blocks on a human; a missing interactive
-  credential is a clean startup error naming the `agentd login` to run.
+  credential is a clean startup error naming the `agentd --login` to run.
 - **Secret-free:** every credential input is a `{{secret:…}}` / `{{secret-file:…}}`
   reference; the token cache and device codes are never logged.
 - **No ambient authority:** every credential is configured per endpoint; AWS/

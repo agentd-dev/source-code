@@ -21,11 +21,6 @@ stderr (no `tracing`, no metrics SDK, no OTLP) and a tiny health surface (exit
 code + an optional `--health-file`). Everything heavier is feature-gated. Full
 rationale is in [RFC 0010](../rfcs/0010-observability-health-telemetry.md).
 
-> **Status.** The runtime is implemented: the supervisor reactor, MCP client,
-> intelligence client, the agentic loop, the v2 lifecycle + workflow triggers,
-> and therefore the events below are all live. The examples here describe real
-> behaviour.
-
 ---
 
 ## stdout vs stderr
@@ -92,14 +87,14 @@ allocation — below-level calls cost essentially nothing.
 The `event` string is the backbone — what you filter, count, and alert on. It is
 a small, **closed**, dotted set. Adding an event later is cheap; renaming one
 breaks dashboards. The supervisor/lifecycle and agentic-loop events below are
-the v1 set (build-gated surfaces add a few more, noted inline).
+the core set; build-gated surfaces add a few more, noted inline.
 
 ### Supervisor / lifecycle (`comp:"supervisor"`)
 
 | Event | Fields beyond canonical |
 |---|---|
 | `proc.start` | `mode`, `pid`, `version`, `argv_hash` |
-| `proc.ready` | readiness reached (see [Health](#health-mode-aware)) |
+| `proc.ready` | readiness reached (see [Health](#health-shape-aware)) |
 | `proc.shutdown` | `signal`, `reason` |
 | `proc.exit` | `code`, `uptime_ms` |
 | `config.loaded` | `mcp_servers` (count/names), `mode`, limits — no secrets |
@@ -153,7 +148,7 @@ introduces **no** new `event` strings.
 > `kind:"self_subscribe"`. Build-gated surfaces also emit `metrics.*` /
 > `cron.unavailable` / `mcp.serve_unavailable` when a flag needs a feature.
 
-### Operability: management, hot reload, intelligence swap
+### Operability: the listener, hot reload, intelligence swap
 
 These events come from the operability surfaces (the A2A listener, hot reload,
 the intelligence hot-swap). They are emitted only by the builds that serve them
@@ -162,17 +157,23 @@ each lives in [`docs/operations.md`](operations.md).
 
 | Event | `comp` | Fields beyond canonical |
 |---|---|---|
-| `a2a.connect` | `supervisor` | `origin` (`stdio`/`management`), `principal`, `conn` — a peer joined the A2A listener |
-| `a2a.drain` | `supervisor` | `in_flight`, `eta_ms` — the `drain` admin command tripped the drain latch |
-| `a2a.lameduck` | `supervisor` | `ready` — the `lameduck` command flipped the readiness override |
-| `a2a.pause` / `a2a.resume` | `supervisor` | `affected` — the `pause`/`resume` commands suspended/continued N live subtrees |
-| `config.reload_requested` | `supervisor` | `trigger` (`sighup`/`watch`) — a reload was requested |
-| `config.reloaded` | `supervisor` | `changed` (the reloadable group labels), `applied_ms` — a reload was **applied** (a clean no-op with no material change still reports `changed:[]`) |
-| `config.reload_rejected` | `supervisor` | `reason` (`invalid`/`restart_required`), `field`, `diagnostics` — a reload was a clean no-op |
-| `config.reload.values` | `supervisor` | `model`, `max_tokens`, `max_steps`, `max_depth`, `log_level` — the value-swap step's new template (no secret) |
-| `config.watch.armed` / `config.watch.fired` / `config.watch.error` | `supervisor` | `file`/`err` — the `--watch-config` inotify watcher armed, fired on a ConfigMap swap, or hit an I/O error |
+| `a2a.listen` | `supervisor` | `authority`, `bound`, `tls`, `mtls`, `require_auth`, `interface`, `pairing` — the listener bound |
+| `a2a.connect` | `supervisor` | `origin`, `conn` — a peer opened a connection (level `debug`) |
+| `a2a.denied` | `supervisor` | `principal`, `method`, `op` — an authorization refusal |
+| `drain.start` / `drain.done` / `drain.abandon` | `supervisor` | the `a2a.drain` admin method and SIGTERM share this path (see the lifecycle table above) |
+| `agent.paused` / `agent.resumed` | `supervisor` | `reason` — an instance-wide `a2a.pause` hold went on or came off |
+| `run.paused` / `run.resumed` | `supervisor` | `run`, `reason` — a single run was held or released |
+| `config.reloaded` | `supervisor` | `trigger` (`sighup`/`watch`), `changed` (the reloadable group labels; a reload with no material change reports `["nothing"]`) — a reload was **applied** |
+| `config.reload.invalid` | `supervisor` | `trigger`, `error` — the candidate did not validate; a clean no-op |
+| `config.reload.restart_required` | `supervisor` | `trigger`, `paths` — the diff touched a restart-only path; a clean no-op |
+| `config.watch.armed` / `config.watch.fired` / `config.watch.error` | `supervisor` | `file`/`err` — the `lifecycle.watch_config` inotify watcher armed, fired on a ConfigMap swap, or hit an I/O error |
 | `intel.swap` | `intel` | `kind` (`model`/`endpoint`), `model_from`, `model_to`, `endpoint_change`, `policy` — a hot-swap was applied at a turn boundary (no URL, no secret) |
 | `intel.swap.reject` | `intel` | a parked swap was refused at the turn boundary |
+
+> The admin methods themselves are recorded in the **audit stream**, not as
+> separate log events: an `audit` line carries `action:"a2a.drain"` (or
+> `"a2a.SendMessage:workflow.run"` for a command DataPart) with the principal,
+> role and outcome. See [operations §6](operations.md).
 
 > The intelligence-swap line carries the model *names* (non-secret identifiers),
 > the swap kind, and whether the endpoint list changed — **never** the endpoint
@@ -295,16 +296,17 @@ backend.
 
 ---
 
-## Health (mode-aware)
+## Health (shape-aware)
 
-A reactive agentd is *supposed* to be idle, so **liveness is measured at the
-supervisor's event loop, not at the agent**.
+An event-driven agentd is *supposed* to be idle, so **liveness is measured at the
+supervisor's event loop, not at the agent**. What readiness means depends on the
+workflow's start node.
 
-| Mode | Readiness | Liveness | Terminal health |
+| Start node | Readiness | Liveness | Terminal health |
 |---|---|---|---|
-| `once` | implicit (the run *is* the readiness) | n/a — bounded | **exit code** is the entire signal |
+| `once` / `manual` | implicit (the run *is* the readiness) | n/a — bounded | **exit code** is the entire signal |
 | `loop` / `schedule` | config parsed, MCP connected, first tick armed → `proc.ready` | heartbeat advances each tick | exit code |
-| `reactive` | MCP connected **and** all declared subscriptions reconciled (subscribed + read-after-subscribe) → `proc.ready` | supervisor heartbeat; **idle is healthy** | exit code |
+| `subscribe` / `signal` / `event` / `a2a` | MCP connected **and** every declared subscription reconciled (subscribed + read-after-subscribe) → `proc.ready` | supervisor heartbeat; **idle is healthy** | exit code |
 
 **Liveness = the supervisor heartbeat.** The reactor bumps a monotonic
 `last_loop_tick` on *every* wake, including idle timeout expiries. If
@@ -340,16 +342,19 @@ the pod is not "ready", so an orchestrator won't route work to it.
    the kernel kills us; agentd never exits those itself.
 
 2. **`--health-file PATH` (default daemon surface).** The supervisor writes the
-   file every heartbeat — **no socket, no port** — via an atomic
+   file once a second — **no socket, no port** — via an atomic
    write-temp-then-`rename`:
 
    ```json
-   {"status":"ready","ts":"2026-06-25T10:00:00.123Z","hb":4821,
-    "last_loop_tick_ms":34,"active_subagents":2,"run_id":"01J8XAMPLE..."}
+   {"ts":"2026-06-25T10:00:00.123Z","run_id":"01J8XAMPLE...","mode":"2.0",
+    "supervisor_tick_age_ms":34,"alive":true,"draining":false}
    ```
 
-   `status` is `ready` | `draining`. A Kubernetes `exec` probe reads it and
-   checks `status` plus `ts` freshness. One dependency-free file write per tick:
+   `alive` is the heartbeat verdict: the supervisor's last loop tick is fresher
+   than the liveness window (10s) and no drain is under way. Once a drain begins
+   the writer emits one final record with `draining:true` and stops. A Kubernetes
+   `exec` probe reads `alive` (or checks `ts` freshness itself). One
+   dependency-free file write per second:
 
    ```yaml
    livenessProbe:
@@ -358,10 +363,10 @@ the pod is not "ready", so an orchestrator won't route work to it.
      periodSeconds: 5
    ```
 
-3. **A2A readiness (when `a2a.listen` is on).** A `Management` peer reads the
-   instance status view via the A2A `status` command (and `ListTasks` for the live
-   subagent/run projection) over the HTTPS listener to learn liveness + readiness
-   — no separate health socket.
+3. **A2A readiness (when `a2a.listen` is on).** An authenticated principal reads
+   the instance status view via the A2A `status` command (and `ListTasks` for the
+   live task/run projection) over the HTTPS listener to learn liveness +
+   readiness — no separate health socket.
 
 4. **HTTP `/healthz` + `/readyz` (opt-in, `--features metrics`).** When an orchestrator
    wants real HTTP probes, served on `--metrics-addr` by the same hand-rolled blocking HTTP code on
@@ -374,65 +379,57 @@ run — a pure CLI invocation carries zero health machinery. HTTP and socket
 surfaces are opt-in and never on for a one-shot.
 
 > `--health-file`, `--log-level` (plus `AGENT_LOG_LEVEL`), `--log-content`,
-> `--listen` (the A2A listener), and `--metrics-addr` (behind `metrics`) are all
-> live; see [`config/v2/`](../crates/agentd/src/config/v2/) for the authoritative
-> flag/env list. `--aggregate-logs` and `--health-http` remain roadmap items
-> tracked in [`docs/design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md).
+> `--listen` (the A2A listener), and `--metrics-addr` (behind `metrics`) are the
+> observability flags; see [`config/v2/`](../crates/agentd/src/config/v2/) for the
+> authoritative flag/env list. `--aggregate-logs` and `--health-http` remain
+> roadmap items tracked in
+> [`docs/design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md).
 
 ---
 
 ## Live state reads (the A2A surface)
 
-> **Changed in agentd 2.0.** The 1.x served `agent://` MCP control resources were
-> removed with the self-MCP surface. A control plane now reads live state over
-> **A2A** (`a2a.listen`, RFC 0029): **`GetTask` / `ListTasks`** for durable
-> task/run state, a **`status`** command DataPart for the instance status view, a
-> **`config`** command for the effective (redacted) reloadable config, and
-> **`agent/card`** for identity — complemented by the **metrics** and **OTEL**
-> signals above for time-series/alerting. Every read resolves to a **principal**
-> and is authorized against the role matrix (a `Stdio`/anonymous caller is
-> refused), the same trust model the 1.x Management-only resources used.
+A control plane reads live state over **A2A** (`a2a.listen`, RFC 0029), on the
+same HTTPS listener that carries everything else. Every read resolves to a
+**principal** and is authorized against the role matrix — an anonymous caller is
+refused — so there is no unauthenticated status port. These reads answer "what is
+this instance doing *right now*"; the **metrics** and **OTEL** signals below
+answer the time-series and alerting questions.
 
-The retired 1.x resources and the state each carried (a migration reference — the
-same data is now reached via the A2A methods above):
-
-| 1.x resource (retired) | Origin | Subscribable | Body |
+| Read | How | Who | Body |
 |---|---|---|---|
-| `agent://status` | any | no | run id, mode, version, pid, uptime, spawn counts |
-| `agent://capabilities` | any | no | the live capabilities manifest (identity, `surfaces{}`, limits) |
-| `agent://run/{id}` | any | yes (each spawn / terminal change) | the served run aggregate; folds in the run-outcome report once terminal |
-| `agent://subagent/{handle}` | any | yes (terminal only) | an async child's status / distilled result |
-| `agent://session/{handle}` | any | yes (each warm-turn boundary) | a warm session's turn state |
-| `agent://inventory` | Management | yes (spawn / exit / status change) | the live subagent-tree projection: lifecycle flags (`draining`/`paused`/`ready`), totals, per-node status/usage |
-| `agent://intelligence` | Management | yes (breaker / active / all-down transitions) | endpoint health: the ordered endpoint list (transport + index, **never** the URL/creds), which is active, each one's breaker state / EWMA latency / error rate, the all-down flag, swap policy, discovery |
-| `agent://config/effective` | Management | yes (each applied hot reload) | the live, **redacted** reloadable-config view (no token/URL/secret) |
-| `agent://capacity` | Management *(cluster build)* | no | the placement view: identity, shard `K/N`, standby, free slots, active subagents, intelligence warmth, saturation |
-| `agent://events` | Management *(`events` feature)* | yes (each new event) | the bounded live-event ring — see below |
+| instance status | `SendMessage` with a `status` command DataPart | any non-anonymous role | instance id, run id, uptime, `draining` / `paused`, the durable store (kind, degraded, generation), armed workflows, live runs, conversations, subagents, OS children, timers, inbox backlog, token budget, tool/skill counts, lifetime counters, instruction source+version, active model, recent activity |
+| effective config | `SendMessage` with a `config` command DataPart | operator | the merged settings document — `{{secret:…}}` **references** only, never resolved values |
+| one task | `GetTask` | the task's owner (operator sees all) | the durable task: state, history, artifacts |
+| all tasks | `ListTasks` | as above | the task/run projection |
+| task updates | `SubscribeToTask` (SSE) | as above | status-update frames until terminal |
+| identity + skills | `GetAgentCard` | public (pre-auth discovery) | name, description, protocol version, capabilities, the workflows offered as skills |
+| the live event feed | `SubscribeToEvents` (SSE) | any non-anonymous role, needs `interface.enabled` | the observation feed: runs, conversations, subagents, tasks, messages, activity, lifecycle and audit — principal-scoped |
+| the log ring | `debug.events` command DataPart | operator, needs `interface.debug` | a cursor window of the JSON log lines — see below |
 
 > The redaction discipline is the same as the capabilities manifest and the
-> intel-swap log line: `agent://intelligence` and `agent://config/effective`
-> carry transport schemes, structural names, and header *names* only — never a
-> token, an endpoint URL, or a resolved `{{secret:…}}` value.
+> intel-swap log line: the `status` and `config` reads carry structural names,
+> transport schemes and header *names* only — never a token, an endpoint URL, or
+> a resolved `{{secret:…}}` value.
 
-### `agent://events` — the live log ring
+### `debug.events` — the live log ring
 
-With the `events` feature (and a management transport to serve it on), the same
-JSON log lines are mirrored into a bounded in-memory ring you can tail over MCP —
-the operator live-tail, without a collector round-trip. A read drains a bounded
-window with the standard MCP cursor; the envelope (`events_schema` = `1.0`)
-reports the window bounds and a **`dropped`** count so a subscriber knows when the
+With `interface.debug` on, the same JSON log lines are mirrored into a bounded
+in-memory ring you can tail over A2A — the operator live-tail, without a
+collector round-trip. Its capacity is `observability.events_ring` (flag
+`--events-ring`). A read drains a bounded window with a sequence cursor and
+reports the window bounds plus a **`dropped`** count, so a reader knows when the
 lossy-by-design ring outran it:
 
 ```jsonc
-// resources/read agent://events?after=4821&level=warn&event=subagent.,limit.
-{ "events_schema":"1.0", "oldest_seq":4700, "newest_seq":4990, "dropped":0,
+// SendMessage part: {"data":{"agentd":{"op":"debug.events","after":4821,"level":"warn","prefix":"run."}}}
+{ "oldest_seq":4700, "newest_seq":4990, "dropped":0,
   "events":[ /* the RFC 0010 JSON log lines, filtered */ ] }
 ```
 
-The cursor + filters ride the query string: `?after=<seq>` (advance to the last
-`seq` you saw; a malformed value safely falls back to the whole window),
-`?level=<lvl>` (exact level match), `?event=<prefix,prefix>` (a comma-list of
-dotted event prefixes). The ring never blocks the supervisor — a slow reader
+The cursor and filters are command arguments: `after` (advance to the last `seq`
+you saw), `limit` (default 200, capped at 500), `level` (exact level match), and
+`prefix` (a dotted event prefix). The ring never blocks the loop — a slow reader
 loses old lines (reflected in `dropped`), never stalls the daemon.
 
 ---
@@ -487,8 +484,8 @@ the features below):
 > `intel.result.usage` log lines. `agent_loop_steps_total`, `agent_refusals_total`,
 > and the steps/tokens/deadline/depth legs of `agent_limit_exceeded_total` are
 > **process-local** — emitted in the re-exec'd child loop, so the supervisor scrape
-> reflects only its own process (cross-process rollup is a v1 non-goal); the
-> `tree_tokens` leg is the supervisor's own bound and is live.
+> reflects only its own process (cross-process rollup is a deliberate non-goal);
+> the `tree_tokens` leg is the supervisor's own bound and is emitted.
 
 **Cardinality discipline (binding):** **never** put `run_id`, `agent_id`,
 `agent_path`, `call_id`, or resource URIs into metric labels — they are unbounded
@@ -504,9 +501,10 @@ served on the already-opt-in surface (`/metrics`). **No `prometheus` or `metrics
 crate** — it is plain text, no async, no SDK.
 
 The metric **names** and label **keys** are a **frozen, versioned contract**
-(`metrics_schema` = `1.0`, surfaced at `surfaces.metrics_schema` in the
-capabilities manifest). The set is additive within the major; a rename/removal
-bumps the major. A control plane authors scalers/alerts against it. Labels carry
+(`metrics_schema` = `1.1`, owned by `obs::metrics::METRICS_SCHEMA`). The set is
+additive within the major — 1.1 added the `agent_budget_tokens_remaining` gauge
+and the `tokens_lifetime` limit value; a rename or removal bumps the major. A
+control plane authors scalers/alerts against it. Labels carry
 **bounded** values only — out-of-vocabulary values fold into an `other` slot so
 the cardinality is structurally bounded (the closed label set is a compile-time
 array). The same cardinality discipline as the default story applies: **never**
@@ -514,18 +512,26 @@ array). The same cardinality discipline as the default story applies: **never**
 
 #### Operability metrics (control plane)
 
-The management/hot-reload surfaces add these to the frozen set:
+The A2A/hot-reload surfaces add these to the frozen set:
 
-- **`agent_paused`** *(gauge, 0/1)* — `1` while the `pause` operator tool has
-  frozen the agentic tree at turn boundaries; `0` after `resume`. **Pause is not
-  readiness** — `agent_ready` ignores it (it tracks only drain / lame-duck), so
-  a paused instance can still read `agent_ready 1`.
+- **`agent_paused`** *(gauge, 0/1)* — `1` while an `a2a.pause` hold is in effect;
+  `0` after `a2a.resume`. **Pause is not readiness** — `agent_ready` ignores it
+  (it tracks only drain / lame-duck), so a paused instance can still read
+  `agent_ready 1`. Read the `paused` field of the A2A `status` command for the
+  authoritative answer: the gauge is rendered but the v2 runtime does not yet
+  write it, so it reads `0` even while a hold is on.
 - **`agent_config_reload_total{result}`** *(counter)* — hot reloads by result.
-  The closed domain is `applied` | `rejected` | `other`. A `rejected` reload is a
-  clean no-op (the running config is unchanged).
+  The label domain is bounded to `applied` | `rejected` | `other`; a refused
+  reload (invalid candidate, or a restart-only diff) currently lands in `other`,
+  and either way is a clean no-op with the running config unchanged. The precise
+  reason is on the `config.reload.invalid` / `config.reload.restart_required`
+  log line.
 - **`agent_config_generation`** *(gauge)* — the count of successfully-applied
-  reloads, monotonic in practice. A scraper detects "this instance has picked up
-  generation N" against the controller's desired generation.
+  reloads, monotonic in practice, so a scraper can detect "this instance has
+  picked up generation N" against the controller's desired generation. Like
+  `agent_paused` it is rendered but not yet written by the v2 runtime; the
+  durable manifest's `lifecycle.config_generation` and the `config.reloaded` log
+  line are the reliable signals today.
 - **`agent_drains_total{phase}`** *(counter)* — drain phase transitions; the
   closed domain is `started` | `completed` | `forced` | `other` (so `completed`
   vs `forced` distinguishes a clean drain from one that overran its budget).

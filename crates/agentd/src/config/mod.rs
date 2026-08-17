@@ -340,7 +340,7 @@ impl ServeTarget {
             let port_ok = serve_port_of(authority).is_some();
             if host.is_empty() || !port_ok {
                 return Err(usage(format!(
-                    "--serve-mcp: HTTP(S) target needs an explicit host:port (got: {spec})"
+                    "a2a.listen: HTTP(S) target needs an explicit host:port (got: {spec})"
                 )));
             }
             if !tls && !crate::net::http::is_loopback_host(host) {
@@ -401,7 +401,7 @@ impl Config {
         let loopback = crate::net::http::is_loopback_host(serve_host_of(bind));
         if !loopback && self.serve_client_ca.is_none() && self.serve_bearer.is_none() {
             return Err(usage(
-                "a non-loopback --serve-mcp needs auth: set --serve-client-ca (mTLS) and/or --serve-bearer".into(),
+                "a non-loopback a2a.listen needs client auth: set a2a.tls.client_ca (mTLS) and/or a2a.bearer".into(),
             ));
         }
         Ok(())
@@ -2131,7 +2131,7 @@ impl Config {
             || self.serve_bearer.is_some()
         {
             return Err(usage(
-                "--serve-cert/--serve-key/--serve-client-ca/--serve-bearer require --serve-mcp"
+                "a2a.tls.cert / a2a.tls.key / a2a.tls.client_ca / a2a.bearer require a2a.listen"
                     .into(),
             ));
         }

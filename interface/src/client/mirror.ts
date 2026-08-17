@@ -25,6 +25,24 @@ import {
 const FEED_LOG_CAP = 500;
 const TRANSCRIPT_CAP = 1000;
 
+/**
+ * A terminal state, in words. A task that ends without an artifact or a message
+ * still owes the reader an explanation, and `TASK_STATE_FAILED` is not one — it
+ * is the wire enum leaking into the conversation.
+ */
+function whyItEnded(state: string): string {
+  switch (state) {
+    case 'TASK_STATE_FAILED':
+      return 'the task failed (no reason reported — check the daemon log)';
+    case 'TASK_STATE_CANCELED':
+      return 'canceled';
+    case 'TASK_STATE_REJECTED':
+      return 'rejected before it ran';
+    default:
+      return state.replace(/^TASK_STATE_/, '').toLowerCase().replace(/_/g, ' ');
+  }
+}
+
 export class Mirror {
   private state: MirrorState = {
     conn: 'connecting',
@@ -357,7 +375,7 @@ export class Mirror {
       });
     } else if (terminal && known) {
       const failed = t.state !== 'TASK_STATE_COMPLETED';
-      const text = t.artifacts[0] ?? t.message ?? (failed ? t.state : '');
+      const text = t.artifacts[0] ?? t.message ?? (failed ? whyItEnded(t.state) : '');
       if (text.length > 0) {
         this.upsertEntry({
           key: `task-${t.id}`,

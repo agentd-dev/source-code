@@ -6,8 +6,8 @@ import path from "node:path";
 const ROOT = path.join(process.cwd(), "..");
 
 // Ordered navigation groups. Each doc names its `group`; the sidebar and the
-// docs index render groups in this order. RFCs are split into the 2.0 set and
-// the foundations so the current specs lead.
+// docs index render groups in this order. Specs are split so the ones that
+// describe the current design lead, with the foundations behind them.
 export const GROUPS = [
   { id: "start", title: "Start here" },
   { id: "concepts", title: "How it works" },
@@ -68,7 +68,7 @@ export const DOCS = [
     file: "docs/modes-and-triggers.md",
     title: "Lifecycle & triggers",
     group: "concepts",
-    blurb: "The 2.0 lifecycle (job vs daemon) and the workflow start-node triggers.",
+    blurb: "Job or daemon, and the start nodes that decide when a run fires.",
   },
   {
     slug: "mcp",
@@ -112,7 +112,7 @@ export const DOCS = [
     file: "docs/configuration.md",
     title: "Configuration",
     group: "operate",
-    blurb: "Every key and flag, precedence, validate-at-startup, and a complete 2.0 config.",
+    blurb: "Every key, the three spellings, precedence, and validation before anything runs.",
   },
   {
     slug: "deployment",
@@ -170,8 +170,7 @@ export const DOCS = [
     file: "docs/scaling.md",
     title: "Scaling",
     group: "operate",
-    tag: "1.x",
-    blurb: "Scale with replicas over a shared durable store; the 1.x cluster page is retained.",
+    blurb: "Many replicas over one queue: sharding, work-claim leases, and idempotency.",
   },
 
   // ── Extend & embed ────────────────────────────────────────────
@@ -198,7 +197,7 @@ export const DOCS = [
     blurb: "Signed agent identity for AAuth-protected MCP servers.",
   },
 
-  // ── RFCs · 2.0 ────────────────────────────────────────────────
+  // ── the specs behind the current design ───────────────────────
   { slug: "rfc-0026", file: "rfcs/0026-agent-loop-and-lifecycle.md", title: "0026 · Agent loop & lifecycle", group: "rfc-core" },
   { slug: "rfc-0027", file: "rfcs/0027-workflow-dialect-3.md", title: "0027 · Workflow dialect v3", group: "rfc-core" },
   { slug: "rfc-0029", file: "rfcs/0029-a2a-conversations-principals-commands.md", title: "0029 · A2A conversations & principals", group: "rfc-core" },
@@ -227,12 +226,7 @@ export const DOCS = [
   { slug: "rfc-0016", file: "rfcs/0016-telemetry-and-lifecycle-contract.md", title: "0016 · Telemetry contract", group: "rfc-foundation" },
   { slug: "rfc-0017", file: "rfcs/0017-declarative-config-and-hot-reload.md", title: "0017 · Config & hot reload", group: "rfc-foundation" },
   { slug: "rfc-0018", file: "rfcs/0018-intelligence-transport-resilience.md", title: "0018 · Intelligence resilience", group: "rfc-foundation" },
-  { slug: "rfc-0005", file: "rfcs/0005-self-mcp-server-and-control-protocol.md", title: "0005 · Self-MCP server", group: "rfc-foundation", tag: "1.x" },
-  { slug: "rfc-0008", file: "rfcs/0008-execution-modes-and-reactive-routing.md", title: "0008 · Modes & reactivity", group: "rfc-foundation", tag: "1.x" },
   { slug: "rfc-0013", file: "rfcs/0013-deferred-v2-surface.md", title: "0013 · Deferred v2 surface", group: "rfc-foundation" },
-  { slug: "rfc-0019", file: "rfcs/0019-horizontal-scaling.md", title: "0019 · Horizontal scaling", group: "rfc-foundation", tag: "1.x" },
-  { slug: "rfc-0020", file: "rfcs/0020-a2a-interop-over-vsock.md", title: "0020 · A2A over vsock", group: "rfc-foundation", tag: "1.x" },
-  { slug: "rfc-0021", file: "rfcs/0021-durable-workflows-and-parity-extensions.md", title: "0021 · Durable workflows", group: "rfc-foundation", tag: "1.x" },
 ];
 
 export function docsInGroup(groupId) {
@@ -250,6 +244,12 @@ export function slugForFile(name) {
 export function readDoc(slug) {
   const entry = DOCS.find((d) => d.slug === slug);
   if (!entry) return null;
-  const raw = fs.readFileSync(path.join(ROOT, entry.file), "utf8");
-  return { ...entry, raw };
+  // A registry entry whose file is missing must not take the whole build down
+  // with it — the page renders as not-found and every other doc still ships.
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, entry.file), "utf8");
+    return { ...entry, raw };
+  } catch {
+    return null;
+  }
 }

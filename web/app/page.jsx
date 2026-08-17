@@ -56,6 +56,15 @@ const HERO_CMD = `$ agentd \\
 {"event":"tool.call","tool":"add_labels","args":{"labels":["bug"]}}
 {"event":"run.done","status":"completed","steps":4,"exit_code":0}`;
 
+const TUI_CMD = `$ agentd tui --config coding.yaml
+
+agentd 2.0.0 · coder                chat  tasks  subagents  debug
+you › find why the staging deploy is flaking
+agent › Reproduced: the readiness probe races the
+        migration job. Patch in api/deploy.yaml.
+⣾ read_file · 3s · 1.2k tok
+● live http://127.0.0.1:8420 · 2 turns · 33/17 tok`;
+
 const ARCH_DIAGRAM = `flowchart TB
   trig["trigger<br/>once · schedule · subscribe · a2a"]
   ext["A2A peer / operator"]
@@ -104,9 +113,9 @@ const TRIGGERS = [
 
 const CAPS = [
   {
-    tag: "no local code",
+    tag: "no local code by default",
     title: "It runs nothing of its own",
-    body: "Zero built-in tools, no shell, no exec, no plugins. Every capability comes from a remote MCP server you declare — a prompt-injected agent has nothing to break into; the blast radius is exactly the servers you wired.",
+    body: "Zero built-in tools and no plugins: every capability comes from a remote MCP server you declare, so the blast radius is exactly what you wired. Local commands are possible but off at two independent layers — a build feature AND a config switch — and then fenced by an allow-list, workdir confinement, argv-not-shell, and a minimal environment.",
   },
   {
     tag: "supervised",
@@ -127,6 +136,11 @@ const CAPS = [
     tag: "authenticated",
     title: "Identity + Rule of Two",
     body: "Trust is a verified mTLS cert or a constant-time bearer — never the transport. Tools are tagged untrusted-input / sensitive / egress; granting one agent all three legs is refused at startup. Scope narrows monotonically; secrets are redacted everywhere.",
+  },
+  {
+    tag: "attachable",
+    title: "A terminal or a browser, live",
+    body: "The daemon owns the session; the TUI and web UI are thin projections of it. Several surfaces watch the same conversation at once, quitting a client leaves the agent working, and approvals render as answerable rows in every attached client — with a rotating pairing code instead of a copied token.",
   },
   {
     tag: "observable",
@@ -206,6 +220,37 @@ export default function Home() {
             A completed / partial / refused / exhausted outcome mapped to an exit code — or it stays
             alive as a daemon. Either way every step is on the event stream.
           </Card>
+        </div>
+      </Section>
+
+      {/* ── the interface ────────────────────────────────────── */}
+      <Section
+        id="interface"
+        eyebrow="work with it"
+        title="Attach a terminal. Or a browser. Or both."
+        intro="agentd is a daemon you can also sit with. One command runs the runtime and a terminal UI together; because the daemon holds the session, a second surface — another screen, another machine — renders the same live state, and quitting a client never ends the work."
+      >
+        <div className="grid gap-4 md:grid-cols-2">
+          <Term title="agentd — daemon + terminal UI">{TUI_CMD}</Term>
+          <div className="panel lift p-5">
+            <h3 className="font-semibold text-[var(--fg-strong)]">Thin by construction</h3>
+            <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
+              The clients hold no state, no tools and no secrets — they forward intent and render a
+              projection of the daemon. That is what makes N surfaces converge without any
+              client-to-client protocol, and what makes a third client a small program.
+            </p>
+            <ul className="mt-3 space-y-1 text-sm text-[var(--dim)]">
+              <li>· approvals (<span className="kbd">ask_human</span>) that survive a restart</li>
+              <li>· live activity — phase, current tool, elapsed, spend</li>
+              <li>· pairing-code login, so no bearer gets copied around</li>
+              <li>· a debug plane you switch on per session, not per deploy</li>
+            </ul>
+            <p className="mt-3 text-sm text-[var(--dim)]">
+              Set one up as a coding agent for a repository:{" "}
+              <a className="link" href="/docs/coding-agent/">docs/coding-agent</a> ·{" "}
+              <a className="link" href="/docs/interface/">the client surface</a>
+            </p>
+          </div>
         </div>
       </Section>
 

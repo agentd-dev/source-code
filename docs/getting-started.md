@@ -270,8 +270,34 @@ workflows:
 
 ---
 
+## Talk to it instead of driving it
+
+Everything above is agentd as a *job*: config in, result out. To work *with*
+the agent — a conversation, approvals, watching what it does — attach a client:
+
+```console
+$ agentd tui --config agent.yaml       # daemon + terminal UI, one command
+$ agentd ui  --config agent.yaml       # …or the browser
+```
+
+The subcommand turns the display surface on for you (it is off by default) and
+ties the two lifetimes together. Keep them separate — `agentd --config …` in
+one shell, `agentd-tui --endpoint http://127.0.0.1:8420` in another — and
+quitting the client leaves the agent working, because the **daemon** owns the
+session, not the client. Attach a second surface any time; they all render the
+same live state.
+
+The clients live in [`interface/`](../interface) and are not part of the Rust
+build: `cd interface && npm install && npm run build`, or install them from npm.
+
 ## Where to go next
 
+- **[interface.md](interface.md)** — the TUI and web UI: screens, the composer
+  (`/` commands, `@skill`, `#target`, `$value`), approvals, pairing-code login,
+  debug mode.
+- **[coding-agent.md](coding-agent.md)** — the full recipe for a
+  pair-programming agent on a repository: giving it hands (`exec` vs MCP),
+  approvals, budgets, and the practices that keep it safe.
 - **[configuration.md](configuration.md)** — every flag and env var, precedence
   (`default < config file < env < flag`), limits, secrets, exit codes.
 - **[modes-and-triggers.md](modes-and-triggers.md)** — the v2 lifecycle

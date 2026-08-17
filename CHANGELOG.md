@@ -7,6 +7,36 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Added (getting it onto a machine: installer, skill, security policy)
+
+- **`install.sh` is served from the domain it advertises.** The site build
+  publishes the repo-root script at `https://agentd.dev/install.sh` (it used to
+  404), so `curl -fsSL https://agentd.dev/install.sh | sh` works. The script now
+  matches what the release actually builds — it accepts **arm64 Linux** (which
+  was refused despite being published) and no longer offers a macOS binary that
+  was never built, pointing at a source build instead. It **verifies the
+  download against the release `SHA256SUMS`**, takes `--version` / `--dir` /
+  `--no-verify` as flags or `AGENTD_*` env vars, and refuses rather than
+  half-installing when a checksum mismatches.
+- **`skills/agentd/`** — an Agent Skill that teaches an AI coding assistant to
+  install, configure, run and debug agentd, with `reference/config.md` and
+  `reference/coding-agent.md` for detail. Drop it in `~/.claude/skills/`. (Not
+  to be confused with agentd's own `skills:` config, which discovers instruction
+  bundles from MCP servers — RFC 0028 §7.)
+- **`SECURITY.md`** — private reporting, and an explicit boundary list: what
+  counts as a vulnerability here (an `exec` fence escape, a secret in a log, a
+  trifecta bypass, unauthenticated access to the A2A listener) versus what does
+  not (a model using powers you granted it).
+
+### Added (`-c` as a short `--config`, and `=` value forms)
+
+- **`-c a.yaml`, `-c=a.yaml` and `--config=a.yaml`** now work everywhere
+  `--config a.yaml` did, including through the `agentd tui|ui` passthrough.
+  Previously only the space-separated long form parsed, so the documented
+  `agentd ui -c=code.yml` failed with `unknown argument`.
+- **`agentd --help` documents the `tui` and `ui` subcommands**, which were
+  implemented but invisible in the help text.
+
 ### Changed (TUI renders fullscreen by default)
 
 - `agentd-tui` now takes over the terminal (the **alternate screen**), so the

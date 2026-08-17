@@ -1376,9 +1376,11 @@ impl Config {
                 "--capabilities" => capabilities = true,
                 // Already resolved into the FILE layer above; consume its value
                 // here so the arg-loop doesn't reject it as unknown.
-                "--config" => {
+                "--config" | "-c" => {
                     let _ = take("--config")?;
                 }
+                // `--config=a.yaml` / `-c=a.yaml`: value already attached.
+                a if matches!(config_flag(a), ConfigFlag::Inline(_)) => {}
                 // Flags acted on outside the arg loop (schema short-circuits at the
                 // top of load; validate is acted on after full resolution). They
                 // take no value — accept and ignore here.
@@ -2804,17 +2806,30 @@ pub(crate) fn read_file(path: &str) -> Result<String, ConfigError> {
 /// `--flag VALUE` pair). Used to resolve `--config` BEFORE the main arg loop so
 /// the file can seed the lowest layer. Returns `None` if absent or value-less.
 /// Every value of a repeatable `flag`, in argument order.
-fn scan_flag_values(args: &[String], flag: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == flag
-            && let Some(v) = it.next()
+/// How one argument spells the config-file flag. `--config` is the canonical
+/// form; `-c` is the short alias, and either may attach its value with `=`
+/// (`-c=a.yaml`, `--config=a.yaml`) as well as separate it with a space.
+pub(crate) enum ConfigFlag<'a> {
+    /// `--config a.yaml` / `-c a.yaml` — the value is the NEXT argument.
+    Separate,
+    /// `--config=a.yaml` / `-c=a.yaml` — the value is attached.
+    Inline(&'a str),
+    /// Not the config flag at all.
+    No,
+}
+
+/// Classify one argument as a spelling of the config-file flag.
+pub(crate) fn config_flag(arg: &str) -> ConfigFlag<'_> {
+    match arg {
+        "--config" | "-c" => ConfigFlag::Separate,
+        _ => match arg
+            .strip_prefix("--config=")
+            .or_else(|| arg.strip_prefix("-c="))
         {
-            out.push(v.clone());
-        }
+            Some(v) => ConfigFlag::Inline(v),
+            None => ConfigFlag::No,
+        },
     }
-    out
 }
 
 /// The ordered config-file list over an already-debranded env map: the
@@ -2832,7 +2847,18 @@ pub(crate) fn config_paths_from_map(args: &[String], envmap: &HashMap<&str, &str
                 .collect()
         })
         .unwrap_or_default();
-    paths.extend(scan_flag_values(args, "--config"));
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match config_flag(a) {
+            ConfigFlag::Separate => {
+                if let Some(v) = it.next() {
+                    paths.push(v.clone());
+                }
+            }
+            ConfigFlag::Inline(v) => paths.push(v.to_string()),
+            ConfigFlag::No => {}
+        }
+    }
     paths
 }
 
@@ -3153,6 +3179,43 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn config_flag_accepts_short_and_inline_spellings() {
+        // `--config a.yaml`, `-c a.yaml`, and either with the value attached by
+        // `=` all name the same file layer, in argument order.
+        let env: Vec<(String, String)> = vec![];
+        for spelling in [
+            args(&["--config", "a.yaml"]),
+            args(&["-c", "a.yaml"]),
+            args(&["--config=a.yaml"]),
+            args(&["-c=a.yaml"]),
+        ] {
+            assert_eq!(
+                Config::config_paths_from(&spelling, &env),
+                vec!["a.yaml".to_string()],
+                "spelling {spelling:?}"
+            );
+        }
+        // Mixed spellings merge in order (later wins downstream).
+        assert_eq!(
+            Config::config_paths_from(&args(&["-c", "base.yaml", "--config=over.yaml"]), &env),
+            vec!["base.yaml".to_string(), "over.yaml".to_string()]
+        );
+        // The env layer comes first, then the flags.
+        assert_eq!(
+            Config::config_paths_from(
+                &args(&["-c=flag.yaml"]),
+                &[("AGENTD_CONFIG".into(), "env.yaml".into())]
+            ),
+            vec!["env.yaml".to_string(), "flag.yaml".to_string()]
+        );
+        // A bare `-c` with nothing after it contributes no path (and the arg
+        // loop reports the usage error).
+        assert!(Config::config_paths_from(&args(&["-c"]), &env).is_empty());
+        // Not the config flag: neither a different flag nor a lookalike value.
+        assert!(Config::config_paths_from(&args(&["--cluster-shard", "a"]), &env).is_empty());
     }
 
     #[test]

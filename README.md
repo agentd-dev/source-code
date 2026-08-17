@@ -95,27 +95,41 @@ transport and spawns no tool processes.
 
 ## Install
 
-**Release binaries** (static musl, amd64 + arm64, with `SHA256SUMS`):
+**Installer** — detects your architecture, verifies the release `SHA256SUMS`,
+installs to `/usr/local/bin` (or `~/.local/bin`), and never invokes sudo:
 
 ```console
-$ curl -LO https://github.com/agentd-dev/source-code/releases/download/v1.4.0/agentd-v1.4.0-x86_64-unknown-linux-musl.tar.gz
-$ tar xzf agentd-v1.4.0-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
-agentd 1.4.0
+$ curl -fsSL https://agentd.dev/install.sh | sh
+```
+
+**Release binaries** (static musl, amd64 + arm64) if you would rather do it by
+hand — `install.sh --help` lists the pinning and directory options:
+
+```console
+$ TAG=$(curl -fsSL https://api.github.com/repos/agentd-dev/source-code/releases/latest | grep -m1 tag_name | cut -d'"' -f4)
+$ curl -LO https://github.com/agentd-dev/source-code/releases/download/$TAG/agentd-$TAG-x86_64-unknown-linux-musl.tar.gz
+$ tar xzf agentd-$TAG-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
 ```
 
 **Container image** (multi-arch, cosign-signed, single layer, ~1.2 MiB pull):
 
 ```console
-$ docker run --rm ghcr.io/agentd-dev/agentd:1.4.0 --capabilities
+$ docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
 ```
 
-**From source** (Rust stable; no C toolchain needed):
+**From source** (Rust stable; no C toolchain needed). Features are compile-time,
+so `--capabilities` tells you what a given binary can actually do:
 
 ```console
 $ cargo build -p agentd-cli --release
 $ cargo build -p agentd-cli --release \
-    --features "serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow"   # the shipped set
+    --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"   # the shipped set
+$ cargo build -p agentd-cli --release --features a2a,exec   # + the local command runner
 ```
+
+`exec` and `cel` are deliberately absent from release binaries — the first
+because [running local commands is opt-in twice over](docs/security.md), the
+second because it is the one dependency-bearing feature.
 
 ## Quickstart
 
@@ -463,7 +477,12 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
 - **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: a coding
   agent (`coding-agent.yaml`), Docker Compose, Kubernetes
   `Job`/`CronJob`/`Deployment` manifests, a systemd unit.
-- **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.4.0 current).
+- **[skills/](skills/README.md)** — an Agent Skill that teaches an AI coding
+  assistant to install, configure and debug agentd (drop it in `~/.claude/skills/`).
+- **[SECURITY.md](SECURITY.md)** — what counts as a vulnerability here, and how
+  to report one privately.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — build, test and review expectations.
+- **[CHANGELOG.md](CHANGELOG.md)** — release history.
 - **Website:** [agentd.dev](https://agentd.dev) — rendered docs + RFCs.
 
 ## License

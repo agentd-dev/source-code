@@ -45,8 +45,9 @@ built-in default  <  config file  <  env var  <  CLI flag
 ```
 
 - **built-in default** — the compiled-in defaults (see the table below).
-- **config file(s)** — local-only **YAML or JSON** files (`--config <path>`,
-  repeatable; `AGENT_CONFIG=a.yaml:b.yaml`) carrying verbose **structural**
+- **config file(s)** — local-only **YAML or JSON** files (`--config <path>`, or
+  `-c`; the value may attach with `=`; repeatable;
+  `AGENT_CONFIG=a.yaml:b.yaml`) carrying verbose **structural**
   config (the MCP-server inventory, declared subscriptions, A2A peers, limits,
   model/log knobs, intelligence endpoint list + headers). **Live** (RFC 0017
   §3). Several files compose into **one document, in order — a later file
@@ -177,7 +178,7 @@ without the feature, they exit `2` (§2), never silently no-op.
 | `--instruction <TEXT>` | `INSTRUCTION` (or `AGENT_INSTRUCTION`) | *(none; required)* | The task to run. Required for `once`/`loop`/`schedule` (and reactive, which reuses it per reaction). A prefixed spelling wins over the bare one. |
 | `--instruction-file <PATH>` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). Sets `instruction`. |
 | `--intelligence <LIST>` | `AGENT_INTELLIGENCE` (or bare `INTELLIGENCE`) | *(none; required)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `https://host/…` (or a loopback `http://` for a same-host dev gateway) — see §4. A prefixed spelling wins over the bare one. |
-| `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). |
+| `-c`, `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). |
 
 ### 3.2 Intelligence
 
@@ -281,7 +282,7 @@ each exits `2`. See §13 for the fleet model.
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
-| `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
+| `-c`, `--config <PATH>` | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
 | `--validate-config` | — | — | Load + validate (file + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free; needs no instruction to validate. |
 | `--config-schema` | — | — | Print the config-file JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free (short-circuits before the file is even read). |
 | `--watch-config` | `AGENT_WATCH_CONFIG` | `false` | Watch the `--config` file's directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs `--features config-watch` **and** a `--config`/`AGENT_CONFIG` file (both validated, exit `2`). See §11. |

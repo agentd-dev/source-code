@@ -361,7 +361,13 @@ impl McpClient {
             let c = b.connect()?;
             self.caps = c.capabilities().clone();
             self.protocol_version = c.protocol_version().map(str::to_string);
-            self.era = Era::Modern;
+            // Report the era the SDK actually negotiated, not an assumption:
+            // rmcp currently pins `LATEST` to a legacy revision, and callers
+            // branch on this.
+            self.era = c
+                .protocol_version()
+                .map(crate::version::era_of)
+                .unwrap_or(Era::Legacy);
             self.rmcp = Some(c);
             return Ok(());
         }

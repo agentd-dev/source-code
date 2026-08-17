@@ -19,11 +19,15 @@
 //! same synchronous methods the native client does. The runtime lives as long as
 //! the client and dies with it.
 //!
-//! **The protocol version is ours to choose.** rmcp's `ProtocolVersion::LATEST`
-//! is the conservative `2025-11-25`; the newer stateless revision is available as
-//! a constant. We ask for the newest revision this library knows
-//! ([`crate::version::LATEST_MODERN_VERSION`]) and let the server negotiate down,
-//! which is the whole point of the handshake.
+//! **The protocol version is the SDK's to choose.** rmcp pins
+//! `ProtocolVersion::LATEST` at `2025-11-25` even though the newer stateless
+//! revision exists as a constant — that is upstream telling us what it is
+//! actually ready to speak. Overriding it would mean asking a server for a
+//! dialect the SDK may not fully implement, which is the opposite of why one
+//! adopts an SDK. So this backend speaks whatever rmcp says is current, and
+//! picks up the stateless revision automatically on the release that promotes
+//! it. (The hand-rolled client, which implements the stateless dialect itself,
+//! continues to negotiate `2026-07-28` — see `crate::version`.)
 
 use crate::client::McpError;
 use crate::inbound;
@@ -206,11 +210,11 @@ impl RmcpBuilder {
         implementation.title = self.client_info.title.clone();
 
         let handler = Handler {
-            // Ask for the newest revision this library knows, NOT rmcp's
-            // conservative `LATEST` — the server negotiates down if it speaks
-            // an older one, which is what the handshake is for.
+            // `ClientInfo::new` already carries `ProtocolVersion::default()`,
+            // i.e. rmcp's `LATEST`. Left explicit so it is obvious this is a
+            // decision (follow the SDK) and not an omission.
             info: ClientInfo::new(caps, implementation)
-                .with_protocol_version(ProtocolVersion::V_2026_07_28),
+                .with_protocol_version(ProtocolVersion::default()),
             inbound: self.inbound.clone(),
         };
 
@@ -350,13 +354,19 @@ impl RmcpClient {
         self.convert(&res, "prompts/list")
     }
 
-    /// Subscribe to a resource.
+    /// Subscribe to a resource, by whichever mechanism the negotiated revision
+    /// actually defines.
     ///
-    /// Under `2026-07-28` this is `subscriptions/listen`, not the legacy
-    /// `resources/subscribe` — rmcp deprecates the latter for exactly the
-    /// version we negotiate. One subscription covers every URI we track, so a
-    /// new URI reopens it with the widened filter and the old handle is
-    /// dropped; its notifications pump into the queue the host drains.
+    /// The two eras disagree: legacy uses `resources/subscribe`, and the
+    /// stateless revision replaces it with `subscriptions/listen` (rmcp
+    /// deprecates the former *for that version*). Since this backend speaks
+    /// whatever revision the SDK says is current, the choice has to be made
+    /// from the negotiated version rather than hard-coded — which also means it
+    /// starts using `listen` on its own the day rmcp promotes `LATEST`.
+    ///
+    /// In the modern case one subscription covers every tracked URI: adding a
+    /// URI reopens it with the widened filter, and its notifications pump into
+    /// the queue the host drains.
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
         {
             let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
@@ -367,6 +377,7 @@ impl RmcpClient {
         self.relisten()
     }
 
+    #[allow(deprecated)]
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
         {
             let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,12 +385,31 @@ impl RmcpClient {
                 return Ok(());
             }
         }
+        // Legacy: the server holds a per-URI subscription, so it needs an
+        // explicit `resources/unsubscribe` — narrowing a filter would not
+        // reach it. Modern: reopening the listen with the narrowed filter is
+        // the cancellation.
+        if !self.modern() {
+            return self
+                .rt
+                .block_on(
+                    self.service
+                        .unsubscribe(rmcp::model::UnsubscribeRequestParams::new(uri.to_string())),
+                )
+                .map_err(|e| rpc_err(&self.name, &format!("resources/unsubscribe {uri}"), e));
+        }
         self.relisten()
     }
 
     /// (Re)open the single subscription covering every tracked URI, and pump its
     /// notifications into the drain queue on a background task.
     fn relisten(&self) -> Result<(), McpError> {
+        // Legacy revisions have no `subscriptions/listen`; the per-URI
+        // `resources/subscribe` is the correct call there, deprecated only
+        // relative to the newer dialect.
+        if !self.modern() {
+            return self.legacy_subscribe_all();
+        }
         let uris: Vec<String> = self
             .uris
             .lock()
@@ -416,6 +446,36 @@ impl RmcpClient {
             }
         });
         *self.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        Ok(())
+    }
+
+    /// Is the negotiated revision the stateless (modern) one?
+    fn modern(&self) -> bool {
+        self.protocol_version
+            .as_deref()
+            .map(|v| matches!(crate::version::era_of(v), crate::version::Era::Modern))
+            .unwrap_or(false)
+    }
+
+    /// Legacy subscription: one `resources/subscribe` per URI. Notifications
+    /// arrive through the handler's channel rather than a subscription handle.
+    #[allow(deprecated)]
+    fn legacy_subscribe_all(&self) -> Result<(), McpError> {
+        let uris: Vec<String> = self
+            .uris
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        for uri in uris {
+            self.rt
+                .block_on(
+                    self.service
+                        .subscribe(rmcp::model::SubscribeRequestParams::new(uri.clone())),
+                )
+                .map_err(|e| rpc_err(&self.name, &format!("resources/subscribe {uri}"), e))?;
+        }
         Ok(())
     }
 

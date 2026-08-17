@@ -20,8 +20,10 @@
 //!      or a transport error, an error string.
 //!
 //! An A2A client does **not** send MCP `initialize` — A2A is its own surface, so
-//! the client just calls `a2a.*`. The wire (de)serialization is shared with the
-//! shared wire helpers ([`crate::mcp::a2a_wire`]) — one A2A vocabulary.
+//! the client just calls the A2A methods. What goes on the wire and what is read
+//! back are the specification's own types ([`crate::a2a::peer`]); this module is
+//! the delegation *policy* — stream first, recover by polling, never re-send —
+//! over agentd's authenticated transport.
 //!
 //! Trust: agentd dials the peer over HTTP(S), presenting the peer client-auth
 //! material on every request (RFC 0031 §7) — a resolved **bearer/framing header**
@@ -29,9 +31,10 @@
 //! (SPIFFE X.509-SVID), a per-request **AWS SigV4** signature (`kind: aws`), and
 //! an ambient **AAuth** signature (RFC 0023) when a process identity is installed.
 
+use crate::a2a::peer::{self as a2a};
 use crate::config::A2aEndpoint;
 use crate::json::{Id, Request};
-use crate::mcp::a2a_wire::{self as a2a, TaskState};
+use a2a_rs::domain::TaskState;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -153,15 +156,17 @@ trait Caller {
 /// terminal states → a descriptive error observation.
 fn terminal_outcome(task: &Value) -> Option<DelegateOutcome> {
     let state = a2a::task_state_of(task);
-    if !state.is_terminal() {
+    if !a2a::is_terminal(state) {
         return None;
     }
     Some(match state {
-        TaskState::Completed => DelegateOutcome::Distillate(a2a::artifact_text_of(task)),
-        TaskState::Rejected => {
+        TaskState::TASK_STATE_COMPLETED => DelegateOutcome::Distillate(a2a::artifact_text_of(task)),
+        TaskState::TASK_STATE_REJECTED => {
             DelegateOutcome::Error("a2a: remote agent rejected the objective".into())
         }
-        TaskState::Canceled => DelegateOutcome::Error("a2a: remote task was canceled".into()),
+        TaskState::TASK_STATE_CANCELED => {
+            DelegateOutcome::Error("a2a: remote task was canceled".into())
+        }
         // Failed (and any other terminal mapped here) — the remote run did not
         // reach a clean conclusion.
         _ => DelegateOutcome::Error("a2a: remote task failed".into()),
@@ -400,7 +405,10 @@ impl HttpConn {
                 // Terminate on a terminal task STATE (A2A spec §3.5.2 — the stream
                 // closes on terminal). agentd emits no non-spec `final` flag, and a
                 // conformant peer signals termination by the state + closing.
-                if crate::mcp::a2a_wire::TaskState::from_wire(state).is_terminal() {
+                if a2a::is_terminal(
+                    serde_json::from_value(json!(state))
+                        .unwrap_or(TaskState::TASK_STATE_UNSPECIFIED),
+                ) {
                     let outcome = match state {
                         "TASK_STATE_COMPLETED" => match distillate {
                             Some(text) => DelegateOutcome::Distillate(text),
@@ -506,7 +514,7 @@ mod tests {
         let mut t = json!({
             "id": id,
             "contextId": format!("ctx-{id}"),
-            "status": { "state": state.as_str(), "timestamp": "1970-01-01T00:00:00.000Z" },
+            "status": { "state": state, "timestamp": "1970-01-01T00:00:00.000Z" },
         });
         if let Some(text) = artifact {
             t["artifacts"] =
@@ -680,7 +688,11 @@ mod tests {
         // terminal Task over unary GetTask instead of erroring or re-sending.
         let url = serve_sse_fixture(
             vec![status_frame("s-2", "TASK_STATE_WORKING", false)],
-            vec![task("s-2", TaskState::Completed, Some("recovered answer"))],
+            vec![task(
+                "s-2",
+                TaskState::TASK_STATE_COMPLETED,
+                Some("recovered answer"),
+            )],
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -711,9 +723,13 @@ mod tests {
     fn delegate_over_http_send_then_poll_returns_the_distillate() {
         // SendMessage → WORKING; GetTask → WORKING then COMPLETED — over HTTP.
         let url = serve_http_fixture(vec![
-            task("h-1", TaskState::Working, None),
-            task("h-1", TaskState::Working, None),
-            task("h-1", TaskState::Completed, Some("http distilled answer")),
+            task("h-1", TaskState::TASK_STATE_WORKING, None),
+            task("h-1", TaskState::TASK_STATE_WORKING, None),
+            task(
+                "h-1",
+                TaskState::TASK_STATE_COMPLETED,
+                Some("http distilled answer"),
+            ),
         ]);
         let ep = A2aEndpoint::parse(&url).expect("parse https endpoint");
         assert!(matches!(ep, A2aEndpoint::Https(_)));
@@ -753,7 +769,7 @@ mod tests {
                 }
                 *cap.lock().unwrap() = head;
                 // Reply terminal immediately so the client stops after one call.
-                let result = task("h-a", TaskState::Completed, Some("authed"));
+                let result = task("h-a", TaskState::TASK_STATE_COMPLETED, Some("authed"));
                 let payload = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -785,7 +801,11 @@ mod tests {
     #[test]
     fn delegate_over_http_send_message_already_terminal_skips_polling() {
         // A blocking peer returns COMPLETED straight from SendMessage.
-        let url = serve_http_fixture(vec![task("h-t", TaskState::Completed, Some("immediate"))]);
+        let url = serve_http_fixture(vec![task(
+            "h-t",
+            TaskState::TASK_STATE_COMPLETED,
+            Some("immediate"),
+        )]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
@@ -796,7 +816,7 @@ mod tests {
 
     #[test]
     fn delegate_over_http_surfaces_a_failed_task() {
-        let url = serve_http_fixture(vec![task("h-2", TaskState::Failed, None)]);
+        let url = serve_http_fixture(vec![task("h-2", TaskState::TASK_STATE_FAILED, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(matches!(
@@ -808,7 +828,7 @@ mod tests {
     #[test]
     fn delegate_over_http_deadline_while_polling_is_a_timeout() {
         // The task never terminates (WORKING repeats) → give up on the deadline.
-        let url = serve_http_fixture(vec![task("h-w", TaskState::Working, None)]);
+        let url = serve_http_fixture(vec![task("h-w", TaskState::TASK_STATE_WORKING, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
         match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {

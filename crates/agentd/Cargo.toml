@@ -19,10 +19,12 @@ path = "src/lib.rs"
 # default (pure-Rust rustls+ring, no cmake/C build dep). Everything else heavier is
 # feature-gated and OFF by default. See rfcs/0002 §dependency-budget.
 [features]
-default = ["tls"]
-# Use the OFFICIAL Rust MCP SDK for outbound MCP instead of the hand-rolled
-# client. Upstream spec-tracking in exchange for ~77 crates and tokio;
-# the default build keeps the minimal client. See docs/mcp.md.
+default = ["tls", "rmcp-client"]
+# Outbound MCP is the OFFICIAL Rust SDK (`rmcp`) — it owns the handshake, the
+# request and notification types, capability negotiation and the version table,
+# so agentd tracks the specification upstream instead of re-reading it. The
+# connection underneath stays agentd's, which is how a request signer, an mTLS
+# identity and the SSRF guard survive the adoption. See docs/mcp.md.
 rmcp-client = ["mcp/rmcp-client"]
 # Direct https:// intelligence/MCP (the default transport). rustls with the `ring`
 # provider (no cmake/C build dep) + bundled webpki roots — so a scratch container

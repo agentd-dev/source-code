@@ -5,6 +5,9 @@
 //! command/NL/gate routing into the runtime) is wired in the runtime at the
 //! P5 cut-over.
 
+/// Talking to another agent: the outbound half, in the spec's types.
+#[cfg(feature = "a2a")]
+pub mod peer;
 /// agentd's answers to the A2A specification's server ports.
 #[cfg(feature = "a2a")]
 pub mod ports;

@@ -511,6 +511,14 @@ impl HttpTransport {
     /// bounds each read so the caller's loop can poll a stop flag between events
     /// (clean shutdown). Errors if the server has no push channel (non-2xx or a
     /// non-SSE response) — the caller then runs without server-initiated pushes.
+    /// The session id the server assigned, if this connection has one.
+    pub fn session_id(&self) -> Option<String> {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn open_events(&self, read_timeout: Duration) -> Result<EventStream, HttpError> {
         let stream = self.connect(read_timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];

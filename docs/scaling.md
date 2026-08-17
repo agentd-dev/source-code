@@ -246,7 +246,30 @@ to someone else when the lease expires.
 
 ---
 
-## 4. Declared but inert: `cluster.shard` and the `subscribe` claim fields
+## 3a. Timer starts are sharded
+
+A `schedule`, `loop`, `cron` or `once` start fires on **exactly one replica**.
+This is the case where getting it wrong is not a risk but a certainty: three
+replicas arming the same nightly job run it three times.
+
+```yaml
+cluster:
+  shard: "0/3"        # this replica's identity; each gets its own K
+  timer_shard: shard0 # or: keyed
+```
+
+- **`shard0`** (default) — replica 0 owns every timer. The answer does not
+  depend on `N`, so resizing the fleet cannot move a job mid-flight.
+- **`keyed`** — each start hashes to a replica (FNV-1a of `workflow/node`), so a
+  fleet with many scheduled workflows spreads them instead of piling them all
+  onto replica 0. Resizing re-hashes, which is fine for a periodic job and is
+  why it is not the default.
+
+A skipped start is counted in `agent_shard_skipped_total` and logged at debug as
+`start.not_ours`. Unsharded (`N == 1`, the default) owns everything, so a
+single-replica deployment is unaffected.
+
+## 4. Declared but inert: the delivery path and the `subscribe` claim fields
 
 Some scaling surfaces are accepted by the config loader without having any
 runtime behaviour. They validate, so a config carrying them starts; nothing
@@ -254,10 +277,10 @@ reads them. **Do not build a fleet on them.**
 
 | Surface | Status |
 |---|---|
-| `cluster.shard` (alias `--shard K/N`, env `AGENTD_CLUSTER_SHARD` / `AGENT_SHARD`) | Parsed and validated — `K/N` shape, `N > 0`, `K < N`. No shard gate exists in the delivery path, so every replica still sees every notification regardless of the value. |
-| `cluster.timer_shard` (`shard0` \| `keyed`) | Parsed and validated. No timer route consults it; a `loop` or `schedule` start node fires on every replica that arms it. |
+| `cluster.shard` (alias `--shard K/N`, env `AGENTD_CLUSTER_SHARD` / `AGENT_SHARD`) | **Live for timer starts** (below). Still inert in the *delivery* path: every replica sees every MCP notification regardless of the value. |
+| `cluster.timer_shard` (`shard0` \| `keyed`) | **Live.** See "Timer starts are sharded" below. |
 | `claim` on a `subscribe` start node | Accepted as a field of the node. No claim is taken and no coordination call is made. |
-| `shard` on a `subscribe` start node | Accepted as a field of the node. Deliveries are not filtered by it. |
+| `shard` on a `subscribe` start node | **Refused at validation.** It promised partitioned deliveries and never filtered anything, so a fleet built on it processed everything N times while looking configured. Failing to start is the honest answer; use `claim`, or shard the timer starts. |
 | The `cluster` build feature | Still declared in `Cargo.toml`, gates nothing in the runtime, and is not in the release feature set. Building with it changes no behaviour. |
 
 The frozen design these surfaces were reserved for — hash partitioning at

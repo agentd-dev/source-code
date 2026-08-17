@@ -269,6 +269,22 @@ impl Runtime {
         kind: &str,
         run_id: Option<&str>,
     ) {
+        // In a sharded fleet, a time-driven start belongs to exactly one
+        // replica. Without this gate three replicas arming the same nightly
+        // `schedule` run it three times — not a risk, a certainty. Event-driven
+        // starts are not gated here: they fire from something that already
+        // happened once.
+        if matches!(kind, "schedule" | "loop" | "cron" | "once")
+            && !self.settings.cluster.shard().owns_timer(workflow, node)
+        {
+            crate::obs::metrics::record_shard_skipped();
+            self.log.debug(
+                "start.not_ours",
+                json!({"workflow": workflow, "node": node, "kind": kind,
+                       "shard": self.settings.cluster.shard.clone()}),
+            );
+            return;
+        }
         let inputs = match spec.get("inputs") {
             Some(mapping) => {
                 let mut data = crate::engine::template::Data::new();

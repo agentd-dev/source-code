@@ -44,6 +44,11 @@ pub const METHODS: &[&str] = &[
     "ListTasks",
     "SubscribeToTask",
     "SubscribeToEvents",
+    "CreateTaskPushNotificationConfig",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "DeleteTaskPushNotificationConfig",
+    "GetExtendedAgentCard",
 ];
 /// A2A error: no such task.
 pub const TASK_NOT_FOUND: i64 = -32001;
@@ -568,7 +573,12 @@ impl Runtime {
             "GetTask" => self.a2a_get_task(&principal, &params),
             "ListTasks" => self.a2a_list_tasks(&principal),
             "CancelTask" => self.a2a_cancel_task(&principal, &params),
+            "PushConfigSet" => self.a2a_push_set(&principal, &params),
+            "PushConfigGet" => self.a2a_push_get(&principal, &params),
+            "PushConfigList" => self.a2a_push_list(&principal, &params),
+            "PushConfigDelete" => self.a2a_push_delete(&principal, &params),
             "GetAgentCard" => self.a2a_agent_card(),
+            "GetExtendedAgentCard" => self.a2a_extended_card(&principal),
             "Pair" => self.a2a_pair(&params),
             m if crate::a2a::principals::is_admin(m) => {
                 self.a2a_admin(&principal, bare(&method), &params)
@@ -1386,6 +1396,155 @@ impl Runtime {
         json!({"tasks": tasks, "totalSize": n, "pageSize": n, "nextPageToken": ""})
     }
 
+    // ---- push notifications (RFC 0029 / A2A `*TaskPushNotificationConfig`) --
+
+    /// The task this request names, if the caller may touch it.
+    ///
+    /// "Not yours" and "does not exist" answer identically on purpose: a caller
+    /// must not be able to probe for other principals' task ids.
+    fn owned_task(&self, principal: &Principal, params: &Value) -> Result<String, Value> {
+        let id = params
+            .get("taskId")
+            .or_else(|| params.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match self.tasks.get(id) {
+            Some(t)
+                if principal.is_operator()
+                    || t.principal.as_deref() == Some(principal.id.as_str()) =>
+            {
+                Ok(id.to_string())
+            }
+            _ => Err(err_obj(TASK_NOT_FOUND, "task not found")),
+        }
+    }
+
+    fn push_enabled(&self) -> Result<(), Value> {
+        if self.settings.a2a.push.enabled {
+            Ok(())
+        } else {
+            Err(err_obj(
+                -32003,
+                "push notifications are not enabled (set a2a.push.enabled: true)",
+            ))
+        }
+    }
+
+    /// Register (or replace) a webhook for a task.
+    ///
+    /// The target is checked here, while the caller is present to be told why —
+    /// a refused URL is a `-32602` with a reason, not a delivery that silently
+    /// never happens.
+    fn a2a_push_set(&mut self, principal: &Principal, params: &Value) -> Value {
+        if let Err(e) = self.push_enabled() {
+            return e;
+        }
+        let cfg = params
+            .get("pushNotificationConfig")
+            .or_else(|| params.get("config"))
+            .cloned()
+            .unwrap_or_else(|| params.clone());
+        let task_id = match self.owned_task(principal, params) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let id = cfg
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.next_id("push"));
+        let target = match crate::a2a::push::from_wire(&cfg, id.clone()) {
+            Ok(t) => t,
+            Err(e) => return err_obj(::mcp::rpc::INVALID_PARAMS, &e),
+        };
+        let allow_private = self.settings.a2a.push.allow_private;
+        if let Err(e) = crate::a2a::push::check_url(&target.url, allow_private) {
+            return err_obj(
+                ::mcp::rpc::INVALID_PARAMS,
+                &format!("push url refused: {e}"),
+            );
+        }
+        let wire = crate::a2a::push::to_wire(&task_id, &target);
+        if let Some(t) = self.tasks.get_mut(&task_id) {
+            t.push.retain(|p| p.id != id);
+            t.push.push(target);
+            t.dirty = true;
+        }
+        self.task_persist(&task_id);
+        self.log.info(
+            "a2a.push.registered",
+            json!({"task": task_id, "config": id, "principal": principal.id}),
+        );
+        wire
+    }
+
+    fn a2a_push_get(&mut self, principal: &Principal, params: &Value) -> Value {
+        if let Err(e) = self.push_enabled() {
+            return e;
+        }
+        let task_id = match self.owned_task(principal, params) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let want = params
+            .get("pushNotificationConfigId")
+            .or_else(|| params.get("configId"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        match self
+            .tasks
+            .get(&task_id)
+            .and_then(|t| t.push.iter().find(|p| want.is_empty() || p.id == want))
+        {
+            Some(p) => crate::a2a::push::to_wire(&task_id, p),
+            None => err_obj(TASK_NOT_FOUND, "no such push notification config"),
+        }
+    }
+
+    fn a2a_push_list(&mut self, principal: &Principal, params: &Value) -> Value {
+        if let Err(e) = self.push_enabled() {
+            return e;
+        }
+        let task_id = match self.owned_task(principal, params) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let configs: Vec<Value> = self
+            .tasks
+            .get(&task_id)
+            .map(|t| {
+                t.push
+                    .iter()
+                    .map(|p| crate::a2a::push::to_wire(&task_id, p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({ "configs": configs })
+    }
+
+    fn a2a_push_delete(&mut self, principal: &Principal, params: &Value) -> Value {
+        if let Err(e) = self.push_enabled() {
+            return e;
+        }
+        let task_id = match self.owned_task(principal, params) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        let want = params
+            .get("pushNotificationConfigId")
+            .or_else(|| params.get("configId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(t) = self.tasks.get_mut(&task_id) {
+            t.push.retain(|p| !want.is_empty() && p.id != want);
+            t.dirty = true;
+        }
+        self.task_persist(&task_id);
+        json!({})
+    }
+
     fn a2a_cancel_task(&mut self, principal: &Principal, params: &Value) -> Value {
         let id = params
             .get("id")
@@ -1517,8 +1676,14 @@ impl Runtime {
             .values()
             .map(|w| json!({"id": w.name, "name": w.name, "description": w.description.clone().unwrap_or_default(), "tags": ["workflow"]}))
             .collect();
-        let mut capabilities =
-            json!({"streaming": true, "pushNotifications": false, "stateTransitionHistory": true});
+        // The card is a promise, so `pushNotifications` tracks whether this
+        // instance will actually accept a webhook rather than whether the code
+        // exists (conformance checks both directions of that).
+        let mut capabilities = json!({
+            "streaming": true,
+            "pushNotifications": self.settings.a2a.push.enabled,
+            "stateTransitionHistory": true,
+        });
         // Advertise the interface surface (RFC 0032) so a display client can
         // discover it pre-auth. The card is public — only the on/off bit rides
         // here; `interface.info` (authenticated) carries the rest.
@@ -1526,18 +1691,50 @@ impl Runtime {
             capabilities["extensions"] =
                 json!([{"uri": "urn:agentd:interface", "params": {"enabled": true}}]);
         }
+        let url = self.settings.a2a.listen.clone().unwrap_or_default();
         json!({
-            "protocolVersion": "0.3.0",
             "name": "agentd",
             "description": "A durable agent (agentd 2.0) — conversations, workflows, and subagents over A2A.",
             "version": crate::VERSION,
-            "url": self.settings.a2a.listen,
+            // How a peer actually reaches this instance. `supportedInterfaces`
+            // is the field the current card carries; a card without one parses
+            // fine and tells a peer nothing it can dial, which is the worst of
+            // both. The flat `url`/`preferredTransport` below are the older
+            // spelling, kept because agentd's own clients read them.
+            "supportedInterfaces": [
+                {"url": url, "protocolBinding": "JSONRPC", "protocolVersion": "0.3.0"}
+            ],
+            "protocolVersion": "0.3.0",
+            "url": url,
             "preferredTransport": "JSONRPC",
             "capabilities": capabilities,
             "defaultInputModes": ["text/plain", "application/json"],
             "defaultOutputModes": ["text/plain", "application/json"],
             "skills": skills,
         })
+    }
+
+    /// The **authenticated** card: the public one, plus what only a named
+    /// caller may be told.
+    ///
+    /// The public card lists every workflow as a skill because discovery has to
+    /// work before anyone is authenticated. This one lists the workflows *this
+    /// principal may actually run*, which is the useful answer — a caller that
+    /// reads a skill here can call it.
+    fn a2a_extended_card(&self, principal: &Principal) -> Value {
+        if principal.is_anonymous() {
+            return err_obj(-32007, "the extended card requires an authenticated caller");
+        }
+        let mut card = self.a2a_agent_card();
+        let skills: Vec<Value> = self
+            .workflows
+            .values()
+            .filter(|w| principal.may_command(&format!("workflow.run:{}", w.name)))
+            .map(|w| json!({"id": w.name, "name": w.name, "description": w.description.clone().unwrap_or_default(), "tags": ["workflow"]}))
+            .collect();
+        card["skills"] = json!(skills);
+        card["supportsAuthenticatedExtendedCard"] = json!(true);
+        card
     }
 
     // ---- task lifecycle ----------------------------------------------------
@@ -1591,6 +1788,7 @@ impl Runtime {
         let Some(sink) = &self.a2a_sink else {
             return;
         };
+        let allow_private = self.settings.a2a.push.allow_private;
         match self.tasks.get(id) {
             Some(t) => {
                 sink.status(
@@ -1603,7 +1801,13 @@ impl Runtime {
                 if t.state.is_terminal()
                     && let Some(a) = crate::a2a::wire::result_artifact(t)
                 {
-                    sink.artifact(&t.id, &t.context_id, a);
+                    sink.artifact(&t.id, &t.context_id, a.clone());
+                }
+                // A caller that asked to be told rather than to watch. Fired
+                // from here because this is the one place every transition
+                // passes through, whatever caused it.
+                if !t.push.is_empty() {
+                    sink.push(t, allow_private);
                 }
                 self.feed_push(
                     "task",

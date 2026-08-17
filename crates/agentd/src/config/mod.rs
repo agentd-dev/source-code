@@ -293,6 +293,41 @@ impl ShardCfg {
         Ok(())
     }
 
+    /// Set `K/N` from a validated spec, leaving the timer mode alone. A
+    /// malformed spec is ignored: validation has already rejected it, and
+    /// "unsharded" is the safe reading of a value that should not exist.
+    pub fn set(&mut self, spec: &str) {
+        let _ = self.parse_into(spec);
+    }
+
+    /// Whether *this* replica owns a time-driven start (`schedule`, `loop`,
+    /// `cron`, `once`).
+    ///
+    /// This is the case where getting it wrong is not a risk but a certainty:
+    /// three replicas arming the same nightly `schedule` run it three times.
+    /// The two modes answer differently on purpose —
+    ///
+    /// * `shard0` — replica 0 owns every timer. Simple, and correct even when
+    ///   the fleet is resized, because the answer does not depend on `N`.
+    /// * `keyed` — each start is hashed to a replica, so a fleet with many
+    ///   scheduled workflows spreads them instead of piling them all on one.
+    ///   Resizing the fleet re-hashes, which is fine for a periodic job and is
+    ///   why this is not the default.
+    ///
+    /// Unsharded (`N == 1`) always owns everything, so the default deployment
+    /// is unaffected by any of this.
+    pub fn owns_timer(&self, workflow: &str, node: &str) -> bool {
+        if self.n <= 1 {
+            return true;
+        }
+        match self.timer {
+            TimerShardMode::Shard0 => self.k == 0,
+            TimerShardMode::Keyed => {
+                fnv1a(&format!("{workflow}/{node}")) % (self.n as u64) == self.k as u64
+            }
+        }
+    }
+
     /// The `"K/N"` identity for the capabilities manifest / capacity resource
     /// (RFC 0019 §9). `None` for the unsharded `N == 1` case (reported as null).
     pub fn label(&self) -> Option<String> {
@@ -302,6 +337,18 @@ impl ShardCfg {
             Some(format!("{}/{}", self.k, self.n))
         }
     }
+}
+
+/// FNV-1a, for the keyed shard assignment. Hand-rolled and stable across
+/// releases on purpose: a hash that changed would silently re-assign every
+/// scheduled workflow on upgrade.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
 }
 
 /// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
@@ -3745,6 +3792,57 @@ mod tests {
     }
 
     // ───────────────────────── RFC 0019 — sharding (§4) ───────────────────────
+
+    /// The gate that makes `--shard` mean something: in a fleet of three, a
+    /// nightly `schedule` must fire once, not three times.
+    #[test]
+    fn a_time_driven_start_belongs_to_exactly_one_replica() {
+        // Unsharded: everything is ours, which is the default deployment.
+        let solo = ShardCfg::default();
+        assert!(solo.owns_timer("nightly", "tick"));
+
+        // shard0: replica 0 owns every timer, and the others own none — an
+        // answer that does not change when the fleet is resized.
+        let fleet: Vec<ShardCfg> = (0..3)
+            .map(|k| ShardCfg {
+                k,
+                n: 3,
+                timer: TimerShardMode::Shard0,
+            })
+            .collect();
+        let owners = fleet
+            .iter()
+            .filter(|s| s.owns_timer("nightly", "tick"))
+            .count();
+        assert_eq!(owners, 1, "exactly one replica runs the nightly job");
+        assert!(fleet[0].owns_timer("nightly", "tick"));
+
+        // keyed: still exactly one owner per start, but different starts land
+        // on different replicas instead of piling onto replica 0.
+        let keyed: Vec<ShardCfg> = (0..3)
+            .map(|k| ShardCfg {
+                k,
+                n: 3,
+                timer: TimerShardMode::Keyed,
+            })
+            .collect();
+        for start in ["nightly/tick", "hourly/tick", "weekly/tick", "audit/tick"] {
+            let (w, node) = start.split_once('/').unwrap();
+            let owners = keyed.iter().filter(|s| s.owns_timer(w, node)).count();
+            assert_eq!(owners, 1, "{start} must have exactly one owner");
+        }
+        let spread: std::collections::BTreeSet<u32> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .iter()
+            .map(|w| {
+                keyed
+                    .iter()
+                    .find(|s| s.owns_timer(w, "tick"))
+                    .map(|s| s.k)
+                    .unwrap()
+            })
+            .collect();
+        assert!(spread.len() > 1, "keyed should spread across the fleet");
+    }
 
     #[test]
     fn shard_defaults_to_unsharded() {

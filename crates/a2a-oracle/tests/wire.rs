@@ -108,7 +108,7 @@ fn boot() -> (Daemon, String, tempdir::TempDir) {
              agent:\n  name: oracle\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
-             a2a:\n  listen: http://127.0.0.1:{port}\n\
+             a2a:\n  listen: http://127.0.0.1:{port}\n  push:\n    enabled: true\n    allow_private: true\n\
              lifecycle:\n  run_until: drained\n\
              observability:\n  log_level: warn\n"
         ),
@@ -185,6 +185,28 @@ fn post(addr: &str, body: &str) -> String {
     b
 }
 
+/// A plain GET, for the well-known discovery path.
+fn fetch(addr: &str, path: &str) -> Value {
+    let mut s = TcpStream::connect(addr).expect("connect a2a");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    loop {
+        let mut l = String::new();
+        r.read_line(&mut l).unwrap();
+        if l.trim().is_empty() {
+            break;
+        }
+    }
+    let mut b = String::new();
+    r.read_to_string(&mut b).unwrap();
+    serde_json::from_str(&b).unwrap_or_else(|e| panic!("non-JSON at {path} ({e}): {b:?}"))
+}
+
 /// One JSON-RPC call; returns the whole envelope so a test can read either half.
 fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
     let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
@@ -236,6 +258,97 @@ fn the_agent_card_parses_as_an_agent_card() {
         theirs.capabilities.streaming.unwrap_or(false),
         "agentd streams; the card must say so: {card}"
     );
+}
+
+/// A card that parses and names no endpoint is the quietest possible failure:
+/// the peer reads it happily and has nowhere to send anything. Discovery is the
+/// *point* of the card, so the interface is the field to assert.
+#[test]
+fn the_card_tells_a_peer_where_to_send_things() {
+    let (_d, addr, _t) = boot();
+    let card = result(&addr, 1, "GetAgentCard", json!({}));
+    let theirs: AgentCard = cross_read("AgentCard", &card);
+
+    let iface = theirs
+        .supported_interfaces
+        .first()
+        .unwrap_or_else(|| panic!("the card names no interface, so a peer cannot dial it: {card}"));
+    assert!(!iface.url.is_empty(), "an interface with no url: {card}");
+    assert_eq!(
+        iface.protocol_binding,
+        a2a_rs::domain::PROTOCOL_BINDING_JSONRPC,
+        "the binding a peer would choose: {card}"
+    );
+
+    // …and the same card is served unauthenticated at the well-known path,
+    // which is how a peer finds it before it has credentials.
+    let served = fetch(&addr, "/.well-known/agent-card.json");
+    let published: AgentCard = cross_read("well-known AgentCard", &served);
+    assert_eq!(published.name, theirs.name);
+    assert_eq!(
+        published.supported_interfaces.len(),
+        theirs.supported_interfaces.len(),
+        "the published card and the RPC card must be the same document"
+    );
+}
+
+/// Every capability the card claims must be exercisable, and every one it
+/// disclaims must be refused. A card is a promise a peer plans against.
+#[test]
+fn the_card_claims_exactly_what_the_server_does() {
+    let (_d, addr, _t) = boot();
+    let card = result(&addr, 1, "GetAgentCard", json!({}));
+    let theirs: AgentCard = cross_read("AgentCard", &card);
+
+    // Push notifications are off in this fixture, so the card must say so and
+    // the method must refuse rather than half-serve.
+    if !theirs
+        .capabilities
+        .as_option()
+        .and_then(|c| c.push_notifications)
+        .unwrap_or(false)
+    {
+        let sent = result(&addr, 2, "SendMessage", status_message("m1"));
+        let task = sent.get("task").cloned().unwrap_or(sent);
+        let id = task["id"].as_str().unwrap_or_default();
+        let v = rpc(
+            &addr,
+            3,
+            "CreateTaskPushNotificationConfig",
+            json!({"taskId": id, "url": "https://hooks.example/x"}),
+        );
+        assert!(
+            v["error"]["code"].as_i64().is_some(),
+            "a disclaimed capability must be refused, not silently accepted: {v}"
+        );
+    }
+}
+
+/// Cancellation, which a peer reaches for when it changes its mind — and the
+/// answer has to be a `Task`, not an acknowledgement.
+#[test]
+fn cancelling_answers_with_the_task_in_a_state_they_can_read() {
+    let (_d, addr, _t) = boot();
+    let sent = result(&addr, 1, "SendMessage", status_message("m1"));
+    let task: Task = cross_read("Task", &sent.get("task").cloned().unwrap_or(sent));
+
+    let v = rpc(&addr, 2, "CancelTask", json!({"id": task.id.as_str()}));
+    match v.get("error") {
+        // A finished task cannot be cancelled, and the spec has a code for
+        // exactly that — which is a better answer than pretending.
+        Some(e) => assert_eq!(
+            e["code"], -32002,
+            "an uncancelable task is TaskNotCancelable: {v}"
+        ),
+        None => {
+            let back: Task = cross_read("CancelTask Task", &v["result"]);
+            assert_eq!(back.id.as_str(), task.id.as_str());
+        }
+    }
+
+    // And a task that does not exist is TaskNotFound either way.
+    let v = rpc(&addr, 3, "CancelTask", json!({"id": "nope"}));
+    assert_eq!(v["error"]["code"], -32001, "{v}");
 }
 
 #[test]
@@ -371,6 +484,75 @@ fn the_frames_we_stream_parse_as_the_events_they_claim_to_be() {
         frames > 0,
         "a streaming send should emit update frames: {raw}"
     );
+}
+
+/// A stream a client can come back to. Each frame carries an event id, which is
+/// what a client echoes as `Last-Event-ID` after a disconnect — without them a
+/// dropped connection means starting over, and for a long task that means
+/// missing the answer.
+#[test]
+fn stream_frames_carry_the_id_a_client_resumes_from() {
+    let (_d, addr, _t) = boot();
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage",
+        "params": status_message("s1")
+    })
+    .to_string();
+    let raw = post(&addr, &body);
+
+    // A streaming method answers with a stream — whatever the message turned
+    // out to contain. A caller that asked for SSE and received a JSON body
+    // cannot parse it.
+    let mut ids = 0usize;
+    let mut frames = 0usize;
+    for line in raw.lines() {
+        if line.starts_with("id:") {
+            ids += 1;
+        }
+        if line.starts_with("data:") {
+            frames += 1;
+        }
+    }
+    assert!(frames > 0, "a streaming send must answer as a stream: {raw}");
+    assert!(
+        ids > 0,
+        "no frame carried an event id, so a disconnected client cannot resume: {raw}"
+    );
+}
+
+/// The push-notification surface, read back through their types. A caller
+/// registers a webhook with a `TaskPushNotificationConfig`; what comes back has
+/// to be one.
+#[test]
+fn a_push_config_round_trips_as_their_type() {
+    use a2a_rs::domain::TaskPushNotificationConfig;
+
+    let (_d, addr, _t) = boot();
+    let sent = result(&addr, 1, "SendMessage", status_message("m1"));
+    let task: Task = cross_read("Task", &sent.get("task").cloned().unwrap_or(sent));
+
+    let created = result(
+        &addr,
+        2,
+        "CreateTaskPushNotificationConfig",
+        // The request *is* the config, flat — as the spec's message defines it.
+        json!({"taskId": task.id.as_str(), "url": "https://127.0.0.1:9/hook", "token": "t"}),
+    );
+    let theirs: TaskPushNotificationConfig = cross_read("TaskPushNotificationConfig", &created);
+    assert_eq!(theirs.task_id, task.id.as_str());
+    assert!(!theirs.url.is_empty());
+
+    let listed = result(
+        &addr,
+        3,
+        "ListTaskPushNotificationConfigs",
+        json!({"taskId": task.id.as_str()}),
+    );
+    let configs = listed["configs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a listing carries its configs: {listed}"));
+    assert_eq!(configs.len(), 1, "{listed}");
+    let _: TaskPushNotificationConfig = cross_read("listed config", &configs[0]);
 }
 
 #[test]

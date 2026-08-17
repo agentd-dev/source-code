@@ -194,7 +194,12 @@ fn top_level_properties(
                 "bearer": secret,
                 "principals": { "type": "array", "items": { "$ref": "#/$defs/Principal" } },
                 "peers": { "type": "array", "items": { "$ref": "#/$defs/A2aPeer" } },
-                "conversation_ttl": duration } }));
+                "conversation_ttl": duration,
+                "push": { "type": "object", "additionalProperties": false,
+                    "description": "push notifications: a caller registers a webhook and agentd POSTs its task's updates there. Default-OFF — the URL comes from a peer, so making the request at all is the operator's decision.",
+                    "properties": {
+                    "enabled": { "type": "boolean", "description": "accept CreateTaskPushNotificationConfig and deliver on transitions" },
+                    "allow_private": { "type": "boolean", "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)" } } } } }));
     m.insert("interface".to_string(), json!({ "type": "object", "additionalProperties": false,
                 "description": "The display-client (TUI/web-UI) surface (RFC 0032), served on the A2A listener. Default-OFF.",
                 "properties": {

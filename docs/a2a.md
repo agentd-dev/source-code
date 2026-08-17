@@ -55,7 +55,9 @@ bearer) and is authorized against a role matrix before anything runs.
 | `CancelTask` | Stop one in flight |
 | `SubscribeToTask` | Follow one task's transitions |
 | `SubscribeToEvents` | The instance-wide observation feed the display clients render (needs `interface.enabled`) |
-| `GetAgentCard` | Discovery: identity, transport, and the capabilities this instance actually implements |
+| `GetAgentCard` | Discovery: identity, transport, and the capabilities this instance actually implements. Also served unauthenticated at `/.well-known/agent-card.json` |
+| `GetExtendedAgentCard` | The authenticated card: the same document, with the skills *this caller* may actually run |
+| `CreateTaskPushNotificationConfig` etc. | Register a webhook for a task's updates instead of holding a stream open (see below) |
 
 Errors use the codes the spec assigns, because peers branch on them: `-32601`
 for a method that does not exist, `-32001` for a task that does not. A peer
@@ -76,6 +78,39 @@ worth stating, because getting them wrong fails silently in the *peer*:
   (minus the artifacts a listing does not resolve), so the state is always at
   `status.state`. The result carries `totalSize`, `pageSize` and
   `nextPageToken`; agentd answers in a single page.
+
+### Being told instead of watching
+
+Streaming assumes the caller can hold a connection open for as long as the work
+takes. A caller that cannot — a serverless function, a queue consumer — registers
+a webhook, and agentd POSTs each of that task's updates to it. The body is the
+`Task`, exactly as a streaming caller would have seen it, so one handler serves
+both ways of being told.
+
+```yaml
+a2a:
+  push:
+    enabled: true         # default OFF
+    allow_private: false  # default OFF
+```
+
+Both defaults are off, and the reason is that **the URL comes from the caller**.
+Every delivery is an outbound request to an address a *peer* chose, which is the
+shape of an SSRF: pointed at a cloud metadata endpoint, agentd fetches
+credentials on the caller's behalf. So `enabled` says you are willing to make
+that request at all, and `allow_private` — a separate, larger decision — says you
+are willing to make it to a private or loopback address. A target is checked
+twice: at registration, where the caller is present to be told why it was
+refused, and again at delivery, because a name can resolve somewhere new in
+between.
+
+The receiver gets `X-A2A-Notification-Token` echoed back from the config, so it
+can tell a real delivery from a stray POST at a URL somebody guessed. A bearer
+agentd should *present* goes in `authentication.credentials` with a `Bearer`
+scheme, and is never read back out.
+
+Delivery is best-effort by design: a webhook that is down must not fail the task
+it was reporting on. Failures are logged as `a2a.push.failed` and dropped.
 
 Anything agentd wants to say that the spec has no field for goes under
 `metadata`, namespaced: `agentd/principal`, `agentd/link`,

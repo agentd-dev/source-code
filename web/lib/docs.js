@@ -101,6 +101,14 @@ export const DOCS = [
     blurb: "The JSON-lines event stream, metrics, OTEL traces, and the A2A read surface.",
   },
   {
+    slug: "interface",
+    file: "docs/interface.md",
+    title: "Interface — TUI & web UI",
+    group: "operate",
+    blurb:
+      "The display clients: one daemon, many synchronized surfaces — pairing-code login, live activity, approvals, steering.",
+  },
+  {
     slug: "operations",
     file: "docs/operations.md",
     title: "Operations",
@@ -162,6 +170,7 @@ export const DOCS = [
   { slug: "rfc-0028", file: "rfcs/0028-tools-registry-and-internal-tools.md", title: "0028 · Tools registry", group: "rfc-core" },
   { slug: "rfc-0030", file: "rfcs/0030-config-schema-v2.md", title: "0030 · Config schema v2", group: "rfc-core" },
   { slug: "rfc-0031", file: "rfcs/0031-endpoint-authentication.md", title: "0031 · Endpoint authentication", group: "rfc-core" },
+  { slug: "rfc-0032", file: "rfcs/0032-interface-and-observation-plane.md", title: "0032 · Interface & observation plane", group: "rfc-core" },
   { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "0022 · Embedding & code tools", group: "rfc-core" },
   { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "0023 · AAuth agent identity", group: "rfc-core", tag: "draft" },
   { slug: "rfc-0024", file: "rfcs/0024-evaluation-harness.md", title: "0024 · Evaluation harness", group: "rfc-core" },

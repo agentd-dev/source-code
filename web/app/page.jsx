@@ -1,7 +1,8 @@
 import Link from "next/link";
 import Mermaid from "./components/Mermaid";
+import Console from "./components/Console";
 
-/* ── tiny presentational helpers ─────────────────────────────────── */
+/* ── page furniture ──────────────────────────────────────────────── */
 
 function Term({ title = "shell", children }) {
   return (
@@ -19,12 +20,17 @@ function Term({ title = "shell", children }) {
   );
 }
 
-function Section({ id, eyebrow, title, intro, children }) {
+function Section({ id, eyebrow, title, intro, children, tight }) {
   return (
-    <section id={id} className="mx-auto max-w-5xl scroll-mt-20 px-4 py-14">
+    <section
+      id={id}
+      className={`mx-auto max-w-[82rem] scroll-mt-20 px-4 ${tight ? "py-10" : "py-16"}`}
+    >
       {eyebrow && <div className="eyebrow mb-3">{eyebrow}</div>}
       {title && (
-        <h2 className="text-2xl font-bold text-[var(--fg-strong)] sm:text-3xl">{title}</h2>
+        <h2 className="max-w-3xl text-2xl font-bold tracking-tight text-[var(--fg-strong)] sm:text-[1.75rem]">
+          {title}
+        </h2>
       )}
       {intro && <p className="mt-3 max-w-2xl text-[var(--dim)]">{intro}</p>}
       <div className="mt-8">{children}</div>
@@ -35,7 +41,7 @@ function Section({ id, eyebrow, title, intro, children }) {
 function Card({ tag, title, children }) {
   return (
     <div className="panel lift p-5">
-      {tag && <div className="mb-2 text-xs text-[var(--green)]">{tag}</div>}
+      {tag && <div className="mb-2 font-mono text-xs text-[var(--green)]">{tag}</div>}
       <h3 className="text-[15px] font-semibold text-[var(--fg-strong)]">{title}</h3>
       <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">{children}</p>
     </div>
@@ -44,30 +50,38 @@ function Card({ tag, title, children }) {
 
 /* ── content ─────────────────────────────────────────────────────── */
 
-const HERO_CMD = `$ agentd \\
-    --instruction "triage new GitHub issues and label them" \\
-    --mcp github=https://mcp-github.internal/mcp \\
-    --intelligence https://gateway.internal/v1 \\
-    --model claude-sonnet-5
-
-{"event":"mcp.connect","server":"github","proto":"2025-11-25"}
-{"event":"run.start","tools":11,"servers":1,"run_id":"19f0…"}
-{"event":"tool.call","tool":"list_issues"}
-{"event":"tool.call","tool":"add_labels","args":{"labels":["bug"]}}
-{"event":"run.done","status":"completed","steps":4,"exit_code":0}`;
+// The hero demo: a one-shot job, typed out in the page.
+const DEMO = [
+  { t: "in", text: 'agentd --prompt "triage the newest issue and label it" \\' },
+  { t: "out", text: "         --mcp github=https://mcp-github.internal/mcp \\", cls: "out" },
+  { t: "out", text: "         --intelligence https://gateway.internal/v1", cls: "out" },
+  { t: "out", text: "", ms: 240 },
+  { t: "out", text: '{"event":"mcp.connect","server":"github","proto":"2025-11-25"}', cls: "comment" },
+  { t: "out", text: '{"event":"run.start","tools":11,"servers":1}', cls: "comment" },
+  { t: "spin", text: "thinking · 1.2k tok", ms: 1100 },
+  { t: "out", text: '{"event":"tool.call","tool":"list_issues"}', cls: "comment" },
+  { t: "spin", text: "list_issues · 0.4s", ms: 700 },
+  { t: "out", text: '{"event":"tool.call","tool":"add_labels","args":{"labels":["bug"]}}', cls: "comment" },
+  { t: "spin", text: "thinking · 2.6k tok", ms: 900 },
+  { t: "out", text: "", ms: 120 },
+  { t: "out", text: "Labelled #482 as bug: the stack trace shows a nil deref in" },
+  { t: "out", text: "parse_config, not a usage error. Assigned to the api team." },
+  { t: "out", text: "", ms: 120 },
+  { t: "out", text: '{"event":"run.done","status":"completed","steps":4,"exit_code":0}', cls: "comment" },
+];
 
 const INSTALL_CMD = `$ curl -fsSL https://agentd.dev/install.sh | sh
 agentd  checksum ok
-agentd  installed agentd 2.0.0 to /usr/local/bin/agentd`;
+agentd  installed agentd to /usr/local/bin/agentd`;
 
 const TUI_CMD = `$ agentd tui --config coding.yaml
 
-agentd 2.0.0 · coder                chat  tasks  subagents  debug
-you › find why the staging deploy is flaking
-agent › Reproduced: the readiness probe races the
-        migration job. Patch in api/deploy.yaml.
+agentd · coder                      chat  tasks  subagents  debug
+▌ find why the staging deploy is flaking
+● Reproduced: the readiness probe races the migration
+  job. Patch in api/deploy.yaml.
 ⣾ read_file · 3s · 1.2k tok
-● live http://127.0.0.1:8420 · 2 turns · 33/17 tok`;
+● live  http://127.0.0.1:8420  2 turns  33/17 tok`;
 
 const ARCH_DIAGRAM = `flowchart TB
   trig["trigger<br/>once · schedule · subscribe · a2a"]
@@ -92,12 +106,13 @@ const ARCH_DIAGRAM = `flowchart TB
   a1 -->|"complete · HTTPS"| llm
   sup <-->|"tasks · runs · state"| store
 
-  classDef accent stroke:#22c55e,stroke-width:1.5px,color:#f4f4f5;
+  classDef accent stroke:#22c55e,stroke-width:1.5px;
   class sup,store accent;`;
 
 const WORKFLOW_YAML = `# a daemon that wakes on a queue and triages each item
 lifecycle: { run_until: drained }        # SIGTERM drains, then exit 0
-store:     { kind: mcp, mcp: { server: state } }   # durable (RFC 0025)
+store:     { kind: mcp, mcp: { server: state } }   # durable
+
 workflows:
   - name: triage
     steps:
@@ -119,7 +134,7 @@ const CAPS = [
   {
     tag: "no local code by default",
     title: "It runs nothing of its own",
-    body: "Zero built-in tools and no plugins: every capability comes from a remote MCP server you declare, so the blast radius is exactly what you wired. Local commands are possible but off at two independent layers — a build feature AND a config switch — and then fenced by an allow-list, workdir confinement, argv-not-shell, and a minimal environment.",
+    body: "Zero built-in tools and no plugins: every capability comes from a remote MCP server you declare, so the blast radius is exactly what you wired. Local commands are possible but off at two independent layers — a build feature AND a config switch — then fenced by an allow-list, workdir confinement, argv-not-shell, and a minimal environment.",
   },
   {
     tag: "supervised",
@@ -134,22 +149,17 @@ const CAPS = [
   {
     tag: "durable",
     title: "Crash-resume from the store",
-    body: "State lives in a remote store behind MCP (RFC 0025). A restarted daemon restores its A2A tasks and in-flight workflows — with blackboard and budget intact — and resumes where it left off. No database linked in.",
+    body: "State lives in a remote store behind MCP. A restarted daemon restores its A2A tasks and in-flight workflows — blackboard and budget intact — and resumes where it left off. No database linked in.",
   },
   {
     tag: "authenticated",
-    title: "Identity + Rule of Two",
+    title: "Identity + the Rule of Two",
     body: "Trust is a verified mTLS cert or a constant-time bearer — never the transport. Tools are tagged untrusted-input / sensitive / egress; granting one agent all three legs is refused at startup. Scope narrows monotonically; secrets are redacted everywhere.",
   },
   {
     tag: "attachable",
     title: "A terminal or a browser, live",
     body: "The daemon owns the session; the TUI and web UI are thin projections of it. Several surfaces watch the same conversation at once, quitting a client leaves the agent working, and approvals render as answerable rows in every attached client — with a rotating pairing code instead of a copied token.",
-  },
-  {
-    tag: "observable",
-    title: "Everything is auditable",
-    body: "One JSON-lines event stream with run_id + agent_path tree correlation, W3C trace-context propagation, and dependency-free OTLP export. /healthz, /readyz, /metrics for k8s — opt-in, off by default.",
   },
 ];
 
@@ -166,55 +176,54 @@ export default function Home() {
   return (
     <main>
       {/* ── hero ─────────────────────────────────────────────── */}
-      <section className="mx-auto max-w-5xl px-4 pt-16 pb-8 sm:pt-24">
-        <div className="chip mb-6">
-          <span className="pulse" /> a runtime, not a framework
-        </div>
-        <h1 className="text-4xl font-bold leading-tight tracking-tight text-[var(--fg-strong)] sm:text-6xl">
-          agentd<span className="cursor" aria-hidden="true" />
-        </h1>
-        <p className="mt-5 max-w-2xl text-lg text-[var(--fg)] sm:text-xl">
-          A small, cloud-native AI agent runtime. Give it an{" "}
-          <span className="text-[var(--fg-strong)]">instruction</span> and{" "}
-          <span className="text-[var(--fg-strong)]">tools from MCP</span> — it runs the agentic
-          loop: think, call a tool, observe, self-correct. As a one-shot job or a long-lived daemon.
-        </p>
-        <p className="mt-4 max-w-2xl text-[var(--dim)]">
-          One static binary — supervised, bounded, durable, observable — that runs no code of its
-          own and links no framework. Everything it can do, you wired.
-        </p>
-
-        <div className="mt-7 flex flex-wrap gap-3">
-          <a href="#run" className="btn btn-primary">
-            $ run it
-          </a>
-          <a href="https://github.com/agentd-dev/source-code" className="btn">
-            github ↗
-          </a>
-          <Link href="/docs/overview/" className="btn">
-            docs
-          </Link>
-        </div>
-
-        <div className="mt-8">
-          <div className="eyebrow mb-2">install</div>
-          <Term title="Linux amd64/arm64 · checksum-verified · no sudo">{INSTALL_CMD}</Term>
-          <p className="mt-2 text-sm text-[var(--dim)]">
-            Or build from source — <code>exec</code> and <code>cel</code> are deliberately not in
-            release binaries. See{" "}
-            <Link href="/docs/getting-started/" className="underline">
-              getting started
-            </Link>
-            .
+      <section className="mx-auto grid max-w-[82rem] gap-10 px-4 pt-14 pb-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:items-center lg:pt-20">
+        <div>
+          <div className="chip mb-6">
+            <span className="pulse" /> a runtime, not a framework
+          </div>
+          <h1 className="text-4xl font-bold leading-[1.08] tracking-tight text-[var(--fg-strong)] sm:text-5xl">
+            The agent runs in a daemon.
+            <br />
+            You keep the fence.
+          </h1>
+          <p className="mt-5 max-w-xl text-lg text-[var(--fg)]">
+            agentd is a small agent runtime: give it an instruction and tools from remote{" "}
+            <strong className="font-semibold text-[var(--fg-strong)]">MCP</strong> servers, and it
+            runs the agentic loop — think, call a tool, observe, self-correct — as a one-shot job or
+            a long-lived daemon.
           </p>
+          <p className="mt-4 max-w-xl text-[var(--dim)]">
+            One static binary, supervised and bounded, that runs no code of its own. Everything it
+            can do, you wired.
+          </p>
+
+          <div className="mt-7 flex flex-wrap gap-3">
+            <Link href="/docs/getting-started/" className="btn btn-primary">
+              Get started
+            </Link>
+            <Link href="/docs/overview/" className="btn">
+              How it works
+            </Link>
+            <a href="https://github.com/agentd-dev/source-code" className="btn">
+              GitHub ↗
+            </a>
+          </div>
+
+          <div className="mt-8">
+            <Term title="install · linux amd64/arm64 · checksum-verified">{INSTALL_CMD}</Term>
+          </div>
         </div>
 
-        <div className="mt-10">
-          <Term title="agentd — a one-shot job">{HERO_CMD}</Term>
+        <div className="lg:pt-6">
+          <Console title="agentd — a one-shot job" script={DEMO} />
+          <p className="mt-3 text-xs text-[var(--dim)]">
+            stdout carries the answer; stderr carries JSON-lines telemetry; the exit code is the
+            terminal status.
+          </p>
         </div>
       </section>
 
-      {/* ── the shape of a run (diagram) ─────────────────────── */}
+      {/* ── the shape of a run ───────────────────────────────── */}
       <Section
         eyebrow="the shape of a run"
         title="One binary. Two loops."
@@ -223,52 +232,48 @@ export default function Home() {
         <Mermaid chart={ARCH_DIAGRAM} />
         <div className="mt-6 grid gap-4 md:grid-cols-3">
           <Card tag="you provide" title="A task, a model, some tools">
-            The task in plain language, an OpenAI-compatible endpoint, and the servers whose tools
-            it may use. Nothing is implicit: capabilities are exactly what you wire.
+            The task in plain language, an OpenAI-compatible endpoint, and the servers whose tools it
+            may use. Nothing is implicit: capabilities are exactly what you wire.
           </Card>
           <Card tag="it runs" title="The ReAct loop, supervised">
-            Think → call a tool → observe → repeat, until an answer or a budget. The loop
-            lives in a subagent; a supervisor with no model owns its lifecycle.
+            Think → call a tool → observe → repeat, until an answer or a budget. The loop runs in a
+            child process the supervisor can always kill.
           </Card>
           <Card tag="it ends" title="A terminal status + a trace">
-            A completed / partial / refused / exhausted outcome mapped to an exit code — or it stays
-            alive as a daemon. Either way every step is on the event stream.
+            A status that maps to an exit code, the result on stdout, and a structured event stream
+            you can replay.
           </Card>
         </div>
       </Section>
 
-      {/* ── the interface ────────────────────────────────────── */}
+      {/* ── talk to it ───────────────────────────────────────── */}
       <Section
         id="interface"
         eyebrow="work with it"
         title="Attach a terminal. Or a browser. Or both."
-        intro="agentd is a daemon you can also sit with. One command runs the runtime and a terminal UI together; because the daemon holds the session, a second surface — another screen, another machine — renders the same live state, and quitting a client never ends the work."
+        intro="The daemon holds the session; the clients are thin projections of it. Open the TUI at your desk and the web UI on another screen — both render the same live state, and quitting a client leaves the agent working."
       >
         <div className="grid gap-4 md:grid-cols-2">
           <Term title="agentd — daemon + terminal UI">{TUI_CMD}</Term>
-          <div className="panel lift p-5">
-            <h3 className="font-semibold text-[var(--fg-strong)]">Thin by construction</h3>
-            <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
-              The clients hold no state, no tools and no secrets — they forward intent and render a
-              projection of the daemon. That is what makes N surfaces converge without any
-              client-to-client protocol, and what makes a third client a small program.
-            </p>
-            <ul className="mt-3 space-y-1 text-sm text-[var(--dim)]">
-              <li>· approvals (<span className="kbd">ask_human</span>) that survive a restart</li>
-              <li>· live activity — phase, current tool, elapsed, spend</li>
-              <li>· pairing-code login, so no bearer gets copied around</li>
-              <li>· a debug plane you switch on per session, not per deploy</li>
-            </ul>
-            <p className="mt-3 text-sm text-[var(--dim)]">
-              Set one up as a coding agent for a repository:{" "}
-              <a className="link" href="/docs/coding-agent/">docs/coding-agent</a> ·{" "}
-              <a className="link" href="/docs/interface/">the client surface</a>
-            </p>
+          <div className="grid gap-4">
+            <Card tag="one command" title="Daemon and client together">
+              <span className="kbd">agentd tui -c agent.yaml</span> runs both and ties their
+              lifetimes. Or run the daemon alone and attach later, from anywhere.
+            </Card>
+            <Card tag="answerable" title="Approvals reach every surface">
+              When the agent asks a question, it renders as an answerable row in every attached
+              client — and survives a restart, because the gate lives in the daemon.
+            </Card>
           </div>
+        </div>
+        <div className="mt-4">
+          <Link href="/docs/interface/" className="text-sm text-[var(--green)] hover:underline">
+            The client surface in full →
+          </Link>
         </div>
       </Section>
 
-      {/* ── where capability comes from, and who may reach in ── */}
+      {/* ── capability & connection ──────────────────────────── */}
       <Section
         id="mcp"
         eyebrow="capability &amp; connection"
@@ -276,70 +281,46 @@ export default function Home() {
         intro="Two protocols, each doing one job. MCP is not an integration here but the substrate: every tool, and every event worth waking for, arrives from a server you named. A2A is the door in the other direction — a served run is an A2A Task, so agentd is a first-class citizen of an agent mesh rather than a leaf."
       >
         <div className="grid gap-4 md:grid-cols-3">
-          <div className="panel lift p-5">
-            <div className="mb-3 font-mono text-xs text-[var(--green)]">01 · tools</div>
-            <h3 className="font-semibold text-[var(--fg-strong)]">Tools come from MCP</h3>
-            <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
-              Declare a server with <span className="kbd">--mcp name=https://host/mcp</span>. agentd
-              connects over Streamable HTTP, negotiates the version, discovers the tools, and offers
-              exactly that set to the model. It spawns no process and runs no local code.
-            </p>
-          </div>
-          <div className="panel lift p-5">
-            <div className="mb-3 font-mono text-xs text-[var(--green)]">02 · reacts</div>
-            <h3 className="font-semibold text-[var(--fg-strong)]">Reactive on resources</h3>
-            <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
-              A <span className="kbd">subscribe</span> start node idles until a server pushes{" "}
-              <span className="kbd">notifications/resources/updated</span> over SSE — then it reads
-              the resource and runs. Event-driven agents, no polling, no glue.
-            </p>
-          </div>
-          <div className="panel lift p-5">
-            <div className="mb-3 font-mono text-xs text-[var(--green)]">03 · speaks A2A</div>
-            <h3 className="font-semibold text-[var(--fg-strong)]">The external channel</h3>
-            <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
-              Set <span className="kbd">a2a.listen</span> and a peer or operator drives it:{" "}
-              <span className="kbd">SendMessage</span> becomes a conversation turn,{" "}
-              <span className="kbd">GetTask</span> reads the durable result — mTLS/bearer, resolved
-              to a principal.
-            </p>
-          </div>
+          <Card tag="01 · tools" title="Tools come from MCP">
+            Declare a server with <span className="kbd">--mcp name=https://host/mcp</span>. agentd
+            connects over Streamable HTTP, negotiates the version, discovers the tools, and offers
+            exactly that set to the model. It spawns no process and runs no local code.
+          </Card>
+          <Card tag="02 · reacts" title="Reactive on resources">
+            A <span className="kbd">subscribe</span> start node idles until a server pushes{" "}
+            <span className="kbd">notifications/resources/updated</span> — then it reads the resource
+            and runs. Event-driven agents, no polling, no glue.
+          </Card>
+          <Card tag="03 · speaks A2A" title="The external channel">
+            Set <span className="kbd">a2a.listen</span> and a peer or operator drives it:{" "}
+            <span className="kbd">SendMessage</span> becomes a conversation turn,{" "}
+            <span className="kbd">GetTask</span> reads the durable result — mTLS or bearer, resolved
+            to a principal.
+          </Card>
         </div>
       </Section>
 
       {/* ── lifecycle & triggers ─────────────────────────────── */}
       <Section
         id="lifecycle"
-        eyebrow="lifecycle & triggers"
+        eyebrow="lifecycle &amp; triggers"
         title="A job, or a daemon — the same loop"
-        intro="agentd 2.0 has no modes. lifecycle.run_until picks the shape (a one-shot job, or a long-lived daemon); workflow start-node triggers decide when a run fires. Both share the same inner loop, the same durable state, the same tool registry."
+        intro="There are no modes. lifecycle.run_until picks the shape; a workflow's start node decides when a run fires. Both share the same inner loop, the same durable state, the same tool registry."
       >
         <div className="panel overflow-hidden">
           {TRIGGERS.map(([k, body, shape], i) => (
             <div
               key={k}
-              className={
-                "grid grid-cols-1 gap-2 px-5 py-4 sm:grid-cols-12 sm:items-center " +
-                (i ? "border-t border-[var(--line)]" : "")
-              }
+              className={`grid grid-cols-[8.5rem_1fr_auto] items-center gap-3 px-4 py-3 text-sm ${
+                i ? "border-t border-[var(--line)]" : ""
+              }`}
             >
-              <div className="font-mono text-sm text-[var(--green)] sm:col-span-3">{k}</div>
-              <div className="text-sm text-[var(--dim)] sm:col-span-7">{body}</div>
-              <div className="text-xs text-[var(--dim)] sm:col-span-2 sm:text-right">
-                <span className="text-[var(--dimmer)]">→</span> {shape}
-              </div>
+              <span className="font-mono text-[var(--green)]">{k}</span>
+              <span className="text-[var(--dim)]">{body}</span>
+              <span className="font-mono text-xs text-[var(--dimmer)]">{shape}</span>
             </div>
           ))}
         </div>
-        <p className="mt-4 text-sm text-[var(--dim)]">
-          Within a run, an agent can <span className="text-[var(--fg)]">spawn subagents</span> (a
-          bounded, reaped tree), <span className="text-[var(--fg)]">delegate a whole workflow</span>{" "}
-          to a child, or <span className="text-[var(--fg)]">delegate over A2A</span> to another
-          agent. Operators drive a running daemon over the same HTTPS surface —{" "}
-          <span className="kbd">a2a.Drain</span> / <span className="kbd">LameDuck</span> /{" "}
-          <span className="kbd">Pause</span> / <span className="kbd">Cancel</span>, authenticated,
-          never a plaintext control plane.
-        </p>
       </Section>
 
       {/* ── workflows ────────────────────────────────────────── */}
@@ -347,36 +328,45 @@ export default function Home() {
         id="workflows"
         eyebrow="durable workflows"
         title="When one loop isn't the right shape"
-        intro="Some work is a graph, not a single reasoning loop. The durable DAG engine (RFC 0027) runs a graph of typed nodes — agent, tool, branch, foreach, parallel, wait, human, subgraph — deterministic where it can be, agentic where it must be, and crash-resumable from the store."
+        intro="Some work is a graph, not a conversation: fan out, gate on a human, retry a branch, resume after a crash. Workflows are typed DAGs the runtime executes and checkpoints — with model calls only where you ask for them."
       >
-        <div className="grid gap-4 md:grid-cols-3">
-          <Card tag="deterministic where it can be" title="Typed nodes, real data flow">
-            <span className="kbd">tool</span> and <span className="kbd">branch</span> paths spend
-            zero model tokens; <span className="kbd">foreach</span> and{" "}
-            <span className="kbd">parallel</span> fan an array over shared lanes without feeding it
-            through the LLM.
-          </Card>
-          <Card tag="humans in the loop, over A2A" title="Ask a person mid-workflow">
-            A <span className="kbd">human</span> node flips the A2A task to{" "}
-            <span className="kbd">input-required</span>; the person answers with a plain{" "}
-            <span className="kbd">SendMessage</span> carrying the task id, and the workflow resumes.
-          </Card>
-          <Card tag="durable by the store" title="Crash-resume &amp; fork">
-            Every superstep is checkpointed to the durable store (RFC 0025). A restarted daemon
-            resumes a SIGKILLed run with its blackboard and budget intact — no external database.
-          </Card>
-        </div>
-        <div className="mt-6">
-          <Term title="a subscribe-triggered daemon, in one config">{WORKFLOW_YAML}</Term>
+        <div className="grid gap-4 lg:grid-cols-[1.05fr_1fr]">
+          <div className="grid gap-4">
+            <Card tag="deterministic where it can be" title="Typed nodes, real data flow">
+              Most node kinds cost zero tokens — assign, map, filter, switch, http, mcp.tool. Only{" "}
+              <span className="kbd">agent</span> and <span className="kbd">think</span> call a model,
+              so a workflow is cheap where it should be.
+            </Card>
+            <Card tag="humans in the loop" title="Ask a person mid-workflow">
+              A <span className="kbd">human</span> step suspends the run and renders as a question in
+              every attached client. The answer becomes the step's output — and the run survives a
+              restart while it waits.
+            </Card>
+            <Card tag="durable by the store" title="Crash-resume, and fork">
+              Every step transition is checkpointed. A restarted daemon rebuilds in-flight runs from
+              the store and continues.
+            </Card>
+          </div>
+          <div>
+            <Term title="a subscribe-triggered daemon, in one config">{WORKFLOW_YAML}</Term>
+            <div className="mt-4 flex flex-wrap gap-3">
+              <Link href="/docs/workflows/" className="btn">
+                Workflow guide
+              </Link>
+              <Link href="/editor/" className="btn">
+                Open the editor
+              </Link>
+            </div>
+          </div>
         </div>
       </Section>
 
-      {/* ── capabilities ─────────────────────────────────────── */}
+      {/* ── guarantees ───────────────────────────────────────── */}
       <Section
         id="capabilities"
         eyebrow="guarantees"
         title="Small surface, serious guarantees"
-        intro="Minimal where it can be, uncompromising where it must be — no local execution, supervision, budgets, durability, authenticated control, and observability are not add-ons."
+        intro="The properties that matter when an agent runs unattended, and where each one is enforced."
       >
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {CAPS.map((c) => (
@@ -385,88 +375,62 @@ export default function Home() {
             </Card>
           ))}
         </div>
-        <p className="mt-5 text-sm text-[var(--dim)]">
-          Signed agent identity is a build away:{" "}
-          <Link href="/docs/aauth/" className="text-[var(--green)] hover:underline">
-            AAuth
-          </Link>{" "}
-          (draft) gives agentd an Ed25519 identity and signs every MCP request with RFC 9421 — no
-          shared API key, and the server knows exactly which agent is calling.
-        </p>
       </Section>
 
       {/* ── footprint ────────────────────────────────────────── */}
       <Section
         eyebrow="footprint"
         title="Minimalism is the moat"
-        intro="Three first-party dependencies. The only other code in the build is rustls + ring for HTTPS — no async runtime, no framework, no C toolchain. It links statically and ships on an empty base."
+        intro="Three direct dependencies. The HTTP client and server, the cron parser, the Prometheus text format, the OTLP exporter and the inotify watch are all hand-rolled on std + libc — which is why the image has nothing to scan but agentd itself."
       >
         <div className="grid gap-4 lg:grid-cols-2">
-          <div className="panel divide-y divide-[var(--line)]">
-            {SPECS.map(([k, v]) => (
-              <div key={k} className="flex items-center justify-between gap-4 px-5 py-3.5">
-                <span className="text-xs uppercase tracking-wider text-[var(--dim)]">{k}</span>
-                <span className="text-right text-sm text-[var(--fg)]">{v}</span>
+          <div className="panel overflow-hidden">
+            {SPECS.map(([k, v], i) => (
+              <div
+                key={k}
+                className={`grid grid-cols-[10rem_1fr] gap-3 px-4 py-3 text-sm ${
+                  i ? "border-t border-[var(--line)]" : ""
+                }`}
+              >
+                <span className="font-mono text-xs text-[var(--dim)]">{k}</span>
+                <span className="text-[var(--fg)]">{v}</span>
               </div>
             ))}
           </div>
           <Term title="the whole image">{`FROM scratch
-COPY agentd /agentd        # one static musl binary
-USER 65532:65532           # nonroot
+COPY agentd /agentd
 ENTRYPOINT ["/agentd"]
 
-# no shell · no libc · no package manager · nothing to attack or patch
-# HTTPS by default (rustls + bundled roots) — dial https:// with no CA bundle
-# opt-in k8s probes: --metrics-addr :9090 → /healthz /readyz /metrics
-# terminal statuses → exit codes a podFailurePolicy branches on`}</Term>
+# ~1.2 MiB pull · cold start <1 ms · idle ~2 MiB RSS`}</Term>
         </div>
       </Section>
 
       {/* ── run it ───────────────────────────────────────────── */}
       <Section
         id="run"
-        eyebrow="quickstart"
-        title="Run it"
-        intro="Pull the image, or build from source. Point it at a remote MCP server and a model over HTTPS, and go."
+        eyebrow="run it"
+        title="Point it at a model and a server, and go"
+        intro="Install the binary, write twenty lines of YAML, and validate before anything runs."
       >
         <div className="grid gap-4 lg:grid-cols-2">
-          <Term title="docker">{`$ docker run --rm ghcr.io/agentd-dev/agentd \\
-    --instruction "summarize /data/report.txt and write a digest" \\
-    --mcp fs=https://mcp-fs.internal/mcp \\
+          <Term title="install and check">{`$ curl -fsSL https://agentd.dev/install.sh | sh
+$ agentd --validate-config -c agent.yaml
+{"event":"config.valid","schema":"2"}`}</Term>
+          <Term title="or in a container">{`$ docker run --rm ghcr.io/agentd-dev/agentd:latest \\
+    --prompt "summarise the incident channel" \\
     --intelligence https://gateway.internal/v1 \\
-    --model claude-sonnet-5`}</Term>
-          <Term title="kubernetes — a one-shot Job">{`apiVersion: batch/v1
-kind: Job
-metadata: { name: agentd-digest }
-spec:
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: agentd
-          image: ghcr.io/agentd-dev/agentd:latest
-          args: ["--mcp", "fs=https://mcp-fs.internal/mcp"]
-          env:
-            - { name: INSTRUCTION, value: "digest the report" }
-            - { name: AGENT_INTELLIGENCE, value: "https://gw/v1" }
-      # podFailurePolicy maps agentd's exit codes → retriable vs terminal`}</Term>
+    --mcp slack=https://mcp-slack.internal/mcp`}</Term>
         </div>
-        <div className="mt-6 flex flex-wrap items-center gap-3 text-sm">
-          <a href="https://github.com/agentd-dev/source-code" className="btn btn-primary">
-            star on github ↗
-          </a>
-          <Link href="/docs/getting-started/" className="btn">
-            getting started
+        <div className="mt-6 flex flex-wrap items-center gap-3">
+          <Link href="/docs/getting-started/" className="btn btn-primary">
+            Getting started
           </Link>
-          <Link href="/docs/architecture/" className="btn">
-            architecture
+          <Link href="/docs/coding-agent/" className="btn">
+            Build a coding agent
           </Link>
-          <Link href="/docs/mcp/" className="btn">
-            mcp
+          <Link href="/docs/configuration/" className="btn">
+            Configuration
           </Link>
-          <span className="text-[var(--dim)]">
-            Job · CronJob · Deployment manifests in <span className="kbd">examples/k8s/</span>
-          </span>
         </div>
       </Section>
     </main>

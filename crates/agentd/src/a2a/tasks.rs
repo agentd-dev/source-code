@@ -70,6 +70,20 @@ pub enum Link {
     },
 }
 
+/// A webhook a caller registered for this task's updates (A2A push
+/// notifications). `token` is echoed back in `X-A2A-Notification-Token` so the
+/// receiver can tell a real delivery from a stray POST; `bearer` is a
+/// credential agentd presents *to* the receiver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PushTarget {
+    pub id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+}
+
 /// The durable task record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -96,6 +110,11 @@ pub struct Task {
     /// The transition history (state, ts).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<Value>,
+    /// Where to POST this task's updates, for a caller that would rather be
+    /// told than hold a stream open. Durable with the task, so a restart keeps
+    /// the promise the caller was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub push: Vec<PushTarget>,
     #[serde(skip)]
     pub dirty: bool,
 }
@@ -115,6 +134,7 @@ impl Task {
             created: now,
             updated: now,
             history: vec![json!({"state": State::Submitted.wire(), "ts": now})],
+            push: Vec::new(),
             dirty: true,
         }
     }

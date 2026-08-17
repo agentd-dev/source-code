@@ -976,6 +976,25 @@ pub struct A2a {
     pub principals: Vec<Principal>,
     pub peers: Vec<A2aPeer>,
     pub conversation_ttl: Option<Dur>,
+    pub push: A2aPush,
+}
+
+/// **Push notifications**: a caller registers a webhook and agentd POSTs its
+/// task's updates there instead of holding a stream open.
+///
+/// Default-OFF, because the URL comes from the caller: every delivery is an
+/// outbound request to an address a *peer* chose, which is the shape of an SSRF.
+/// Enabling it says you are willing to make that request; `allow_private` says
+/// you are willing to make it to a private or loopback address, which is a
+/// separate and larger decision (a peer could otherwise reach agentd's own
+/// surfaces, or a cloud metadata endpoint).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct A2aPush {
+    /// Accept `CreateTaskPushNotificationConfig` and deliver on transitions.
+    pub enabled: bool,
+    /// Permit webhook targets on private / loopback addresses.
+    pub allow_private: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1335,6 +1354,29 @@ pub struct Cgroup {
 pub struct Cluster {
     pub shard: Option<String>,
     pub timer_shard: Option<String>,
+}
+
+impl Cluster {
+    /// This replica's shard identity, as the runtime needs it.
+    ///
+    /// A malformed value cannot reach here — validation rejects it before the
+    /// runtime starts — so an unparseable one degrades to "unsharded, owns
+    /// everything", which is the safe direction for the one thing this decides:
+    /// whether a scheduled workflow fires.
+    pub fn shard(&self) -> crate::config::ShardCfg {
+        let mut cfg = crate::config::ShardCfg::default();
+        if let Some(spec) = &self.shard {
+            cfg.set(spec);
+        }
+        if let Some(mode) = self
+            .timer_shard
+            .as_deref()
+            .and_then(crate::config::TimerShardMode::parse)
+        {
+            cfg.timer = mode;
+        }
+        cfg
+    }
 }
 
 impl Settings {
@@ -3020,6 +3062,32 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             &mut d,
             format!("cluster.timer_shard: {t:?} (want shard0|keyed)"),
         );
+    }
+    // `shard` on a subscribe start promises that deliveries are partitioned
+    // across the fleet. They are not — nothing filters an MCP notification by
+    // shard. Accepting it silently is the one outcome that guarantees duplicate
+    // processing while looking configured, so it is refused with the truth.
+    // (Timer starts ARE sharded; see `cluster.timer_shard`.)
+    for w in &s.workflows {
+        let name = w.get("name").and_then(Value::as_str).unwrap_or("?");
+        let Some(steps) = w.get("steps").and_then(Value::as_object) else {
+            continue;
+        };
+        for (node, spec) in steps {
+            if spec.get("kind").and_then(Value::as_str) == Some("subscribe")
+                && spec.get("shard").is_some()
+            {
+                err(
+                    &mut d,
+                    format!(
+                        "workflow {name:?} step {node:?}: `shard` is not implemented for \
+                         subscribe deliveries — every replica would still receive every \
+                         notification. Partition the work with `claim`, or shard the timer \
+                         starts with cluster.timer_shard."
+                    ),
+                );
+            }
+        }
     }
 
     // secrets provenance: the FILE layer must not carry inline secrets

@@ -12,6 +12,9 @@ pub mod peer;
 #[cfg(feature = "a2a")]
 pub mod ports;
 pub mod principals;
+/// Push notifications: telling a caller instead of making it watch.
+#[cfg(feature = "a2a")]
+pub mod push;
 /// The listener: identity in, protocol out.
 #[cfg(feature = "a2a")]
 pub mod serve;

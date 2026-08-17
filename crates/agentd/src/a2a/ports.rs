@@ -242,31 +242,64 @@ impl AsyncTaskQuery for RuntimePorts {
     }
 }
 
+/// Push notifications: a caller registers a webhook and is told about its task
+/// instead of watching it.
+///
+/// The register/read/delete half is here; the *delivery* half is
+/// [`StreamSink::push`], fired from the reactor where every transition passes.
+/// Both are refused unless `a2a.push.enabled` — the URL comes from a peer, so
+/// making the request at all is the operator's decision (see
+/// [`crate::a2a::push`]).
 #[async_trait::async_trait]
 impl AsyncNotificationManager for RuntimePorts {
     async fn set_config(
         &self,
-        _config: &TaskPushNotificationConfig,
+        config: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        Err(A2AError::PushNotificationNotSupported)
+        let who = caller();
+        let params = json!({
+            "taskId": config.task_id,
+            "pushNotificationConfig": serde_json::to_value(config).map_err(A2AError::JsonParse)?,
+        });
+        let v = self.call("PushConfigSet", params, &who).await?;
+        serde_json::from_value(v).map_err(A2AError::JsonParse)
     }
+
     async fn get_config(
         &self,
-        _params: &a2a_rs::domain::GetTaskPushNotificationConfigParams,
+        params: &a2a_rs::domain::GetTaskPushNotificationConfigParams,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        Err(A2AError::PushNotificationNotSupported)
+        let who = caller();
+        let req = json!({
+            "taskId": params.id,
+            "pushNotificationConfigId": params.push_notification_config_id,
+        });
+        let v = self.call("PushConfigGet", req, &who).await?;
+        serde_json::from_value(v).map_err(A2AError::JsonParse)
     }
+
     async fn list_configs(
         &self,
-        _params: &a2a_rs::domain::ListTaskPushNotificationConfigsParams,
+        params: &a2a_rs::domain::ListTaskPushNotificationConfigsParams,
     ) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
-        Err(A2AError::PushNotificationNotSupported)
+        let who = caller();
+        let v = self
+            .call("PushConfigList", json!({"taskId": params.id}), &who)
+            .await?;
+        serde_json::from_value(v["configs"].clone()).map_err(A2AError::JsonParse)
     }
+
     async fn delete_config(
         &self,
-        _params: &a2a_rs::domain::DeleteTaskPushNotificationConfigParams,
+        params: &a2a_rs::domain::DeleteTaskPushNotificationConfigParams,
     ) -> Result<(), A2AError> {
-        Err(A2AError::PushNotificationNotSupported)
+        let who = caller();
+        let req = json!({
+            "taskId": params.id,
+            "pushNotificationConfigId": params.push_notification_config_id,
+        });
+        self.call("PushConfigDelete", req, &who).await?;
+        Ok(())
     }
 }
 
@@ -362,14 +395,20 @@ impl AsyncStreamingHandler for SharedStreaming {
 pub struct StreamSink {
     updates: Arc<a2a_rs::adapter::InMemoryStreamingHandler>,
     handle: tokio::runtime::Handle,
+    log: crate::obs::log::Logger,
 }
 
 impl StreamSink {
     pub fn new(
         updates: Arc<a2a_rs::adapter::InMemoryStreamingHandler>,
         handle: tokio::runtime::Handle,
+        log: crate::obs::log::Logger,
     ) -> StreamSink {
-        StreamSink { updates, handle }
+        StreamSink {
+            updates,
+            handle,
+            log,
+        }
     }
 
     /// Publish a status transition.
@@ -383,6 +422,33 @@ impl StreamSink {
     ) {
         let ev = crate::a2a::wire::status_event(task_id, context_id, state, message, at_ms);
         self.spawn_status(task_id.to_string(), ev);
+    }
+
+    /// Deliver this task's state to every webhook registered on it.
+    ///
+    /// Best-effort and off the reactor: a webhook that is down, slow, or now
+    /// pointing somewhere it should not must not affect the task it is
+    /// reporting on. Each delivery is one blocking POST on the blocking pool.
+    pub fn push(&self, task: &crate::a2a::tasks::Task, allow_private: bool) {
+        let event = serde_json::to_value(crate::a2a::wire::task(task)).unwrap_or_default();
+        for target in &task.push {
+            let target = target.clone();
+            let event = event.clone();
+            let task_id = task.id.clone();
+            let log = self.log.clone();
+            self.handle.spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    crate::a2a::push::deliver(&target, &event, allow_private)
+                })
+                .await;
+                if let Ok(Err(e)) = outcome {
+                    log.warn(
+                        "a2a.push.failed",
+                        serde_json::json!({"task": task_id, "err": e}),
+                    );
+                }
+            });
+        }
     }
 
     /// Publish a delivered artifact.

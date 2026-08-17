@@ -117,6 +117,7 @@ pub fn spawn(
     let sink = Arc::new(ports::StreamSink::new(
         Arc::clone(&updates),
         runtime.handle().clone(),
+        log.clone(),
     ));
     let ports = RuntimePorts::new(Arc::clone(&bridge), Arc::clone(&updates));
     let adapter = Arc::new(
@@ -253,12 +254,36 @@ struct CardFromRuntime(Arc<A2aBridge>);
 #[async_trait::async_trait]
 impl a2a_rs::services::AgentInfoProvider for CardFromRuntime {
     async fn get_agent_card(&self) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
+        self.card("GetAgentCard", Principal::anonymous()).await
+    }
+
+    /// The authenticated card, scoped to whoever is asking. The caller travels
+    /// on the request's task-local, because the port takes none.
+    async fn get_authenticated_extended_card(
+        &self,
+    ) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
+        self.card("GetExtendedAgentCard", ports::caller()).await
+    }
+}
+
+impl CardFromRuntime {
+    async fn card(
+        &self,
+        method: &'static str,
+        who: Principal,
+    ) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
         let bridge = Arc::clone(&self.0);
-        let v = tokio::task::spawn_blocking(move || {
-            bridge.call("GetAgentCard", json!({}), Principal::anonymous())
-        })
-        .await
-        .map_err(|e| a2a_rs::domain::A2AError::Internal(e.to_string()))?;
+        let v = tokio::task::spawn_blocking(move || bridge.call(method, json!({}), who))
+            .await
+            .map_err(|e| a2a_rs::domain::A2AError::Internal(e.to_string()))?;
+        if let Some(e) = v.get("_error") {
+            return Err(a2a_rs::domain::A2AError::UnsupportedOperation(
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no extended card")
+                    .to_string(),
+            ));
+        }
         serde_json::from_value(v).map_err(a2a_rs::domain::A2AError::JsonParse)
     }
 }
@@ -393,8 +418,21 @@ async fn dispatch(
         // Discovery. The spec's JSON-RPC binding has no method for the *public*
         // card — it is fetched from `.well-known` — but every agentd client asks
         // for it here, so both ways work and both are unauthenticated.
-        "GetAgentCard" | "agent/card" | "agent/getAuthenticatedExtendedCard" => {
+        "GetAgentCard" | "agent/card" => {
             return unary(&app, id, "GetAgentCard", json!({}), principal).await;
+        }
+        // Served here rather than passed down for the same reason as the public
+        // card: both must be the *same document*, and a round trip through the
+        // SDK's `AgentCard` drops any field it has no place for.
+        "GetExtendedAgentCard" | "agent/getAuthenticatedExtendedCard" => {
+            if principal.is_anonymous() {
+                return err(
+                    id,
+                    -32007,
+                    "the extended card requires an authenticated caller",
+                );
+            }
+            return unary(&app, id, "GetExtendedAgentCard", json!({}), principal).await;
         }
         // The one method an anonymous caller may use: exchanging the rotating
         // code for a session token IS the login (RFC 0032 §13).
@@ -447,7 +485,8 @@ async fn dispatch(
     if matches!(bare.as_str(), "SendMessage" | "SendStreamingMessage")
         && crate::runtime::a2a_server::command_op(&params["message"]).is_some()
     {
-        return unary(&app, id, "SendMessage", params, principal).await;
+        let streaming = bare == "SendStreamingMessage";
+        return unary_maybe_streamed(&app, id, "SendMessage", params, principal, streaming).await;
     }
 
     // A send with no task id yet gets one now. The protocol layer subscribes to
@@ -541,15 +580,43 @@ async fn unary(
     params: Value,
     principal: Principal,
 ) -> Response {
+    unary_maybe_streamed(app, id, method, params, principal, false).await
+}
+
+/// [`unary`], but able to answer as a one-frame SSE stream.
+///
+/// `SendStreamingMessage` promises a stream, and that promise does not depend on
+/// what the message turned out to contain. A command DataPart is answered by the
+/// runtime in one step, so there is exactly one frame to send — but a caller
+/// that asked for a stream and received a JSON body would fail to parse it,
+/// which is a worse answer than a short stream.
+async fn unary_maybe_streamed(
+    app: &Arc<App>,
+    id: Value,
+    method: &str,
+    params: Value,
+    principal: Principal,
+    streamed: bool,
+) -> Response {
     let bridge = Arc::clone(&app.bridge);
     let method = method.to_string();
     let v = tokio::task::spawn_blocking(move || bridge.call(&method, params, principal))
         .await
         .unwrap_or_else(|e| json!({"_error": {"code": -32603, "message": e.to_string()}}));
-    match v.get("_error") {
-        Some(e) => json_response(json!({"jsonrpc": "2.0", "id": id, "error": e})),
-        None => json_response(json!({"jsonrpc": "2.0", "id": id, "result": v})),
+    let envelope = match v.get("_error") {
+        Some(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
+        None => json!({"jsonrpc": "2.0", "id": id, "result": v}),
+    };
+    if !streamed {
+        return json_response(envelope);
     }
+    let frame = axum::response::sse::Event::default()
+        .id("1")
+        .data(serde_json::to_string(&envelope).unwrap_or_default());
+    axum::response::Sse::new(futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(frame)
+    }))
+    .into_response()
 }
 
 fn json_response(v: Value) -> Response {

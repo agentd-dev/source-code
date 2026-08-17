@@ -7,6 +7,44 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Added (push notifications, the authenticated card, and a shard gate that works)
+
+- **Push notifications.** A caller registers a webhook and agentd POSTs its
+  task's updates there instead of the caller holding a stream open. Default-OFF
+  at two levels, because the URL comes from a peer: `a2a.push.enabled` says you
+  will make the request at all, and `a2a.push.allow_private` — a separate and
+  larger decision — says you will make it to a private or loopback address. The
+  target is guarded at registration *and* again at delivery, since a name can
+  resolve somewhere new in between. Configs are durable with the task, so a
+  restart keeps the promise the caller was given.
+- **`GetExtendedAgentCard`.** The authenticated card: the same document, with
+  the skills this caller may actually run rather than every workflow. An
+  anonymous caller gets `-32007`.
+- **Sharded timer starts are real.** `cluster.shard` + `cluster.timer_shard`
+  now decide whether a `schedule`/`loop`/`cron`/`once` start fires on this
+  replica — `shard0` (replica 0 owns every timer) or `keyed` (each start hashes
+  to one). Three replicas arming the same nightly job used to run it three
+  times. Skips are counted in `agent_shard_skipped_total`.
+
+### Fixed
+
+- **The agent card named no interface.** It carried the older flat
+  `url`/`preferredTransport`, and nothing in `supportedInterfaces` — so a peer
+  reading the card parsed it happily and had nowhere to send anything.
+  Discovery is the card's whole purpose; the interface is now there, and the
+  spec oracle asserts it.
+- **`SendStreamingMessage` sometimes did not stream.** A command DataPart was
+  answered with a JSON body, so a caller that asked for SSE could not parse the
+  reply. A streaming method answers with a stream whatever the message contained.
+- **`shard` on a `subscribe` start is refused rather than ignored.** It promised
+  partitioned deliveries and filtered nothing, so a fleet built on it processed
+  everything N times while looking configured. Failing to start is the honest
+  answer; `docs/scaling.md` says what to use instead.
+
+The spec oracle grew from 8 checks to 13 — discovery, capability honesty,
+cancellation, stream resumability and the push-config surface — which is how the
+first two fixes above were found.
+
 ### Changed (BREAKING: MCP and A2A are the published implementations now)
 
 agentd used to implement both protocols itself. It does not any more, and the

@@ -67,7 +67,18 @@ impl Principal {
                 | "CancelTask"
                 | "ListTasks"
                 | "SubscribeToTask"
-                | "SubscribeToEvents" => match op {
+                | "SubscribeToEvents"
+                // The push-notification family is scoped to the caller's own
+                // tasks the same way `GetTask` is — ownership is enforced at
+                // the task, so any named caller may manage webhooks on what it
+                // started.
+                | "CreateTaskPushNotificationConfig"
+                | "GetTaskPushNotificationConfig"
+                | "ListTaskPushNotificationConfigs"
+                | "DeleteTaskPushNotificationConfig"
+                // The extended card is the *authenticated* card: any named
+                // caller may read it, and it is scoped to what they may run.
+                | "GetExtendedAgentCard" => match op {
                     None => true, // natural language / streaming
                     Some(tool) => self.may_command(tool),
                 },

@@ -43,6 +43,12 @@ type PendingSwap = Arc<Mutex<Option<SwapIntel>>>;
 
 pub(crate) type Up = Arc<Mutex<Stdout>>;
 
+/// How long an MCP server's `elicitation/create` waits for a human before the
+/// server is told `cancel`. The gate itself may outlive this — the operator can
+/// still answer it in the TUI — but a server should not hold a request open
+/// indefinitely waiting for someone to walk back to their desk.
+const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The in-child self-handler for an agentd 2.0 subagent (RFC 0026 §6). A subagent
 /// is a **flat child of the reactor** — it runs a ReAct loop over its granted
 /// MCP + code tools and reports its result; it has **no** in-child orchestration
@@ -186,7 +192,19 @@ pub fn run() -> i32 {
 
     let mut servers = Vec::new();
     for spec in &payload.mcp_servers {
+        // Let this server ask the operator questions: `elicitation/create`
+        // round-trips to the supervisor's `ask_human`, which renders a gate in
+        // every attached client. Declared per-connection so a server only asks
+        // when we can actually deliver the question to a human.
+        let elicit: Arc<dyn ::mcp::inbound::Handler> =
+            Arc::new(crate::mcp::elicit::ElicitationBridge::new(
+                Arc::clone(&up),
+                Arc::clone(&replies),
+                Arc::clone(&cancel),
+                ELICITATION_TIMEOUT,
+            ));
         let connected = crate::mcp::from_spec(spec, Duration::from_secs(60))
+            .map(|c| c.with_elicitation(elicit))
             .and_then(|mut c| c.initialize().map(|()| c));
         match connected {
             Ok(mut c) => {

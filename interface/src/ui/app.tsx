@@ -110,32 +110,52 @@ function EdgeItem({ name, mirror, endpoint, active }: { name: string; mirror: Mi
   }
 }
 
+/**
+ * Who said what is carried by TREATMENT, not by an author label: the user's
+ * own lines are inverted (the same idiom as the TUI), everything else takes a
+ * gutter mark. `white-space: pre-wrap` in the stylesheet keeps multi-line
+ * bodies intact.
+ */
 function Row({ e }: { e: TranscriptEntry }): React.JSX.Element {
   if (e.kind === 'user')
     return (
-      <div className="row">
-        <span className="who-user">you › </span>
-        {e.text}
-        {e.principal && e.principal !== 'operator' ? <span className="principal"> ({e.principal})</span> : null}
+      <div className="row user">
+        <div className="bubble">{e.text}</div>
+        {e.principal && e.principal !== 'operator' ? (
+          <div className="principal">{e.principal}</div>
+        ) : null}
       </div>
     );
   if (e.kind === 'agent')
     return (
-      <div className="row">
-        <span className="who-agent">agent › </span>
-        {e.text}
-        {e.inputRequired ? <span className="gate"> [reply to continue]</span> : null}
+      <div className="row agent">
+        <span className="mark">●</span>
+        <span className="body">
+          {e.text}
+          {e.inputRequired ? <span className="gate"> ⏎ reply to continue</span> : null}
+        </span>
       </div>
     );
   if (e.kind === 'error')
     return (
-      <div className="row">
-        <span className="who-err">agent ✗ </span>
-        {e.text}
+      <div className="row err">
+        <span className="mark">✗</span>
+        <span className="body">{e.text}</span>
       </div>
     );
-  if (e.kind === 'command') return <div className="row cmd">▸ {e.text}</div>;
-  return <div className="row note">· {e.text}</div>;
+  if (e.kind === 'command')
+    return (
+      <div className="row cmd">
+        <span className="mark">▸</span>
+        <span className="body">{e.text}</span>
+      </div>
+    );
+  return (
+    <div className="row note">
+      <span className="mark">·</span>
+      <span className="body">{e.text}</span>
+    </div>
+  );
 }
 
 function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => void }): React.JSX.Element {
@@ -194,11 +214,20 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
           }}
         >
           <span className="prompt">›</span>
-          <input
+          <textarea
             autoFocus
+            rows={Math.min(12, input.split('\n').length)}
             value={input}
             onChange={(ev) => setInput(ev.target.value)}
             onKeyDown={(ev) => {
+              // Enter sends; Shift/Ctrl/Alt+Enter is a newline (a browser CAN
+              // tell them apart, unlike a terminal).
+              if (ev.key === 'Enter' && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+                ev.preventDefault();
+                if (input.trim()) onSend(input);
+                setInput('');
+                return;
+              }
               if (suggestions.length === 0) return;
               if (ev.key === 'Tab') {
                 ev.preventDefault();
@@ -211,7 +240,7 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
                 setSugIndex((i) => (i + 1) % suggestions.length);
               }
             }}
-            placeholder="message agentd — / commands · @skill · #target · $value"
+            placeholder="message agentd — / commands · @skill · #target · $value    (⇧⏎ newline)"
           />
         </form>
       </div>

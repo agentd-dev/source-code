@@ -88,7 +88,10 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
   mirror.apply({ seq: 2, ts: 20, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: 20 } } } });
   await tick();
   let frame = ui.lastFrame();
-  assert.match(frame, /you › What is up\?/);
+  // Authorship is treatment, not a label: the user's line carries the
+  // inverse block's gutter bar, the agent's a bullet.
+  assert.match(frame, /▌\s+What is up\?/);
+  assert.doesNotMatch(frame, /you ›/, 'no author labels');
   // With no activity record yet, the working row degrades to a bare label.
   assert.match(frame, /working/);
   assert.match(frame, /1 active/);
@@ -113,7 +116,7 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
   mirror.apply({ seq: 3, ts: 30, kind: 'task', data: { task: { id: 't1', contextId: 'c1', updated: 30, status: { state: 'TASK_STATE_COMPLETED', timestamp: 30 }, artifacts: [{ parts: [{ text: 'All good.' }] }] } } });
   await tick();
   frame = ui.lastFrame();
-  assert.match(frame, /agent › All good\./);
+  assert.match(frame, /● All good\./);
   assert.doesNotMatch(frame, /working —/);
   ui.unmount();
 });
@@ -126,7 +129,7 @@ test('draining and input-required surface prominently', async () => {
   await tick();
   const frame = ui.lastFrame();
   assert.match(frame, /Which env\?/);
-  assert.match(frame, /\[reply to continue\]/);
+  assert.match(frame, /⏎ reply to continue/);
   assert.match(frame, /DRAINING/);
   ui.unmount();
 });
@@ -137,14 +140,16 @@ test('fullscreen windows the transcript from the bottom and reports what is abov
     key: `k${i}`, ctx: 'c', ts: i, kind: 'user', text: `line ${i}`,
   }));
   // Following the tail: the last N that fit, nothing hidden below.
+  // Each message costs its body plus the blank separator row that spaces the
+  // conversation out, so a 5-row window holds two of them.
   const bottom = windowEntries(entries, { rows: 5, columns: 80, offset: 0 });
-  assert.equal(bottom.visible.length, 5);
+  assert.equal(bottom.visible.length, 2);
   assert.equal(bottom.visible.at(-1).text, 'line 19', 'anchored at the live end');
-  assert.equal(bottom.above, 15);
+  assert.equal(bottom.above, 18);
   // Scrolled up by 10: the window moves back, the tail is hidden below.
   const up = windowEntries(entries, { rows: 5, columns: 80, offset: 10 });
   assert.equal(up.visible.at(-1).text, 'line 9');
-  assert.equal(up.above, 5);
+  assert.equal(up.above, 8);
   // Wrapped entries take more rows, so fewer fit.
   const long = [{ key: 'l', ctx: 'c', ts: 0, kind: 'user', text: 'x'.repeat(300) }, ...entries];
   const wrapped = windowEntries(long, { rows: 4, columns: 40, offset: 20 });

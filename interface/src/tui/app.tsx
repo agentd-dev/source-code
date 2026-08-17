@@ -16,7 +16,7 @@ import React, {
   useSyncExternalStore,
 } from 'react';
 import { Box, Text, useApp, useInput, useStdin, useWindowSize } from 'ink';
-import TextInput from 'ink-text-input';
+import { MultilineInput, type EditState } from './parts/input.js';
 import {
   AgentdClient,
   Json,
@@ -80,6 +80,8 @@ export function App(props: AppProps): React.JSX.Element {
   /** Entries hidden below the viewport (0 = following the live end). */
   const [scroll, setScroll] = useState(0);
   const [input, setInput] = useState('');
+  // The composer is a multiline editor, so the cursor is app state too.
+  const [cursor, setCursor] = useState(0);
   const [selected, setSelected] = useState(0);
   const [sugIndex, setSugIndex] = useState(0);
   const [subDetail, setSubDetail] = useState<{ handle: string; detail: Json | null } | null>(null);
@@ -151,11 +153,15 @@ export function App(props: AppProps): React.JSX.Element {
   });
 
   // Rows the body may use: the terminal minus the chrome (top edge, composer,
-  // suggestions, bottom edge — which wraps on narrow terminals).
+  // suggestions, bottom edge — which wraps on narrow terminals). The
+  // fullscreen composer is boxed, so it costs its two border rows too; get
+  // this wrong and the viewport overflows and clips its own newest message.
+  const composerRows = 1 + (props.fullscreen !== false && isRawModeSupported ? 2 : 0);
   const bodyRows = Math.max(
     3,
     rows -
-      (3 +
+      (2 +
+        composerRows +
         (suggestions.length > 0 ? 1 : 0) +
         // The bottom edge wraps to a second line only on a narrow terminal.
         (columns < 100 && (s.info?.display?.bottom?.length ?? 8) > 6 ? 1 : 0)),
@@ -165,6 +171,7 @@ export function App(props: AppProps): React.JSX.Element {
     async (raw: string) => {
       const trimmed = raw.trim();
       setInput('');
+      setCursor(0);
       if (trimmed.length === 0) return;
       if (trimmed.startsWith('/')) {
         await runSlash(trimmed);
@@ -377,8 +384,15 @@ export function App(props: AppProps): React.JSX.Element {
     (ch, key) => {
       // Suggestions capture Tab/↑/↓ while visible (chat only).
       if (screen === 'chat' && suggestions.length > 0) {
-        if (key.tab || key.rightArrow) {
-          setInput(applySuggestion(input, suggestions[Math.min(sugIndex, suggestions.length - 1)]));
+        if (key.tab) {
+          {
+            const next = applySuggestion(
+              input,
+              suggestions[Math.min(sugIndex, suggestions.length - 1)],
+            );
+            setInput(next);
+            setCursor(next.length);
+          }
           return;
         }
         if (key.upArrow) {
@@ -511,11 +525,27 @@ export function App(props: AppProps): React.JSX.Element {
       {screen === 'chat' ? (
         isRawModeSupported ? (
           <Box flexDirection="column">
-            <Box flexDirection="row">
+            <Box
+              flexDirection="row"
+              borderStyle={fullscreen ? 'round' : undefined}
+              borderColor={theme.border}
+              paddingX={fullscreen ? 1 : 0}
+            >
               <Text color={theme.accent} bold>
                 {'› '}
               </Text>
-              <TextInput value={input} onChange={setInput} onSubmit={(v: string) => void submit(v)} />
+              <Box flexGrow={1}>
+                <MultilineInput
+                  value={input}
+                  cursor={cursor}
+                  onChange={(s: EditState) => {
+                    setInput(s.value);
+                    setCursor(s.cursor);
+                  }}
+                  onSubmit={(v: string) => void submit(v)}
+                  ignoreVertical={suggestions.length > 0}
+                />
+              </Box>
             </Box>
             {suggestions.length > 0 ? (
               <Box flexDirection="row" gap={2} marginLeft={2}>

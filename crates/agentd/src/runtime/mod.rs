@@ -380,6 +380,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         a2a_pairing: None,
         activity: BTreeMap::new(),
+        last_root_reply: None,
         #[cfg(feature = "a2a")]
         feed_marks: BTreeMap::new(),
         #[cfg(feature = "a2a")]
@@ -657,6 +658,23 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     {
         crate::obs::otel::arm_logs(&ep, "agentd", crate::VERSION);
         log.info("otel.logs.armed", json!({"endpoint": ep}));
+    }
+    // `--prompt`: the task, delivered as a MESSAGE into the agent's root
+    // context — the same path an A2A message takes. Root scope is the point:
+    // the agent answers with its full tool surface, so a prompt may set the
+    // instance up (`workflow.create` a loop/schedule/subscribe) instead of
+    // only answering once. Whether the process then exits is the ordinary
+    // lifecycle question: `auto` stays up iff something long-lived is armed.
+    if let Some(prompt) = rt.settings.agent.prompt.clone()
+        && !prompt.trim().is_empty()
+    {
+        if let Err(err) = rt.accept_event(
+            events::kinds::A2A_MESSAGE,
+            Some("operator".into()),
+            json!({"text": prompt, "context_id": crate::context::ROOT}),
+        ) {
+            log.warn("prompt.reject", json!({"err": err}));
+        }
     }
     // A debug-only seam (`AGENTD_TEST_INBOX_FILE`): inject inbox events from a
     // JSON file — the e2e suite's stand-in for the A2A server until P5.

@@ -7,6 +7,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Added (`--prompt`: a one-shot job, or a self-setup)
+
+- **`agentd --prompt "…" --intelligence <url>`** asks, answers on stdout, and
+  exits — the shape people expect from an agent CLI. `--prompt-file` and
+  `AGENTD_AGENT_PROMPT` work too, and `--instruction` still means the standing
+  policy: give both and the instruction is the system prompt while the prompt
+  is the task.
+- **The prompt is delivered as a message into the agent's root context**, not
+  as a synthesized workflow step, and that distinction is the feature:
+  workflow-authoring tools are root-scoped, so a prompt running as a step could
+  never build what it was asked for. A prompt may therefore **set the instance
+  up** — "check the queue every 30 seconds from now on" has the agent
+  `workflow.create` its own `loop`/`schedule`/`subscribe` workflow.
+- **`lifecycle.run_until: auto` now re-reads the live workflow set.** It used
+  to decide "job or daemon" once, at startup, from the *configured* workflows —
+  so an instance that armed a long-lived workflow at runtime idle-exited out
+  from under it moments later. A self-set-up agent now stays up, and a plain
+  one-shot still exits.
+
 ### Changed (the display clients ship as one package: `@agentd-dev/cli`)
 
 - **Three npm packages became one.** `@agentd/client`, `@agentd/tui` and

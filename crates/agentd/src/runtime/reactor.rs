@@ -265,6 +265,9 @@ pub struct Runtime {
     pub(crate) a2a_pairing: Option<std::sync::Arc<super::a2a_server::PairingState>>,
     /// Live per-unit activity (RFC 0032 §17), keyed by child node id.
     pub(crate) activity: BTreeMap<u64, super::activity::Activity>,
+    /// The newest root-context reply, so a `--prompt` job can print its answer
+    /// (a prompt runs as a turn, not as a `once` run with an output).
+    pub(crate) last_root_reply: Option<String>,
     /// Per-item fingerprints behind the feed's section diffing (`feed_tick`).
     #[cfg(feature = "a2a")]
     pub(crate) feed_marks: BTreeMap<String, u64>,
@@ -682,10 +685,17 @@ impl Runtime {
         }
         // Job shape / idle policy.
         let run_until = self.settings.lifecycle.run_until;
+        // `auto` re-reads the LIVE workflow set, not just the configured one:
+        // a long-lived workflow the agent defined at runtime (`workflow.create`
+        // — the self-setup shape, where a `--prompt` tells it to build its own
+        // loop/schedule/subscribe) turns the one-shot job into a daemon exactly
+        // as a configured one would have. Without this the instance idle-exits
+        // out from under the thing it was just asked to set up.
+        let job_now = self.job_shape && !self.workflows.values().any(|w| w.is_long_lived());
         let idle_policy = match run_until {
             RunUntil::Idle => true,
             RunUntil::Drained => false,
-            RunUntil::Auto => self.job_shape,
+            RunUntil::Auto => job_now,
         };
         if !idle_policy {
             return None;
@@ -704,7 +714,7 @@ impl Runtime {
             return None;
         }
         let since = *self.idle_since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= self.settings.lifecycle.idle_grace() || self.job_shape {
+        if since.elapsed() >= self.settings.lifecycle.idle_grace() || job_now {
             let code = self.job_exit_code();
             self.log.info(
                 "lifecycle.idle_exit",
@@ -755,6 +765,9 @@ impl Runtime {
             .rev()
             .filter_map(|id| self.runs.get(id))
             .find_map(|r| r.output.clone())
+            // A `--prompt` job has no `once` run to carry an output: its answer
+            // is the root turn's reply.
+            .or_else(|| self.last_root_reply.clone().map(Value::String))
     }
 
     // ---- checkpoints ---------------------------------------------------------

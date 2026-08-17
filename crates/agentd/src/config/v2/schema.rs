@@ -86,6 +86,7 @@ fn top_level_properties(
                 "properties": {
                     "name": { "type": "string", "description": "instance identity (falls back to the downward-API instance, then the hostname)" },
                     "instruction": { "type": "string", "description": "static text, or a single-token URI a configured MCP server serves (read + subscribed)" },
+                    "prompt": { "type": "string", "description": "a one-shot task (--prompt): with no workflows configured the generated run executes this, while `instruction` stays the standing policy (the run's system prompt)" },
                     "preflight": { "enum": ["never", "auto", "always"] },
                     "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] } },
                     "on_workflow_finished": { "enum": ["ignore", "note", "think"] },

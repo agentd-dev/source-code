@@ -147,7 +147,7 @@ const SPECS = [
   ["protocols", "rmcp (official MCP SDK) · a2a-rs (A2A from the spec)"],
   ["transport", "HTTPS everywhere · rustls + ring · bundled roots"],
   ["reactor", "one writer thread · blocking I/O · kernel-enforced cancel"],
-  ["binary", "one static musl ELF · 2.98 MiB · stripped · on scratch"],
+  ["binary", "one static musl ELF · 6.6 MiB · stripped · on scratch"],
   ["arch", "amd64 + arm64 · nonroot · read-only rootfs"],
   ["supply chain", "cosign-signed · SPDX SBOM attested"],
 ];
@@ -415,7 +415,7 @@ export default function Home() {
 COPY agentd /agentd
 ENTRYPOINT ["/agentd"]
 
-# 1.5 MiB download · cold start <1 ms · idle ~2 MiB RSS`}</Term>
+# 3.0 MiB download · cold start <1 ms · idle ~2 MiB RSS`}</Term>
         </div>
       </Section>
 

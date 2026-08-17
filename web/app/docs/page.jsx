@@ -20,7 +20,7 @@ const PATHS = [
     href: "/docs/architecture/",
     kicker: "evaluating it",
     title: "Understand the design",
-    body: "Two loops, one binary, three dependencies. Start with the architecture, then read the harness for what keeps an agent bounded.",
+    body: "Two loops, one static binary, and the protocols from their own SDKs. Start with the architecture, then read the harness for what keeps an agent bounded.",
   },
   {
     href: "/docs/coding-agent/",

@@ -1864,6 +1864,22 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
 
     // --- FILE layer: several files, later wins (JSON Merge Patch) ---
     let config_paths = super::config_paths_from_map(args, &envmap);
+    // Two discovered spellings at once: refuse rather than pick. Whichever one
+    // agentd chose, somebody would be editing the other and wondering why
+    // nothing changed.
+    if config_paths.len() > 1
+        && config_paths.iter().all(|p| {
+            super::DISCOVERED_CONFIG_NAMES
+                .iter()
+                .any(|n| p.ends_with(n))
+        })
+    {
+        return Err(usage(format!(
+            "both {} and {} are present; keep one (or name the file with --config)",
+            super::DISCOVERED_CONFIG_NAMES[0],
+            super::DISCOVERED_CONFIG_NAMES[1]
+        )));
+    }
     let (file_doc, files) = if config_paths.is_empty() {
         (Value::Object(Map::new()), Vec::new())
     } else {

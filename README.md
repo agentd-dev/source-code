@@ -35,12 +35,16 @@ idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · Apache-2
 
 ## Why agentd
 
-1. **Minimalism as the moat.** Three direct external dependencies (`serde`,
-   `serde_json`, `libc`) — no async runtime, no framework, no C toolchain. The
-   HTTP client/server, cron parser, Prometheus text, OTLP export, and inotify
-   watch are all hand-rolled on `std` + `libc`. The result is a 3 MiB static
-   binary that starts in under a millisecond, idles at ~2 MiB, and ships as a
-   single-layer `FROM scratch` image with nothing to CVE-scan but agentd itself.
+1. **The protocols are not ours to get wrong.** MCP is
+   [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust
+   SDK; A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs), generated from
+   the specification's protocol buffers. Both run over agentd's own socket, so
+   request signing, mTLS and the SSRF guard survive the adoption. Everything
+   small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
+   export, the inotify watch — is still hand-rolled on `std` + `libc`. What
+   ships is one 6.5 MiB static binary that starts in under a millisecond, idles
+   at ~2 MiB, and lands as a single-layer `FROM scratch` image with no shell, no
+   libc, and nothing to CVE-scan but agentd itself.
 2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
    tool library and executes nothing locally. Every capability is a **remote MCP
    server** you declare with `--mcp name=https://…`. One protocol in, one
@@ -117,7 +121,8 @@ $ tar xzf agentd-$TAG-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
 $ docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
 ```
 
-**From source** (Rust stable; no C toolchain needed). Features are compile-time,
+**From source** (Rust stable; needs a C toolchain — `cmake` and a C++ compiler —
+because the protocol SDKs build `aws-lc-sys`). Features are compile-time,
 so `--capabilities` tells you what a given binary can actually do:
 
 ```console

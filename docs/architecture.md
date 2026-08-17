@@ -1,9 +1,9 @@
-# Architecture: one binary, two loops, three dependencies
+# Architecture: one binary, two loops, two protocols we did not write
 
 You are about to run something that holds your API keys, spawns processes, talks
 to a language model, and stays up for weeks. Before you do, you want three
 answers without reading the source: what happens when the model wedges mid-turn,
-what survives when the process dies, and how much third-party code you have just
+what survives when the process dies, and what third-party code you have just
 agreed to trust.
 
 One idea shapes all three: **hand-write the small, stable protocol layers, and
@@ -299,10 +299,13 @@ a SPIFFE `spiffe://` URI SAN reaches principal matching.
 
 ## What is hand-rolled, and why
 
+Everything in this table is small, frozen, and only partly needed — which is the
+whole rule. A protocol with a living specification is none of those, which is why
+MCP and A2A are not in it.
+
 | Layer | Where | Instead of |
 |---|---|---|
 | HTTP/1.1 client + SSE reader | `net/http.rs`, 644 lines | `ureq` + `url` → IDNA → ICU |
-| MCP Streamable-HTTP server | `mcp/http_server.rs`, 1,200 lines | an async web framework |
 | YAML subset reader | `config/yaml.rs`, 1,307 lines | `serde_yaml`, itself unmaintained |
 | JSON Schema subset | `jsonschema.rs`, 803 lines | a schema crate and a regex engine |
 | Cron | `triggers/timer.rs` | `croner` |
@@ -334,34 +337,42 @@ fire — and sets the same latch SIGHUP sets, so there is one reload code path.
 
 ### The dependency ledger, stated honestly
 
-The engine has **exactly three direct external dependencies**: `serde`,
-`serde_json`, and `libc` (unix-only). CI hard-fails if `cargo tree -p agentd-core
---depth 1` shows anything else.
+Two things in agentd are emphatically *not* hand-rolled, and they are the two
+that talk to other people's software:
 
-That number has a definition, and the definition does work. It counts *direct*
-dependencies, and the check excludes workspace path crates on the grounds that
-`net` and `mcp` are first-party code. The resolved graph is larger:
+| | Implementation | Why not ours |
+|---|---|---|
+| MCP | [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) — the official Rust SDK | a live specification, and a misreading fails in the *peer* |
+| A2A | [`a2a-rs`](https://github.com/emillindfors/a2a-rs) — generated from the spec's protobufs | same, and proven: an independent reading found four faults in ours |
+
+Both plug into agentd's own HTTP transport, so the credentials only agentd knows
+about — AAuth signatures, SigV4, mTLS identities, refreshed OAuth tokens — and
+the SSRF guard all still apply. The SDKs own the protocol; agentd owns the socket.
+
+The resolved graph is what it is:
 
 | Build | External crates |
 |---|---|
-| `--no-default-features` | 12 |
-| default (`tls`) | 26 |
-| the full shipped feature set | 26 |
-| `--features cel,workflow` | 54 |
+| `--no-default-features` | 78 |
+| default (`tls` + MCP) | 91 |
+| the full shipped feature set (adds A2A) | 187 |
 
-TLS is on by default, so the default build really does link rustls, ring,
-rustls-webpki, webpki-roots and their support crates — all arriving through
-`net`, where that surface was parked on purpose. One correction to a claim you
-may have read elsewhere: the default build **does** invoke a C compiler, because
-`ring` carries `cc` as a build dependency and compiles about 30 object files.
-What `ring` buys over `aws-lc-rs` is no cmake, not no C. `--no-default-features`
-is genuinely C-free.
+An earlier version of this document said "exactly three direct external
+dependencies" and pointed at a CI job that enforced it. That job is gone. The
+claim it protected — *you can hold the whole trust boundary in your head* — is no
+longer one agentd can make, and pretending otherwise would be worse than
+retiring it. What replaced it is a gate on the thing a user actually receives:
+the release binary must still be a statically linked musl artifact that runs on
+`scratch`, 6.5 MiB with no shell, no libc and no package manager.
 
-Three gates hold the line: a CI job asserts the direct-dependency count; another
-compiles, clippies and tests 17 feature combinations including every shipped
-feature solo, because `--all-features` unification hides broken solo builds; and
-`deny.toml` bans wildcard versions, denies yanked crates, and carries a
-hand-maintained permissive-only license allow-list.
+The build now needs a C toolchain — `cmake` and a C++ compiler, for the
+`aws-lc-sys` that arrives underneath the SDKs. That is a builder-image cost, not
+a shipping one.
+
+Two gates remain: the feature matrix compiles, clippies and tests 17 combinations
+including every shipped feature solo, because `--all-features` unification hides
+broken solo builds; and `deny.toml` bans wildcard versions, denies yanked crates,
+and carries a hand-maintained permissive-only licence allow-list.
 
 ---
 
@@ -374,7 +385,7 @@ dependencies.
 | Feature | Adds crates | Gates |
 |---|---|---|
 | `tls` *(default)* | rustls, ring, webpki-roots, … | HTTPS in and out |
-| `a2a` | none — chains `tls` | the inbound A2A / interface listener |
+| `a2a` | `a2a-rs`, axum, tokio, … | the inbound A2A / interface listener |
 | `cron` | none | the five-field UTC parser |
 | `oauth` | none | OAuth 2.1 device, PKCE and client-credentials tokens |
 | `metrics` | none | the atomic registry and Prometheus text |

@@ -144,10 +144,10 @@ const CAPS = [
 ];
 
 const SPECS = [
-  ["first-party deps", "3 (serde · serde_json · libc)"],
+  ["protocols", "rmcp (official MCP SDK) · a2a-rs (A2A from the spec)"],
   ["transport", "HTTPS everywhere · rustls + ring · bundled roots"],
-  ["runtime", "no async runtime · no C toolchain · blocking I/O + threads"],
-  ["binary", "one static musl ELF · stripped · on scratch"],
+  ["reactor", "one writer thread · blocking I/O · kernel-enforced cancel"],
+  ["binary", "one static musl ELF · 6.5 MiB · stripped · on scratch"],
   ["arch", "amd64 + arm64 · nonroot · read-only rootfs"],
   ["supply chain", "cosign-signed · SPDX SBOM attested"],
 ];
@@ -393,8 +393,8 @@ export default function Home() {
       {/* ── footprint ────────────────────────────────────────── */}
       <Section
         eyebrow="footprint"
-        title="Minimalism is the moat"
-        intro="Three direct dependencies. The HTTP client and server, the cron parser, the Prometheus text format, the OTLP exporter and the inotify watch are all hand-rolled on std + libc — which is why the image has nothing to scan but agentd itself."
+        title="Two protocols we don't implement, one file that ships"
+        intro="MCP is the official Rust SDK; A2A is generated from the specification's protocol buffers. Both run over agentd's own socket, so request signing, mTLS and the SSRF guard survive the adoption. What reaches you is still one static binary on an empty base — no shell, no libc, nothing to scan but agentd itself."
       >
         <div className="grid gap-4 lg:grid-cols-2">
           <div className="panel overflow-hidden">
@@ -414,7 +414,7 @@ export default function Home() {
 COPY agentd /agentd
 ENTRYPOINT ["/agentd"]
 
-# ~1.2 MiB pull · cold start <1 ms · idle ~2 MiB RSS`}</Term>
+# ~3 MiB pull · cold start <1 ms · idle ~2 MiB RSS`}</Term>
         </div>
       </Section>
 

@@ -9,11 +9,13 @@
 # scheduling, OTLP trace+log export, and SIGHUP + inotify config hot-reload (a
 # ConfigMap volume swap reloads in place). All but `a2a` (which pulls the TLS
 # stack) are hand-rolled and add NO dependency.
-# As of v2.0.0, HTTPS is the primary transport for both intelligence and MCP, so
-# `tls` is ON by DEFAULT: the binary carries pure-Rust rustls (`ring`, no cmake/C)
-# + bundled webpki roots — serde/serde_json + libc + rustls/ring/webpki-roots, no
-# async runtime, no C toolchain — links statically against musl, and ships on an
-# empty base: ~few MB, no shell, no libc, no package manager. Nothing to attack.
+# HTTPS is the primary transport for both intelligence and MCP, so `tls` is ON by
+# DEFAULT: rustls with the `ring` provider + bundled webpki roots, so there is no
+# system CA bundle to mount. MCP and A2A are the official/published protocol
+# implementations (`rmcp`, `a2a-rs`), which bring an async runtime and a C
+# toolchain into the BUILD — and change nothing about what ships: one static
+# musl binary on an empty base, a few MB, no shell, no libc, no package manager.
+# Nothing to attack.
 #
 # Change the capability surface at build time with FEATURES, e.g.:
 #   docker build --build-arg FEATURES=a2a,metrics,cron,otel .
@@ -28,10 +30,12 @@ ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one
-# Dockerfile produces native-static amd64 AND arm64 images. musl-dev supplies the
-# static C runtime stubs the linker references; the build is pure Rust (libc
-# *bindings* only — no C is compiled in the dependency-free feature set).
-RUN apk add --no-cache musl-dev
+# Dockerfile produces native-static amd64 AND arm64 images.
+#
+# The protocol SDKs (`rmcp` for MCP, `a2a-rs` for A2A) bring `aws-lc-sys`, which
+# is C compiled at build time — hence a real toolchain here. It is a *builder*
+# cost only: what ships is still one static binary on an empty base.
+RUN apk add --no-cache musl-dev cmake make perl g++
 WORKDIR /build
 COPY . .
 # Release profile (workspace Cargo.toml): LTO'd, stripped, size-optimized,

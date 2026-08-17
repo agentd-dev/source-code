@@ -9,8 +9,9 @@ argument about syntax.
 
 This is not a claim that Rust is fast: the workload is I/O- and syscall-bound,
 and the release profile trades CPU for size (`opt-level = "z"`). It is a claim
-that Rust makes a very small dependency graph affordable — and the graph is the
-real decision.
+about what the language makes affordable — writing the parts that are small and
+frozen by hand, on `std` and `libc`, while what ships stays one static binary
+with nothing else in the image.
 
 ## What the runtime has to do
 
@@ -22,71 +23,89 @@ weeks turns a small per-iteration leak into an OOM kill.
 per node in the process tree, not once per deployment.
 
 **It must be auditable.** The supervisor holds API keys and brokers whatever a
-model asks for; every crate linked into it sits inside that trust boundary. "How
-many things do I have to trust?" should have a number for an answer.
+model asks for; every crate linked into it sits inside that trust boundary. That
+argues for a small graph — and it argued, for a while, against depending on
+anyone else for MCP and A2A. The next section is why that was wrong.
 
 **It must be able to stop a model.** The cancel that matters is not dropping a
 future. A wedged turn is a child process with an open socket to a provider; the
 only thing that reliably ends it is `killpg` on its process group.
 
 Go would satisfy the first three about as well — one static binary, fast start,
-no C toolchain, a scheduler comfortable at these thread counts. What Rust adds is
-that `std` plus `libc` is enough to write HTTP/1.1, cron, DER parsing and inotify
-by hand, without giving up memory safety. That is what makes the next section
-affordable.
+a scheduler comfortable at these thread counts. What Rust adds is that `std` plus
+`libc` is enough to write HTTP/1.1, cron, DER parsing and inotify by hand,
+without giving up memory safety.
 
-## The three-dependency moat
+## Two protocols we do not implement
 
-The engine's direct external dependencies — the exact check CI runs:
+agentd used to implement MCP and A2A itself, and for a while that was defensible:
+both are small, and a hand-written subset is auditable in a way a dependency
+tree is not. It stopped being defensible for a reason worth stating plainly,
+because it is the argument against the version of this document that came
+before.
 
-```console
-$ cargo tree -p agentd-core --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/'
-libc v0.2.186
-serde v1.0.228
-serde_json v1.0.150
-```
+A protocol you implement from your own reading of the specification fails in one
+particular way: **silently, in the peer**. The tests you write encode the same
+reading as the code, so they agree with it. What finally disagrees is somebody
+else's client, in production, and what it reports is nothing — a message that
+never arrived, a task that never looked finished. We proved this on ourselves:
+checking agentd's A2A output against an independent implementation of the same
+spec found four such faults in an hour, every one of them valid JSON.
+([a2a.md](a2a.md) lists them.)
 
-Three external crates. The build fails if that count changes
-(`.github/workflows/ci.yml`, job `minimalism`).
+So MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the
+official Rust SDK, and A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs),
+an implementation generated from the specification's protocol buffers. They own
+the handshakes, the typed request and response shapes, capability negotiation,
+the streaming rules, the error codes and the version tables. agentd tracks the
+specifications by upgrading a dependency rather than by re-reading a document.
 
-That pipeline is the definition, so state it plainly: the gate counts **direct**
-dependencies, and the `grep` drops the two workspace path crates alongside them —
-`agentd-mcp` and `agentd-net`, which are our own code. The default build links
-more than three, because TLS is on and `rustls` arrives through `net`.
+What agentd kept is the part a protocol crate has no opinion about: **the
+socket**. Both SDKs plug into agentd's own HTTP transport, so adopting them cost
+nothing that was already working — an AAuth request signature with its
+challenge/re-sign loop, an AWS SigV4 signature per request, an mTLS client
+identity, a refreshed OAuth token, the SSRF guard on every dial. rmcp's
+`StreamableHttpClient` and a2a-rs's ports are both traits; that seam is the whole
+integration.
 
-| Build | Resolved external crates |
+### What that costs, and what it does not
+
+| Build | External crates |
 |---|---|
-| `--no-default-features` | 12 |
-| default (`tls`) | 26 |
-| shipped release feature set | 26 |
-| `--features cel,workflow` | 54 |
+| `--no-default-features` | 78 |
+| default (`tls` + MCP) | 91 |
+| shipped release feature set (adds A2A) | 187 |
 
-The framing survives structurally: every third-party crate a shipped build links
-is quarantined in `crates/net`, a 2,093-line `serde`-free leaf that depends on
-nothing else in the workspace. Exactly two opt-in edges bypass it, both declared
-in the engine's own manifest — `cel-interpreter` behind `cel`, and the `ring`
-that `aauth` reuses from `rustls`. The moat is not "we have three dependencies";
-it is that third-party code has one door in every shipped build, and CI watches
-it. `deny.toml` backs that up: wildcards and yanked crates denied, a
-hand-maintained permissive-only license allow-list.
+An earlier version of this page counted three direct dependencies and had CI
+fail the build if that number moved. That gate is gone, replaced by one that
+guards what actually reaches a user: the release binary is still a **statically
+linked musl artifact that runs on `scratch`** — 6.5 MiB, 3.0 MiB gzipped, no
+shell, no libc, no package manager. The dependency count moved by two orders of
+magnitude; the attack surface of the thing that ships did not.
+
+The build gained a C toolchain, because `aws-lc-sys` arrives underneath the SDKs
+and compiles C at build time. That is a builder-image cost (`cmake`, `g++`), not
+a runtime one.
+
+Quarantine survives as a habit rather than a rule: third-party code still
+reaches the engine through `crates/net` and `crates/mcp`, and `deny.toml` still
+denies wildcards and yanked crates against a hand-maintained permissive-only
+licence allow-list. What is no longer true is that you can hold the whole
+dependency graph in your head. Trading that for protocol implementations two
+independent readings agree on was the right trade, and it should be described as
+a trade rather than as a win.
 
 ```mermaid
 flowchart LR
-  CORE["agentd-core · the engine"] --> NET["agentd-net<br/>the shipped third-party door"]
-  CORE --> SERDE["serde · serde_json"]
-  CORE --> LIBC["libc"]
-  CORE --> MCP["agentd-mcp"] --> NET
-  NET -. "feature: tls · DEFAULT" .-> RUSTLS["rustls · ring · webpki-roots<br/>14 crates in all"]
-  CORE -. "feature: cel · never shipped" .-> CEL["cel-interpreter · +28 crates"]
+  CORE["agentd-core · the engine"] --> NET["agentd-net<br/>transport, TLS, SSRF guard"]
+  CORE --> MCP["agentd-mcp"]
+  MCP --> RMCP["rmcp · the official MCP SDK"]
+  MCP --> NET
+  CORE -. "feature: a2a" .-> A2A["a2a-rs · A2A from the spec's protobufs"]
+  RMCP -. "over agentd's socket" .-> NET
+  A2A -. "over agentd's socket" .-> NET
+  CORE --> SERDE["serde · serde_json · libc"]
 ```
-
-Capability is a compile-time decision with the same shape. Of fourteen named
-features, nine are literally empty arrays — they gate hand-rolled code and cost
-nothing — and two chain only to other in-tree features. Three touch the
-dependency line: `tls`; `aauth`, which adds zero crates because its Ed25519
-signing reuses the `ring` that `rustls` already resolved; and `cel`, which takes
-the tree from 26 crates to 54. `cel` never ships, and a build without it rejects
-a graph that uses CEL at define time rather than mis-evaluating it later.
 
 ## What memory safety buys, and what it does not
 
@@ -128,11 +147,12 @@ point — the JSON Schema validator carries no regex engine because its schemas 
 not need one. And `net::http` is generic over `Read + Write`, so
 `rustls::StreamOwned` drops into the same request path with no branch.
 
-TLS is the honest exception: nobody should hand-roll it, so `rustls` is a default
-dependency and brings fourteen crates. It also means the default build compiles
-C — `ring` carries `cc` as a build dependency and produces 30 object files. What
-`ring` avoids is `cmake` and `aws-lc-rs`, not a C compiler — only
-`--no-default-features` is C-free.
+Two things are deliberately *not* in that table, and the reason is the same one:
+you hand-roll where the specification is small, frozen, and only partly needed —
+and neither TLS nor a wire protocol with a live specification is any of those.
+TLS is `rustls`; MCP and A2A are their SDKs. Both compile C at build time
+(`ring`'s `cc`, `aws-lc-sys`'s `cmake`), which is a builder cost and not a
+shipping one.
 
 ## No async runtime
 
@@ -192,17 +212,16 @@ duration. And the loop is not a pure event-driven park: it waits
 
 ## The numbers, and where they come from
 
-Measured on an x86_64 **glibc, dynamically linked** release build (LTO,
-stripped, `opt-level = "z"`):
+The artifact that ships is a static-PIE musl build (LTO, stripped,
+`opt-level = "z"`) of the release feature set:
 
-| Build | Binary | gzip |
-|---|---|---|
-| `--no-default-features` | 3,017,664 B (2.88 MiB) | 1.25 MiB |
-| default (`tls`) | 4,012,008 B (3.83 MiB) | 1.77 MiB |
-| shipped feature set | 4,645,808 B (4.43 MiB) | 2.05 MiB |
+| | Size |
+|---|---|
+| binary | 6,858,216 B (6.54 MiB) |
+| gzipped | 2.99 MiB |
 
-TLS costs +971 KiB (+33%); the eight further shipped features add +619 KiB
-(+16%) and zero dependencies.
+That is the whole image: `FROM scratch` plus this file. Adopting two protocol
+SDKs roughly doubled it and left everything else about the image unchanged.
 
 An idle daemon running a schedule workflow: `Threads: 1`, `VmRSS` 3.8–3.9 MiB,
 and **0 CPU ticks** over 10 seconds at `CLK_TCK=100` — under 0.1% of a core,

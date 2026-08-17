@@ -94,30 +94,34 @@ jobs:
           workspaces: crates/a2a-oracle -> crates/a2a-oracle/target
       - run: cargo test --manifest-path crates/a2a-oracle/Cargo.toml
 
-  # Minimalism is the moat: the DEFAULT build must stay at exactly three direct
-  # dependencies (serde, serde_json, libc) — no async runtime, no TLS, no C. This
-  # fails the build if an unearned dependency sneaks in.
-  minimalism:
+  # What ships is one static binary on an empty base. That is now the claim
+  # worth guarding: MCP and A2A are the official/published implementations
+  # (`rmcp`, `a2a-rs`), which bring an async runtime and a C toolchain into the
+  # *build*, so "few dependencies" stopped being the thing to assert — while
+  # "no runtime, no shell, no libc, nothing to attack" did not.
+  static-binary:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - name: Assert the default build has exactly 3 direct deps
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools cmake
+      - name: Build the release binary the image ships
         run: |
-          # `--prefix none` lists one package per line with no tree glyphs, so the
-          # count is charset-independent (cargo tree emits ASCII art off a TTY, so
-          # a `├`/`└` grep counts 0 in CI). First line is the agent root; drop it.
-          # Workspace path crates (net, mcp — they print with a `(/…)` path suffix)
-          # are OUR OWN code, not third-party surface; only EXTERNAL crates count
-          # against the moat.
-          deps=$(cargo tree -p agentd-core --depth 1 --edges normal --prefix none | tail -n +2 | grep -v ' (/' | grep -c .)
-          echo "direct deps: $deps"
-          if [ "$deps" -ne 3 ]; then
-            echo "::error::default build must have exactly 3 direct deps (serde, serde_json, libc); found $deps"
-            cargo tree -p agentd-core --depth 1 --edges normal --prefix none
-            exit 1
-          fi
+          cargo build --release --locked -p agentd-cli \
+            --target x86_64-unknown-linux-musl \
+            --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
+      - name: Assert it is statically linked and runs
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/agentd
+          file "$bin"
+          case "$(file -b "$bin")" in
+            *static-pie\ linked*|*statically\ linked*) ;;
+            *) echo "::error::the release binary is not static — it cannot ship on scratch"; exit 1 ;;
+          esac
+          "$bin" --version
 
   # Build the OCI image from the Dockerfile (single-arch smoke build, no push) and
   # prove the static binary runs — so a Dockerfile or static-link regression is

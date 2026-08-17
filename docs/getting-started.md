@@ -31,7 +31,8 @@ the directory (`--dir ~/bin`). Release binaries are Linux/musl, amd64 and arm64;
 below.
 
 Building from source: agentd is a single Cargo crate in a workspace. The default
-build is dependency-light: no async runtime, no C/C++ toolchain.
+build needs a C toolchain (`cmake` and a C++ compiler) for the `aws-lc-sys`
+underneath the MCP and A2A SDKs; what it produces is one static binary.
 
 ```console
 $ git clone <repo> agent && cd agent

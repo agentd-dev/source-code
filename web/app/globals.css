@@ -328,6 +328,17 @@ a {
 .out {
   color: #8b8b94;
 }
+/* Demo transcript roles: the user's own line, a gate, an error. */
+.term .user {
+  color: #7dd3fc;
+  font-weight: 600;
+}
+.term .warn {
+  color: #fde68a;
+}
+.term .err {
+  color: #ff8787;
+}
 
 .cursor {
   display: inline-block;

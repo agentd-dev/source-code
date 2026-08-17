@@ -267,7 +267,7 @@ sees and does:
 ```jsonc
 // GetTask {"id":"a3"} →
 { "status": { "state": "TASK_STATE_INPUT_REQUIRED",
-              "message": { "role": "agent", "parts": [{ "text": "{\"question\":\"Ship it?\",…}" }] } } }
+              "message": { "role": "ROLE_AGENT", "parts": [{ "text": "{\"question\":\"Ship it?\",…}" }] } } }
 // the human answers — the A2A spec's own multi-turn shape:
 // SendMessage {"message":{"taskId":"a3","parts":[{"text":"yes"}]}}
 ```

@@ -7,6 +7,49 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Fixed (the A2A wire was not quite proto3 JSON — a second reader found it)
+
+A2A is defined in protocol buffers, and its JSON binding is proto3 JSON. agentd
+followed that for task states (`TASK_STATE_*`) but had drifted elsewhere, in the
+way that is hardest to notice: every one of these parses fine as *JSON* and is
+rejected by a peer's *generated types*, in production, with no error we would
+ever see.
+
+- **`role` is `ROLE_AGENT`, not `"agent"`.** Every agent-authored `Message` —
+  task status, streaming status frames — used the English word. A peer built
+  from the schema could not deserialize any of them. (The outbound A2A *client*
+  already sent `ROLE_USER`, so the two halves of agentd disagreed.)
+- **`status.timestamp` is an RFC 3339 string, not epoch milliseconds.** It is a
+  `google.protobuf.Timestamp`; an integer is a type error to a peer.
+- **`ListTasks` returns `Task`s.** It was returning agentd's internal record —
+  a flat `state`, plus `principal`/`link`/`updated` — so the one method whose
+  whole job is enumerating tasks emitted objects a peer could not read as tasks.
+  The result now also carries `totalSize`, `pageSize` and `nextPageToken`, which
+  `ListTasksResult` requires.
+- **`Task.history` is `repeated Message`**, so agentd's state transitions no
+  longer sit there pretending to be messages. Everything agentd wants to say
+  that the spec has no field for now lives under `metadata`, namespaced:
+  `agentd/principal`, `agentd/link`, `agentd/statusHistory`, `agentd/created`.
+
+The TUI and web clients read the new shape and still accept the old one.
+
+### Added (an independent reader for the A2A spec)
+
+- **`crates/a2a-oracle`** boots the real daemon, drives its real A2A listener,
+  and parses every response with [a2a-rs] — an unrelated implementation of the
+  same specification, by a different author, with types derived from the
+  published schema. Our own tests were written from our own reading of the spec
+  and so cannot catch a *plausible* misreading; this is a second reader that
+  can, and it is what found everything in the section above. It is deliberately
+  **outside the workspace** (it brings ~180 crates and a C toolchain, which
+  would end the `FROM scratch` static build) with its own target dir, and runs
+  as its own CI job: `cargo test --manifest-path crates/a2a-oracle/Cargo.toml`.
+- The conformance suite gained
+  `a2a-conversation/tasks-are-proto3-json-on-every-path`, so the shapes stay
+  fixed in ordinary CI, without the C toolchain.
+
+[a2a-rs]: https://github.com/emillindfors/a2a-rs
+
 ### Fixed (`--validate-config` missed workflow errors — and the docs had some)
 
 - **`--validate-config` now parses workflow definitions**, the same strict parse

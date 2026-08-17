@@ -1097,9 +1097,18 @@ fn push_frame(writer: &::mcp::server::SharedWriter, id: &::mcp::rpc::Id, payload
 }
 
 fn status_frame(task_id: &str, context_id: &str, state: &str, message: Option<&str>) -> Value {
-    let mut status = json!({"state": state, "timestamp": crate::state::now_ms()});
+    let mut status = json!({"state": state,
+        "timestamp": crate::a2a::tasks::a2a_timestamp(crate::state::now_ms())});
     if let Some(m) = message {
-        status["message"] = json!({"role": "agent", "parts": [{"text": m}]});
+        // `ROLE_AGENT`, not `"agent"`: the A2A wire is proto3 JSON (see
+        // `a2a::tasks::agent_message`).
+        status["message"] = json!({
+            "messageId": format!("{task_id}.status"),
+            "taskId": task_id,
+            "contextId": context_id,
+            "role": "ROLE_AGENT",
+            "parts": [{"text": m}],
+        });
     }
     json!({"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}})
 }
@@ -1933,7 +1942,11 @@ impl Runtime {
             })
             .map(|t| t.summary())
             .collect();
-        json!({"tasks": tasks})
+        // `ListTasksResult` is a fixed shape: a peer's generated type has
+        // `totalSize`/`pageSize`/`nextPageToken` as non-optional. We return the
+        // whole set in one page, so the token is empty and the sizes agree.
+        let n = tasks.len();
+        json!({"tasks": tasks, "totalSize": n, "pageSize": n, "nextPageToken": ""})
     }
 
     fn a2a_cancel_task(&mut self, principal: &Principal, params: &Value) -> Value {

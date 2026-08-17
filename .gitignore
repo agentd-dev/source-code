@@ -17,3 +17,5 @@ __pycache__/
 
 # Copied in at site-build time from the repo-root installer (single source of truth).
 web/public/install.sh
+# The A2A spec oracle is its own workspace, so its target dir is its own too.
+crates/a2a-oracle/target/

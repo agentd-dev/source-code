@@ -41,9 +41,10 @@ export type TaskLink =
   | { turn: { ctx: string } };
 
 /**
- * The client's normalized task view. The wire has TWO shapes — the full task
- * (nested `status.state`, from GetTask/SendMessage/feed) and the flat summary
- * (top-level `state`, from ListTasks) — normalized here once, at the edge.
+ * The client's normalized task view. The wire is an A2A `Task` in both the full
+ * (GetTask/SendMessage/feed) and light (ListTasks) form, so `state` is always
+ * under `status` and agentd's own facts under `metadata` — flattened here once,
+ * at the edge, with fallbacks for daemons that predate that shape.
  */
 export interface TaskView {
   id: string;

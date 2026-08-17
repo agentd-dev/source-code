@@ -7,6 +7,15 @@
 [workspace]
 resolver = "3"
 members = ["crates/net", "crates/mcp", "crates/agentd", "crates/agentd-cli", "crates/agentd-conformance"]
+# `crates/a2a-oracle` checks our A2A wire against an INDEPENDENT implementation
+# of the spec, and is deliberately NOT a member: that implementation brings ~179
+# crates and a C toolchain (`cmake`), which is right for an on-demand check and
+# wrong for every `cargo test` and for the `FROM scratch` release build. It is
+# its own workspace with its own target dir, so it also cannot race the shared
+# `target/debug/agentd` other suites drive. Run it deliberately:
+#
+#     cargo test --manifest-path crates/a2a-oracle/Cargo.toml
+exclude = ["crates/a2a-oracle"]
 
 # Release profile for a distributable single binary: size-first, LTO'd, stripped,
 # abort-on-panic. This is a cloud appliance shipped on `scratch`, so a smaller

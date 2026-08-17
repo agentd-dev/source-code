@@ -5,8 +5,17 @@
 //! command/NL/gate routing into the runtime) is wired in the runtime at the
 //! P5 cut-over.
 
+/// agentd's answers to the A2A specification's server ports.
+#[cfg(feature = "a2a")]
+pub mod ports;
 pub mod principals;
+/// The listener: identity in, protocol out.
+#[cfg(feature = "a2a")]
+pub mod serve;
 pub mod tasks;
+/// The wire projection, built from the specification's own types.
+#[cfg(feature = "a2a")]
+pub mod wire;
 
 pub use principals::{CallerIdentity, Principal, Resolver};
 pub use tasks::{Link, State, Task};

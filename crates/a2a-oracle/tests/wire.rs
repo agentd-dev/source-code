@@ -25,8 +25,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use a2a_rs::domain::generated::StreamResponse;
-use a2a_rs::domain::{AgentCard, ListTasksResult, Message, Task, TaskState};
+use a2a_rs::domain::generated::{ListTasksResponse, StreamResponse};
+use a2a_rs::domain::{AgentCard, Message, Task, TaskState};
 use serde_json::{Value, json};
 
 // ── booting the real thing ───────────────────────────────────────────────────
@@ -275,7 +275,11 @@ fn the_task_list_parses_as_a_task_list() {
     result(&addr, 2, "SendMessage", status_message("m2"));
 
     let listed = result(&addr, 3, "ListTasks", json!({}));
-    let theirs: ListTasksResult = cross_read("ListTasksResult", &listed);
+    // The *generated* response type, not the hand-written mirror: proto3 JSON
+    // omits a field at its default value, so a strict struct with no defaults
+    // would reject a legal empty page. This is the type a peer built from the
+    // schema actually deserializes into.
+    let theirs: ListTasksResponse = cross_read("ListTasksResponse", &listed);
     assert!(
         theirs.tasks.len() >= 2,
         "both tasks should be enumerable: {listed}"
@@ -409,7 +413,7 @@ fn the_error_codes_peers_branch_on_are_the_specified_ones() {
     assert_eq!(a2a_rs::domain::error::TASK_NOT_FOUND, -32001);
     assert_eq!(a2a_rs::domain::error::UNSUPPORTED_OPERATION, -32004);
 
-    let v = rpc(&addr, 1, "GetTask", json!({"name": "tasks/does-not-exist"}));
+    let v = rpc(&addr, 1, "GetTask", json!({"id": "does-not-exist"}));
     assert_eq!(
         v["error"]["code"], a2a_rs::domain::error::TASK_NOT_FOUND,
         "an unknown task must be TaskNotFound, not a generic failure: {v}"

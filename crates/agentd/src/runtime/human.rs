@@ -68,7 +68,7 @@ impl Runtime {
 
         // A human can answer only through the interface surface.
         #[cfg(feature = "a2a")]
-        let available = self.settings.interface.enabled && self.a2a_shared.is_some();
+        let available = self.settings.interface.enabled && self.a2a_sink.is_some();
         #[cfg(not(feature = "a2a"))]
         let available = false;
 

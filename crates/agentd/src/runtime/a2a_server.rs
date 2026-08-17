@@ -30,8 +30,6 @@ use crate::obs::log::Logger;
 use crate::runtime::events::{Event, kinds};
 use crate::runtime::reactor::{PendingKind, Runtime};
 use serde_json::{Value, json};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,59 +53,6 @@ pub const UNSUPPORTED_OPERATION: i64 = -32004;
 /// reconnecting client can resume across without a re-bootstrap.
 pub const FEED_RING: usize = 1024;
 
-// ---- the shared, read-only snapshot the transport threads consult ----------
-
-/// The task view the handler threads read without touching runtime state. The
-/// loop republishes a task here on every transition; the transport polls it for
-/// blocking sends and streaming. (Drain is enforced on the loop side, where
-/// `Runtime::draining` refuses new sends — the snapshot is read-only state.)
-#[derive(Default)]
-pub struct SharedTasks {
-    /// task id → the A2A `Task` JSON, plus an internal `_principal` tag.
-    tasks: Mutex<BTreeMap<String, Value>>,
-}
-
-impl SharedTasks {
-    pub fn snapshot(&self, id: &str) -> Option<Value> {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .cloned()
-    }
-    /// Every task this principal may see (operators see all); the `_principal`
-    /// tag is stripped from the projection.
-    pub fn list(&self, principal: &str, is_operator: bool) -> Vec<Value> {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter(|t| is_operator || t["_principal"].as_str() == Some(principal))
-            .map(strip_principal)
-            .collect()
-    }
-    pub fn put(&self, id: &str, task: Value) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), task);
-    }
-    pub fn remove(&self, id: &str) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-    }
-}
-
-fn strip_principal(t: &Value) -> Value {
-    let mut t = t.clone();
-    if let Value::Object(o) = &mut t {
-        o.remove("_principal");
-    }
-    t
-}
-
 // ---- the interface event feed (RFC 0032) -----------------------------------
 
 /// Who may see a feed event.
@@ -126,8 +71,7 @@ pub enum FeedVis {
 /// Events carry a monotonic `seq` so a reconnecting client resumes from a
 /// cursor (`fromSeq`); an overrun evicts the oldest (the client re-bootstraps
 /// via the `status` command when its cursor predates the window). Same
-/// single-writer discipline as [`SharedTasks`]: the loop writes, transport
-/// threads only read.
+/// The loop writes; the listener's stream tasks only read.
 pub struct SharedFeed {
     inner: Mutex<FeedInner>,
     /// `interface.debug` — gates the debug event kinds (audit, logs). Atomic
@@ -232,16 +176,6 @@ impl SharedFeed {
             .unwrap_or(g.seq);
         (g.seq, oldest, g.dropped)
     }
-}
-
-fn is_terminal_wire(state: &str) -> bool {
-    matches!(
-        state,
-        "TASK_STATE_COMPLETED"
-            | "TASK_STATE_FAILED"
-            | "TASK_STATE_CANCELED"
-            | "TASK_STATE_REJECTED"
-    )
 }
 
 // ---- pairing-code login (RFC 0032 §13) --------------------------------------
@@ -384,43 +318,32 @@ pub struct A2aRequest {
 /// The transport's post-office into the loop + the shared view.
 pub struct A2aBridge {
     events_tx: Sender<Event>,
-    shared: Arc<SharedTasks>,
     /// The interface event feed (RFC 0032) — `None` unless `interface.enabled`.
     feed: Option<Arc<SharedFeed>>,
     resolver: Arc<Resolver>,
-    request_timeout: Duration,
-    stream_deadline: Duration,
-    log: Logger,
+    pub request_timeout: Duration,
+    pub stream_deadline: Duration,
 }
 
 impl A2aBridge {
-    /// Build the bridge and the shared snapshot map (stored on the runtime).
-    pub fn new(
-        events_tx: Sender<Event>,
-        resolver: Resolver,
-        log: Logger,
-    ) -> (Arc<A2aBridge>, Arc<SharedTasks>) {
-        Self::with_feed(events_tx, resolver, log, None)
+    /// The listener's post office into the loop.
+    pub fn new(events_tx: Sender<Event>, resolver: Resolver) -> Arc<A2aBridge> {
+        Self::with_feed(events_tx, resolver, None)
     }
 
     /// [`A2aBridge::new`] with the interface feed attached (RFC 0032).
     pub fn with_feed(
         events_tx: Sender<Event>,
         resolver: Resolver,
-        log: Logger,
         feed: Option<Arc<SharedFeed>>,
-    ) -> (Arc<A2aBridge>, Arc<SharedTasks>) {
-        let shared = Arc::new(SharedTasks::default());
-        let bridge = Arc::new(A2aBridge {
+    ) -> Arc<A2aBridge> {
+        Arc::new(A2aBridge {
             events_tx,
-            shared: shared.clone(),
             feed,
             resolver: Arc::new(resolver),
             request_timeout: Duration::from_secs(120),
             stream_deadline: Duration::from_secs(600),
-            log,
-        });
-        (bridge, shared)
+        })
     }
 
     /// Resolve the caller from the transport's evidence: the verified mTLS
@@ -429,7 +352,7 @@ impl A2aBridge {
     /// the management/loopback operator fallback, so a matched cert identity wins
     /// its declared role while an all-empty-principals listener keeps the "any
     /// verified cert ⇒ operator" default.
-    fn principal(
+    pub fn principal_of(
         &self,
         mgmt: bool,
         bearer: Option<&str>,
@@ -444,6 +367,17 @@ impl A2aBridge {
             ..Default::default()
         };
         self.resolver.resolve(&id, bearer)
+    }
+
+    /// The interface observation feed, when `interface.enabled` armed one.
+    pub fn feed(&self) -> Option<Arc<SharedFeed>> {
+        self.feed.clone()
+    }
+
+    /// Post a request to the loop and wait for its reply. Blocking — an async
+    /// caller (the A2A ports) runs this on a blocking thread.
+    pub fn call(&self, method: &str, params: Value, principal: Principal) -> Value {
+        self.call_loop(method, params, principal)
     }
 
     /// Post a request to the loop and wait for its reply.
@@ -461,473 +395,6 @@ impl A2aBridge {
         reply_rx
             .recv_timeout(self.request_timeout)
             .unwrap_or_else(|_| err_obj(rpc_internal(), "the runtime did not answer in time"))
-    }
-
-    /// Poll the shared snapshot until the task is terminal or the deadline hits.
-    fn poll_to_terminal(&self, task_id: &str, deadline: Instant) -> Value {
-        loop {
-            match self.shared.snapshot(task_id) {
-                Some(t) => {
-                    let state = t["status"]["state"].as_str().unwrap_or("");
-                    if is_terminal_wire(state)
-                        || state == "TASK_STATE_INPUT_REQUIRED"
-                        || Instant::now() >= deadline
-                    {
-                        return strip_principal(&t);
-                    }
-                }
-                None if Instant::now() >= deadline => {
-                    return err_obj(TASK_NOT_FOUND, "task not found");
-                }
-                None => {}
-            }
-            std::thread::sleep(Duration::from_millis(60));
-        }
-    }
-}
-
-// The credential evidence the connection presented — set in `authenticate`, read
-// in `dispatch` on the SAME per-connection thread (see the module note): the
-// bearer, plus the verified mTLS leaf subject CN + SANs (RFC 0029 §10.3).
-thread_local! {
-    static PRESENTED_BEARER: RefCell<Option<String>> = const { RefCell::new(None) };
-    static PRESENTED_SUBJECT: RefCell<Option<String>> = const { RefCell::new(None) };
-    static PRESENTED_SANS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    /// The bearer matched a live pairing session with this role (RFC 0032 §13).
-    static PAIRED_ROLE: RefCell<Option<crate::config::v2::Role>> = const { RefCell::new(None) };
-}
-
-fn set_thread_bearer(b: Option<String>) {
-    PRESENTED_BEARER.with(|c| *c.borrow_mut() = b);
-}
-fn take_thread_bearer() -> Option<String> {
-    PRESENTED_BEARER.with(|c| c.borrow_mut().take())
-}
-/// Stash the verified mTLS peer identity for `dispatch` to fold into the caller.
-fn set_thread_peer(subject: Option<String>, sans: Vec<String>) {
-    PRESENTED_SUBJECT.with(|c| *c.borrow_mut() = subject);
-    PRESENTED_SANS.with(|c| *c.borrow_mut() = sans);
-}
-fn take_thread_peer() -> (Option<String>, Vec<String>) {
-    (
-        PRESENTED_SUBJECT.with(|c| c.borrow_mut().take()),
-        PRESENTED_SANS.with(|c| std::mem::take(&mut *c.borrow_mut())),
-    )
-}
-fn set_thread_paired(role: Option<crate::config::v2::Role>) {
-    PAIRED_ROLE.with(|c| *c.borrow_mut() = role);
-}
-fn take_thread_paired() -> Option<crate::config::v2::Role> {
-    PAIRED_ROLE.with(|c| c.borrow_mut().take())
-}
-
-// ---- HttpAuth: trust classification ----------------------------------------
-
-/// Classifies a connection and stashes its bearer for principal resolution.
-#[cfg(feature = "a2a")]
-pub struct A2aAuth {
-    /// The listener requires a credential (mTLS client CA or a server bearer).
-    pub require_auth: bool,
-    /// The resolved server bearer (its match ⇒ operator).
-    pub server_bearer: Option<String>,
-    /// Pairing-code login (RFC 0032 §13) — session tokens + the `Pair` path.
-    pub pairing: Option<Arc<PairingState>>,
-}
-
-#[cfg(feature = "a2a")]
-impl ::mcp::http_server::HttpAuth for A2aAuth {
-    fn authenticate(
-        &self,
-        parts: &::mcp::http_server::RequestParts,
-    ) -> Option<::mcp::server::PeerOrigin> {
-        use ::mcp::server::PeerOrigin;
-        let bearer = parts
-            .header("authorization")
-            .and_then(|h| {
-                h.strip_prefix("Bearer ")
-                    .or_else(|| h.strip_prefix("bearer "))
-            })
-            .map(str::to_string);
-        set_thread_bearer(bearer.clone());
-        set_thread_paired(None);
-        // Surface the verified mTLS identity (RFC 0029 §10.3) so `san`/`sub`
-        // principal rules can match a client cert, not just a bearer.
-        set_thread_peer(
-            parts.peer_subject.map(str::to_string),
-            parts.peer_sans.to_vec(),
-        );
-        // A pairing session token (RFC 0032 §13) is a first-class credential:
-        // resolved here, stashed for `dispatch` to mint the paired principal.
-        if let (Some(p), Some(b)) = (&self.pairing, &bearer)
-            && let Some(role) = p.check_bearer(b)
-        {
-            set_thread_paired(Some(role));
-            return Some(if role == crate::config::v2::Role::Operator {
-                PeerOrigin::Management
-            } else {
-                PeerOrigin::Stdio
-            });
-        }
-        // A plaintext-loopback dev listener (no CA, no bearer configured) is
-        // treated as the single operator — the 1.x AllowAll behavior.
-        if !self.require_auth {
-            return Some(PeerOrigin::Management);
-        }
-        // A verified client cert ⇒ management (operator via the resolver).
-        if parts.peer_cert {
-            return Some(PeerOrigin::Management);
-        }
-        match (&self.server_bearer, &bearer) {
-            // The server bearer ⇒ management.
-            (Some(server), Some(got)) if ct_eq(server.as_bytes(), got.as_bytes()) => {
-                Some(PeerOrigin::Management)
-            }
-            // A different bearer may still match a principal — let it through as
-            // non-management; the handler resolves it (or denies).
-            (_, Some(_)) => Some(PeerOrigin::Stdio),
-            // No credential on a listener that requires one: with pairing
-            // enabled, let the request through UNAUTHENTICATED (it resolves to
-            // the anonymous principal, which may call exactly `Pair` and the
-            // public card) — that is how a code-holder bootstraps. Without
-            // pairing, 401 as before.
-            (_, None) => {
-                if self.pairing.is_some() {
-                    Some(PeerOrigin::Stdio)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-/// Constant-time byte compare.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut d = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        d |= x ^ y;
-    }
-    d == 0
-}
-
-// ---- Handler: routing ------------------------------------------------------
-
-/// The `Handler` the HTTPS listener drives.
-#[cfg(feature = "a2a")]
-pub struct A2aHandler {
-    pub bridge: Arc<A2aBridge>,
-}
-
-#[cfg(feature = "a2a")]
-impl ::mcp::server::Handler for A2aHandler {
-    fn dispatch(
-        &self,
-        req: ::mcp::rpc::Request,
-        origin: ::mcp::server::PeerOrigin,
-        writer: &::mcp::server::SharedWriter,
-        _conn: u64,
-    ) -> ::mcp::rpc::Response {
-        use ::mcp::rpc::Response;
-        let bearer = take_thread_bearer();
-        // The MCP lifecycle triple (initialize/ping) needs no principal.
-        if let Some(resp) = ::mcp::server::lifecycle_response(
-            &req,
-            &json!({"name": "agentd", "version": crate::VERSION}),
-            &json!({"streaming": {}, "resources": {"subscribe": true}}),
-        ) {
-            return resp;
-        }
-        let mgmt = origin == ::mcp::server::PeerOrigin::Management;
-        let (subject, sans) = take_thread_peer();
-        // A live pairing session (RFC 0032 §13) resolves directly to its role;
-        // everything else goes through the principal rules.
-        let principal = match take_thread_paired() {
-            Some(role) => paired_principal(role),
-            None => self
-                .bridge
-                .principal(mgmt, bearer.as_deref(), subject, sans),
-        };
-        let method = bare(&req.method).to_string();
-        let params = req.params.clone().unwrap_or_else(|| json!({}));
-
-        // The agent card is public (discovery).
-        if matches!(
-            req.method.as_str(),
-            "GetAgentCard" | "agent/card" | "agent/getAuthenticatedExtendedCard"
-        ) {
-            return finalize(
-                req.id,
-                self.bridge.call_loop("GetAgentCard", json!({}), principal),
-            );
-        }
-        // `Pair` (RFC 0032 §13) is the one method an ANONYMOUS caller may use:
-        // exchanging the rotating code for a session token IS the login.
-        if matches!(req.method.as_str(), "Pair" | "interface.pair") {
-            return finalize(req.id, self.bridge.call_loop("Pair", params, principal));
-        }
-        // Operator admin family.
-        if crate::a2a::principals::is_admin(&req.method) {
-            if !principal.is_operator() {
-                return Response::err(req.id, -32003, "operator role required");
-            }
-            return finalize(
-                req.id,
-                self.bridge.call_loop(&req.method, params, principal),
-            );
-        }
-        if !METHODS.contains(&method.as_str()) {
-            return Response::err(
-                req.id,
-                ::mcp::rpc::METHOD_NOT_FOUND,
-                format!("unsupported method: {}", req.method),
-            );
-        }
-        // The interface feed (RFC 0032) is served only while `interface.enabled`.
-        if method == "SubscribeToEvents" && self.bridge.feed.is_none() {
-            return Response::err(
-                req.id,
-                UNSUPPORTED_OPERATION,
-                "the interface surface is disabled (set interface.enabled: true)",
-            );
-        }
-        // Authorization: NL is open to any non-anonymous role; a command
-        // DataPart is checked against the role's command grants.
-        let op = params.get("message").and_then(command_op);
-        if !principal.may(&method, op.as_deref()) {
-            self.bridge.log.warn(
-                "a2a.denied",
-                json!({"principal": principal.id, "method": method, "op": op}),
-            );
-            return Response::err(req.id, -32003, "not authorized");
-        }
-        if self.streams(&req.method) {
-            return self.stream(req, principal, params, writer);
-        }
-        // Unary: post to the loop, then block to a terminal state if the client
-        // asked to (A2A `message/send` defaults to blocking).
-        let started = self.bridge.call_loop(&method, params.clone(), principal);
-        if started.get("_error").is_some() {
-            return finalize(req.id, started);
-        }
-        let blocking = params["configuration"]["blocking"]
-            .as_bool()
-            .unwrap_or(true);
-        let state = started["task"]["status"]["state"].as_str().unwrap_or("");
-        if blocking
-            && !is_terminal_wire(state)
-            && state != "TASK_STATE_INPUT_REQUIRED"
-            && let Some(id) = started["task"]["id"].as_str()
-        {
-            let deadline = Instant::now() + self.bridge.request_timeout;
-            return finalize(
-                req.id,
-                json!({"task": self.bridge.poll_to_terminal(id, deadline)}),
-            );
-        }
-        finalize(req.id, started)
-    }
-
-    fn streams(&self, method: &str) -> bool {
-        matches!(
-            bare(method),
-            "SendStreamingMessage" | "SubscribeToTask" | "SubscribeToEvents"
-        )
-    }
-
-    fn on_connect(&self, origin: ::mcp::server::PeerOrigin, conn: u64) {
-        self.bridge.log.debug(
-            "a2a.connect",
-            json!({"origin": origin.as_str(), "conn": conn}),
-        );
-    }
-}
-
-#[cfg(feature = "a2a")]
-impl A2aHandler {
-    /// A streaming method: start the work, emit a `working` frame, then push
-    /// status/artifact frames from the shared snapshot until terminal. The
-    /// terminal frame is the returned `Response` (framework convention).
-    fn stream(
-        &self,
-        req: ::mcp::rpc::Request,
-        principal: Principal,
-        params: Value,
-        writer: &::mcp::server::SharedWriter,
-    ) -> ::mcp::rpc::Response {
-        use ::mcp::rpc::Response;
-        let method = bare(&req.method).to_string();
-        if method == "SubscribeToEvents" {
-            return self.stream_events(req, principal, params, writer);
-        }
-        let started = if method == "SubscribeToTask" {
-            let id = params
-                .get("id")
-                .or_else(|| params.get("taskId"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            self.bridge
-                .shared
-                .snapshot(&id)
-                .map(|t| json!({"task": t}))
-                .unwrap_or_else(|| err_obj(TASK_NOT_FOUND, "task not found"))
-        } else {
-            self.bridge
-                .call_loop("SendStreamingMessage", params, principal)
-        };
-        if started.get("_error").is_some() {
-            return finalize(req.id, started);
-        }
-        let Some(task_id) = started["task"]["id"].as_str().map(str::to_string) else {
-            return finalize(req.id, started);
-        };
-        let context_id = started["task"]["contextId"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let alive = push_frame(
-            writer,
-            &req.id,
-            status_frame(&task_id, &context_id, "TASK_STATE_WORKING", None),
-        );
-        if !alive {
-            return Response::ok(
-                req.id,
-                status_frame(&task_id, &context_id, "TASK_STATE_WORKING", None),
-            );
-        }
-        let deadline = Instant::now() + self.bridge.stream_deadline;
-        let mut last_artifacts = 0usize;
-        let mut last_state = String::from("TASK_STATE_WORKING");
-        loop {
-            std::thread::sleep(Duration::from_millis(80));
-            let Some(task) = self.bridge.shared.snapshot(&task_id) else {
-                return Response::ok(
-                    req.id,
-                    status_frame(
-                        &task_id,
-                        &context_id,
-                        "TASK_STATE_FAILED",
-                        Some("task vanished"),
-                    ),
-                );
-            };
-            if let Some(arts) = task["artifacts"].as_array()
-                && arts.len() > last_artifacts
-            {
-                for a in &arts[last_artifacts..] {
-                    if !push_frame(writer, &req.id, artifact_frame(&task_id, &context_id, a)) {
-                        // The peer is gone; the work continues server-side
-                        // (recover via GetTask / SubscribeToTask).
-                        return Response::ok(
-                            req.id,
-                            status_frame(&task_id, &context_id, &last_state, None),
-                        );
-                    }
-                }
-                last_artifacts = arts.len();
-            }
-            let state = task["status"]["state"].as_str().unwrap_or("").to_string();
-            let msg = task["status"]["message"]["parts"][0]["text"]
-                .as_str()
-                .map(str::to_string);
-            if is_terminal_wire(&state) || state == "TASK_STATE_INPUT_REQUIRED" {
-                return Response::ok(
-                    req.id,
-                    status_frame(&task_id, &context_id, &state, msg.as_deref()),
-                );
-            }
-            if state != last_state {
-                if !push_frame(
-                    writer,
-                    &req.id,
-                    status_frame(&task_id, &context_id, &state, msg.as_deref()),
-                ) {
-                    return Response::ok(
-                        req.id,
-                        status_frame(&task_id, &context_id, &state, msg.as_deref()),
-                    );
-                }
-                last_state = state;
-            }
-            if Instant::now() >= deadline {
-                return Response::ok(
-                    req.id,
-                    status_frame(
-                        &task_id,
-                        &context_id,
-                        "TASK_STATE_WORKING",
-                        Some("stream deadline reached"),
-                    ),
-                );
-            }
-        }
-    }
-
-    /// `SubscribeToEvents` (RFC 0032 §4): the global observation stream. The
-    /// first frame is a `hello` (current cursor + whether the caller's
-    /// `fromSeq` predates the replay window ⇒ `resync`, meaning re-bootstrap
-    /// via the `status` command); then ring events with `seq > fromSeq` replay,
-    /// and new ones follow as they land — each frame `{"event": {seq, ts, kind,
-    /// data}}`, scoped to what the principal may see. The final frame (at the
-    /// stream deadline, or when the peer goes away) is a `goodbye` carrying the
-    /// cursor to resume from.
-    fn stream_events(
-        &self,
-        req: ::mcp::rpc::Request,
-        principal: Principal,
-        params: Value,
-        writer: &::mcp::server::SharedWriter,
-    ) -> ::mcp::rpc::Response {
-        use ::mcp::rpc::Response;
-        let Some(feed) = &self.bridge.feed else {
-            return Response::err(
-                req.id,
-                UNSUPPORTED_OPERATION,
-                "the interface surface is disabled (set interface.enabled: true)",
-            );
-        };
-        let after = params
-            .get("fromSeq")
-            .or_else(|| params.get("after"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let (newest, oldest, dropped) = feed.bounds();
-        // The cursor predates the replay window: events were evicted past it,
-        // so replay from the window start and tell the client to re-bootstrap.
-        let resync = after > 0 && dropped > 0 && after < oldest.saturating_sub(1);
-        let mut cursor = if resync { 0 } else { after };
-        let hello = json!({"hello": {
-            "seq": newest,
-            "resume": after,
-            "resync": resync,
-            "debug": feed.debug(),
-            "version": crate::VERSION,
-        }});
-        if !push_frame(writer, &req.id, hello) {
-            return Response::ok(req.id, json!({"goodbye": {"seq": cursor}}));
-        }
-        let is_op = principal.is_operator();
-        let deadline = Instant::now() + self.bridge.stream_deadline;
-        loop {
-            let (events, next) = feed.since(cursor, &principal.id, is_op, 256);
-            cursor = next;
-            for ev in events {
-                if !push_frame(writer, &req.id, json!({"event": ev})) {
-                    return Response::ok(req.id, json!({"goodbye": {"seq": cursor}}));
-                }
-            }
-            if Instant::now() >= deadline {
-                return Response::ok(
-                    req.id,
-                    json!({"goodbye": {"seq": cursor, "reason": "deadline"}}),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
     }
 }
 
@@ -953,7 +420,7 @@ fn default_display_bottom() -> Vec<String> {
 }
 
 /// The principal a live pairing session resolves to (RFC 0032 §13).
-fn paired_principal(role: crate::config::v2::Role) -> Principal {
+pub fn paired_principal(role: crate::config::v2::Role) -> Principal {
     use crate::config::v2::Role;
     match role {
         Role::Operator => Principal {
@@ -974,7 +441,7 @@ fn paired_principal(role: crate::config::v2::Role) -> Principal {
 }
 
 /// A command DataPart's op (`{"data": {"agentd": {"op": "<tool>", …}}}`).
-fn command_op(message: &Value) -> Option<String> {
+pub fn command_op(message: &Value) -> Option<String> {
     message["parts"].as_array()?.iter().find_map(|p| {
         p.get("data")
             .and_then(|d| d.get("agentd"))
@@ -1060,61 +527,12 @@ fn truncate_strings(v: Value, max: usize) -> Value {
     }
 }
 
-fn finalize(id: ::mcp::rpc::Id, v: Value) -> ::mcp::rpc::Response {
-    use ::mcp::rpc::Response;
-    if let Some(err) = v.get("_error") {
-        let code = err
-            .get("code")
-            .and_then(Value::as_i64)
-            .unwrap_or(rpc_internal());
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("error")
-            .to_string();
-        return Response::err(id, code, msg);
-    }
-    Response::ok(id, v)
-}
-
 fn err_obj(code: i64, msg: &str) -> Value {
     json!({"_error": {"code": code, "message": msg}})
 }
 
 fn rpc_internal() -> i64 {
     ::mcp::rpc::INTERNAL_ERROR
-}
-
-/// Push one intermediate SSE frame; `false` means the peer is gone (a failed
-/// write) — streams use it to stop early instead of polling to the deadline.
-#[cfg(feature = "a2a")]
-fn push_frame(writer: &::mcp::server::SharedWriter, id: &::mcp::rpc::Id, payload: Value) -> bool {
-    let resp = ::mcp::rpc::Response::ok(id.clone(), payload);
-    match writer.lock() {
-        Ok(mut w) => w.write_response(&resp).is_ok(),
-        Err(_) => false,
-    }
-}
-
-fn status_frame(task_id: &str, context_id: &str, state: &str, message: Option<&str>) -> Value {
-    let mut status = json!({"state": state,
-        "timestamp": crate::a2a::tasks::a2a_timestamp(crate::state::now_ms())});
-    if let Some(m) = message {
-        // `ROLE_AGENT`, not `"agent"`: the A2A wire is proto3 JSON (see
-        // `a2a::tasks::agent_message`).
-        status["message"] = json!({
-            "messageId": format!("{task_id}.status"),
-            "taskId": task_id,
-            "contextId": context_id,
-            "role": "ROLE_AGENT",
-            "parts": [{"text": m}],
-        });
-    }
-    json!({"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}})
-}
-
-fn artifact_frame(task_id: &str, context_id: &str, artifact: &Value) -> Value {
-    json!({"artifactUpdate": {"taskId": task_id, "contextId": context_id, "artifact": artifact, "lastChunk": true}})
 }
 
 // ---- the runtime binding (runs on the single-writer loop) -------------------
@@ -1129,8 +547,24 @@ impl Runtime {
             principal,
             reply,
         } = req;
+        // The listener pre-mints the id of the task this request will create,
+        // because the protocol layer subscribes to a task's updates before the
+        // work starts. Whichever path creates it — a conversation turn or a
+        // command — takes the id from here, so the caller is watching the task
+        // it is actually given.
+        self.reserved_task_id = params["message"]["taskId"]
+            .as_str()
+            .filter(|s| !s.is_empty() && !self.tasks.contains_key(*s))
+            .map(str::to_string);
         let out = match bare(&method) {
             "SendMessage" | "SendStreamingMessage" => self.a2a_send(&principal, &params),
+            // The listener asks for the id a new task will have BEFORE
+            // dispatching the send. The protocol layer subscribes to a task's
+            // updates first and processes the message second, so that no
+            // transition is missed — which means the id has to exist before the
+            // work does. Minting stays here because the counter is the
+            // reactor's, and durable across restarts.
+            "NewTaskId" => json!({"id": self.next_id("task")}),
             "GetTask" => self.a2a_get_task(&principal, &params),
             "ListTasks" => self.a2a_list_tasks(&principal),
             "CancelTask" => self.a2a_cancel_task(&principal, &params),
@@ -1144,6 +578,7 @@ impl Runtime {
                 &format!("unsupported method: {other}"),
             ),
         };
+        self.reserved_task_id = None;
         // Audit every A2A call: who (principal + role), what (method + command
         // op), and the outcome — the plan §3.11 audit trail.
         let op = params.get("message").and_then(command_op);
@@ -1190,8 +625,9 @@ impl Runtime {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| self.next_id("msg"));
-        // Continue an existing task (e.g. answering an input-required gate) or
-        // start a fresh conversation.
+        // Continue an existing task (answering an input-required gate) or start
+        // a fresh conversation. An id for a task that does not exist yet is the
+        // listener's reservation, and `task_create` takes it.
         let existing = message["taskId"].as_str().and_then(|tid| {
             self.tasks
                 .get(tid)
@@ -1229,6 +665,7 @@ impl Runtime {
             _ => {
                 let ctx = message["contextId"]
                     .as_str()
+                    .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .unwrap_or_else(|| self.next_id("a2a"));
                 let tid = self.task_create(&ctx, principal, Link::Turn { ctx: ctx.clone() });
@@ -2106,8 +1543,13 @@ impl Runtime {
     // ---- task lifecycle ----------------------------------------------------
 
     /// Create + persist a fresh task; publish it to the shared view.
+    /// Create a task, taking the listener's reserved id when the request that
+    /// is being served brought one (see [`Runtime::reserved_task_id`]).
     pub(crate) fn task_create(&mut self, ctx: &str, principal: &Principal, link: Link) -> String {
-        let id = self.next_id("task");
+        let id = match self.reserved_task_id.take() {
+            Some(id) => id,
+            None => self.next_id("task"),
+        };
         let task = Task::new(&id, ctx, Some(&principal.id), link);
         self.tasks.insert(id.clone(), task);
         self.task_persist(&id);
@@ -2137,18 +1579,32 @@ impl Runtime {
         json!({"task": self.tasks.get(&id).map(Task::to_a2a).unwrap_or(Value::Null)})
     }
 
-    /// Republish a task to the shared snapshot (tagged with its owner), and
-    /// mirror the transition onto the interface feed (RFC 0032 §4) so every
-    /// attached display client converges without polling.
+    /// Publish a task transition: to A2A subscribers, and onto the interface
+    /// feed (RFC 0032 §4) so every attached display client converges without
+    /// polling.
+    ///
+    /// The A2A half is also what *settles a blocking send* — the protocol layer
+    /// waits on this stream rather than polling a snapshot — so a task that
+    /// never publishes is a task that never finishes as far as a caller can
+    /// tell.
     pub(crate) fn task_sync(&self, id: &str) {
-        let Some(shared) = &self.a2a_shared else {
+        let Some(sink) = &self.a2a_sink else {
             return;
         };
         match self.tasks.get(id) {
             Some(t) => {
-                let mut v = t.to_a2a();
-                v["_principal"] = json!(t.principal);
-                shared.put(id, v);
+                sink.status(
+                    &t.id,
+                    &t.context_id,
+                    t.state.to_wire(),
+                    t.message.as_deref(),
+                    t.updated,
+                );
+                if t.state.is_terminal()
+                    && let Some(a) = crate::a2a::wire::result_artifact(t)
+                {
+                    sink.artifact(&t.id, &t.context_id, a);
+                }
                 self.feed_push(
                     "task",
                     FeedVis::Owner(t.principal.clone()),
@@ -2156,7 +1612,6 @@ impl Runtime {
                 );
             }
             None => {
-                shared.remove(id);
                 self.feed_push("task.removed", FeedVis::Operator, json!({"id": id}));
             }
         }
@@ -2267,32 +1722,32 @@ fn run_view(id: &str, r: &crate::engine::RunState) -> Value {
 
 // ---- listener startup ------------------------------------------------------
 
-/// What [`spawn_a2a_listener`] hands the runtime: the shared task view, the
-/// interface feed (when `interface.enabled`), and the pairing state (when
-/// `interface.pairing.enabled`).
-pub(crate) type A2aServing = (
-    Arc<SharedTasks>,
-    Option<Arc<SharedFeed>>,
-    Option<Arc<PairingState>>,
-);
+/// What [`spawn_a2a_listener`] hands the runtime: the interface feed (when `interface.enabled`), the pairing state (when
+/// `interface.pairing.enabled`), and the live listener — which must be kept,
+/// because dropping it stops serving.
+pub(crate) struct A2aServing {
+    pub feed: Option<Arc<SharedFeed>>,
+    pub pairing: Option<Arc<PairingState>>,
+    pub listener: crate::a2a::serve::Listener,
+}
 
-/// Bind + start the A2A HTTPS listener. Returns the shared task view + the
-/// interface feed (when `interface.enabled`) to store on the runtime, or an
-/// error string (a bind/TLS failure is fatal at startup).
-#[cfg(feature = "a2a")]
+/// Bind and start the A2A listener.
+///
+/// Everything protocol-shaped below this line belongs to `a2a-rs`; what is
+/// assembled here is the identity posture — whether a credential is required at
+/// all, which one counts, and what a bare loopback connection means — plus the
+/// TLS identity that makes a client certificate readable in the first place.
 pub(crate) fn spawn_a2a_listener(
     a2a: &crate::config::v2::A2a,
     interface: &crate::config::v2::Interface,
     events_tx: Sender<Event>,
     resolver: Resolver,
     env: &dyn Fn(&str) -> Option<String>,
-    write_timeout: Duration,
+    _write_timeout: Duration,
     log: Logger,
 ) -> Result<A2aServing, String> {
     use std::path::Path;
-    use std::sync::atomic::AtomicU64;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
-    // `a2a.listen` is a URL (`http(s)://host:port`); split scheme from authority.
     let crate::config::ServeTarget::Http {
         bind,
         tls: tls_scheme,
@@ -2328,7 +1783,7 @@ pub(crate) fn spawn_a2a_listener(
         || server_bearer.is_some()
         || (pairing.is_some() && !loopback_listener);
 
-    let acceptor = if tls_scheme {
+    let tls = if tls_scheme {
         let cert = a2a
             .tls
             .cert
@@ -2339,79 +1794,52 @@ pub(crate) fn spawn_a2a_listener(
             .key
             .as_deref()
             .ok_or("a2a.tls.key is required for https")?;
-        let client_ca = a2a.tls.client_ca.as_deref();
-        let tls = crate::net::tls::TlsAcceptor::from_paths(
+        let acceptor = crate::net::tls::TlsAcceptor::from_paths(
             Path::new(cert),
             Path::new(key),
-            client_ca.map(Path::new),
+            a2a.tls.client_ca.as_deref().map(Path::new),
         )
         .map_err(|e| format!("a2a tls: {e}"))?;
-        ::mcp::http_server::HttpAcceptor::Tls(tls)
+        Some(acceptor.server_config())
     } else {
-        ::mcp::http_server::HttpAcceptor::Plain
+        None
     };
 
     // The interface feed (RFC 0032) exists only while `interface.enabled`.
     let feed = interface
         .enabled
         .then(|| Arc::new(SharedFeed::new(interface.debug)));
-    let (bridge, shared) = A2aBridge::with_feed(events_tx, resolver, log.clone(), feed.clone());
-    let handler = Arc::new(A2aHandler { bridge });
-    let auth = Arc::new(A2aAuth {
-        require_auth,
-        server_bearer,
-        pairing: pairing.clone(),
-    });
-    let listener =
-        ::mcp::http_server::bind_tcp(&bind).map_err(|e| format!("a2a bind {bind}: {e}"))?;
-    // The actually-bound authority (a `:0` request resolves to an ephemeral port).
-    let bound = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| listen.to_string());
-    let subs: ::mcp::server::SubRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let conn_counter = Arc::new(AtomicU64::new(0));
-    ::mcp::http_server::spawn_accept_http_opts(
-        listener,
-        Arc::new(acceptor),
-        handler,
-        auth,
-        subs,
-        conn_counter,
-        write_timeout,
-        ::mcp::http_server::ServeOptions {
-            // A hosted web UI's origin clears the DNS-rebind guard with CORS
-            // (RFC 0032 §7); loopback origins are always accepted.
+    let bridge = A2aBridge::with_feed(events_tx, resolver, feed.clone());
+
+    let listener = crate::a2a::serve::spawn(
+        &bind,
+        crate::a2a::serve::Opts {
+            auth: crate::a2a::serve::Auth {
+                require_auth,
+                server_bearer,
+                pairing: pairing.clone(),
+            },
             extra_origins: interface.origins.clone(),
+            tls,
+            request_timeout: bridge.request_timeout,
+            stream_deadline: bridge.stream_deadline,
         },
-    )
-    .map_err(|e| format!("a2a accept: {e}"))?;
-    log.info("a2a.listen", json!({"authority": listen, "bound": bound, "tls": tls_scheme, "mtls": a2a.tls.client_ca.is_some(), "require_auth": require_auth, "interface": interface.enabled, "interface_debug": interface.enabled && interface.debug, "pairing": pairing.is_some()}));
-    Ok((shared, feed, pairing))
+        Arc::clone(&bridge),
+        feed.clone(),
+        log.clone(),
+    )?;
+
+    log.info("a2a.listen", json!({"authority": listen, "bound": listener.bound, "tls": tls_scheme, "mtls": a2a.tls.client_ca.is_some(), "require_auth": require_auth, "interface": interface.enabled, "interface_debug": interface.enabled && interface.debug, "pairing": pairing.is_some()}));
+    Ok(A2aServing {
+        feed,
+        pairing,
+        listener,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shared_tasks_filter_by_principal_and_operator_sees_all() {
-        let s = SharedTasks::default();
-        s.put(
-            "t1",
-            json!({"id": "t1", "_principal": "user:a", "status": {"state": "TASK_STATE_WORKING"}}),
-        );
-        s.put("t2", json!({"id": "t2", "_principal": "user:b"}));
-        assert_eq!(s.list("user:a", false).len(), 1);
-        assert!(
-            s.list("user:a", false)[0].get("_principal").is_none(),
-            "the internal tag is stripped"
-        );
-        assert_eq!(s.list("anyone", true).len(), 2, "operator sees all");
-        assert_eq!(s.snapshot("t1").unwrap()["id"], "t1");
-        s.remove("t1");
-        assert!(s.snapshot("t1").is_none());
-    }
 
     #[test]
     fn command_and_text_extraction() {
@@ -2457,20 +1885,21 @@ mod tests {
             Level::Warn,
         );
         let (tx, _rx) = std::sync::mpsc::channel();
-        let (bridge, _shared) = A2aBridge::new(tx, resolver, log);
+        let _ = log;
+        let bridge = A2aBridge::new(tx, resolver);
 
         // A SPIFFE X.509-SVID (empty subject; identity in the URI SAN) under the
         // team trust path → the user role, labelled by its SAN.
-        let p = bridge.principal(true, None, None, vec!["spiffe://corp/team/alice".into()]);
+        let p = bridge.principal_of(true, None, None, vec!["spiffe://corp/team/alice".into()]);
         assert_eq!(p.role, crate::config::v2::Role::User);
         assert_eq!(p.id, "user:spiffe://corp/team/alice");
         // A cert under the ops path → operator (a different rule).
-        let op = bridge.principal(true, None, None, vec!["spiffe://corp/ops/root".into()]);
+        let op = bridge.principal_of(true, None, None, vec!["spiffe://corp/ops/root".into()]);
         assert!(op.is_operator());
         // A cert matching NO rule, with principals configured, is NOT operator
         // (the surfaced identity turns the allowlist on — mgmt no longer blanket-
         // grants operator once explicit rules exist).
-        let anon = bridge.principal(true, None, None, vec!["spiffe://other/x".into()]);
+        let anon = bridge.principal_of(true, None, None, vec!["spiffe://other/x".into()]);
         assert!(
             anon.is_anonymous(),
             "unmatched cert is denied, not operator"
@@ -2592,18 +2021,12 @@ mod tests {
         assert!(t["list"][1].as_str().unwrap().contains("bytes)"));
     }
 
+    /// Callers may address a method with or without the historical `a2a.`
+    /// prefix. (Frame construction and terminal classification moved to
+    /// `a2a::wire` and to a2a-rs respectively.)
     #[test]
-    fn terminal_classification_and_frames() {
-        assert!(is_terminal_wire("TASK_STATE_COMPLETED") && is_terminal_wire("TASK_STATE_FAILED"));
-        assert!(!is_terminal_wire("TASK_STATE_WORKING"));
+    fn a_method_may_be_addressed_with_or_without_the_prefix() {
         assert_eq!(bare("a2a.SendMessage"), "SendMessage");
         assert_eq!(bare("GetTask"), "GetTask");
-        let f = status_frame("t", "c", "TASK_STATE_COMPLETED", Some("done"));
-        assert_eq!(f["statusUpdate"]["status"]["state"], "TASK_STATE_COMPLETED");
-        assert_eq!(
-            f["statusUpdate"]["status"]["message"]["parts"][0]["text"],
-            "done"
-        );
-        assert!(ct_eq(b"abc", b"abc") && !ct_eq(b"abc", b"abd") && !ct_eq(b"a", b"ab"));
     }
 }

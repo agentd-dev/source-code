@@ -256,13 +256,23 @@ pub struct Runtime {
     pub(crate) event_to_task: BTreeMap<String, String>,
     /// The task snapshot the A2A listener threads read (None ⇒ not serving).
     #[cfg(feature = "a2a")]
-    pub(crate) a2a_shared: Option<std::sync::Arc<super::a2a_server::SharedTasks>>,
     /// The interface event feed (RFC 0032; None ⇒ interface disabled).
     #[cfg(feature = "a2a")]
     pub(crate) a2a_feed: Option<std::sync::Arc<super::a2a_server::SharedFeed>>,
     /// Pairing-code login (RFC 0032 §13; None ⇒ pairing disabled).
     #[cfg(feature = "a2a")]
     pub(crate) a2a_pairing: Option<std::sync::Arc<super::a2a_server::PairingState>>,
+    /// The id the listener reserved for the task the request being served will
+    /// create. Taken by the first `task_create` of that request, and cleared
+    /// after it — an id belongs to one request only.
+    #[cfg(feature = "a2a")]
+    pub(crate) reserved_task_id: Option<String>,
+    /// Where a task transition is published so A2A subscribers see it.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_sink: Option<std::sync::Arc<crate::a2a::ports::StreamSink>>,
+    /// The live listener. Held, not used: dropping it stops serving.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_listener: Option<crate::a2a::serve::Listener>,
     /// Live per-unit activity (RFC 0032 §17), keyed by child node id.
     pub(crate) activity: BTreeMap<u64, super::activity::Activity>,
     /// The newest root-context reply, so a `--prompt` job can print its answer

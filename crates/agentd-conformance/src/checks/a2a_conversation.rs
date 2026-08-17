@@ -242,14 +242,14 @@ fn task_shape(h: &Harness) -> Outcome {
         }
     }
 
-    // `ListTasksResult` has no optional fields — a peer's type will not
-    // deserialize a bare `{tasks}`.
-    for field in ["totalSize", "pageSize", "nextPageToken"] {
-        if listed.get(field).is_none() {
-            return Outcome::fail(format!(
-                "ListTasks must return `{field}`; the result shape is fixed: {listed}"
-            ));
-        }
+    // The listing envelope carries the paging fields. Proto3 JSON omits a field
+    // at its default value, so `nextPageToken` is absent exactly when there is
+    // no next page — its absence is the answer, not an omission. The counts are
+    // asserted because they are non-default here: two tasks exist.
+    if listed["totalSize"].as_u64().unwrap_or(0) == 0 {
+        return Outcome::fail(format!(
+            "ListTasks should report how many tasks it found: {listed}"
+        ));
     }
     Outcome::pass()
 }

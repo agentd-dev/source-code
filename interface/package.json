@@ -1,19 +1,64 @@
 {
-  "name": "agentd-interface",
-  "private": true,
-  "description": "The agentd display clients: a shared thin-client core (@agentd/client), the terminal UI (@agentd/tui), and the web UI (@agentd/ui). Separate Node projects — agentd hosts all state; these only render it.",
+  "name": "@agentd-dev/cli",
+  "version": "2.0.0",
+  "description": "The agentd display clients: the terminal UI (agentd-tui), the web UI (agentd-ui), and the thin-client core they share. agentd hosts all state — these only render it.",
   "license": "AGPL-3.0-only",
-  "workspaces": [
-    "client",
-    "tui",
-    "ui"
+  "type": "module",
+  "main": "dist/client/index.js",
+  "types": "dist/client/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client/index.js"
+    }
+  },
+  "bin": {
+    "agentd-tui": "dist/tui/cli.js",
+    "agentd-ui": "bin/serve.mjs"
+  },
+  "files": [
+    "dist",
+    "bin"
   ],
   "scripts": {
-    "build": "npm run build -w @agentd/client && npm run build -w @agentd/tui && npm run build -w @agentd/ui",
-    "test": "npm test -w @agentd/client && npm test -w @agentd/tui",
-    "typecheck": "npm run typecheck -w @agentd/client && npm run typecheck -w @agentd/tui && npm run typecheck -w @agentd/ui"
+    "build": "npm run build:node && npm run build:web",
+    "build:node": "tsc -p tsconfig.json && node -e \"const fs=require('fs');const p='dist/tui/cli.js';fs.writeFileSync(p,'#!/usr/bin/env node\\n'+fs.readFileSync(p));fs.chmodSync(p,0o755)\"",
+    "build:web": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json",
+    "test": "npm run build:node && node --test test/*.test.mjs",
+    "start": "node dist/tui/cli.js"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "esbuild": "^0.28.2",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentd-dev/source-code.git",
+    "directory": "interface"
+  },
+  "homepage": "https://agentd.dev",
+  "keywords": [
+    "agentd",
+    "agent",
+    "a2a",
+    "llm",
+    "terminal",
+    "ink",
+    "tui",
+    "cli"
+  ]
 }

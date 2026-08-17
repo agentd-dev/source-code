@@ -3,7 +3,7 @@
 // live-value interpolation — identical behavior for the TUI and the web UI.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Mirror, suggest, applySuggestion, prepare, triggerToken } from '../dist/index.js';
+import { Mirror, suggest, applySuggestion, prepare, triggerToken } from '../dist/client/index.js';
 
 function seeded() {
   const m = new Mirror();
@@ -72,7 +72,7 @@ test('a config feed event updates the live info every surface renders from', () 
 });
 
 test('the activity line says what the agent is doing, for how long, at what cost', async () => {
-  const { activityLine, elapsed, tokens } = await import('../dist/index.js');
+  const { activityLine, elapsed, tokens } = await import('../dist/client/index.js');
   const now = 1_000_000;
   const base = { id: '7', round: 1, tokens_in: 0, tokens_out: 0, started_ms: now - 12_000, updated_ms: now };
   // Thinking, with elapsed only (no tokens spent yet).
@@ -95,7 +95,7 @@ test('the activity line says what the agent is doing, for how long, at what cost
 });
 
 test('the mirror folds activity events and finds the record for a task', async () => {
-  const { Mirror } = await import('../dist/index.js');
+  const { Mirror } = await import('../dist/client/index.js');
   const m = new Mirror();
   m.apply({ seq: 1, ts: 1, kind: 'activity', data: { id: '7', task: 't1', phase: 'thinking', round: 1, tokens_in: 10, tokens_out: 5, started_ms: 1, updated_ms: 1 } });
   assert.equal(m.activityFor('t1').phase, 'thinking');

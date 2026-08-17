@@ -5,8 +5,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
 import { render } from 'ink-testing-library';
-import { Mirror } from '@agentd/client';
-import { App } from '../dist/app.js';
+import { Mirror } from '../dist/client/index.js';
+import { App } from '../dist/tui/app.js';
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
@@ -132,7 +132,7 @@ test('draining and input-required surface prominently', async () => {
 });
 
 test('fullscreen windows the transcript from the bottom and reports what is above', async () => {
-  const { windowEntries } = await import('../dist/parts/transcript.js');
+  const { windowEntries } = await import('../dist/tui/parts/transcript.js');
   const entries = Array.from({ length: 20 }, (_, i) => ({
     key: `k${i}`, ctx: 'c', ts: i, kind: 'user', text: `line ${i}`,
   }));

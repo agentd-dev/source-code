@@ -16,7 +16,7 @@
  */
 import React from 'react';
 import { render } from 'ink';
-import { AgentdClient } from '@agentd/client';
+import { AgentdClient } from '../client/index.js';
 import { App } from './app.js';
 
 interface Args {

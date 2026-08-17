@@ -301,7 +301,8 @@ session, not the client. Attach a second surface any time; they all render the
 same live state.
 
 The clients live in [`interface/`](../interface) and are not part of the Rust
-build: `cd interface && npm install && npm run build`, or install them from npm.
+build: `npm install -g @agentd-dev/cli` (one package, both binaries), or build
+from source with `cd interface && npm install && npm run build`.
 
 ## Where to go next
 

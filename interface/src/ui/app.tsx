@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * The web UI, in the format of the TUI: the same @agentd/client Mirror the
+ * The web UI, in the format of the TUI: the same the client core Mirror the
  * terminal renders, projected to the DOM. Open it beside the TUI — both stay
  * in sync because both watch the same daemon feed; neither holds truth.
  * The chrome renders whatever `interface.display` declares; the composer
@@ -22,7 +22,7 @@ import {
   prepare,
   suggest,
   workflowNames,
-} from '@agentd/client';
+} from '../client/index.js';
 
 type Screen = 'chat' | 'tasks' | 'subagents' | 'debug';
 

@@ -3216,7 +3216,7 @@ pub fn help_text() -> String {
          \x20                            both need `interface.enabled: true`, which the\n\
          \x20                            subcommand sets for you; the client exits with the daemon.\n\
          \x20                            Detached instead: run `agentd -c …`, then `agentd-tui\n\
-         \x20                            --endpoint <url>` (npm i -g @agentd/tui).\n\
+         \x20                            --endpoint <url>` (npm i -g @agentd-dev/cli).\n\
          \nCONTROL:\n\
          \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\

@@ -2,7 +2,7 @@
 /** The one-line status bar: connection, counters, hints. Pure projection. */
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { MirrorState } from '@agentd/client';
+import type { MirrorState } from '../../client/index.js';
 import { theme } from '../theme.js';
 
 function connDot(s: MirrorState): { dot: string; color: string; label: string } {

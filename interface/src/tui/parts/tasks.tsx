@@ -2,7 +2,7 @@
 /** The tasks screen: every task the principal may see, selectable, cancelable. */
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { TaskView } from '@agentd/client';
+import type { TaskView } from '../../client/index.js';
 import { ago, shortId, stateLabel, theme } from '../theme.js';
 
 export function TaskList({

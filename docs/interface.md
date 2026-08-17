@@ -50,7 +50,7 @@ The subcommand forces `interface.enabled` on, redirects the daemon's log lines
 to a file (the path is printed first; `AGENTD_INTERFACE_LOG` overrides), hands
 the terminal to the client, and ties the lifetimes: quitting the client drains
 the daemon gracefully; the daemon exiting closes the client. The client binary
-is found on PATH (`npm install -g @agentd/tui` / `@agentd/ui`;
+is found on PATH (`npm install -g @agentd-dev/cli`, which ships both;
 `AGENTD_TUI_BIN` / `AGENTD_UI_BIN` override).
 
 ## 3. Detached: connect to any running agentd
@@ -243,18 +243,21 @@ any program can be a display client:
 - The reply to any prompt arrives as its task's terminal artifact on the feed —
   the same event every other client folds in.
 
-The reference implementation is the shared TypeScript core
-[`@agentd/client`](../interface/client) (wire + state mirror + observation
-driver with poll fallback); both shipped UIs are ~thin renderers over it.
+The reference implementation is the shared TypeScript core in
+[`@agentd-dev/cli`](../interface) (wire + state mirror + observation driver
+with poll fallback, exported as the package's library entry point); both
+shipped UIs are ~thin renderers over it.
 
 ## 7. Building the clients
 
 ```sh
 cd interface
 npm install
-npm run build          # client → tui → ui
+npm run build          # the client core + the TUI, then the web bundle
 npm test               # unit + render tests
 ```
 
-Node ≥ 20. The clients are **not** part of the Rust workspace or its release
-artifact; the daemon's 3-dependency default build is unchanged.
+Node ≥ 20. One package, `@agentd-dev/cli`, provides both binaries
+(`agentd-tui`, `agentd-ui`) and the client library. The clients are **not**
+part of the Rust workspace or its release artifact; the daemon's
+3-dependency default build is unchanged.

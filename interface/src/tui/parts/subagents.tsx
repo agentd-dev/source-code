@@ -7,7 +7,7 @@
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { Json, MirrorState } from '@agentd/client';
+import type { Json, MirrorState } from '../../client/index.js';
 import { ago, theme } from '../theme.js';
 
 function statusColor(status: string): string {

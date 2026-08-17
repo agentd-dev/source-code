@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"]
+  },
+  "// note": "The browser app (src/ui) is bundled by build.mjs and typechecked by tsconfig.web.json — it needs bundler resolution, so it is excluded here.",
+  "include": ["src/client", "src/tui"]
+}

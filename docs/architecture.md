@@ -363,7 +363,7 @@ claim it protected — *you can hold the whole trust boundary in your head* — 
 longer one agentd can make, and pretending otherwise would be worse than
 retiring it. What replaced it is a gate on the thing a user actually receives:
 the release binary must still be a statically linked musl artifact that runs on
-`scratch`, 6.5 MiB with no shell, no libc and no package manager.
+`scratch`, 2.98 MiB with no shell, no libc and no package manager.
 
 The build now needs a C toolchain — `cmake` and a C++ compiler, for the
 `aws-lc-sys` that arrives underneath the SDKs. That is a builder-image cost, not

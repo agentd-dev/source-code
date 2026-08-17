@@ -1,7 +1,7 @@
 # Scheduled agentd via a Kubernetes CronJob → one-shot `once` per tick.
 #
 # This is the PREFERRED way to schedule agentd (rfcs/0011 §9): an external
-# CronJob fires `--mode once` per tick. It is more robust, observable, and
+# The CronJob fires one run per tick. It is more robust, observable, and
 # 12-factor than agentd's own internal --interval/--schedule clock (which
 # exists as a standalone convenience, not the recommended cluster pattern).
 # Each tick is an independent, idempotent unit of work.
@@ -54,10 +54,9 @@ spec:
             - name: agentd
               # Pin a version tag (or a digest) in production rather than :latest.
               image: ghcr.io/agentd-dev/agentd:latest
-              # Mode defaults to `once`; stated explicitly for clarity.
+              # A pod per tick: the CronJob schedule is the trigger, and the
+              # run finishes and exits on its own.
               args:
-                - --mode
-                - once
                 - --mcp
                 - fs=https://mcp-fs.internal/mcp
               env:
@@ -74,7 +73,7 @@ spec:
                       name: agentd-intelligence
                       key: token
                 - name: AGENT_MODEL
-                  value: claude-sonnet-4-6
+                  value: claude-sonnet-5
                 # Deadline shorter than the Job's activeDeadlineSeconds so a
                 # hung run trips agentd's own --deadline (exit 124) first.
                 - name: AGENT_DEADLINE

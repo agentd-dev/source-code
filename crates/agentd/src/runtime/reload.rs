@@ -55,11 +55,13 @@ impl Runtime {
                     json!({"trigger": trigger, "changed": changed}),
                 );
                 crate::obs::metrics::record_config_reload("applied");
+                let mut generation = 0;
                 self.durable.manifest_update(|m| {
-                    m.lifecycle["config_generation"] =
-                        json!(m.lifecycle["config_generation"].as_u64().unwrap_or(0) + 1);
+                    generation = m.lifecycle["config_generation"].as_u64().unwrap_or(0) + 1;
+                    m.lifecycle["config_generation"] = json!(generation);
                     m.lifecycle["config_reloaded_at"] = json!(now_ms());
                 });
+                crate::obs::metrics::set_config_generation(generation);
             }
             Err(ReloadRefused::Invalid(errs)) => {
                 for e in &errs {

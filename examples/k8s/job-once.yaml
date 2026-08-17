@@ -1,4 +1,4 @@
-# A one-shot agentd run as a Kubernetes Job (mode `once`).
+# A one-shot agentd run as a Kubernetes Job.
 #
 # The instruction IS the unit of work: agentd runs it to a terminal status
 # and exits with a code from the rfcs/0011 §5 table. `podFailurePolicy` maps
@@ -100,7 +100,7 @@ spec:
                   name: agentd-intelligence
                   key: token
             - name: AGENT_MODEL
-              value: claude-sonnet-4-6
+              value: claude-sonnet-5
             # Stable idempotency key per logical unit of work, so a Job retry
             # dedupes side effects in the backing MCP service (rfcs/0011 §6).
             - name: AGENT_RUN_ID

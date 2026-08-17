@@ -28,8 +28,9 @@ interface:
   debug: false                      # extra information (see §5)
 ```
 
-With `enabled: false` the daemon's wire surface is byte-identical to a build
-without the feature — clients get a clear "interface is disabled" error.
+With `enabled: false` the daemon serves no interface surface at all — the event
+feed and the interface reads answer with a clear "the interface surface is
+disabled" error, and nothing is buffered for them.
 
 Auth is the A2A listener's (RFC 0029): on a plaintext loopback listener with no
 principals a local client is the **operator** with zero setup; a remote client
@@ -69,7 +70,7 @@ agentd-ui  --endpoint http://127.0.0.1:8420 --open   # a local web UI
 - `agentd-ui` serves the built web app on `127.0.0.1:4173` (`--port`) with the
   endpoint pre-filled; `--open` launches the browser. The page also takes
   `?endpoint=…` and remembers your last connection.
-- **Hosted web UI:** `interface/ui/dist/` is a static site — deploy it
+- **Hosted web UI:** `interface/dist/web/` is a static site — deploy it
   anywhere, then allow its origin on each daemon it should reach:
 
   ```yaml
@@ -111,11 +112,11 @@ Both clients speak the same surface:
   working task.
 - **The composer speaks four prefixes** (suggestions appear as you type; Tab
   accepts):
-  - `/` — commands: `/help /new /tasks /subagents /debug /status
+  - `/` — commands: `/help /new /chat /tasks /subagents /debug /status
     /config [path] /set <path> <value> /workflow <name> /signal <name> [run]
     /send <handle> <text> /pause [run] /resume [run] /plan /cancel [task]
-    /pair /drain /quit` — **plus every workflow as a shortcut** (`/deploy`
-    runs the `deploy` workflow; system names win).
+    /conversations /pair /drain /quit` — **plus every workflow as a shortcut**
+    (`/deploy` runs the `deploy` workflow; system names win).
   - `@` — **skills**: `@release-notes` autocompletes from the daemon's
     catalogue and stays in the text (agentd preloads referenced skills).
   - `#` — **targets**: start a message with `#task-…` to answer/continue that
@@ -189,6 +190,8 @@ mutates config it doesn't own. `/config` prints the full effective document,
 The no-copy way to connect a browser or a remote TUI:
 
 ```yaml
+a2a:
+  listen: http://127.0.0.1:8420   # the interface is served on this listener
 interface:
   enabled: true
   pairing:
@@ -259,5 +262,5 @@ npm test               # unit + render tests
 
 Node ≥ 20. One package, `@agentd-dev/cli`, provides both binaries
 (`agentd-tui`, `agentd-ui`) and the client library. The clients are **not**
-part of the Rust workspace or its release artifact; the daemon's
-3-dependency default build is unchanged.
+part of the Rust workspace or its release artifact, so the daemon keeps its
+3-dependency default build.

@@ -3044,6 +3044,19 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             Err(_) => {}
         }
     }
+    // The local command runner is a capability like any other, and it carries
+    // the two heaviest legs: it can touch anything inside `workdir`
+    // (`sensitive`) and it can talk to the network if the allow-list lets it
+    // (`egress`). The registry tags it that way, but the registry is built
+    // after validation — so the tags have to be contributed here, or enabling
+    // `exec` next to an untrusted-input server assembles the whole trifecta
+    // and starts anyway. Gated on the feature: without it `exec` is
+    // mapping-only, and whichever MCP server provides it carries its own tags.
+    #[cfg(feature = "exec")]
+    if s.security.exec.enabled {
+        tags.push(crate::sec::scope::TrifectaTag::Sensitive);
+        tags.push(crate::sec::scope::TrifectaTag::Egress);
+    }
     use crate::sec::scope::{TrifectaVerdict, check_trifecta};
     if check_trifecta(tags, s.security.allow_trifecta) == TrifectaVerdict::RefusedTrifecta {
         err(&mut d, "lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)".into());
@@ -3576,6 +3589,54 @@ mod tests {
     }
 
     // ---- load: layering, aliases, sugar --------------------------------------
+
+    #[cfg(feature = "exec")]
+    #[test]
+    fn enabling_exec_next_to_untrusted_input_assembles_the_trifecta() {
+        // `exec` is tagged sensitive+egress in the tool registry — but the
+        // registry is built AFTER validation, so for a long time those tags
+        // never reached the check and this config started happily. It is the
+        // whole lethal trifecta: untrusted input, sensitive powers, an egress
+        // path.
+        let cfg = "config_version: \"2\"\nstore: {kind: memory}\n\
+                   mcp:\n  servers:\n    - name: web\n      endpoint: https://mcp-web.internal/mcp\n      tags: {\"*\": [untrusted_input]}\n\
+                   security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n";
+        let f = write_tmp(cfg, "yaml");
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("lethal-trifecta refused"), "{e}");
+
+        // The documented override still lets an operator take the risk.
+        load(
+            &args(&[
+                "--config",
+                f.path().to_str().unwrap(),
+                "--validate-config",
+                "--allow-trifecta",
+            ]),
+            &base_env(),
+        )
+        .expect("--allow-trifecta is the escape hatch");
+
+        // exec WITHOUT an untrusted-input source is only two legs: still fine.
+        let alone = write_tmp(
+            "config_version: \"2\"\nstore: {kind: memory}\n\
+             security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n",
+            "yaml",
+        );
+        load(
+            &args(&[
+                "--config",
+                alone.path().to_str().unwrap(),
+                "--validate-config",
+            ]),
+            &base_env(),
+        )
+        .expect("two legs are not the trifecta");
+    }
 
     #[test]
     fn validate_config_catches_workflow_body_errors_the_runtime_would_refuse() {

@@ -7,17 +7,17 @@ hand it three things and it runs the agentic loop:
 2. an **intelligence** endpoint (`--intelligence`, the one LLM it talks to),
 3. **tools and resources over MCP** (`--mcp name=<endpoint> …`),
 
-and a **lifecycle + triggers** that decide *when* the loop runs (agentd 2.0 has no
-`--mode`; see [modes-and-triggers.md](modes-and-triggers.md)). Everything below is
-the same binary with those knobs turned differently. No plugins, no SDK, no
-per-use-case code — the use case lives in the instruction and the wiring.
+and a **lifecycle + triggers** that decide *when* the loop runs (see
+[modes-and-triggers.md](modes-and-triggers.md)). Everything below is the same
+binary with those knobs turned differently. No plugins, no SDK, no per-use-case
+code — the use case lives in the instruction and the wiring.
 
 There are two axes to think along:
 
 - **agent as a single agent** — one supervised subagent runs a task to a
   terminal status. Pick a trigger for the shape (run-once, poll, react).
 - **agent orchestrating subagents** — the root agent delegates through the
-  `subagent.spawn` chokepoint into a **supervised process tree**: each child gets
+  `subagent.run` chokepoint into a **supervised process tree**: each child gets
   a narrowed objective, a subset of the tools, and a slice of the budget, and
   returns a small distilled result. The process tree *is* the agent tree.
 
@@ -89,7 +89,7 @@ fatal/limit class stops it.
 Wire it to anything an MCP server can expose as a subscribable resource — an
 alert queue, a support inbox, a "new object" bucket notification, a CI webhook
 landed as a resource — and it triages each item as it arrives. The trigger lives
-in a workflow (there is no `--mode`/`--subscribe` flag in 2.0):
+in the workflow:
 
 ```yaml
 # triage.yaml
@@ -119,7 +119,7 @@ agentd --config triage.yaml
 ```
 
 **The contract.** A `subscribe` start node names a **concrete resource URI**. The
-wake notification carries **only a URI** — the agentd `resources/read`s the item's
+wake notification carries **only a URI** — agentd `resources/read`s the item's
 *current* state, so a change missed during a restart is still recovered (level-,
 not edge-, triggered). The agent step emits one JSON decision object per item,
 and — importantly — treats the item's text as **untrusted data, not
@@ -145,7 +145,7 @@ regressions; reconcile desired vs actual config and file drift reports; sweep a
 data lake for schema violations every 15 minutes.
 
 ```bash
-# k8s CronJob spec runs, on each fire (a plain job — no --mode in 2.0):
+# the k8s CronJob spec runs, on each fire, a plain job:
 agentd \
   --instruction-file /etc/agentd/audit.md \
   --intelligence https://gw.example/v1 \
@@ -156,7 +156,7 @@ agentd \
 ```
 
 In-process instead — a `schedule` start node (fire on a clock) or a `loop` start
-node (`every: 0` re-enters immediately, a drain-a-backlog worker):
+node (`interval: 0` re-enters immediately, a drain-a-backlog worker):
 
 ```yaml
 # audit.yaml
@@ -173,19 +173,20 @@ workflows:
 
 **Why agentd.** A `CronJob` owns lifecycle, retries, and history; agentd owns the
 *reasoning* of one fire and an honest exit code. A `loop` start node with
-`every: 0` is a drain-a-backlog worker that re-enters the instant it finishes,
-until a bound (its `until` condition / token ceiling) or `SIGTERM`.
+`interval: 0` is a drain-a-backlog worker that re-enters the instant it finishes,
+until a bound (its `until` condition / `max_iterations` / token ceiling) or
+`SIGTERM`.
 
 ---
 
 # Part B — orchestrating subagents
 
 Delegation has exactly one path: the root agent's model calls the
-**`subagent.spawn`** self-tool. The supervisor (which owns the process table)
+**`subagent.run`** self-tool. The supervisor (which owns the process table)
 mints the child's identity and depth, **intersects** its tool scope to a subset
 of the parent's, clamps its budget to what the tree can still afford, and only
 then re-execs a child process. The child returns a **distillate** (~1–2k tokens)
-— never its transcript. Caps (depth 4, 8 children/node, 64/tree, the tree-token
+— never its transcript. Caps (depth 3, 8 children/node, 64/tree, the tree-token
 ceiling) come back as ordinary tool-result errors the model can adapt to — a
 runaway loop gets refusals, never a fork bomb. The
 [Rule-of-Two](security.md) trifecta check is enforced once, at startup, over the
@@ -218,7 +219,7 @@ agentd \
 The coordinator instruction does the decomposing — for example:
 
 > Audit the repository at `/src`. For **each** of {security, performance,
-> API-compatibility, documentation}, `subagent.spawn` a worker whose objective is
+> API-compatibility, documentation}, `subagent.run` a worker whose objective is
 > that dimension only, scoped to the `fs` tool, with a JSON output contract
 > `{dimension, findings[], severity}`. Do not analyze the code yourself. When all
 > workers return, merge their findings, de-duplicate, and emit one ranked report;
@@ -284,14 +285,16 @@ Add the third leg — say, *emailing* the customer (`egress`) — and the Rule-o
 refuses to co-locate it on this root. That's the runtime steering you to the
 right shape: run the **actor** as a *separate* agent holding `crm` + `email`
 (`sensitive` + `egress` — still two legs) and have this reactive front hand it the
-distillate over MCP — the cross-process composition of **use case 6** below. Each
+distillate over A2A — the cross-process composition of **use case 6** below. Each
 process stays within the Rule-of-Two; no single agent ever holds all three.
 
 **Why agentd.** The trust boundary is the **process boundary** plus the
 spawn-time scope intersection — not a convention you hope the model follows. An
 untagged server is treated conservatively as `untrusted_input`, so the check fails
-*closed*. (agentd has no `exec` tool — it runs no local code; the trifecta budget is
-entirely over the granted MCP servers' tags.)
+*closed*. The startup budget is computed over the granted MCP servers' tags; the
+local-command `exec` tool (use case 7) is off unless you both build and enable
+it, and its registry contract carries `sensitive` + `egress`, so it belongs on
+the actor side of a partition like this one.
 
 ## 6. A served worker an orchestrator drives and steers
 
@@ -368,6 +371,7 @@ agent:
     You are a careful engineer working in the repository at /work.
     Explore before you edit; ask before anything destructive.
   ask_human_fallback: wait          # a question parks until you answer it
+store:    { kind: memory }          # a daemon needs a store; see coding-agent.md §4 to make it durable
 a2a:      { listen: "http://127.0.0.1:8420" }
 interface: { enabled: true }        # the TUI/web-UI surface (default OFF)
 security:
@@ -390,8 +394,10 @@ workdir confinement, no shell, minimal env) is what bounds the blast radius;
 the model's cooperation is not a control.
 
 **Watch for:** `exec` is not in release binaries (build with `--features
-exec`); adding an MCP server tagged `untrusted_input` alongside it trips the
-Rule-of-Two refusal on purpose; and a non-loopback listener demands client auth.
+exec`); its registry contract carries `sensitive` + `egress`, so keep
+`untrusted_input`-tagged servers off this agent and read them in a child
+instead (use case 5); and a non-loopback listener demands client auth
+(`a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing`) or refuses to start.
 
 Full recipe, including the practices: **[coding-agent.md](coding-agent.md)**.
 
@@ -408,7 +414,7 @@ is the instruction, the `--mcp` wiring, and the trigger.
 
 ## See also
 
-- [`modes-and-triggers.md`](modes-and-triggers.md) — the lifecycle + the `once` / `loop` / `schedule` / `subscribe` / `a2a` start-node triggers in depth, and the reactive router.
+- [`modes-and-triggers.md`](modes-and-triggers.md) — the lifecycle + the `once` / `loop` / `schedule` / `subscribe` / `signal` / `event` start-node triggers in depth, and the reactive router.
 - [`subagents.md`](subagents.md) — the spawn payload, scope intersection, dispositions, caps, and supervision.
 - [`mcp.md`](mcp.md) — agentd as an MCP **client**, plus the A2A endpoint (RFC 0029) it exposes for composition.
 - [`security.md`](security.md) — the Rule-of-Two trifecta, secret redaction, and tool scoping.

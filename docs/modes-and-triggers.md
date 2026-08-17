@@ -1,9 +1,8 @@
 # Lifecycle & triggers
 
-agentd 2.0 has **one durable runtime** — a single-writer event loop over durable
-state (RFC 0026). There are **no modes**: the 1.x `once` / `loop` / `reactive` /
-`schedule` / `workflow` mode drivers were removed in the 2.0 cut-over. What used
-to be a "mode" is now one of two things:
+agentd has **one durable runtime** — a single-writer event loop over durable
+state (RFC 0026). There are **no modes** to choose between. When a run happens is
+decided by two independent things:
 
 - the process **lifecycle shape** — whether the instance is a one-shot *job* or a
   long-lived *daemon* (`lifecycle.run_until`); or
@@ -120,20 +119,5 @@ a2a:
   **audited** (`observability.audit`).
 
 See [`docs/configuration.md`](configuration.md) for the full `a2a` schema and
-[RFC 0029](../rfcs/0029-a2a-v2.md) for the wire contract.
+[RFC 0029](../rfcs/0029-a2a-conversations-principals-commands.md) for the wire contract.
 
----
-
-## Migrating from 1.x modes
-
-| 1.x | 2.0 |
-|---|---|
-| `--mode once` (default) | the default job — `--instruction …`, or a `once` start node |
-| `--mode loop --interval 30s` | a `loop` start node (`every: 30s`) |
-| `--mode schedule --cron '…'` | a `schedule` start node (`cron: '…'`) |
-| `--mode reactive --subscribe <uri>` | a `subscribe` start node + `lifecycle.run_until: drained` |
-| `--mode workflow --workflow f.yaml` | put the workflow in `workflows:` (v3 dialect) |
-| `--serve-mcp` (v1 self-MCP) | `a2a.listen` (the A2A v2 listener) |
-
-The 1.x flat config schema and the `--mode` flag are rejected with a migration
-hint. Convert the config to `config_version: "2"` with the sections above.

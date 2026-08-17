@@ -7,6 +7,51 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Changed (BREAKING: MCP and A2A are the published implementations now)
+
+agentd used to implement both protocols itself. It does not any more, and the
+reason is worth stating: a protocol written from your own reading of a
+specification fails **silently, in the peer** — your tests encode the same
+reading as your code, so they agree with it, and what finally disagrees is
+somebody else's client, reporting nothing. Checking agentd's A2A output against
+an independent implementation found four such faults in an hour (see the entry
+below); that was the argument.
+
+- **MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)**, the
+  official Rust SDK: the handshake, the typed requests and notifications,
+  capability negotiation, the streaming rules, the error mapping, the version
+  table. `rmcp-client` is a default feature; the hand-rolled client, era probe
+  and modern-dialect implementation are gone.
+- **A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs)**, generated from
+  the specification's protocol buffers: method dispatch, the typed shapes, SSE
+  framing, the blocking-send rule, the error codes. agentd supplies the ports —
+  identity, the authorization matrix, and the durable tasks the reactor owns.
+- **The socket stays agentd's.** Both SDKs run over agentd's own HTTP transport,
+  so nothing that was working stopped: AAuth request signing with its
+  challenge/re-sign loop, AWS SigV4, mTLS client identities, OAuth refresh, the
+  SSRF guard. There is no split fleet and no fallback path.
+
+Two bugs surfaced during the migration, both of the quiet kind: the SDK's
+notification hooks were not connected to agentd's wake path (a reactive daemon
+that never wakes), and the SDK ran on a current-thread runtime that only
+advances inside `block_on` (so dispatch happened only while agentd was already
+busy). Both fixed.
+
+**What this costs.** The dependency graph went from 26 crates to 187 in the
+shipped feature set, and the build now needs a C toolchain (`cmake`, a C++
+compiler) for `aws-lc-sys`. The CI job that asserted three direct dependencies
+is retired, replaced by one that guards what a user actually receives: the
+release binary is still a statically linked musl artifact on `scratch` — 6.5 MiB,
+no shell, no libc, nothing to scan but agentd itself. The docs that claimed the
+old posture (`README`, `architecture.md`, `why-rust.md`, `mcp.md`, the landing
+page) say this instead.
+
+**What this changes on the wire.** The modern/stateless MCP revision now follows
+rmcp's schedule — it pins `LATEST` to the legacy revision today, and agentd gains
+the stateless one when the SDK does. `configuration.blocking` was never an A2A
+field; the spec spells it `returnImmediately`, and the listener translates so
+existing clients keep working.
+
 ### Fixed (the A2A wire was not quite proto3 JSON — a second reader found it)
 
 A2A is defined in protocol buffers, and its JSON binding is proto3 JSON. agentd

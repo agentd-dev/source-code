@@ -24,7 +24,7 @@ only carries the LLM request/response. Do not conflate the two.
 ## The one URI: HTTPS
 
 Intelligence is reached over **HTTPS** — a hand-rolled HTTP/1.1 client over a
-`Read + Write` byte stream, so agentd ships no async runtime and no `url`/ICU
+`Read + Write` byte stream, so the intelligence path needs no `url`/ICU
 stack. The endpoint is a single transport, `https://`, with a **loopback
 `http://` carve-out for local development**.
 
@@ -59,8 +59,8 @@ agentd \
   --mcp incidents=https://intra/incidents/mcp
 ```
 
-TLS is rustls with the `ring` provider and `webpki-roots` — no C toolchain, no
-cmake. SNI is the parsed host.
+TLS is rustls with the `ring` provider and `webpki-roots`; SNI is the parsed
+host.
 
 ### `http://127.0.0.1` — a same-host dev gateway (loopback only)
 

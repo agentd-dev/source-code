@@ -204,7 +204,8 @@ it **larger** than `--drain-timeout`.
 
 ## 3. Container — minimal scratch/distroless image
 
-agentd is `std` + `libc`, statically linkable, with no async runtime and no C
+agentd is statically linkable — one musl artifact with no shell and no libc in
+the image, whatever the build needed to produce it. Building from source needs a C
 toolchain, and it runs **no local shell or filesystem tools** — every external
 effect leaves through MCP or A2A — so the image stays small (a few MB on
 `scratch`). The recommended entrypoint is `agentd` itself: it sets
@@ -214,11 +215,10 @@ own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
 The published image (`Dockerfile` at the repo root) ships the **cloud-native
 feature set** by default —
 `FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"` (the same
-set the release workflow builds). Apart from `a2a` (which pulls the TLS stack for
-the HTTPS listener) and `aauth` (a direct edge on `ring`, already in the tree as
-rustls's crypto provider), they are hand-rolled and dependency-free
-(serde/serde_json + libc + the workspace crates), so the binary stays the
-minimalism target. What each adds:
+set the release workflow builds). `a2a` brings the A2A SDK and the async stack
+its listener runs on; `aauth` is a direct edge on `ring`, already in the tree as
+rustls's crypto provider; the rest are hand-rolled and add no dependency. What
+each adds:
 
 | Feature | Adds |
 |---|---|

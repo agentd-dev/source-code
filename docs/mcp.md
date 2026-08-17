@@ -267,55 +267,51 @@ stops with it, and the whole drain counts inside `lifecycle.drain_timeout`
 
 ---
 
-## Choosing a client backend
+## Who implements the protocol
 
-agentd's MCP client is hand-rolled, like the rest of the network stack — that
-is what keeps the default build at three external dependencies and its start
-under a millisecond. It is also a bet: that we track the specification
-correctly ourselves.
+Outbound MCP is [`rmcp`](https://crates.io/crates/rmcp), the official Rust SDK
+maintained alongside the specification. It owns the handshake, the request and
+notification types, capability negotiation, the streaming rules, the error
+mapping and the version table. agentd tracks MCP by upgrading a dependency
+rather than by re-reading a document.
 
-You can take the other side of that bet. Building with `--features rmcp-client`
-routes outbound MCP through [`rmcp`](https://crates.io/crates/rmcp), the
-official Rust SDK maintained alongside the protocol:
+That was not always true. agentd used to implement the protocol itself, and the
+argument against continuing is not that it was buggy — it is that a protocol
+implemented from your own reading of a specification fails *silently, in the
+peer*. Your tests encode the same reading as your code, so they agree with it.
 
-```console
-$ cargo build -p agentd-cli --release --features a2a,rmcp-client
-```
+### The socket stays agentd's
 
-| | hand-rolled (default) | `rmcp-client` |
-|---|---|---|
-| Extra crates | 0 | **+77**, including tokio |
-| Spec tracking | ours | upstream |
-| Protocol version | `2026-07-28` (the stateless revision), negotiating down | whatever rmcp declares current — `2025-11-25` today |
-| Async runtime | none | a private current-thread runtime inside the client |
+The SDK's transport is a trait, and agentd implements it over its own HTTP
+connection. So adopting the SDK cost none of the things that only agentd knows
+how to do:
 
-The version difference is deliberate. rmcp pins its `LATEST` at `2025-11-25`
-even though the newer constant exists — that is upstream saying what it is
-ready to speak, and overriding it would mean asking servers for a dialect the
-SDK may not fully implement. So this backend follows rmcp and will pick up the
-stateless revision on the release that promotes it, with no change here. The
-subscription mechanism follows the same rule: `resources/subscribe` at a legacy
-revision, `subscriptions/listen` at a stateless one, chosen from what was
-actually negotiated.
-
-Either way the surface above the client is identical, so nothing else in agentd
-changes.
-
-### What stays on the native transport
-
-Request signing and mutual-TLS identities plug into agentd's own HTTP
-transport, which the SDK does not use. Rather than silently drop a credential,
-a server that needs one keeps the hand-rolled client **even when the SDK is
-compiled in**:
-
-- AAuth request signing (RFC 9421)
+- AAuth request signing (RFC 9421), including the challenge/re-sign loop
 - OAuth token refresh through the signer seam
-- AWS SigV4
-- SPIFFE X.509-SVID mTLS
+- AWS SigV4, computed per request
+- SPIFFE X.509-SVID mutual TLS
+- the SSRF guard on every dial
 
-So a build with `rmcp-client` is a mixed fleet: plain servers go through the
-SDK, authenticated ones through ours. That is deliberate — losing a credential
-to gain a dependency would be a bad trade.
+There is no split fleet and no fallback path: every server goes through the SDK,
+and every server keeps its credentials.
+
+### Which revision agentd speaks
+
+Whatever the SDK speaks. rmcp pins its `LATEST` at `2025-11-25` even though the
+newer constant exists — that is upstream saying what it is ready to speak, and
+overriding it would mean asking servers for a dialect the SDK may not fully
+implement. agentd gains the stateless revision on the release that promotes it,
+with no change here. The subscription mechanism follows the same rule:
+`resources/subscribe` at a legacy revision, `subscriptions/listen` at a stateless
+one, chosen from what was actually negotiated.
+
+### What agentd still owns
+
+The reactive half — that a server's `notifications/resources/updated` becomes a
+workflow wake — is agentd's, and it is wired to the SDK's notification hooks. It
+is worth naming because it is the thing that breaks quietly: a client that
+receives a notification and drops it leaves the agent idle forever, with nothing
+in any log to say why.
 
 ## 2. The other direction
 

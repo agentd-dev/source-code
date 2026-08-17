@@ -10,11 +10,11 @@ const ROOT = path.join(process.cwd(), "..");
 // the foundations so the current specs lead.
 export const GROUPS = [
   { id: "start", title: "Start here" },
-  { id: "concepts", title: "Concepts" },
-  { id: "operate", title: "Operate" },
+  { id: "concepts", title: "How it works" },
+  { id: "operate", title: "Build & operate" },
   { id: "extend", title: "Extend & embed" },
-  { id: "rfc-core", title: "RFCs · 2.0" },
-  { id: "rfc-foundation", title: "RFCs · foundations" },
+  { id: "rfc-core", title: "Specifications" },
+  { id: "rfc-foundation", title: "Specifications · foundations" },
 ];
 
 export const DOCS = [
@@ -50,6 +50,20 @@ export const DOCS = [
     blurb: "The two-loop split, the process tree, and how a run flows from config to result.",
   },
   {
+    slug: "harness",
+    file: "docs/harness.md",
+    title: "The harness",
+    group: "concepts",
+    blurb: "The supervisor that never talks to the model — process tree, kill ladder, budgets, recovery.",
+  },
+  {
+    slug: "agent-loop",
+    file: "docs/agent-loop.md",
+    title: "The agent loop",
+    group: "concepts",
+    blurb: "One turn end to end: context assembly, the round loop, tool dispatch, termination.",
+  },
+  {
     slug: "modes-and-triggers",
     file: "docs/modes-and-triggers.md",
     title: "Lifecycle & triggers",
@@ -69,6 +83,20 @@ export const DOCS = [
     title: "Subagents",
     group: "concepts",
     blurb: "The same-binary re-exec subagent tree — spawn payload, scope intersection, caps.",
+  },
+  {
+    slug: "why-rust",
+    file: "docs/why-rust.md",
+    title: "Why Rust",
+    group: "concepts",
+    blurb: "The dependency moat, what is hand-rolled, and where the choice costs something.",
+  },
+  {
+    slug: "experience",
+    file: "docs/experience.md",
+    title: "Developer experience",
+    group: "concepts",
+    blurb: "Validate before anything runs; exit codes as an API; telemetry you can filter.",
   },
   {
     slug: "workflows",

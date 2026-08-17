@@ -31,6 +31,7 @@ import {
   starterSpec,
 } from "../../lib/nodeRegistry";
 import { parseConfig, serializeConfig, emptyWorkflow, layout, newStepId } from "../../lib/workflowIo";
+import { validateWorkflow, canConnect } from "../../lib/validate";
 
 const DEFAULT_DOC = { config_version: "2" };
 
@@ -42,8 +43,8 @@ function WfNode({ id, data, selected }) {
   return (
     <div
       style={{
-        borderColor: selected ? accent : "var(--line)",
-        boxShadow: selected ? `0 0 0 1px ${accent}` : "none",
+        borderColor: data.invalid ? "#ef4444" : selected ? accent : "var(--line)",
+        boxShadow: selected ? `0 0 0 1px ${data.invalid ? "#ef4444" : accent}` : "none",
       }}
       className="min-w-[132px] rounded-md border bg-[var(--panel)] text-[13px]"
       title={BLURBS[data.kind] || data.kind}
@@ -59,7 +60,12 @@ function WfNode({ id, data, selected }) {
         <span className="font-mono font-semibold" style={{ color: accent }}>
           {data.kind}
         </span>
-        {!info.implemented && (
+        {data.invalid && (
+          <span className="ml-auto text-[11px] leading-none text-red-400" title="this step has errors">
+            ✗
+          </span>
+        )}
+        {!info.implemented && !data.invalid && (
           <span className="ml-auto rounded bg-[var(--line)] px-1 text-[9px] text-[var(--dim)]">soon</span>
         )}
       </div>
@@ -76,6 +82,8 @@ function Editor() {
   const [workflows, setWorkflows] = useState(() => [emptyWorkflow("main")]);
   const [active, setActive] = useState(0);
   const [selected, setSelected] = useState(null);
+  const [selectedEdge, setSelectedEdge] = useState(null);
+  const [showIssues, setShowIssues] = useState(true);
   const [showYaml, setShowYaml] = useState(false);
   const [importText, setImportText] = useState("");
   const [importing, setImporting] = useState(false);
@@ -102,17 +110,60 @@ function Editor() {
     (changes) => updateActive({ edges: applyEdgeChanges(changes, wf.edges) }),
     [wf, updateActive]
   );
+  // Whether an edge is legal at all — asked while the user is still dragging,
+  // so an impossible connection is refused at the handle rather than accepted
+  // and then reported as an error afterwards.
+  const isValidConnection = useCallback(
+    (conn) => {
+      const s = nodeById(wf.nodes, conn.source)?.data.kind;
+      const t = nodeById(wf.nodes, conn.target)?.data.kind;
+      if (wf.edges.some((e) => e.source === conn.source && e.target === conn.target)) return false;
+      return canConnect(s, t, conn.source, conn.target).ok;
+    },
+    [wf]
+  );
+
   const onConnect = useCallback(
     (conn) => {
-      // Guard: a start node cannot depend on anything (no inbound edge).
-      if (isStart(nodeById(wf.nodes, conn.target)?.data.kind)) {
-        setError("a start node can't have a dependency (remove the target's start kind first)");
+      const s = nodeById(wf.nodes, conn.source)?.data.kind;
+      const t = nodeById(wf.nodes, conn.target)?.data.kind;
+      const verdict = canConnect(s, t, conn.source, conn.target);
+      if (!verdict.ok) {
+        setError(verdict.why);
+        return;
+      }
+      if (wf.edges.some((e) => e.source === conn.source && e.target === conn.target)) {
+        setError(`${conn.target} already depends on ${conn.source}`);
         return;
       }
       updateActive({ edges: addEdge({ ...conn, id: `e_${Date.now().toString(36)}` }, wf.edges) });
+      setSelectedEdge(null);
     },
     [wf, updateActive]
   );
+
+  // ── edges as first-class objects ────────────────────────────────────────
+  const retargetEdge = (edgeId, field, value) => {
+    const edge = wf.edges.find((e) => e.id === edgeId);
+    if (!edge) return;
+    const next = { ...edge, [field]: value };
+    const s = nodeById(wf.nodes, next.source)?.data.kind;
+    const tk = nodeById(wf.nodes, next.target)?.data.kind;
+    const verdict = canConnect(s, tk, next.source, next.target);
+    if (!verdict.ok) {
+      setError(verdict.why);
+      return;
+    }
+    updateActive({ edges: wf.edges.map((e) => (e.id === edgeId ? next : e)) });
+  };
+  const setEdgeLabel = (edgeId, label) =>
+    updateActive({
+      edges: wf.edges.map((e) => (e.id === edgeId ? { ...e, label: label || undefined } : e)),
+    });
+  const deleteEdge = (edgeId) => {
+    updateActive({ edges: wf.edges.filter((e) => e.id !== edgeId) });
+    setSelectedEdge(null);
+  };
 
   const addNode = useCallback(
     (kind) => {
@@ -225,7 +276,21 @@ function Editor() {
     r.onload = () => doImport(String(r.result));
     r.readAsText(f);
   };
+  // Live validation — the same rules the runtime applies, so a graph the
+  // editor calls clean is one `agentd --validate-config` also accepts.
+  const issues = useMemo(() => validateWorkflow(wf), [wf]);
+  const invalid = new Set(issues.errors.filter((e) => e.id).map((e) => e.id));
+
   const download = () => {
+    // Validate before anything leaves the editor: exporting a graph the
+    // daemon would refuse at startup is the one outcome worth blocking.
+    if (issues.errors.length) {
+      setShowIssues(true);
+      setError(
+        `${issues.errors.length} problem${issues.errors.length > 1 ? "s" : ""} to fix before export — see the checks panel`,
+      );
+      return;
+    }
     const blob = new Blob([yamlText], { type: "text/yaml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -265,6 +330,22 @@ function Editor() {
           </button>
         </div>
         <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={() => setShowIssues((v) => !v)}
+            className="btn-ghost"
+            title="graph checks — the rules the runtime enforces"
+            style={
+              issues.errors.length
+                ? { color: "#f87171", borderColor: "rgba(248,113,113,.5)" }
+                : { color: "var(--green)", borderColor: "color-mix(in srgb, var(--green) 45%, transparent)" }
+            }
+          >
+            {issues.errors.length
+              ? `${issues.errors.length} error${issues.errors.length > 1 ? "s" : ""}`
+              : issues.warnings.length
+                ? `valid · ${issues.warnings.length} note${issues.warnings.length > 1 ? "s" : ""}`
+                : "valid"}
+          </button>
           <button onClick={autoLayout} className="btn-ghost">auto-layout</button>
           <button onClick={() => setShowYaml((v) => !v)} className="btn-ghost">
             {showYaml ? "hide yaml" : "yaml"}
@@ -310,14 +391,34 @@ function Editor() {
         {/* canvas */}
         <div className="relative min-w-0 flex-1">
           <ReactFlow
-            nodes={nodes}
-            edges={edges}
+            nodes={nodes.map((n) =>
+              invalid.has(n.id) ? { ...n, data: { ...n.data, invalid: true } } : n,
+            )}
+            edges={edges.map((e) => ({
+              ...e,
+              selected: e.id === selectedEdge,
+              style:
+                e.id === selectedEdge
+                  ? { stroke: "var(--green)", strokeWidth: 2 }
+                  : { stroke: "var(--dimmer)" },
+            }))}
             nodeTypes={NODE_TYPES}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
-            onNodeClick={(_, n) => setSelected(n.id)}
-            onPaneClick={() => setSelected(null)}
+            isValidConnection={isValidConnection}
+            onNodeClick={(_, n) => {
+              setSelected(n.id);
+              setSelectedEdge(null);
+            }}
+            onEdgeClick={(_, e) => {
+              setSelectedEdge(e.id);
+              setSelected(null);
+            }}
+            onPaneClick={() => {
+              setSelected(null);
+              setSelectedEdge(null);
+            }}
             fitView
             proOptions={{ hideAttribution: true }}
             defaultEdgeOptions={{ animated: false, style: { stroke: "var(--dimmer)" } }}
@@ -332,6 +433,43 @@ function Editor() {
               className="!bg-[var(--panel)]"
             />
           </ReactFlow>
+
+          {showIssues && (issues.errors.length > 0 || issues.warnings.length > 0) && (
+            <div className="absolute bottom-2 left-2 right-2 max-h-[38%] overflow-auto rounded-md border border-[var(--line)] bg-[var(--panel)] p-2 text-xs">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="font-mono text-[11px] text-[var(--dim)]">
+                  graph checks — the rules the runtime enforces
+                </span>
+                <button onClick={() => setShowIssues(false)} className="text-[var(--dim)] hover:text-[var(--fg-strong)]">
+                  ×
+                </button>
+              </div>
+              <ul className="space-y-1">
+                {issues.errors.map((e, i) => (
+                  <li key={`e${i}`} className="flex gap-2">
+                    <span className="text-red-400">✗</span>
+                    <button
+                      className="text-left text-[var(--fg)] hover:underline"
+                      onClick={() => e.id && (setSelected(e.id), setSelectedEdge(null))}
+                    >
+                      {e.message}
+                    </button>
+                  </li>
+                ))}
+                {issues.warnings.map((w, i) => (
+                  <li key={`w${i}`} className="flex gap-2">
+                    <span className="text-amber-400">!</span>
+                    <button
+                      className="text-left text-[var(--dim)] hover:underline"
+                      onClick={() => w.id && (setSelected(w.id), setSelectedEdge(null))}
+                    >
+                      {w.message}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           {showYaml && (
             <div className="absolute right-2 top-2 bottom-2 w-[38%] overflow-auto rounded-md border border-[var(--line)] bg-[var(--bg-soft)] p-2">
@@ -353,6 +491,15 @@ function Editor() {
               onField={setSpecField}
               onRemoveField={removeSpecField}
               onDelete={deleteNode}
+              issues={issues.errors.filter((e) => e.id === selNode.id)}
+            />
+          ) : selectedEdge ? (
+            <EdgePanel
+              edge={wf.edges.find((e) => e.id === selectedEdge)}
+              nodes={wf.nodes}
+              onRetarget={(field, value) => retargetEdge(selectedEdge, field, value)}
+              onLabel={(v) => setEdgeLabel(selectedEdge, v)}
+              onDelete={() => deleteEdge(selectedEdge)}
             />
           ) : (
             <WorkflowPanel
@@ -394,7 +541,72 @@ function Editor() {
 }
 
 // ── panels ──────────────────────────────────────────────────────────────────
-function PropertyPanel({ node, onId, onKind, onField, onRemoveField, onDelete }) {
+
+/**
+ * An edge is `depends_on`: "target runs after source". It is worth inspecting
+ * because re-pointing one is otherwise a delete-and-redraw, and because the
+ * rules that govern it (no inbound edge on a start node, nothing after a
+ * terminal step) are easier to learn when the editor states them.
+ */
+function EdgePanel({ edge, nodes, onRetarget, onLabel, onDelete }) {
+  if (!edge) return null;
+  const opts = nodes.map((n) => ({ id: n.id, kind: n.data.kind }));
+  const src = nodes.find((n) => n.id === edge.source);
+  const tgt = nodes.find((n) => n.id === edge.target);
+  return (
+    <div>
+      <div className="mb-3">
+        <div className="font-mono text-[11px] uppercase tracking-wider text-[var(--dim)]">
+          connection
+        </div>
+        <div className="mt-1 text-sm text-[var(--fg-strong)]">
+          <span className="font-mono">{edge.target}</span>{" "}
+          <span className="text-[var(--dim)]">depends on</span>{" "}
+          <span className="font-mono">{edge.source}</span>
+        </div>
+        <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
+          {tgt?.data.kind} runs only after {src?.data.kind} reaches a terminal state. Its output is
+          addressable as{" "}
+          <span className="kbd">{`{{steps.${edge.source}.output}}`}</span>.
+        </p>
+      </div>
+
+      <Label>from (runs first)</Label>
+      <select className="input" value={edge.source} onChange={(e) => onRetarget("source", e.target.value)}>
+        {opts.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.id} · {o.kind}
+          </option>
+        ))}
+      </select>
+
+      <div className="mt-2" />
+      <Label>to (runs after)</Label>
+      <select className="input" value={edge.target} onChange={(e) => onRetarget("target", e.target.value)}>
+        {opts.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.id} · {o.kind}
+          </option>
+        ))}
+      </select>
+
+      <div className="mt-2" />
+      <Label>label (editor only)</Label>
+      <input
+        className="input"
+        value={edge.label || ""}
+        placeholder="e.g. on success"
+        onChange={(e) => onLabel(e.target.value)}
+      />
+
+      <button onClick={onDelete} className="btn-ghost mt-4 w-full hover:!text-red-400">
+        remove connection
+      </button>
+    </div>
+  );
+}
+
+function PropertyPanel({ node, onId, onKind, onField, onRemoveField, onDelete, issues = [] }) {
   const info = nodeInfo(node.data.kind);
   const spec = node.data.spec || {};
   const known = info.fields || [];
@@ -407,6 +619,14 @@ function PropertyPanel({ node, onId, onKind, onField, onRemoveField, onDelete })
         <span className="font-semibold text-[var(--fg-strong)]">Step</span>
         <button onClick={onDelete} className="text-xs text-red-400 hover:text-red-300">delete</button>
       </div>
+
+      {issues.length > 0 && (
+        <ul className="mb-3 space-y-1 rounded border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-300">
+          {issues.map((e, i) => (
+            <li key={i}>{e.message.replace(/^step "[^"]+": /, "")}</li>
+          ))}
+        </ul>
+      )}
 
       <Label>id</Label>
       <input

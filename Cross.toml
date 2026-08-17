@@ -1,0 +1,15 @@
+# `cross` builds the release artifacts in a container per target, and that
+# container needs a C toolchain now: `aws-lc-sys` arrives underneath the protocol
+# SDKs (`rmcp` for MCP, `a2a-rs` for A2A) and compiles C at build time.
+#
+# This is a *builder* cost only. What ships is unchanged — one statically linked
+# musl binary on `scratch`, with no shell, no libc and no package manager.
+[target.x86_64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes cmake",
+]
+
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes cmake",
+]

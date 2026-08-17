@@ -39,8 +39,9 @@ advances inside `block_on` (so dispatch happened only while agentd was already
 busy). Both fixed.
 
 **What this costs.** The dependency graph went from 26 crates to 187 in the
-shipped feature set, and the build now needs a C toolchain (`cmake`, a C++
-compiler) for `aws-lc-sys`. The CI job that asserted three direct dependencies
+shipped feature set; the build needs a C toolchain (`cmake`, a C++ compiler) for
+`aws-lc-sys`; and the MSRV moves to **1.96**, which `a2a-rs` sets. The
+`Dockerfile` and a new `Cross.toml` install what the builders need. The CI job that asserted three direct dependencies
 is retired, replaced by one that guards what a user actually receives: the
 release binary is still a statically linked musl artifact on `scratch` — 6.5 MiB,
 no shell, no libc, nothing to scan but agentd itself. The docs that claimed the

@@ -7,7 +7,7 @@
 name = "agentd-mcp"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "Model Context Protocol base library: wire types, version/era negotiation, transports"
 license = "Apache-2.0"
 repository = "https://github.com/agentd-dev/source-code"

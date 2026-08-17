@@ -13,7 +13,7 @@
 name = "agentd-conformance"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "Black-box conformance suite for the agent runtime (MCP client/server + supervisor + agent loop)"
 license = "Apache-2.0"
 publish = false

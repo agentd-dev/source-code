@@ -207,8 +207,8 @@ it **larger** than `--drain-timeout`.
 agentd is statically linkable — one musl artifact with no shell and no libc in
 the image, whatever the build needed to produce it. Building from source needs a C
 toolchain, and it runs **no local shell or filesystem tools** — every external
-effect leaves through MCP or A2A — so the image stays small (a few MB on
-`scratch`). The recommended entrypoint is `agentd` itself: it sets
+effect leaves through MCP or A2A — so the image stays small (~10 MB on
+`scratch`, a ~3 MiB pull). The recommended entrypoint is `agentd` itself: it sets
 `PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
 own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
 

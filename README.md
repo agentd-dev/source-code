@@ -13,7 +13,7 @@ A2A `Deployment` — and when you want to *work with* it, attach a terminal or a
 browser: `agentd tui -c agent.yaml`.
 
 ```
-binary 3.0 MiB static (musl, FROM scratch) · image ~1.2 MiB pull · cold start <1 ms
+binary 6.5 MiB static (musl, FROM scratch) · ~3 MiB pull · cold start <1 ms
 idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · Apache-2.0
 ```
 
@@ -115,7 +115,7 @@ $ curl -LO https://github.com/agentd-dev/source-code/releases/download/$TAG/agen
 $ tar xzf agentd-$TAG-x86_64-unknown-linux-musl.tar.gz && ./agentd --version
 ```
 
-**Container image** (multi-arch, cosign-signed, single layer, ~1.2 MiB pull):
+**Container image** (multi-arch, cosign-signed, single layer, ~3 MiB pull):
 
 ```console
 $ docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
@@ -456,7 +456,7 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
 | Metric | Value |
 |---|---|
 | Binary (static-PIE, runs on `scratch`) | **3.0 MiB** (1.5 MiB gzipped) |
-| Container image pull | **~1.2 MiB**, single layer |
+| Container image pull | **~3 MiB**, single layer |
 | Cold start (`--version` / `--capabilities`) | **< 1 ms** |
 | Idle serving daemon RSS | **~2 MiB**, flat under load |
 | Served request overhead (`tools/call`, loopback, fresh conn) | **p50 0.26 ms** |

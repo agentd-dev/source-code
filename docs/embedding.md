@@ -15,8 +15,8 @@ tools** registered into the agent.
 
 > The normative contract is **RFC 0022** (obligations, precedence, stability
 > tiers). The compile-guaranteed reference is
-> [`crates/agentd/examples/custom-cli.rs`](../crates/agentd/examples/custom-cli.rs)
-> — run it with `cargo run -p agentd-core --example custom-cli --features workflow`.
+> [`crates/agentd/examples/embedded-agent.rs`](../crates/agentd/examples/embedded-agent.rs)
+> — run it with `cargo run -p agentd-core --example embedded-agent`.
 
 ## The three obligations
 
@@ -129,7 +129,7 @@ verified end-to-end against the built-in mock intelligence.)
 Author a dialect-2 graph as data, drive it with your own executor — the whole
 RFC 0021 surface (reducers, `parallel`, `human` gates, the checkpointer) works
 from an embedder. Full file:
-[`crates/agentd/examples/custom-cli.rs`](../crates/agentd/examples/custom-cli.rs).
+[`crates/agentd/examples/embedded-agent.rs`](../crates/agentd/examples/embedded-agent.rs).
 
 ```rust
 let graph = agentd::graph::parse_graph(&json!({

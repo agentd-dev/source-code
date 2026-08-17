@@ -4,11 +4,13 @@
 binary runs **one agent**: hand it an instruction and one LLM endpoint, and it
 runs the agentic loop — think, call a tool, observe, repeat — until the task
 reaches a terminal status or a new event wakes it. Every tool comes from a
-**remote MCP server** over HTTPS (agentd ships none of its own and **never runs
-local code**), it reacts to the world through **MCP resource subscriptions**,
-speaks **A2A** to other agents, and can drive **durable DAG workflows**. It
-is built to be a cloud-native unit of work — drop it into a `Job`, a `CronJob`,
-or a long-lived A2A `Deployment`.
+**remote MCP server** over HTTPS (agentd ships none of its own; local execution
+is off unless you compile *and* enable the guarded `exec` runner), it reacts to
+the world through **MCP resource subscriptions**, speaks **A2A** to other
+agents, and can drive **durable DAG workflows**. It is built to be a
+cloud-native unit of work — drop it into a `Job`, a `CronJob`, or a long-lived
+A2A `Deployment` — and when you want to *work with* it, attach a terminal or a
+browser: `agentd tui -c agent.yaml`.
 
 ```
 binary 3.0 MiB static (musl, FROM scratch) · image ~1.2 MiB pull · cold start <1 ms
@@ -19,7 +21,8 @@ idle daemon ~2 MiB RSS · 3 direct external deps · HTTPS everywhere · AGPL-3.0
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Quickstart](#quickstart)
-- [Five modes](#five-modes)
+- [Talk to it — TUI & web UI](#talk-to-it--tui--web-ui)
+- [Lifecycle & triggers](#lifecycle--triggers)
 - [Workflows](#workflows)
 - [Embedding — the engine in your app](#embedding--the-engine-in-your-app)
 - [Composition: serving, subagents, A2A](#composition-serving-subagents-a2a)
@@ -132,6 +135,36 @@ endpoint speaks the OpenAI-compatible wire with native tool-calling; a
 comma-list of endpoints is a failover order. See
 [docs/getting-started.md](docs/getting-started.md).
 
+## Talk to it — TUI & web UI
+
+agentd hosts the state; the clients are thin. One command runs the daemon and a
+terminal UI together:
+
+```console
+$ agentd tui --config agent.yaml     # or: agentd ui -c agent.yaml (browser)
+```
+
+```
+agentd 2.0.0 · prod-agent                        chat  tasks  subagents  debug
+you › Deploy api-gateway to staging
+agent › Deploy checks passed. Rolling out v2.4.1 — 3 pods cycling, ETA 90s.
+⣾ read_file · 3s · 1.2k tok
+● live http://127.0.0.1:8420 · 1 turns · 33/17 tok
+```
+
+Because the daemon owns the session, **several surfaces watch the same one at
+once** — a terminal at your desk, a browser on another screen, a colleague's
+machine paired with a rotating code — and quitting a client leaves the agent
+working. Approvals (`ask_human`) render as answerable rows in every attached
+client and survive a restart; a debug mode exposes the live event feed,
+per-step run detail and the log tail when you ask for it.
+
+Both clients are separate Node projects under [`interface/`](interface) built
+on a shared thin-client core, so a third client is a small program. See
+**[docs/interface.md](docs/interface.md)**, and
+**[docs/coding-agent.md](docs/coding-agent.md)** to set one up as a
+pair-programming agent for a repository.
+
 ## Lifecycle & triggers
 
 agentd 2.0 has **one durable runtime** — no modes. A run is either a one-shot
@@ -243,10 +276,10 @@ let (outcome, usage) = run_loop(&intel, &mcp_servers, &LoopInput {
 
 Workflows embed the same way — author a dialect-2 graph as data, `drive()` it
 with your own executor, and code tools are addressable from `tool` nodes as the
-reserved server **`code`**. Two compile-guaranteed examples ship in-tree:
-[`embedded-agent.rs`](crates/agentd/examples/embedded-agent.rs) (the loop in a
-host app) and [`custom-cli.rs`](crates/agentd/examples/custom-cli.rs) (a custom
-CLI driving a code-tool workflow offline). The **stock CLI registers nothing**
+reserved server **`code`**. A compile-guaranteed example ships in-tree:
+[`embedded-agent.rs`](crates/agentd/examples/embedded-agent.rs) — the loop
+called directly from a host app, with a code-registered tool the model can call
+into mid-reasoning. The **stock CLI registers nothing**
 — its no-local-code posture holds by construction. Reusable on their own:
 `agentd-mcp` (MCP client/server + wire) and `agentd-net` (transports). Recipes,
 the embedder obligations (the re-exec dispatch!), and the API-stability tiers:
@@ -418,6 +451,8 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
   [configuration](docs/configuration.md) ·
   [architecture](docs/architecture.md) · [mcp](docs/mcp.md) ·
   [modes & triggers](docs/modes-and-triggers.md) ·
+  [interface (TUI/web UI)](docs/interface.md) ·
+  [coding agent](docs/coding-agent.md) ·
   [workflows](docs/workflows.md) · [subagents](docs/subagents.md) ·
   [intelligence](docs/intelligence.md) · [security](docs/security.md) ·
   [observability](docs/observability.md) · [operations](docs/operations.md) ·
@@ -425,9 +460,9 @@ Measured on the v1.0.0 release build (x86_64, musl, stripped):
   [use cases](docs/use-cases.md)
 - **[rfcs/README.md](rfcs/README.md)** — the normative specifications
   (RFC 0001–0022; RFC 0001 is the narrative front door).
-- **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: shell
-  one-liners, Docker Compose, Kubernetes `Job`/`CronJob`/`Deployment`
-  manifests, a systemd unit.
+- **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: a coding
+  agent (`coding-agent.yaml`), Docker Compose, Kubernetes
+  `Job`/`CronJob`/`Deployment` manifests, a systemd unit.
 - **[CHANGELOG.md](CHANGELOG.md)** — release history (v1.4.0 current).
 - **Website:** [agentd.dev](https://agentd.dev) — rendered docs + RFCs.
 

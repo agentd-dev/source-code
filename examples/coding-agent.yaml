@@ -1,0 +1,80 @@
+# A coding agent you host — the config behind docs/coding-agent.md.
+#
+#   cargo build --release --features a2a,exec     # exec is NOT in release binaries
+#   export OPENAI_API_KEY=sk-…
+#   agentd tui --config examples/coding-agent.yaml
+#
+# `agentd tui` starts the daemon AND the terminal UI together. To keep them
+# separate (so quitting the UI leaves the agent working):
+#
+#   agentd --config examples/coding-agent.yaml
+#   agentd-tui --endpoint http://127.0.0.1:8420
+#
+# Point `security.exec.workdir` at the repository you want it to work in.
+config_version: "2"
+
+agent:
+  name: coder
+  # Standing policy — HOW to work, not what today's task is. The task goes in
+  # the message. Reusable playbooks belong in skills.
+  instruction: |
+    You are a careful engineer working in the repository at /work.
+
+    Explore before you edit: read the relevant files, run the tests, and say
+    what you found. Prefer the smallest change that fixes the cause, not the
+    symptom.
+
+    Ask before you act destructively — anything that rewrites history, force
+    pushes, deletes files, or touches credentials. Use ask_human and wait for
+    the answer.
+
+    When you finish, state what changed and how you verified it.
+  preflight: never
+  # An unanswered question parks until you come back, rather than guessing.
+  ask_human_fallback: wait
+
+intelligence:
+  endpoints: https://api.openai.com/v1
+  model: gpt-5.1
+  # A reference, never the key itself — resolved from the environment at start.
+  token: "{{secret:OPENAI_API_KEY}}"
+  budget:
+    windows: [{ per: day, tokens: 2000000 }]
+    on_exhausted: refuse
+
+# In-process state: simple, and gone when the daemon stops. Point this at an
+# MCP/HTTP store (RFC 0025) to make conversations, tasks and pending approvals
+# survive a restart.
+store:
+  kind: memory
+
+# The listener the TUI and web UI attach to. Loopback ⇒ a local client is the
+# operator with no credential. Binding non-loopback REQUIRES client auth.
+a2a:
+  listen: http://127.0.0.1:8420
+
+interface:
+  enabled: true
+  # Internals (transcripts, per-step run detail, the log ring) stay closed
+  # until you ask: `/set interface.debug true` opens them live.
+  debug: false
+
+security:
+  exec:
+    enabled: true
+    workdir: /work
+    # argv[0] allow-list — an empty list denies everything. Start read-only
+    # ([git, rg, ls, cat]) and widen as the agent earns it. `sed` writes files;
+    # `cargo` runs the tests. Adding `bash` grants everything: deliberate only.
+    allow: [git, rg, ls, cat, sed, cargo]
+    timeout: 120s
+    max_output: 262144
+    # ONLY these reach the child — the agent's own environment (and its
+    # secrets) never does.
+    env: [PATH, HOME, LANG]
+
+limits:
+  run: { steps: 60, tokens: 400000, deadline: 30m }
+
+lifecycle:
+  run_until: drained

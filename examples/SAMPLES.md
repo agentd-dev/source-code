@@ -1,14 +1,23 @@
 # agentd examples
 
-Runnable samples for the three operational shapes of **agentd** — a one-shot
-run, an event-reactive daemon, and a polling/work-until-done loop — plus the
-instruction files and MCP server config they use.
-
-> **Status.** Implemented and released (v2.0.0). The agentic ReAct loop, the
-> supervisor + subagent process tree, the MCP client, served self-MCP over
-> HTTP(S), and all four run modes ship; the commands below run real agent runs
-> (given an intelligence endpoint + MCP servers). Every flag and env var used
-> here exists in `crates/agentd/src/config.rs` (the authoritative surface).
+> ### Read this first — two eras live here
+>
+> **Current (agentd 2.0):**
+>
+> | File | What it is |
+> |---|---|
+> | **`coding-agent.yaml`** | **A coding agent you pair with** — the config behind [docs/coding-agent.md](../docs/coding-agent.md). `agentd tui --config examples/coding-agent.yaml` starts the daemon *and* a terminal UI. Validated against the binary. |
+>
+> **Legacy (agentd 1.x — superseded, kept for reference):** the `run-*.sh`
+> scripts, the k8s manifests and the flag tables below drive the **`--mode`**
+> surface that agentd 2.0 **removed**. A 1.x invocation is now rejected at
+> startup with a migration hint, so those commands will not run as written.
+> The 2.0 equivalents are: one durable runtime (`lifecycle.run_until` = job or
+> daemon) with workflow **start nodes** (`once` / `loop` / `schedule` /
+> `subscribe` / `signal` / `event` / `a2a`) as the triggers — see
+> [modes-and-triggers.md](../docs/modes-and-triggers.md) and
+> [getting-started.md](../docs/getting-started.md). Modernizing these scripts
+> is tracked work, not a claim that they work today.
 
 ---
 
@@ -16,6 +25,7 @@ instruction files and MCP server config they use.
 
 | File | What it is |
 |---|---|
+| `coding-agent.yaml` | **(2.0)** A pair-programming agent for a repository: the `exec` fence, approvals, budgets, and the display surface the TUI/web UI attach to. |
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |
 | `mcp-servers.json` | An illustrative MCP server config (name + remote `endpoint` + auth `headers` + `tags`), the shape a `--config` JSON file carries. |

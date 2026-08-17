@@ -101,6 +101,14 @@ export const DOCS = [
     blurb: "The JSON-lines event stream, metrics, OTEL traces, and the A2A read surface.",
   },
   {
+    slug: "coding-agent",
+    file: "docs/coding-agent.md",
+    title: "Coding agent (software engineering)",
+    group: "operate",
+    blurb:
+      "Pair-program on a repository: giving it hands (exec vs MCP), approvals, budgets, and the practices that keep it safe.",
+  },
+  {
     slug: "interface",
     file: "docs/interface.md",
     title: "Interface — TUI & web UI",

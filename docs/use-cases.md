@@ -35,6 +35,7 @@ and an orchestrator can drive another agent that is itself reactive.
 | Split a big task into parallel narrowed workers | any | — | **fan-out** |
 | Let an untrusted reader feed a trusted actor safely | any | — | **trust-partition** |
 | Run a long-lived worker an orchestrator drives + steers | an `a2a.listen` daemon | `Deployment` | **served** |
+| **Pair with a human on a codebase, in a terminal or browser** | an `a2a.listen` daemon + `interface.enabled` | your laptop / a dev box | optional |
 
 Every flag below is in [`configuration.md`](configuration.md); the mechanics are
 in [`modes-and-triggers.md`](modes-and-triggers.md), [`subagents.md`](subagents.md),
@@ -348,6 +349,51 @@ real, reaped process with a hard deadline, a no-progress watchdog, and active
 ping/pong liveness; `GetTask` / `ListTasks` give the driver an honest, durable
 view of each task — which **survives a worker restart** (RFC 0025) — without
 parsing logs.
+
+---
+
+## 7. A coding agent you pair with (software engineering)
+
+**Shape:** a **daemon** with the display surface on · your laptop or a dev box ·
+subagents optional.
+
+The interactive shape: you talk to the agent about a repository and watch it
+work, like a coding CLI — except the session lives in the daemon, so it
+survives the client, several surfaces can watch it at once, and the same
+instance can also run scheduled engineering chores.
+
+```yaml
+agent:
+  instruction: |
+    You are a careful engineer working in the repository at /work.
+    Explore before you edit; ask before anything destructive.
+  ask_human_fallback: wait          # a question parks until you answer it
+a2a:      { listen: "http://127.0.0.1:8420" }
+interface: { enabled: true }        # the TUI/web-UI surface (default OFF)
+security:
+  exec:                             # needs --features exec; default-OFF twice over
+    enabled: true
+    workdir: /work
+    allow: [git, rg, ls, cat, sed, cargo]
+```
+
+```console
+$ agentd tui --config coding.yaml
+```
+
+**Why this shape.** The daemon owns the conversation, so quitting the terminal
+does not end the work and a browser (or a colleague, via a rotating pairing
+code) can attach to the same session. `ask_human` gates render as answerable
+rows in every attached client and survive a restart — the approval prompt is
+server-side, not a property of your terminal. The `exec` fence (allow-list,
+workdir confinement, no shell, minimal env) is what bounds the blast radius;
+the model's cooperation is not a control.
+
+**Watch for:** `exec` is not in release binaries (build with `--features
+exec`); adding an MCP server tagged `untrusted_input` alongside it trips the
+Rule-of-Two refusal on purpose; and a non-loopback listener demands client auth.
+
+Full recipe, including the practices: **[coding-agent.md](coding-agent.md)**.
 
 ---
 

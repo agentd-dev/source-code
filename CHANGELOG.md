@@ -5,7 +5,23 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v2.0.0 — the durable agent: A2A, workflows, display clients, and protocols from their own SDKs
+
+The rewrite lands. agentd 2.0 is a daemon you can attach to, hand work to, and
+hold to account: durable workflows that survive a restart, an A2A surface other
+agents and your own display clients speak, human-in-the-loop gates that reach
+every attached screen, and — as of this release — MCP and A2A implemented by
+`rmcp` and `a2a-rs` rather than by us.
+
+**Breaking.** The 1.x execution modes and their flags are gone (each exits `2`
+naming its replacement), MCP and A2A wire details moved to strict proto3 JSON,
+and clustering was removed rather than finished. Read the three BREAKING
+sections below before upgrading.
+
+Crates step to `agentd-core` / `agentd-cli` **2.0.0** (`agentd-mcp` /
+`agentd-net` **0.3.0**); the display clients ship as `@agentd-dev/cli` **2.0.0**;
+the image is `ghcr.io/agentd-dev/agentd:2.0.0`. The MSRV is **1.96**, set by the
+protocol SDKs.
 
 ### Removed (BREAKING: clustering and sharding are gone)
 
@@ -29,12 +45,12 @@ and `agent_saturation` metrics, which were reserved names flat at zero. Each
 removed flag now exits `2` naming what to do instead. RFC 0019 is marked
 **Withdrawn**, with the reasoning kept.
 
-This also withdraws the sharded-timer gate added earlier in this cycle: it was a
-real fix to a real duplicate-run problem, but the right place for that decision
-is one line of deployment config (replica 0 arms the nightly `schedule`; the
-others do not), not a hash inside the agent.
+One thing this gives up honestly: in a fleet, three replicas arming the same
+nightly `schedule` will run it three times. That is a real problem, and the right
+place to solve it is one line of deployment config — replica 0 arms the schedule,
+the others do not — rather than a hash inside the agent.
 
-### Added (push notifications, the authenticated card, and a shard gate that works)
+### Added (push notifications and the authenticated agent card)
 
 - **Push notifications.** A caller registers a webhook and agentd POSTs its
   task's updates there instead of the caller holding a stream open. Default-OFF
@@ -47,12 +63,6 @@ others do not), not a hash inside the agent.
 - **`GetExtendedAgentCard`.** The authenticated card: the same document, with
   the skills this caller may actually run rather than every workflow. An
   anonymous caller gets `-32007`.
-- **Sharded timer starts are real.** `cluster.shard` + `cluster.timer_shard`
-  now decide whether a `schedule`/`loop`/`cron`/`once` start fires on this
-  replica — `shard0` (replica 0 owns every timer) or `keyed` (each start hashes
-  to one). Three replicas arming the same nightly job used to run it three
-  times. Skips are counted in `agent_shard_skipped_total`.
-
 ### Fixed
 
 - **The agent card named no interface.** It carried the older flat

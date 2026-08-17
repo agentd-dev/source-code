@@ -2429,7 +2429,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     let mut d = Diagnostics::default();
     let err = |d: &mut Diagnostics, m: String| d.errors.push(m);
 
-
     // config_version
     if let Some(v) = &s.config_version
         && v != schema::CONFIG_VERSION
@@ -3595,7 +3594,10 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("unknown field"), "{msg}");
         assert!(msg.contains("prompt"), "{msg}");
-        assert!(msg.contains("instruction"), "names the allowed fields: {msg}");
+        assert!(
+            msg.contains("instruction"),
+            "names the allowed fields: {msg}"
+        );
 
         // The same workflow, spelled correctly, still validates.
         let ok = write_tmp(

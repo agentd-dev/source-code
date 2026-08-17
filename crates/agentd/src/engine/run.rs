@@ -670,7 +670,10 @@ mod tests {
         assert!(!back.dirty);
         assert_eq!(back.summary()["workflow"], json!("w"));
         // A rendered spec.
-        let data = run.data(env_view("inst", "r", Some("brief"), None), json!({"k": "v"}));
+        let data = run.data(
+            env_view("inst", "r", Some("brief"), None),
+            json!({"k": "v"}),
+        );
         let mut s = w.step("f").unwrap().clone();
         s.spec
             .insert("extra".into(), json!("{{env.instruction}}/{{memory.k}}"));

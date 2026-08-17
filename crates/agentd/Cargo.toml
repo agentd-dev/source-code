@@ -20,6 +20,10 @@ path = "src/lib.rs"
 # feature-gated and OFF by default. See rfcs/0002 §dependency-budget.
 [features]
 default = ["tls"]
+# Use the OFFICIAL Rust MCP SDK for outbound MCP instead of the hand-rolled
+# client. Upstream spec-tracking in exchange for ~77 crates and tokio;
+# the default build keeps the minimal client. See docs/mcp.md.
+rmcp-client = ["mcp/rmcp-client"]
 # Direct https:// intelligence/MCP (the default transport). rustls with the `ring`
 # provider (no cmake/C build dep) + bundled webpki roots — so a scratch container
 # has trust anchors with no system CA bundle. On by default; opt out with

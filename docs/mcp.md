@@ -267,6 +267,47 @@ stops with it, and the whole drain counts inside `lifecycle.drain_timeout`
 
 ---
 
+## Choosing a client backend
+
+agentd's MCP client is hand-rolled, like the rest of the network stack — that
+is what keeps the default build at three external dependencies and its start
+under a millisecond. It is also a bet: that we track the specification
+correctly ourselves.
+
+You can take the other side of that bet. Building with `--features rmcp-client`
+routes outbound MCP through [`rmcp`](https://crates.io/crates/rmcp), the
+official Rust SDK maintained alongside the protocol:
+
+```console
+$ cargo build -p agentd-cli --release --features a2a,rmcp-client
+```
+
+| | hand-rolled (default) | `rmcp-client` |
+|---|---|---|
+| Extra crates | 0 | **+77**, including tokio |
+| Spec tracking | ours | upstream |
+| Protocol version | `2026-07-28`, negotiating down | `2026-07-28` (we override rmcp's more conservative default) |
+| Async runtime | none | a private current-thread runtime inside the client |
+
+Both speak the same protocol version and expose the same surface to the rest of
+agentd, so nothing above the client changes.
+
+### What stays on the native transport
+
+Request signing and mutual-TLS identities plug into agentd's own HTTP
+transport, which the SDK does not use. Rather than silently drop a credential,
+a server that needs one keeps the hand-rolled client **even when the SDK is
+compiled in**:
+
+- AAuth request signing (RFC 9421)
+- OAuth token refresh through the signer seam
+- AWS SigV4
+- SPIFFE X.509-SVID mTLS
+
+So a build with `rmcp-client` is a mixed fleet: plain servers go through the
+SDK, authenticated ones through ours. That is deliberate — losing a credential
+to gain a dependency would be a bad trade.
+
 ## 2. The other direction
 
 MCP is how agentd reaches *out* for capability. How something reaches *in* — a

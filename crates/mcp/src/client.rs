@@ -124,6 +124,25 @@ pub struct McpClient {
     /// modern (stateless per-request `_meta`). Governs how every request is built.
     era: Era,
     timeout: Duration,
+    /// When compiled with `rmcp-client`, the official SDK answers every
+    /// operation instead of the hand-rolled path below. Held here rather than
+    /// behind an enum so callers keep taking `&[McpClient]` and nothing else in
+    /// the tree has to know which backend is live.
+    #[cfg(feature = "rmcp-client")]
+    rmcp: Option<crate::rmcp_client::RmcpClient>,
+    /// The endpoint + headers the SDK backend needs to build its own transport.
+    /// Only carried when that backend is compiled in.
+    #[cfg(feature = "rmcp-client")]
+    endpoint: String,
+    /// Whether this connection needs OUR transport: a request signer (AAuth
+    /// RFC 9421, OAuth refresh, AWS SigV4) or an mTLS client identity. Those
+    /// plug into `HttpTransport`, which the SDK does not use — so a server that
+    /// needs one stays on the native path even when the SDK is compiled in.
+    /// Silently dropping a credential would be the worst possible trade.
+    #[cfg(feature = "rmcp-client")]
+    needs_native_transport: bool,
+    #[cfg(feature = "rmcp-client")]
+    extra_headers: Vec<(String, String)>,
     /// Server→client requests we advertise an ability to answer, and the host
     /// callback that answers them. `ping` is answered regardless.
     inbound_caps: inbound::Capabilities,
@@ -179,9 +198,11 @@ impl McpClient {
     ) -> Result<McpClient, McpError> {
         let ep = McpEndpoint::parse(endpoint)
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
+        #[cfg(feature = "rmcp-client")]
+        let signed = signer.is_some();
         Ok(McpClient {
             name: name.to_string(),
-            http: Arc::new(HttpTransport::new(ep, headers).with_signer(signer)),
+            http: Arc::new(HttpTransport::new(ep, headers.clone()).with_signer(signer)),
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             events: Mutex::new(None),
             subscribed_uris: Mutex::new(BTreeSet::new()),
@@ -192,6 +213,14 @@ impl McpClient {
             // Established on connect; legacy is the safe default until then.
             era: Era::Legacy,
             timeout,
+            #[cfg(feature = "rmcp-client")]
+            rmcp: None,
+            #[cfg(feature = "rmcp-client")]
+            endpoint: endpoint.to_string(),
+            #[cfg(feature = "rmcp-client")]
+            needs_native_transport: signed,
+            #[cfg(feature = "rmcp-client")]
+            extra_headers: headers,
             inbound_caps: inbound::Capabilities::default(),
             inbound_handler: None,
             tool_meta: None,
@@ -273,6 +302,10 @@ impl McpClient {
     /// the process (see [`net::tls`]).
     #[cfg(feature = "tls")]
     pub fn with_identity(mut self, identity: net::tls::ClientIdentity) -> Self {
+        #[cfg(feature = "rmcp-client")]
+        {
+            self.needs_native_transport = true;
+        }
         // The Arc is unshared here (called right after connect, before the event
         // thread), so get_mut succeeds; a no-op if it were somehow already shared.
         if let Some(h) = Arc::get_mut(&mut self.http) {
@@ -307,6 +340,31 @@ impl McpClient {
     /// liveness heartbeat) for the full ~60s — a timeout is a contained
     /// `mcp.connect.fail` (the server is simply absent, RFC 0007 / RFC 0017 §5.3).
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
+        // With the official SDK compiled in, it owns the handshake and every
+        // operation after it. The hand-rolled path below is then unused — the
+        // `return` is load-bearing in the OTHER configuration, where that path
+        // is the whole function.
+        #[cfg(feature = "rmcp-client")]
+        if !self.needs_native_transport {
+            let mut b = crate::rmcp_client::RmcpBuilder::new(
+                &self.name,
+                &self.endpoint,
+                self.extra_headers.clone(),
+                timeout,
+            )
+            .with_client_info(self.client_info.clone());
+            if self.inbound_caps.elicitation
+                && let Some(h) = &self.inbound_handler
+            {
+                b = b.with_elicitation(Arc::clone(h));
+            }
+            let c = b.connect()?;
+            self.caps = c.capabilities().clone();
+            self.protocol_version = c.protocol_version().map(str::to_string);
+            self.era = Era::Modern;
+            self.rmcp = Some(c);
+            return Ok(());
+        }
         // Detect the server's ERA (versioning §backward-compatibility): attempt a
         // MODERN `server/discover`; a modern JSON-RPC error body identifies a
         // modern server (retry with a mutual version), otherwise fall back to the
@@ -510,6 +568,10 @@ impl McpClient {
     /// applied to EACH page (each pagination round-trip is bounded), matching the
     /// per-request contract of [`Self::request_with_timeout`].
     pub fn list_tools_within(&self, timeout: Duration) -> Result<Vec<Tool>, McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.list_tools();
+        }
         if !self.caps.supports_tools() {
             return Ok(Vec::new());
         }
@@ -547,6 +609,15 @@ impl McpClient {
         name: &str,
         arguments: Option<Value>,
     ) -> Result<CallToolResult, McpError> {
+        // The tool call is the hot path; the SDK owns the whole round trip
+        // (including its own `_meta` handling) when it is the live backend.
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            let raw = c.call_tool_with_meta(name, arguments.clone(), None)?;
+            return serde_json::from_value(raw).map_err(|e| {
+                McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
+            });
+        }
         if !self.caps.supports_tools() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no tools",
@@ -588,6 +659,14 @@ impl McpClient {
         extra_meta: Value,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            let _ = timeout; // the SDK owns its own per-request deadline
+            let raw = c.call_tool_with_meta(name, arguments.clone(), Some(extra_meta.clone()))?;
+            return serde_json::from_value(raw).map_err(|e| {
+                McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
+            });
+        }
         if !self.caps.supports_tools() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no tools",
@@ -600,6 +679,10 @@ impl McpClient {
     }
 
     pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.list_resources();
+        }
         if !self.caps.supports_resources() {
             return Ok(Vec::new());
         }
@@ -620,6 +703,10 @@ impl McpClient {
     /// `prompts/list`, following cursor pagination to completion. Empty when the
     /// server doesn't advertise `prompts`.
     pub fn list_prompts(&self) -> Result<Vec<Prompt>, McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.list_prompts();
+        }
         if !self.caps.supports_prompts() {
             return Ok(Vec::new());
         }
@@ -780,6 +867,10 @@ impl McpClient {
         uri: &str,
         timeout: Duration,
     ) -> Result<ReadResourceResult, McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.read_resource(uri);
+        }
         let params = ReadResourceParams {
             uri: uri.to_string(),
         };
@@ -795,6 +886,10 @@ impl McpClient {
     /// bound, RFC 0016 §10) — for the reactor-thread reload re-handshake, where a
     /// slow-but-alive server arming a subscription must not block the reactor.
     pub fn subscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.subscribe(uri);
+        }
         if !self.caps.supports_subscribe() {
             return Err(McpError::Capability(format!(
                 "server '{}' does not support resource subscriptions",
@@ -913,6 +1008,10 @@ impl McpClient {
     /// unsubscribe, both best-effort: a slow server here must not block the reactor
     /// or the drain past the liveness window / drain budget.
     pub fn unsubscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.unsubscribe(uri);
+        }
         if self.era == Era::Modern {
             // Modern: drop the URI and re-open `subscriptions/listen` with the rest
             // (or stop the stream if none remain).
@@ -935,6 +1034,10 @@ impl McpClient {
     /// `notifications/resources/updated`). The reactive router
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
+        #[cfg(feature = "rmcp-client")]
+        if let Some(c) = &self.rmcp {
+            return c.drain_notifications();
+        }
         let mut q = self.notifications.lock().unwrap_or_else(|e| e.into_inner());
         q.drain(..).collect()
     }

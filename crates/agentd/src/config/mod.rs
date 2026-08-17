@@ -28,6 +28,7 @@ use crate::sec::scope::TrifectaTag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Execution mode — one supervisor loop, four exit predicates (RFC 0008).
@@ -2321,7 +2322,55 @@ pub(crate) fn config_paths_from_map(args: &[String], envmap: &HashMap<&str, &str
             ConfigFlag::No => {}
         }
     }
+    // Nothing named a config, so look for the project's own: `.agentd.yml` in
+    // the working directory, the way a linter or a formatter picks up its
+    // dotfile. Only ever a fallback — an explicit `--config` or `AGENTD_CONFIG`
+    // means the caller has already decided.
+    if paths.is_empty() && !is_informational(args) {
+        paths.extend(discovered_config_in(Path::new(".")));
+    }
     paths
+}
+
+/// The file names agentd looks for when an invocation names no config.
+///
+/// Two spellings because `.yml` and `.yaml` are both idiomatic and guessing
+/// wrong should not mean silence — a config file the tool ignores is the worst
+/// outcome of the three.
+pub const DISCOVERED_CONFIG_NAMES: [&str; 2] = [".agentd.yml", ".agentd.yaml"];
+
+/// Which of [`DISCOVERED_CONFIG_NAMES`] exist in `dir`, in order.
+///
+/// Returns **all** matches rather than the first, so that two present at once
+/// surfaces as an error at load rather than a silent pick between them. Callers
+/// that get more than one refuse to start.
+pub fn discovered_config_in(dir: &Path) -> Vec<String> {
+    DISCOVERED_CONFIG_NAMES
+        .iter()
+        .map(|n| dir.join(n))
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Whether this invocation only wants to print something.
+///
+/// `--help` and `--version` must work in any directory. Discovering a config
+/// for them would mean a stray `.agentd.yml` two levels of `cd` away could make
+/// `agentd --help` fail, which is an unreasonable way to learn a file is
+/// malformed.
+fn is_informational(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-h" | "--help"
+                | "-V"
+                | "--version"
+                | "--config-schema"
+                | "--config-schema=2"
+                | "--workflow-schema"
+        )
+    })
 }
 
 /// Type a config DOCUMENT (a merged file set, the env-path layer, or one
@@ -2672,6 +2721,49 @@ mod tests {
         assert!(Config::config_paths_from(&args(&["-c"]), &env).is_empty());
         // Not the config flag: neither a different flag nor a lookalike value.
         assert!(Config::config_paths_from(&args(&["--cluster-shard", "a"]), &env).is_empty());
+    }
+
+    /// `.agentd.yml` in the working directory, picked up when the invocation
+    /// named no config — and never when it did.
+    #[test]
+    fn a_dotfile_is_discovered_only_when_nothing_else_named_a_config() {
+        let dir = std::env::temp_dir().join(format!("agentd-discover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing there yet.
+        assert!(discovered_config_in(&dir).is_empty());
+
+        std::fs::write(dir.join(".agentd.yml"), "config_version: \"2\"\n").unwrap();
+        let found = discovered_config_in(&dir);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with(".agentd.yml"), "{found:?}");
+
+        // Both spellings are reported, so the caller can refuse rather than
+        // silently pick one: whichever it chose, somebody would be editing the
+        // other and wondering why nothing changed.
+        std::fs::write(dir.join(".agentd.yaml"), "config_version: \"2\"\n").unwrap();
+        assert_eq!(discovered_config_in(&dir).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The informational invocations must work in any directory — a stray
+    /// dotfile must not be able to break `--help`.
+    #[test]
+    fn help_and_version_do_not_discover_a_config() {
+        for a in [
+            "--help",
+            "-h",
+            "--version",
+            "-V",
+            "--config-schema",
+            "--workflow-schema",
+        ] {
+            assert!(is_informational(&args(&[a])), "{a} should be informational");
+        }
+        assert!(!is_informational(&args(&["--validate-config"])));
+        assert!(!is_informational(&args(&[])));
     }
 
     #[test]

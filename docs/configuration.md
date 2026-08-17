@@ -39,7 +39,7 @@ built-in default  <  config file  <  env var  <  CLI flag
   config (the MCP-server inventory, workflow definitions, A2A peers and
   principals, the store, limits, model/log knobs, intelligence endpoint list +
   headers). **Live** (RFC 0017 §3). Several files compose into **one document,
-  in order — a later file overrides the earlier ones** (§12.1). The merged
+  in order — a later file overrides the earlier ones** (§12.2). The merged
   document slots between *default* and *env*, so env and flags still override
   it. **Repeatable list flags ADD to the file's lists**
   (`--mcp`/`--a2a-peer`/`--workflow` append to what the files declare). Secrets
@@ -621,7 +621,7 @@ Every applied reload logs `config.reloaded` with the changed groups, bumps
 ## 12. The config file (`--config`, RFC 0017 §3)
 
 `--config <PATH>` (repeatable) / `AGENT_CONFIG` loads one or more documents in
-**YAML or JSON** (§12.1 for how several compose). The extension picks the syntax
+**YAML or JSON** (§12.2 for how several compose). The extension picks the syntax
 (`.yaml`/`.yml` ⇒ YAML, `.json`/`.jsonc` ⇒ JSON with `//`/`/* */` comments);
 any other extension is sniffed (a document starting with `{`/`[` is JSON, else
 YAML). YAML is read by agentd's own
@@ -637,7 +637,38 @@ the file and listing the fields that *are* allowed — the most common config ty
 closed at parse time. Print the schema with `--config-schema=2` (Draft 2020-12,
 exit `0`); validate a candidate with `--validate-config`.
 
-### 12.1 Several files — later overrides earlier
+### 12.1 `.agentd.yml` — the project's own config
+
+When an invocation names **no** config — no `--config`, no `AGENT_CONFIG` —
+agentd looks for `.agentd.yml` (or `.agentd.yaml`) in the working directory and
+loads it, the way a linter or a formatter picks up its dotfile. So a checked-in
+project config makes `agentd` work with no flags at all:
+
+```console
+$ cd ~/work/triage     # contains .agentd.yml
+$ agentd --validate-config
+{"event":"config.valid","files":["./.agentd.yml"],"schema":"2"}
+```
+
+Three rules keep it from being surprising:
+
+- **It is only ever a fallback.** Naming a config — by flag or by env — means
+  you have already decided; the dotfile is not consulted, not merged, not
+  layered underneath. There is no way for a stray file to modify a run you
+  spelled out.
+- **Only the working directory.** No walk up to a parent, no `$HOME`, no
+  `/etc`. Where it applies is exactly where you can see it.
+- **Both spellings present is an error** (exit `2`), not a silent pick between
+  them — whichever agentd chose, somebody would be editing the other and
+  wondering why nothing changed.
+
+`--help`, `--version`, `--config-schema` and `--workflow-schema` never discover
+a config, so a malformed dotfile cannot stop you from reading the help.
+
+Once discovered it is an ordinary file layer: env and flags still override it,
+and `--watch-config` watches it like any other.
+
+### 12.2 Several files — later overrides earlier
 
 The files in play are, in order: every entry of `AGENT_CONFIG` (a `:`-separated,
 PATH-style list), then every `--config <path>` in argument order. They compose
@@ -668,7 +699,7 @@ observability:                  observability:
   log_level: debug                log_level: null        # unsets → built-in default
 ```
 
-### 12.2 What the file carries
+### 12.3 What the file carries
 
 The file carries the **whole** schema — every section named at the top of this
 page, i.e. every path `agentd --config-schema=2` prints. There is no separate

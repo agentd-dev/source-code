@@ -298,6 +298,33 @@ a {
 }
 
 /* a terminal block — dark in both themes, on purpose */
+/* The demo picker scrolls sideways when the labels do not fit; without an edge
+   signal a clipped label just looks broken. The fade is decoration only, so it
+   never eats a click. */
+.tabscroll::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 2.5rem;
+  pointer-events: none;
+  background: linear-gradient(to right, transparent, var(--bg));
+}
+@media (min-width: 1024px) {
+  .tabscroll::after {
+    display: none;
+  }
+}
+
+/* A grid or flex item is `min-width: auto` by default, so a terminal — a `<pre>`
+   with `white-space: pre` — sizes its track to its longest line. On a phone that
+   is the whole page scrolling sideways because of one YAML sample. Every
+   terminal here scrolls its own content, so no track needs to be that wide. */
+main :is(.grid, .flex) > * {
+  min-width: 0;
+}
+
 .term {
   background: var(--term-bg);
   border: 1px solid var(--term-line);
@@ -316,7 +343,18 @@ a {
   margin: 0;
   padding: 0.95rem 1.05rem;
   overflow-x: auto;
+  overflow-wrap: normal;
   white-space: pre;
+}
+/* A phone has ~40 characters at the desktop size; a step down buys ~8 more,
+   which is the difference between reading a command and scrolling to it. */
+@media (max-width: 640px) {
+  .term {
+    font-size: 0.74rem;
+  }
+  .term pre {
+    padding: 0.8rem 0.85rem;
+  }
 }
 .prompt {
   color: #4ade80;
@@ -658,6 +696,9 @@ details.doc-nav-group[open] > summary::before {
   margin-top: 1.9rem;
 }
 .prose-agent :where(code):not(:where(pre code)) {
+  /* An identifier longer than a phone is wide would otherwise push the page
+     sideways; breaking one mid-token is the lesser evil. */
+  overflow-wrap: anywhere;
   font-family: var(--mono);
   background: var(--panel-2);
   border: 1px solid var(--line);

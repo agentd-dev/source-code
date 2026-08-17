@@ -55,8 +55,23 @@ function useInView(ref) {
   return seen;
 }
 
-export default function Console({ title = "agentd", script = [], className = "" }) {
+export default function Console({
+  title = "agentd",
+  script = [],
+  className = "",
+  /**
+   * A fixed transcript height (any CSS length).
+   *
+   * Without it the block grows line by line and the page reflows under the
+   * reader — in the hero, where the demo plays while they are still reading the
+   * first paragraph, that is the whole layout moving. With it the terminal is a
+   * window: it reserves its space up front, scrolls its own content, and
+   * switching between demos of different lengths does not move anything either.
+   */
+  height,
+}) {
   const box = useRef(null);
+  const view = useRef(null);
   const reduced = useReducedMotion();
   const inView = useInView(box);
   const [done, setDone] = useState([]); // settled lines
@@ -120,6 +135,16 @@ export default function Console({ title = "agentd", script = [], className = "" 
 
   const lines = reduced || !inView ? full : done;
 
+  // Keep the newest line visible in a fixed-height window; without this the
+  // transcript plays on past the bottom edge and the reader watches a static
+  // screen. `auto` (not `smooth`) because a per-line animation at typing speed
+  // reads as jitter.
+  useEffect(() => {
+    if (!height) return;
+    const el = view.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [height, lines.length, typing, spin]);
+
   return (
     <div className={`term ${className}`} ref={box}>
       <div className="panel-title">
@@ -149,7 +174,11 @@ export default function Console({ title = "agentd", script = [], className = "" 
           </button>
         )}
       </div>
-      <pre aria-live="polite">
+      <pre
+        aria-live="polite"
+        ref={view}
+        style={height ? { height, overflowY: "auto" } : undefined}
+      >
         {lines.map((l, i) =>
           l.t === "in" ? (
             <div key={i}>

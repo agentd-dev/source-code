@@ -17,7 +17,7 @@ import Console from "./Console";
 const DEMOS = [
   {
     id: "one-shot",
-    label: "one-shot job",
+    label: "one-shot",
     blurb: "Ask, answer, exit. The exit code is the terminal status.",
     title: "agentd — a one-shot job",
     script: [
@@ -43,7 +43,7 @@ const DEMOS = [
   },
   {
     id: "reactive",
-    label: "reactive daemon",
+    label: "reactive",
     blurb: "Idles at near-zero CPU until a server pushes a resource update.",
     title: "agentd — wake on an event",
     script: [
@@ -64,7 +64,7 @@ const DEMOS = [
   },
   {
     id: "workflow",
-    label: "durable workflow",
+    label: "workflow",
     blurb: "A graph that checkpoints before every effect — and resumes after a kill.",
     title: "agentd — crash-resume",
     script: [
@@ -89,7 +89,7 @@ const DEMOS = [
   },
   {
     id: "tui",
-    label: "pair programming",
+    label: "pairing",
     blurb: "A daemon you talk to. Quit the client; the agent keeps working.",
     title: "agentd tui — coder",
     script: [
@@ -114,7 +114,7 @@ const DEMOS = [
   },
   {
     id: "bounded",
-    label: "held to account",
+    label: "guardrails",
     blurb: "Validation before side effects; budgets that stop a runaway loop.",
     title: "agentd — the fence",
     script: [
@@ -144,27 +144,49 @@ export default function ConsoleDemos() {
 
   return (
     <div>
-      <div className="mb-3 flex flex-wrap gap-1.5" role="tablist" aria-label="Example runs">
-        {DEMOS.map((d) => (
-          <button
-            key={d.id}
-            type="button"
-            role="tab"
-            aria-selected={d.id === active}
-            onClick={() => setActive(d.id)}
-            className={
-              d.id === active
-                ? "rounded-full border px-3 py-1 font-mono text-xs border-[var(--green)] text-[var(--green)]"
-                : "rounded-full border px-3 py-1 font-mono text-xs border-[var(--line-2)] text-[var(--dim)] hover:text-[var(--fg-strong)] hover:border-[var(--dim)]"
-            }
-          >
-            {d.label}
-          </button>
-        ))}
+      {/*
+        A segmented control rather than a row of loose pills: these are five
+        views of one thing, and a control that looks like one object says so.
+        It scrolls sideways on a narrow screen instead of wrapping to three
+        ragged rows — the terminal below it is already the tall element, and a
+        stack of pills above it pushed the whole demo off the first screen.
+      */}
+      {/* The fade at the right edge is the only thing telling a phone reader
+          there are more runs than fit; a cut-off word reads as a bug. */}
+      <div className="tabscroll relative mb-3">
+        <div
+          className="max-w-full overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          role="tablist"
+          aria-label="Example runs"
+        >
+        <div className="inline-flex gap-1 rounded-xl border border-[var(--line)] bg-[var(--panel-2)] p-1">
+          {DEMOS.map((d) => {
+            const on = d.id === active;
+            return (
+              <button
+                key={d.id}
+                type="button"
+                role="tab"
+                aria-selected={on}
+                onClick={() => setActive(d.id)}
+                className={`shrink-0 whitespace-nowrap rounded-lg px-3 py-1.5 font-mono text-xs transition-colors ${
+                  on
+                    ? "bg-[var(--term-bg)] text-[var(--term-fg)] shadow-sm"
+                    : "text-[var(--dim)] hover:bg-[var(--panel)] hover:text-[var(--fg-strong)]"
+                }`}
+              >
+                {on && <span className="mr-1.5 text-[var(--green-solid)]">▍</span>}
+                {d.label}
+              </button>
+            );
+            })}
+          </div>
+        </div>
       </div>
 
-      {/* `key` remounts the console so a newly-picked run plays from the top. */}
-      <Console key={demo.id} title={demo.title} script={demo.script} />
+      {/* `key` remounts the console so a newly-picked run plays from the top.
+          The fixed height means that remount does not resize the page. */}
+      <Console key={demo.id} title={demo.title} script={demo.script} height="21rem" />
 
       <p className="mt-3 text-xs text-[var(--dim)]">{demo.blurb}</p>
     </div>

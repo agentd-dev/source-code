@@ -156,28 +156,29 @@ export default function Home() {
   return (
     <main>
       {/* ── hero ─────────────────────────────────────────────── */}
-      <section className="mx-auto grid max-w-[82rem] gap-10 px-4 pt-14 pb-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:items-center lg:pt-20">
-        <div>
-          <div className="chip mb-6">
+      <section className="mx-auto grid max-w-[82rem] gap-8 px-4 pt-10 pb-6 sm:gap-10 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:items-center lg:pt-20">
+        {/* DOM order is the MOBILE order — what it is, then what it looks like
+            running, then how to install it. On desktop the explicit row/column
+            starts put the console beside the prose instead. */}
+        <div className="min-w-0 lg:col-start-1 lg:row-start-1">
+          <div className="chip mb-5 sm:mb-6">
             <span className="pulse" /> a runtime, not a framework
           </div>
-          <h1 className="text-4xl font-bold leading-[1.08] tracking-tight text-[var(--fg-strong)] sm:text-5xl">
-            The agent runs in a daemon.
-            <br />
-            You keep the fence.
+          <h1 className="text-[2rem] font-bold leading-[1.12] tracking-tight text-[var(--fg-strong)] sm:text-[2.75rem] sm:leading-[1.08] lg:text-5xl">
+            agentd is an agent runtime.
           </h1>
-          <p className="mt-5 max-w-xl text-lg text-[var(--fg)]">
-            agentd is a small agent runtime: give it an instruction and tools from remote{" "}
+          <p className="mt-4 max-w-xl text-base text-[var(--fg)] sm:mt-5 sm:text-lg">
+            One static binary. Give it an instruction and tools from remote{" "}
             <strong className="font-semibold text-[var(--fg-strong)]">MCP</strong> servers, and it
             runs the agentic loop — think, call a tool, observe, self-correct — as a one-shot job or
             a long-lived daemon.
           </p>
           <p className="mt-4 max-w-xl text-[var(--dim)]">
-            One static binary, supervised and bounded, that runs no code of its own. Everything it
-            can do, you wired.
+            It runs no code of its own: everything the agent can do, you wired. The supervisor that
+            owns its lifecycle holds no model, so it cannot be talked out of stopping it.
           </p>
 
-          <div className="mt-7 flex flex-wrap gap-3">
+          <div className="mt-6 flex flex-wrap gap-3 sm:mt-7">
             <Link href="/docs/getting-started/" className="btn btn-primary">
               Get started
             </Link>
@@ -188,14 +189,14 @@ export default function Home() {
               GitHub ↗
             </a>
           </div>
-
-          <div className="mt-8">
-            <Term title="install · linux amd64/arm64 · checksum-verified">{INSTALL_CMD}</Term>
-          </div>
         </div>
 
-        <div className="lg:pt-6">
+        <div className="min-w-0 lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:pt-6">
           <ConsoleDemos />
+        </div>
+
+        <div className="min-w-0 lg:col-start-1 lg:row-start-2">
+          <Term title="install · linux amd64/arm64 · checksum-verified">{INSTALL_CMD}</Term>
         </div>
       </section>
 

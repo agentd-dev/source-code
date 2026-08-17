@@ -75,6 +75,26 @@ fn artifact_json(v: &Value) -> Value {
 }
 
 /// Poll `workflow.status` for one run until `pred` holds; returns the view.
+/// The newest run's id, polled until the supervisor has registered it.
+///
+/// `workflow.run` returns as soon as the request is accepted, so a
+/// `workflow.status` issued immediately after can still see an empty list —
+/// rare locally, reliably reproducible under CI load.
+fn wait_run_id(addr: &str, secs: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let ws = command(addr, 902, "workflow.status", json!({}));
+        if let Some(id) = artifact_json(&ws)["runs"][0]["run"].as_str() {
+            return id.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timeout: no run appeared in workflow.status"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_run<F: Fn(&Value) -> bool>(addr: &str, run: &str, secs: u64, what: &str, pred: F) -> Value {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -210,11 +230,7 @@ fn a_signal_resumes_a_waiting_run() {
     let started = command(&addr, 1, "workflow.run", json!({"name": "waiter"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     // Find the run id + confirm it parks on the wait.
-    let ws = command(&addr, 2, "workflow.status", json!({}));
-    let run_id = artifact_json(&ws)["runs"][0]["run"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let run_id = wait_run_id(&addr, 10);
     wait_run(&addr, &run_id, 10, "suspended on the signal", |v| {
         v["status"] == "suspended" || v["status"] == "running"
     });
@@ -245,11 +261,7 @@ fn a_single_run_pauses_and_resumes() {
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
     command(&addr, 1, "workflow.run", json!({"name": "slow"}));
-    let ws = command(&addr, 2, "workflow.status", json!({}));
-    let run_id = artifact_json(&ws)["runs"][0]["run"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let run_id = wait_run_id(&addr, 10);
 
     // Pause the run mid-flight; it must NOT complete while paused.
     let paused = rpc(&addr, 3, "a2a.pause", json!({"run": run_id}));

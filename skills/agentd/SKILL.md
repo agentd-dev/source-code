@@ -132,7 +132,7 @@ listener. Detached instead — the daemon keeps working when the client quits:
 
 ```sh
 agentd -c agent.yaml &
-npm i -g @agentd/tui && agentd-tui --endpoint http://127.0.0.1:8420
+npm i -g @agentd-dev/cli && agentd-tui --endpoint http://127.0.0.1:8420
 ```
 
 Loopback callers are the operator with no credential. **Binding non-loopback

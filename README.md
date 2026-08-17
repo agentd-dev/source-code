@@ -173,8 +173,9 @@ working. Approvals (`ask_human`) render as answerable rows in every attached
 client and survive a restart; a debug mode exposes the live event feed,
 per-step run detail and the log tail when you ask for it.
 
-Both clients are separate Node projects under [`interface/`](interface) built
-on a shared thin-client core, so a third client is a small program. See
+Both clients ship as one npm package — `npm i -g @agentd-dev/cli`, source under
+[`interface/`](interface) — built on a shared thin-client core that the package
+also exports, so a third client is a small program. See
 **[docs/interface.md](docs/interface.md)**, and
 **[docs/coding-agent.md](docs/coding-agent.md)** to set one up as a
 pair-programming agent for a repository.

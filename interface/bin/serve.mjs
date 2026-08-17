@@ -34,9 +34,9 @@ const bearer = process.env.AGENTD_BEARER ?? '';
 const port = Number(opt('port', '4173'));
 const open = args.includes('--open');
 
-const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist');
+const dist = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'web');
 if (!existsSync(join(dist, 'index.html'))) {
-  process.stderr.write('agentd-ui: dist/ is not built — run `npm run build -w @agentd/ui`\n');
+  process.stderr.write('agentd-ui: dist/ is not built — run `npm run build`\n');
   process.exit(2);
 }
 

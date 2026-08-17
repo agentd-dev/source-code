@@ -7,7 +7,7 @@
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { MirrorState } from '@agentd/client';
+import type { MirrorState } from '../../client/index.js';
 import { theme } from '../theme.js';
 
 export interface ChromeCtx {

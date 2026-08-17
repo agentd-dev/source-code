@@ -6,7 +6,7 @@
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { FeedEvent, Json, MirrorState } from '@agentd/client';
+import type { FeedEvent, Json, MirrorState } from '../../client/index.js';
 import { ago, shortId, theme } from '../theme.js';
 
 function one(v: Json): string {

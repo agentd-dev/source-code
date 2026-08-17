@@ -3,7 +3,7 @@
 - Status: **Implemented**
 - Requires: RFC 0029 (A2A conversations, principals, commands), RFC 0016 §7.2 (the event ring)
 - Companions: `docs/interface.md` (operator guide), `docs/design/03-tui-thin-client.md` (design rationale),
-  `interface/` (the client projects: `@agentd/client`, `@agentd/tui`, `@agentd/ui`)
+  `interface/` (the clients: one npm package, `@agentd-dev/cli`)
 
 ## 1. Motivation
 
@@ -143,18 +143,21 @@ cross-site origin stays 403. `EventSource` is never used — clients consume the
 SSE stream via fetch, so `Authorization` works. A web UI served from loopback
 (`agentd-ui`) needs no configuration; a hosted copy lists its origin.
 
-## 8. The clients (`interface/`, separate Node projects)
+## 8. The clients (`interface/`, a separate Node package)
 
-Not bundled into agentd; the Rust dependency moat is untouched.
+Not bundled into agentd; the Rust dependency moat is untouched. They ship as
+**one npm package, `@agentd-dev/cli`**, providing both binaries and the client
+library — a display client is a single install, and the core cannot skew
+against the UIs that render from it.
 
-- **`@agentd/client`** — the shared framework-free core: the JSON-RPC/SSE
+- **the client core** (the package's library entry point) — framework-free: the JSON-RPC/SSE
   wire, task-shape normalization (nested vs flat), the **Mirror** (an
   event-sourced projection with the transcript derivation: `message` events +
   task terminal artifacts, local echo reconciled by `messageId`, command-result
   tasks kept off the conversation), and the **Observation** driver
   (bootstrap `status`+`ListTasks` → feed with cursor resume/reconnect →
   automatic poll fallback against a daemon without the surface).
-- **`@agentd/tui`** (bin `agentd-tui`) — Ink. Chat, Tasks, Subagents, Debug —
+- **the TUI** (bin `agentd-tui`) — Ink. Chat, Tasks, Subagents, Debug —
   debug panes render only when the daemon says `debug: true`. **Fullscreen
   (alternate screen) by default**: the client owns the scroll (PgUp/PgDn over
   a bottom-anchored viewport, follow-the-tail unless scrolled up) because that
@@ -162,7 +165,7 @@ Not bundled into agentd; the Rust dependency moat is untouched.
   where settled rows ride `<Static>` into the terminal's own scrollback and
   survive quitting. Degrades to a read-only inline view without an interactive
   terminal.
-- **`@agentd/ui`** (bin `agentd-ui`) — the web UI in the format of the TUI
+- **the web UI** (bin `agentd-ui`) — in the format of the TUI
   (dark-terminal identity), same Mirror, statically hostable `dist/`;
   `agentd-ui` serves it locally with an injected endpoint and `--open`.
 
@@ -255,7 +258,7 @@ effective document, or one path.
 ## 15. Composer affordances (client-side, shared)
 
 Both shipped UIs speak the same input language (implemented once in
-`@agentd/client`'s composer module):
+the package's composer module):
 
 - **`/`** — commands: the system set (`/help /new /tasks /subagents /debug
   /status /config [path] /set /workflow /cancel /pair /drain /quit`), plus

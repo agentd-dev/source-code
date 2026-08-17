@@ -11,7 +11,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
-import { AgentdClient, Mirror, Observation } from '../dist/index.js';
+import { AgentdClient, Mirror, Observation } from '../dist/client/index.js';
 
 const BIN = process.env.AGENTD_E2E_BIN;
 

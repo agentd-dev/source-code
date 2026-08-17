@@ -13,7 +13,7 @@
  */
 import React from 'react';
 import { Box, Static, Text } from 'ink';
-import type { TranscriptEntry } from '@agentd/client';
+import type { TranscriptEntry } from '../../client/index.js';
 import { SPINNER, theme } from '../theme.js';
 
 function Row({ e }: { e: TranscriptEntry }): React.JSX.Element {

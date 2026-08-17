@@ -33,10 +33,14 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
     let mut daemon_args: Vec<String> = Vec::new();
     let mut debug = false;
     let mut open = true;
+    let mut inline = false;
     for a in args {
         match a.as_str() {
             "--debug" => debug = true,
             "--no-open" => open = false,
+            // A client-side render mode: the daemon has no such setting, so it
+            // must be caught here rather than fall through as an unknown flag.
+            "--inline" => inline = true,
             other => daemon_args.push(other.to_string()),
         }
     }
@@ -114,6 +118,7 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
         bearer,
         debug,
         open,
+        inline,
         tty,
         Arc::clone(&child_slot),
         Arc::clone(&done),
@@ -224,6 +229,7 @@ fn spawn_watcher(
     bearer: Option<String>,
     debug: bool,
     open: bool,
+    inline: bool,
     tty: Tty,
     child_slot: Arc<Mutex<Option<Child>>>,
     done: Arc<AtomicBool>,
@@ -270,6 +276,9 @@ fn spawn_watcher(
             if debug {
                 cmd.arg("--debug");
             }
+            if inline && sub == "tui" {
+                cmd.arg("--inline");
+            }
             if sub == "ui" && open {
                 cmd.arg("--open");
             }
@@ -279,7 +288,7 @@ fn spawn_watcher(
                     let _ = tty_println(
                         &tty,
                         &format!(
-                            "agentd {sub}: cannot start {bin:?}: {e}\n  install it: npm install -g @agentd/{sub}  (or set {bin_env})"
+                            "agentd {sub}: cannot start {bin:?}: {e}\n  install it: npm install -g @agentd-dev/cli  (or set {bin_env})"
                         ),
                     );
                     unsafe { libc::raise(libc::SIGTERM) };

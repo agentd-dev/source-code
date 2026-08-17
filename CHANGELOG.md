@@ -7,6 +7,20 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Changed (the display clients ship as one package: `@agentd-dev/cli`)
+
+- **Three npm packages became one.** `@agentd/client`, `@agentd/tui` and
+  `@agentd/ui` are now a single published package, **`@agentd-dev/cli`**, whose
+  `bin` provides both `agentd-tui` and `agentd-ui` and whose library entry point
+  is the shared thin-client core. A display client is one install, and the core
+  can no longer skew against the UIs that render from it. `interface/` is a
+  plain package (`src/{client,tui,ui}`), not a workspace.
+- **`agentd tui --inline` works.** The passthrough forwarded only `--debug` and
+  `--no-open` to the client, so the documented `--inline` fell through to the
+  daemon and died with `unknown argument: --inline`.
+- The "cannot start the client" hint and `agentd --help` now name
+  `npm install -g @agentd-dev/cli`.
+
 ### Added (getting it onto a machine: installer, skill, security policy)
 
 - **`install.sh` is served from the domain it advertises.** The site build
@@ -63,7 +77,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - Deliberately coarse: events fire only on a change an operator would notice,
   and elapsed is never streamed (clients tick from `started_ms`), so a long
   think emits nothing and the feed's replay ring stays a record of state.
-  `activityLine()` in `@agentd/client` renders it identically in both UIs.
+  `activityLine()` in `@agentd-dev/cli` renders it identically in both UIs.
 
 ### Added (human-in-the-loop + steering — RFC 0032 §16, RFC 0029 §5/§7)
 
@@ -92,7 +106,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `status.paused` + a `lifecycle` feed event keep every client honest (the
   UIs show PAUSED).
 - Clients: `/signal /send /pause /resume /plan` in both UIs (+
-  `signal()/subagentSend()/pause()/resume()/planGet()` on `@agentd/client`).
+  `signal()/subagentSend()/pause()/resume()/planGet()` on the client core).
 
 ### Added (the display-client interface & observation plane — RFC 0032, `docs/interface.md`)
 
@@ -116,13 +130,13 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   as one command — forces `--interface.enabled` (argv, reload-safe), redirects
   daemon logs to a file, hands the tty to the client (`AGENTD_TUI_BIN`/
   `AGENTD_UI_BIN` override), ties lifetimes (client exit ⇒ graceful drain).
-- **`interface/` — the display clients** (separate Node projects; the Rust
-  3-dependency moat is untouched): `@agentd/client` (the shared thin-client
-  core: wire, task normalization, the event-sourced Mirror, the Observation
-  driver with automatic poll fallback), `@agentd/tui` (Ink terminal UI: chat
-  with `<Static>` transcript, tasks, daemon-gated debug screen; degrades to a
-  read-only view without a tty), `@agentd/ui` (the web UI in the format of the
-  TUI; statically hostable `dist/`; `agentd-ui` local server with `--open`).
+- **`interface/` — the display clients** (a separate Node package,
+  `@agentd-dev/cli`; the Rust 3-dependency moat is untouched): the shared
+  thin-client core (wire, task normalization, the event-sourced Mirror, the
+  Observation driver with automatic poll fallback), the `agentd-tui` Ink
+  terminal UI (chat, tasks, daemon-gated debug screen; degrades to a read-only
+  view without a tty), and the `agentd-ui` web UI in the format of the TUI
+  (statically hostable, local server with `--open`).
 - The agent card advertises `urn:agentd:interface` when enabled;
   `--capabilities` reports the interface block and the extra methods/ops.
 - **Pairing-code login** (`interface.pairing`, RFC 0032 §13): the daemon
@@ -148,7 +162,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   status, mode, attempts, tokens, truncated result/error, requested_by —
   behind the new subagents screen (TUI: list → Enter → detail → Esc back;
   web: clickable rows → detail → back), fed live by `subagent` events.
-- **Composer affordances** (shared `@agentd/client` rules, both UIs, with
+- **Composer affordances** (shared client-core rules, both UIs, with
   as-you-type suggestions): `/` system commands **plus every workflow as a
   shortcut**; `@skill` catalogue completion (inline — agentd preloads
   references); leading `#task-…`/`#ctx` message targeting (answer a specific

@@ -1,7 +1,7 @@
 name: interface
 
-# The display clients (interface/ — RFC 0032): a separate Node workspace, so a
-# separate gate. Typecheck + unit/render tests on the supported Node lines,
+# The display clients (interface/ — RFC 0032): a separate Node package
+# (@agentd-dev/cli), so a separate gate. Typecheck + unit/render tests on the supported Node lines,
 # plus the LIVE cross-language e2e: the TypeScript client driving a real
 # cargo-built daemon over the actual wire (feed convergence, pairing,
 # config.set propagation).
@@ -35,8 +35,8 @@ jobs:
           cache-dependency-path: interface/package-lock.json
       - run: npm ci
         working-directory: interface
-      # Build FIRST: the TUI/UI resolve `@agentd/client` through its published
-      # `dist/` types, which do not exist on a fresh checkout.
+      # Build FIRST: the tests import the compiled `dist/`, which does not
+      # exist on a fresh checkout.
       - run: npm run build
         working-directory: interface
       - run: npm run typecheck
@@ -62,6 +62,6 @@ jobs:
       - run: npm run build
         working-directory: interface
       - run: node --test test/live.e2e.mjs
-        working-directory: interface/client
+        working-directory: interface
         env:
           AGENTD_E2E_BIN: ${{ github.workspace }}/target/debug/agentd

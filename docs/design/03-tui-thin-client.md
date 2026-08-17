@@ -2,7 +2,7 @@
 
 Status: **IMPLEMENTED** (2026-08-16) — the contract became **RFC 0032** (`rfcs/0032-interface-and-observation-plane.md`),
 the daemon side shipped as the `interface` config + `SubscribeToEvents` feed + taskless reads + `agentd tui|ui`
-passthrough, and the clients live under `interface/` (`@agentd/client`, `@agentd/tui`, `@agentd/ui`); operator guide in
+passthrough, and the clients live under `interface/` (one package, `@agentd-dev/cli`); operator guide in
 `docs/interface.md`. This document remains as the design rationale; where it and RFC 0032 differ, the RFC (and code) win —
 notably: the observation plane shipped as the feed + taskless command reads (no `agent://` resources), and Phase 0/1/3
 landed together.

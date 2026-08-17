@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * The TUI shell: a thin renderer over `@agentd/client`'s {@link Mirror}. All
+ * The TUI shell: a thin renderer over `the client core`'s {@link Mirror}. All
  * state lives in the daemon; this component holds only view state (which
  * screen, which selection, what's typed). Screens: chat · tasks · subagents ·
  * debug. The chrome (top/bottom edges) renders whatever `interface.display`
@@ -30,7 +30,7 @@ import {
   prepare,
   suggest,
   workflowNames,
-} from '@agentd/client';
+} from '../client/index.js';
 import { theme } from './theme.js';
 import { Transcript } from './parts/transcript.js';
 import { TaskList } from './parts/tasks.js';

@@ -4,7 +4,7 @@
 // mirror's convergence behavior — including the cross-client transcript.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sseParser, normalizeTask, Mirror } from '../dist/index.js';
+import { sseParser, normalizeTask, Mirror } from '../dist/client/index.js';
 
 test('sse parser handles chunk boundaries, multi-line data and comments', () => {
   const got = [];

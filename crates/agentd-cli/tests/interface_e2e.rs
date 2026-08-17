@@ -272,16 +272,13 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
         .filter_map(Value::as_str)
         .collect();
     assert!(ops.contains(&"conversation.get") && ops.contains(&"debug.events"));
-    // Taskless: an interface read creates NO durable task.
-    let tasks_before = rpc(&addr, 2, "ListTasks", json!({}))["tasks"]
-        .as_array()
-        .unwrap()
-        .len();
+    // Taskless: an interface read creates NO durable task. (Proto3 JSON omits a
+    // field at its default value, so "no tasks" arrives as an absent `tasks`
+    // rather than an empty array — which is exactly what is being asserted.)
+    let count = |v: &Value| v["tasks"].as_array().map(Vec::len).unwrap_or(0);
+    let tasks_before = count(&rpc(&addr, 2, "ListTasks", json!({})));
     let _ = command(&addr, 3, "interface.info", json!({}));
-    let tasks_after = rpc(&addr, 4, "ListTasks", json!({}))["tasks"]
-        .as_array()
-        .unwrap()
-        .len();
+    let tasks_after = count(&rpc(&addr, 4, "ListTasks", json!({})));
     assert_eq!(tasks_before, tasks_after, "interface reads are taskless");
 
     // The agent card advertises the surface (public discovery).

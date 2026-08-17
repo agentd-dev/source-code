@@ -504,6 +504,18 @@ impl TlsAcceptor {
         }
         Ok(stream)
     }
+
+    /// The current rustls configuration, for an async acceptor that drives the
+    /// handshake itself (`tokio_rustls::TlsAcceptor`) rather than through
+    /// [`TlsAcceptor::accept`]. Reload-aware, so a rotated mounted identity is
+    /// picked up on the same schedule a blocking accept would see it.
+    pub fn server_config(&self) -> Arc<ServerConfig> {
+        self.maybe_reload(RELOAD_CHECK_TTL);
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// Whether the accepted peer presented a (verified) client certificate — under

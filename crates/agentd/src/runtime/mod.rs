@@ -374,11 +374,16 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         event_to_task: BTreeMap::new(),
         #[cfg(feature = "a2a")]
-        a2a_shared: None,
         #[cfg(feature = "a2a")]
         a2a_feed: None,
         #[cfg(feature = "a2a")]
         a2a_pairing: None,
+        #[cfg(feature = "a2a")]
+        reserved_task_id: None,
+        #[cfg(feature = "a2a")]
+        a2a_sink: None,
+        #[cfg(feature = "a2a")]
+        a2a_listener: None,
         activity: BTreeMap::new(),
         last_root_reply: None,
         #[cfg(feature = "a2a")]
@@ -561,10 +566,13 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             write_timeout,
             log.clone(),
         ) {
-            Ok((shared, feed, pairing)) => {
-                rt.a2a_shared = Some(shared);
-                rt.a2a_feed = feed;
-                rt.a2a_pairing = pairing;
+            Ok(serving) => {
+                rt.a2a_feed = serving.feed;
+                rt.a2a_pairing = serving.pairing;
+                rt.a2a_sink = Some(std::sync::Arc::clone(&serving.listener.sink));
+                // The listener stops the moment it is dropped, so the runtime
+                // holds it for as long as it is serving.
+                rt.a2a_listener = Some(serving.listener);
                 // The interface debug reads tail the live log ring (RFC 0016
                 // §7.2 / RFC 0032 §5) — install it only when debug is on, so
                 // the default build keeps its zero-cost logging hot path.

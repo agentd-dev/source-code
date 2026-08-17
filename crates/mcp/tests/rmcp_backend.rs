@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 #[derive(Default)]
 struct Seen {
     init: Option<Value>,
+    /// Every JSON-RPC method the client called, in order.
+    methods: Vec<String>,
 }
 type Shared = Arc<Mutex<Seen>>;
 
@@ -87,6 +89,7 @@ fn spawn_server(seen: Shared) -> String {
                     return;
                 }
                 let id = msg["id"].clone();
+                seen.lock().unwrap().methods.push(method.to_string());
                 match method {
                     "initialize" => {
                         seen.lock().unwrap().init = Some(msg["params"].clone());
@@ -95,7 +98,9 @@ fn spawn_server(seen: Shared) -> String {
                             &json!({
                                 "jsonrpc": "2.0", "id": id,
                                 "result": {
-                                    "protocolVersion": "2026-07-28",
+                                    // Echo what the client asked for, the way a
+                                    // real server does when it can speak it.
+                                    "protocolVersion": msg["params"]["protocolVersion"],
                                     "capabilities": {"tools": {}, "resources": {"subscribe": true}},
                                     "serverInfo": {"name": "mock", "version": "0"}
                                 }
@@ -143,9 +148,12 @@ impl Handler for Yes {
 }
 
 #[test]
-fn the_handshake_asks_for_the_newest_revision_not_rmcps_default() {
-    // rmcp's ProtocolVersion::LATEST is 2025-11-25. Adopting the SDK must not
-    // silently give up the newer stateless revision this crate targets.
+fn the_handshake_speaks_whatever_revision_the_sdk_supports() {
+    // Deliberately not pinned to a date: this backend follows rmcp's own
+    // `LATEST`, so it adopts the stateless revision on the release that
+    // promotes it — without a change here. Pinning our own constant would mean
+    // asking servers for a dialect the SDK may not fully implement.
+    let expected = rmcp::model::ProtocolVersion::LATEST.to_string();
     let seen: Shared = Arc::default();
     let ep = spawn_server(Arc::clone(&seen));
     let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
@@ -157,8 +165,46 @@ fn the_handshake_asks_for_the_newest_revision_not_rmcps_default() {
         .init
         .clone()
         .expect("no initialize seen");
-    assert_eq!(init["protocolVersion"], "2026-07-28", "handshake: {init}");
-    assert_eq!(client.protocol_version(), Some("2026-07-28"));
+    assert_eq!(init["protocolVersion"], expected, "handshake: {init}");
+    assert_eq!(client.protocol_version(), Some(expected.as_str()));
+    // …and it is a revision our own version table recognises, so the SDK and
+    // this crate cannot drift apart unnoticed.
+    assert!(mcp::version::is_supported_version(&expected));
+}
+
+#[test]
+fn subscribing_uses_the_method_the_negotiated_revision_defines() {
+    // The eras disagree: legacy has `resources/subscribe`, the stateless
+    // revision replaces it with `subscriptions/listen`. Whichever rmcp
+    // negotiates, we must call the one that version actually defines — a
+    // `listen` against a legacy server is an unknown method.
+    let seen: Shared = Arc::default();
+    let ep = spawn_server(Arc::clone(&seen));
+    let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
+        .connect()
+        .expect("connect");
+    client.subscribe("file:///a.txt").expect("subscribe");
+
+    let called = seen.lock().unwrap().methods.clone();
+    let modern = matches!(
+        mcp::version::era_of(client.protocol_version().unwrap_or("")),
+        mcp::version::Era::Modern
+    );
+    if modern {
+        assert!(
+            called.iter().any(|m| m == "subscriptions/listen"),
+            "modern revision should listen, saw: {called:?}"
+        );
+    } else {
+        assert!(
+            called.iter().any(|m| m == "resources/subscribe"),
+            "legacy revision should subscribe, saw: {called:?}"
+        );
+        assert!(
+            !called.iter().any(|m| m == "subscriptions/listen"),
+            "listen is not defined at this revision: {called:?}"
+        );
+    }
 }
 
 #[test]

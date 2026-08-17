@@ -286,11 +286,20 @@ $ cargo build -p agentd-cli --release --features a2a,rmcp-client
 |---|---|---|
 | Extra crates | 0 | **+77**, including tokio |
 | Spec tracking | ours | upstream |
-| Protocol version | `2026-07-28`, negotiating down | `2026-07-28` (we override rmcp's more conservative default) |
+| Protocol version | `2026-07-28` (the stateless revision), negotiating down | whatever rmcp declares current — `2025-11-25` today |
 | Async runtime | none | a private current-thread runtime inside the client |
 
-Both speak the same protocol version and expose the same surface to the rest of
-agentd, so nothing above the client changes.
+The version difference is deliberate. rmcp pins its `LATEST` at `2025-11-25`
+even though the newer constant exists — that is upstream saying what it is
+ready to speak, and overriding it would mean asking servers for a dialect the
+SDK may not fully implement. So this backend follows rmcp and will pick up the
+stateless revision on the release that promotes it, with no change here. The
+subscription mechanism follows the same rule: `resources/subscribe` at a legacy
+revision, `subscriptions/listen` at a stateless one, chosen from what was
+actually negotiated.
+
+Either way the surface above the client is identical, so nothing else in agentd
+changes.
 
 ### What stays on the native transport
 

@@ -14,6 +14,7 @@
 //! background thread pumps them into a queue [`Self::drain_notifications`] serves.
 
 use crate::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
+use crate::inbound;
 use crate::rpc::{self, RpcError};
 use crate::wire::{
     CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
@@ -61,6 +62,39 @@ impl std::error::Error for McpError {}
 
 type NotifQueue = Arc<Mutex<VecDeque<rpc::Notification>>>;
 
+/// Routes an inbound JSON-RPC frame: a notification is queued for the reactor,
+/// a **request** is answered and the response POSTed back.
+///
+/// MCP is bidirectional and this client used to be deaf in one direction —
+/// every server→client request was dropped, including `ping`, which the spec
+/// says both sides MUST answer. The router is shared by every path that can
+/// receive a frame (the SSE event stream, the modern listen stream, and the
+/// interleaved frames on any request's own response stream) so there is one
+/// place that decides what an inbound frame means.
+struct InboundRouter {
+    http: Arc<HttpTransport>,
+    queue: NotifQueue,
+    caps: inbound::Capabilities,
+    handler: Option<Arc<dyn inbound::Handler>>,
+    timeout: Duration,
+}
+
+impl InboundRouter {
+    fn route(&self, frame: Value) {
+        if let Some(req) = inbound::as_request(&frame) {
+            let resp = inbound::answer(&req, self.caps, self.handler.as_deref());
+            // Best effort: a server that cannot take our answer is a server we
+            // cannot help, and failing the caller's request over it would be
+            // worse than the silence we are fixing.
+            if let Ok(body) = serde_json::to_vec(&resp) {
+                let _ = self.http.send(None, &body, self.timeout, &[], |_| {});
+            }
+            return;
+        }
+        queue_notification(&self.queue, frame);
+    }
+}
+
 /// A connected (and, after [`McpClient::initialize`], handshaken) remote MCP
 /// server over Streamable HTTP.
 pub struct McpClient {
@@ -90,6 +124,10 @@ pub struct McpClient {
     /// modern (stateless per-request `_meta`). Governs how every request is built.
     era: Era,
     timeout: Duration,
+    /// Server→client requests we advertise an ability to answer, and the host
+    /// callback that answers them. `ping` is answered regardless.
+    inbound_caps: inbound::Capabilities,
+    inbound_handler: Option<Arc<dyn inbound::Handler>>,
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
     /// `{"agent/run_id": …}`) so backing services can dedupe retries
     /// (RFC 0011 §idempotency).
@@ -154,6 +192,8 @@ impl McpClient {
             // Established on connect; legacy is the safe default until then.
             era: Era::Legacy,
             timeout,
+            inbound_caps: inbound::Capabilities::default(),
+            inbound_handler: None,
             tool_meta: None,
             client_info: Implementation {
                 name: "agentd".into(),
@@ -169,6 +209,52 @@ impl McpClient {
     pub fn with_client_info(mut self, info: Implementation) -> Self {
         self.client_info = info;
         self
+    }
+
+    /// Answer server→client **elicitation** requests through `handler`: a server
+    /// may ask the operator a question mid-call and get a typed answer back.
+    /// Declares the `elicitation` client capability, so a server only asks when
+    /// we can actually deliver the question to a human.
+    pub fn with_elicitation(mut self, handler: Arc<dyn inbound::Handler>) -> Self {
+        self.inbound_caps.elicitation = true;
+        self.inbound_handler = Some(handler);
+        self
+    }
+
+    /// Answer `roots/list` through `handler` — the URI roots this client permits
+    /// a server to operate on. Declares the `roots` capability.
+    pub fn with_roots(mut self, handler: Arc<dyn inbound::Handler>) -> Self {
+        self.inbound_caps.roots = true;
+        self.inbound_handler = Some(handler);
+        self
+    }
+
+    /// A router over this client's transport + inbound policy, cloneable into
+    /// the background streams.
+    fn router(&self) -> Arc<InboundRouter> {
+        Arc::new(InboundRouter {
+            http: Arc::clone(&self.http),
+            queue: Arc::clone(&self.notifications),
+            caps: self.inbound_caps,
+            handler: self.inbound_handler.clone(),
+            timeout: self.timeout,
+        })
+    }
+
+    /// The full client capability object sent in the handshake / per-request
+    /// `_meta`: the declared inbound capabilities merged with any extensions.
+    fn declared_capabilities(&self) -> Value {
+        let mut caps = self.client_capabilities.clone();
+        let inbound = self.inbound_caps.to_json();
+        match (caps.as_object_mut(), inbound.as_object()) {
+            (Some(dst), Some(src)) => {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+                Value::Object(dst.clone())
+            }
+            _ => caps,
+        }
     }
 
     /// Advertise support for the **tasks extension** (`io.modelcontextprotocol/
@@ -273,7 +359,7 @@ impl McpClient {
             &mut params,
             &version,
             &self.client_info,
-            &self.client_capabilities,
+            &self.declared_capabilities(),
         );
         self.http.set_protocol_version(version);
         let routing = modern::routing_headers(method::SERVER_DISCOVER, &params);
@@ -282,10 +368,10 @@ impl McpClient {
         let req = rpc::Request::new(id, method::SERVER_DISCOVER, Some(params));
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode server/discover: {e}")))?;
-        let notifications = &self.notifications;
-        let outcome = self.http.send(Some(id), &body, timeout, &refs, |n| {
-            queue_notification(notifications, n)
-        });
+        let router = self.router();
+        let outcome = self
+            .http
+            .send(Some(id), &body, timeout, &refs, |n| router.route(n));
 
         match outcome {
             // HTTP 2xx: a discover result, or a JSON-RPC error (a legacy server that
@@ -357,9 +443,18 @@ impl McpClient {
         // The modern probe set a version header; clear it so the initialize request
         // carries none (nothing negotiated yet — legacy sends the header only after).
         self.http.clear_protocol_version();
+        // The handshake must advertise what we can answer, or a server will
+        // never send the elicitation/roots requests we now handle.
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
-            capabilities: ClientCapabilities::default(),
+            capabilities: ClientCapabilities {
+                experimental: None,
+                elicitation: self.inbound_caps.elicitation.then(|| json!({})),
+                roots: self
+                    .inbound_caps
+                    .roots
+                    .then(|| json!({"listChanged": false})),
+            },
             client_info: self.client_info.clone(),
         };
         let result =
@@ -738,11 +833,11 @@ impl McpClient {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let http = Arc::clone(&self.http);
-        let queue = Arc::clone(&self.notifications);
+        let router = self.router();
         let stop_thread = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name(format!("mcp-events:{}", self.name))
-            .spawn(move || event_loop(http, queue, stop_thread))
+            .spawn(move || event_loop(http, router, stop_thread))
             .ok();
         if let Some(handle) = handle {
             *guard = Some(EventStreamHandle { stop, handle });
@@ -774,7 +869,7 @@ impl McpClient {
             &mut params,
             &version,
             &self.client_info,
-            &self.client_capabilities,
+            &self.declared_capabilities(),
         );
         let routing: Vec<(String, String)> =
             modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
@@ -789,11 +884,11 @@ impl McpClient {
 
         let stop = Arc::new(AtomicBool::new(false));
         let http = Arc::clone(&self.http);
-        let queue = Arc::clone(&self.notifications);
+        let router = self.router();
         let stop_thread = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name(format!("mcp-listen:{}", self.name))
-            .spawn(move || modern_listen_loop(http, queue, stop_thread, body, routing))
+            .spawn(move || modern_listen_loop(http, router, stop_thread, body, routing))
             .ok();
         if let Some(handle) = handle {
             *self.events.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -889,7 +984,7 @@ impl McpClient {
                 &mut p,
                 version,
                 &self.client_info,
-                &self.client_capabilities,
+                &self.declared_capabilities(),
             );
             let mut routing: Vec<(String, String)> = modern::routing_headers(method, &p)
                 .into_iter()
@@ -922,12 +1017,10 @@ impl McpClient {
         let req = rpc::Request::new(id, method, params);
         let body = serde_json::to_vec(&req)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
-        let notifications = &self.notifications;
+        let router = self.router();
         let msg = self
             .http
-            .send(Some(id), &body, timeout, &refs, |n| {
-                queue_notification(notifications, n)
-            })
+            .send(Some(id), &body, timeout, &refs, |n| router.route(n))
             .map_err(|e| http_err(&self.name, method, e))?
             .ok_or_else(|| {
                 McpError::Transport(format!("no response to {method} on '{}'", self.name))
@@ -945,11 +1038,9 @@ impl McpClient {
         let note = rpc::Notification::new(method, params);
         let body = serde_json::to_vec(&note)
             .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
-        let notifications = &self.notifications;
+        let router = self.router();
         self.http
-            .send(None, &body, self.timeout, &[], |n| {
-                queue_notification(notifications, n)
-            })
+            .send(None, &body, self.timeout, &[], |n| router.route(n))
             .map_err(|e| http_err(&self.name, method, e))?;
         Ok(())
     }
@@ -1050,7 +1141,7 @@ fn queue_notification(queue: &Mutex<VecDeque<rpc::Notification>>, n: Value) {
 /// its JSON-RPC notifications into the shared queue until `stop`. Reconnects on a
 /// transient drop; gives up if the server has no push channel (a non-2xx / non-SSE
 /// response), leaving the client pull-only.
-fn event_loop(http: Arc<HttpTransport>, queue: NotifQueue, stop: Arc<AtomicBool>) {
+fn event_loop(http: Arc<HttpTransport>, router: Arc<InboundRouter>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         let mut sse = match http.open_events(EVENT_READ_TIMEOUT) {
             Ok(s) => s,
@@ -1067,7 +1158,7 @@ fn event_loop(http: Arc<HttpTransport>, queue: NotifQueue, stop: Arc<AtomicBool>
                 continue;
             }
         };
-        pump_events(&mut sse, &queue, &stop);
+        pump_events(&mut sse, &router, &stop);
     }
 }
 
@@ -1078,7 +1169,7 @@ fn event_loop(http: Arc<HttpTransport>, queue: NotifQueue, stop: Arc<AtomicBool>
 /// listen (non-2xx / non-SSE), leaving the client pull-only.
 fn modern_listen_loop(
     http: Arc<HttpTransport>,
-    queue: NotifQueue,
+    router: Arc<InboundRouter>,
     stop: Arc<AtomicBool>,
     body: Vec<u8>,
     routing: Vec<(String, String)>,
@@ -1101,23 +1192,22 @@ fn modern_listen_loop(
                 continue;
             }
         };
-        pump_events(&mut sse, &queue, &stop);
+        pump_events(&mut sse, &router, &stop);
     }
 }
 
-/// Read events off one SSE stream into `queue` until EOF/error or `stop`.
-fn pump_events(sse: &mut EventStream, queue: &NotifQueue, stop: &AtomicBool) {
+/// Read frames off one SSE stream until EOF/error or `stop`, routing each.
+fn pump_events(sse: &mut EventStream, router: &InboundRouter, stop: &AtomicBool) {
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         match sse.next_event() {
             Ok(Some(ev)) => {
-                if let Ok(note) = serde_json::from_str::<rpc::Notification>(&ev.data) {
-                    queue
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back(note);
+                // A frame here may be a notification OR a server→client
+                // request; the router decides and answers the latter.
+                if let Ok(frame) = serde_json::from_str::<Value>(&ev.data) {
+                    router.route(frame);
                 }
             }
             Ok(None) => return, // clean EOF — reconnect

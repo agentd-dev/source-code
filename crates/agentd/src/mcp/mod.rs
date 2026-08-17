@@ -117,6 +117,7 @@ fn spiffe_x509_identity(
 // Auth material resolution for remote MCP endpoints (RFC 0012 §3.7): materialize
 // secret-free `{{secret:…}}` header templates into wire headers at connect time.
 pub mod auth;
+pub mod elicit;
 // OAuth 2.1 client-credentials (M2M) token source for endpoints behind an OAuth
 // gateway (RFC 0006 §auth). Feature-gated; dependency-free.
 #[cfg(feature = "oauth")]

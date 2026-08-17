@@ -23,6 +23,7 @@
 pub mod client;
 pub mod http;
 pub mod http_server;
+pub mod inbound;
 pub mod modern;
 pub mod rpc;
 pub mod server;

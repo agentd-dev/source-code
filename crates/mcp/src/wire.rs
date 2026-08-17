@@ -74,6 +74,13 @@ pub struct Implementation {
 pub struct ClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>,
+    /// `{}` when this client can deliver a server's `elicitation/create` to a
+    /// human. Omitted otherwise — a server must not ask what we cannot answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<Value>,
+    /// `{"listChanged": bool}` when this client answers `roots/list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

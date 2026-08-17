@@ -25,6 +25,8 @@ pub mod http;
 pub mod http_server;
 pub mod inbound;
 pub mod modern;
+#[cfg(feature = "rmcp-client")]
+pub mod rmcp_client;
 pub mod rpc;
 pub mod server;
 pub mod version;

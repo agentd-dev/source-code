@@ -28,6 +28,10 @@ path = "src/main.rs"
 # matrix compiles both crates per row, so a drift fails loudly.
 [features]
 default = ["tls"]
+# Use the OFFICIAL Rust MCP SDK for outbound MCP instead of the hand-rolled
+# client. Upstream spec-tracking in exchange for ~77 crates and tokio;
+# the default build keeps the minimal client. See docs/mcp.md.
+rmcp-client = ["agentd/rmcp-client"]
 tls = ["agentd/tls"]
 a2a = ["tls", "agentd/a2a"]
 cron = ["agentd/cron"]

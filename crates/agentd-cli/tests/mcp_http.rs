@@ -4,6 +4,13 @@
 //! connect → initialize (capturing `Mcp-Session-Id`) → tools/list (application/json
 //! response) → tools/call (SSE response with an interleaved notification) →
 //! resources/read — with no process spawned, proving the transport end to end.
+//!
+//! Scoped to the **hand-rolled** transport. With `--features rmcp-client` the
+//! official SDK owns the connection and speaks its own HTTP stack, so these
+//! assertions (session-id capture, our SSE framing, our modern-dialect headers)
+//! describe a code path that is not in play; `crates/mcp/tests/rmcp_backend.rs`
+//! covers that configuration instead.
+#![cfg(not(feature = "rmcp-client"))]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

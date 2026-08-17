@@ -11,6 +11,12 @@
 //! handshake advertises only what we can answer, that `ping` is answered
 //! unconditionally, and that an `elicitation/create` reaches the host handler
 //! and its decision reaches the server.
+//!
+//! Scoped to the **native** backend. With `--features rmcp-client` the SDK owns
+//! the connection and answers these itself over `subscriptions/listen` rather
+//! than the legacy event stream these mocks speak; that configuration is
+//! covered by `rmcp_backend.rs`.
+#![cfg(not(feature = "rmcp-client"))]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

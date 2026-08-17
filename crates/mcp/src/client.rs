@@ -13,23 +13,19 @@
 //! long-lived `GET` SSE stream, opened lazily on the first subscribe — a
 //! background thread pumps them into a queue [`Self::drain_notifications`] serves.
 
-use crate::http::{EventStream, HttpError, HttpTransport, McpEndpoint};
+use crate::http::{HttpError, HttpTransport, McpEndpoint};
 use crate::inbound;
 use crate::rpc::{self, RpcError};
 use crate::wire::{
-    CallToolResult, ClientCapabilities, CompleteParams, CompleteResult, DiscoverResult, Era,
-    GetPromptParams, GetPromptResult, Implementation, InitializeParams, InitializeResult,
-    LATEST_MODERN_VERSION, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, Resource,
-    ResourceTemplate, SUPPORTED_PROTOCOL_VERSIONS, ServerCapabilities, SubscribeParams, Task, Tool,
-    UNSUPPORTED_PROTOCOL_VERSION_CODE, UnsupportedProtocolVersion, as_task_result,
-    best_mutual_version, is_modern_error_code, method, negotiate_version,
+    CallToolResult, CompleteParams, CompleteResult, Era, GetPromptParams, GetPromptResult,
+    Implementation, LATEST_MODERN_VERSION, ListResourceTemplatesResult, Prompt, ReadResourceResult,
+    Resource, ResourceTemplate, ServerCapabilities, Task, Tool, as_task_result, method,
 };
 // The modern (stateless) request builders live alongside `wire` in the mcp crate.
 use crate::modern;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,8 +105,6 @@ pub struct McpClient {
     events: Mutex<Option<EventStreamHandle>>,
     /// The resource URIs subscribed to. On modern this is the filter the
     /// `subscriptions/listen` stream is (re)opened with; legacy subscribes
-    /// per-URI over `resources/subscribe` and doesn't need it.
-    subscribed_uris: Mutex<BTreeSet<String>>,
     /// Cached tool `inputSchema`s (name → schema) from the last `tools/list`, so a
     /// modern `tools/call` can mirror `x-mcp-header`-annotated params into
     /// `Mcp-Param-*` headers (transports §custom-headers). Populated only with
@@ -134,13 +128,6 @@ pub struct McpClient {
     /// Only carried when that backend is compiled in.
     #[cfg(feature = "rmcp-client")]
     endpoint: String,
-    /// Whether this connection needs OUR transport: a request signer (AAuth
-    /// RFC 9421, OAuth refresh, AWS SigV4) or an mTLS client identity. Those
-    /// plug into `HttpTransport`, which the SDK does not use — so a server that
-    /// needs one stays on the native path even when the SDK is compiled in.
-    /// Silently dropping a credential would be the worst possible trade.
-    #[cfg(feature = "rmcp-client")]
-    needs_native_transport: bool,
     #[cfg(feature = "rmcp-client")]
     extra_headers: Vec<(String, String)>,
     /// Server→client requests we advertise an ability to answer, and the host
@@ -165,11 +152,6 @@ struct EventStreamHandle {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
-
-/// Each read on the notification `GET` stream is bounded so the loop can poll its
-/// stop flag between events (clean shutdown) — the reactive push cadence is far
-/// below this, so a live update is never delayed by it.
-const EVENT_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl McpClient {
     /// Connect to a remote MCP server over Streamable HTTP (RFC 0004). `endpoint`
@@ -199,13 +181,11 @@ impl McpClient {
         let ep = McpEndpoint::parse(endpoint)
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
         #[cfg(feature = "rmcp-client")]
-        let signed = signer.is_some();
         Ok(McpClient {
             name: name.to_string(),
             http: Arc::new(HttpTransport::new(ep, headers.clone()).with_signer(signer)),
             notifications: Arc::new(Mutex::new(VecDeque::new())),
             events: Mutex::new(None),
-            subscribed_uris: Mutex::new(BTreeSet::new()),
             tool_schemas: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             caps: ServerCapabilities::default(),
@@ -217,8 +197,6 @@ impl McpClient {
             rmcp: None,
             #[cfg(feature = "rmcp-client")]
             endpoint: endpoint.to_string(),
-            #[cfg(feature = "rmcp-client")]
-            needs_native_transport: signed,
             #[cfg(feature = "rmcp-client")]
             extra_headers: headers,
             inbound_caps: inbound::Capabilities::default(),
@@ -302,10 +280,6 @@ impl McpClient {
     /// the process (see [`net::tls`]).
     #[cfg(feature = "tls")]
     pub fn with_identity(mut self, identity: net::tls::ClientIdentity) -> Self {
-        #[cfg(feature = "rmcp-client")]
-        {
-            self.needs_native_transport = true;
-        }
         // The Arc is unshared here (called right after connect, before the event
         // thread), so get_mut succeeds; a no-op if it were somehow already shared.
         if let Some(h) = Arc::get_mut(&mut self.http) {
@@ -340,18 +314,19 @@ impl McpClient {
     /// liveness heartbeat) for the full ~60s — a timeout is a contained
     /// `mcp.connect.fail` (the server is simply absent, RFC 0007 / RFC 0017 §5.3).
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
-        // With the official SDK compiled in, it owns the handshake and every
-        // operation after it. The hand-rolled path below is then unused — the
-        // `return` is load-bearing in the OTHER configuration, where that path
-        // is the whole function.
+        // The SDK owns the handshake and every operation after it — over *this*
+        // connection's transport, so a request signer (AAuth's challenge loop,
+        // AWS SigV4), an mTLS client identity and the SSRF guard all still
+        // apply. Adopting the SDK cost none of them.
         #[cfg(feature = "rmcp-client")]
-        if !self.needs_native_transport {
+        {
             let mut b = crate::rmcp_client::RmcpBuilder::new(
                 &self.name,
                 &self.endpoint,
                 self.extra_headers.clone(),
                 timeout,
             )
+            .with_http(Arc::clone(&self.http))
             .with_client_info(self.client_info.clone());
             if self.inbound_caps.elicitation
                 && let Some(h) = &self.inbound_handler
@@ -369,182 +344,8 @@ impl McpClient {
                 .map(crate::version::era_of)
                 .unwrap_or(Era::Legacy);
             self.rmcp = Some(c);
-            return Ok(());
+            Ok(())
         }
-        // Detect the server's ERA (versioning §backward-compatibility): attempt a
-        // MODERN `server/discover`; a modern JSON-RPC error body identifies a
-        // modern server (retry with a mutual version), otherwise fall back to the
-        // legacy `initialize` handshake.
-        match self.probe_modern(timeout)? {
-            Probe::Modern(discover) => self.establish_modern(*discover),
-            Probe::ModernRetry(supported) => {
-                let v = best_mutual_version(&supported).ok_or_else(|| {
-                    McpError::Transport(format!(
-                        "server '{}' shares no MCP protocol version with agentd \
-                         (server offered {supported:?}, agentd speaks {SUPPORTED_PROTOCOL_VERSIONS:?})",
-                        self.name
-                    ))
-                })?;
-                self.http.set_protocol_version(v.clone());
-                self.protocol_version = Some(v);
-                match self.probe_modern(timeout)? {
-                    Probe::Modern(discover) => self.establish_modern(*discover),
-                    _ => Err(McpError::Transport(format!(
-                        "server '{}' rejected the negotiated MCP protocol version",
-                        self.name
-                    ))),
-                }
-            }
-            Probe::Legacy => self.legacy_initialize(timeout),
-        }
-    }
-
-    /// Cap on the era-detection probe. Discovery is a no-op request a healthy
-    /// server answers immediately; a server that accepts the connection but never
-    /// answers `server/discover` (a legacy server that hangs on unknown methods
-    /// rather than erroring) must not pin the handshake for the caller's full
-    /// per-request timeout (default 60s) — the probe gives up quickly and the
-    /// legacy `initialize` (with the full timeout) decides for real.
-    const PROBE_TIMEOUT_CAP: Duration = Duration::from_secs(5);
-
-    /// Probe the server with a MODERN `server/discover` and classify the era. The
-    /// discover request carries the per-request `_meta` + routing headers; the raw
-    /// transport outcome (a discover result, a modern JSON-RPC error, or anything
-    /// else) tells us whether the server is modern or legacy.
-    fn probe_modern(&mut self, timeout: Duration) -> Result<Probe, McpError> {
-        let timeout = timeout.min(Self::PROBE_TIMEOUT_CAP);
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let version = self
-            .protocol_version
-            .clone()
-            .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
-        let mut params = json!({});
-        modern::inject_client_meta(
-            &mut params,
-            &version,
-            &self.client_info,
-            &self.declared_capabilities(),
-        );
-        self.http.set_protocol_version(version);
-        let routing = modern::routing_headers(method::SERVER_DISCOVER, &params);
-        let refs: Vec<(&str, &str)> = routing.iter().map(|(k, v)| (*k, v.as_str())).collect();
-
-        let req = rpc::Request::new(id, method::SERVER_DISCOVER, Some(params));
-        let body = serde_json::to_vec(&req)
-            .map_err(|e| McpError::Transport(format!("encode server/discover: {e}")))?;
-        let router = self.router();
-        let outcome = self
-            .http
-            .send(Some(id), &body, timeout, &refs, |n| router.route(n));
-
-        match outcome {
-            // HTTP 2xx: a discover result, or a JSON-RPC error (a legacy server that
-            // doesn't know server/discover answers with a generic error).
-            Ok(Some(msg)) => {
-                let resp: rpc::Response = serde_json::from_value(msg).map_err(|e| {
-                    McpError::Transport(format!(
-                        "bad server/discover reply on '{}': {e}",
-                        self.name
-                    ))
-                })?;
-                if let Some(err) = resp.error {
-                    return Ok(if is_modern_error_code(err.code) {
-                        classify_modern_error(&err)
-                    } else {
-                        Probe::Legacy
-                    });
-                }
-                let discover: DiscoverResult =
-                    serde_json::from_value(resp.result.unwrap_or(Value::Null)).map_err(|e| {
-                        McpError::Transport(format!(
-                            "bad server/discover result on '{}': {e}",
-                            self.name
-                        ))
-                    })?;
-                Ok(Probe::Modern(Box::new(discover)))
-            }
-            Ok(None) => Ok(Probe::Legacy),
-            // A non-2xx: a recognized MODERN error body ⇒ modern; else legacy.
-            Err(HttpError::Status(_, body)) => Ok(rpc_error_from_body(&body)
-                .filter(|e| is_modern_error_code(e.code))
-                .map(|e| classify_modern_error(&e))
-                .unwrap_or(Probe::Legacy)),
-            // A CONNECT failure (or an unsupported-transport build) means the
-            // server is absent for both eras — propagate; nothing else can work.
-            Err(e @ (HttpError::Connect(_) | HttpError::Unsupported(_))) => {
-                Err(http_err(&self.name, method::SERVER_DISCOVER, e))
-            }
-            // Reached the server but got no discover answer (read timeout on a
-            // server that hangs on unknown methods, a close-without-reply, a
-            // mid-stream error): not a modern server signal — fall back to the
-            // legacy handshake, which uses the full timeout and errors visibly
-            // if the server is genuinely broken.
-            Err(_) => Ok(Probe::Legacy),
-        }
-    }
-
-    /// Adopt the MODERN (stateless) era from a `server/discover` result: no
-    /// session, no `notifications/initialized`; every subsequent request carries
-    /// `_meta` + routing headers (see [`Self::request_with_timeout`]).
-    fn establish_modern(&mut self, discover: DiscoverResult) -> Result<(), McpError> {
-        self.era = Era::Modern;
-        // The version we probed with was accepted (we got a result); prefer the
-        // newest we share with the server's advertised list, else keep it.
-        let version = best_mutual_version(&discover.supported_versions)
-            .or_else(|| self.protocol_version.clone())
-            .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
-        self.http.set_protocol_version(version.clone());
-        self.protocol_version = Some(version);
-        self.caps = discover.capabilities;
-        Ok(())
-    }
-
-    /// The LEGACY `initialize` handshake (lifecycle §initialization): advertise our
-    /// latest legacy version, adopt the server's negotiated version, store caps,
-    /// send `notifications/initialized`.
-    fn legacy_initialize(&mut self, timeout: Duration) -> Result<(), McpError> {
-        self.era = Era::Legacy;
-        // The modern probe set a version header; clear it so the initialize request
-        // carries none (nothing negotiated yet — legacy sends the header only after).
-        self.http.clear_protocol_version();
-        // The handshake must advertise what we can answer, or a server will
-        // never send the elicitation/roots requests we now handle.
-        let params = InitializeParams {
-            protocol_version: PROTOCOL_VERSION.to_string(),
-            capabilities: ClientCapabilities {
-                experimental: None,
-                elicitation: self.inbound_caps.elicitation.then(|| json!({})),
-                roots: self
-                    .inbound_caps
-                    .roots
-                    .then(|| json!({"listChanged": false})),
-            },
-            client_info: self.client_info.clone(),
-        };
-        let result =
-            self.request_with_timeout(method::INITIALIZE, Some(to_value(&params)), timeout)?;
-        let init: InitializeResult = serde_json::from_value(result)
-            .map_err(|e| McpError::Transport(format!("bad initialize result: {e}")))?;
-
-        // Version negotiation (lifecycle §version-negotiation): the server echoes
-        // our version if it supports it, else returns one it does. Adopt its choice
-        // iff we can speak it; otherwise we cannot agree and must disconnect.
-        let negotiated = negotiate_version(&init.protocol_version).ok_or_else(|| {
-            McpError::Transport(format!(
-                "server '{}' offered unsupported MCP protocol version '{}' \
-                 (agentd speaks {:?})",
-                self.name, init.protocol_version, SUPPORTED_PROTOCOL_VERSIONS
-            ))
-        })?;
-        // Echo it on every subsequent request as MCP-Protocol-Version (a Streamable
-        // HTTP MUST) — set BEFORE `notifications/initialized`, which is the first
-        // request that must carry the header.
-        self.http.set_protocol_version(negotiated.clone());
-        self.protocol_version = Some(negotiated);
-
-        self.caps = init.capabilities;
-        self.notify(method::INITIALIZED, None)?;
-        Ok(())
     }
 
     /// The protocol era established on connect (legacy handshake vs modern
@@ -573,38 +374,14 @@ impl McpClient {
     /// which the callers already treat as a best-effort failure. The timeout is
     /// applied to EACH page (each pagination round-trip is bounded), matching the
     /// per-request contract of [`Self::request_with_timeout`].
-    pub fn list_tools_within(&self, timeout: Duration) -> Result<Vec<Tool>, McpError> {
+    pub fn list_tools_within(&self, _timeout: Duration) -> Result<Vec<Tool>, McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.list_tools();
-        }
-        if !self.caps.supports_tools() {
-            return Ok(Vec::new());
-        }
-        let mut tools = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
-            let page: ListToolsResult =
-                self.request_as_within(method::TOOLS_LIST, params, timeout)?;
-            // A tool whose `x-mcp-header` annotations are invalid MUST be excluded
-            // (transports §schema-extension) so one bad definition can't break the
-            // rest; a valid tool's schema is cached for modern Mcp-Param-* mirroring.
-            let mut schemas = self.tool_schemas.lock().unwrap_or_else(|e| e.into_inner());
-            for tool in page.tools {
-                if modern::validate_x_mcp_headers(&tool.input_schema).is_err() {
-                    continue;
-                }
-                schemas.insert(tool.name.clone(), tool.input_schema.clone());
-                tools.push(tool);
-            }
-            drop(schemas);
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(tools)
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        c.list_tools()
     }
 
     /// `tools/call`. The returned [`CallToolResult`] carries `isError` (a
@@ -618,20 +395,15 @@ impl McpClient {
         // The tool call is the hot path; the SDK owns the whole round trip
         // (including its own `_meta` handling) when it is the live backend.
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            let raw = c.call_tool_with_meta(name, arguments.clone(), None)?;
-            return serde_json::from_value(raw).map_err(|e| {
-                McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
-            });
-        }
-        if !self.caps.supports_tools() {
-            return Err(McpError::Capability(format!(
-                "server '{}' has no tools",
-                self.name
-            )));
-        }
-        let params = build_call_params(name, arguments, self.tool_meta.as_ref());
-        self.request_as(method::TOOLS_CALL, Some(params))
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        let raw = c.call_tool_with_meta(name, arguments.clone(), None)?;
+        serde_json::from_value(raw).map_err(|e| {
+            McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
+        })
     }
 
     /// `tools/call` with **per-call** `_meta` merged on top of the persistent
@@ -666,68 +438,38 @@ impl McpClient {
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            let _ = timeout; // the SDK owns its own per-request deadline
-            let raw = c.call_tool_with_meta(name, arguments.clone(), Some(extra_meta.clone()))?;
-            return serde_json::from_value(raw).map_err(|e| {
-                McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
-            });
-        }
-        if !self.caps.supports_tools() {
-            return Err(McpError::Capability(format!(
-                "server '{}' has no tools",
-                self.name
-            )));
-        }
-        let merged = merge_meta(self.tool_meta.as_ref(), extra_meta);
-        let params = build_call_params(name, arguments, Some(&merged));
-        self.request_as_within(method::TOOLS_CALL, Some(params), timeout)
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        let _ = timeout; // the SDK owns its own per-request deadline
+        let raw = c.call_tool_with_meta(name, arguments.clone(), Some(extra_meta.clone()))?;
+        serde_json::from_value(raw).map_err(|e| {
+            McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
+        })
     }
 
     pub fn list_resources(&self) -> Result<Vec<Resource>, McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.list_resources();
-        }
-        if !self.caps.supports_resources() {
-            return Ok(Vec::new());
-        }
-        let mut resources = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
-            let page: ListResourcesResult = self.request_as(method::RESOURCES_LIST, params)?;
-            resources.extend(page.resources);
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(resources)
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        c.list_resources()
     }
 
     /// `prompts/list`, following cursor pagination to completion. Empty when the
     /// server doesn't advertise `prompts`.
     pub fn list_prompts(&self) -> Result<Vec<Prompt>, McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.list_prompts();
-        }
-        if !self.caps.supports_prompts() {
-            return Ok(Vec::new());
-        }
-        let mut prompts = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
-            let page: ListPromptsResult = self.request_as(method::PROMPTS_LIST, params)?;
-            prompts.extend(page.prompts);
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(prompts)
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        c.list_prompts()
     }
 
     /// `prompts/get` — render the named prompt template with `arguments` (a flat
@@ -871,16 +613,15 @@ impl McpClient {
     pub fn read_resource_within(
         &self,
         uri: &str,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<ReadResourceResult, McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.read_resource(uri);
-        }
-        let params = ReadResourceParams {
-            uri: uri.to_string(),
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
         };
-        self.request_as_within(method::RESOURCES_READ, Some(to_value(&params)), timeout)
+        c.read_resource(uri)
     }
 
     /// `resources/subscribe` — gated on the server advertising it (RFC 0004).
@@ -891,118 +632,14 @@ impl McpClient {
     /// [`Self::subscribe`] with a caller-supplied timeout (the SHORT management
     /// bound, RFC 0016 §10) — for the reactor-thread reload re-handshake, where a
     /// slow-but-alive server arming a subscription must not block the reactor.
-    pub fn subscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
+    pub fn subscribe_within(&self, uri: &str, _timeout: Duration) -> Result<(), McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.subscribe(uri);
-        }
-        if !self.caps.supports_subscribe() {
-            return Err(McpError::Capability(format!(
-                "server '{}' does not support resource subscriptions",
-                self.name
-            )));
-        }
-        if self.era == Era::Modern {
-            // Modern: `resources/subscribe` is replaced by `subscriptions/listen` —
-            // record the URI and (re)open the listen stream with the full filter.
-            self.subscribed_uris
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(uri.to_string());
-            self.restart_modern_listen();
-            return Ok(());
-        }
-        // Legacy: register per-URI over `resources/subscribe`, then open the GET
-        // notification stream (lazily; idempotent).
-        self.request_with_timeout(
-            method::RESOURCES_SUBSCRIBE,
-            Some(to_value(&SubscribeParams { uri: uri.into() })),
-            timeout,
-        )?;
-        self.ensure_event_stream();
-        Ok(())
-    }
-
-    /// Start the background LEGACY notification `GET` SSE thread if it isn't
-    /// running. Idempotent. Notifications land in the shared queue drained by
-    /// [`Self::drain_notifications`]. If the server has no push channel the thread
-    /// exits quietly and the client runs pull-only.
-    fn ensure_event_stream(&self) {
-        let mut guard = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
-            return;
-        }
-        let stop = Arc::new(AtomicBool::new(false));
-        let http = Arc::clone(&self.http);
-        let router = self.router();
-        let stop_thread = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
-            .name(format!("mcp-events:{}", self.name))
-            .spawn(move || event_loop(http, router, stop_thread))
-            .ok();
-        if let Some(handle) = handle {
-            *guard = Some(EventStreamHandle { stop, handle });
-        }
-    }
-
-    /// (Re)open the MODERN `subscriptions/listen` stream with the current URI set.
-    /// The filter is carried in one request, so adding/removing a URI restarts the
-    /// stream. Stops any prior stream first; a no-op when nothing is subscribed.
-    fn restart_modern_listen(&self) {
-        self.stop_event_stream();
-        let uris: Vec<String> = self
-            .subscribed_uris
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        if uris.is_empty() {
-            return;
-        }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let version = self
-            .protocol_version
-            .clone()
-            .unwrap_or_else(|| LATEST_MODERN_VERSION.to_string());
-        let mut params = json!({ "notifications": { "resourceSubscriptions": uris } });
-        modern::inject_client_meta(
-            &mut params,
-            &version,
-            &self.client_info,
-            &self.declared_capabilities(),
-        );
-        let routing: Vec<(String, String)> =
-            modern::routing_headers(method::SUBSCRIPTIONS_LISTEN, &params)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
-        let req = rpc::Request::new(id, method::SUBSCRIPTIONS_LISTEN, Some(params));
-        let body = match serde_json::to_vec(&req) {
-            Ok(b) => b,
-            Err(_) => return,
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
         };
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let http = Arc::clone(&self.http);
-        let router = self.router();
-        let stop_thread = Arc::clone(&stop);
-        let handle = std::thread::Builder::new()
-            .name(format!("mcp-listen:{}", self.name))
-            .spawn(move || modern_listen_loop(http, router, stop_thread, body, routing))
-            .ok();
-        if let Some(handle) = handle {
-            *self.events.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(EventStreamHandle { stop, handle });
-        }
-    }
-
-    /// Stop the background notification thread (either era) if one is running.
-    fn stop_event_stream(&self) {
-        if let Some(ev) = self.events.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            ev.stop.store(true, Ordering::SeqCst);
-            let _ = ev.handle.join();
-        }
+        c.subscribe(uri)
     }
 
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
@@ -1013,27 +650,14 @@ impl McpClient {
     /// bound, RFC 0016 §10) — for the reactor-thread reload reconcile + the drain
     /// unsubscribe, both best-effort: a slow server here must not block the reactor
     /// or the drain past the liveness window / drain budget.
-    pub fn unsubscribe_within(&self, uri: &str, timeout: Duration) -> Result<(), McpError> {
+    pub fn unsubscribe_within(&self, uri: &str, _timeout: Duration) -> Result<(), McpError> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.unsubscribe(uri);
-        }
-        if self.era == Era::Modern {
-            // Modern: drop the URI and re-open `subscriptions/listen` with the rest
-            // (or stop the stream if none remain).
-            self.subscribed_uris
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(uri);
-            self.restart_modern_listen();
-            return Ok(());
-        }
-        self.request_with_timeout(
-            method::RESOURCES_UNSUBSCRIBE,
-            Some(to_value(&SubscribeParams { uri: uri.into() })),
-            timeout,
-        )?;
-        Ok(())
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        c.unsubscribe(uri)
     }
 
     /// Drain any notifications queued since the last drain (e.g.
@@ -1041,11 +665,10 @@ impl McpClient {
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
         #[cfg(feature = "rmcp-client")]
-        if let Some(c) = &self.rmcp {
-            return c.drain_notifications();
-        }
-        let mut q = self.notifications.lock().unwrap_or_else(|e| e.into_inner());
-        q.drain(..).collect()
+        let Some(c) = &self.rmcp else {
+            return Vec::new();
+        };
+        c.drain_notifications()
     }
 
     // ---- internals ----
@@ -1142,17 +765,6 @@ impl McpClient {
             None => Ok(resp.result.unwrap_or(Value::Null)),
         }
     }
-
-    fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
-        let note = rpc::Notification::new(method, params);
-        let body = serde_json::to_vec(&note)
-            .map_err(|e| McpError::Transport(format!("encode {method}: {e}")))?;
-        let router = self.router();
-        self.http
-            .send(None, &body, self.timeout, &[], |n| router.route(n))
-            .map_err(|e| http_err(&self.name, method, e))?;
-        Ok(())
-    }
 }
 
 impl Drop for McpClient {
@@ -1169,45 +781,6 @@ impl Drop for McpClient {
             ev.stop.store(true, Ordering::SeqCst);
             let _ = ev.handle.join();
         }
-    }
-}
-
-/// The era-detection outcome of a modern `server/discover` probe.
-enum Probe {
-    /// The server is modern and returned its capabilities (boxed — much larger
-    /// than the other variants).
-    Modern(Box<DiscoverResult>),
-    /// The server is modern but did not support our version — the versions it does
-    /// support (from a `-32022` error); retry with a mutual one.
-    ModernRetry(Vec<String>),
-    /// The server is not modern — fall back to the legacy `initialize` handshake.
-    Legacy,
-}
-
-/// Parse a JSON-RPC error object out of a raw HTTP error-response body (a modern
-/// server returns one for an unsupported version / header mismatch).
-fn rpc_error_from_body(body: &[u8]) -> Option<RpcError> {
-    serde_json::from_slice::<rpc::Response>(body)
-        .ok()
-        .and_then(|r| r.error)
-}
-
-/// Classify a modern JSON-RPC error into a probe outcome: a `-32022`
-/// unsupported-version error yields the server's `supported` list to retry with;
-/// any other modern error (e.g. header mismatch) can't be proceeded with.
-fn classify_modern_error(err: &RpcError) -> Probe {
-    if err.code == UNSUPPORTED_PROTOCOL_VERSION_CODE {
-        let supported = err
-            .data
-            .as_ref()
-            .and_then(|d| serde_json::from_value::<UnsupportedProtocolVersion>(d.clone()).ok())
-            .map(|u| u.supported)
-            .unwrap_or_default();
-        Probe::ModernRetry(supported)
-    } else {
-        // A header mismatch (-32020) is our own request bug against a modern server;
-        // ModernRetry with no list ⇒ best_mutual returns None ⇒ a clear error.
-        Probe::ModernRetry(Vec::new())
     }
 }
 
@@ -1246,127 +819,8 @@ fn queue_notification(queue: &Mutex<VecDeque<rpc::Notification>>, n: Value) {
     }
 }
 
-/// The notification `GET` SSE thread: (re)open the server→client stream and pump
-/// its JSON-RPC notifications into the shared queue until `stop`. Reconnects on a
-/// transient drop; gives up if the server has no push channel (a non-2xx / non-SSE
-/// response), leaving the client pull-only.
-fn event_loop(http: Arc<HttpTransport>, router: Arc<InboundRouter>, stop: Arc<AtomicBool>) {
-    while !stop.load(Ordering::Relaxed) {
-        let mut sse = match http.open_events(EVENT_READ_TIMEOUT) {
-            Ok(s) => s,
-            // No usable push channel — stop trying (don't spin).
-            Err(HttpError::Status(_, _)) | Err(HttpError::Unsupported(_)) => return,
-            // Transient (connect/HTTP) — back off, then retry unless stopping.
-            Err(_) => {
-                for _ in 0..20 {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                continue;
-            }
-        };
-        pump_events(&mut sse, &router, &stop);
-    }
-}
-
-/// The MODERN notification thread: (re)open the `subscriptions/listen` POST stream
-/// with the pre-built request `body` + routing headers, and pump its notifications
-/// (the acknowledgment + the opted-in change notifications) into the queue until
-/// `stop`. Reconnects on a transient drop; gives up if the server rejects the
-/// listen (non-2xx / non-SSE), leaving the client pull-only.
-fn modern_listen_loop(
-    http: Arc<HttpTransport>,
-    router: Arc<InboundRouter>,
-    stop: Arc<AtomicBool>,
-    body: Vec<u8>,
-    routing: Vec<(String, String)>,
-) {
-    while !stop.load(Ordering::Relaxed) {
-        let refs: Vec<(&str, &str)> = routing
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let mut sse = match http.open_listen(EVENT_READ_TIMEOUT, &body, &refs) {
-            Ok(s) => s,
-            Err(HttpError::Status(_, _)) | Err(HttpError::Unsupported(_)) => return,
-            Err(_) => {
-                for _ in 0..20 {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                continue;
-            }
-        };
-        pump_events(&mut sse, &router, &stop);
-    }
-}
-
-/// Read frames off one SSE stream until EOF/error or `stop`, routing each.
-fn pump_events(sse: &mut EventStream, router: &InboundRouter, stop: &AtomicBool) {
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        match sse.next_event() {
-            Ok(Some(ev)) => {
-                // A frame here may be a notification OR a server→client
-                // request; the router decides and answers the latter.
-                if let Ok(frame) = serde_json::from_str::<Value>(&ev.data) {
-                    router.route(frame);
-                }
-            }
-            Ok(None) => return, // clean EOF — reconnect
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                // Idle read timeout — loop to re-check the stop flag.
-                continue;
-            }
-            Err(_) => return, // stream error — reconnect
-        }
-    }
-}
-
-/// Build `tools/call` params — `{name, arguments?, _meta?}` — injecting the
-/// client's `_meta` (run id, etc.) for retry dedup. Pure. RFC 0011 §idempotency.
-fn build_call_params(name: &str, arguments: Option<Value>, meta: Option<&Value>) -> Value {
-    let mut p = serde_json::Map::new();
-    p.insert("name".into(), Value::String(name.to_string()));
-    if let Some(args) = arguments {
-        p.insert("arguments".into(), args);
-    }
-    if let Some(m) = meta {
-        p.insert("_meta".into(), m.clone());
-    }
-    Value::Object(p)
-}
-
 fn to_value<T: Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
-}
-
-/// Merge `extra` over the persistent `base` meta for a single call, without
-/// mutating either. When both are objects, `extra` wins key-by-key (a shallow
-/// merge — the claim contract's keys are flat); a non-object `extra` replaces
-/// `base` wholesale; a `None`/non-object `base` yields `extra`. Pure.
-fn merge_meta(base: Option<&Value>, extra: Value) -> Value {
-    match (base, &extra) {
-        (Some(Value::Object(b)), Value::Object(e)) => {
-            let mut m = b.clone();
-            for (k, v) in e {
-                m.insert(k.clone(), v.clone());
-            }
-            Value::Object(m)
-        }
-        _ => extra,
-    }
 }
 
 #[cfg(test)]
@@ -1374,39 +828,6 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-
-    #[test]
-    fn call_params_inject_meta_for_idempotency() {
-        let meta = json!({"agent/run_id": "r1"});
-        let p = build_call_params("send_email", Some(json!({"to": "x"})), Some(&meta));
-        assert_eq!(p["name"], "send_email");
-        assert_eq!(p["arguments"]["to"], "x");
-        assert_eq!(p["_meta"]["agent/run_id"], "r1");
-
-        // no meta / no args → those keys are absent
-        let p2 = build_call_params("noop", None, None);
-        assert_eq!(p2["name"], "noop");
-        assert!(p2.get("_meta").is_none());
-        assert!(p2.get("arguments").is_none());
-    }
-
-    #[test]
-    fn merge_meta_overlays_extra_without_mutating_base() {
-        // Per-call claim_key rides on top of the persistent run_id stamp.
-        let base = json!({"agent/run_id": "r1", "traceparent": "tp"});
-        let merged = merge_meta(
-            Some(&base),
-            json!({"agent/claim_key": "ck", "traceparent": "tp2"}),
-        );
-        assert_eq!(merged["agent/run_id"], "r1"); // persistent key preserved
-        assert_eq!(merged["agent/claim_key"], "ck"); // per-call key added
-        assert_eq!(merged["traceparent"], "tp2"); // extra wins on conflict
-        // The base is untouched.
-        assert_eq!(base["traceparent"], "tp");
-        // No persistent base → the extra is the meta.
-        let only = merge_meta(None, json!({"agent/claim_key": "ck"}));
-        assert_eq!(only["agent/claim_key"], "ck");
-    }
 
     #[test]
     fn error_display() {

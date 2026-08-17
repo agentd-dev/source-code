@@ -53,12 +53,29 @@ struct Inbound {
     handler: Option<Arc<dyn inbound::Handler>>,
 }
 
-/// Bridges rmcp's `ClientHandler` onto our host-facing [`inbound::Handler`], so
-/// a server's elicitation reaches the same place under either backend.
+/// Bridges rmcp's `ClientHandler` onto agentd: a server's elicitation reaches
+/// the host that can answer it, and a server's notifications reach the queue the
+/// reactor drains.
+///
+/// The notification half matters more than it looks. agentd is a *reactive*
+/// daemon: `notifications/resources/updated` is what wakes a subscribed
+/// workflow. A handler that accepted those and dropped them would leave the
+/// agent idle forever, with nothing in any log to say why.
 #[derive(Clone)]
 struct Handler {
     info: ClientInfo,
     inbound: Inbound,
+    /// Where a server's notifications land until the reactor drains them.
+    queue: Arc<Mutex<Vec<rpc::Notification>>>,
+}
+
+impl Handler {
+    fn queue(&self, method: &str, params: Value) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(rpc::Notification::new(method, Some(params)));
+    }
 }
 
 fn declined() -> ElicitResult {
@@ -107,6 +124,56 @@ impl ClientHandler for Handler {
             _ => ElicitResult::new(ElicitationAction::Cancel),
         })
     }
+
+    // ---- notifications: the reactive wake path ----
+
+    async fn on_resource_updated(
+        &self,
+        params: rmcp::model::ResourceUpdatedNotificationParam,
+        _ctx: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.queue(
+            "notifications/resources/updated",
+            serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
+        );
+    }
+
+    async fn on_resource_list_changed(&self, _ctx: rmcp::service::NotificationContext<RoleClient>) {
+        self.queue("notifications/resources/list_changed", json!({}));
+    }
+
+    async fn on_tool_list_changed(&self, _ctx: rmcp::service::NotificationContext<RoleClient>) {
+        self.queue("notifications/tools/list_changed", json!({}));
+    }
+
+    async fn on_prompt_list_changed(&self, _ctx: rmcp::service::NotificationContext<RoleClient>) {
+        self.queue("notifications/prompts/list_changed", json!({}));
+    }
+
+    // Logging is deprecated by SEP-2577 upstream, but a server that still sends
+    // it should still be heard while it exists.
+    #[allow(deprecated)]
+    async fn on_logging_message(
+        &self,
+        params: rmcp::model::LoggingMessageNotificationParam,
+        _ctx: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.queue(
+            "notifications/message",
+            serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
+        );
+    }
+
+    async fn on_progress(
+        &self,
+        params: rmcp::model::ProgressNotificationParam,
+        _ctx: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        self.queue(
+            "notifications/progress",
+            serde_json::to_value(&params).unwrap_or_else(|_| json!({})),
+        );
+    }
 }
 
 /// A blocking MCP client backed by the official SDK.
@@ -134,6 +201,10 @@ pub struct RmcpBuilder {
     timeout: Duration,
     client_info: Implementation,
     inbound: Inbound,
+    /// agentd's authenticated socket. Present whenever the connection carries a
+    /// credential the SDK's own client could not (a request signer, an mTLS
+    /// identity); absent only in tests that dial a bare loopback server.
+    http: Option<Arc<crate::http::HttpTransport>>,
 }
 
 impl RmcpBuilder {
@@ -157,7 +228,15 @@ impl RmcpBuilder {
                 caps: inbound::Capabilities::default(),
                 handler: None,
             },
+            http: None,
         }
+    }
+
+    /// Use agentd's socket for this connection — the one carrying its request
+    /// signer, mTLS identity and SSRF guard.
+    pub fn with_http(mut self, http: Arc<crate::http::HttpTransport>) -> Self {
+        self.http = Some(http);
+        self
     }
 
     pub fn with_client_info(mut self, info: Implementation) -> Self {
@@ -175,8 +254,16 @@ impl RmcpBuilder {
 
     /// Connect and run the `initialize` handshake.
     pub fn connect(self) -> Result<RmcpClient, McpError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // A *multi-threaded* runtime, deliberately. The SDK runs the transport
+        // and the service dispatch as background tasks, and a server pushing a
+        // notification (`resources/updated` — agentd's reactive wake) has to be
+        // heard between our calls, not only during one. On a current-thread
+        // runtime those tasks advance only inside `block_on`, so a daemon that
+        // was idling — exactly when a wake matters — would never receive it.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
+            .thread_name("agentd-mcp")
             .build()
             .map_err(|e| {
                 McpError::Transport(format!("mcp server '{}': runtime: {e}", self.name))
@@ -210,6 +297,7 @@ impl RmcpBuilder {
         implementation.title = self.client_info.title.clone();
 
         let handler = Handler {
+            queue: Arc::clone(&notifications),
             // `ClientInfo::new` already carries `ProtocolVersion::default()`,
             // i.e. rmcp's `LATEST`. Left explicit so it is obvious this is a
             // decision (follow the SDK) and not an omission.
@@ -219,9 +307,20 @@ impl RmcpBuilder {
         };
 
         let name = self.name.clone();
+        // The SDK speaks the protocol; agentd supplies the socket, so a
+        // connection keeps its signer, its mTLS identity and its SSRF guard.
+        let socket = match &self.http {
+            Some(h) => Arc::clone(h),
+            None => Arc::new(crate::http::HttpTransport::new(
+                crate::http::McpEndpoint::parse(&self.endpoint)
+                    .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?,
+                self.headers.clone(),
+            )),
+        };
+        let client = crate::rmcp_transport::AgentdHttp::new(socket, self.timeout);
         let service = rt
             .block_on(async move {
-                let transport = StreamableHttpClientTransport::from_config(config);
+                let transport = StreamableHttpClientTransport::with_client(client, config);
                 handler.serve(transport).await
             })
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;

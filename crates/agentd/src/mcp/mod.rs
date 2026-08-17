@@ -135,8 +135,6 @@ pub mod mock_http;
 // with `a2a_client`. The v1 self-MCP server + v1 A2A server surfaces were removed
 // with the mode cut-over; the v2 A2A server is `runtime::a2a_server`.
 #[cfg(feature = "a2a")]
-pub mod a2a_wire;
-
 // agentd-as-A2A-client: the remote-A2A-agent delegation backend (RFC 0020 §3).
 // Connects to a declared peer over HTTP(S) + the RFC 0004
 // JSON-RPC codec, runs `a2a.SendMessage` then polls `a2a.GetTask` to a terminal

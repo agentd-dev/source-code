@@ -252,7 +252,9 @@ remaining 28 libc FFI across eight files. A panic in the supervisor path takes
 the whole tree down by design, which makes every `unwrap` an availability
 decision.
 
-**The learning curve is real.** Edition 2024, a `rust-version` floor of 1.88, a
+**The learning curve is real.** Edition 2024, a `rust-version` floor of 1.96 —
+set by the protocol SDKs, not by us, which is one of the ordinary costs of
+depending on somebody else's crate — a
 transport generic over `Read + Write`, raw signal handling: working here demands
 comfort with async-signal-safety rules, not only the borrow checker.
 

@@ -25,7 +25,7 @@
 # cargo `--no-default-features`.
 
 # ---- builder -------------------------------------------------------------
-FROM rust:1.88-alpine AS builder
+FROM rust:1.96-alpine AS builder
 ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses

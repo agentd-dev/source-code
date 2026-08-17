@@ -2,7 +2,7 @@
 name = "agentd-core"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "Minimal, MCP-native agent runtime as a library: the agentic loop, supervisor, workflows, and code-registered tools (the agentd engine)"
 license = "AGPL-3.0-only"
 repository = "https://github.com/agentd-dev/source-code"

@@ -10,7 +10,7 @@
 name = "agentd-cli"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "agentd — a minimal, MCP-native, reactive agent runtime (the CLI binary over the agentd-core engine)"
 license = "AGPL-3.0-only"
 repository = "https://github.com/agentd-dev/source-code"

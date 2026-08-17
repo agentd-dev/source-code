@@ -7,7 +7,7 @@
 name = "agentd-net"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "Minimal blocking HTTP/1.1 + SSE over Read+Write, unix/tls/vsock connects, SSRF guard"
 license = "AGPL-3.0-only"
 repository = "https://github.com/agentd-dev/source-code"

@@ -31,6 +31,18 @@ pub fn checks() -> Vec<Check> {
             run: agent_card,
         },
         Check {
+            id: "a2a-conversation/card-declares-only-what-it-implements",
+            category: Category::A2aConversation,
+            desc: "every capability the agent card advertises is exercisable, and one it disclaims is refused cleanly rather than half-served",
+            run: card_honesty,
+        },
+        Check {
+            id: "a2a-conversation/protocol-errors-use-the-specified-codes",
+            category: Category::A2aConversation,
+            desc: "an unknown method is -32601 and an unknown task is -32001, rather than a generic failure",
+            run: protocol_errors,
+        },
+        Check {
             id: "a2a-conversation/nl-message-becomes-task-artifact",
             category: Category::A2aConversation,
             desc: "a natural-language message runs a turn; the answer is the task artifact, readable via GetTask/ListTasks",
@@ -83,6 +95,14 @@ fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
         serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
     assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
     v["result"].clone()
+}
+
+/// Like [`rpc`], but returns the whole envelope so a check can assert on the
+/// JSON-RPC **error** — the half `rpc` deliberately panics on.
+fn rpc_raw(addr: &str, id: i64, method: &str, params: Value) -> Value {
+    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+    let resp = post_raw(addr, &body);
+    serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
 }
 
 /// Block until the listener accepts a connection, or fail past the deadline.
@@ -175,6 +195,107 @@ fn agent_card(h: &Harness) -> Outcome {
             format!("the card should advertise streaming: {card}"),
         )
     })
+}
+
+/// The card is a promise. This checks both directions of it: a capability
+/// advertised as available actually works, and one advertised as absent is
+/// refused with a real JSON-RPC error rather than half-served or crashed.
+///
+/// The failure this guards against is the expensive kind — a peer that reads
+/// the card, believes it, and builds against something that is not there.
+fn card_honesty(h: &Harness) -> Outcome {
+    let tmp = h.tempdir();
+    let llm = mock_llm(h, &tmp, &json!({"turns": [{"content": "ok"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_file(&tmp, "agentd.yaml", &a2a_config(&llm.uri, port, ""));
+    let _daemon = h.spawn(&["--config", &cfg]);
+    wait_ready(&addr);
+
+    let card = rpc(&addr, 1, "GetAgentCard", json!({}));
+    let caps = &card["capabilities"];
+
+    // Advertised as available ⇒ it must work. `streaming` is the one the card
+    // claims, so a streaming send must produce a task rather than an error.
+    if caps["streaming"] == true {
+        // A streaming send answers with SSE, not a JSON body — so assert on the
+        // stream: the spec's update frames must arrive and reach a terminal
+        // state, which is exactly what "streaming: true" promises a caller.
+        let body = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "SendStreamingMessage",
+            "params": {"message": {"messageId": "s1", "parts": [{"text": "hi"}]}}
+        })
+        .to_string();
+        let raw = post_raw(&addr, &body);
+        if raw.contains("\"error\"") {
+            return Outcome::fail(format!(
+                "the card advertises streaming but the stream carried an error: {raw}"
+            ));
+        }
+        if !raw.contains("statusUpdate") {
+            return Outcome::fail(format!(
+                "a streaming send should emit statusUpdate frames: {raw}"
+            ));
+        }
+        if !raw.contains("TASK_STATE_COMPLETED") {
+            return Outcome::fail(format!("the stream should reach a terminal state: {raw}"));
+        }
+    }
+
+    // Advertised as ABSENT ⇒ asking for it is a clean refusal. A capability we
+    // disclaim must not be silently half-implemented, and must not 500.
+    if caps["pushNotifications"] == false {
+        let env = rpc_raw(
+            &addr,
+            3,
+            "SetTaskPushNotificationConfig",
+            json!({"taskId": "t", "pushNotificationConfig": {"url": "https://x.example/hook"}}),
+        );
+        let code = env["error"]["code"].as_i64();
+        if code.is_none() {
+            return Outcome::fail(format!(
+                "pushNotifications is disclaimed, so the method must be refused: {env}"
+            ));
+        }
+        // -32601 (unknown method) and -32004 (unsupported operation) both say
+        // "not here" honestly; anything else is a surprise for a caller.
+        if !matches!(code, Some(-32601) | Some(-32004)) {
+            return Outcome::fail(format!(
+                "a disclaimed capability should refuse with -32601/-32004, got: {env}"
+            ));
+        }
+    }
+
+    Outcome::pass()
+}
+
+/// JSON-RPC and A2A both specify codes for the two failures a client actually
+/// branches on. Returning a generic error instead forces peers to string-match
+/// our messages, which then become an accidental API.
+fn protocol_errors(h: &Harness) -> Outcome {
+    let tmp = h.tempdir();
+    let llm = mock_llm(h, &tmp, &json!({"turns": [{"content": "ok"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_file(&tmp, "agentd.yaml", &a2a_config(&llm.uri, port, ""));
+    let _daemon = h.spawn(&["--config", &cfg]);
+    wait_ready(&addr);
+
+    let unknown = rpc_raw(&addr, 1, "DefinitelyNotAMethod", json!({}));
+    if unknown["error"]["code"].as_i64() != Some(-32601) {
+        return Outcome::fail(format!(
+            "an unknown method should be -32601 (method not found): {unknown}"
+        ));
+    }
+
+    let missing = rpc_raw(&addr, 2, "GetTask", json!({"id": "task-does-not-exist"}));
+    if missing["error"]["code"].as_i64() != Some(-32001) {
+        return Outcome::fail(format!(
+            "an unknown task should be -32001 (task not found): {missing}"
+        ));
+    }
+
+    Outcome::pass()
 }
 
 fn nl_message_artifact(h: &Harness) -> Outcome {

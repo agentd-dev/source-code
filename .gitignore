@@ -14,3 +14,6 @@
 /bench/scorecard.json
 /bench/ablation.json
 __pycache__/
+
+# Copied in at site-build time from the repo-root installer (single source of truth).
+web/public/install.sh

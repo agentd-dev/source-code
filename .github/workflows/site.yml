@@ -3,7 +3,7 @@ name: site
 on:
   push:
     branches: [main]
-    paths: ["web/**", "docs/**", "rfcs/**", ".github/workflows/site.yml"]
+    paths: ["web/**", "docs/**", "rfcs/**", "install.sh", ".github/workflows/site.yml"]
   workflow_dispatch:
 
 permissions:
@@ -27,6 +27,10 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
         working-directory: web
+        # `curl -fsSL https://agentd.dev/install.sh | sh` — served from the repo
+        # root script, copied in at build time so there is one source of truth.
+        # (web/public/install.sh is gitignored for exactly that reason.)
+      - run: cp install.sh web/public/install.sh
       - run: npm run build
         working-directory: web
         # Served from the custom apex domain agentd.dev at the root —

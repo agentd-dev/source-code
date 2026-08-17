@@ -1925,9 +1925,14 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                     .ok_or_else(|| usage("--logout requires a target (e.g. mcp:<name>)".into()))?;
                 ask = Ask::Logout(t);
             }
-            "--config" => {
+            "--config" | "-c" => {
                 it.next(); // consumed by the FILE layer
             }
+            // `--config=a.yaml` / `-c=a.yaml`: the FILE layer already took it.
+            _ if matches!(
+                crate::config::config_flag(a),
+                crate::config::ConfigFlag::Inline(_)
+            ) => {}
             _ => {
                 if let Some((flag, hint)) = REMOVED_FLAGS.iter().find(|(f, _)| *f == a) {
                     return Err(usage(format!("{flag} was removed in agentd 2.0: {hint}")));
@@ -3187,6 +3192,7 @@ pub fn help_text() -> String {
          USAGE:\n\
          \x20 agentd --config <settings.yaml> [--config <overlay.yaml> …] [--<path> <value> …]\n\
          \x20 agentd --instruction <TEXT> --intelligence <URL> [--mcp name=endpoint …]   # one-shot sugar\n\
+         \x20 agentd tui|ui --config <settings.yaml> [--<path> <value> …]   # + a display client\n\
          \n\
          Every setting is a document path (YAML/JSON file, AGENTD_<PATH> env, --<path> flag);\n\
          several files merge in order (later wins). Precedence: built-in < files < env < flags.\n\
@@ -3204,8 +3210,15 @@ pub fn help_text() -> String {
         out.push_str(&format!("  {:<32} {} → {}\n", a.flag, shape, a.path));
     }
     out.push_str(
-        "\nCONTROL:\n\
-         \x20 --config <PATH>            a settings file (repeatable; or AGENT_CONFIG=a.yaml:b.yaml)\n\
+        "\nSUBCOMMANDS (run the daemon with a display client attached; RFC 0032):\n\
+         \x20 tui                        + the terminal UI (fullscreen; --inline for in-place)\n\
+         \x20 ui                         + the web UI, opened in a browser\n\
+         \x20                            both need `interface.enabled: true`, which the\n\
+         \x20                            subcommand sets for you; the client exits with the daemon.\n\
+         \x20                            Detached instead: run `agentd -c …`, then `agentd-tui\n\
+         \x20                            --endpoint <url>` (npm i -g @agentd/tui).\n\
+         \nCONTROL:\n\
+         \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
          \x20 --config-schema=2          print the settings JSON Schema (v2) and exit\n\
          \x20 --workflow-schema          print the workflow (dialect 3) JSON Schema + node registry and exit\n\

@@ -56,6 +56,10 @@ const HERO_CMD = `$ agentd \\
 {"event":"tool.call","tool":"add_labels","args":{"labels":["bug"]}}
 {"event":"run.done","status":"completed","steps":4,"exit_code":0}`;
 
+const INSTALL_CMD = `$ curl -fsSL https://agentd.dev/install.sh | sh
+agentd  checksum ok
+agentd  installed agentd 2.0.0 to /usr/local/bin/agentd`;
+
 const TUI_CMD = `$ agentd tui --config coding.yaml
 
 agentd 2.0.0 · coder                chat  tasks  subagents  debug
@@ -193,6 +197,19 @@ export default function Home() {
           <Link href="/docs/overview/" className="btn">
             docs
           </Link>
+        </div>
+
+        <div className="mt-8">
+          <div className="eyebrow mb-2">install</div>
+          <Term title="Linux amd64/arm64 · checksum-verified · no sudo">{INSTALL_CMD}</Term>
+          <p className="mt-2 text-sm text-[var(--dim)]">
+            Or build from source — <code>exec</code> and <code>cel</code> are deliberately not in
+            release binaries. See{" "}
+            <Link href="/docs/getting-started/" className="underline">
+              getting started
+            </Link>
+            .
+          </p>
         </div>
 
         <div className="mt-10">

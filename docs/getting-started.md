@@ -24,16 +24,29 @@ see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
 
 ## Install / build
 
-agentd is a single Cargo crate in a workspace. The default build is
-dependency-light: no async runtime, no TLS, no C/C++ toolchain.
+The fastest path is the installer — it picks the right architecture, verifies
+the release `SHA256SUMS`, and installs to `/usr/local/bin` (or `~/.local/bin`
+when that is not writable). It never invokes sudo for you:
+
+```console
+$ curl -fsSL https://agentd.dev/install.sh | sh
+$ agentd --version
+```
+
+`install.sh --help` covers pinning a version (`--version v2.0.0`) and choosing
+the directory (`--dir ~/bin`). Release binaries are Linux/musl, amd64 and arm64;
+**`exec` and `cel` are not compiled into them** — those need the source build
+below.
+
+Building from source: agentd is a single Cargo crate in a workspace. The default
+build is dependency-light: no async runtime, no C/C++ toolchain.
 
 ```console
 $ git clone <repo> agent && cd agent
 $ cargo build -p agentd-cli --release
-   Compiling agentd v1.0.0
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
-agentd 1.0.0
+agentd 2.0.0
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops

@@ -79,8 +79,8 @@ integration.
 An earlier version of this page counted three direct dependencies and had CI
 fail the build if that number moved. That gate is gone, replaced by one that
 guards what actually reaches a user: the release binary is still a **statically
-linked musl artifact that runs on `scratch`** — 6.5 MiB, 3.0 MiB gzipped, no
-shell, no libc, no package manager. The dependency count moved by two orders of
+linked musl artifact that runs on `scratch`** — 2.98 MiB, a 1.5 MiB download,
+no shell, no libc, no package manager. The dependency count moved by two orders of
 magnitude; the attack surface of the thing that ships did not.
 
 The build gained a C toolchain, because `aws-lc-sys` arrives underneath the SDKs
@@ -215,13 +215,15 @@ duration. And the loop is not a pure event-driven park: it waits
 The artifact that ships is a static-PIE musl build (LTO, stripped,
 `opt-level = "z"`) of the release feature set:
 
-| | Size |
-|---|---|
-| binary | 6,858,216 B (6.54 MiB) |
-| gzipped | 2.99 MiB |
+| | amd64 | arm64 |
+|---|---|---|
+| binary | 3,126,304 B (2.98 MiB) | 2.79 MiB |
+| `.tar.gz` download | 1,547,037 B (1.48 MiB) | 2.79 MiB |
 
-That is the whole image: `FROM scratch` plus this file. Adopting two protocol
-SDKs roughly doubled it and left everything else about the image unchanged.
+Measured on the **published v2.0.0 artifacts**, not a local build — a local
+`cargo build --release` of the same feature set comes out around 6.9 MiB, and
+the released binary is what a user actually receives. That is the whole image
+too: `FROM scratch` plus this file.
 
 An idle daemon running a schedule workflow: `Threads: 1`, `VmRSS` 3.8–3.9 MiB,
 and **0 CPU ticks** over 10 seconds at `CLK_TCK=100` — under 0.1% of a core,

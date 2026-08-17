@@ -185,10 +185,10 @@ esac
 cat <<EOF
 
   next
-    agentd --help                       every flag
-    agentd --validate-config -c a.yaml  check a config without running it
-    agentd tui -c a.yaml                run it with a terminal UI attached
+    agentd --help                            every flag
+    agentd --validate-config --config a.yaml check a config without running it
+    agentd tui --config a.yaml               run it with a terminal UI attached
 
   docs  ${DOCS}/docs/getting-started/
-  TUI   ${DOCS}/docs/interface/   (needs agentd 2.0+ and \`interface.enabled\`)
+  TUI   ${DOCS}/docs/interface/   (the TUI, and the short \`-c\`, need agentd 2.0+)
 EOF

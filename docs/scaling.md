@@ -202,19 +202,29 @@ redelivery.
 
 ### 3.4 Spawn-claim vs continue-claim
 
-A claim route's URI that is *also* a `--continue` URI becomes a **continue-claim**:
-the lease is held across the warm session's whole life — claimed on the session's
-first delivery, renewed by the heartbeat every `ttl × fraction` while the session
-is live, and acked/released when the session ends or drains — instead of
-claimed-then-settled per event. No new flag: it is the existing idiom of "a claim
-route whose URI is also a `--continue` URI".
+A claimed `subscribe` start node that also delivers into a **warm** session
+(`deliver: wait`) becomes a **continue-claim**: the lease is held across that
+session's whole life — claimed on its first delivery, renewed by the heartbeat
+every `ttl × fraction` while it is live, and acked/released when the session
+ends or drains — instead of claimed-then-settled per event. It is not a separate
+mode, just a claim route whose delivery is warm.
 
-```bash
+```yaml
 # continue-claim: one warm session per claimed channel, lease held for its life
-agentd … --mode reactive \
-         --mcp coord=https://mcp-workqueue.internal/mcp \
-         --continue 'file:///stream/in.json' \
-         --claim 'file:///stream/in.json'=coord
+workflows:
+  - name: worker
+    version: 3
+    steps:
+      pull:
+        kind: subscribe
+        server: coord
+        uri: "file:///stream/in.json"
+        deliver: wait                 # warm session, not one run per event
+        claim: { server: coord, ttl: 60s, renew_fraction: 0.5 }
+      work: { kind: agent, depends_on: [pull], instruction: "handle the item" }
+      done: { kind: finish, depends_on: [work] }
+mcp:
+  servers: [ { name: coord, endpoint: https://mcp-workqueue.internal/mcp } ]
 ```
 
 ### 3.5 At-least-once + idempotency (NOT exactly-once)

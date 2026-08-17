@@ -43,7 +43,7 @@ function Nav() {
           <span className="text-[var(--green)]">~</span>
         </Link>
         <Link href="/#mcp" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
-          mcp + a2a
+          capability
         </Link>
         <Link href="/#lifecycle" className="hidden text-[var(--dim)] hover:text-[var(--fg-strong)] sm:inline">
           lifecycle

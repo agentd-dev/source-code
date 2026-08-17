@@ -277,10 +277,11 @@ workflows:
     steps:
       s: { kind: schedule, cron: "0 3 * * *" }
       audit: { kind: agent, depends_on: [s],
-               prompt: "Run cargo audit and cargo outdated in /work; summarize what needs attention." }
+               instruction: "Run cargo audit and cargo outdated in /work; summarize what needs attention." }
       gate: { kind: human, question: "Apply the safe upgrades?", depends_on: [audit] }
       apply: { kind: agent, depends_on: [gate],
-               prompt: "Apply only the upgrades the operator approved: {{steps.gate.output}}" }
+               instruction: "Apply only the upgrades the operator approved: {{steps.gate.output}}" }
+      done:  { kind: finish, depends_on: [apply], status: completed }
 ```
 
 You wake up to a question in your TUI instead of a stale report — the gate

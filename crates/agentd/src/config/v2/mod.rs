@@ -2429,6 +2429,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     let mut d = Diagnostics::default();
     let err = |d: &mut Diagnostics, m: String| d.errors.push(m);
 
+
     // config_version
     if let Some(v) = &s.config_version
         && v != schema::CONFIG_VERSION
@@ -3048,6 +3049,23 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     if check_trifecta(tags, s.security.allow_trifecta) == TrifectaVerdict::RefusedTrifecta {
         err(&mut d, "lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)".into());
     }
+
+    // Workflow definitions — the SAME strict parse the runtime runs at startup
+    // (`load_workflows`). Without it, `--validate-config` passes a config that
+    // then exits 2 on the first real start: a typo'd step field (`prompt:` on
+    // an `agent` node) validated clean and failed in production, which is what
+    // the pre-flight check exists to prevent. Reported after the structural
+    // checks above so the more basic error still leads. `file:`/`uri:` refs
+    // resolve at startup, so only inline definitions are checkable here.
+    for w in &s.workflows {
+        if w.get("steps").is_none() {
+            continue;
+        }
+        if let Err(errs) = crate::engine::model::parse_workflow(w) {
+            // The parser's messages already name the workflow and the step.
+            d.errors.extend(errs);
+        }
+    }
     d
 }
 
@@ -3559,6 +3577,37 @@ mod tests {
     }
 
     // ---- load: layering, aliases, sugar --------------------------------------
+
+    #[test]
+    fn validate_config_catches_workflow_body_errors_the_runtime_would_refuse() {
+        // The pre-flight check must not pass a config that then exits 2 on the
+        // first real start. A typo'd step field used to validate clean and be
+        // refused by `load_workflows` at startup — the worst possible split.
+        let f = write_tmp(
+            "config_version: \"2\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], prompt: \"typo — agent steps take `instruction`\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
+            &base_env(),
+        )
+        .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("unknown field"), "{msg}");
+        assert!(msg.contains("prompt"), "{msg}");
+        assert!(msg.contains("instruction"), "names the allowed fields: {msg}");
+
+        // The same workflow, spelled correctly, still validates.
+        let ok = write_tmp(
+            "config_version: \"2\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], instruction: \"do it\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
+            "yaml",
+        );
+        load(
+            &args(&["--config", ok.path().to_str().unwrap(), "--validate-config"]),
+            &base_env(),
+        )
+        .expect("a correct workflow validates");
+    }
 
     #[test]
     fn a_prompt_is_a_message_not_a_sugar_workflow() {

@@ -48,7 +48,7 @@ const HERO_CMD = `$ agentd \\
     --instruction "triage new GitHub issues and label them" \\
     --mcp github=https://mcp-github.internal/mcp \\
     --intelligence https://gateway.internal/v1 \\
-    --model claude-sonnet-4-6
+    --model claude-sonnet-5
 
 {"event":"mcp.connect","server":"github","proto":"2025-11-25"}
 {"event":"run.start","tools":11,"servers":1,"run_id":"19f0…"}
@@ -180,11 +180,8 @@ export default function Home() {
           loop: think, call a tool, observe, self-correct. As a one-shot job or a long-lived daemon.
         </p>
         <p className="mt-4 max-w-2xl text-[var(--dim)]">
-          MCP-native over HTTPS: tools come only from remote{" "}
-          <span className="text-[var(--green)]">MCP servers</span>, it{" "}
-          <span className="text-[var(--green)]">reacts</span> to resource subscriptions, and it{" "}
-          <span className="text-[var(--green)]">speaks A2A</span> to other agents and operators. It
-          runs no code of its own. One static binary — supervised, bounded, durable, observable.
+          One static binary — supervised, bounded, durable, observable — that runs no code of its
+          own and links no framework. Everything it can do, you wired.
         </p>
 
         <div className="mt-7 flex flex-wrap gap-3">
@@ -220,17 +217,17 @@ export default function Home() {
       {/* ── the shape of a run (diagram) ─────────────────────── */}
       <Section
         eyebrow="the shape of a run"
-        title="One binary. Two loops. Tools over MCP."
-        intro="A supervisor with no model owns lifecycle and the process tree; the reasoning lives only inside killable subagent processes. Tools arrive over MCP, the LLM over HTTPS, and the outside world over A2A — nothing else is linked in."
+        title="One binary. Two loops."
+        intro="A supervisor with no model owns lifecycle, limits and the process tree. The reasoning lives only inside killable subagent processes — so a runaway or a jailbroken model is contained by a process that cannot be prompted."
       >
         <Mermaid chart={ARCH_DIAGRAM} />
         <div className="mt-6 grid gap-4 md:grid-cols-3">
-          <Card tag="you provide" title="Instruction · MCP servers · a model">
-            The task in plain language, the remote MCP servers whose tools it may use, and an
-            OpenAI-compatible endpoint over HTTPS. Capabilities are exactly what you wire.
+          <Card tag="you provide" title="A task, a model, some tools">
+            The task in plain language, an OpenAI-compatible endpoint, and the servers whose tools
+            it may use. Nothing is implicit: capabilities are exactly what you wire.
           </Card>
           <Card tag="it runs" title="The ReAct loop, supervised">
-            Think → call a tool over MCP → observe → repeat, until an answer or a budget. The loop
+            Think → call a tool → observe → repeat, until an answer or a budget. The loop
             lives in a subagent; a supervisor with no model owns its lifecycle.
           </Card>
           <Card tag="it ends" title="A terminal status + a trace">
@@ -271,12 +268,12 @@ export default function Home() {
         </div>
       </Section>
 
-      {/* ── MCP + A2A ────────────────────────────────────────── */}
+      {/* ── where capability comes from, and who may reach in ── */}
       <Section
         id="mcp"
-        eyebrow="mcp + a2a"
-        title="One protocol in, one protocol out"
-        intro="MCP is not an integration in agentd — it is the substrate for tools and reactivity. A2A is the external channel: a served run is an A2A Task, so agentd is a first-class citizen of any agent mesh."
+        eyebrow="capability &amp; connection"
+        title="Where its abilities come from"
+        intro="Two protocols, each doing one job. MCP is not an integration here but the substrate: every tool, and every event worth waking for, arrives from a server you named. A2A is the door in the other direction — a served run is an A2A Task, so agentd is a first-class citizen of an agent mesh rather than a leaf."
       >
         <div className="grid gap-4 md:grid-cols-3">
           <div className="panel lift p-5">
@@ -437,7 +434,7 @@ ENTRYPOINT ["/agentd"]
     --instruction "summarize /data/report.txt and write a digest" \\
     --mcp fs=https://mcp-fs.internal/mcp \\
     --intelligence https://gateway.internal/v1 \\
-    --model claude-sonnet-4-6`}</Term>
+    --model claude-sonnet-5`}</Term>
           <Term title="kubernetes — a one-shot Job">{`apiVersion: batch/v1
 kind: Job
 metadata: { name: agentd-digest }
@@ -465,7 +462,7 @@ spec:
             architecture
           </Link>
           <Link href="/docs/mcp/" className="btn">
-            mcp + a2a
+            mcp
           </Link>
           <span className="text-[var(--dim)]">
             Job · CronJob · Deployment manifests in <span className="kbd">examples/k8s/</span>

@@ -13,6 +13,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "agentd — a minimal, MCP-native, reactive agent runtime (the CLI binary over the agentd-core engine)"
 license = "AGPL-3.0-only"
+readme = "README.md"
 repository = "https://github.com/agentd-dev/source-code"
 keywords = ["agent", "mcp", "a2a", "llm", "cli"]
 categories = ["command-line-utilities", "development-tools"]

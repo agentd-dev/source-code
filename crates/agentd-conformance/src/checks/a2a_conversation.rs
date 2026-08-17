@@ -43,6 +43,12 @@ pub fn checks() -> Vec<Check> {
             run: protocol_errors,
         },
         Check {
+            id: "a2a-conversation/tasks-are-proto3-json-on-every-path",
+            category: Category::A2aConversation,
+            desc: "SendMessage, GetTask and ListTasks all return the same proto3-JSON `Task`: state under `status`, an RFC 3339 timestamp, `ROLE_AGENT`",
+            run: task_shape,
+        },
+        Check {
             id: "a2a-conversation/nl-message-becomes-task-artifact",
             category: Category::A2aConversation,
             desc: "a natural-language message runs a turn; the answer is the task artifact, readable via GetTask/ListTasks",
@@ -173,6 +179,79 @@ fn status_command(h: &Harness) -> Outcome {
             format!("the status summary should name conversations + runs: {text:?}"),
         )
     })
+}
+
+/// The A2A wire is **proto3 JSON**, and the ways to get that subtly wrong are
+/// all silent: a peer's generated types reject `"agent"` where `ROLE_AGENT` is
+/// expected, an integer where a `google.protobuf.Timestamp` string is expected,
+/// or a flat `state` where a `TaskStatus` is expected — and the failure lands in
+/// the peer, not here. Every path that emits a task is checked, because they are
+/// separate code (full projection, listing projection) and drift apart quietly.
+fn task_shape(h: &Harness) -> Outcome {
+    let tmp = h.tempdir();
+    let llm = mock_llm(h, &tmp, &json!({"turns": [{"content": "unused"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_file(&tmp, "agentd.yaml", &a2a_config(&llm.uri, port, ""));
+    let _daemon = h.spawn(&["--config", &cfg]);
+    wait_ready(&addr);
+
+    let params =
+        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "status"}}}]}});
+    let sent = rpc(&addr, 1, "SendMessage", params);
+    let task = sent["task"].clone();
+    let id = task["id"].as_str().unwrap_or("").to_string();
+
+    let listed = rpc(&addr, 2, "ListTasks", json!({}));
+    let got = rpc(&addr, 3, "GetTask", json!({"id": id}));
+    let from_list = listed["tasks"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["id"] == id.as_str()))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    for (what, t) in [
+        ("SendMessage", &task),
+        ("GetTask", &got),
+        ("ListTasks", &from_list),
+    ] {
+        if t["status"]["state"].as_str().is_none() {
+            return Outcome::fail(format!(
+                "{what} should carry the state in `status.state`: {t}"
+            ));
+        }
+        if !t["state"].is_null() {
+            return Outcome::fail(format!(
+                "{what} puts a bare `state` at the top level; `Task` has no such field, so a peer reads the task as stateless: {t}"
+            ));
+        }
+        // `TaskStatus.timestamp` is a `google.protobuf.Timestamp` ⇒ RFC 3339.
+        match t["status"]["timestamp"].as_str() {
+            Some(ts) if ts.ends_with('Z') && ts.contains('T') => {}
+            _ => {
+                return Outcome::fail(format!(
+                    "{what}: `status.timestamp` must be an RFC 3339 string, not epoch millis: {t}"
+                ));
+            }
+        }
+        let role = &t["status"]["message"]["role"];
+        if !role.is_null() && role != "ROLE_AGENT" {
+            return Outcome::fail(format!(
+                "{what}: the role is a proto enum name (`ROLE_AGENT`), not the English word: {t}"
+            ));
+        }
+    }
+
+    // `ListTasksResult` has no optional fields — a peer's type will not
+    // deserialize a bare `{tasks}`.
+    for field in ["totalSize", "pageSize", "nextPageToken"] {
+        if listed.get(field).is_none() {
+            return Outcome::fail(format!(
+                "ListTasks must return `{field}`; the result shape is fixed: {listed}"
+            ));
+        }
+    }
+    Outcome::pass()
 }
 
 fn agent_card(h: &Harness) -> Outcome {

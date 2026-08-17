@@ -1,0 +1,37 @@
+# An INDEPENDENT reading of the A2A specification, used as a test oracle.
+#
+# agentd's A2A surface is hand-rolled. Our own tests cannot catch a *plausible*
+# misreading of the spec, because they were written from the same reading as the
+# implementation. This crate parses the JSON agentd actually emits with
+# `a2a-rs` — an unrelated implementation by a different author — so two
+# independent readings have to agree.
+#
+# Excluded from the workspace's default members: a2a-rs brings ~179 crates and a
+# C toolchain (aws-lc-sys/cmake), which is acceptable for an on-demand check and
+# not for the shipped binary. Run it deliberately:
+#
+#     cargo test --manifest-path crates/a2a-oracle/Cargo.toml
+# Its own workspace: a separate target dir means this crate's build of agentd
+# cannot overwrite the one the conformance suite and the CLI tests drive.
+[workspace]
+
+[package]
+name = "a2a-oracle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+serde = "1"
+serde_json = "1"
+a2a-rs = { version = "0.6", default-features = false, features = ["jsonrpc-server"] }
+# For the method table — the one thing worth reading out of the source rather
+# than off the wire, so a renamed constant fails the build.
+agentd = { package = "agentd-core", path = "../agentd", features = ["a2a"] }

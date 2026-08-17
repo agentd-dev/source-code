@@ -19,6 +19,22 @@ import {
 } from './types.js';
 import { rpc, rpcStream, StreamFrame } from './wire.js';
 
+/**
+ * Epoch milliseconds from either form of timestamp.
+ *
+ * `TaskStatus.timestamp` is a `google.protobuf.Timestamp`, so on the wire it is
+ * an RFC 3339 string — but everything downstream sorts and subtracts it. A raw
+ * number is accepted too, for daemons that predate the fix.
+ */
+function epochMs(v: Json | undefined): number | undefined {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') {
+    const ms = Date.parse(v);
+    return Number.isNaN(ms) ? undefined : ms;
+  }
+  return undefined;
+}
+
 /** Normalize either wire task shape into the client view. */
 export function normalizeTask(t: Json): TaskView | null {
   if (t === null || typeof t !== 'object' || Array.isArray(t)) return null;
@@ -43,16 +59,20 @@ export function normalizeTask(t: Json): TaskView | null {
       }
     }
   }
+  // The facts the A2A spec has no field for travel under `metadata`, namespaced.
+  // The flat fallbacks are for daemons that predate that move.
+  const meta = (o.metadata ?? null) as { [k: string]: Json } | null;
+  const history = meta?.['agentd/statusHistory'] ?? o.history;
   return {
     id,
     contextId: (o.contextId as string) ?? '',
     state,
     message,
     artifacts,
-    link: (o.link as TaskView['link']) ?? undefined,
-    principal: (o.principal as string) ?? undefined,
-    updated: (o.updated as number) ?? ((status?.timestamp as number) ?? 0),
-    history: Array.isArray(o.history) ? o.history : undefined,
+    link: ((meta?.['agentd/link'] ?? o.link) as TaskView['link']) ?? undefined,
+    principal: ((meta?.['agentd/principal'] ?? o.principal) as string) ?? undefined,
+    updated: epochMs(status?.timestamp) ?? epochMs(o.updated) ?? 0,
+    history: Array.isArray(history) ? history : undefined,
   };
 }
 

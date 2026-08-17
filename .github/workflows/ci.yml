@@ -75,6 +75,25 @@ jobs:
       - run: cargo test -p agentd-core ${{ matrix.features }}
       - run: cargo test -p agentd-cli ${{ matrix.features }}
 
+  # Check the A2A wire against an INDEPENDENT implementation of the same spec.
+  #
+  # Our own tests were written from our own reading of the specification, so they
+  # cannot catch a *plausible* misreading — a field named the way we assumed, an
+  # enum spelled the way we guessed. This boots the real daemon and parses its
+  # responses with `a2a-rs`, whose types come from the published schema by way of
+  # a different author. It lives outside the workspace (it brings ~180 crates and
+  # `cmake`), so it needs its own job.
+  a2a-spec-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Its own workspace, so its own target dir — the cache has to be told.
+          workspaces: crates/a2a-oracle -> crates/a2a-oracle/target
+      - run: cargo test --manifest-path crates/a2a-oracle/Cargo.toml
+
   # Minimalism is the moat: the DEFAULT build must stay at exactly three direct
   # dependencies (serde, serde_json, libc) — no async runtime, no TLS, no C. This
   # fails the build if an unearned dependency sneaks in.

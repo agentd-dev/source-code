@@ -21,21 +21,50 @@ test('sse parser handles chunk boundaries, multi-line data and comments', () => 
   assert.equal(got[3], 'l1\nl2');
 });
 
-test('normalizeTask folds both wire shapes into one view', () => {
-  // The nested shape (GetTask / SendMessage / feed).
+test('normalizeTask flattens the A2A task the daemon actually sends', () => {
+  // One shape on every path now: state under `status`, an RFC 3339 timestamp,
+  // and agentd's own facts under `metadata` (proto3's extension point).
   const full = normalizeTask({
     id: 't1',
     contextId: 'c1',
-    status: { state: 'TASK_STATE_COMPLETED', timestamp: 5, message: { role: 'agent', parts: [{ text: 'done' }] } },
+    status: {
+      state: 'TASK_STATE_COMPLETED',
+      timestamp: '2026-08-17T13:41:27.824Z',
+      message: { role: 'ROLE_AGENT', parts: [{ text: 'done' }] },
+    },
     artifacts: [{ artifactId: 't1.result', parts: [{ text: 'The answer' }] }],
+    metadata: {
+      'agentd/principal': 'operator',
+      'agentd/link': { run: { id: 'r1' } },
+      'agentd/statusHistory': [{ state: 'TASK_STATE_SUBMITTED', ts: 1 }],
+    },
   });
   assert.equal(full.state, 'TASK_STATE_COMPLETED');
   assert.equal(full.message, 'done');
   assert.deepEqual(full.artifacts, ['The answer']);
-  // The flat summary shape (ListTasks).
-  const flat = normalizeTask({ id: 't2', contextId: 'c2', state: 'TASK_STATE_WORKING', principal: 'operator', updated: 9 });
-  assert.equal(flat.state, 'TASK_STATE_WORKING');
-  assert.equal(flat.updated, 9);
+  assert.equal(full.principal, 'operator');
+  assert.deepEqual(full.link, { run: { id: 'r1' } });
+  assert.equal(full.history.length, 1);
+  // The timestamp is RFC 3339 on the wire and epoch ms in the view — the TUI
+  // sorts and subtracts it, so a string would silently produce NaN.
+  assert.equal(full.updated, Date.parse('2026-08-17T13:41:27.824Z'));
+
+  // The listing is the same shape without artifacts.
+  const listed = normalizeTask({
+    id: 't2',
+    contextId: 'c2',
+    status: { state: 'TASK_STATE_WORKING', timestamp: '2026-08-17T13:41:28.000Z' },
+    metadata: { 'agentd/principal': 'operator' },
+  });
+  assert.equal(listed.state, 'TASK_STATE_WORKING');
+  assert.deepEqual(listed.artifacts, []);
+
+  // A daemon predating that move still reads: the flat fields are the fallback.
+  const old = normalizeTask({ id: 't3', contextId: 'c3', state: 'TASK_STATE_WORKING', principal: 'operator', updated: 9 });
+  assert.equal(old.state, 'TASK_STATE_WORKING');
+  assert.equal(old.updated, 9);
+  assert.equal(old.principal, 'operator');
+
   assert.equal(normalizeTask({ noId: true }), null);
 });
 

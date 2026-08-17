@@ -121,13 +121,16 @@ Seven A2A methods + the card (`a2a_server.rs:40-47`):
 | `SendStreamingMessage` | same → SSE frames | **yes** | status/artifact frames, terminal frame closes |
 | `GetTask` | `{id}` → **`Task` (bare)** | no | drop-recovery + cross-restart read |
 | `CancelTask` | `{id}` → **`Task` (bare)** | no | cascades to linked run / subagent |
-| `ListTasks` | `{}` → `{tasks:[summary]}` | no | snapshot; operator sees all, others own-only |
+| `ListTasks` | `{}` → `{tasks:[Task], totalSize, pageSize, nextPageToken}` | no | snapshot, one page; operator sees all, others own-only. The tasks are `Task`s without `artifacts`. |
 | `SubscribeToTask` | `{id}` → SSE frames | **yes** | re-attach to a live task; `-32001` if unknown |
 | `GetAgentCard` | `{}` → `AgentCard` | no | **public**; `skills` = workflows only |
 
-Two shape asymmetries the client must handle: **wrapped vs bare** (`SendMessage` wraps in `{task}`;
-`GetTask`/`CancelTask` return the `Task` directly) and **nested vs flat state** (`GetTask` nests
-`status.state`; `ListTasks` puts `state` at top level).
+One shape asymmetry the client must handle: **wrapped vs bare** — `SendMessage` wraps in `{task}`,
+`GetTask`/`CancelTask` return the `Task` directly. Every task is otherwise the same object, so
+`status.state` is the only place a state is ever read, and agentd's own facts (`agentd/link`,
+`agentd/principal`, `agentd/statusHistory`) live under `metadata`, which is where proto3 puts
+extensions. `status.timestamp` is an RFC 3339 string, not epoch millis — it is a
+`google.protobuf.Timestamp`.
 
 ### 3.3 The read surface (one command carries almost everything)
 

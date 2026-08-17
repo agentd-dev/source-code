@@ -61,6 +61,34 @@ Errors use the codes the spec assigns, because peers branch on them: `-32601`
 for a method that does not exist, `-32001` for a task that does not. A peer
 should never have to string-match an error message.
 
+### The wire is proto3 JSON
+
+A2A is defined in protocol buffers, and its JSON binding is proto3 JSON — which
+is stricter than "some JSON with these field names". Three consequences are
+worth stating, because getting them wrong fails silently in the *peer*:
+
+- **Enums are the proto value names.** `TASK_STATE_COMPLETED`, not `completed`;
+  `ROLE_AGENT`, not `agent`.
+- **Timestamps are RFC 3339 strings.** `status.timestamp` is a
+  `google.protobuf.Timestamp`, so `"2026-08-17T13:41:27.824Z"` — not epoch
+  milliseconds.
+- **Every task is a `Task`.** `ListTasks` returns the same object as `GetTask`
+  (minus the artifacts a listing does not resolve), so the state is always at
+  `status.state`. The result carries `totalSize`, `pageSize` and
+  `nextPageToken`; agentd answers in a single page.
+
+Anything agentd wants to say that the spec has no field for goes under
+`metadata`, namespaced: `agentd/principal`, `agentd/link`,
+`agentd/statusHistory`. That is what proto3 leaves open for extensions, and it
+means a strict peer can ignore all of it.
+
+This is verified two ways. `agentd-conformance` asserts the shapes on every path
+that emits a task; and `crates/a2a-oracle` — excluded from the default build —
+boots the real daemon and parses its responses with
+[a2a-rs](https://github.com/emillindfors/a2a-rs), an unrelated implementation of
+the same specification, so a misreading on our side has to survive a second
+reader before it reaches anyone.
+
 ## Roles, and what each may call
 
 | Role | May call |

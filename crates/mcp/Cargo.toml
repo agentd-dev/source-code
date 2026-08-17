@@ -10,6 +10,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "Model Context Protocol base library: wire types, version/era negotiation, transports"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/agentd-dev/source-code"
 keywords = ["mcp", "json-rpc", "agent", "llm", "protocol"]
 categories = ["network-programming", "api-bindings"]

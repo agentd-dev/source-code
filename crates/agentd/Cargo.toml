@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "Minimal, MCP-native agent runtime as a library: the agentic loop, supervisor, workflows, and code-registered tools (the agentd engine)"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/agentd-dev/source-code"
 keywords = ["agent", "mcp", "a2a", "llm", "workflow"]
 categories = ["development-tools", "network-programming"]

@@ -10,6 +10,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "Minimal blocking HTTP/1.1 + SSE over Read+Write, unix/tls/vsock connects, SSRF guard"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/agentd-dev/source-code"
 keywords = ["http", "sse", "tls", "ssrf", "transport"]
 categories = ["network-programming"]

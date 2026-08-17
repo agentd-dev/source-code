@@ -5,12 +5,9 @@
 //! response) → tools/call (SSE response with an interleaved notification) →
 //! resources/read — with no process spawned, proving the transport end to end.
 //!
-//! Scoped to the **hand-rolled** transport. With `--features rmcp-client` the
-//! official SDK owns the connection and speaks its own HTTP stack, so these
-//! assertions (session-id capture, our SSE framing, our modern-dialect headers)
-//! describe a code path that is not in play; `crates/mcp/tests/rmcp_backend.rs`
-//! covers that configuration instead.
-#![cfg(not(feature = "rmcp-client"))]
+//! These drive a real `McpClient` — the official SDK over agentd's own socket —
+//! at a mock server on a real port, and assert from the *server's* side, which
+//! is the only side that can tell whether the wire is right.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -35,9 +32,6 @@ struct Seen {
 struct HttpReq {
     session_id: Option<String>,
     protocol_version: Option<String>,
-    mcp_method: Option<String>,
-    mcp_name: Option<String>,
-    mcp_params: Vec<(String, String)>,
     body: Value,
 }
 
@@ -51,9 +45,6 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
     let mut content_length = 0usize;
     let mut session_id = None;
     let mut protocol_version = None;
-    let mut mcp_method = None;
-    let mut mcp_name = None;
-    let mut mcp_params = Vec::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 {
@@ -70,9 +61,6 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
                 "content-length" => content_length = val.parse().unwrap_or(0),
                 "mcp-session-id" => session_id = Some(val),
                 "mcp-protocol-version" => protocol_version = Some(val),
-                "mcp-method" => mcp_method = Some(val),
-                "mcp-name" => mcp_name = Some(val),
-                k if k.starts_with("mcp-param-") => mcp_params.push((key, val)),
                 _ => {}
             }
         }
@@ -83,9 +71,6 @@ fn read_http_request(stream: &TcpStream) -> Option<HttpReq> {
     Some(HttpReq {
         session_id,
         protocol_version,
-        mcp_method,
-        mcp_name,
-        mcp_params,
         body,
     })
 }
@@ -344,43 +329,6 @@ fn notification_get_stream_delivers_server_pushes() {
     // Dropping the client stops the notification thread cleanly.
     drop(client);
     let _ = std::fs::remove_file(&addr_file);
-}
-
-/// A LEGACY mock that answers `initialize` with a fixed `protocolVersion` (to
-/// drive the legacy negotiation edge cases). It rejects the client's modern
-/// `server/discover` probe with method-not-found (as a legacy server does), so
-/// the client falls back to `initialize`. Returns its endpoint.
-fn spawn_fixed_version_mock(version: &'static str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(mut stream) = conn else { continue };
-            let Some(req) = read_http_request(&stream) else {
-                continue;
-            };
-            let id = req.body.get("id").cloned().unwrap_or(Value::Null);
-            let method = req.body["method"].as_str().unwrap_or("");
-            let payload = if method == "initialize" {
-                json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {
-                        "protocolVersion": version,
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "fixed", "version": "0"}
-                    }
-                })
-            } else {
-                // A legacy server doesn't know server/discover → generic error.
-                json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32601, "message": "method not found"}
-                })
-            };
-            write_json(&mut stream, "", &payload);
-        }
-    });
-    format!("http://127.0.0.1:{port}/mcp")
 }
 
 #[test]

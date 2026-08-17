@@ -19,25 +19,12 @@ name = "mcp"
 path = "src/lib.rs"
 
 [features]
-default = ["rmcp-client"]
+default = []
 # Direct https:// MCP (TCP+TLS) + mutual-TLS client identities — maps to net/tls.
 tls = ["net/tls"]
 # AF_VSOCK MCP transport — maps to net/vsock for the client (outbound connect) and
 # pulls the `vsock` crate directly for the server's inbound `VsockListener`.
 vsock = ["net/vsock", "dep:vsock"]
-# The OFFICIAL Rust MCP SDK as an alternative client backend, for deployments
-# that want upstream spec-tracking over the minimal build. It is a real cost —
-# rmcp brings tokio and ~60 transitive crates — so it is opt-in, and the
-# hand-rolled client remains the default. See docs/mcp.md.
-rmcp-client = [
-    "dep:rmcp",
-    "dep:tokio",
-    "dep:http",
-    "dep:sse-stream",
-    "dep:futures",
-    "dep:tokio-stream",
-    "dep:thiserror",
-]
 
 [dependencies]
 # Shared transport primitives (the HTTP/1.1+SSE client, unix/tls/vsock connects).
@@ -47,10 +34,11 @@ serde_json = "1"
 # The served-MCP vsock listener (`server::ServeStream::Vsock`). The client's vsock
 # *connect* lives in `net`; the server *listens*, so it needs `VsockListener` here.
 vsock = { version = "0.5", optional = true }
-# The official MCP SDK (opt-in; see the `rmcp-client` feature). `default-features
-# = false` keeps the server half, the macro crate and reqwest out — we need the
-# client, its SSE channel, the streamable-HTTP transport and elicitation.
-rmcp = { version = "3.1", optional = true, default-features = false, features = [
+# The OFFICIAL MCP SDK — the client, not an alternative to one. `default-features
+# = false` keeps the server half, the macro crate and reqwest out; the transport
+# is agentd's own (`rmcp_transport`), which is how request signing and mTLS
+# survive the adoption.
+rmcp = { version = "3.1", default-features = false, features = [
     "client",
     "client-side-sse",
     "transport-streamable-http-client",
@@ -59,12 +47,12 @@ rmcp = { version = "3.1", optional = true, default-features = false, features = 
 # The SDK's transport is generic over an HTTP client; agentd supplies its own
 # (`rmcp_transport`), so these are the pieces that seam needs: the SSE event type
 # it yields, stream combinators, a channel-as-stream, and an error type.
-sse-stream = { version = "0.2", optional = true }
-futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
-tokio-stream = { version = "0.1", optional = true }
-thiserror = { version = "2", optional = true }
-# rmcp is async; the facade owns a private current-thread runtime so the rest of
-# agentd stays blocking.
-tokio = { version = "1", optional = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+sse-stream = { version = "0.2" }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio-stream = { version = "0.1" }
+thiserror = { version = "2" }
+# rmcp is async; the facade owns a private runtime so the rest of agentd stays
+# blocking. Multi-threaded on purpose — see `rmcp_client::connect`.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
 # Header types for the transport's custom-header map (already in rmcp's tree).
-http = { version = "1", optional = true }
+http = { version = "1" }

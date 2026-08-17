@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **official SDK** as an alternative client backend (`--features rmcp-client`).
+//! The **official SDK**, wrapped so the rest of agentd stays blocking.
 //!
 //! agentd's own MCP client is hand-rolled, for the same reason everything else
 //! here is: the default build has three external dependencies and a sub-millisecond

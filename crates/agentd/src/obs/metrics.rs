@@ -326,53 +326,6 @@ pub fn set_reactive_backlog(pending: u64, inflight: u64, subscriptions: u64, lag
     let _ = (pending, inflight, subscriptions, lag_ms);
 }
 
-/// An item was dropped as out-of-shard (RFC 0019 §4.1 / §5.1
-/// `agent_shard_skipped_total`). The shard gate is the cheap pre-filter applied
-/// at routing intake before any spawn; this counts the items this replica rejects.
-pub fn record_shard_skipped() {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY.shard_skipped.fetch_add(1, Ordering::Relaxed);
-}
-
-/// A claim was lost to another replica (RFC 0019 §5.1 `agent_claims_lost_total`).
-/// Wired by the claim gate (`cluster` build): a `work.claim{granted:false}` drops
-/// the delivery and increments this — the over-provisioning signal a scaler reads
-/// (high & rising under low backlog ⇒ scale down).
-pub fn record_claim_lost() {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY.claims_lost.fetch_add(1, Ordering::Relaxed);
-}
-
-/// A claim was granted (RFC 0019 §3.2 / §5.1 `agent_claims_granted_total`): this
-/// replica won `work.claim` and proceeds to process the item. Wired by the claim
-/// gate in the `cluster` build.
-pub fn record_claim_granted() {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY.claims_granted.fetch_add(1, Ordering::Relaxed);
-}
-
-/// A held claim was released (RFC 0019 §3.3 / §6 `agent_claims_released_total`):
-/// a non-terminal wind-down or a drain handed the item back to the fleet. Wired by
-/// the claim gate + the drain step-1.5 in the `cluster` build.
-pub fn record_claim_released() {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY
-        .claims_released
-        .fetch_add(1, Ordering::Relaxed);
-}
-
-/// Set the saturation gauge — `in_flight / capacity` in `[0.0, 1.0]` (RFC 0019
-/// §5.1), the HPA "utilization" target. Stored as basis points (0..=10000) in a
-/// u64 atomic and rendered as `value/10000.0`, so the gauge stays a plain atomic
-/// (telemetry never allocates / never fails). `numerator`/`denominator` are the
-/// live in-flight count and the capacity cap; a zero denominator reads 0.0.
-pub fn set_saturation(numerator: u64, denominator: u64) {
-    #[cfg(feature = "metrics")]
-    imp::REGISTRY.set_saturation(numerator, denominator);
-    #[cfg(not(feature = "metrics"))]
-    let _ = (numerator, denominator);
-}
-
 /// A config hot reload reached a terminal disposition (RFC 0017 §5.6). Drives
 /// `agent_config_reload_total{result}` with the closed domain
 /// `applied`\|`rejected` (an unknown value buckets `other`). A `rejected` reload
@@ -628,17 +581,6 @@ mod imp {
         subscriptions_active: AtomicU64,
         reaction_lag_ms: AtomicU64,
 
-        // --- RFC 0019 §5.1: horizontal-scaling signals ----------------------
-        // `agent_saturation` is stored as basis points (0..=10000) and rendered
-        // as a float in [0,1]. `agent_shard_skipped_total` counts out-of-shard
-        // drops; `agent_claims_lost_total` is fed by the claim gate (work-claim
-        // ships) alongside the granted/released counters.
-        saturation_bp: AtomicU64,
-        pub(super) shard_skipped: AtomicU64,
-        pub(super) claims_lost: AtomicU64,
-        pub(super) claims_granted: AtomicU64,
-        pub(super) claims_released: AtomicU64,
-
         // --- RFC 0017 §5.6: hot-reload outcome counter + generation gauge -----
         config_reloads: LabelCounter<{ RELOAD_RESULTS.len() }>,
         pub(super) config_generation: AtomicU64,
@@ -691,11 +633,6 @@ mod imp {
                 inflight_reactions: AtomicU64::new(0),
                 subscriptions_active: AtomicU64::new(0),
                 reaction_lag_ms: AtomicU64::new(0),
-                saturation_bp: AtomicU64::new(0),
-                shard_skipped: AtomicU64::new(0),
-                claims_lost: AtomicU64::new(0),
-                claims_granted: AtomicU64::new(0),
-                claims_released: AtomicU64::new(0),
                 config_reloads: LabelCounter::new(),
                 config_generation: AtomicU64::new(0),
                 budget_tokens_remaining: AtomicU64::new(0),
@@ -816,19 +753,6 @@ mod imp {
             self.subscriptions_active
                 .store(subscriptions, Ordering::Relaxed);
             self.reaction_lag_ms.store(lag_ms, Ordering::Relaxed);
-        }
-
-        pub(super) fn set_saturation(&self, numerator: u64, denominator: u64) {
-            // Store as basis points (0..=10000) so the gauge stays a plain atomic;
-            // `render` divides by 10000.0 to emit the [0,1] float. Clamp to the cap
-            // so a transient over-cap in-flight never reports > 1.0. A zero capacity
-            // is reported as 0 (no work possible ⇒ no saturation), never a div-by-0.
-            let bp = numerator
-                .saturating_mul(10_000)
-                .checked_div(denominator)
-                .unwrap_or(0)
-                .min(10_000);
-            self.saturation_bp.store(bp, Ordering::Relaxed);
         }
 
         pub(super) fn render(&self) -> String {
@@ -1178,44 +1102,6 @@ mod imp {
                 g(&self.reaction_lag_ms),
             );
 
-            // --- horizontal-scaling signals (RFC 0019 §5.1) ------------------
-            // `agent_saturation` is in_flight/capacity in [0,1] — the HPA target.
-            // Stored as basis points; rendered as the float.
-            let sat = g(&self.saturation_bp) as f64 / 10_000.0;
-            gauge_f64(
-                &mut s,
-                "agent_saturation",
-                "In-flight / capacity utilization in [0,1] (RFC 0019 §5.1).",
-                sat,
-            );
-            counter(
-                &mut s,
-                "agent_shard_skipped_total",
-                "Items dropped as out-of-shard (RFC 0019 §4.1).",
-                g(&self.shard_skipped),
-            );
-            // Claim lifecycle counters (RFC 0019 §5.1). Lost is the over-provision
-            // signal (high under low backlog ⇒ scale down); granted/released round
-            // out the claim outcome set. Wired by the `cluster` claim gate.
-            counter(
-                &mut s,
-                "agent_claims_lost_total",
-                "Work claims lost to another replica (RFC 0019 §5.1).",
-                g(&self.claims_lost),
-            );
-            counter(
-                &mut s,
-                "agent_claims_granted_total",
-                "Work claims granted to this replica (RFC 0019 §3.2).",
-                g(&self.claims_granted),
-            );
-            counter(
-                &mut s,
-                "agent_claims_released_total",
-                "Held claims released back to the fleet (RFC 0019 §3.3/§6).",
-                g(&self.claims_released),
-            );
-
             // --- legacy bare series (RFC 0010 §3.8; retained, additive) ------
             counter(
                 &mut s,
@@ -1412,12 +1298,6 @@ mod imp {
     }
 
     /// One float-valued gauge family (e.g. a [0,1] ratio) in Prometheus text.
-    fn gauge_f64(s: &mut String, name: &str, help: &str, value: f64) {
-        let _ = writeln!(s, "# HELP {name} {help}");
-        let _ = writeln!(s, "# TYPE {name} gauge");
-        let _ = writeln!(s, "{name} {value}");
-    }
-
     /// One labelled counter family: a single HELP/TYPE header, then one series
     /// line per closed-domain label value (RFC 0016 §4.2 — the domain is the
     /// bound). `domain` and the `LabelCounter` slots are the same length.
@@ -1577,45 +1457,6 @@ mod imp {
             assert!(out.contains("agent_inflight_reactions 1"));
             assert!(out.contains("agent_subscriptions_active 9"));
             assert!(out.contains("agent_reaction_lag_ms 250"));
-        }
-
-        #[test]
-        fn horizontal_scaling_signals_render() {
-            // RFC 0019 §5.1: saturation (float [0,1]), shard-skip counter, and the
-            // claims-lost counter (fed by the claim gate).
-            let r = Registry::new();
-            // 35/64 in-flight → 5468 bp → 0.5468 (basis-point granularity).
-            r.set_saturation(35, 64);
-            r.shard_skipped.fetch_add(3, Ordering::Relaxed);
-            let out = r.render();
-            assert!(out.contains("# TYPE agent_saturation gauge"));
-            assert!(out.contains("agent_saturation 0.5468"));
-            assert!(out.contains("# TYPE agent_shard_skipped_total counter"));
-            assert!(out.contains("agent_shard_skipped_total 3"));
-            // The claim lifecycle counters render (default 0 in a bare registry).
-            assert!(out.contains("# TYPE agent_claims_lost_total counter"));
-            assert!(out.contains("agent_claims_lost_total 0"));
-            assert!(out.contains("# TYPE agent_claims_granted_total counter"));
-            assert!(out.contains("# TYPE agent_claims_released_total counter"));
-            // And they increment.
-            r.claims_lost.fetch_add(2, Ordering::Relaxed);
-            r.claims_granted.fetch_add(5, Ordering::Relaxed);
-            r.claims_released.fetch_add(1, Ordering::Relaxed);
-            let out = r.render();
-            assert!(out.contains("agent_claims_lost_total 2"));
-            assert!(out.contains("agent_claims_granted_total 5"));
-            assert!(out.contains("agent_claims_released_total 1"));
-        }
-
-        #[test]
-        fn saturation_clamps_and_guards_zero_capacity() {
-            let r = Registry::new();
-            // over-cap in-flight clamps to 1.0
-            r.set_saturation(100, 64);
-            assert!(r.render().contains("agent_saturation 1"));
-            // zero capacity → 0.0 (never a div-by-zero)
-            r.set_saturation(5, 0);
-            assert!(r.render().contains("agent_saturation 0"));
         }
 
         #[test]

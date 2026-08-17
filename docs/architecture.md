@@ -393,7 +393,6 @@ dependencies.
 | `hot-reload` | none | SIGHUP validate-first quiesce-and-reapply |
 | `config-watch` | none — chains `hot-reload` | the inotify directory watch |
 | `workflow` | none | nothing live — the durable DAG engine is unconditional |
-| `cluster` | none | `--shard K/N`, claim/lease, capacity signal |
 | `exec` | none | the guarded local command runner |
 | `aauth` | none new — reuses `ring` | Ed25519 identity + RFC 9421 signing |
 | `cel` | **+28** | CEL predicates and expressions |

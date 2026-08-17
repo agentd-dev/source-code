@@ -232,7 +232,6 @@ each adds:
 | `aauth` | AAuth agent identity: an Ed25519 keypair, agent-token enrolment, and RFC 9421 signatures on outbound MCP requests (RFC 0023). |
 
 Build a narrower (or wider) surface with `--build-arg FEATURES=…`. Other features
-the binary can carry: `cluster` (the `cluster.shard` identity, [§4d](#4d-statefulset--a-fleet)),
 `exec` (the guarded local-command tool, off at runtime too), `cel` (CEL
 expressions in workflows — the one feature with a dependency), and
 `internal-mocks` (test scaffolding). `tls` is in the **default** set (it is the
@@ -550,13 +549,10 @@ replica owns what its own configuration tells it to own. Three shapes work:
   resolved against `a2a.peers`), each peer a worker replica. Delegation is a
   durable step, so an unfinished unit stays visible and retriable.
 
-**Shard identity.** `cluster.shard` (`--shard K/N`, `AGENTD_CLUSTER_SHARD`) and
-`cluster.timer_shard` (`shard0` | `keyed`) are part of the config schema behind
-the `cluster` build feature; a value is validated as `K/N` with `K < N` (exit `2`
-otherwise) and carries a replica's shard identity for a control plane that
-assigns ordinals. The trigger path applies no shard predicate of its own, so
-ownership still comes from one of the three shapes above. `cluster` is
-restart-only — a live reload that changes it is refused.
+**There is no shard identity.** agentd carries no cluster-coordination surface —
+no shard flag, no claim route, no standby pool. Ownership comes from one of the
+three shapes above, all of which put it in a system that can arbitrate it. See
+[scaling.md §4](scaling.md).
 
 ### 4e. Hot reload via a ConfigMap (`hot-reload` / `config-watch` features)
 
@@ -575,7 +571,7 @@ either send `SIGHUP` or run `--watch-config`:
   limits / observability / context. An invalid candidate keeps the running
   config — nothing is half-applied. A diff that touches a **restart-only** path
   (`agent.name`, the `store.*` binding, `lifecycle.*`, `a2a.listen`/`tls`/`bearer`,
-  the `observability` listeners, `security`, `cluster`) is **refused** with
+  the `observability` listeners, `security`) is **refused** with
   `reason="restart_required"` and logged as `config.reload.restart_required` —
   roll the pod.
 - **`SIGHUP`** (`hot-reload` feature) is the portable trigger if you would rather

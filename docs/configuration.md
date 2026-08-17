@@ -10,7 +10,7 @@ handshake.
 The configuration is one nested **`config_version: "2"`** document, with the
 sections `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`,
 `context`, `knowledge`, `search`, `skills`, `workflows`, `webhooks`, `limits`,
-`lifecycle`, `a2a`, `interface`, `observability`, `security`, `cluster`. Every
+`lifecycle`, `a2a`, `interface`, `observability`, `security`. Every
 **path** in that schema is also an env var (`limits.max_runs` ⇒
 `AGENTD_LIMITS_MAX_RUNS`) and a flag (`--limits.max-runs`); a set of short
 spellings is wired up as **aliases** (`--instruction`, `--intelligence`,
@@ -129,7 +129,6 @@ RFC 0011 §5).
 | every `a2a.peers[]` is uniquely named with an `http(s)://` endpoint; every `a2a.principals[]` match names a subject | `a2a peer 'p': endpoint must be http(s)://` · `a2a.principals[0]: match needs one of san \| sub \| bearer_ref \| aauth_agent \| any` |
 | `lifecycle.exit_code_map` remaps only the policy codes | `lifecycle.exit_code_map: only the policy codes 3 and 7 are remappable (got key "5")` |
 | `lifecycle.watch_config` has a file to watch | `lifecycle.watch_config requires a config file (--config / AGENTD_CONFIG)` |
-| `cluster.shard` is a well-formed `K/N`; `cluster.timer_shard` is `shard0`\|`keyed` | `cluster.shard: --shard: N must be > 0` |
 | `observability.log_level` is a known level; an `audit.sink: store` has a store | `observability.audit.sink includes 'store' but store.kind is none` |
 | the **file** layer carries no inline credential | `config file: intelligence.token carries an inline credential; use {{secret:NAME}} / {{secret-file:PATH}} (or set it from env/flag)` |
 | no credential-shaped header (`intelligence.headers`, an MCP server's, a peer's, `store.http.headers`) has an inline value | `intelligence.headers['authorization'] looks like a credential but has an inline value; use {{secret:NAME}} / {{secret-file:PATH}}` |
@@ -262,10 +261,6 @@ rolling `windows` (`{per: hour, tokens: 2000000}`), an `on_exhausted` tactic
 
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
-| `--shard K/N` | `cluster.shard` | `SHARD` | `0/1` | This replica owns shard `K` of `N` of the URI/key space (FNV-1a hash gate). `0/1` is unsharded. `N==0` or `K>=N` is exit `2`. A StatefulSet injects `AGENT_SHARD` from the pod ordinal (§13). |
-| — | `cluster.timer_shard` | — | `shard0` | Timer-route behaviour for a sharded `schedule`/`loop` fleet: `shard0` (only shard 0 fires the fleet-wide ticker) \| `keyed` (every replica fires; a per-tick key gate is applied elsewhere). |
-
-Both are **restart-only** (§11). See §13.
 
 ### 3.6 Runtime / observability / security
 
@@ -425,7 +420,7 @@ long-lived **daemon**, and what wakes it:
 | `manual` | only when explicitly triggered (`workflow.run`, or an A2A `workflow.run` command) | — |
 | `loop` | repeatedly, on an interval, until a condition | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
 | `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: "02:00Z"`; plus `tz`, `jitter`, `catch_up` |
-| `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `claim`, `shard`, `deliver`, `on_no_listener` |
+| `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener` |
 | `signal` | when a named signal arrives | `name` (required), `filter`, `deliver` |
 | `event` | on a runtime event | `on` (required — e.g. `workflow_finished`), `filter` |
 | `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `idempotency`, `respond` |
@@ -539,7 +534,7 @@ config files and applies the **reloadable subset** at a quiesce boundary,
 validate-first. In a build **without** `hot-reload`, `SIGHUP` keeps its default
 disposition (terminates) — restart to reconfigure. Restart-only paths
 (`store`, `lifecycle.run_until`/`run_id`/`drain_timeout`, `a2a.listen`/`a2a.tls`/
-`a2a.bearer`, `security`, `cluster`, …) never reload (§11).
+`a2a.bearer`, `security`, …) never reload (§11).
 
 ---
 
@@ -700,7 +695,6 @@ each path is equally reachable from env and flags (§1.1), so
 | `memory`, `context`, `knowledge`, `search`, `skills` | Working-memory caps, context window/compaction, and the MCP servers backing knowledge, search, and the skill catalogue. |
 | `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink}`. |
 | `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`. |
-| `cluster` | `shard`, `timer_shard` (§13). |
 
 **Secrets stay out of the file.** Four paths are credential-bearing and are
 **rejected outright** when a file supplies a literal: `intelligence.token`,
@@ -799,39 +793,20 @@ For the reloadable-vs-restart-only partition of these fields, see §11.
 
 ---
 
-## 13. Sharding & fleet identity — `cluster`
+## 13. Running a fleet
 
-A fleet of identical agentd replicas partitions a shared workload by **shard
-identity** (RFC 0019):
+There is no `cluster` section, no `--shard` flag, and no per-start `claim` or
+`shard` option. agentd carries **no coordination protocol of its own**.
 
-```yaml
-cluster:
-  shard: "2/8"          # this replica owns shard 2 of 8
-  timer_shard: shard0   # shard0 (default) | keyed
-```
+An earlier version declared all of it — shard identity, work-claim leases, a
+standby pool — and none of it was ever wired to anything. It was removed rather
+than finished, because coordination needs a shared source of truth and agentd
+already talks to two that are better placed to own it: the MCP server the work
+comes from, and the store.
 
-- **`cluster.shard` (`--shard K/N` / `AGENT_SHARD`)** — this replica owns shard
-  `K` of `N`; an FNV-1a hash over the URI/key decides ownership. `0/1` (the
-  default) is unsharded. `N == 0` or `K >= N` is exit `2` at validation. A
-  StatefulSet injects `AGENT_SHARD=K/N` from the pod ordinal; a `--shard` flag
-  overrides it.
-- **`cluster.timer_shard`** — timer-route behaviour for a sharded
-  `schedule`/`loop` fleet: `shard0` (only shard 0 fires the fleet-wide ticker) or
-  `keyed` (every replica fires; a per-tick key gate decides ownership).
-
-Shard identity is immutable for the life of the process — the whole `cluster`
-section is **restart-only** (§11).
-
-A `subscribe` start node carries the per-trigger half of the same idea: `shard`
-narrows which items this replica takes, and `claim` leases an item against a
-coordination MCP server before processing it, so two replicas never work the same
-item (§6).
-
-> **Wiring status.** `cluster.shard` / `cluster.timer_shard` and a start node's
-> `claim` / `shard` options are accepted and validated, but the 2.0 runtime does
-> not yet apply the shard gate or the claim lease — a sharded fleet today
-> partitions upstream (one queue subscription per replica, or a coordinating MCP
-> server that hands out work). See [`scaling.md`](scaling.md) for the fleet model.
+So a fleet partitions **upstream**: one queue subscription per replica, or a
+coordination server that hands out work and takes it back when a lease expires.
+Both are described, with working config, in [`scaling.md`](scaling.md).
 
 ---
 

@@ -94,8 +94,6 @@ pub const KINDS: &[KindInfo] = &[
             "debounce_ms",
             "coalesce",
             "filter",
-            "claim",
-            "shard",
             "deliver",
             "on_no_listener",
             "inputs",

@@ -254,12 +254,6 @@ fn top_level_properties(
                     "workdir": { "type": "string" }, "timeout": duration,
                     "max_output": { "type": "integer" },
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } } } }));
-    m.insert(
-        "cluster".to_string(),
-        json!({ "type": "object", "additionalProperties": false, "properties": {
-                "shard": { "type": "string", "pattern": "^[0-9]+/[0-9]+$" },
-                "timer_shard": { "enum": ["shard0", "keyed"] } } }),
-    );
 }
 
 fn defs_properties(

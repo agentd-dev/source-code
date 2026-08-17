@@ -7,6 +7,33 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Removed (BREAKING: clustering and sharding are gone)
+
+Shard identity, work-claim leases and the standby pool were declared in the
+config schema, validated at startup, and **read by nothing**. They had been that
+way for a long time; the honest options were to finish them or remove them, and
+the premise turned out to be wrong for agentd, so they are removed.
+
+Coordination needs a shared source of truth. agentd already talks to two that
+are better placed to own it than a replica is — the MCP server the work comes
+from, and the store. A queue can hand an item to somebody else when a lease
+expires; no agentd-side hash can. So a fleet partitions **upstream**: one
+subscription per replica, or the queue's own claim/lease semantics called from a
+workflow step. Both are described with working config in `docs/scaling.md`.
+
+Gone: the `cluster` build feature; `cluster.shard` and `cluster.timer_shard`;
+`--shard`, `--claim`, `--claim-ttl`, `--claim-renew-fraction`, `--standby`,
+`--assign-from` and their env aliases; `claim` and `shard` as fields of a
+`subscribe` start node; and the `agent_shard_skipped_total`, `agent_claims_*`
+and `agent_saturation` metrics, which were reserved names flat at zero. Each
+removed flag now exits `2` naming what to do instead. RFC 0019 is marked
+**Withdrawn**, with the reasoning kept.
+
+This also withdraws the sharded-timer gate added earlier in this cycle: it was a
+real fix to a real duplicate-run problem, but the right place for that decision
+is one line of deployment config (replica 0 arms the nightly `schedule`; the
+others do not), not a hash inside the agent.
+
 ### Added (push notifications, the authenticated card, and a shard gate that works)
 
 - **Push notifications.** A caller registers a webhook and agentd POSTs its

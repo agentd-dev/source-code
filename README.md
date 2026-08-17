@@ -415,16 +415,12 @@ See [docs/operations.md](docs/operations.md) and [docs/observability.md](docs/ob
 
 ## Scaling out
 
-With `--features cluster` (RFC 0019):
-
-- `--shard K/N` — deterministic hash-partitioning of the URI/key space across a
-  fleet of identical replicas (works for reactive and timer modes).
-- `--claim <uri>=<server>` + `--claim-ttl` — claim/lease an item before
-  processing it, so at-least-once event delivery becomes exactly-one-owner
-  processing.
-- `--standby --assign-from <server>:<uri>` — a warm worker pool that
-  claim-pulls assignments.
-- `agent://capacity` + Prometheus metrics feed autoscaling.
+Scale inside one instance first (`concurrency.max_runs`, `limits.max_runs`,
+`agent.max_parallel_turns`, `parallel` on fan-out steps). For a fleet, agentd has
+**no coordination protocol of its own** — ownership lives where it can actually
+be arbitrated: partition the subscriptions at the source, or use the queue's own
+claim/lease semantics from a workflow step. Prometheus metrics feed the
+autoscaler.
 
 See [docs/scaling.md](docs/scaling.md).
 
@@ -442,12 +438,11 @@ time. A flag whose feature is absent exits `2` loudly — never a silent no-op.
 | `metrics` | hand-written Prometheus text + health endpoints | — |
 | `otel` | hand-rolled OTLP/HTTP span export, GenAI semconv | — |
 | `cron` | 5-field UTC cron scheduling (hand-rolled parser) | — |
-| `cluster` | sharding, claim/lease, standby pools, capacity signal | — |
 | `oauth` | OAuth 2.1 client-credentials for remote endpoints | — |
 | `hot-reload` / `config-watch` | SIGHUP / inotify restart-free reconfig | — |
 
 Shipped release feature set:
-`serve-https,a2a,events,metrics,cron,otel,cluster,hot-reload,config-watch,workflow`.
+`a2a,metrics,cron,otel,oauth,aauth,hot-reload,config-watch,workflow`.
 
 ## Footprint (measured)
 

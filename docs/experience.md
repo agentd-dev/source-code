@@ -128,7 +128,7 @@ that an `agent` step takes `instruction` (a `prompt` belongs to `think`) and a
 $ agentd -c release.yaml --validate-config      # two guessed field names
 {"event":"config.invalid","msg":"workflow \"release\" step \"draft\": unknown field \"prompt\" for kind \"agent\" (allowed: instruction, output_contract, output_schema, tools, servers, limits, context, skills, system)"}
 {"event":"config.invalid","msg":"workflow \"release\" step \"draft\": kind \"agent\" requires field \"instruction\""}
-{"event":"config.invalid","msg":"workflow \"release\" step \"start\": unknown field \"debounce\" for kind \"subscribe\" (allowed: server, uri, debounce_ms, coalesce, filter, claim, shard, deliver, on_no_listener, inputs)"}
+{"event":"config.invalid","msg":"workflow \"release\" step \"start\": unknown field \"debounce\" for kind \"subscribe\" (allowed: server, uri, debounce_ms, coalesce, filter, deliver, on_no_listener, inputs)"}
 ```
 
 Structure is checked too: a workflow needs a start node and a `finish` step,
@@ -192,7 +192,7 @@ with a broken or absent configuration.
 The same gate protects reconfiguration. SIGHUP (or `lifecycle.watch_config`)
 re-merges and re-validates before applying anything, and a change under any
 restart-only path — `a2a.listen`, `a2a.tls`, `a2a.bearer`, `store.kind`,
-`security`, `cluster`, `lifecycle.run_until` — is refused wholesale as
+`security`, `lifecycle.run_until` — is refused wholesale as
 `restart_required`, leaving the running configuration in place. Reload is
 all-or-nothing.
 

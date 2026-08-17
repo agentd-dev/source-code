@@ -159,7 +159,6 @@ pub struct Settings {
     pub goal: Option<Goal>,
     pub observability: Observability,
     pub security: Security,
-    pub cluster: Cluster,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1349,36 +1348,6 @@ pub struct Cgroup {
     pub pids_max: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Cluster {
-    pub shard: Option<String>,
-    pub timer_shard: Option<String>,
-}
-
-impl Cluster {
-    /// This replica's shard identity, as the runtime needs it.
-    ///
-    /// A malformed value cannot reach here — validation rejects it before the
-    /// runtime starts — so an unparseable one degrades to "unsharded, owns
-    /// everything", which is the safe direction for the one thing this decides:
-    /// whether a scheduled workflow fires.
-    pub fn shard(&self) -> crate::config::ShardCfg {
-        let mut cfg = crate::config::ShardCfg::default();
-        if let Some(spec) = &self.shard {
-            cfg.set(spec);
-        }
-        if let Some(mode) = self
-            .timer_shard
-            .as_deref()
-            .and_then(crate::config::TimerShardMode::parse)
-        {
-            cfg.timer = mode;
-        }
-        cfg
-    }
-}
-
 impl Settings {
     /// Type a settings document. `source` names it in errors.
     pub fn from_document(doc: Value, source: &str) -> Result<Settings, String> {
@@ -1424,7 +1393,6 @@ pub const V2_KEYS: &[&str] = &[
     "skills",
     "memory",
     "context",
-    "cluster",
 ];
 
 /// v1 (flat) top-level keys.
@@ -1734,11 +1702,6 @@ pub const ALIASES: &[Alias] = &[
         path: "security.cgroup.pids_max",
         kind: AliasKind::Set,
     },
-    Alias {
-        flag: "--shard",
-        path: "cluster.shard",
-        kind: AliasKind::Set,
-    },
 ];
 
 /// Legacy env names → v2 paths (the derived `AGENTD_<PATH>` names are the
@@ -1766,7 +1729,6 @@ pub const ENV_ALIASES: &[(&str, &str)] = &[
     ("SERVE_BEARER", "a2a.bearer"),
     ("TLS_CA", "security.tls_ca"),
     ("ALLOW_TRIFECTA", "security.allow_trifecta"),
-    ("SHARD", "cluster.shard"),
     ("WATCH_CONFIG", "lifecycle.watch_config"),
 ];
 
@@ -1789,26 +1751,24 @@ pub const REMOVED_FLAGS: &[(&str, &str)] = &[
         "use a `loop` start node with `interval`, or a `schedule` start node with `every`",
     ),
     ("--cron", "use a `schedule` start node with `cron`"),
+    // Clustering was removed, not migrated: agentd has no coordination protocol
+    // of its own. A fleet partitions upstream — one subscription per replica, or
+    // the queue's own lease semantics from a workflow step (docs/scaling.md).
+    (
+        "--shard",
+        "agentd does not partition work; give each replica its own subscription (docs/scaling.md)",
+    ),
     (
         "--claim",
-        "use the `claim` option of a `subscribe` start node",
+        "call the queue's own claim/lease tools from a workflow step (docs/scaling.md §2c)",
     ),
-    (
-        "--claim-ttl",
-        "use the `claim.ttl` option of a `subscribe` start node",
-    ),
-    (
-        "--claim-renew-fraction",
-        "use the `claim.renew_fraction` option of a `subscribe` start node",
-    ),
+    ("--claim-ttl", "it went with --claim"),
+    ("--claim-renew-fraction", "it went with --claim"),
     (
         "--standby",
-        "removed in 2.0 (a `subscribe` start node with `claim` gives the pull-worker shape)",
+        "there is no standby pool; a worker replica is an ordinary instance with its own subscription",
     ),
-    (
-        "--assign-from",
-        "removed in 2.0 (a `subscribe` start node with `claim`)",
-    ),
+    ("--assign-from", "it went with --standby"),
     (
         "--workflow-resume",
         "automatic: runs resume from the store on restart (`resume_policy` per workflow)",
@@ -3048,48 +3008,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         );
     }
 
-    // cluster
-    if let Some(sh) = &s.cluster.shard {
-        let mut cfg = super::ShardCfg::default();
-        if let Err(e) = cfg.parse_into(sh) {
-            err(&mut d, format!("cluster.shard: {e}"));
-        }
-    }
-    if let Some(t) = &s.cluster.timer_shard
-        && super::TimerShardMode::parse(t).is_none()
-    {
-        err(
-            &mut d,
-            format!("cluster.timer_shard: {t:?} (want shard0|keyed)"),
-        );
-    }
-    // `shard` on a subscribe start promises that deliveries are partitioned
-    // across the fleet. They are not — nothing filters an MCP notification by
-    // shard. Accepting it silently is the one outcome that guarantees duplicate
-    // processing while looking configured, so it is refused with the truth.
-    // (Timer starts ARE sharded; see `cluster.timer_shard`.)
-    for w in &s.workflows {
-        let name = w.get("name").and_then(Value::as_str).unwrap_or("?");
-        let Some(steps) = w.get("steps").and_then(Value::as_object) else {
-            continue;
-        };
-        for (node, spec) in steps {
-            if spec.get("kind").and_then(Value::as_str) == Some("subscribe")
-                && spec.get("shard").is_some()
-            {
-                err(
-                    &mut d,
-                    format!(
-                        "workflow {name:?} step {node:?}: `shard` is not implemented for \
-                         subscribe deliveries — every replica would still receive every \
-                         notification. Partition the work with `claim`, or shard the timer \
-                         starts with cluster.timer_shard."
-                    ),
-                );
-            }
-        }
-    }
-
     // secrets provenance: the FILE layer must not carry inline secrets
     for m in secret_violations(&loaded.file_doc) {
         err(&mut d, m);
@@ -3294,7 +3212,6 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "observability.events_ring",
     "observability.traceparent",
     "security",
-    "cluster",
 ];
 
 /// The restart-only paths whose values differ between two effective documents.
@@ -3480,7 +3397,6 @@ mod tests {
             "security",
             "security.cgroup",
             "security.exec",
-            "cluster",
         ] {
             let s = schema_props_at(&schema, path);
             let f = struct_fields_at(path);
@@ -3497,7 +3413,6 @@ mod tests {
             let sample = match &b.kind {
                 paths::Kind::String => match b.path.as_str() {
                     "config_version" => json!("2"),
-                    "cluster.shard" => json!("0/2"),
                     _ => json!("x"),
                 },
                 paths::Kind::Integer => json!(1),

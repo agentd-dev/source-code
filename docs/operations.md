@@ -297,7 +297,7 @@ never dumped: a `bearer_ref` renders as `***`.
 
 Not every feature is in the released binary. `a2a`, `metrics`, `cron`, `otel`,
 `hot-reload`, `config-watch`, `aauth` and `oauth` ship in the published builds;
-`cluster` (sharding, `cluster.timer_shard`), `exec` and `cel` are build-from-source
+`exec` and `cel` are build-from-source
 opt-ins. The manifest reflects the binary you actually have.
 
 ### 4.2 `--config-schema=2` and `--validate-config`
@@ -359,7 +359,7 @@ inputs, so a flag still overrides the new file. The partition is owned by
 | `agent` (preflight, wake_on, tools, parallelism, budget) | `a2a.listen`, `a2a.tls`, `a2a.bearer` |
 | `mcp` (live re-handshake) | `observability.otel`, `.metrics_addr`, `.health_file`, `.events_ring`, `.traceparent` |
 | `tools`, `knowledge`, `search` (registry rebuild) | `security` |
-| `skills` (sources re-discovered) | `cluster` (shard, timer shard) |
+| `skills` (sources re-discovered) | — |
 | `workflows` (live runs stay pinned to their hash) | |
 | `limits`, `lifecycle.idle_grace`, `observability.log_level` / `.log_content`, `memory`, `context` | |
 
@@ -452,5 +452,5 @@ message carried a command DataPart — so `a2a.SendMessage:workflow.run` and
   endpoint other agents call.
 - [The interface — TUI & web UI](interface.md) — the display clients that ride
   this same listener.
-- [Horizontal scaling](scaling.md) — sharding and the autoscaling signals; drain
+- [Horizontal scaling](scaling.md) — partitioning work and the autoscaling signals; drain
   is the scale-down-safety seam.

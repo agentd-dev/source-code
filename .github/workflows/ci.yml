@@ -47,16 +47,14 @@ jobs:
           - "--features metrics"
           - "--features otel"
           - "--features oauth"
-          - "--features cluster"
           - "--features hot-reload"
           - "--features config-watch"
           - "--features workflow"
           - "--features cel"
           - "--features aauth" # AAuth [DRAFT] — Ed25519 identity + RFC 9421 signing (ships build-from-source, like cel)
           - "--features a2a,hot-reload" # the combo that latently broke once
-          - "--features cluster,metrics" # the scaling-signal cross combo
           - "--release --features internal-mocks" # debug auto-enables it; --release exercises the opt-in path
-          - "--features a2a,metrics,cron,otel,cluster,hot-reload,config-watch,workflow" # the release-artifact set
+          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,workflow" # the release-artifact set
           - "--all-features"
     steps:
       - uses: actions/checkout@v4

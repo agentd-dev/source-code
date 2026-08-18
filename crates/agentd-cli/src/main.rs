@@ -83,6 +83,17 @@ fn run() -> i32 {
 /// precise v1/mixed/removed-flag diagnostics).
 fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
     use agentd::config::v2::{self, Ask, Detected};
+    // `--fresh` (RFC 0033 §3.2) is an intent for *this* process's life, not a
+    // setting: it has no document path, and a file or env var that pinned an
+    // instance to never resuming would be a footgun. So it is consumed here,
+    // before the settings model ever sees the argv (which would reject it as an
+    // unknown argument), and recorded where `state::Durable::restore` reads it.
+    let fresh = args.iter().any(|a| a == "--fresh");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--fresh").cloned().collect();
+    let args = args.as_slice();
+    if fresh {
+        agentd::state::request_fresh();
+    }
     let detected = match v2::probe(args, env) {
         Ok(d) => d,
         Err(e) => {
@@ -119,7 +130,16 @@ see docs/configuration.md."
     };
     match ask {
         Ask::Help => {
-            print!("{}", v2::help_text());
+            // `--fresh` never reaches the settings model, so it is not in the
+            // generated flag tables either — splice it into the CONTROL block, or
+            // it would be a flag that works and is undocumented.
+            print!(
+                "{}",
+                v2::help_text().replace(
+                    "  -h, --help",
+                    "  --fresh                    start a NEW generation: do not resume prior durable state\n                             (the previous generation is kept on the store, not deleted)\n  -h, --help",
+                )
+            );
             exit::SUCCESS
         }
         Ask::Version => {
@@ -200,6 +220,14 @@ see docs/configuration.md."
                 }
             }
         }
-        Ask::Run => agentd::runtime::run(&loaded, args, env),
+        Ask::Run => {
+            // Record what shaped the durable state (RFC 0033 §3.3) before the
+            // runtime opens the store. `restore()` compares this with the digest
+            // the manifest carries and *reports* a difference — it never gates on
+            // it: identity is `agent.name`, and keying it on a config hash would
+            // orphan a live workflow on the most ordinary edit (§3.1).
+            agentd::state::record_config_digest(&loaded.settings);
+            agentd::runtime::run(&loaded, args, env)
+        }
     }
 }

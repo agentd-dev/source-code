@@ -33,7 +33,7 @@ resolved from env / mounted files — never inline values.
 | Intelligence | `intelligence.endpoints` (ordered failover), `.model`, `.token` | `--intelligence` / `--model` / `--intelligence-token` |
 | Token budget | `intelligence.budget.windows` (rate-limit the burn, RFC 0025) | — |
 | MCP servers | `mcp.servers: [{name, endpoint}]` | `--mcp name=<endpoint>` |
-| Durable store | `store.kind: mcp\|http\|memory\|none`, `store.mcp.server` | — |
+| Durable store | `store.kind: file\|mcp\|http\|memory\|none` (defaults: `file` for a long-lived instance, `none` for a one-shot), `store.file.path`, `store.mcp.server` | — |
 | **A2A listener** | `a2a.listen`, `a2a.tls`, `a2a.principals`, `a2a.bearer` | — |
 | **A2A peers** | `a2a.peers: [{name, endpoint}]` | — |
 | Workflows / triggers | `workflows: [{name, steps}]` (start nodes: once/loop/schedule/subscribe/signal/event/webhook/manual) | — |
@@ -108,10 +108,12 @@ agentd --run-id "nightly-digest-2026-06-25" \
 ```
 
 The key rides in the `_meta` of every outbound MCP `tools/call`; a backing
-service that honours idempotency keys collapses a retried effect to one. agentd
-keeps no local durable state of its own — a bare job externalises every effect
-through MCP, and a daemon's state lives in the configured `store` — so a re-run
-is safe by construction.
+service that honours idempotency keys collapses a retried effect to one. A
+one-shot keeps **no** state of its own — it defaults to `store.kind: none`, and
+every effect leaves through MCP — so a re-run is safe by construction. (A
+long-lived instance is the opposite by default: its state is the point, and it
+lands in the configured `store`, on this host's filesystem unless told
+otherwise — §2, §3.)
 
 ---
 
@@ -120,7 +122,12 @@ is safe by construction.
 A **daemon** (`lifecycle.run_until: drained`) idles cheaply and wakes on its
 triggers — an A2A message/command, or a `subscribe` / `schedule` / `loop` start
 node. It exits only on a SIGTERM drain, never on an individual run failing. A
-daemon needs a **durable store** (RFC 0025) so state survives a restart.
+daemon is **durable** (RFC 0025) so state survives a restart: name no `store`
+and it gets `kind: file` under the state-directory chain
+([`configuration.md`](configuration.md) §12.3), which is the right answer on a
+laptop or a VM with a real disk. The config below names `kind: mcp` instead
+because it is going to run as more than one pod over its life — see §3 for what
+a file store does and does not survive in a container.
 
 ```yaml
 # /etc/agentd/triage.yaml
@@ -272,6 +279,56 @@ ENTRYPOINT ["/agentd"]
 > `a2a.listen` on a non-`a2a` build never binds; a `cron` field on a non-`cron`
 > build never fires). Pin the feature set for your image and keep config and
 > build in step.
+
+### Durable state on a `scratch` image
+
+A long-lived instance is durable by default, and the default adapter is
+`store.kind: file` — one directory on the local filesystem
+([`configuration.md`](configuration.md) §12.3). In a container that default is
+honest but weak: the state directory lands on the **writable layer**, which
+survives a process restart (a crash, a `restartPolicy` bounce — the daemon
+restores its runs, timers and pending inbox) and does **not** survive a
+reschedule. A new pod is a new writable layer, and the previous state is gone
+with the old one. The `scratch` image makes that easy to miss, because there is
+no shell to go looking with.
+
+Two ways to mean it:
+
+- **Mount a volume at the state path** — a PVC (or a hostPath on a single
+  machine), with `store.file.path` pointing inside it. Durability then belongs
+  to the volume, which is where it always belonged. Bind it to a
+  `StatefulSet`'s `volumeClaimTemplates` so a rescheduled ordinal re-attaches
+  its own claim (§4d): identity is `agent.name` / the pod name, and the volume
+  follows the same ordinal.
+- **Use `mcp` or `http`** — the state lives in a service, the pod is
+  disposable, and any number of replicas can be rescheduled anywhere. This is
+  the fleet answer; `file` refuses to be shared (two processes on one directory
+  is a startup error naming the holder's pid), so it is not an option for
+  `replicas: 2` regardless of the volume.
+
+```yaml
+# Deployment/StatefulSet pod spec — a file store that survives a reschedule.
+containers:
+  - name: agent
+    image: ghcr.io/agentd-dev/agentd:2.1.0
+    args: [--config=/etc/agentd/triage.yaml]     # store: { kind: file, file: { path: /var/lib/agentd } }
+    volumeMounts:
+      - { name: state, mountPath: /var/lib/agentd }
+    securityContext:
+      runAsUser: 65532                            # the uid that owns 0700/0600
+      readOnlyRootFilesystem: true                # the state volume is the only writable path
+volumes:
+  - name: state
+    persistentVolumeClaim: { claimName: agent-triage-state }
+```
+
+`readOnlyRootFilesystem: true` composes with this deliberately: the only paths
+agentd writes are ones you named — the state directory, the credential cache if
+an endpoint uses one (`$AGENTD_CRED_DIR`), and `observability.health_file` if it
+is set. Give each a mount (an `emptyDir` is enough for the last two) and the
+filesystem surface is closed. Set the state volume's ownership to the uid the
+container runs as: the adapter creates its directories `0700` and its files
+`0600` and never falls back to anything looser.
 
 ### TLS is on by default — or terminate it in a sidecar
 
@@ -469,6 +526,11 @@ spec:
           image: ghcr.io/example/agent:1.0.0
           args:
             - --config=/etc/agentd/triage.yaml   # the §2 daemon config (store + subscribe workflow)
+          volumeMounts:
+            # Only needed for store.kind: file — a state directory on the pod's
+            # writable layer would not survive this Deployment rescheduling the
+            # pod (§3). With store.kind: mcp|http, drop the mount and the volume.
+            - { name: state, mountPath: /var/lib/agentd }
           livenessProbe:
             # The reactor heartbeats the health file; a wedged reactor goes stale.
             exec: { command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/agent/health) )) -lt 30"] }
@@ -477,7 +539,18 @@ spec:
           #   httpGet: { path: /healthz, port: 8080 }
           resources:
             limits: { memory: "512Mi" }   # 137 on OOM → raise this
+      volumes:
+        - name: state
+          persistentVolumeClaim: { claimName: agent-triage-state }
 ```
+
+`replicas: 1` is not decoration here: one durable identity is one process. A
+rolling update briefly overlaps the old pod and the new one, so pair a `file`
+store with `strategy: { type: Recreate }` — where the two pods really do share
+one filesystem the adapter's `flock` catches it and the new pod exits at startup
+naming the holder's pid, and where they do not (two nodes, two layers) the new
+pod quietly starts on empty state, which is worse. With `mcp`/`http` the same
+overlap surfaces as the `seq`-CAS `Conflict` described in §4d.
 
 Note the liveness probe targets the **supervisor reactor**, not the agentic
 work — a subagent legitimately busy on a long tool call must not flip pod
@@ -504,7 +577,11 @@ shape a fleet:
 
 A `StatefulSet` supplies exactly that: a stable ordinal → a stable pod name → a
 stable per-replica durable namespace, plus a stable per-pod A2A address through
-the headless service.
+the headless service. (It is also the one shape in which a `file` store makes
+sense across a reschedule: add a `volumeClaimTemplates` entry mounted at
+`store.file.path` and each ordinal re-attaches its own claim — one writer per
+directory, which is the adapter's rule. A fleet sharing one backend still needs
+`mcp`/`http`.)
 
 ```yaml
 apiVersion: apps/v1

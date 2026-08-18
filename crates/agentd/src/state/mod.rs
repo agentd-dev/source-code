@@ -16,9 +16,10 @@ use crate::obs::log::Logger;
 use crate::store::{Envelope, KeySeq, PutOutcome, SharedStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub(crate) use crate::store::now_ms;
@@ -112,6 +113,19 @@ pub struct Manifest {
     pub budget: Value,
     #[serde(default)]
     pub lifecycle: Value,
+    /// The digest of the settings that shaped this state (RFC 0033 §3.3),
+    /// section name -> hex. A **signal, not a key**: a mismatch is reported at
+    /// restore and the state is resumed anyway. Empty on a manifest written
+    /// before this existed, which is why an empty side never compares (an
+    /// upgrade must not announce that everything moved).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_digest: BTreeMap<String, String>,
+    /// Records an earlier `--fresh` abandoned (RFC 0033 §3.2). They are still in
+    /// the store — `--fresh` deletes nothing — but they belong to a superseded
+    /// generation, so the `list` reconciliation in [`Durable::restore`] must not
+    /// re-adopt them and undo the flag one boot later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<EntityRef>,
 }
 
 impl Manifest {
@@ -207,6 +221,154 @@ impl Policy {
     }
 }
 
+// ---- startup intent (RFC 0033 §3.2–§3.3) ------------------------------------
+//
+// Two facts belong to *this process's life* rather than to the settings
+// document: "do not resume prior state" (`--fresh`) and "here is the
+// configuration we are about to run under" (the digest). Neither is a setting —
+// a file or an env var that pinned an instance to never resuming would be a
+// footgun, and the digest is derived, not authored — so neither has a document
+// path to bind to. The entry point knows both before the reactor exists; the
+// reactor reaches `restore()` holding only a store and a policy. Rather than
+// threading an argv fact through constructors that have no other reason to know
+// about argv, `main` records them here once, and `Durable::new` reads them.
+// Everything downstream works off the per-`Durable` copy, so a library embedder
+// (and every unit test) can set them explicitly instead.
+
+static FRESH: AtomicBool = AtomicBool::new(false);
+static CONFIG_DIGEST: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
+/// `--fresh` was given: the next [`Durable`] opened in this process starts a new
+/// generation instead of resuming (RFC 0033 §3.2).
+pub fn request_fresh() {
+    FRESH.store(true, Ordering::Relaxed);
+}
+
+/// Whether `--fresh` was given.
+pub fn fresh_requested() -> bool {
+    FRESH.load(Ordering::Relaxed)
+}
+
+/// Record the digest of the configuration this process runs under, for
+/// [`Durable::restore`] to compare against the manifest's (RFC 0033 §3.3).
+/// First call wins — the configuration is loaded once, before any side effect.
+pub fn record_config_digest(settings: &crate::config::v2::Settings) {
+    let _ = CONFIG_DIGEST.set(config_digest(settings));
+}
+
+fn recorded_config_digest() -> BTreeMap<String, String> {
+    CONFIG_DIGEST.get().cloned().unwrap_or_default()
+}
+
+/// The digest of the settings that **shaped the durable state** (RFC 0033 §3.3):
+/// section name → SHA-256 hex of that section's canonical JSON.
+///
+/// Deliberately *not* the whole document. Only the three sections whose meaning
+/// the stored records depend on are digested — a different `intelligence.model`
+/// or a new MCP server does not make yesterday's inbox mean something else, and
+/// including them would make the signal fire on every ordinary edit until an
+/// operator learned to ignore it.
+///
+/// Nothing secret-bearing goes in. `store.http.headers` and the endpoint URLs
+/// that can carry credentials in userinfo or a query are excluded by
+/// construction (see [`store_shape`]) — they are auth, not layout, and a digest
+/// of a low-entropy secret is a secret. The hash uses the crate's dependency-free
+/// SHA-256 ([`crate::sha::sha256_hex`], already the workflow/artifact content
+/// hash), so this adds no dependency and no feature gate.
+pub fn config_digest(settings: &crate::config::v2::Settings) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    // serde_json's Map is a BTreeMap here (no `preserve_order`), so `to_string`
+    // is already canonical: key order cannot make an unchanged config look moved.
+    let digest = |v: &Value| crate::sha::sha256_hex(v.to_string().as_bytes());
+    out.insert(
+        "workflows".to_string(),
+        digest(&Value::Array(settings.workflows.clone())),
+    );
+    out.insert("store".to_string(), digest(&store_shape(&settings.store)));
+    out.insert(
+        "limits".to_string(),
+        digest(&limits_shape(&settings.limits)),
+    );
+    out
+}
+
+/// The secret-free projection of `store` that shapes the state: where records
+/// go and how they are checkpointed. `Store` is deserialize-only, so this is
+/// spelled out field by field — which is the point: a new secret-bearing field
+/// cannot silently join the digest.
+fn store_shape(s: &crate::config::v2::Store) -> Value {
+    json!({
+        "kind": format!("{:?}", s.kind),
+        "prefix": s.prefix(),
+        "on_error": format!("{:?}", s.on_error),
+        "audit": s.audit,
+        "checkpoint_debounce_ms": s.checkpoint.debounce_ms,
+        "durability": format!("{:?}", s.durability),
+        "timeout_ms": s.timeout.map(|d| d.0.as_millis() as u64),
+        // The MCP server *name* is a config-local label, never a credential; the
+        // HTTP adapter contributes only its presence (base_url and headers are
+        // auth surface, §7).
+        "mcp_server": s.mcp.as_ref().map(|m| m.server.clone()),
+        "http": s.http.is_some(),
+    })
+}
+
+/// The projection of `limits` — all numbers and durations, nothing secret. The
+/// resolved values (not the `Option`s) so that writing a default explicitly does
+/// not read as a change.
+fn limits_shape(s: &crate::config::v2::Limits) -> Value {
+    json!({
+        "max_runs": s.max_runs,
+        "run_steps": s.run.steps(),
+        "run_tokens": s.run.tokens(),
+        "run_deadline_ms": s.run.deadline().as_millis() as u64,
+        "subagents": format!("{:?}", s.subagents),
+        "inline_max_bytes": s.inline_max_bytes,
+        "step_timeout_ms": s.step_timeout.map(|d| d.0.as_millis() as u64),
+    })
+}
+
+/// Which digested sections moved between the manifest's record and this run.
+///
+/// An empty side never compares: a manifest written before the digest existed
+/// carries none, and a `Durable` built without settings (an embedder, a test)
+/// computes none — reporting "everything changed" in either case would train
+/// the operator to ignore the one event that matters.
+fn changed_sections(
+    recorded: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> Vec<String> {
+    if recorded.is_empty() || current.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = current
+        .iter()
+        .filter(|(k, v)| recorded.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    out.extend(
+        recorded
+            .keys()
+            .filter(|k| !current.contains_key(*k))
+            .cloned(),
+    );
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The kinds the restore reconciles against `list` — the entity kinds a crash
+/// can leave in the store ahead of the manifest that indexes them.
+const RECONCILED: [Kind; 7] = [
+    Kind::Inbox,
+    Kind::Context,
+    Kind::Run,
+    Kind::Subagent,
+    Kind::Task,
+    Kind::Timer,
+    Kind::Artifact,
+];
+
 /// What a restore found (RFC 0025 §6).
 #[derive(Debug, Default)]
 pub struct Restored {
@@ -271,6 +433,11 @@ pub struct Durable {
     last_flush: Mutex<Instant>,
     degraded: AtomicBool,
     log: Option<Logger>,
+    /// `--fresh`: open a new generation instead of resuming (RFC 0033 §3.2).
+    fresh: bool,
+    /// The digest of the configuration this life runs under (RFC 0033 §3.3);
+    /// empty when nothing recorded one, which disables the comparison.
+    config_digest: BTreeMap<String, String>,
 }
 
 impl Durable {
@@ -292,7 +459,23 @@ impl Durable {
             last_flush: Mutex::new(Instant::now()),
             degraded: AtomicBool::new(false),
             log,
+            fresh: fresh_requested(),
+            config_digest: recorded_config_digest(),
         }
+    }
+
+    /// Override the `--fresh` intent this `Durable` was built with — for an
+    /// embedder that drives the façade directly, and for the tests, neither of
+    /// which goes through the CLI that sets the process-wide default.
+    pub fn with_fresh(mut self, fresh: bool) -> Durable {
+        self.fresh = fresh;
+        self
+    }
+
+    /// Override the configuration digest (see [`with_fresh`](Durable::with_fresh)).
+    pub fn with_config_digest(mut self, digest: BTreeMap<String, String>) -> Durable {
+        self.config_digest = digest;
+        self
     }
 
     pub fn store_kind(&self) -> &'static str {
@@ -548,6 +731,9 @@ impl Durable {
     /// entity (verifying envelopes), reconcile with `list` where supported, warm
     /// the seq map, bump the generation. A fresh instance (no manifest) writes
     /// generation 1.
+    ///
+    /// Under `--fresh` (RFC 0033 §3.2) the middle is skipped: see
+    /// [`restore_fresh`](Durable::restore_fresh).
     pub fn restore(&self) -> Result<Restored, StoreError> {
         let mut out = Restored::default();
         let (manifest, fresh) = match self.get(Kind::Manifest, "agent")? {
@@ -566,6 +752,29 @@ impl Durable {
                 false,
             ),
         };
+        // `--fresh` reads the manifest and stops there: the generation counter is
+        // the one thing a new life must inherit (otherwise "which life am I in?"
+        // resets on every use of the flag), and knowing what is being left behind
+        // is what lets the new generation retire it instead of deleting it.
+        if self.fresh {
+            return self.restore_fresh(manifest, fresh);
+        }
+        // The configuration digest (RFC 0033 §3.3) is a **signal, not a gate**.
+        // Identity is `agent.name` (§3.1): keying it on a config hash would start
+        // the agent fresh and orphan its in-flight workflows the first time
+        // someone raised a limit or fixed a typo — silently, which is exactly the
+        // outcome durability exists to prevent. So a difference is reported and
+        // the state is resumed regardless; the operator decides.
+        let moved = changed_sections(&manifest.config_digest, &self.config_digest);
+        if !moved.is_empty() {
+            self.log_event(
+                "store.config_changed",
+                json!({
+                    "sections": moved,
+                    "msg": "state was written under a different configuration — resuming anyway; --fresh to start a new generation",
+                }),
+            );
+        }
         // Indexed entities.
         for r in &manifest.entities {
             let Some(kind) = Kind::parse(&r.kind) else {
@@ -578,29 +787,37 @@ impl Durable {
             }
         }
         // Reconcile with `list` (entity-first write order can leave records the
-        // manifest never indexed).
-        for kind in [
-            Kind::Inbox,
-            Kind::Context,
-            Kind::Run,
-            Kind::Subagent,
-            Kind::Task,
-            Kind::Timer,
-            Kind::Artifact,
-        ] {
+        // manifest never indexed). `seen` doubles as the ground truth for
+        // pruning the retired set below; it stays `None` on a store without
+        // `list`, where "gone" and "invisible" cannot be told apart.
+        let mut seen: Option<BTreeSet<(String, String)>> = None;
+        for kind in RECONCILED {
             match self.list(kind) {
                 Ok(keys) => {
+                    let seen = seen.get_or_insert_with(BTreeSet::new);
                     for ks in keys {
                         let Some((_, id)) =
                             crate::store::parse_key(&self.prefix, &self.instance, &ks.key)
                         else {
                             continue;
                         };
+                        seen.insert((kind.as_str().to_string(), id.to_string()));
                         let indexed = manifest
                             .entities
                             .iter()
                             .any(|e| e.kind == kind.as_str() && e.id == id);
                         if indexed {
+                            continue;
+                        }
+                        // A record a previous `--fresh` retired (RFC 0033 §3.2):
+                        // still on the store because nothing was deleted, but it
+                        // belongs to an abandoned generation. Adopting it here
+                        // would undo the flag on the next ordinary start.
+                        if manifest
+                            .retired
+                            .iter()
+                            .any(|r| r.kind == kind.as_str() && r.id == id)
+                        {
                             continue;
                         }
                         if let Some(env) = self.get(kind, id)? {
@@ -630,11 +847,25 @@ impl Durable {
         }
         m.generation += 1;
         m.updated = now_ms();
+        // Carry the digest of what we actually ran under, so the next life
+        // compares against this configuration rather than re-reporting the same
+        // move forever. An unrecorded digest leaves the manifest's alone — an
+        // embedder must not erase an operator's signal.
+        if !self.config_digest.is_empty() {
+            m.config_digest = self.config_digest.clone();
+        }
+        // Prune the retired set to what the store still holds: once an operator
+        // has cleaned out the abandoned generation, its ghost list should not be
+        // carried forever.
+        if let Some(seen) = &seen {
+            m.retired
+                .retain(|r| seen.contains(&(r.kind.clone(), r.id.clone())));
+        }
         *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = m.clone();
         self.manifest_dirty.store(true, Ordering::Relaxed);
         self.flush(true)?;
         if fresh && out.count() == 0 {
-            self.log_event("restore.fresh", json!({"generation": 1}));
+            self.log_event("restore.fresh", json!({"generation": m.generation}));
             return Ok(out);
         }
         self.log_event(
@@ -652,10 +883,112 @@ impl Durable {
         Ok(out)
     }
 
+    /// `--fresh` (RFC 0033 §3.2): open the NEXT generation without resuming.
+    ///
+    /// Nothing is unlinked. A flag that silently destroys durable state is a
+    /// footgun — the operator who types `--fresh` to get past a wedged run is
+    /// exactly the one who will want yesterday's conversation back — so the new
+    /// generation starts *alongside* the old one:
+    ///
+    /// * the outgoing manifest is copied to `manifest/agent.gen<N>`, because it
+    ///   is the index of the retired records and without it they are a heap of
+    ///   ULIDs no one can map back to anything;
+    /// * every record still in the store is named in the new manifest's
+    ///   `retired`, so the next ordinary start does not re-adopt them through the
+    ///   `list` reconciliation and quietly undo the flag one boot later;
+    /// * the generation counter is inherited and bumped, so the log says which
+    ///   life is live.
+    fn restore_fresh(
+        &self,
+        prior: Manifest,
+        no_prior_manifest: bool,
+    ) -> Result<Restored, StoreError> {
+        // What the new generation is walking away from: whatever `list` can see,
+        // plus the prior index (a store without `list` still has one).
+        let mut retired: Vec<EntityRef> = Vec::new();
+        let mut push = |kind: &str, id: &str, seq: u64| {
+            if !retired.iter().any(|r| r.kind == kind && r.id == id) {
+                retired.push(EntityRef {
+                    kind: kind.to_string(),
+                    id: id.to_string(),
+                    seq,
+                });
+            }
+        };
+        for kind in RECONCILED {
+            match self.list(kind) {
+                Ok(keys) => {
+                    for ks in keys {
+                        if let Some((_, id)) =
+                            crate::store::parse_key(&self.prefix, &self.instance, &ks.key)
+                        {
+                            push(kind.as_str(), id, ks.seq.unwrap_or(0));
+                        }
+                    }
+                }
+                Err(StoreError::Unsupported(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        for e in &prior.entities {
+            push(&e.kind, &e.id, e.seq);
+        }
+        for e in &prior.retired {
+            push(&e.kind, &e.id, e.seq);
+        }
+        // Preserve the outgoing index BEFORE overwriting `manifest/agent`: dying
+        // between the two writes then leaves a stray copy, never a lost one.
+        if !no_prior_manifest {
+            self.put(
+                Kind::Manifest,
+                &format!("agent.gen{}", prior.generation),
+                serde_json::to_value(&prior).unwrap_or(Value::Null),
+                None,
+            )?;
+        }
+        // Every field spelled out rather than `..prior`: the whole point of the
+        // flag is that nothing carries over except the counter and the birth date.
+        let m = Manifest {
+            generation: prior.generation + 1,
+            created: if prior.created == 0 {
+                now_ms()
+            } else {
+                prior.created
+            },
+            updated: now_ms(),
+            entities: Vec::new(),
+            starts: BTreeMap::new(),
+            budget: Value::Null,
+            lifecycle: Value::Null,
+            config_digest: self.config_digest.clone(),
+            retired,
+        };
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = m.clone();
+        self.manifest_dirty.store(true, Ordering::Relaxed);
+        self.flush(true)?;
+        self.log_event(
+            "restore.fresh",
+            json!({
+                "generation": m.generation,
+                "superseded": prior.generation,
+                "retired": m.retired.len(),
+                "msg": "--fresh: this generation starts empty; the previous one's records were kept, not deleted",
+            }),
+        );
+        Ok(Restored::default())
+    }
+
     fn log_event(&self, event: &str, fields: Value) {
         if let Some(l) = &self.log {
             match event {
-                e if e.ends_with(".fail") || e == "store.conflict" => l.warn(event, fields),
+                e if e.ends_with(".fail")
+                    || e == "store.conflict"
+                    // A resumed state written under a different configuration is
+                    // the operator's cue to check what moved — warn, not info.
+                    || e == "store.config_changed" =>
+                {
+                    l.warn(event, fields)
+                }
                 _ => l.info(event, fields),
             }
         }
@@ -881,5 +1214,128 @@ mod tests {
             d2.put(Kind::Run, "x", json!({}), None),
             Err(StoreError::Io(_))
         ));
+    }
+
+    /// RFC 0033 §3.2: `--fresh` opens the NEXT generation without resuming, and
+    /// destroys nothing — the abandoned records stay readable, the outgoing index
+    /// is preserved, and a later ordinary start does not quietly re-adopt them
+    /// through the `list` reconciliation.
+    #[test]
+    fn fresh_opens_a_new_generation_without_resuming_and_deletes_nothing() {
+        let mem = Arc::new(MemoryStore::new());
+
+        // Life 1: a run and a pending inbox event.
+        let d = durable(mem.clone());
+        assert!(d.restore().unwrap().manifest.is_none());
+        d.put(Kind::Run, "r1", json!({"status": "running"}), None)
+            .unwrap();
+        let ev = InboxEvent::new("a2a.message", None, json!({"n": 1}));
+        d.inbox_put(&ev).unwrap();
+        assert_eq!(d.manifest().generation, 1);
+
+        // Life 2, `--fresh`: a new generation that resumes none of it.
+        let f = durable(mem.clone()).with_fresh(true);
+        let r = f.restore().unwrap();
+        assert!(
+            r.manifest.is_none(),
+            "a new generation reports no prior life"
+        );
+        assert_eq!(r.count(), 0);
+        assert!(r.inbox_pending().is_empty(), "the inbox does not replay");
+        let m = f.manifest();
+        assert_eq!(m.generation, 2, "the counter is inherited, not reset");
+        assert!(m.entities.is_empty());
+
+        // Nothing was deleted, and the previous index is still findable.
+        assert!(
+            f.get(Kind::Run, "r1").unwrap().is_some(),
+            "--fresh keeps the abandoned records"
+        );
+        let kept = f
+            .get(Kind::Manifest, "agent.gen1")
+            .unwrap()
+            .expect("the outgoing manifest is preserved");
+        let kept: Manifest = serde_json::from_value(kept.state).unwrap();
+        assert_eq!(kept.generation, 1);
+        assert!(m.retired.iter().any(|e| e.kind == "run" && e.id == "r1"));
+        assert!(m.retired.iter().any(|e| e.kind == "inbox" && e.id == ev.id));
+
+        // Life 3, ordinary: the retired generation is not re-adopted — otherwise
+        // the flag would come undone one boot later.
+        let d3 = durable(mem.clone());
+        let r3 = d3.restore().unwrap();
+        assert_eq!(r3.count(), 0, "retired records stay retired");
+        assert!(r3.unindexed.is_empty());
+        assert_eq!(d3.manifest().generation, 3);
+    }
+
+    /// RFC 0033 §3.3: the configuration digest is a **signal, not a key** — a
+    /// difference is reported and the state is resumed anyway (§3.1: keying
+    /// identity on a config hash would orphan a live workflow on a typo fix).
+    #[test]
+    fn a_moved_config_digest_reports_but_never_gates_the_resume() {
+        let before: BTreeMap<String, String> = [
+            ("workflows".to_string(), "aaa".to_string()),
+            ("store".to_string(), "sss".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut after = before.clone();
+        after.insert("workflows".to_string(), "bbb".to_string());
+        assert_eq!(changed_sections(&before, &after), vec!["workflows"]);
+        // An empty side never compares: a pre-digest manifest, or a `Durable`
+        // built without settings, must not announce that everything moved.
+        assert!(changed_sections(&BTreeMap::new(), &after).is_empty());
+        assert!(changed_sections(&before, &BTreeMap::new()).is_empty());
+
+        let mem = Arc::new(MemoryStore::new());
+        let d = durable(mem.clone()).with_config_digest(before.clone());
+        d.restore().unwrap();
+        d.put(Kind::Run, "r1", json!({"status": "running"}), None)
+            .unwrap();
+        assert_eq!(d.manifest().config_digest, before);
+
+        let d2 = durable(mem.clone()).with_config_digest(after.clone());
+        let r = d2.restore().unwrap();
+        assert_eq!(r.of(Kind::Run).len(), 1, "state is still resumed");
+        assert_eq!(d2.manifest().generation, 2);
+        assert_eq!(
+            d2.manifest().config_digest,
+            after,
+            "the next life compares against what this one ran under"
+        );
+    }
+
+    /// The digest covers only the sections whose meaning the stored records
+    /// depend on (RFC 0033 §3.3) — an edit anywhere else must not fire it.
+    #[test]
+    fn the_digest_covers_workflows_store_and_limits_only() {
+        let doc = json!({
+            "config_version": "2",
+            "agent": {"name": "a", "instruction": "one"},
+            "workflows": [{"name": "w", "version": 3, "steps": {"s": {"kind": "once"}}}],
+            "limits": {"run": {"steps": 10}},
+        });
+        let settings = |patch: &dyn Fn(&mut Value)| {
+            let mut d = doc.clone();
+            patch(&mut d);
+            serde_json::from_value::<crate::config::v2::Settings>(d).expect("settings")
+        };
+        let base = config_digest(&settings(&|_| {}));
+        assert_eq!(
+            base.keys().collect::<Vec<_>>(),
+            ["limits", "store", "workflows"]
+        );
+
+        let elsewhere = config_digest(&settings(&|d| d["agent"]["instruction"] = json!("two")));
+        assert_eq!(base, elsewhere, "an instruction edit is not a state change");
+
+        let wf = config_digest(&settings(&|d| {
+            d["workflows"][0]["steps"]["t"] = json!({"kind": "noop"})
+        }));
+        assert_eq!(changed_sections(&base, &wf), vec!["workflows"]);
+
+        let lim = config_digest(&settings(&|d| d["limits"]["run"]["steps"] = json!(11)));
+        assert_eq!(changed_sections(&base, &lim), vec!["limits"]);
     }
 }

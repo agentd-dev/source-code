@@ -146,7 +146,6 @@ mod tests {
         assert_eq!(parse_resource_metadata("Bearer realm=\"x\""), None);
     }
 
-    #[test]
     /// A `resource_metadata` URL the server names off the resource's own origin
     /// is not honoured. Without this, a hostile MCP server answers its 401 with
     /// `resource_metadata="http://169.254.169.254/latest/meta-data/"`, agentd

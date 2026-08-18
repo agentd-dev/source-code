@@ -134,10 +134,11 @@ fn top_level_properties(
     m.insert("store".to_string(), json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "kind": { "enum": ["mcp", "http", "memory", "none"] },
+                    "kind": { "enum": ["mcp", "http", "file", "memory", "none"] },
                     "prefix": { "type": "string" },
                     "mcp": { "$ref": "#/$defs/StoreMcp" },
                     "http": { "$ref": "#/$defs/StoreHttp" },
+                    "file": { "$ref": "#/$defs/StoreFile" },
                     "checkpoint": { "type": "object", "additionalProperties": false, "properties": { "debounce_ms": { "type": "integer", "minimum": 0 } } },
                     "durability": { "type": "object", "additionalProperties": false, "properties": {
                         "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] } } },
@@ -322,6 +323,10 @@ fn defs_properties(
                 "base_url": { "type": "string" }, "headers": string_map,
                 "get": { "$ref": "#/$defs/HttpOp" }, "put": { "$ref": "#/$defs/HttpOp" },
                 "list": { "$ref": "#/$defs/HttpOp" }, "delete": { "$ref": "#/$defs/HttpOp" } } }));
+    // RFC 0033 §4: the only knob is where the state lives, and it is optional —
+    // an omitted `path` resolves through $AGENTD_STATE_DIR / $XDG_STATE_HOME.
+    m.insert("StoreFile".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
+                "path": { "type": "string", "description": "the state root; default $AGENTD_STATE_DIR, else $XDG_STATE_HOME/agentd/state, else $HOME/.local/state/agentd/state, else the OS temp dir" } } }));
     m.insert("SkillSource".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["server"], "properties": {
                 "server": { "type": "string" }, "discover": { "enum": ["prompts", "resources", "auto"] }, "filter": { "type": "string" } } }));
     m.insert("WorkflowRef".to_string(), json!({ "type": "object", "required": ["name"], "properties": {

@@ -14,7 +14,7 @@ browser: `agentd tui -c agent.yaml`.
 
 ```
 binary 6.6 MiB static (musl, FROM scratch) · 3.0 MiB download · cold start <1 ms
-idle daemon ~2 MiB RSS · protocols from their own SDKs · HTTPS everywhere · AGPL-3.0
+idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · AGPL-3.0
 ```
 
 - [Why agentd](#why-agentd)
@@ -43,7 +43,7 @@ idle daemon ~2 MiB RSS · protocols from their own SDKs · HTTPS everywhere · A
    small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
    export, the inotify watch — is still hand-rolled on `std` + `libc`. What
    ships is one 6.6 MiB static binary that starts in under a millisecond, idles
-   at ~2 MiB, and lands as a single-layer `FROM scratch` image with no shell, no
+   at 5.5 MiB on one thread, and lands as a single-layer `FROM scratch` image with no shell, no
    libc, and nothing to CVE-scan but agentd itself.
 2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
    tool library and executes nothing locally. Every capability is a **remote MCP
@@ -446,17 +446,18 @@ Shipped release feature set:
 
 ## Footprint (measured)
 
-Measured on the v1.0.0 release build (x86_64, musl, stripped):
+Measured on the v2.1.0 release build (x86_64, musl, stripped, the shipped
+feature set):
 
 | Metric | Value |
 |---|---|
 | Binary (static-PIE, runs on `scratch`) | **6.6 MiB** amd64 · 5.0 MiB arm64 |
 | Release download (amd64) | **3.0 MiB** `.tar.gz` → 6.6 MiB binary |
 | Cold start (`--version` / `--capabilities`) | **< 1 ms** |
-| Idle serving daemon RSS | **~2 MiB**, flat under load |
+| Idle daemon RSS (schedule workflow, file store) | **5.5 MiB**, 1 thread |
+| Idle daemon CPU | **1 jiffy / 6 s** — under 0.2% of a core |
 | Served request overhead (`tools/call`, loopback, fresh conn) | **p50 0.26 ms** |
 | Deterministic workflow steps | **~146k steps/sec** (single lane, 0 model tokens) |
-| Direct external dependencies | **3** (`serde`, `serde_json`, `libc`) |
 
 ## Documentation map
 

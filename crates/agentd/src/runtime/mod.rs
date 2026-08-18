@@ -211,7 +211,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
 
     // The store (RFC 0025). `none` ⇒ an in-process store for a job-shaped
-    // instance (validation already refused long-lived instances without one).
+    // instance: a long-lived one either defaulted to `file` (RFC 0033 §5) or
+    // asked for `none` in writing, which validation already refused.
     let store = match settings.store.kind {
         StoreKind::None => {
             log.warn(
@@ -255,6 +256,28 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             return crate::exit::MCP_REQUIRED_DOWN;
         }
     };
+    // The file store, named out loud (RFC 0033 §5.1). Durability is a property
+    // of the DIRECTORY, not of agentd: on a mounted volume this survives
+    // anything, on a container's writable layer it survives a restart of this
+    // process and not a reschedule. A store that implies more than it delivers
+    // is worse than the exit 2 it replaced, so the path, the life we are in and
+    // whether it was chosen or defaulted are all on one line. Logged after
+    // `restore` because that is where the manifest's `generation` becomes known
+    // (RFC 0025 §6) — a fresh instance has no manifest and is generation 1.
+    if settings.store.kind == StoreKind::File {
+        let root = crate::config::v2::file_store_root(&settings.store);
+        log.info(
+            "store.file",
+            json!({
+                "path": root.display().to_string(),
+                "generation": restored.manifest.as_ref().map(|m| m.generation).unwrap_or(1),
+                // `store.kind` absent from the effective document (files ← env ←
+                // flags) is exactly what `load` defaulted to `file`.
+                "defaulted": loaded.doc.pointer("/store/kind").is_none(),
+                "msg": "durable state is on the local filesystem; it survives a restart of this process but not a move to another host — use store.kind mcp|http for a fleet",
+            }),
+        );
+    }
 
     // Registry (RFC 0028): overrides validated against the connected servers.
     let registry = match Registry::build(&settings, &server_tools) {
@@ -810,6 +833,15 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         "a2a": a2a,
         "interface": {"enabled": s.interface.enabled, "debug": s.interface.debug, "origins": s.interface.origins.len(), "pairing": s.interface.pairing.enabled, "display": {"top": s.interface.display.top, "bottom": s.interface.display.bottom}},
         "store": format!("{:?}", s.store.kind).to_lowercase(),
+        // For the file adapter the kind alone under-reports: what an operator
+        // actually gets depends on the directory it lands in, and on whether
+        // they chose it or the long-lived default did (RFC 0033 §5.1). Additive
+        // and `null` for every other adapter, so the `store` string above stays
+        // the stable answer to "which adapter".
+        "store_file": (s.store.kind == StoreKind::File).then(|| json!({
+            "path": crate::config::v2::file_store_root(&s.store).display().to_string(),
+            "defaulted": loaded.doc.pointer("/store/kind").is_none(),
+        })),
         "lifecycle": {"run_until": format!("{:?}", s.lifecycle.run_until).to_lowercase(), "daemon": s.a2a.listen.is_some() || s.workflows.iter().any(|w| w["steps"].as_object().is_some_and(|st| st.values().any(|n| n["kind"].as_str().is_some_and(|k| matches!(k, "loop" | "schedule" | "subscribe" | "signal" | "event")))))},
     })
 }

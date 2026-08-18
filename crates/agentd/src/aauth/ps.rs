@@ -116,7 +116,8 @@ fn signed_post<T: for<'de> Deserialize<'de>>(
         sig::now_secs(),
         Some(&digest),
     );
-    request::<T>(&u, "POST", &hdrs, &bytes, timeout)
+    // The token endpoint is derived from the operator-configured `ps_url`.
+    request::<T>(&u, "POST", &hdrs, &bytes, timeout, false)
 }
 
 fn signed_get<T: for<'de> Deserialize<'de>>(
@@ -135,7 +136,8 @@ fn signed_get<T: for<'de> Deserialize<'de>>(
         sig::now_secs(),
         None,
     );
-    request::<T>(&u, "GET", &hdrs, &[], timeout)
+    // The poll URL is PS-supplied: vet it.
+    request::<T>(&u, "GET", &hdrs, &[], timeout, true)
 }
 
 fn request<T: for<'de> Deserialize<'de>>(
@@ -144,12 +146,13 @@ fn request<T: for<'de> Deserialize<'de>>(
     hdrs: &[(String, String)],
     body: &[u8],
     timeout: Duration,
+    vetted: bool,
 ) -> Result<T, String> {
     let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
     for (k, v) in hdrs {
         headers.push((k.as_str(), v.as_str()));
     }
-    let mut stream = connect(u, timeout)?;
+    let mut stream = connect(u, timeout, vetted)?;
     let resp = http::send(
         stream.as_mut(),
         &u.host_header(),
@@ -165,9 +168,22 @@ fn request<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&resp.body).map_err(|e| format!("aauth: PS: bad response: {e}"))
 }
 
-fn connect(url: &Url, timeout: Duration) -> Result<Box<dyn http::Stream>, String> {
-    let tcp = http::connect_tcp(&url.host, url.port, timeout)
-        .map_err(|e| format!("aauth: PS connect {}: {e}", url.host))?;
+/// Dial a PS endpoint. `vetted` selects the SSRF-guarded connect, which every
+/// **server-supplied** URL must use: the consent `location` comes verbatim out
+/// of the PS's own JSON, and the poll below repeats a *signed, token-bearing*
+/// GET against it twice a second for up to five minutes. Unguarded, a hostile
+/// or compromised PS aims 600 credential-bearing requests at
+/// `169.254.169.254` or an internal admin endpoint. The configured `ps_url`
+/// itself is an operator choice and dials by name, so a loopback PS still
+/// works for development.
+fn connect(url: &Url, timeout: Duration, vetted: bool) -> Result<Box<dyn http::Stream>, String> {
+    let tcp = if vetted {
+        crate::net::ssrf::connect_vetted(&url.host, url.port, timeout, false)
+            .map_err(|e| format!("aauth: PS connect {}: {e}", url.host))?
+    } else {
+        http::connect_tcp(&url.host, url.port, timeout)
+            .map_err(|e| format!("aauth: PS connect {}: {e}", url.host))?
+    };
     if url.is_tls() {
         #[cfg(feature = "tls")]
         {

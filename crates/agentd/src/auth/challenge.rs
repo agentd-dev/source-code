@@ -28,8 +28,18 @@ struct ResourceMetadata {
 pub fn discover_issuer(resource: &str, timeout: Duration) -> Option<String> {
     // Prefer the metadata URL the server names in its 401 challenge; else the
     // well-known location derived from the resource origin (RFC 9728 §3.1).
-    let meta_url =
-        challenge_metadata_url(resource, timeout).or_else(|| well_known_url(resource))?;
+    // A `resource_metadata` URL the SERVER named is only honoured when it lives
+    // on the resource's own origin. RFC 9728 metadata describes that resource,
+    // so same-origin is where it belongs — and the alternative is a blind GET at
+    // an address a hostile MCP server picks, whose `authorization_servers` answer
+    // then chooses the issuer for the OIDC discovery and token requests that
+    // follow. Cross-origin, we ignore the challenge and use the well-known
+    // location instead of refusing outright, so a misconfigured server degrades
+    // rather than breaks. Same-origin (rather than the SSRF classifier) keeps a
+    // loopback development server working, since its resource is loopback too.
+    let meta_url = challenge_metadata_url(resource, timeout)
+        .filter(|u| same_origin(resource, u))
+        .or_else(|| well_known_url(resource))?;
     let meta: ResourceMetadata = get_json(&meta_url, timeout)?;
     meta.authorization_servers
         .into_iter()
@@ -84,6 +94,17 @@ fn well_known_url(resource: &str) -> Option<String> {
     ))
 }
 
+/// Whether `candidate` has the same scheme, host and port as `base`. Used to
+/// bound a server-named metadata URL to the resource it describes.
+fn same_origin(base: &str, candidate: &str) -> bool {
+    let (Ok(b), Ok(c)) = (Url::parse(base), Url::parse(candidate)) else {
+        return false;
+    };
+    b.scheme.eq_ignore_ascii_case(&c.scheme)
+        && b.host.eq_ignore_ascii_case(&c.host)
+        && b.port == c.port
+}
+
 /// GET + parse JSON, tolerant of a non-2xx / bad body (→ `None`).
 fn get_json<T: serde::de::DeserializeOwned>(url: &str, timeout: Duration) -> Option<T> {
     let url = Url::parse(url).ok()?;
@@ -123,6 +144,38 @@ mod tests {
         );
         // No resource_metadata param → None (fall back to well-known).
         assert_eq!(parse_resource_metadata("Bearer realm=\"x\""), None);
+    }
+
+    #[test]
+    /// A `resource_metadata` URL the server names off the resource's own origin
+    /// is not honoured. Without this, a hostile MCP server answers its 401 with
+    /// `resource_metadata="http://169.254.169.254/latest/meta-data/"`, agentd
+    /// GETs it blind, and whatever comes back names the issuer for every
+    /// authenticated request that follows.
+    #[test]
+    fn a_cross_origin_metadata_url_is_not_honoured() {
+        let res = "https://mcp.example/mcp";
+        assert!(same_origin(res, "https://mcp.example/.well-known/x"));
+        assert!(same_origin(res, "https://MCP.EXAMPLE/other"));
+        // Different host, different scheme, and a different port are all other
+        // origins — the last is the one an attacker reaches for on a shared host.
+        assert!(!same_origin(
+            res,
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(!same_origin(res, "https://evil.example/meta"));
+        assert!(!same_origin(res, "http://mcp.example/meta"));
+        assert!(!same_origin(res, "https://mcp.example:8443/meta"));
+        // A loopback development server keeps working: its resource is loopback
+        // too, so its own metadata URL is same-origin.
+        assert!(same_origin(
+            "http://127.0.0.1:8080/mcp",
+            "http://127.0.0.1:8080/.well-known/oauth-protected-resource"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:8080/mcp",
+            "http://127.0.0.1:9090/x"
+        ));
     }
 
     #[test]

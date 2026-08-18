@@ -891,3 +891,13 @@ details.doc-nav-group[open] > summary::before {
   stroke: #ef4444;
   stroke-dasharray: 4 3;
 }
+
+/* A dot-separated inline list. The separator is a ::before on the item that
+   FOLLOWS it, never a flex child of its own: a standalone separator span is a
+   wrap opportunity, so at narrow widths it gets stranded at the end of a line
+   and reads as a typo. Owned by the next item, it always wraps with it. */
+.speclist > span + span::before {
+  content: "·";
+  margin: 0 0.55rem;
+  opacity: 0.55;
+}

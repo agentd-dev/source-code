@@ -175,14 +175,25 @@ export default function Home() {
 
           <div className="mt-6 flex flex-wrap gap-3 sm:mt-7">
             <Link href="/docs/getting-started/" className="btn btn-primary">
-              Get started
+              Install
             </Link>
             <Link href="/docs/overview/" className="btn">
               How it works
             </Link>
-            <a href="https://github.com/agentd-dev/source-code" className="btn">
-              GitHub ↗
-            </a>
+          </div>
+
+          {/* The claims a sceptical infra reader checks, as measured facts rather
+              than adjectives: the two identity words carry the emphasis, the
+              numbers behind them are the evidence. Four items, not five: a
+              fifth wraps at desktop widths and strands a separator at the end
+              of the first line, which reads as a typo. Figures are the shipped
+              v2.1.0 amd64 artifact — keep them in step with the footprint table
+              in README.md and docs/why-rust.md. */}
+          <div className="speclist mt-7 flex flex-wrap items-center gap-y-1 border-t border-[var(--line)] pt-4 font-mono text-xs text-[var(--dim)]">
+            <span className="text-[var(--fg-strong)]">Rust</span>
+            <span className="text-[var(--fg-strong)]">cloud-native</span>
+            <span>6.6 MiB static binary</span>
+            <span>&lt; 1 ms cold start</span>
           </div>
         </div>
 

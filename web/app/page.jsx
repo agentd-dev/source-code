@@ -165,17 +165,12 @@ export default function Home() {
             <span className="pulse" /> a runtime, not a framework
           </div>
           <h1 className="text-[2rem] font-bold leading-[1.12] tracking-tight text-[var(--fg-strong)] sm:text-[2.75rem] sm:leading-[1.08] lg:text-5xl">
-            agentd is an agent runtime.
+            The runtime for autonomous AI agents.
           </h1>
           <p className="mt-4 max-w-xl text-base text-[var(--fg)] sm:mt-5 sm:text-lg">
-            One static binary. Give it an instruction and tools from remote{" "}
-            <strong className="font-semibold text-[var(--fg-strong)]">MCP</strong> servers, and it
-            runs the agentic loop — think, call a tool, observe, self-correct — as a one-shot job or
-            a long-lived daemon.
-          </p>
-          <p className="mt-4 max-w-xl text-[var(--dim)]">
-            It runs no code of its own: everything the agent can do, you wired. The supervisor that
-            owns its lifecycle holds no model, so it cannot be talked out of stopping it.
+            Run agents as one-shot jobs, long-lived daemons, or durable workflows. Connect a model
+            and <strong className="font-semibold text-[var(--fg-strong)]">MCP</strong> tools; agentd
+            handles execution, supervision, lifecycle, and recovery.
           </p>
 
           <div className="mt-6 flex flex-wrap gap-3 sm:mt-7">

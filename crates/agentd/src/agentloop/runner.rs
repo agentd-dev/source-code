@@ -19,6 +19,7 @@ use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::intel::client::IntelClient;
 use crate::mcp::client::McpClient;
 use crate::obs::log::Logger;
+use crate::subagent::protocol::ALLOWED_TOOLS_ROLE;
 use crate::supervisor::budget::Budget;
 use crate::wire::intel::{Message, Request, ToolDef, Usage};
 use serde_json::{Value, json};
@@ -88,6 +89,13 @@ pub struct Session<'a> {
     resources: ResourceCatalogue,
     model: String,
     messages: Vec<Message>,
+    /// The narrowed tool GRANTS this session runs under (RFC 0009 — a parent's
+    /// `subagent.run` `tools:` list, carried on the seed under
+    /// [`ALLOWED_TOOLS_ROLE`]). Each element is one grant's pattern list, and a
+    /// tool must satisfy EVERY grant: a grant only ever narrows, so intersecting
+    /// is the only safe way to combine two. Empty = ungranted = the full
+    /// catalogue (a root / embedded run, which is nobody's subagent).
+    allowed: Vec<Vec<String>>,
 }
 
 impl<'a> Session<'a> {
@@ -101,7 +109,8 @@ impl<'a> Session<'a> {
         input: &LoopInput,
         self_handler: &mut dyn SelfHandler,
     ) -> Result<Session<'a>, LoopAbort> {
-        let (mut tools, tool_to_server) = build_catalogue(servers)?;
+        let allowed = seed_grants(&input.seed);
+        let (mut tools, mut tool_to_server) = build_catalogue(servers)?;
         // CODE-REGISTERED tools (RFC 0022 §4): first-party wins a name
         // collision — drop the MCP entry so the catalogue offers ONE def per
         // name and it is the one the dispatch will actually run.
@@ -117,6 +126,12 @@ impl<'a> Session<'a> {
         if !resources.owner.is_empty() || self_handler.serves_self_resources() {
             tools.push(resource_read_tool_def());
         }
+        // The parent's narrowed grant lands LAST, over the whole assembled
+        // catalogue (MCP + code + self-tools + `resource.read`) and over the
+        // routing map that governs dispatch — RFC 0009 scope narrows
+        // monotonically, so a grant of `["a"]` means `a` and nothing else, not
+        // "a, plus everything agentd merged in afterwards".
+        narrow_catalogue(&allowed, &mut tools, &mut tool_to_server);
         let mut messages = vec![Message::system(system_prompt(
             input.output_contract.as_deref(),
         ))];
@@ -124,6 +139,11 @@ impl<'a> Session<'a> {
             messages.push(Message::system(note));
         }
         for (role, content) in &input.seed {
+            // The grant is policy, not conversation: it never enters the
+            // transcript (and so never reaches the model as a suggestion).
+            if role == ALLOWED_TOOLS_ROLE {
+                continue;
+            }
             messages.push(seed_message(role, content));
         }
         messages.push(Message::user(&input.instruction));
@@ -134,6 +154,7 @@ impl<'a> Session<'a> {
             resources,
             model: input.model.clone(),
             messages,
+            allowed,
         })
     }
 
@@ -145,7 +166,7 @@ impl<'a> Session<'a> {
     /// catalogue for its whole life. Self-tools and `resource.read` are
     /// re-merged; the transcript is untouched.
     pub fn refresh_tools(&mut self, self_handler: &mut dyn SelfHandler) -> Result<(), LoopAbort> {
-        let (mut tools, tool_to_server) = build_catalogue(self.servers)?;
+        let (mut tools, mut tool_to_server) = build_catalogue(self.servers)?;
         // Same code-tool precedence as `prepare` (RFC 0022 §4).
         let code = crate::tools::defs();
         if !code.is_empty() {
@@ -156,6 +177,10 @@ impl<'a> Session<'a> {
         if !self.resources.owner.is_empty() || self_handler.serves_self_resources() {
             tools.push(resource_read_tool_def());
         }
+        // Re-narrow: a server that ADDS a tool mid-session must not widen a
+        // grant the parent already bounded (the refresh is a live catalogue
+        // rebuild, not a re-grant).
+        narrow_catalogue(&self.allowed, &mut tools, &mut tool_to_server);
         self.tools = tools;
         self.tool_to_server = tool_to_server;
         Ok(())
@@ -189,6 +214,15 @@ impl<'a> Session<'a> {
         } else {
             ToolClass::SelfControl
         }
+    }
+
+    /// Whether this session's GRANT admits `name` (RFC 0009). Every grant must
+    /// admit it; an ungranted session (no parent narrowing) admits everything.
+    /// The catalogue is already filtered, so this is the second gate: it exists
+    /// for the model that names a tool anyway — hallucinated, or remembered from
+    /// a transcript written before a `refresh_tools` narrowed the set.
+    pub fn tool_permitted(&self, name: &str) -> bool {
+        grant_permits(&self.allowed, name)
     }
 
     /// Append the next event as a new user turn — the delivery point for a warm
@@ -363,7 +397,19 @@ impl<'a> Session<'a> {
                     }
                     log.info("tool.call", call);
                     let tool_start = crate::obs::otel::now_unix_nanos();
-                    let (content, is_error) = if tc.name == "resource.read" {
+                    let (content, is_error) = if !self.tool_permitted(&tc.name) {
+                        // Refused, never served: the grant binds the DISPATCH,
+                        // not just the definitions offered. A model that names a
+                        // narrowed-away tool gets an error observation it can
+                        // adapt to, exactly like an unknown tool.
+                        (
+                            format!(
+                                "error: tool '{}' is not in this subagent's allowed tools",
+                                tc.name
+                            ),
+                            true,
+                        )
+                    } else if tc.name == "resource.read" {
                         // An `agentd://` URI reads agentd's own state (e.g. an
                         // async child's completion) via the self-handler; any
                         // other URI is an MCP-server resource.
@@ -502,6 +548,40 @@ fn build_catalogue(
         }
     }
     Ok((tools, routing))
+}
+
+/// The narrowed tool grants a spawn payload carried on its context seed (RFC
+/// 0009): one pattern list per [`ALLOWED_TOOLS_ROLE`] entry. Normally zero (no
+/// narrowing) or one (the supervisor mints exactly one per child).
+fn seed_grants(seed: &[(String, String)]) -> Vec<Vec<String>> {
+    seed.iter()
+        .filter(|(role, _)| role == ALLOWED_TOOLS_ROLE)
+        .map(|(_, content)| crate::subagent::protocol::parse_allowed_tools(content))
+        .collect()
+}
+
+/// Whether every grant admits `name` — patterns are the registry's (`*`, an
+/// exact name, `prefix*`), so a `tools:` list reads the same here as it does in
+/// a workflow `agent` step. No grants ⇒ admitted.
+fn grant_permits(grants: &[Vec<String>], name: &str) -> bool {
+    grants
+        .iter()
+        .all(|g| g.iter().any(|p| crate::registry::pattern_matches(p, name)))
+}
+
+/// Drop everything the grants exclude from an assembled catalogue AND from the
+/// routing map — the map is what `dispatch_tool` consults, so filtering both is
+/// what makes an excluded MCP tool unreachable rather than merely unadvertised.
+fn narrow_catalogue(
+    grants: &[Vec<String>],
+    tools: &mut Vec<ToolDef>,
+    routing: &mut HashMap<String, usize>,
+) {
+    if grants.is_empty() {
+        return;
+    }
+    tools.retain(|t| grant_permits(grants, &t.name));
+    routing.retain(|name, _| grant_permits(grants, name));
 }
 
 /// Route one tool call to its owning server. A transport error is returned as
@@ -726,6 +806,7 @@ mod tests {
             },
             model: "m".into(),
             messages: vec![],
+            allowed: Vec::new(),
         };
         assert_eq!(
             sess.tool_class("runner.code_tool"),
@@ -779,6 +860,7 @@ mod tests {
             },
             model: "m".into(),
             messages: vec![],
+            allowed: Vec::new(),
         };
         // Routed names → Mcp; every self/control name → SelfControl.
         for n in mcp {
@@ -910,6 +992,65 @@ mod tests {
         assert_eq!(session.transcript_len(), transcript, "transcript untouched");
         // And the class boundary still holds: a self-tool is SelfControl.
         assert_eq!(session.tool_class("beta"), ToolClass::SelfControl);
+    }
+
+    #[test]
+    fn a_seed_grant_narrows_the_catalogue_the_dispatch_and_nothing_else() {
+        // RFC 0009 (the `subagent.run` `tools:` grant): a child granted ["alpha"]
+        // sees ONLY alpha — the grant filters the assembled catalogue, and the
+        // dispatch refuses a name the model produces anyway. The grant itself is
+        // policy: it never lands in the transcript.
+        let _guard = crate::tools::test_registry_guard();
+        struct TwoTools;
+        impl SelfHandler for TwoTools {
+            fn tools(&self) -> Vec<ToolDef> {
+                ["alpha", "beta"]
+                    .into_iter()
+                    .map(|n| ToolDef {
+                        name: n.into(),
+                        description: String::new(),
+                        input_schema: Value::Null,
+                    })
+                    .collect()
+            }
+            fn handle(&mut self, _name: &str, _args: &Value) -> Option<(String, bool)> {
+                Some(("served".into(), false))
+            }
+        }
+        let grant = LoopInput {
+            instruction: "x".into(),
+            output_contract: None,
+            seed: vec![
+                (
+                    crate::subagent::protocol::ALLOWED_TOOLS_ROLE.to_string(),
+                    "[\"alpha\"]".to_string(),
+                ),
+                ("user".to_string(), "a real seed message".to_string()),
+            ],
+            model: "m".into(),
+            max_steps: 5,
+            max_tokens: 1000,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            cancel: None,
+        };
+        let mut handler = TwoTools;
+        let narrowed = Session::prepare(&[], &grant, &mut handler).unwrap();
+        assert_eq!(narrowed.tools_len(), 1, "only the granted tool is offered");
+        assert!(narrowed.tool_permitted("alpha"));
+        assert!(
+            !narrowed.tool_permitted("beta"),
+            "a filtered-out tool is refused at dispatch, not served"
+        );
+        // The grant is not conversation: system prompt + the real seed + the
+        // instruction — the marker is gone.
+        assert_eq!(narrowed.transcript_len(), 3);
+
+        // The same payload WITHOUT the grant is the unnarrowed baseline.
+        let mut plain = grant;
+        plain.seed.remove(0);
+        let wide = Session::prepare(&[], &plain, &mut handler).unwrap();
+        assert_eq!(wide.tools_len(), 2);
+        assert!(wide.tool_permitted("beta"));
     }
 
     #[cfg(unix)]

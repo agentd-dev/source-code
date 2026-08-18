@@ -864,12 +864,18 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
 
     // ---- turn completion -------------------------------------------------------
 
+    /// Whether `node`'s unit is still unsettled — no terminal frame ever came
+    /// back from that worker. Asked from the reap path, i.e. AFTER the child
+    /// left the table, so it reads the settled marker `on_turn_done` /
+    /// `on_turn_failed` leave on the record rather than the child's mere
+    /// presence: presence is false for settled and orphaned workers alike.
     pub(crate) fn pending_turn_exists(&self, node: NodeId) -> bool {
-        self.children.get(node).is_some()
+        !self.children.is_settled(node)
     }
 
     pub(crate) fn on_turn_done(&mut self, node: NodeId, turn: TurnResult) {
         self.activity_end(node);
+        self.children.mark_settled(node);
         let Some(child) = self.children.get(node) else {
             return;
         };
@@ -916,10 +922,20 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
 
     pub(crate) fn on_turn_failed(&mut self, node: NodeId, error: String) {
         self.activity_end(node);
-        let Some(child) = self.children.get(node) else {
+        // The child may already be gone: the reap path routes an orphaned
+        // worker's failure here *after* `Children::on_reaped` removed it, and
+        // the kind is what says which unit to fail and which reservation to
+        // release — so fall back to the reaped record rather than returning
+        // and leaking both.
+        let Some(kind) = self
+            .children
+            .get(node)
+            .map(|c| c.kind.clone())
+            .or_else(|| self.children.reaped_kind(node))
+        else {
             return;
         };
-        let kind = child.kind.clone();
+        self.children.mark_settled(node);
         self.log.warn(
             "turn.failed",
             json!({"node": node.0, "kind": super::children::kind_label(&kind), "err": error}),

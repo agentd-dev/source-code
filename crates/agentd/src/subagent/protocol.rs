@@ -244,6 +244,58 @@ pub struct SpawnPayload {
     pub turn: Option<Box<TurnSpec>>,
 }
 
+/// The reserved [`SeedMessage::role`] that carries a child's **tool allow-list**
+/// — `subagent.run`'s `tools:` narrowing (RFC 0009: scope narrows monotonically
+/// down the tree). Minted by the supervisor with
+/// [`SpawnPayload::narrow_tools`], enforced by the child in
+/// [`crate::agentloop::runner::Session::prepare`], which filters its assembled
+/// catalogue AND its dispatch against it.
+///
+/// The grant rides `context_seed` because that is the one part of the payload the
+/// child forwards VERBATIM into the loop's `LoopInput` (`subagent/control.rs`), so
+/// it reaches the one place the catalogue is assembled without a second adapter
+/// hop. The loop CONSUMES it — it is a grant, not a message, and never enters the
+/// transcript. The slash makes it uninhabitable by a real role (`system`/`user`/
+/// `assistant`/`tool`), and the direction is fail-safe: a marker can only ever
+/// REMOVE tools from the grant the supervisor already made, never add one.
+pub const ALLOWED_TOOLS_ROLE: &str = "agentd/allowed-tools";
+
+/// Parse an allow-list marker's body (a JSON array of registry patterns: `*`, an
+/// exact name, `prefix*`). An unreadable body narrows to NOTHING rather than to
+/// everything — a grant that cannot be read is not a grant (fail closed).
+pub fn parse_allowed_tools(content: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(content).unwrap_or_default()
+}
+
+impl SpawnPayload {
+    /// Narrow this child's tool grant to `allow` (RFC 0009). Any allow-list entry
+    /// already in the seed is dropped first, so the SUPERVISOR's mint is the only
+    /// grant the child sees — a caller-supplied `context` array cannot forge or
+    /// widen one. An empty `allow` is a real narrowing to nothing, not "no
+    /// narrowing"; leave the marker off entirely for the unnarrowed case.
+    pub fn narrow_tools(&mut self, allow: &[String]) {
+        self.context_seed.retain(|m| m.role != ALLOWED_TOOLS_ROLE);
+        self.context_seed.insert(
+            0,
+            SeedMessage {
+                role: ALLOWED_TOOLS_ROLE.to_string(),
+                content: serde_json::to_string(allow).unwrap_or_else(|_| "[]".to_string()),
+            },
+        );
+    }
+
+    /// The narrowed grant this payload carries (`None` = unnarrowed: the full
+    /// catalogue the granted servers publish). Reads back what
+    /// [`SpawnPayload::narrow_tools`] minted — including after a restore, which
+    /// re-spawns from the stored payload.
+    pub fn allowed_tools(&self) -> Option<Vec<String>> {
+        self.context_seed
+            .iter()
+            .find(|m| m.role == ALLOWED_TOOLS_ROLE)
+            .map(|m| parse_allowed_tools(&m.content))
+    }
+}
+
 /// A checkpoint-resume reference (RFC 0021 §8.4). Retained for the (dead) v1
 /// `Config` `--workflow-resume` parsing until the full v1-`Config` deletion; the
 /// v1 in-child workflow driver that consumed it was removed with the mode
@@ -603,6 +655,62 @@ mod tests {
             }
             other => panic!("expected intel_health, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn narrow_tools_mints_one_supervisor_grant_and_survives_the_wire() {
+        // RFC 0009: `subagent.run`'s `tools:` is a GRANT the child enforces. It
+        // rides the seed under the reserved role, exactly once, minted by the
+        // supervisor — a forged entry a caller smuggled in through `context` is
+        // dropped, so the child can never see two disagreeing grants.
+        let mut p = payload();
+        p.context_seed.insert(
+            0,
+            SeedMessage {
+                role: ALLOWED_TOOLS_ROLE.into(),
+                content: "[\"*\"]".into(),
+            },
+        );
+        p.narrow_tools(&["knowledge.search".to_string()]);
+        assert_eq!(
+            p.context_seed
+                .iter()
+                .filter(|m| m.role == ALLOWED_TOOLS_ROLE)
+                .count(),
+            1,
+            "one grant only — the forged `*` is gone"
+        );
+        assert_eq!(
+            p.allowed_tools(),
+            Some(vec!["knowledge.search".to_string()])
+        );
+        // The real seed messages are untouched by the mint.
+        assert!(p.context_seed.iter().any(|m| m.content == "prior note"));
+
+        // It survives the control frame (a restore re-spawns from this payload).
+        let msg = ControlMsg::Spawn(Box::new(p));
+        let mut buf = Vec::new();
+        frame::write_frame(&mut buf, &msg).unwrap();
+        let back: ControlMsg =
+            serde_json::from_slice(&frame::read_frame(&mut Cursor::new(buf)).unwrap().unwrap())
+                .unwrap();
+        match back {
+            ControlMsg::Spawn(p) => assert_eq!(
+                p.allowed_tools(),
+                Some(vec!["knowledge.search".to_string()])
+            ),
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unnarrowed_payload_has_no_grant_and_a_broken_one_grants_nothing() {
+        // No marker = no narrowing (the root/embedded shape) — the child keeps
+        // the full catalogue its granted servers publish.
+        assert_eq!(payload().allowed_tools(), None);
+        // A body that will not parse is NOT read as "everything": fail closed.
+        assert!(parse_allowed_tools("not json").is_empty());
+        assert!(parse_allowed_tools("[\"a\",\"b.*\"]").len() == 2);
     }
 
     #[test]

@@ -484,8 +484,21 @@ impl Runtime {
     }
 
     /// A resource update arrived: resolve `wait resource` steps on it.
+    ///
+    /// The notify-then-read runs on an executor thread, never here. This is the
+    /// single-writer loop: an MCP `resources/read` is a network round trip
+    /// bounded only by the server's own patience, so reading inline hands a slow
+    /// (or hostile) server the whole daemon for the length of one read — no
+    /// timer fires, no checkpoint lands, the drain does not progress and SIGTERM
+    /// is not observed. Subscriptions are agentd's reactivity story, so this is
+    /// the hot path. The thread reports back through `events_tx` exactly like
+    /// `step_mcp_resource` and every other asynchronous effect, and the loop
+    /// resolves the waits when that event arrives.
     pub(crate) fn on_resource_updated(&mut self, server: &str, uri: &str) {
-        let mut hits: Vec<(String, String)> = Vec::new();
+        // Each hit carries its own deadline: the loop keeps running while we
+        // read, so a `wait … timeout` may resolve the step as Timeout first, and
+        // a late read must not resurrect a step the loop has already finished.
+        let mut hits: Vec<(String, String, Option<u64>)> = Vec::new();
         for (rid, run) in &self.runs {
             for (sid, st) in &run.steps {
                 if st.status == StepStatus::Suspended
@@ -494,32 +507,43 @@ impl Runtime {
                     && w["server"] == server
                     && w["uri"] == uri
                 {
-                    hits.push((rid.clone(), sid.clone()));
+                    hits.push((rid.clone(), sid.clone(), w["deadline_ms"].as_u64()));
                 }
             }
         }
         if hits.is_empty() {
             return;
         }
-        // Notify-then-read.
-        let content = self
-            .mcp
-            .get(server)
-            .and_then(|c| c.read_resource(uri).ok())
-            .map(|r| {
-                let t = r.text();
-                serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t))
-            });
-        for (rid, sid) in hits {
-            self.finish_step_pub(
-                &rid,
-                &sid,
-                StepStatus::Done,
-                Some(json!({"uri": uri, "server": server, "content": content})),
-                None,
-                0,
-            );
-        }
+        let Some(client) = self.mcp.get(server).cloned() else {
+            return; // the server went away between the notification and here
+        };
+        let tx = self.events_tx.clone();
+        let (srv, u) = (server.to_string(), uri.to_string());
+        std::thread::Builder::new()
+            .name(format!("mcp.updated:{server}"))
+            .spawn(move || {
+                // A failed read still resolves the wait, as the inline read did:
+                // the update itself is the event, and `content: null` says the
+                // follow-up read did not land.
+                let content = client.read_resource(&u).ok().map(|r| {
+                    let t = r.text();
+                    serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t))
+                });
+                for (run, step, deadline_ms) in hits {
+                    if deadline_ms.is_some_and(|d| now_ms() > d) {
+                        continue;
+                    }
+                    let _ = tx.send(super::events::Event::StepDone {
+                        run,
+                        step,
+                        output: json!({"uri": u, "server": srv, "content": content}),
+                        is_error: false,
+                        error: None,
+                        tokens: 0,
+                    });
+                }
+            })
+            .ok();
     }
 
     /// Deliver a named signal: to `wait signal` steps (any run, or `run` only),

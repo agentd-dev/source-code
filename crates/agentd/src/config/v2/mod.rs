@@ -3131,11 +3131,42 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                             .into(),
                     );
                 }
-                // Best practice: a non-loopback webhook surface should authenticate.
-                // Per-node auth is enforced when the route is armed; this nudges the
-                // operator at config time.
-                if !loopback && s.webhooks.default_auth.is_none() {
-                    d.warnings.push("webhooks.listen is non-loopback with no webhooks.default_auth — every webhook node must declare its own `auth` (HMAC recommended)".into());
+                // Symmetric with the `a2a.listen` refusal above: both are inbound
+                // listeners that TRIGGER work, so a reachable one must authenticate
+                // its callers — an open webhook route hands the agent's workflows to
+                // anyone who can reach the port. Auth is resolved per route
+                // (`runtime::webhooks::build_verify`: the node's own `auth`, else the
+                // listener `default_auth`), so refuse only when a route would really
+                // end up unverified — a listener whose every node signs is fine.
+                // `none: true` is the documented loopback-only dev opt-out, not
+                // authentication, so it does not buy an open public bind; the schema
+                // offers no other way to ask for one, and this deliberately does not
+                // invent one.
+                if !loopback && !webhook_default_verifies(s.webhooks.default_auth.as_ref()) {
+                    let mut open: Vec<String> = Vec::new();
+                    let mut nodes = 0usize;
+                    for w in &s.workflows {
+                        let wf = w.get("name").and_then(Value::as_str).unwrap_or("?");
+                        for (node, auth) in webhook_nodes(w) {
+                            nodes += 1;
+                            if !webhook_auth_verifies(auth) {
+                                open.push(format!("{wf}/{node}"));
+                            }
+                        }
+                    }
+                    if !open.is_empty() {
+                        err(
+                            &mut d,
+                            format!(
+                                "webhooks.listen on a non-loopback address needs auth: set webhooks.default_auth (hmac, bearer or header), or give every `webhook` node its own `auth` (HMAC recommended) — unauthenticated: {}",
+                                open.join(", ")
+                            ),
+                        );
+                    } else if nodes == 0 {
+                        // Nothing is reachable yet (every path answers 404), so this
+                        // is not a live hole — but the next node added would be one.
+                        d.warnings.push("webhooks.listen is non-loopback with no webhooks.default_auth — every webhook node must declare its own `auth` (HMAC recommended)".into());
+                    }
                 }
             }
             Err(e) => err(&mut d, format!("webhooks.listen: {e}")),
@@ -3350,6 +3381,56 @@ pub fn workflow_uses_webhook(w: &Value) -> bool {
                         && st.get("on").and_then(Value::as_str) == Some("webhook"))
             })
         })
+}
+
+/// The inbound-webhook routes a raw workflow document arms, as
+/// `(node id, declared auth)`. Two shapes, matching what the listener reads: a
+/// `webhook` start node carries its `auth` at the top level, while a
+/// `wait: {on: webhook}` callback carries it under `webhook.auth`
+/// (`runtime::webhooks::webhook_wait`).
+fn webhook_nodes(w: &Value) -> Vec<(&str, Option<&Value>)> {
+    let Some(steps) = w.get("steps").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    steps
+        .iter()
+        .filter_map(|(id, st)| {
+            let kind = st.get("kind").and_then(Value::as_str);
+            if kind == Some("webhook") {
+                Some((id.as_str(), st.get("auth")))
+            } else if matches!(kind, Some("wait") | Some("await"))
+                && st.get("on").and_then(Value::as_str) == Some("webhook")
+            {
+                Some((id.as_str(), st.get("webhook").and_then(|c| c.get("auth"))))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether a node's declared `auth` actually verifies the caller. This mirrors
+/// `runtime::webhooks::build_verify` INCLUDING its type tests — there a
+/// non-object `hmac`/`header` or a non-string `bearer` is not a verifier and
+/// falls through, so counting it as auth here would bless a route the listener
+/// serves open. `none: true` short-circuits to `Verify::None`, so it is the
+/// opposite of authentication.
+fn webhook_auth_verifies(auth: Option<&Value>) -> bool {
+    let Some(a) = auth else { return false };
+    if a.get("none").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    a.get("hmac").and_then(Value::as_object).is_some()
+        || a.get("header").and_then(Value::as_object).is_some()
+        || a.get("bearer").and_then(Value::as_str).is_some()
+}
+
+/// The same question for the listener-wide `default_auth` (the typed twin,
+/// `runtime::webhooks::build_verify_typed`): `none` wins over everything, and a
+/// declared-but-incomplete verifier still counts — the listener refuses to spawn
+/// on it, which fails closed.
+fn webhook_default_verifies(d: Option<&WebhookAuth>) -> bool {
+    d.is_some_and(|d| !d.none && (d.hmac.is_some() || d.bearer.is_some() || d.header.is_some()))
 }
 
 fn validate_budget(b: &Budget, at: &str, d: &mut Diagnostics) {

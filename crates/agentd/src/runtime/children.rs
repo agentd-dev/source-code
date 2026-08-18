@@ -54,6 +54,12 @@ pub struct Child {
     pub liveness: Liveness,
     pub cancelled: bool,
     pub tokens: u64,
+    /// Whether this child's unit has been settled — a terminal frame
+    /// (`TurnDone` / `Failed`) was folded back into the durable state. The
+    /// reap path needs the answer *after* the record has left the table (see
+    /// [`Children::is_settled`]): the child's mere presence cannot give it,
+    /// because a settled worker also stays in the table until it is reaped.
+    pub settled: bool,
 }
 
 /// The children registry.
@@ -68,6 +74,13 @@ pub struct Children {
     ladder: Option<Ladder>,
     last_ping: Instant,
     ping_seq: u64,
+    /// The child reaped most recently, kept past its removal from `map` as
+    /// `(node, kind, settled)`: the reap path asks "did this worker report a
+    /// terminal frame?" — and, when it did not, needs the kind to route the
+    /// failure and release the reservation the kind carries. One slot is
+    /// enough because the reactor drains reaps one at a time and finishes with
+    /// a node before taking the next.
+    last_reaped: Option<(NodeId, ChildKind, bool)>,
 }
 
 impl Children {
@@ -87,6 +100,7 @@ impl Children {
             ladder: None,
             last_ping: Instant::now(),
             ping_seq: 0,
+            last_reaped: None,
         }
     }
 
@@ -136,6 +150,7 @@ impl Children {
             started: now,
             cancelled: false,
             tokens: 0,
+            settled: false,
         };
         self.pid_to_node.insert(child.sub.pid(), node);
         self.map.insert(node, child);
@@ -160,12 +175,49 @@ impl Children {
         true
     }
 
+    /// A terminal frame was folded back in for `node`: its unit is settled, so
+    /// the reap path must not fail it a second time. Marks the just-reaped
+    /// record too, so a failure routed *from* the reap path is not re-entered.
+    pub fn mark_settled(&mut self, node: NodeId) {
+        if let Some(c) = self.map.get_mut(&node) {
+            c.settled = true;
+        }
+        if let Some((n, _, settled)) = self.last_reaped.as_mut()
+            && *n == node
+        {
+            *settled = true;
+        }
+    }
+
+    /// Whether `node`'s unit has been settled by a terminal frame — answerable
+    /// after the child is gone, which is the only time the question is asked.
+    /// A node we never knew counts as settled: there is nothing left to fail.
+    pub fn is_settled(&self, node: NodeId) -> bool {
+        if let Some(c) = self.map.get(&node) {
+            return c.settled;
+        }
+        match &self.last_reaped {
+            Some((n, _, settled)) if *n == node => *settled,
+            _ => true,
+        }
+    }
+
+    /// The kind of the most recently reaped child, so its failure can still be
+    /// routed (and its reservation released) once `on_reaped` has removed it.
+    pub fn reaped_kind(&self, node: NodeId) -> Option<ChildKind> {
+        match &self.last_reaped {
+            Some((n, kind, _)) if *n == node => Some(kind.clone()),
+            _ => None,
+        }
+    }
+
     /// A child was reaped: forget it and return its record.
     pub fn on_reaped(&mut self, r: &Reaped) -> Option<(NodeId, Child)> {
         let node = self.pid_to_node.remove(&r.pid)?;
         let mut c = self.map.remove(&node)?;
         c.sub.mark_reaped();
         c.liveness.on_eof();
+        self.last_reaped = Some((node, c.kind.clone(), c.settled));
         crate::obs::metrics::record_subagent_exited(match r.outcome {
             crate::supervisor::reap::WaitOutcome::Exited(0) => "completed",
             crate::supervisor::reap::WaitOutcome::Exited(_) => "crashed",

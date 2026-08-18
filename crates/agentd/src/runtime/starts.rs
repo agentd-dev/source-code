@@ -47,6 +47,11 @@ impl Runtime {
     /// after the `once` handling). Schedules the first deadline for `loop`/
     /// `schedule` and subscribes `subscribe` resources.
     pub(crate) fn arm_long_lived_starts(&mut self) {
+        // Boot's last pass over restored state before the loop starts ticking —
+        // and the only one that is NOT also a hot-reload path, so the timer
+        // repair (a run restored with a suspended step whose timer is gone)
+        // rides here rather than re-running on every reload.
+        self.repair_orphaned_timer_waits();
         let specs: Vec<StartSpec> = self
             .workflows
             .values()
@@ -89,14 +94,23 @@ impl Runtime {
     }
 
     fn arm_schedule(&mut self, workflow: &str, node: &str, spec: &Map<String, Value>) {
-        let next = self.next_schedule_ms(spec, now_ms());
+        let st = self.start_state(workflow, node);
+        let at_fired = st["at_fired"].as_bool().unwrap_or(false);
+        let next = self.next_schedule_ms(spec, now_ms(), at_fired);
         if let Some(next) = next {
-            let mut st = self.start_state(workflow, node);
+            let mut st = st;
             st["next_ms"] = json!(next);
             self.set_start_state(workflow, node, st);
             self.log.info(
                 "start.schedule.armed",
                 json!({"workflow": workflow, "node": node, "next_ms": next}),
+            );
+        } else if at_fired {
+            // The one-shot `at` was consumed in an earlier life: nothing to arm,
+            // and nothing wrong either.
+            self.log.info(
+                "start.schedule.done",
+                json!({"workflow": workflow, "node": node, "note": "one-shot `at` already fired"}),
             );
         } else {
             self.log.warn(
@@ -106,8 +120,15 @@ impl Runtime {
         }
     }
 
-    /// The next fire time (ms) for a `schedule` start node.
-    fn next_schedule_ms(&self, spec: &Map<String, Value>, after_ms: u64) -> Option<u64> {
+    /// The next fire time (ms) for a `schedule` start node. `at_fired` is the
+    /// durable "the one-shot `at` has already gone off" flag: once set, `at` is
+    /// out of the running and only a recurrence (`every`/`cron`) can arm again.
+    fn next_schedule_ms(
+        &self,
+        spec: &Map<String, Value>,
+        after_ms: u64,
+        at_fired: bool,
+    ) -> Option<u64> {
         if let Some(every) = spec
             .get("every")
             .and_then(Value::as_str)
@@ -118,9 +139,11 @@ impl Runtime {
         if let Some(at) = spec
             .get("at")
             .and_then(Value::as_str)
+            .filter(|_| !at_fired)
             .and_then(|a| crate::config::parse_duration(a).ok())
         {
-            // `at` (a one-shot delay) — fire once after the delay.
+            // `at` (a one-shot delay) — fire once after the delay, then never
+            // again: it is consumed by its own firing (see `poll_starts`).
             return Some(now_ms() + at.as_millis() as u64);
         }
         #[cfg(feature = "cron")]
@@ -177,6 +200,16 @@ impl Runtime {
                     if let Some(next) = st["next_ms"].as_u64()
                         && now >= next
                     {
+                        // A one-shot `at:` is CONSUMED by this firing. The flag
+                        // is durable in the start state (not an in-memory one)
+                        // because a restart re-arms from that state: without it
+                        // every tick past the instant re-armed `now + at`, so a
+                        // workflow the operator asked to run once at 03:00 ran
+                        // continuously from 03:00 on. A `cron` alongside `at`
+                        // still takes over from here — `at` is then just the
+                        // first occurrence.
+                        let at_fired =
+                            st["at_fired"].as_bool().unwrap_or(false) || spec.contains_key("at");
                         self.fire_start(
                             &workflow,
                             &node,
@@ -185,13 +218,16 @@ impl Runtime {
                             "schedule",
                         );
                         // Arm the following occurrence (catch_up: one — fire once, skip missed).
-                        let following = self.next_schedule_ms(&spec, now);
+                        let following = self.next_schedule_ms(&spec, now, at_fired);
                         let mut st = self.start_state(&workflow, &node);
                         match following {
                             Some(n) => st["next_ms"] = json!(n),
                             None => {
                                 st.as_object_mut().map(|o| o.remove("next_ms"));
                             }
+                        }
+                        if at_fired {
+                            st["at_fired"] = json!(true);
                         }
                         st["last_fired"] = json!(now);
                         self.set_start_state(&workflow, &node, st);

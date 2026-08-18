@@ -823,30 +823,39 @@ impl Runtime {
             return;
         }
         let now = now_ms();
-        let mut done: Vec<(usize, Value, bool)> = Vec::new();
-        for (i, p) in self.pending.iter().enumerate() {
+        // Collect by TARGET, never by index: `reply` re-enters the reactor (a
+        // step outcome cascades through `finish_step` into
+        // `cancel_scoped_children`, which prunes `pending` itself), so an index
+        // remembered across a reply addresses a different entry by the time we
+        // get to it — or one past the end, panicking the reactor thread and
+        // taking the daemon with it. Two `race` branches waiting on the same
+        // deadline are the live case: both land in `done` in one pass, the
+        // winner's reply cancels the loser's branch.
+        let mut done: Vec<(Target, Value, bool)> = Vec::new();
+        for p in self.pending.iter() {
+            let t = &p.target;
             match &p.kind {
                 PendingKind::Await { condition, deadline_ms } => {
                     let data = self.await_data();
                     let vars: Vec<(&str, &Value)> = data.iter().map(|(k, v)| (k.as_str(), v)).collect();
                     match crate::cel::eval_bool(condition.trim().trim_start_matches("CEL:").trim(), &vars) {
-                        Ok(true) => done.push((i, json!({"satisfied": true}), false)),
-                        Ok(false) if now >= *deadline_ms => done.push((i, json!({"satisfied": false, "timed_out": true}), false)),
+                        Ok(true) => done.push((t.clone(), json!({"satisfied": true}), false)),
+                        Ok(false) if now >= *deadline_ms => done.push((t.clone(), json!({"satisfied": false, "timed_out": true}), false)),
                         Ok(false) => {}
-                        Err(e) => done.push((i, Value::String(format!("await: {e}")), true)),
+                        Err(e) => done.push((t.clone(), Value::String(format!("await: {e}")), true)),
                     }
                 }
                 PendingKind::Run { run, deadline_ms } => match self.runs.get(run) {
-                    Some(r) if r.status.is_terminal() => done.push((i, json!({"run": run, "status": r.status, "output": r.output, "error": r.error}), false)),
-                    Some(_) if now >= *deadline_ms => done.push((i, json!({"run": run, "status": "running", "timed_out": true}), false)),
+                    Some(r) if r.status.is_terminal() => done.push((t.clone(), json!({"run": run, "status": r.status, "output": r.output, "error": r.error}), false)),
+                    Some(_) if now >= *deadline_ms => done.push((t.clone(), json!({"run": run, "status": "running", "timed_out": true}), false)),
                     Some(_) => {}
-                    None => done.push((i, Value::String(format!("run {run:?} does not exist")), true)),
+                    None => done.push((t.clone(), Value::String(format!("run {run:?} does not exist")), true)),
                 },
                 PendingKind::Subagent { handle } => {
                     if let Some(s) = self.subagents.get(handle)
                         && super::reactor::is_terminal_status(&s.status)
                     {
-                        done.push((i, json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error}), false));
+                        done.push((t.clone(), json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error}), false));
                     }
                 }
                 // Human gates run their own pass (auto-judge + prune + timeout).
@@ -855,9 +864,16 @@ impl Runtime {
                 | PendingKind::Human { .. } => {}
             }
         }
-        for (i, v, e) in done.into_iter().rev() {
-            let p = self.pending.remove(i);
-            self.reply(&p.target, v, e);
+        for (target, v, e) in done {
+            // A reentrant prune may already have removed (and cancelled) this
+            // entry while we were replying to an earlier one — it is no longer
+            // waiting, so answering it would resurrect a cancelled branch.
+            let len = self.pending.len();
+            self.pending.retain(|p| p.target != target);
+            if self.pending.len() == len {
+                continue;
+            }
+            self.reply(&target, v, e);
         }
         self.poll_pending_human();
     }

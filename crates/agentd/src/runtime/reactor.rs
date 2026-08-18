@@ -431,11 +431,20 @@ impl Runtime {
     }
 
     fn process_inbox(&mut self) {
-        while let Some(ev) = self.inbox_queue.pop_front() {
+        // Drain a SNAPSHOT, never the live deque: a start event that overflows
+        // its workflow's concurrency cap re-queues itself (`on_overflow: queue`,
+        // the default), and the cap can only be relieved by `schedule_runs` — a
+        // LATER step of this tick. Popping from the same deque the requeue
+        // pushes onto re-offers the event immediately and the single-writer
+        // reactor spins at 100% CPU forever: no timers, no checkpoint, no
+        // SIGTERM. Requeued (and newly accepted) events land in the fresh
+        // `self.inbox_queue` and are retried on the next tick instead.
+        let mut batch = std::mem::take(&mut self.inbox_queue);
+        while let Some(ev) = batch.pop_front() {
             if self.draining {
                 // Keep it durable for the next life; stop intake.
-                self.inbox_queue.push_front(ev);
-                return;
+                batch.push_front(ev);
+                break;
             }
             self.counters.inbox_processed += 1;
             match ev.kind.as_str() {
@@ -479,6 +488,10 @@ impl Runtime {
                 }
             }
         }
+        // Whatever the drain did not consume keeps its place ahead of the
+        // events requeued (or accepted) while the batch was processing.
+        batch.append(&mut self.inbox_queue);
+        self.inbox_queue = batch;
     }
 
     pub(crate) fn inbox_done(&mut self, id: &str) {
@@ -572,7 +585,61 @@ impl Runtime {
         self.log.info("child.exit", json!({"node": node.0, "pid": r.pid, "kind": super::children::kind_label(&child.kind), "outcome": format!("{:?}", r.outcome)}));
         // A child that died without its terminal frame: fail its unit.
         match child.kind {
-            ChildKind::RootTurn { .. } | ChildKind::StepTurn { .. } | ChildKind::Think { .. } => {
+            // The old guard asked `pending_turn_exists` — "is the child still in
+            // the table?" — which cannot answer this question from here: a
+            // `TurnDone` settles the step but leaves the child in the table
+            // until it is reaped, and `Children::on_reaped` above has already
+            // removed it, so the guard is false for settled and orphaned workers
+            // alike and the step stayed Running forever. The STEP can answer it:
+            // it is Running and still owned by THIS worker only when no terminal
+            // frame ever landed.
+            ChildKind::StepTurn {
+                ref run,
+                ref step,
+                reservation,
+            } => {
+                let node_owned = node.0.to_string();
+                let orphaned = self
+                    .runs
+                    .get(run)
+                    .and_then(|st| st.step(step))
+                    .is_some_and(|s| {
+                        s.status == crate::engine::StepStatus::Running
+                            && s.worker.as_deref() == Some(node_owned.as_str())
+                    });
+                if orphaned {
+                    // `on_turn_failed` would route this, but it re-reads the
+                    // child table too and returns early on the reaped node; the
+                    // reservation it would have released is released here.
+                    if let Some(res) = reservation {
+                        self.governor.release(res);
+                    }
+                    self.log.warn(
+                        "turn.failed",
+                        json!({"node": node.0, "kind": super::children::kind_label(&child.kind), "err": "worker exited without a result"}),
+                    );
+                    self.on_step_turn_done(
+                        run,
+                        step,
+                        crate::subagent::protocol::TurnResult {
+                            status: "failed".into(),
+                            error: Some(format!(
+                                "worker exited without a result ({:?})",
+                                r.outcome
+                            )),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            // A root turn and a think expose no equivalent state to test here,
+            // so they keep the child-table guard — which, for the reason above,
+            // never fires: routing their failure needs `finish_root_turn` /
+            // `on_think_done`, both private to `turns`, plus a settled marker on
+            // the child record. A think's tool waiter is still answered by the
+            // pending sweep below; a root turn's inbox event stays pending and
+            // replays on restart.
+            ChildKind::RootTurn { .. } | ChildKind::Think { .. } => {
                 if self.pending_turn_exists(node) {
                     self.on_turn_failed(
                         node,

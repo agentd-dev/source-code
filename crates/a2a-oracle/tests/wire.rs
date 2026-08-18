@@ -513,7 +513,10 @@ fn stream_frames_carry_the_id_a_client_resumes_from() {
             frames += 1;
         }
     }
-    assert!(frames > 0, "a streaming send must answer as a stream: {raw}");
+    assert!(
+        frames > 0,
+        "a streaming send must answer as a stream: {raw}"
+    );
     assert!(
         ids > 0,
         "no frame carried an event id, so a disconnected client cannot resume: {raw}"
@@ -597,7 +600,8 @@ fn the_error_codes_peers_branch_on_are_the_specified_ones() {
 
     let v = rpc(&addr, 1, "GetTask", json!({"id": "does-not-exist"}));
     assert_eq!(
-        v["error"]["code"], a2a_rs::domain::error::TASK_NOT_FOUND,
+        v["error"]["code"],
+        a2a_rs::domain::error::TASK_NOT_FOUND,
         "an unknown task must be TaskNotFound, not a generic failure: {v}"
     );
 

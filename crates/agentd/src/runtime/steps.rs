@@ -270,7 +270,12 @@ impl Runtime {
         {
             match w.concurrency.on_overflow {
                 crate::engine::model::OnOverflow::Queue => {
-                    // Keep the event pending; it is retried each tick.
+                    // Keep the event pending; it is retried on a LATER tick.
+                    // Nothing this tick can relieve the cap — only a live run
+                    // reaching a terminal status in `schedule_runs` does, and
+                    // that step has not run yet — so this must not be re-offered
+                    // now. `process_inbox` drains a snapshot for exactly that
+                    // reason: this push lands on the next tick's queue.
                     self.inbox_queue.push_back(ev.clone());
                     return false;
                 }
@@ -343,6 +348,11 @@ impl Runtime {
                 "run.create.fail",
                 json!({"workflow": name, "err": e.to_string()}),
             );
+            // The event stays pending in the DURABLE inbox (only a consumed
+            // start is marked done), so dropping it from the in-memory queue
+            // here would make the start silently vanish until a restart
+            // replays it. Requeue it like an overflow: the next tick retries.
+            self.inbox_queue.push_back(ev.clone());
             return false;
         }
         run.dirty = false;

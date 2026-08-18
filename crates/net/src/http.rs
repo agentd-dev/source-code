@@ -166,7 +166,19 @@ pub fn send<S: Read + Write + ?Sized>(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> io::Result<Response> {
+    // The request TARGET is caller-supplied too — a templated endpoint path or
+    // a peer-supplied A2A push-notification URL — and CR/LF there splits the
+    // request line exactly as it splits a header, letting an injected
+    // `Authorization:` shadow the operator's real one further down. Scanned
+    // before anything is written so the framing layer stays closed on both
+    // caller surfaces, not just headers (RFC 0012).
     let mut req: Vec<u8> = Vec::with_capacity(256 + body.len());
+    if path.contains(['\r', '\n']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CR/LF in request target",
+        ));
+    }
     write!(req, "{method} {path} HTTP/1.1\r\n")?;
     write!(req, "Host: {host_header}\r\n")?;
     req.extend_from_slice(b"Connection: close\r\n");
@@ -297,15 +309,35 @@ fn read_chunked<R: BufRead>(r: &mut R) -> io::Result<Vec<u8>> {
             }
             break;
         }
-        if body.len() + size > MAX_RESPONSE {
+        // The declared size is peer-controlled and unverified until the bytes
+        // actually arrive, so it must never be trusted with arithmetic OR with
+        // an allocation. `size > MAX_RESPONSE` is checked first and the running
+        // total uses `saturating_add`: the plain `body.len() + size` this
+        // replaces wrapped on a size near `usize::MAX` — panicking the process
+        // in debug, and in release wrapping *below* the cap so the check passed
+        // and the allocation below aborted on a multi-exabyte request. That is
+        // remotely reachable: `runtime::mod` dials every configured MCP server
+        // at startup, so a hostile server could kill the daemon at connect time,
+        // defeating the "a down server is only logged" containment.
+        if size > MAX_RESPONSE || body.len().saturating_add(size) > MAX_RESPONSE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "chunked response exceeds cap",
             ));
         }
-        let mut chunk = vec![0u8; size];
-        r.read_exact(&mut chunk)?;
-        body.extend_from_slice(&chunk);
+        // Read the chunk incrementally onto `body` instead of pre-allocating
+        // `size` bytes, so even under the cap a lying header buys the peer an
+        // allocation only as large as the bytes it really sends. A short read
+        // means the peer framed a chunk it never delivered — that is a
+        // truncated response, not an empty one, so it must not parse.
+        let before = body.len();
+        r.by_ref().take(size as u64).read_to_end(&mut body)?;
+        if body.len() - before != size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated chunk",
+            ));
+        }
         // Trailing CRLF after the chunk.
         let mut crlf = [0u8; 2];
         r.read_exact(&mut crlf)?;
@@ -386,7 +418,15 @@ pub fn send_streaming<S: Read + Write>(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> io::Result<StreamingResponse<S>> {
+    // Same request-target scan as [`send`] — this is the MCP path, where the
+    // target comes from server-advertised endpoint metadata.
     let mut req: Vec<u8> = Vec::with_capacity(256 + body.len());
+    if path.contains(['\r', '\n']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CR/LF in request target",
+        ));
+    }
     write!(req, "{method} {path} HTTP/1.1\r\n")?;
     write!(req, "Host: {host_header}\r\n")?;
     req.extend_from_slice(b"Connection: close\r\n");

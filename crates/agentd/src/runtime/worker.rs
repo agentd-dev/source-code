@@ -377,6 +377,7 @@ pub fn run_turn(
             let mut finish_seen = None;
             for (i, tc) in resp.tool_calls.iter().enumerate() {
                 if bridge.cancelled() {
+                    seal_unanswered(&mut delta, &resp.tool_calls[i..], "cancelled");
                     finish_with!("cancelled");
                 }
                 result.tool_calls += 1;
@@ -388,6 +389,7 @@ pub fn run_turn(
                         "the model repeated {} with identical arguments {LOOP_REPEATS} times",
                         tc.name
                     ));
+                    seal_unanswered(&mut delta, &resp.tool_calls[i..], "loop_detected");
                     finish_with!("loop_detected");
                 }
                 let call_start = Instant::now();
@@ -516,6 +518,35 @@ fn render_len(m: &Message) -> String {
                 .collect::<String>()
         ),
         Message::ToolResult { content, .. } => content.clone(),
+    }
+}
+
+/// Answer the tool calls the turn never got to run, so the transcript delta it
+/// reports is self-consistent.
+///
+/// Every provider dialect requires one tool result per `tool_calls` id on the
+/// preceding assistant message, and the tool loop has exits that fire BETWEEN
+/// pushing that assistant message and pushing its results (cancellation between
+/// calls, loop detection on the offending call). The delta is appended verbatim
+/// to the DURABLE context, so an unanswered id is not one lost result: every
+/// later turn and every restart replays the same malformed context and the
+/// provider rejects it with a fatal 400 forever — reported as a retryable
+/// `intel:` failure (exit `INTEL_UNAVAILABLE`), so an external scheduler keeps
+/// retrying a request agentd itself malformed. The synthetic result is an error
+/// result, the same shape [`execute_call`] uses when the supervisor never
+/// answers, so the model sees the call did not happen rather than a made-up
+/// success.
+fn seal_unanswered(delta: &mut Vec<Msg>, unanswered: &[ToolCall], status: &str) {
+    for tc in unanswered {
+        delta.push(Msg::tool(
+            tc.id.clone(),
+            tc.name.clone(),
+            Value::String(format!(
+                "{}: not executed — the turn ended ({status}) before this call ran",
+                tc.name
+            )),
+            true,
+        ));
     }
 }
 
@@ -1030,6 +1061,74 @@ mod tests {
         );
         assert_eq!(r.status, "failed");
         assert!(r.error.as_deref().unwrap().starts_with("intel:"));
+    }
+
+    #[test]
+    fn an_exit_inside_the_tool_loop_answers_every_call_it_persisted() {
+        // Cancellation landing BETWEEN two calls of one assistant message (the
+        // other early exit, loop detection, is covered end to end in
+        // `wedged_context_e2e`). The delta is appended verbatim to the DURABLE
+        // context, so leaving an id unanswered would malform that context for
+        // every later turn and every restart — not just lose one result.
+        struct CancelAfterOneCall(usize);
+        impl Bridge for CancelAfterOneCall {
+            fn tool_request(&mut self, _n: &str, _a: &Value, _d: Instant) -> Option<(Value, bool)> {
+                self.0 += 1;
+                Some((json!({"ok": true}), false))
+            }
+            fn budget_request(&mut self, _e: u64, _d: Instant) -> Option<BudgetReply> {
+                None
+            }
+            fn cancelled(&self) -> bool {
+                self.0 > 0
+            }
+        }
+        // Three DISTINCT calls so loop detection does not fire first.
+        let intel = mock_intel(&json!({"turns": [{"tool_calls": [
+            {"name": "memory.set", "arguments": {"key": "a"}},
+            {"name": "memory.set", "arguments": {"key": "b"}},
+            {"name": "memory.set", "arguments": {"key": "c"}}
+        ]}]}));
+        let mut bridge = CancelAfterOneCall(0);
+        let r = run_turn(
+            &spec(TurnKind::Turn),
+            &limits(),
+            &intel,
+            &FakeMcp,
+            &mut bridge,
+            &log(),
+        );
+        assert_eq!(r.status, "cancelled");
+        // assistant + the one executed result + two sealed ones.
+        assert_eq!(r.messages.len(), 4, "{:?}", r.messages);
+        let answered: Vec<&str> = r
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Tool { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        match &r.messages[0] {
+            Msg::Assistant { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 3);
+                for tc in tool_calls {
+                    assert!(
+                        answered.contains(&tc.id.as_str()),
+                        "tool_call {} has no result: {:?}",
+                        tc.id,
+                        r.messages
+                    );
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(&r.messages[3], Msg::Tool { is_error: true, content, .. }
+                if content.as_str().unwrap_or_default().contains("not executed")),
+            "the sealed result says the call did not happen: {:?}",
+            r.messages[3]
+        );
     }
 
     #[test]

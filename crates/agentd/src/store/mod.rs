@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The **state store** contract and adapters (RFC 0025 §2, §4).
 //!
-//! agentd's durability rests on four operations against a REMOTE store —
+//! agentd's durability rests on four operations —
 //! `put(key, seq, envelope) / get(key[, seq]) / list(prefix) / delete(key)` —
 //! implemented by an adapter chosen in `store.kind`: [`mcp`] (any MCP server's
-//! tools, mapped), [`http`] (plain HTTP), or [`memory`] (in-process; tests and
-//! dev). `put` is a **compare-and-set on `seq`**: the stored seq must be lower,
-//! else `Conflict` — the split-brain guard every caller treats as fatal.
+//! tools, mapped), [`http`] (plain HTTP), [`file`] (the local filesystem, RFC
+//! 0033 — durable for one host, single-writer), or [`memory`] (in-process;
+//! tests and dev). `put` is a **compare-and-set on `seq`**: the stored seq
+//! must be lower, else `Conflict` — the split-brain guard every caller treats
+//! as fatal.
 //! agentd links no database client and defines no schema beyond the
 //! [`Envelope`].
 
+pub mod file;
 pub mod http;
 pub mod mapping;
 pub mod mcp;
@@ -154,7 +157,8 @@ pub trait Store: Send + Sync {
     fn list(&self, prefix: &str) -> Result<Vec<KeySeq>, StoreError>;
     /// Remove a key (optional; `Unsupported` ⇒ callers tombstone via `put`).
     fn delete(&self, key: &str) -> Result<(), StoreError>;
-    /// The adapter kind (`mcp` / `http` / `memory`), for status and metrics.
+    /// The adapter kind (`mcp` / `http` / `file` / `memory`), for status and
+    /// metrics.
     fn kind(&self) -> &'static str;
 }
 
@@ -224,6 +228,22 @@ pub fn open(
                 cfg.clone(),
                 timeout,
             ))))
+        }
+        StoreKind::File => {
+            // The root is resolved by the config module (RFC 0033 §4) so the
+            // startup log, `--capabilities` and this open all name the same
+            // directory. `store.file` may be absent entirely — the chain then
+            // runs on the environment alone.
+            let root = crate::config::v2::file_store_root(settings);
+            // `open` takes the exclusive instance lock, and a held lock arrives
+            // as `Io` (RFC 0033 §4.1) carrying the holder's pid. Name the
+            // adapter in front of it: the operator reads this at exit, where
+            // "store i/o: …" alone would not say which store or which path.
+            let store = file::FileStore::open(&root).map_err(|e| match e {
+                StoreError::Io(m) => StoreError::Io(format!("store.file: {m}")),
+                other => other,
+            })?;
+            Ok(Some(Arc::new(store)))
         }
         StoreKind::Http => {
             let cfg = settings.http.as_ref().ok_or_else(|| {

@@ -234,9 +234,11 @@ so the figure described code nobody was running, and the local build it was
 "correcting" had been right. Provenance is part of a measurement: an artifact is
 only authoritative once you know what it was built from.
 
-An idle daemon running a schedule workflow: `Threads: 1`, `VmRSS` 3.8–3.9 MiB,
-and **0 CPU ticks** over 10 seconds at `CLK_TCK=100` — under 0.1% of a core,
-despite the 200 ms tick.
+An idle daemon running a schedule workflow, on the shipped v2.1.0 build with a
+file store: `Threads: 1`, `VmRSS` **5.5 MiB**, and **1 CPU tick** over 6 seconds
+at `CLK_TCK=100` — under 0.2% of a core, despite the 200 ms tick. (The earlier
+3.8–3.9 MiB here, and the ~2 MiB the README used to claim, both predated the
+protocol SDKs. Neither had been re-measured since.)
 
 Spawn cost is easily misquoted. A loop of 100 `agentd --version` invocations
 costs ~2.7 ms each on this build, against a `/bin/true` floor of ~0.93 ms —

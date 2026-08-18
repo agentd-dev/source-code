@@ -43,7 +43,7 @@ impl FileStore {
         fs::create_dir_all(root)
             .map_err(|e| StoreError::Io(format!("store dir {}: {e}", root.display())))?;
         restrict_dir(root);
-        let lock = LockFile::acquire(&root.join(LOCK)).map_err(|e| StoreError::Io(e))?;
+        let lock = LockFile::acquire(&root.join(LOCK)).map_err(StoreError::Io)?;
         Ok(FileStore {
             root: root.to_path_buf(),
             _lock: lock,
@@ -108,7 +108,13 @@ impl Store for FileStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| StoreError::Io(format!("mkdir {}: {e}", parent.display())))?;
-            restrict_dir(parent);
+            // Every level, not just the leaf: `create_dir_all` makes the
+            // intermediate directories with the process umask (0755 by
+            // default), and a key is `<prefix>/<instance>/<kind>/<id>` — three
+            // levels deep. The root's own 0700 hides them today, but a root the
+            // operator points somewhere pre-existing would not, and each level
+            // names an instance and an entity kind.
+            restrict_tree(&self.root, parent);
         }
         let body = serde_json::to_vec(envelope)
             .map_err(|e| StoreError::Mapping(format!("envelope: {e}")))?;
@@ -214,6 +220,19 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// `0700` on every directory from `root` (exclusive) down to `leaf` (inclusive).
+fn restrict_tree(root: &Path, leaf: &Path) {
+    let Ok(rel) = leaf.strip_prefix(root) else {
+        restrict_dir(leaf);
+        return;
+    };
+    let mut p = root.to_path_buf();
+    for comp in rel.components() {
+        p.push(comp);
+        restrict_dir(&p);
+    }
 }
 
 /// `0700` on a state directory: it holds conversation content and tool results.

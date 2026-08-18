@@ -119,8 +119,8 @@ RFC 0011 §5).
 | `intelligence.swap_policy` / `dialect` / `auth` are coherent | `intelligence.dialect: bedrock requires intelligence.auth.kind = aws (SigV4)` |
 | every `mcp.servers[]` has a unique non-reserved name, a valid endpoint, and parseable tags | `mcp.servers[]: a server has an empty name` · `mcp.servers[]: duplicate server name 'fs'` · `mcp server 'a': mcp endpoint must be https://host[:port][/path] (got: ftp://x)` |
 | every server reference resolves (`store.mcp.server`, `knowledge.server`, `search.server`, `skills.sources[].server`, `tools.overrides[].server`) | `store.mcp.server 'state' is not a declared MCP server` |
-| the chosen `store.kind` carries its block | `store.kind is mcp but store.mcp is not set` · `store.http needs at least 'get' and 'put' operations` |
-| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`webhook` start node) configures a durable `store` | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: mcp \| http)` |
+| the chosen `store.kind` carries its block | `store.kind is mcp but store.mcp is not set` · `store.http needs at least 'get' and 'put' operations` · `store.file.path is empty — set a directory, or omit the field to use $AGENTD_STATE_DIR / $XDG_STATE_HOME/agentd/state` |
+| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`webhook` start node) has a durable `store` — it now **defaults** to `kind: file` (§12.3), so this only fires when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
 | every workflow is named, unique, and has exactly one of `file` \| `uri` \| `steps` | `workflows['w'] must have exactly one of file \| uri \| steps` |
 | every inline workflow parses under the dialect-3 node registry — the *same* parse the runtime runs at startup | `workflow "w" step "s": unknown field "every" for kind "loop" (allowed: interval, delay, until, max_iterations, backoff, inputs)` |
 | an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, and a non-loopback bind authenticates its clients | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing` |
@@ -137,7 +137,8 @@ RFC 0011 §5).
 Non-fatal findings come back on the same channel as
 `{"event":"config.warning","msg":…}` and do **not** change the exit code — a
 `store.kind: none` one-shot (not durable: a crash re-runs it), a
-`store.kind: memory` (state does not survive the process), a non-loopback
+`store.kind: memory` (state does not survive the process), a `store.file` block
+sitting beside a `kind` that is not `file` (dead config, ignored), a non-loopback
 `webhooks.listen` with no `webhooks.default_auth`, an `interface.debug` with the
 interface off, and an unknown `interface.display` item.
 
@@ -426,10 +427,11 @@ long-lived **daemon**, and what wakes it:
 | `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `idempotency`, `respond` |
 
 The **long-lived** kinds — `loop`, `schedule`, `subscribe`, `signal`, `event`,
-`webhook` — make the instance a daemon under `run_until: auto`, and a daemon
-**must** configure a durable `store` (§2). A bare `a2a.listen` does the same
-without any start node: an inbound A2A message becomes a conversation turn
-directly. (There is also an `a2a` *start-node* kind in the registry; the engine
+`webhook` — make the instance a daemon under `run_until: auto`, and a daemon is
+**durable**: with no `store` section it gets `kind: file` on the local filesystem
+(§12.3), and an explicit `kind: none` on a daemon is exit `2` (§2). A bare
+`a2a.listen` does the same without any start node: an inbound A2A message
+becomes a conversation turn directly. (There is also an `a2a` *start-node* kind in the registry; the engine
 does not execute it yet, and refuses a workflow that uses one —
 `agentd --workflow-schema` reports each kind's `implemented` flag.)
 
@@ -546,6 +548,7 @@ the credential is always redacted. Example shapes:
 ```json
 {"event":"config.warning","msg":"store.kind is none: this one-shot run is not durable (a crash re-runs it from scratch); set store.kind for durability"}
 {"event":"config.invalid","msg":"a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set"}
+{"event":"store.file","path":"/var/lib/agentd","generation":3,"defaulted":true,"msg":"durable state is on the local filesystem; it survives a restart of this process but not a move to another host — use store.kind mcp|http for a fleet"}
 ```
 
 Once the configuration is accepted the supervisor announces itself:
@@ -715,7 +718,7 @@ each path is equally reachable from env and flags (§1.1), so
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `pricing`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
-| `store` | `kind` (`mcp`\|`http`\|`memory`\|`none`), the matching `mcp{}`/`http{}` operation mapping, `prefix`, `timeout`, `on_error`, `durability{}`, `checkpoint{}`, `audit`. |
+| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. |
 | `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` references (§6). |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck` (RFC 0026). |
 | `limits` | `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
@@ -726,6 +729,73 @@ each path is equally reachable from env and flags (§1.1), so
 | `memory`, `context`, `knowledge`, `search`, `skills` | Working-memory caps, context window/compaction, and the MCP servers backing knowledge, search, and the skill catalogue. |
 | `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink}`. |
 | `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`. |
+
+**The `store` section, and the default a daemon now gets.** `store.kind` picks
+the adapter: `mcp` (a coordination MCP server's `state.*` tools), `http` (a plain
+HTTP key-value endpoint), `file` (this host's filesystem), `memory` (in-process,
+lost on exit — dev only), `none` (no durable state). Set it and it wins. Leave
+the whole section out and the **shape of the instance** decides (RFC 0033 §5):
+
+| instance shape | default `store.kind` |
+|---|---|
+| one-shot (no long-lived start node, no listener, no `goal`) | `none` — unchanged. A job that quietly began writing state to disk would surprise everyone who runs one. |
+| long-lived (§6) | **`file`** — where it used to be exit `2`. |
+
+That exit `2` was the wrong order of business: the first `schedule` anybody
+wrote refused to start until they had stood up a coordination backend. Durability
+should be what a laptop already satisfies; a shared backend is what you graduate
+to when you have a fleet.
+
+```yaml
+store:
+  kind: file
+  file:
+    path: /var/lib/agentd     # optional — the chain below applies when it is unset
+  prefix: agentd              # as for every adapter (default `agentd`)
+```
+
+**Where the directory comes from**, first that applies — the same chain the
+credential cache uses (RFC 0031 §11), so it is one chain to learn:
+
+1. `store.file.path`
+2. `$AGENTD_STATE_DIR`
+3. `$XDG_STATE_HOME/agentd/state`
+4. `$HOME/.local/state/agentd/state`
+5. the OS temp dir — the last resort; the startup line names the path it landed
+   on, and state under `/tmp` survives a restart of the process but not a reboot
+
+Under that root the keys are the ordinary ones — `<prefix>/<instance>/<kind>/<id>`
+(RFC 0025 §3.1) — one JSON file per key, every path segment percent-encoded (so
+an id of `../..` is a filename, never a directory hop). Nothing about the key
+changes with the adapter, so an instance that outgrows `file` and moves to `mcp`
+keeps the identity of everything it wrote.
+
+Four things to know before relying on it:
+
+- **One process per directory, enforced.** On open the adapter takes an
+  exclusive `flock` on `<root>/.lock`; a second one fails at startup naming the
+  holder — `… is locked by pid 4131 — another agentd is using this state
+  directory; give this instance its own agent.name or store.file.path`. A
+  directory has no compare-and-set that a second process would respect, so
+  rather than pretend, it refuses. Two replicas need `mcp` or `http` (§13).
+- **Identity is `agent.name`.** It is what the `<instance>` segment holds (with
+  the usual fallback to the downward-API pod name, then `HOSTNAME`), so a
+  restart finds its state again by being the same agent — not by a hash of the
+  configuration, which would abandon in-flight work the first time somebody
+  added an MCP server or fixed a typo. Renaming the agent is an unambiguous "this
+  is a different instance".
+- **Durability is the filesystem's, not agentd's.** The runtime says which
+  directory it landed in, once, at startup (`{"event":"store.file",…}`, §10),
+  including whether the path was chosen or defaulted; `--capabilities` carries
+  the same as `store_file: {path, defaulted}`. On a container's writable layer
+  the state survives a process restart and **not** a reschedule — mount a
+  volume, or use `mcp`/`http` ([`deployment.md`](deployment.md)).
+- **`0700` directories, `0600` files, no encryption at rest.** The state holds
+  conversation content and tool results, and is protected exactly as the
+  credential cache is: by the user the daemon runs as. If that is not enough,
+  point `store.file.path` at an encrypted volume. No tool the model can call
+  reaches it — there is no `fs` tool, and the store is the runtime's own ledger,
+  not part of the agent's surface.
 
 **Secrets stay out of the file.** Four paths are credential-bearing and are
 **rejected outright** when a file supplies a literal: `intelligence.token`,
@@ -838,6 +908,11 @@ comes from, and the store.
 So a fleet partitions **upstream**: one queue subscription per replica, or a
 coordination server that hands out work and takes it back when a lease expires.
 Both are described, with working config, in [`scaling.md`](scaling.md).
+
+One consequence for the store: a fleet needs `kind: mcp` or `kind: http`. The
+`file` adapter (§12.3) is a single-writer store and says so at startup — the
+second process to open the directory fails with the first one's pid rather than
+interleaving writes into it.
 
 ---
 

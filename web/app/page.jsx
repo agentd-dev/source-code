@@ -421,7 +421,7 @@ export default function Home() {
 COPY agentd /agentd
 ENTRYPOINT ["/agentd"]
 
-# 3.0 MiB download · cold start <1 ms · idle ~2 MiB RSS`}</Term>
+# 3.0 MiB download · cold start <1 ms · idle 5.5 MiB RSS`}</Term>
         </div>
       </Section>
 

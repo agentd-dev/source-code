@@ -698,6 +698,7 @@ pub struct Store {
     pub prefix: Option<String>,
     pub mcp: Option<StoreMcp>,
     pub http: Option<StoreHttp>,
+    pub file: Option<StoreFile>,
     pub checkpoint: Checkpoint,
     pub durability: Durability,
     pub on_error: StoreOnError,
@@ -716,9 +717,69 @@ impl Store {
 pub enum StoreKind {
     Mcp,
     Http,
+    /// The local filesystem (RFC 0033): one file per key under a root
+    /// directory, single-writer, durable to whatever the filesystem is.
+    File,
     Memory,
     #[default]
     None,
+}
+
+/// `store.file` (RFC 0033 §4). The only setting is where the state lives; the
+/// adapter needs nothing else, so the block itself is optional — `kind: file`
+/// with no block resolves the root from the environment ([`file_store_root`]).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StoreFile {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// The `file` store's root directory (RFC 0033 §4), first that applies:
+/// `store.file.path`, `$AGENTD_STATE_DIR`, `$XDG_STATE_HOME/agentd/state`,
+/// `$HOME/.local/state/agentd/state`, else the OS temp dir.
+///
+/// This is deliberately the same chain — and the same order — that
+/// [`crate::auth::cache::default_dir`] uses for the credential cache, one
+/// sibling over (`state` beside `creds`): an operator who has learned where
+/// agentd keeps its tokens already knows where it keeps its state, and one
+/// `XDG_STATE_HOME` moves both. Resolution lives here, next to the schema, so
+/// the startup log, `--capabilities` and [`crate::store::open`] all name the
+/// one directory instead of each re-deriving it.
+///
+/// The last resort is the OS temp dir: a store that is *there* survives a
+/// process restart but not a reboot, which is why the runtime logs the
+/// resolved path and whether it was defaulted (RFC 0033 §5.1) rather than
+/// letting a user believe more than the filesystem delivers.
+pub fn file_store_root(store: &Store) -> std::path::PathBuf {
+    file_store_root_in(store, &|k| std::env::var_os(k))
+}
+
+/// [`file_store_root`] with the environment injected. The chain is the part
+/// worth testing and the process env is shared by every test in this binary,
+/// so the lookup is a parameter — the same shape `unresolved_secret_ref` uses.
+fn file_store_root_in(
+    store: &Store,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(p) = store.file.as_ref().and_then(|f| f.path.as_deref()) {
+        return PathBuf::from(p);
+    }
+    if let Some(d) = env("AGENTD_STATE_DIR") {
+        return PathBuf::from(d);
+    }
+    if let Some(d) = env("XDG_STATE_HOME") {
+        return PathBuf::from(d).join("agentd").join("state");
+    }
+    if let Some(h) = env("HOME") {
+        return PathBuf::from(h)
+            .join(".local")
+            .join("state")
+            .join("agentd")
+            .join("state");
+    }
+    std::env::temp_dir().join("agentd").join("state")
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1369,6 +1430,23 @@ impl Settings {
             .ok()
             .filter(|h| !h.trim().is_empty())
             .unwrap_or_else(|| "agentd".to_string())
+    }
+
+    /// Whether this instance OUTLIVES a single run — it serves A2A or webhooks,
+    /// watches a goal, or owns a workflow with a long-lived start node
+    /// (`loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`webhook`).
+    ///
+    /// This is the durability predicate (RFC 0025 §durability, RFC 0033 §5): a
+    /// job-shaped run can lose its state and simply be re-run, an instance that
+    /// keeps running cannot. Two callers need the same answer — [`load`], which
+    /// defaults such an instance to the file store, and [`validate`], which
+    /// refuses an EXPLICIT `store.kind: none` here — so the predicate lives in
+    /// one place rather than being spelled twice and drifting.
+    pub fn is_long_lived(&self) -> bool {
+        self.a2a.listen.is_some()
+            || self.webhooks.listen.is_some()
+            || self.goal.is_some()
+            || self.workflows.iter().any(workflow_is_long_lived)
     }
 }
 
@@ -2063,7 +2141,29 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     }
 
     // --- type + validate ---
-    let settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
+    let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
+    // --- RFC 0033 §5: durability a laptop already satisfies ---
+    //
+    // A long-lived instance that names no store used to exit 2 and ask for a
+    // coordination backend before the operator had run anything. It now gets the
+    // FILE adapter: durable to whatever filesystem it lands on, and the runtime
+    // says so at startup (`store.file`) rather than implying more (§5.1).
+    //
+    // "Absent" is read off the effective DOCUMENT, not off `settings.store.kind`
+    // — `StoreKind` derives `Default = None`, so the typed value cannot tell a
+    // config that said nothing from one that said `none`. `doc` is the merged
+    // file ← env ← flag layers, so `--store-kind none` / `AGENTD_STORE_KIND=none`
+    // count as explicit exactly like the YAML key does. That distinction is the
+    // whole point: an operator who WROTE `none` on a long-lived instance still
+    // gets the diagnostic (validate, below), because silently overriding a
+    // stated choice is worse than refusing to start.
+    //
+    // A one-shot instance is deliberately untouched and keeps `none`: a job that
+    // suddenly began writing state to disk would surprise every existing user of
+    // it, and re-running it is already the recovery story.
+    if doc.pointer("/store/kind").is_none() && settings.is_long_lived() {
+        settings.store.kind = StoreKind::File;
+    }
     let mut loaded = Loaded {
         settings,
         doc,
@@ -2762,6 +2862,21 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 }
             }
         },
+        StoreKind::File => {
+            // No block is required: `kind: file` alone resolves a root from the
+            // environment (RFC 0033 §4). The one thing that cannot work is an
+            // explicit empty path — it would resolve to the process's working
+            // directory, so it is refused here rather than discovered as a
+            // state directory nobody meant to create.
+            if let Some(f) = &s.store.file
+                && f.path.as_deref().is_some_and(|p| p.trim().is_empty())
+            {
+                err(
+                    &mut d,
+                    "store.file.path is empty — set a directory, or omit the field to use $AGENTD_STATE_DIR / $XDG_STATE_HOME/agentd/state".into(),
+                );
+            }
+        }
         StoreKind::Memory => {
             d.warnings.push(
                 "store.kind is memory: state does not survive the process (dev/test only)".into(),
@@ -2771,17 +2886,31 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             // A job-shaped instance (one-shot workflows, no listener) may run
             // without a store — a crash re-runs it. Anything long-lived MUST
             // be durable (RFC 0025): an A2A listener or a long-lived start node.
-            let long_lived_wf = s.workflows.iter().any(workflow_is_long_lived);
-            if s.a2a.listen.is_some()
-                || s.webhooks.listen.is_some()
-                || s.goal.is_some()
-                || long_lived_wf
-            {
-                err(&mut d, "store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|a2a|webhook start node) — configure a durable store (store.kind: mcp | http)".into());
+            //
+            // Reaching here with a long-lived instance now means the operator
+            // WROTE `none` (RFC 0033 §5): the absent case was defaulted to the
+            // file store back in `load`. So the message says how to take the
+            // default back, not just which backends exist.
+            if s.is_long_lived() {
+                err(&mut d, "store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default".into());
             } else if !s.workflows.is_empty() {
                 d.warnings.push("store.kind is none: this one-shot run is not durable (a crash re-runs it from scratch); set store.kind for durability".into());
             }
         }
+    }
+    // The mirror of the checks above: each adapter validates the block it needs,
+    // so a block that belongs to an adapter that is not selected is dead config.
+    // Silence would be the wrong answer — `store.file.path` set beside
+    // `kind: mcp` reads like state on disk and is not — but so would refusing to
+    // start, since the block does no harm; the operator is told it is ignored.
+    if s.store.file.is_some() && s.store.kind != StoreKind::File {
+        d.warnings.push(format!(
+            "store.file is set but store.kind is {} — the file adapter is not in use and the block is ignored",
+            // The Debug name lowercased is exactly the YAML spelling of the
+            // variant (`serde(rename_all = "lowercase")`), so the warning
+            // quotes back what the operator wrote.
+            format!("{:?}", s.store.kind).to_lowercase()
+        ));
     }
     if let Some(ms) = s.store.checkpoint.debounce_ms
         && ms > 60_000
@@ -3318,6 +3447,9 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "store.prefix",
     "store.mcp",
     "store.http",
+    // Moving the state directory under a running instance would strand every
+    // key it has written, so it joins the other store paths as restart-only.
+    "store.file",
     "lifecycle.run_until",
     "lifecycle.drain_timeout",
     "lifecycle.run_id",
@@ -3835,9 +3967,9 @@ mod tests {
     }
 
     #[test]
-    fn a_long_lived_instance_needs_a_durable_store() {
-        // An A2A listener ⇒ durable store required.
-        let e = load(
+    fn a_long_lived_instance_defaults_to_the_file_store_but_an_explicit_none_is_refused() {
+        // An A2A listener is long-lived ⇒ the file store, not the old exit 2.
+        let (l, _) = load(
             &args(&[
                 "--instruction",
                 "x",
@@ -3846,19 +3978,36 @@ mod tests {
             ]),
             &base_env(),
         )
-        .unwrap_err();
-        assert!(format!("{e}").contains("durable store"), "{e}");
-        // A long-lived start node ⇒ required too.
+        .unwrap();
+        assert_eq!(l.settings.store.kind, StoreKind::File);
+        // A long-lived start node ⇒ the same default.
         let f = write_tmp(
-            "config_version: \"2\"\nworkflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n",
+            "config_version: \"2\"\nworkflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
             "yaml",
         );
-        let e = load(
+        let (l, _) = load(
             &args(&["--config", f.path().to_str().unwrap()]),
             &base_env(),
         )
+        .unwrap();
+        assert_eq!(l.settings.store.kind, StoreKind::File);
+        // …but a STATED `none` is still refused: the default fills a silence, it
+        // does not overrule an operator (RFC 0033 §5).
+        let e = load(
+            &args(&[
+                "--config",
+                f.path().to_str().unwrap(),
+                "--store.kind",
+                "none",
+            ]),
+            &base_env(),
+        )
         .unwrap_err();
-        assert!(format!("{e}").contains("durable store"), "{e}");
+        assert!(format!("{e}").contains("long-lived"), "{e}");
+        // A one-shot job keeps `none` — the default deliberately does not move
+        // for the shape that can simply be re-run.
+        let (l, _) = load(&args(&["--instruction", "x"]), &base_env()).unwrap();
+        assert_eq!(l.settings.store.kind, StoreKind::None);
         // memory is accepted (with a warning).
         let (l, _) = load(
             &args(&["--instruction", "x", "--store.kind", "memory"]),
@@ -4210,6 +4359,125 @@ mod tests {
         assert!(s.agent.tools.code.allows("anything"));
         assert!(
             Settings::from_document(json!({"limits": {"run": {"deadline": "soon"}}}), "t").is_err()
+        );
+    }
+
+    // ---- the file store (RFC 0033) --------------------------------------------
+
+    #[test]
+    fn file_store_root_walks_the_chain_in_order() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let env = |pairs: Vec<(&'static str, &'static str)>| {
+            move |k: &str| -> Option<OsString> {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(*v))
+            }
+        };
+        let all = vec![
+            ("AGENTD_STATE_DIR", "/state-dir"),
+            ("XDG_STATE_HOME", "/xdg"),
+            ("HOME", "/home/a"),
+        ];
+        let with_file = |path: Option<&str>| Store {
+            file: Some(StoreFile {
+                path: path.map(str::to_string),
+            }),
+            ..Store::default()
+        };
+
+        // 1. store.file.path wins over every environment variable.
+        assert_eq!(
+            file_store_root_in(&with_file(Some("/var/lib/agentd")), &env(all.clone())),
+            PathBuf::from("/var/lib/agentd")
+        );
+        // 2. $AGENTD_STATE_DIR is taken verbatim — an operator naming the
+        //    directory does not get `agentd/state` appended to it.
+        assert_eq!(
+            file_store_root_in(&with_file(None), &env(all.clone())),
+            PathBuf::from("/state-dir")
+        );
+        // 3. $XDG_STATE_HOME, with the agentd/state suffix (`creds` sibling).
+        assert_eq!(
+            file_store_root_in(&Store::default(), &env(all[1..].to_vec())),
+            PathBuf::from("/xdg/agentd/state")
+        );
+        // 4. $HOME/.local/state/… — the XDG default spelled out.
+        assert_eq!(
+            file_store_root_in(&Store::default(), &env(all[2..].to_vec())),
+            PathBuf::from("/home/a/.local/state/agentd/state")
+        );
+        // 5. Last resort: the OS temp dir (non-durable; the runtime says so).
+        assert_eq!(
+            file_store_root_in(&Store::default(), &env(vec![])),
+            std::env::temp_dir().join("agentd").join("state")
+        );
+        // The chain is the credential cache's, one sibling over: same order,
+        // same suffix shape, `state` where `creds` is.
+        assert!(
+            file_store_root_in(&Store::default(), &env(all[1..].to_vec()))
+                .ends_with("agentd/state")
+        );
+    }
+
+    #[test]
+    fn file_store_validation_diagnostics() {
+        // `kind: file` needs no block at all.
+        let l = load_doc("config_version: \"2\"\nstore: {kind: file}\n").unwrap();
+        assert_eq!(l.settings.store.kind, StoreKind::File);
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+        // …and a long-lived instance is satisfied by it (no `store.kind is none`).
+        let l = load_doc(
+            "config_version: \"2\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\na2a: {listen: \"http://127.0.0.1:8080\"}\n",
+        )
+        .unwrap();
+        assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
+        assert_eq!(
+            file_store_root(&l.settings.store),
+            std::path::PathBuf::from("/var/lib/agentd")
+        );
+
+        // An explicitly empty path would resolve to the working directory.
+        let e = load_doc("config_version: \"2\"\nstore: {kind: file, file: {path: \"\"}}\n")
+            .unwrap_err();
+        assert!(format!("{e}").contains("store.file.path is empty"), "{e}");
+
+        // A block belonging to an adapter that is not selected is dead config:
+        // a warning (it is ignored), not a refusal (it does no harm).
+        let l = load_doc(
+            "config_version: \"2\"\nstore: {kind: memory, file: {path: /var/lib/agentd}}\n",
+        )
+        .unwrap();
+        let d = validate(&l);
+        assert!(d.errors.is_empty(), "{:?}", d.errors);
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("store.file is set but store.kind is memory")),
+            "{:?}",
+            d.warnings
+        );
+        // No warning when the file adapter IS the selected one.
+        let l =
+            load_doc("config_version: \"2\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\n")
+                .unwrap();
+        assert!(
+            !validate(&l)
+                .warnings
+                .iter()
+                .any(|w| w.contains("store.file")),
+            "{:?}",
+            validate(&l).warnings
+        );
+        // Changing the state directory under a running instance is restart-only.
+        assert_eq!(
+            restart_only_diff(
+                &json!({"store": {"kind": "file", "file": {"path": "/a"}}}),
+                &json!({"store": {"kind": "file", "file": {"path": "/b"}}})
+            ),
+            vec!["store.file".to_string()]
         );
     }
 

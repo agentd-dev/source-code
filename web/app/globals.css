@@ -177,13 +177,7 @@ a {
 .menu > summary {
   list-style: none;
   cursor: pointer;
-  display: inline-flex;
-  align-items: center;
   gap: 0.3rem;
-  padding: 0.35rem 0.6rem;
-  border-radius: 6px;
-  font-size: 0.875rem;
-  color: var(--dim);
 }
 .menu > summary::-webkit-details-marker {
   display: none;
@@ -205,6 +199,7 @@ a {
 .menu[open] > summary {
   color: var(--fg-strong);
   background: var(--panel-2);
+  border-color: var(--line);
 }
 .menu-panel {
   position: absolute;
@@ -242,15 +237,35 @@ a {
   background: var(--line);
   margin: 0.3rem 0.2rem;
 }
-.nav-link {
-  padding: 0.35rem 0.6rem;
-  border-radius: 6px;
-  font-size: 0.875rem;
-  color: var(--dim);
+/* Every control in the header is the same 2rem box. A text link, a menu trigger
+   and an icon button sit in one row, so their height, corner radius and hover
+   inset all have to agree — and `.nav-link` used to take its height from
+   line-height instead (21px + 11.2px padding = 32.2px against the icon buttons'
+   exact 32px), which left the mobile "Docs" link a pixel proud of the two icons
+   beside it, with a 6px radius against their 7px. Height and border are stated
+   here rather than inferred so the row cannot drift again. */
+/* In `@layer components` because this sets `display`, and the mobile-only Docs
+   link carries `md:hidden`. Rules in this file are otherwise unlayered, which
+   in Tailwind v4 beats every utility — an unlayered `display: inline-flex` here
+   would silently override `hidden` and show the link on desktop, where the full
+   nav already offers it. Layered, the utility wins. */
+@layer components {
+  .nav-link,
+  .menu > summary {
+    display: inline-flex;
+    align-items: center;
+    height: 2rem;
+    padding: 0 0.6rem;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    font-size: 0.875rem;
+    color: var(--dim);
+  }
 }
 .nav-link:hover {
   color: var(--fg-strong);
   background: var(--panel-2);
+  border-color: var(--line);
 }
 .icon-btn {
   display: inline-flex;

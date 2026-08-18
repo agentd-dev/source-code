@@ -5,6 +5,139 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.2.0 — durability by default, and the defects a real review found
+
+The headline feature is small and the bug list is not. A multi-agent review of
+the 2.1.0 tree raised 34 findings; 33 survived adversarial refutation, and the
+worst of them wedged the daemon on **default configuration**. This release is
+that list, closed, plus the store that should have existed all along.
+
+Crates: `agentd-core` / `agentd-cli` / `agentd-conformance` **2.2.0**,
+`agentd-net` **0.4.0** (new public API), `agentd-mcp` **0.3.1**. The display
+clients ship as `@agentd-dev/cli` **2.2.0**; the image is
+`ghcr.io/agentd-dev/agentd:2.2.0`.
+
+### Added
+
+- **A local file store (RFC 0033), and durability by default.** A long-lived
+  instance — a schedule, a subscription, an A2A listener, a goal — used to exit
+  `2` unless you had already stood up an MCP or HTTP coordination backend.
+  Durability should be something a laptop already satisfies. `store.kind: file`
+  is a full adapter: seq CAS, atomic writes (tmp → fsync → rename → fsync dir),
+  `0700` directories and `0600` files at every level, path traversal closed at
+  the adapter, and an exclusive `flock` so two instances on one directory fail
+  at startup naming the holder's pid rather than interleaving into corruption.
+
+  Identity is **`agent.name`**, not a hash of the config. A hash looks automatic
+  and is actively harmful: adding an MCP server or fixing a typo changes it, so
+  the agent starts fresh, abandons its in-flight workflows and orphans the old
+  state — silently, from the most ordinary edit anyone makes. The digest is kept
+  where it belongs, in the manifest, logging `store.config_changed` and resuming
+  anyway. `--fresh` exposes the generation counter the manifest already had.
+
+  One-shot runs are unchanged (they still write nothing), and an explicit
+  `store.kind: none` is still refused. Durability is the filesystem's property,
+  not agentd's: on a container's writable layer this survives a restart but not
+  a reschedule, and the defaulted store says exactly that at startup.
+
+### Fixed (BREAKING for two configurations — see the last two entries)
+
+**Ship-blockers.**
+
+- **The reactor livelocked on its own default concurrency policy.** A start
+  event over the cap was pushed back onto the deque `process_inbox` was
+  draining, and the cap can only be relieved by a later step of the same tick.
+  The single writer spun at 100% CPU forever: no timers, no checkpoints, no
+  SIGTERM. `on_overflow: queue` is the default and `max_runs` defaults to 4, so
+  a workflow with no `concurrency:` block at all wedged the daemon on its fifth
+  concurrent start. The default path had never been executed past the cap.
+- **One malformed request killed the daemon.** A `SendMessage` whose `params`
+  was not an object panicked the A2A listener through serde_json's `IndexMut`,
+  and the release profile is `panic = "abort"`.
+- **A hostile chunk header aborted the process** — the accumulated-length check
+  overflowed. Reachable at startup, since agentd dials every configured MCP
+  server then.
+- **`poll_pending` removed by a stale index**, panicking the reactor when a
+  reply re-entered and pruned the table underneath it.
+- **A turn ending mid-tool-call wedged its context permanently**: an assistant
+  message with `tool_calls` no result ever answered, replayed from durable
+  state on every later turn and every restart.
+- **A dead turn worker never failed its step.** The guard asked whether the
+  child was still in the table; the reap path removes it first.
+
+**Security.**
+
+- **The SSRF guard was decorative.** It resolved a name, classified the
+  addresses, then discarded them — and the callers dialled by *name*, resolving
+  a second time. Hostile DNS answered the check with a public address and the
+  connect with `169.254.169.254`. The guarded URLs are exactly the model- and
+  peer-supplied ones. Now resolve-once, dial the vetted address, re-assert on
+  every entry at the syscall boundary; TLS/SNI and `Host` stay on the hostname.
+- **Two more credential-bearing dials took their URL from the remote side** —
+  the AAuth Person-Server consent poll (a signed, token-bearing GET repeated
+  twice a second for five minutes at a PS-chosen address) and RFC 9728
+  discovery (whose answer then chose the issuer for the authenticated flow).
+- **`SubscribeToTask` attached to any task id** with no ownership check.
+- **A `{{secret:…}}` that failed to resolve was silently dropped**, so the
+  daemon started and dialled the model with the `authorization` header absent.
+- **`subagent.run`'s `tools` narrowing was accepted and never enforced** — the
+  grant was written into the spawn payload and read by nothing, so a parent
+  bounding an untrusted sub-task got a child with the full catalogue.
+- **A discovered `.agentd.yml` could lift the lethal-trifecta gate** — `cd` into
+  a repo you cloned, run a flags-only `agentd`, and that repo's dotfile governed
+  your grant. Discovery is a convenience and may no longer relax a security
+  control; an explicitly named `--config` still can. *(Behaviour change for
+  anyone relying on 2.1.0 discovery to configure security settings.)*
+- **A non-loopback `webhooks.listen` with no auth was a warning**, while
+  `a2a.listen` in the same situation was a hard error. Both are inbound
+  listeners that trigger work. It is an error now, checked per route.
+  *(Breaking: a public webhook listener with an unauthenticated route now exits
+  `2`. Set `webhooks.default_auth`, or give the node its own `auth`.)*
+
+**Correctness and robustness.**
+
+- `cancel_scoped_children` matched nothing: element and branch children are
+  keyed `parent[ix].step` / `parent{branch}.step`, which never start with
+  `parent.`, so the `foreach`/`parallel` failure paths and the `race` timeout
+  cancelled no child, disarmed no timer and dropped no pending entry.
+- `timeout` on `race`, `join` and `workflow.wait` was silently dead — the parser
+  stripped it before the handlers read it.
+- A `schedule` with `at:` re-armed forever: a job asked to run once at 03:00 ran
+  continuously from 03:00 onward.
+- `Timers::fire` deleted the durable timer *before* checkpointing its effect,
+  orphaning the suspended step on a crash in that window. Restore gained a
+  repair pass for a `Suspended` step whose timer did not come back.
+- The reactor did a synchronous MCP `resources/read` on the single-writer
+  thread, stalling timers, checkpoints, drain and SIGTERM for up to the MCP
+  timeout — on the subscription path, which is agentd's whole reactivity story.
+- Compaction could leave an assistant message first, which the Anthropic dialect
+  cannot send; the context is durable, so one bad fold poisoned every later turn.
+- MCP elicitation could not work: the answer was a bare string (so every
+  request became `cancel`), the notification stream dialled without the request
+  signer, and an interleaved server→client request was buffered until timeout.
+- The A2A task id counter reset to 0 on restart while tasks were restored, so a
+  new message silently joined a restored task.
+- The A2A `config` command returned the raw merged settings, credentials in the
+  clear, over a remote protocol surface.
+- Non-ASCII in a JSON/JSONC config was silently mojibake'd by a byte-wise
+  comment stripper.
+- The observation feed never signalled `resync` when a client's cursor was ahead
+  of it, so display clients silently stopped receiving events after a restart.
+- The HTTP request reader bounded neither header bytes nor header count.
+- `principals::bare()` leaked a String per request on an attacker-controlled
+  method name.
+- `intelligence.budget.windows[].reset` panicked instead of exiting `2` on a
+  multi-byte character.
+
+### Changed
+
+- The measured footprint is re-measured rather than inherited. Idle RSS is
+  **5.5 MiB** on one thread with a schedule workflow and a file store, and one
+  CPU jiffy per six seconds. The README claimed ~2 MiB and `why-rust.md`
+  3.8–3.9 MiB; both predated the protocol SDKs and neither had been re-measured.
+  The README's footprint table also drops its retired three-dependency row and
+  its stale v1.0.0 attribution.
+
 ## v2.1.0 — a project config, and a build that needs no C toolchain
 
 ### Added

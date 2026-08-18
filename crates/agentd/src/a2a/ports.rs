@@ -21,7 +21,8 @@
 //! answer with the spec's own error for "not here" rather than a half-built
 //! result.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use a2a_rs::domain::{
     A2AError, ContextId, ListTasksParams, ListTasksResult, Message, Task as WireTask,
@@ -32,6 +33,7 @@ use a2a_rs::port::{
     AsyncMessageHandler, AsyncNotificationManager, AsyncStreamingHandler, AsyncTaskLifecycle,
     AsyncTaskQuery, RequestContext, StreamingSubscriber,
 };
+use futures_util::TryStreamExt;
 use serde_json::{Value, json};
 
 use crate::a2a::Principal;
@@ -95,6 +97,50 @@ tokio::task_local! {
     /// dispatch. Unset means nobody is being served, which reads as anonymous —
     /// the role the authorization matrix refuses everything.
     static CALLER: Principal;
+
+    /// The tasks this request has *proved* its caller may watch.
+    ///
+    /// The spec's streaming port takes a task id and nothing else — no caller,
+    /// no context — so the fan-out cannot tell one principal's task from
+    /// another's, and attaching to an id is otherwise attaching to whatever
+    /// that id names. Ownership lives in the reactor, and the reactor already
+    /// answers the question on every task read, so the answer is recorded here
+    /// as the request goes past and read back at the one place a subscription
+    /// is made ([`SharedStreaming::combined_update_stream`]).
+    ///
+    /// Scoped alongside [`CALLER`], per request; the entries never outlive it.
+    static STREAMABLE: StreamAuthz;
+}
+
+/// One request's stream-authorization ledger: task id ⇒ may this caller see it.
+///
+/// Shared (`Arc`) rather than owned because a subscription outlives the request
+/// that opened it — the SSE body is polled long after the handler returned — and
+/// a send's verdict does not exist yet when its subscription is made.
+#[derive(Clone, Default)]
+struct StreamAuthz(Arc<Mutex<HashMap<String, bool>>>);
+
+impl StreamAuthz {
+    /// Record the reactor's verdict on one task.
+    fn record(&self, task_id: &str, allowed: bool) {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.insert(task_id.to_string(), allowed);
+        }
+    }
+
+    /// The verdict, or `None` for "this request has not asked yet".
+    fn verdict(&self, task_id: &str) -> Option<bool> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|seen| seen.get(task_id).copied())
+    }
+}
+
+/// The ledger of the request being served. `None` means no request is — which
+/// is nobody's subscription, and so grants nothing.
+fn streamable() -> Option<StreamAuthz> {
+    STREAMABLE.try_with(StreamAuthz::clone).ok()
 }
 
 /// Run `f` with `who` as the caller for the duration of one request.
@@ -102,7 +148,9 @@ pub async fn with_caller<F, T>(who: Principal, f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    CALLER.scope(who, f).await
+    CALLER
+        .scope(who, STREAMABLE.scope(StreamAuthz::default(), f))
+        .await
 }
 
 /// The caller of the request being served.
@@ -172,7 +220,17 @@ impl AsyncMessageHandler for RuntimePorts {
         if !task_id.is_empty() {
             params["taskId"] = json!(task_id);
         }
-        task_from(self.call("SendMessage", params, &who).await?)
+        let task = task_from(self.call("SendMessage", params, &who).await?)?;
+        // The task the reactor made for this message belongs to this caller —
+        // and it is the *only* task this send authorizes. A send that named
+        // somebody else's task id does not continue it (the reactor starts a
+        // fresh one instead), so the id it named stays unrecorded and the
+        // subscription the protocol layer opened on it ahead of this call
+        // never delivers. See [`STREAMABLE`].
+        if let Some(seen) = streamable() {
+            seen.record(&task.id, true);
+        }
+        Ok(task)
     }
 }
 
@@ -188,10 +246,16 @@ impl AsyncTaskLifecycle for RuntimePorts {
 
     async fn get(&self, id: &TaskId, history_length: Option<u32>) -> Result<WireTask, A2AError> {
         let who = caller();
-        let mut t = task_from(
-            self.call("GetTask", json!({"id": id.as_str()}), &who)
-                .await?,
-        )?;
+        let got = self.call("GetTask", json!({"id": id.as_str()}), &who).await;
+        // The reactor answers a read with the ownership matrix already applied —
+        // somebody else's task is "not found", so existence is not disclosed —
+        // which makes this verdict exactly the one a subscription needs. A
+        // `SubscribeToTask` reads the task before it attaches, so recording it
+        // here is what lets the attach refuse. See [`STREAMABLE`].
+        if let Some(seen) = streamable() {
+            seen.record(id.as_str(), got.is_ok());
+        }
+        let mut t = task_from(got?)?;
         if let Some(n) = history_length {
             t = t.with_limited_history(Some(n));
         }
@@ -305,11 +369,17 @@ impl AsyncNotificationManager for RuntimePorts {
 
 /// The streaming half: a2a-rs's own in-memory fan-out, shared.
 ///
-/// agentd has nothing to add to it — the reactor publishes transitions in
-/// through [`StreamSink`], and every subscriber, replay buffer and
-/// stream-termination rule is the protocol layer's. This exists only because the
-/// adapter takes the handler by value while the reactor needs a handle to the
-/// same one.
+/// agentd adds one thing to it — authorization. Every subscriber, replay buffer
+/// and stream-termination rule is the protocol layer's, and the reactor
+/// publishes transitions in through [`StreamSink`]; but the fan-out is keyed by
+/// task id alone, and agentd's tasks belong to principals. Attaching is
+/// therefore gated on the same ownership the task reads enforce (see
+/// [`STREAMABLE`]) — without it, naming another principal's task id was enough
+/// to watch its transitions and, with a `Last-Event-ID`, to replay its result
+/// artifact.
+///
+/// The type exists at all because the adapter takes the handler by value while
+/// the reactor needs a handle to the same one.
 pub struct SharedStreaming(pub Arc<a2a_rs::adapter::InMemoryStreamingHandler>);
 
 #[async_trait::async_trait]
@@ -373,6 +443,23 @@ impl AsyncStreamingHandler for SharedStreaming {
     > {
         self.0.artifact_update_stream(task_id).await
     }
+    /// The one place a subscription is made — every streaming method in the
+    /// protocol layer arrives here — and so the one place ownership is checked.
+    ///
+    /// The two ways in reach it from opposite directions, which is why the
+    /// answer is given in two ways:
+    ///
+    /// * A **subscribe** (`SubscribeToTask`) reads the task first, so the
+    ///   verdict is already in. A caller that may not read the task may not
+    ///   watch it either, and it is refused with the same "not found" the read
+    ///   gave it — a non-owner must not learn from the difference that the task
+    ///   exists.
+    /// * A **send** attaches *before* the message is processed, deliberately, so
+    ///   that a task settling immediately cannot be missed. Nothing is known
+    ///   about the id at that moment — it came off the wire — so the
+    ///   subscription is made as before and the verdict applied at the first
+    ///   poll, by which time the send has recorded the task it really created.
+    ///   Anything still unproved by then delivers nothing.
     async fn combined_update_stream(
         &self,
         task_id: &str,
@@ -383,7 +470,27 @@ impl AsyncStreamingHandler for SharedStreaming {
         >,
         A2AError,
     > {
-        self.0.combined_update_stream(task_id, from_event_id).await
+        let seen = streamable();
+        if seen.as_ref().and_then(|s| s.verdict(task_id)) == Some(false) {
+            return Err(A2AError::TaskNotFound(task_id.to_string()));
+        }
+        let inner = self
+            .0
+            .combined_update_stream(task_id, from_event_id)
+            .await?;
+        if seen.as_ref().and_then(|s| s.verdict(task_id)) == Some(true) {
+            return Ok(inner);
+        }
+        let id = task_id.to_string();
+        Ok(Box::pin(
+            futures_util::stream::once(async move {
+                match seen.and_then(|s| s.verdict(&id)) {
+                    Some(true) => Ok(inner),
+                    _ => Err(A2AError::TaskNotFound(id)),
+                }
+            })
+            .try_flatten(),
+        ))
     }
 }
 

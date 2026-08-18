@@ -42,6 +42,19 @@ const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
 /// Cap on a request body (JSON-RPC frames are small; this bounds a hostile peer).
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// Cap on the whole request HEAD — request line plus every header line. A body
+/// is bounded by its declared `Content-Length`; a head is bounded by nothing the
+/// peer tells us, so it has to be bounded by us: without this, one connection
+/// that never sends a newline grows a `String` until the process dies, and it
+/// can do that BEFORE authenticating (the head is read to find the credential).
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+
+/// Cap on the number of header lines kept. The byte cap already bounds the
+/// total, but 64 KiB of four-byte headers is still ~13k `Vec` entries and every
+/// `RequestParts::header` lookup is a linear scan over them — so bound the count
+/// as well. Real callers send a handful.
+const MAX_HEADERS: usize = 100;
+
 /// A verified mTLS peer's identity, surfaced to trust classification (RFC 0029
 /// §10.3). All-empty for a plain / no-client-cert connection. rustls has already
 /// verified the chain; these fields are only *read* from the leaf certificate.
@@ -256,8 +269,22 @@ fn serve_conn<S: Read + Write + Send + 'static>(
     opts: &ServeOptions,
 ) {
     let mut reader = BufReader::new(stream);
-    let Some(req) = read_request(&mut reader) else {
-        return; // malformed / EOF before a full request
+    let req = match read_request(&mut reader) {
+        Ok(req) => req,
+        // A refused head is answered, not just dropped: 431 is a real answer a
+        // client can act on, and it costs nothing — the peer never got past the
+        // reader, so no handler and no auth decision was involved.
+        Err(ReadError::HeadTooLarge) => {
+            let _ = write_simple(
+                reader.get_mut(),
+                431,
+                "Request Header Fields Too Large",
+                b"request head exceeds the header size/count limits",
+                None,
+            );
+            return;
+        }
+        Err(ReadError::Incomplete) => return, // malformed / EOF before a full request
     };
 
     // DNS-rebinding defense (Streamable HTTP security MUST / RFC 0005): a browser
@@ -704,8 +731,19 @@ fn serve_conn_raw<S: Read + Write + Send + 'static>(
     handler: &Arc<dyn RawHandler>,
 ) {
     let mut reader = BufReader::new(stream);
-    let Some(req) = read_request(&mut reader) else {
-        return;
+    let req = match read_request(&mut reader) {
+        Ok(req) => req,
+        Err(ReadError::HeadTooLarge) => {
+            let _ = write_simple(
+                reader.get_mut(),
+                431,
+                "Request Header Fields Too Large",
+                b"request head exceeds the header size/count limits",
+                None,
+            );
+            return;
+        }
+        Err(ReadError::Incomplete) => return,
     };
     // Webhook callers are servers, not browsers — loopback-only origins here.
     if matches!(check_origin(&req.headers, &[]), OriginCheck::Denied) {
@@ -808,22 +846,55 @@ fn next_session_id() -> String {
     format!("s-{millis:x}-{n:x}")
 }
 
-/// Read one HTTP/1.1 request (request line, headers, `Content-Length` body).
-/// Returns `None` on EOF-before-request or a malformed head.
-fn read_request<S: Read>(reader: &mut BufReader<S>) -> Option<HttpRequest> {
+/// Why a request could not be read.
+enum ReadError {
+    /// EOF before a complete request, a malformed head, or an over-long body —
+    /// nothing worth answering; the connection is dropped.
+    Incomplete,
+    /// The head blew [`MAX_HEAD_BYTES`] / [`MAX_HEADERS`]. Answered `431` so the
+    /// peer learns why, rather than being cut off mid-sentence.
+    HeadTooLarge,
+}
+
+/// Read one head line (request line or header), spending from `budget`. The
+/// budget bounds the READ itself rather than being checked after the fact: a
+/// line is refused before it is buffered, which is the whole point — a peer that
+/// never sends a newline must not be able to make us allocate for it. `Ok(0)`
+/// is EOF.
+fn read_head_line<S: Read>(
+    reader: &mut BufReader<S>,
+    budget: &mut usize,
+    line: &mut String,
+) -> Result<usize, ReadError> {
+    // `budget + 1`: a line that exactly fills the budget still terminates inside
+    // it, and one byte more is what proves the cap was blown.
+    let n = Read::take(&mut *reader, *budget as u64 + 1)
+        .read_line(line)
+        .map_err(|_| ReadError::Incomplete)?;
+    if n > *budget {
+        return Err(ReadError::HeadTooLarge);
+    }
+    *budget -= n;
+    Ok(n)
+}
+
+/// Read one HTTP/1.1 request (request line, headers, `Content-Length` body)
+/// under the head bounds above.
+fn read_request<S: Read>(reader: &mut BufReader<S>) -> Result<HttpRequest, ReadError> {
+    let mut budget = MAX_HEAD_BYTES;
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).ok()? == 0 {
-        return None;
+    if read_head_line(reader, &mut budget, &mut request_line)? == 0 {
+        return Err(ReadError::Incomplete);
     }
     let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
+    let method = parts.next().ok_or(ReadError::Incomplete)?.to_string();
+    let target = parts.next().ok_or(ReadError::Incomplete)?.to_string();
 
     let mut headers = Vec::new();
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 {
+        if read_head_line(reader, &mut budget, &mut line)? == 0 {
             break;
         }
         let line = line.trim_end();
@@ -831,6 +902,9 @@ fn read_request<S: Read>(reader: &mut BufReader<S>) -> Option<HttpRequest> {
             break; // end of headers
         }
         if let Some((k, v)) = line.split_once(':') {
+            if headers.len() >= MAX_HEADERS {
+                return Err(ReadError::HeadTooLarge);
+            }
             let name = k.trim().to_ascii_lowercase();
             let value = v.trim().to_string();
             if name == "content-length" {
@@ -840,13 +914,15 @@ fn read_request<S: Read>(reader: &mut BufReader<S>) -> Option<HttpRequest> {
         }
     }
     if content_length > MAX_BODY {
-        return None;
+        return Err(ReadError::Incomplete);
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
+        reader
+            .read_exact(&mut body)
+            .map_err(|_| ReadError::Incomplete)?;
     }
-    Some(HttpRequest {
+    Ok(HttpRequest {
         method,
         target,
         headers,

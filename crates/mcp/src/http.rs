@@ -322,6 +322,29 @@ impl HttpTransport {
         }
     }
 
+    /// The AAuth headers for ONE dial (RFC 0023): the signature over
+    /// `@method`/`@authority`/`@path` (over `body` too when the server requires a
+    /// content-digest cover), plus the optional `AAuth-Capabilities` advert.
+    /// Empty without a signer — the endpoint is then called unsigned.
+    ///
+    /// Every dial goes through here, not just the request POST: a signed server
+    /// answers an unsigned dial with a challenge, and on the long-lived
+    /// notification stream that failure is silent in the worst way — the daemon
+    /// keeps answering requests and simply never wakes.
+    fn auth_headers(&self, method: &str, body: &[u8]) -> Vec<(String, String)> {
+        match &self.signer {
+            Some(s) => {
+                let authority = self.endpoint.host_header();
+                let mut sig = s.sign(method, authority, self.endpoint.http_path(), body);
+                if let Some(caps) = s.capabilities() {
+                    sig.push(("AAuth-Capabilities".into(), caps));
+                }
+                sig
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// POST one JSON-RPC message. For a REQUEST (`id` present), return the JSON-RPC
     /// response with the matching id — parsed from the `application/json` body or
     /// pumped out of the `text/event-stream` (queuing any interleaved
@@ -416,20 +439,9 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
-        // AAuth request signing (RFC 0023): sign over @method/@authority/@path
-        // (+ content-digest when the server requires it). Owned strings kept
-        // alive in `signed` for the borrow.
-        let signed: Vec<(String, String)> = match &self.signer {
-            Some(s) => {
-                let authority = self.endpoint.host_header();
-                let mut sig = s.sign("POST", authority, self.endpoint.http_path(), body);
-                if let Some(caps) = s.capabilities() {
-                    sig.push(("AAuth-Capabilities".into(), caps));
-                }
-                sig
-            }
-            None => Vec::new(),
-        };
+        // AAuth request signing (RFC 0023). Owned strings kept alive in `signed`
+        // for the borrow.
+        let signed = self.auth_headers("POST", body);
         for (k, v) in &signed {
             headers.push((k.as_str(), v.as_str()));
         }
@@ -543,6 +555,16 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
+        // The push channel is signed exactly like the request path — an
+        // `auth:`-configured server rejects an unsigned GET, and losing this
+        // stream costs the daemon its whole reactivity story. The
+        // challenge/re-sign loop stays on the POST path: this dial only ever
+        // happens post-initialize, so the signer has already satisfied whatever
+        // the server required and signs from what it learned there.
+        let signed = self.auth_headers("GET", b"");
+        for (k, v) in &signed {
+            headers.push((k.as_str(), v.as_str()));
+        }
         let resp = http::send_streaming(
             stream,
             self.endpoint.host_header(),
@@ -593,6 +615,12 @@ impl HttpTransport {
             headers.push((k, v));
         }
         for (k, v) in &self.headers {
+            headers.push((k.as_str(), v.as_str()));
+        }
+        // Signed like any other POST: the modern era's listen stream IS the
+        // notification channel, so an unsigned dial loses reactivity the same way.
+        let signed = self.auth_headers("POST", body);
+        for (k, v) in &signed {
             headers.push((k.as_str(), v.as_str()));
         }
         let resp = http::send_streaming(

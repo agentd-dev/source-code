@@ -280,7 +280,11 @@ impl Runtime {
             }
             "parallel" | "race" => {
                 let branches: Vec<String> = step.branches.keys().cloned().collect();
-                json!({"kind": step.kind, "branches": branches, "results": {}, "errors": {}, "started_ms": now_ms(), "min_success": spec.get("min_success").and_then(Value::as_u64), "timeout_ms": spec.get("timeout").and_then(crate::engine::model::duration_ms_opt)})
+                // `timeout` is a COMMON_FIELD: `parse_step` lifts it into the
+                // typed `step.timeout_ms` and never copies it into `spec`, so
+                // reading it back out of `spec` left `timeout_ms` permanently
+                // null and a `race` deadline silently never fired.
+                json!({"kind": step.kind, "branches": branches, "results": {}, "errors": {}, "started_ms": now_ms(), "min_success": spec.get("min_success").and_then(Value::as_u64), "timeout_ms": step.timeout_ms})
             }
             "subgraph" => json!({"kind": "subgraph", "started_ms": now_ms()}),
             other => {
@@ -1031,12 +1035,14 @@ impl Runtime {
     }
 
     /// Cancel every child (turn worker) and mark every non-terminal scoped step
-    /// under `prefix` cancelled.
+    /// under `prefix` cancelled. `prefix` is either an instance scope
+    /// (`par{a}` — the race winner cancelling its losers) or the parent step's
+    /// own id (`each` — a failure path cancelling every instance it spawned).
     pub(crate) fn cancel_scoped_children(&mut self, run_id: &str, prefix: &str) {
         let nodes: Vec<_> = self
             .children
             .iter()
-            .filter(|(_, c)| matches!(&c.kind, super::children::ChildKind::StepTurn { run, step, .. } if run == run_id && (step.starts_with(&format!("{prefix}.")) || step == prefix)))
+            .filter(|(_, c)| matches!(&c.kind, super::children::ChildKind::StepTurn { run, step, .. } if run == run_id && (under_scope(step, prefix) || step == prefix)))
             .map(|(n, _)| *n)
             .collect();
         for n in nodes {
@@ -1044,18 +1050,17 @@ impl Runtime {
         }
         let timers = self.timers.owned_by(|o| {
             o["run"].as_str() == Some(run_id)
-                && o["step"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with(&format!("{prefix}.")))
+                && o["step"].as_str().is_some_and(|s| under_scope(s, prefix))
         });
         for t in timers {
             let _ = self.timers.disarm(&self.durable, &t);
         }
-        self.pending.retain(|p| !matches!(&p.target, super::reactor::Target::Step(r, s) if r == run_id && s.starts_with(&format!("{prefix}."))));
+        // Pruning `pending` here is reentrant-safe: `poll_pending` collects by
+        // target, not by index, precisely because this runs underneath it.
+        self.pending.retain(|p| !matches!(&p.target, super::reactor::Target::Step(r, s) if r == run_id && under_scope(s, prefix)));
         if let Some(run) = self.runs.get_mut(run_id) {
-            let p = format!("{prefix}.");
             for (id, st) in run.steps.iter_mut() {
-                if id.starts_with(&p) && !st.status.is_terminal() {
+                if under_scope(id, prefix) && !st.status.is_terminal() {
                     st.status = StepStatus::Cancelled;
                     st.finished = Some(now_ms());
                 }
@@ -1087,6 +1092,19 @@ pub fn strip_scope_suffix(scoped_parent: &str) -> String {
         Some(h) => format!("{h}.{base}"),
         None => base.to_string(),
     }
+}
+
+/// Whether the scoped step id `id` lives *under* the scope `prefix`, at any
+/// depth: a subgraph body step (`prefix.step`), or a step of one of `prefix`'s
+/// element/branch instances (`prefix[3].step`, `prefix{a}.step`). The
+/// delimiter test is what makes it a scope test rather than a string test —
+/// `eachother.x` is not under `each`. A plain `starts_with("{prefix}.")` was
+/// only ever true for the subgraph form, so the `foreach`/`parallel` failure
+/// paths and the `race` timeout — which all pass the parent's own id, whose
+/// children are the indexed/branch forms — cancelled nothing at all.
+fn under_scope(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with(['.', '[', '{']))
 }
 
 fn seg_label(seg: &Segment) -> String {
@@ -1204,6 +1222,15 @@ mod tests {
         assert_eq!(strip_scope_suffix("par{a}"), "par");
         assert_eq!(strip_scope_suffix("x[1].y[2]"), "x[1].y");
         assert!(is_scoped("a.b") && !is_scoped("a"));
+        // Cancellation scope: the element/branch forms are children of the
+        // parent's own id too, and a longer name that merely shares the
+        // prefix is not.
+        assert!(under_scope("each[0].work", "each"));
+        assert!(under_scope("par{a}.work", "par"));
+        assert!(under_scope("sub.work", "sub"));
+        assert!(under_scope("each[0].inner{b}.leaf", "each[0].inner"));
+        assert!(!under_scope("eachother.work", "each"));
+        assert!(!under_scope("each", "each"));
         assert_eq!(
             collect_results(&[("0".to_string(), json!(1))].into_iter().collect(), 2),
             json!([1, null])

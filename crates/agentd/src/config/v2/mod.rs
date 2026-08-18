@@ -1834,7 +1834,7 @@ pub fn probe(args: &[String], env: &[(String, String)]) -> Result<Detected, Conf
             .get("AGENTD_CONFIG_VERSION")
             .or_else(|| envmap.get("CONFIG_VERSION"))
             .is_some_and(|v| *v == "2");
-    let paths = super::config_paths_from_map(args, &envmap);
+    let paths = super::config_paths_from_map(args, &envmap).paths;
     if paths.is_empty() {
         return Ok(if flag_v2 {
             Detected::V2
@@ -1863,17 +1863,16 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     let mut warnings = Vec::new();
 
     // --- FILE layer: several files, later wins (JSON Merge Patch) ---
-    let config_paths = super::config_paths_from_map(args, &envmap);
+    let super::ConfigPaths {
+        paths: config_paths,
+        discovered,
+    } = super::config_paths_from_map(args, &envmap);
     // Two discovered spellings at once: refuse rather than pick. Whichever one
     // agentd chose, somebody would be editing the other and wondering why
-    // nothing changed.
-    if config_paths.len() > 1
-        && config_paths.iter().all(|p| {
-            super::DISCOVERED_CONFIG_NAMES
-                .iter()
-                .any(|n| p.ends_with(n))
-        })
-    {
+    // nothing changed. Only DISCOVERY is ambiguous this way — naming two files
+    // that happen to be spelled `.agentd.yml` and `.agentd.yaml` (`--config a/.agentd.yml
+    // --config b/.agentd.yaml`) states an order, so layering them is legal.
+    if discovered && config_paths.len() > 1 {
         return Err(usage(format!(
             "both {} and {} are present; keep one (or name the file with --config)",
             super::DISCOVERED_CONFIG_NAMES[0],
@@ -1909,6 +1908,36 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
             ));
         }
         _ => {}
+    }
+    // A DISCOVERED config governs an invocation that never named it: `cd` into a
+    // repo you cloned, type `agentd --prompt …`, and that repo's `.agentd.yml`
+    // decides where your credentials go. Convenience is worth that only while the
+    // file cannot RELAX a security control, so an unnamed file setting one is
+    // exit 2 with the file and the setting named. An explicit `--config` keeps
+    // its full power — naming the file IS the deliberate act, and that is the
+    // whole distinction being drawn here.
+    if discovered {
+        let file = config_paths.first().map_or("", String::as_str);
+        if let Some((_, label)) = DISCOVERY_FORBIDDEN_RELAXATIONS
+            .iter()
+            .find(|(ptr, _)| file_doc.pointer(ptr).and_then(Value::as_bool) == Some(true))
+        {
+            return Err(usage(format!(
+                "{file} was discovered, not named, and it sets {label}: a config found in the \
+                 working directory may not relax a security control. Pass `--config {file}` if \
+                 you meant to run under that file's grant."
+            )));
+        }
+        // …and whatever else it wired that bears on security is named at startup
+        // (option (c) of the containment): an adopted dotfile is never silent
+        // about the endpoints, peers and powers it just chose for this process.
+        let touched = discovered_security_settings(&file_doc);
+        if !touched.is_empty() {
+            warnings.push(format!(
+                "adopted the discovered config {file} (no --config given); it sets {}",
+                touched.join(", ")
+            ));
+        }
     }
     let mut doc = file_doc.clone();
 
@@ -2064,6 +2093,48 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
             .join("\n"))));
     }
     Ok((loaded, ask))
+}
+
+/// The security controls a config file can **relax** — the two booleans that
+/// widen what this process may do (lift the lethal-trifecta refusal, RFC 0012
+/// §3.2; turn on the local command runner, RFC 0028 §exec). A file the operator
+/// NAMED may set them; a file merely discovered in the working directory may
+/// not. Narrowing settings are deliberately absent: a dotfile that takes power
+/// away needs no ceremony.
+const DISCOVERY_FORBIDDEN_RELAXATIONS: [(&str, &str); 2] = [
+    ("/security/allow_trifecta", "security.allow_trifecta"),
+    ("/security/exec/enabled", "security.exec.enabled"),
+];
+
+/// The settings that decide where this agent's credentials go, who may reach
+/// it, and what it may call. A DISCOVERED config that sets any of them has them
+/// named in a startup `config.warning`, so adopting a dotfile is visible in the
+/// log rather than inferred from behaviour. Pointer + the dotted label to print:
+/// NAMES only, never values (a value may be a `{{secret:…}}` template — RFC 0012
+/// §3.7).
+const DISCOVERY_SECURITY_SETTINGS: [(&str, &str); 12] = [
+    ("/intelligence/endpoints", "intelligence.endpoints"),
+    ("/intelligence/token", "intelligence.token"),
+    ("/intelligence/token_file", "intelligence.token_file"),
+    ("/intelligence/headers", "intelligence.headers"),
+    ("/intelligence/auth", "intelligence.auth"),
+    ("/mcp/servers", "mcp.servers"),
+    ("/tools/overrides", "tools.overrides"),
+    ("/store", "store"),
+    ("/a2a/listen", "a2a.listen"),
+    ("/a2a/peers", "a2a.peers"),
+    ("/webhooks/listen", "webhooks.listen"),
+    ("/security", "security"),
+];
+
+/// Which of [`DISCOVERY_SECURITY_SETTINGS`] the file layer actually set, in
+/// declaration order. `null` counts as unset (RFC 7396 unsets with `null`).
+fn discovered_security_settings(file_doc: &Value) -> Vec<&'static str> {
+    DISCOVERY_SECURITY_SETTINGS
+        .iter()
+        .filter(|(ptr, _)| file_doc.pointer(ptr).is_some_and(|v| !v.is_null()))
+        .map(|(_, label)| *label)
+        .collect()
 }
 
 fn binding_for<'a>(bindings: &'a [Binding], path: &str) -> Option<&'a Binding> {
@@ -2442,6 +2513,23 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
     out
 }
 
+/// Why a declared header value's `{{secret:NAME}}` / `{{secret-file:PATH}}` ref
+/// does not resolve, or `None` when it does (or when the value carries no ref).
+///
+/// This is the security half of header validation, and it is not cosmetic: a
+/// header whose ref does not resolve is a header that is **not sent**, so
+/// without this check the process starts and dials the endpoint with no
+/// credential at all. Validate-before-side-effect (RFC 0011 §2) means that is
+/// exit 2 at startup, naming the ref — the same rule, and the same resolver, the
+/// runtime uses at the moment of use. The message names the ref, never the
+/// resolved value (RFC 0012 §3.7).
+fn unresolved_secret_ref(value: &str) -> Option<String> {
+    if !crate::sec::secret::has_secret_ref(value) {
+        return None;
+    }
+    crate::sec::secret::refs_resolvable(value, &|k| std::env::var(k).ok()).err()
+}
+
 pub fn validate(loaded: &Loaded) -> Diagnostics {
     let s = &loaded.settings;
     let mut d = Diagnostics::default();
@@ -2519,6 +2607,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     "intelligence.headers['{name}'] looks like a credential but has an inline value; use {{{{secret:NAME}}}} / {{{{secret-file:PATH}}}}"
                 ),
             );
+        } else if let Some(e) = unresolved_secret_ref(value) {
+            err(&mut d, format!("intelligence.headers['{name}']: {e}"));
         }
     }
 
@@ -2555,6 +2645,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                         "mcp server '{}' header '{h}' looks like a credential but has an inline value; use a {{{{secret:…}}}} reference",
                         srv.name
                     ),
+                );
+            } else if let Some(e) = unresolved_secret_ref(v) {
+                err(
+                    &mut d,
+                    format!("mcp server '{}' header '{h}': {e}", srv.name),
                 );
             }
         }
@@ -2661,6 +2756,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                                 "store.http.headers['{name}'] looks like a credential but has an inline value"
                             ),
                         );
+                    } else if let Some(e) = unresolved_secret_ref(v) {
+                        err(&mut d, format!("store.http.headers['{name}']: {e}"));
                     }
                 }
             }
@@ -2988,6 +3085,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                         p.name
                     ),
                 );
+            } else if let Some(e) = unresolved_secret_ref(v) {
+                err(&mut d, format!("a2a peer '{}' header '{h}': {e}", p.name));
             }
         }
     }
@@ -3131,7 +3230,12 @@ fn validate_budget(b: &Budget, at: &str, d: &mut Diagnostics) {
                 .push(format!("{at}.windows[{i}]: set tokens and/or requests"));
         }
         if let Some(r) = &w.reset {
+            // `HH:MMZ` is ASCII by construction, and the ASCII test must come
+            // BEFORE the byte slices: `r.len()` is bytes, so a multi-byte char
+            // (`0é:0Z` is six bytes) would otherwise make `r[..2]` land inside a
+            // character and panic. A config error is exit 2, never a panic.
             let ok = r.len() == 6
+                && r.is_ascii()
                 && r.ends_with('Z')
                 && r[..2].parse::<u32>().is_ok_and(|h| h < 24)
                 && &r[2..3] == ":"

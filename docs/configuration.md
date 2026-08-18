@@ -126,6 +126,7 @@ RFC 0011 §5).
 | an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, and a non-loopback bind authenticates its clients | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing` |
 | `interface.enabled` has a listener to ride, and pairing has an interface | `interface.enabled requires a2a.listen (the interface is served on the A2A listener)` |
 | a `webhook` node has a listener | `a 'webhook' node (start or wait) is used but webhooks.listen is not set — configure webhooks.listen (https://host:port)` |
+| a non-loopback `webhooks.listen` authenticates every route it serves — symmetric with `a2a.listen`, since both are inbound listeners that trigger work | `webhooks.listen on a non-loopback address needs auth: set webhooks.default_auth (hmac, bearer or header), or give every 'webhook' node its own auth (HMAC recommended) — unauthenticated: w/h` |
 | every `a2a.peers[]` is uniquely named with an `http(s)://` endpoint; every `a2a.principals[]` match names a subject | `a2a peer 'p': endpoint must be http(s)://` · `a2a.principals[0]: match needs one of san \| sub \| bearer_ref \| aauth_agent \| any` |
 | `lifecycle.exit_code_map` remaps only the policy codes | `lifecycle.exit_code_map: only the policy codes 3 and 7 are remappable (got key "5")` |
 | `lifecycle.watch_config` has a file to watch | `lifecycle.watch_config requires a config file (--config / AGENTD_CONFIG)` |
@@ -139,7 +140,9 @@ Non-fatal findings come back on the same channel as
 `store.kind: none` one-shot (not durable: a crash re-runs it), a
 `store.kind: memory` (state does not survive the process), a `store.file` block
 sitting beside a `kind` that is not `file` (dead config, ignored), a non-loopback
-`webhooks.listen` with no `webhooks.default_auth`, an `interface.debug` with the
+`webhooks.listen` with no `webhooks.default_auth` *and no webhook routes yet*
+(nothing is reachable, but the next node added would be — an unauthenticated
+route is an error, see below), an `interface.debug` with the
 interface off, and an unknown `interface.display` item.
 
 `-h`/`--help`, `-V`/`--version`, `--capabilities`, `--config-schema=2`,

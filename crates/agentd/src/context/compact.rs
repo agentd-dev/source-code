@@ -54,9 +54,10 @@ worth remembering). Keep entries short and specific; never invent; keep identifi
 Reply with ONLY one JSON object matching the schema.";
 
 /// Decide what to fold. `keep_last` messages stay verbatim; a fold always
-/// ends before the kept window and never splits an assistant tool-call from
-/// its tool results. Returns `None` when there is nothing worth folding
-/// (fewer than `keep_last + 2` messages).
+/// ends before the kept window, never splits an assistant tool-call from its
+/// tool results, and always leaves a `User` message first in the kept window.
+/// Returns `None` when there is nothing worth folding (fewer than
+/// `keep_last + 2` messages, or no user message to fold up to).
 pub fn plan_compaction(
     ctx: &ContextState,
     keep_last: usize,
@@ -76,11 +77,27 @@ pub fn plan_compaction(
             fold += 1;
         }
     }
-    // Do not split a tool round: if the first kept message is a tool result,
-    // move the boundary back to its assistant call.
-    while fold > 0 && matches!(ctx.messages.get(fold), Some(Msg::Tool { .. })) {
+    // One boundary correction, and it subsumes the tool-round rule: walk back
+    // until the first kept message is a `User`. Two things go wrong otherwise,
+    // and because the context is durable a single bad fold poisons every later
+    // turn and survives a restart:
+    //   * an `Assistant` first sends `messages[0].role == "assistant"` in the
+    //     anthropic dialect, which the API rejects — the summary block is no
+    //     shield, system messages hoist into the top-level `system` field
+    //     (`intel/anthropic.rs`), so the assistant really is first on the wire;
+    //   * a `Tool` first is a `tool_result` block whose `tool_use` was folded
+    //     away — a dangling id, the split the old tool-round rule guarded
+    //     against from the other end.
+    // Walking back only ever keeps *more*, so both the "at least 2 kept" floor
+    // and the target-token loop above stay satisfied. `get` (not an index) is
+    // load-bearing: `keep_last` is caller-supplied and may be 0, and folding
+    // everything is fine — the next turn appends its user message first.
+    while fold > 0 && ctx.messages.get(fold).is_some_and(|m| !m.is_user()) {
         fold -= 1;
     }
+    // No user message at or before the boundary: decline rather than fold to a
+    // shape the provider refuses. An oversized context is recoverable; a
+    // checkpointed context that cannot be sent is not.
     if fold == 0 {
         return None;
     }
@@ -263,10 +280,18 @@ mod tests {
             false,
         ));
         c.append(Msg::assistant(Some("done".into()), vec![]));
-        // 9 messages; keep_last 2 → fold 7 → messages[7] is the tool result → move back to 6.
+        // 9 messages; keep_last 2 → fold 7 → messages[7] is the tool result, [6]
+        // its assistant call, [5] the user that opened the round → fold 5, the
+        // last boundary that leaves a user message first (see the walk-back).
         let req = plan_compaction(&c, 2, None).unwrap();
-        assert_eq!(req.fold, 6);
+        assert_eq!(req.fold, 5);
+        assert!(c.messages[req.fold].is_user());
         assert!(req.input.contains("[user] message number 0"));
+        assert!(req.input.contains("[user] message number 4"));
+        assert!(
+            !req.input.contains("[user] message number 5"),
+            "the user that opened the tool round is kept, not folded"
+        );
         assert!(
             !req.input.contains("memory.get"),
             "the tool round stays verbatim"
@@ -279,6 +304,108 @@ mod tests {
         let big = ctx_with(20);
         let req = plan_compaction(&big, 10, Some(1)).unwrap();
         assert_eq!(req.fold, 18);
+    }
+
+    /// A mixed transcript: `user, assistant, user, assistant(call), tool,
+    /// assistant, user, assistant(call), tool, tool, assistant`.
+    fn mixed_ctx() -> ContextState {
+        let mut c = ContextState::new(ContextKind::Conversation, 1000);
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "memory.get".into(),
+            arguments: json!({"key": id}),
+        };
+        c.append(Msg::user("first ask with a few words", None));
+        c.append(Msg::assistant(Some("first answer".into()), vec![]));
+        c.append(Msg::user("second ask with a few words", None));
+        c.append(Msg::assistant(None, vec![call("c1")]));
+        c.append(Msg::tool(
+            "c1",
+            "memory.get",
+            json!({"found": false}),
+            false,
+        ));
+        c.append(Msg::assistant(Some("second answer".into()), vec![]));
+        c.append(Msg::user("third ask with a few words", None));
+        c.append(Msg::assistant(None, vec![call("c2"), call("c3")]));
+        c.append(Msg::tool("c2", "memory.get", json!({"found": true}), false));
+        c.append(Msg::tool("c3", "memory.get", json!({"found": true}), false));
+        c.append(Msg::assistant(Some("third answer".into()), vec![]));
+        c
+    }
+
+    /// The kept window must open on a `User`. The anthropic dialect hoists
+    /// system messages (summary + plan included) into the top-level `system`
+    /// field, so an assistant left first by a fold really is `messages[0]` on
+    /// the wire and the API rejects it — and the context is durable, so that
+    /// fold poisons every later turn until someone edits the record by hand.
+    #[test]
+    fn fold_never_leaves_an_assistant_or_a_tool_result_first() {
+        let c = mixed_ctx();
+        // keep_last 1 → fold 10 (the trailing assistant); 9 and 8 are tool
+        // results, 7 their assistant call → the user at 6 is the boundary.
+        let req = plan_compaction(&c, 1, None).unwrap();
+        assert_eq!(req.fold, 6);
+        assert!(c.messages[req.fold].is_user());
+        // keep_last 5 → fold 6 already lands on the user; nothing to correct.
+        assert_eq!(plan_compaction(&c, 5, None).unwrap().fold, 6);
+        // keep_last 7 → fold 4 is a tool result → back past its call at 3 to
+        // the user at 2 (the old rule stopped at 3, an assistant).
+        let req = plan_compaction(&c, 7, None).unwrap();
+        assert_eq!(req.fold, 2);
+        assert!(c.messages[req.fold].is_user());
+        // An aggressive target folds forward first, then walks back the same way.
+        let req = plan_compaction(&c, 2, Some(1)).unwrap();
+        assert!(c.messages[req.fold].is_user());
+        // A transcript with no user message at all is refused rather than
+        // folded into a shape the provider will not accept.
+        let mut none = ContextState::new(ContextKind::Conversation, 1000);
+        for i in 0..6 {
+            none.append(Msg::assistant(Some(format!("thought {i}")), vec![]));
+        }
+        assert!(plan_compaction(&none, 2, None).is_none());
+    }
+
+    /// Property-style: over every fold point the two callers can ask for, the
+    /// kept window opens on a `User` and carries no orphaned tool result.
+    #[test]
+    fn every_fold_point_keeps_a_user_first_and_no_orphan_tool_result() {
+        let c = mixed_ctx();
+        let n = c.messages.len();
+        for keep_last in 0..=n {
+            for target in [None, Some(0), Some(1), Some(60), Some(10_000)] {
+                let Some(req) = plan_compaction(&c, keep_last, target) else {
+                    continue;
+                };
+                let kept = &c.messages[req.fold..];
+                let Some(first) = kept.first() else {
+                    continue; // keep_last 0: everything folds, nothing to lead
+                };
+                assert!(
+                    first.is_user(),
+                    "keep_last {keep_last} target {target:?} → fold {} left {first:?} first",
+                    req.fold
+                );
+                // No kept tool result may reference a call that was folded away.
+                let calls: Vec<&str> = kept
+                    .iter()
+                    .flat_map(|m| match m {
+                        Msg::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+                        _ => &[],
+                    })
+                    .map(|tc| tc.id.as_str())
+                    .collect();
+                for m in kept {
+                    if let Msg::Tool { id, .. } = m {
+                        assert!(
+                            calls.contains(&id.as_str()),
+                            "keep_last {keep_last} target {target:?} → fold {} orphaned {id}",
+                            req.fold
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

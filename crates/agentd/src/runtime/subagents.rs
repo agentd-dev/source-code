@@ -217,8 +217,16 @@ impl Runtime {
             .map(|a| {
                 a.iter()
                     .filter_map(|m| {
+                        let role = m["role"].as_str()?;
+                        // The tool grant is minted below from `tools:` alone —
+                        // a caller cannot smuggle one in through `context`
+                        // (a forged one could only narrow its own child, but the
+                        // supervisor owns the grant, so there is one source).
+                        if role == crate::subagent::protocol::ALLOWED_TOOLS_ROLE {
+                            return None;
+                        }
                         Some(SeedMessage {
-                            role: m["role"].as_str()?.to_string(),
+                            role: role.to_string(),
                             content: m["content"].as_str()?.to_string(),
                         })
                     })
@@ -234,7 +242,7 @@ impl Runtime {
                     format!("Reply with ONLY one JSON object matching this JSON Schema: {s}")
                 })
             });
-        let payload = SpawnPayload {
+        let mut payload = SpawnPayload {
             instruction: instruction.clone(),
             output_contract,
             context_seed,
@@ -277,6 +285,15 @@ impl Runtime {
             role: Role::Agent,
             turn: None,
         };
+        // The `tools:` narrowing is a GRANT, not a note: minted into the payload
+        // here and ENFORCED by the child, which filters both its catalogue and
+        // its dispatch against it (`agentloop::runner::Session::prepare`). Without
+        // the mint the argument would be recorded and ignored, and a parent
+        // bounding an untrusted sub-task would silently get a child holding
+        // everything — the opposite of RFC 0009's monotonically narrowing scope.
+        if let Some(a) = &allow {
+            payload.narrow_tools(a);
+        }
         // A durable record BEFORE the spawn (restore re-spawns pending ones).
         let mut record = SubagentRecord {
             handle: handle.clone(),
@@ -292,7 +309,7 @@ impl Runtime {
             tokens: 0,
             created: now_ms(),
             updated: now_ms(),
-            payload: Some(secret_free_payload(&payload, allow.as_deref())),
+            payload: Some(secret_free_payload(&payload)),
             node: None,
             dirty: true,
         };
@@ -549,11 +566,15 @@ pub fn parse_rate(s: &str) -> (u32, f64) {
 
 /// The payload as stored (no credential: the intelligence token is re-supplied
 /// from the live settings on restore).
-fn secret_free_payload(p: &SpawnPayload, allow: Option<&[String]>) -> Value {
+fn secret_free_payload(p: &SpawnPayload) -> Value {
     let mut clean = p.clone();
     clean.intelligence.token = None;
     let mut v = serde_json::to_value(&clean).unwrap_or(Value::Null);
-    if let Some(a) = allow {
+    // The record keeps surfacing the narrowed grant for audits/`subagent.status`
+    // — read back OFF THE PAYLOAD that actually carries it, so the record can
+    // never claim a confinement the child was not given. The payload itself
+    // carries it into a restore-time respawn.
+    if let Some(a) = p.allowed_tools() {
         v["allowed_tools"] = json!(a);
     }
     v

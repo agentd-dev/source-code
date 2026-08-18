@@ -633,12 +633,13 @@ impl Runtime {
                 }
             }
             // A root turn and a think expose no equivalent state to test here,
-            // so they keep the child-table guard — which, for the reason above,
-            // never fires: routing their failure needs `finish_root_turn` /
-            // `on_think_done`, both private to `turns`, plus a settled marker on
-            // the child record. A think's tool waiter is still answered by the
-            // pending sweep below; a root turn's inbox event stays pending and
-            // replays on restart.
+            // so they ask `pending_turn_exists` — which now answers from the
+            // settled marker `on_turn_done`/`on_turn_failed` leave on the child
+            // record, not from the child's presence in the table. Presence
+            // cannot answer it: `on_reaped` has already removed the child by the
+            // time this runs, and a normally-settled worker also stays in the
+            // table until it is reaped, so the old form read false for settled
+            // and orphaned workers alike and this arm never fired.
             ChildKind::RootTurn { .. } | ChildKind::Think { .. } => {
                 if self.pending_turn_exists(node) {
                     self.on_turn_failed(

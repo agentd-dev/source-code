@@ -12,11 +12,14 @@
 //! stream ([`SseReader`]) — the MCP Streamable HTTP transport, where a response may
 //! be a single JSON body or a `text/event-stream`, and a long-lived GET carries
 //! server→client notifications.
-//! `connect_tcp` is intentionally unguarded: agentd's HTTP client only ever
-//! dials the *operator-configured* intelligence endpoint, which the model
-//! cannot influence. The SSRF classifier (`net::ssrf`) exists for any future
-//! model/agent-supplied URL surface and is composed at the call site that
-//! needs it.
+//! `connect_tcp` is intentionally unguarded, and dials by *name*: it exists for
+//! the *operator-configured* endpoints (the intelligence dial, the auth/token
+//! endpoints), which the model cannot influence. A model/agent/peer-supplied URL
+//! must NOT be dialled through it — not even with a guard wrapped around it,
+//! since the guard's lookup and this function's lookup are two resolutions and a
+//! hostile nameserver can answer them differently. Those surfaces use
+//! [`crate::ssrf::connect_vetted`], which resolves once and dials the address it
+//! vetted.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -138,8 +141,10 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Connect a plain TCP stream with connect + read/write timeouts. Intentionally
-/// unguarded — the only caller dials the operator-configured endpoint; the SSRF
-/// classifier (`net::ssrf`) is composed at any model/agent-supplied URL surface.
+/// unguarded, and resolves the name itself — for operator-configured endpoints
+/// only. A model/agent/peer-supplied URL belongs on
+/// [`crate::ssrf::connect_vetted`]: composing `ssrf::guard_host` around *this*
+/// function resolves twice and is the DNS-rebinding hole, not a fix for it.
 pub fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
     let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {

@@ -15,7 +15,9 @@
 //! it at an internal admin endpoint and agentd reaches somewhere the caller
 //! cannot. So a target is guarded twice — refused at registration, when the
 //! caller is present to be told why, and again at delivery, because DNS can
-//! change its mind between the two.
+//! change its mind between the two. The delivery guard resolves once and dials
+//! an address it vetted (`ssrf::connect_vetted`); handing the *name* to the
+//! connect would re-resolve it and hand a hostile nameserver the second answer.
 //!
 //! Delivery is best-effort by design: a webhook that is down must not fail the
 //! task it was reporting on. Failures are logged and dropped, never retried into
@@ -58,7 +60,9 @@ pub fn check_url(url: &str, allow_private: bool) -> Result<(), String> {
 /// it, so a client can share one handler between the two ways of being told.
 pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Result<(), String> {
     // Guarded again here, not only at registration: the name resolved once when
-    // the caller registered, and nothing stops it resolving elsewhere now.
+    // the caller registered, and nothing stops it resolving elsewhere now. This
+    // re-check carries the scheme rule; the address rule is what the dial below
+    // enforces, on the addresses it actually connects to.
     check_url(&target.url, allow_private)?;
     let u = crate::net::http::Url::parse(&target.url).map_err(|e| e.to_string())?;
     let body = serde_json::to_vec(event).map_err(|e| e.to_string())?;
@@ -80,7 +84,12 @@ pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Resul
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let tcp = crate::net::http::connect_tcp(&u.host, u.port, DELIVERY_TIMEOUT)
+    // Dial an address the guard vetted, not the name: `connect_tcp` would
+    // resolve a second time, and a peer who controls the authoritative DNS
+    // would answer the check above with a public address and this connect with
+    // `169.254.169.254`. TLS/SNI and the `Host` header below deliberately stay
+    // on the hostname — connect by IP, verify by name.
+    let tcp = crate::net::ssrf::connect_vetted(&u.host, u.port, DELIVERY_TIMEOUT, allow_private)
         .map_err(|e| e.to_string())?;
     let resp = if u.is_tls() {
         #[cfg(feature = "tls")]

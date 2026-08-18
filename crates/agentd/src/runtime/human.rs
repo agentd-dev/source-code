@@ -232,6 +232,32 @@ impl Runtime {
             return;
         };
         let (task, standalone) = (task.clone(), *standalone);
+        // The asker has to still BE there to receive it. A child that died with
+        // its gate open took its `ToolResult` slot with it, so `reply` would
+        // write into a closed pipe and a human's decision would vanish leaving
+        // nothing but a debug line — while the task read as answered.
+        // `poll_pending_human` reaps orphaned gates every tick; this is the race
+        // where the answer lands in the same tick the child is reaped, and the
+        // honest outcome is a failed gate, not a silent one.
+        if let Target::Child(node, _) = &p.target
+            && self.children.get(*node).is_none()
+        {
+            const LATE: &str = "ask_human: the asking turn ended before the answer arrived";
+            self.human_task_fail(&task, LATE);
+            self.log.warn(
+                "human.answer.undelivered",
+                json!({"task": task, "via": via}),
+            );
+            self.audit(super::audit::AuditEvent {
+                action: "ask_human.answered",
+                target: json!({"task": task}),
+                outcome: "undelivered",
+                principal: Some(via),
+                role: None,
+                request_id: None,
+            });
+            return;
+        }
         #[cfg(feature = "a2a")]
         if self.tasks.contains_key(&task) {
             use crate::a2a::tasks::State;
@@ -262,7 +288,22 @@ impl Runtime {
             role: None,
             request_id: None,
         });
-        self.reply(&p.target, Value::String(text.to_string()), false);
+        // A tool result must be `ask_human`'s DECLARED output shape
+        // (`{reply, timed_out}` — `registry/internal.rs`). It was a bare string,
+        // which every consumer reading the contract missed: the MCP elicitation
+        // bridge pulls `reply` out of the tool result to build the spec's
+        // `accept` content, found nothing, and turned every `elicitation/create`
+        // into a `cancel`. `via` rides along so the asker cannot mistake a
+        // judge's guess for a human decision either (RFC 0032 §16).
+        //
+        // A workflow `human` step is NOT a tool result: RFC 0032 §16 defines the
+        // answer itself as the step's output, and later steps template on
+        // `steps.<gate>.output`, so a step keeps the bare reply.
+        let result = match &p.target {
+            Target::Child(..) => json!({"reply": text, "timed_out": false, "via": via}),
+            Target::Step(..) => Value::String(text.to_string()),
+        };
+        self.reply(&p.target, result, false);
     }
 
     /// Fail pending ask `i` (timeout / cancel / judge failure).
@@ -300,12 +341,20 @@ impl Runtime {
         let now = now_ms();
         let auto = self.settings.agent.ask_human_fallback == AskHumanFallback::Auto;
         enum End {
-            Prune(String),
+            /// The asker is gone: drop the gate and fail its task with `why`.
+            Prune(String, &'static str),
             Timeout,
         }
-        let mut fire_auto: Vec<usize> = Vec::new();
-        let mut ends: Vec<(usize, End)> = Vec::new();
-        for (i, p) in self.pending.iter().enumerate() {
+        // Addressed by TARGET, never by index — the reentrancy that panicked
+        // `poll_pending`: ending one gate calls `reply`, which re-enters the
+        // reactor (a step outcome cascades through `finish_step` into
+        // `cancel_scoped_children`, which prunes `pending` itself), so an index
+        // remembered across an end addresses a different entry by the time we
+        // use it — or one past the end, panicking the reactor thread and taking
+        // the daemon with it.
+        let mut fire_auto: Vec<Target> = Vec::new();
+        let mut ends: Vec<(Target, End)> = Vec::new();
+        for p in self.pending.iter() {
             let PendingKind::Human {
                 task,
                 deadline_ms,
@@ -315,35 +364,62 @@ impl Runtime {
             else {
                 continue;
             };
-            // The step resolved some other way (its wait-record timed out, the
-            // run was cancelled): drop the dangling gate.
-            if let Target::Step(run, step) = &p.target {
-                let suspended = self
-                    .runs
-                    .get(run)
-                    .and_then(|r| r.steps.get(step))
-                    .is_some_and(|s| s.status == crate::engine::run::StepStatus::Suspended);
-                if !suspended {
-                    ends.push((i, End::Prune(task.clone())));
+            match &p.target {
+                // The step resolved some other way (its wait-record timed out,
+                // the run was cancelled): drop the dangling gate.
+                Target::Step(run, step) => {
+                    let suspended = self
+                        .runs
+                        .get(run)
+                        .and_then(|r| r.steps.get(step))
+                        .is_some_and(|s| s.status == crate::engine::run::StepStatus::Suspended);
+                    if !suspended {
+                        ends.push((
+                            p.target.clone(),
+                            End::Prune(task.clone(), "the asking step resolved without an answer"),
+                        ));
+                        continue;
+                    }
+                }
+                // The asking CHILD is gone (it crashed, was killed, its turn was
+                // torn down). Nothing can receive the answer any more — the
+                // `ToolResult` slot died with the process — so leaving the gate
+                // open would park an operator in front of an answerable question
+                // whose answer goes nowhere, for the rest of the 24 h ask
+                // timeout. Fail it explicitly: the task leaves `input-required`,
+                // and a later reply on it continues the conversation as a fresh
+                // turn — RFC 0032 §16's documented degrade for a turn's gate.
+                Target::Child(node, _) if self.children.get(*node).is_none() => {
+                    ends.push((
+                        p.target.clone(),
+                        End::Prune(
+                            task.clone(),
+                            "the asking turn ended before the gate was answered",
+                        ),
+                    ));
                     continue;
                 }
+                Target::Child(..) => {}
             }
             if now >= *deadline_ms {
                 if auto && !auto_fired {
-                    fire_auto.push(i);
+                    fire_auto.push(p.target.clone());
                 } else {
-                    ends.push((i, End::Timeout));
+                    ends.push((p.target.clone(), End::Timeout));
                 }
             }
         }
-        for i in fire_auto {
+        for target in fire_auto {
+            let Some(p) = self.pending.iter_mut().find(|p| p.target == target) else {
+                continue;
+            };
             let PendingKind::Human {
                 task,
                 question,
                 deadline_ms,
                 auto_fired,
                 ..
-            } = &mut self.pending[i].kind
+            } = &mut p.kind
             else {
                 continue;
             };
@@ -363,11 +439,22 @@ impl Runtime {
             }
             self.spawn_human_judge(&task, &question);
         }
-        for (i, end) in ends.into_iter().rev() {
+        for (target, end) in ends {
+            // A reentrant prune may already have removed this entry while we
+            // were ending an earlier one — it is no longer waiting.
+            let Some(i) = self
+                .pending
+                .iter()
+                .position(|p| p.target == target && matches!(&p.kind, PendingKind::Human { .. }))
+            else {
+                continue;
+            };
             match end {
-                End::Prune(task) => {
+                End::Prune(task, why) => {
                     self.pending.remove(i);
-                    self.human_task_fail(&task, "the asking step resolved without an answer");
+                    self.log
+                        .warn("human.ask.pruned", json!({"task": task, "err": why}));
+                    self.human_task_fail(&task, why);
                 }
                 End::Timeout => self.human_fail(i, "ask_human: no answer within the timeout"),
             }

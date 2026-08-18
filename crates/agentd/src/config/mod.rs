@@ -890,7 +890,7 @@ impl Config {
         // file overrides the earlier ones with JSON-Merge-Patch semantics
         // (objects merge, scalars/lists replace, `null` unsets; RFC 7396). Each
         // file is YAML or JSON by extension, else sniffed (`file::Format`).
-        let config_paths = config_paths_from_map(args, &envmap);
+        let config_paths = config_paths_from_map(args, &envmap).paths;
         let file_present = !config_paths.is_empty();
         if file_present {
             let (doc, loaded) = file::read_documents(&config_paths).map_err(usage)?;
@@ -1375,7 +1375,7 @@ impl Config {
         let env = debrand_env(env);
         let envmap: HashMap<&str, &str> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        config_paths_from_map(args, &envmap)
+        config_paths_from_map(args, &envmap).paths
     }
 
     /// Resolve `--intelligence-token-file` into `intelligence_token` when no
@@ -2295,11 +2295,28 @@ pub(crate) fn config_flag(arg: &str) -> ConfigFlag<'_> {
     }
 }
 
+/// The config files an invocation will load, and **how they were chosen**.
+///
+/// The provenance is not a detail: a file the operator NAMED (`--config` /
+/// `AGENTD_CONFIG`) is a decision they made, while a DISCOVERED `.agentd.yml`
+/// is a file that happened to be in the working directory when they typed a
+/// flags-only command. The two get different trust (see the discovered-config
+/// containment in `config::v2::load`), so the loader must be able to tell them
+/// apart rather than seeing one flat list of paths.
+pub(crate) struct ConfigPaths {
+    /// The files to load, in merge order (earlier is overridden by later).
+    pub paths: Vec<String>,
+    /// True when `paths` came from DISCOVERY — nothing named a config, so a
+    /// dotfile in the working directory was adopted. Never true alongside a
+    /// named path: discovery is a fallback for an empty list.
+    pub discovered: bool,
+}
+
 /// The ordered config-file list over an already-debranded env map: the
 /// `AGENTD_CONFIG` entries (`:`-separated, empty entries skipped) then each
 /// `--config` value. Env first so a platform-injected base is overridden by an
 /// operator's explicit `--config` overlay (later wins).
-pub(crate) fn config_paths_from_map(args: &[String], envmap: &HashMap<&str, &str>) -> Vec<String> {
+pub(crate) fn config_paths_from_map(args: &[String], envmap: &HashMap<&str, &str>) -> ConfigPaths {
     let mut paths: Vec<String> = envmap
         .get("AGENTD_CONFIG")
         .map(|v| {
@@ -2326,10 +2343,12 @@ pub(crate) fn config_paths_from_map(args: &[String], envmap: &HashMap<&str, &str
     // the working directory, the way a linter or a formatter picks up its
     // dotfile. Only ever a fallback — an explicit `--config` or `AGENTD_CONFIG`
     // means the caller has already decided.
+    let mut discovered = false;
     if paths.is_empty() && !is_informational(args) {
         paths.extend(discovered_config_in(Path::new(".")));
+        discovered = !paths.is_empty();
     }
-    paths
+    ConfigPaths { paths, discovered }
 }
 
 /// The file names agentd looks for when an invocation names no config.

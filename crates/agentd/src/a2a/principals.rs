@@ -136,7 +136,7 @@ impl Principal {
 /// The admin methods (operator-only).
 pub fn is_admin(method: &str) -> bool {
     matches!(
-        bare(method),
+        bare(method).as_str(),
         "a2a.drain"
             | "a2a.lameduck"
             | "a2a.pause"
@@ -150,12 +150,21 @@ pub fn is_admin(method: &str) -> bool {
     )
 }
 
-fn bare(m: &str) -> &str {
+/// The method name folded for matching, owned.
+///
+/// Owned rather than `&'static str` because the only way to hand a lowercased
+/// copy back as `'static` is `String::leak`, and `m` is the `method` member of
+/// a JSON-RPC request: remote input, unbounded in length, and reached *before*
+/// the caller is known to be anybody — an `Authorization: Bearer junk` header
+/// resolves to the anonymous principal rather than a 401, and every request
+/// passes through [`is_admin`] on its way to being refused. One leak per
+/// request with an attacker-chosen name is an unbounded RSS climb driven from
+/// off the box, so nothing here may outlive the call.
+fn bare(m: &str) -> String {
     m.strip_prefix("a2a.")
         .map(|_| m)
         .unwrap_or(m)
         .to_ascii_lowercase()
-        .leak()
 }
 
 /// What the transport learned about the caller.

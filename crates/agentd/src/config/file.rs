@@ -360,18 +360,33 @@ impl ConfigFile {
 /// Strip line (`//`) and block (`/* */`) comments from JSON-with-comments,
 /// preserving string literals (a `//` inside a `"…"` is data, not a comment).
 /// Byte-oriented and minimal — the moat forbids a jsonc *crate*.
+///
+/// **Everything kept is copied as a SLICE of `src`, never as `byte as char`.**
+/// That distinction is the whole UTF-8 story: `0xE2 as char` is U+00E2 ('â'), so
+/// a byte-wise copy silently mojibake's an em-dash, an accented name or any CJK
+/// text into its Latin-1 shadow — and the result is still valid JSON, so nothing
+/// ever reports an error and the agent runs on a subtly wrong instruction.
+/// Slicing carries the whole multibyte sequence through untouched.
+///
+/// Scanning stays byte-wise, which is safe because every byte this function
+/// *matches on* (`"`, `\`, `/`, `*`, `\n`) is ASCII, and an ASCII byte can never
+/// occur inside a multibyte UTF-8 sequence (continuation bytes are all ≥ 0x80).
+/// So a comment boundary is always a char boundary and the slices below can
+/// never split a character.
 fn strip_jsonc(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
     let mut in_str = false;
+    // Start of the run of bytes not yet copied out. A run is broken only by a
+    // comment; everything else is emitted verbatim by slicing `src[run..i]`.
+    let mut run = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if in_str {
-            out.push(b as char);
             if b == b'\\' && i + 1 < bytes.len() {
-                // Keep the escaped char verbatim (e.g. \" must not end the string).
-                out.push(bytes[i + 1] as char);
+                // Skip the escape AND the escaped byte without inspecting it, so
+                // a \" cannot end the string. Both stay in the current run.
                 i += 2;
                 continue;
             }
@@ -383,54 +398,36 @@ fn strip_jsonc(src: &str) -> String {
         }
         if b == b'"' {
             in_str = true;
-            out.push('"');
             i += 1;
             continue;
         }
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             // line comment → skip to end of line (keep the newline for line counts).
+            out.push_str(&src[run..i]);
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
+            run = i;
             continue;
         }
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             // block comment → skip to the closing */.
+            out.push_str(&src[run..i]);
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
             }
-            i += 2;
+            // Step past the `*/`. On an UNTERMINATED comment `i` is left mid-text,
+            // so clamp to the end — `bytes.len()` is always a char boundary, and
+            // the malformed document is serde_json's error to report, not ours.
+            i = (i + 2).min(bytes.len());
+            run = i;
             continue;
         }
-        // UTF-8 safety: push the raw byte's char only for ASCII; for multibyte
-        // sequences copy them through unchanged.
-        if b < 0x80 {
-            out.push(b as char);
-            i += 1;
-        } else {
-            // Copy the full multibyte char.
-            let ch_len = utf8_len(b);
-            let end = (i + ch_len).min(bytes.len());
-            out.push_str(&src[i..end]);
-            i = end;
-        }
+        i += 1;
     }
+    out.push_str(&src[run..]);
     out
-}
-
-/// UTF-8 leading-byte → sequence length (1–4). Used only to copy a multibyte
-/// char through the comment stripper unchanged.
-fn utf8_len(lead: u8) -> usize {
-    if lead >= 0xF0 {
-        4
-    } else if lead >= 0xE0 {
-        3
-    } else if lead >= 0xC0 {
-        2
-    } else {
-        1
-    }
 }
 
 /// Emit the hand-written **JSON Schema (Draft 2020-12)** of the config file
@@ -757,6 +754,28 @@ intelligence_headers:
         assert_eq!(cf.max_tokens, Some(10));
         // The `//` inside the string literal survived (not treated as a comment).
         assert_eq!(cf.subscribe, vec!["http://x//path"]);
+    }
+
+    #[test]
+    fn non_ascii_round_trips_through_the_jsonc_stripper() {
+        // Silent corruption is the worst failure mode: mojibake'd text is still
+        // valid JSON, so a byte-wise stripper would hand the agent a subtly wrong
+        // instruction with nothing reporting an error. Every string here must come
+        // back byte-identical, INCLUDING the ones pressed up against a comment —
+        // that adjacency is exactly where a byte-wise stripper splits a sequence.
+        let model = "Ünïcøde — 日本語 μοντέλο";
+        let src = format!(
+            "{{\n  /* 日本語 block */\"model\": \"{model}\",/*é*/\n  \"subscribe\": [\"fs:file:///wätch/收件箱\"] // — trailing 日本語\n}}"
+        );
+        let cf = ConfigFile::parse(&src).unwrap();
+        assert_eq!(cf.model.as_deref(), Some(model), "mojibake in the value");
+        assert_eq!(cf.subscribe, vec!["fs:file:///wätch/收件箱"]);
+        // The stripper itself must be the identity on a comment-free document.
+        let plain = format!("{{ \"model\": \"{model}\" }}");
+        assert_eq!(strip_jsonc(&plain), plain);
+        // A \-escape adjacent to multibyte text must not eat the following byte.
+        let cf = ConfigFile::parse("{ \"model\": \"a\\\"—\\\\é\" }").unwrap();
+        assert_eq!(cf.model.as_deref(), Some("a\"—\\é"));
     }
 
     #[test]

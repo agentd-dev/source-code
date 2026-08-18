@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
@@ -54,6 +55,17 @@ impl AgentdHttp {
 #[error("{0}")]
 pub struct TransportError(String);
 
+/// One item lifted off a POST's response stream, in arrival order.
+enum Pumped {
+    /// A message the server sent BEFORE its reply: a notification, or — the
+    /// case that makes the ordering load-bearing — a request of its own
+    /// (elicitation, sampling) that it is now blocked waiting for us to answer.
+    Message(Value),
+    /// The exchange ended: the reply (`None` when the POST was a notification
+    /// and `202 Accepted` came back), or the transport error that ended it.
+    Done(Result<Option<Value>, String>),
+}
+
 /// One JSON value as the SDK expects to read it off a stream.
 fn as_event(v: &Value) -> Sse {
     Sse {
@@ -69,11 +81,21 @@ impl StreamableHttpClient for AgentdHttp {
 
     /// POST one message.
     ///
-    /// Everything the server said in reply — notifications it interleaved, then
-    /// the response itself — is handed back as a stream, because that is the
-    /// only shape that can carry more than one message and the SDK reads it the
-    /// same either way. A notification-only POST is answered `202 Accepted` by
-    /// the server and reported as accepted here.
+    /// Everything the server says in reply — whatever it interleaves, then the
+    /// response itself — is handed back as a stream, because that is the only
+    /// shape that can carry more than one message and the SDK reads it the same
+    /// either way. A notification-only POST is answered `202 Accepted` by the
+    /// server and reported as accepted here.
+    ///
+    /// **The stream is live, not a replay.** The spec lets a server interleave a
+    /// REQUEST of its own on the response stream of a POST — an elicitation, a
+    /// sampling call — and then block until the client answers it (over a
+    /// separate POST) before finishing the original reply. Collecting the frames
+    /// and returning them once the reply landed would deadlock exactly that
+    /// exchange: the server waits for an answer the SDK has not been shown yet,
+    /// the POST runs to its timeout, and the frames are dropped with the error.
+    /// So the blocking read runs on its own thread and forwards each frame as it
+    /// arrives; this returns as soon as the FIRST one does.
     async fn post_message(
         &self,
         _uri: Arc<str>,
@@ -89,39 +111,59 @@ impl StreamableHttpClient for AgentdHttp {
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
 
-        let out = tokio::task::spawn_blocking(move || {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pumped>();
+        // Not awaited: the send owns a blocking thread for as long as the server
+        // keeps the exchange open, and this call must return before it finishes.
+        // The thread ends when the send does; a receiver dropped early makes the
+        // sends fail, which costs nothing since the send is already unwinding.
+        let notes_tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
             let refs: Vec<(&str, &str)> = extra
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let mut notes = Vec::new();
-            let resp = http.send(request_id, &body, timeout, &refs, |n| notes.push(n));
-            (resp, notes)
-        })
-        .await
-        .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
+            let resp = http.send(request_id, &body, timeout, &refs, |n| {
+                let _ = notes_tx.send(Pumped::Message(n));
+            });
+            let _ = tx.send(Pumped::Done(resp.map_err(|e| e.to_string())));
+        });
 
-        let (resp, notes) = out;
-        let resp = resp.map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
+        // Wait for the first frame only. `Mcp-Session-Id` rides the response
+        // HEAD, which the transport has already recorded by the time any frame
+        // can reach us, so reading it here is not early.
+        let first = match rx.recv().await {
+            Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => v,
+            // A notification: nothing came back, and nothing should have.
+            Some(Pumped::Done(Ok(None))) => return Ok(StreamableHttpPostResponse::Accepted),
+            Some(Pumped::Done(Err(e))) => {
+                return Err(StreamableHttpError::Client(TransportError(e)));
+            }
+            // The pump vanished without reporting — only reachable if the
+            // blocking thread itself died, which is a dead socket either way.
+            None => {
+                return Err(StreamableHttpError::Client(TransportError(
+                    "mcp: response stream ended with no reply".into(),
+                )));
+            }
+        };
         let session = self.http.session_id();
 
-        let mut events: Vec<Result<Sse, SseError>> =
-            notes.iter().map(|n| Ok(as_event(n))).collect();
-        match resp {
-            Some(v) => {
-                events.push(Ok(as_event(&v)));
-                Ok(StreamableHttpPostResponse::Sse(
-                    Box::pin(futures::stream::iter(events)),
-                    session,
-                ))
+        let rest = futures::stream::unfold(rx, |mut rx| async move {
+            match rx.recv().await {
+                Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => {
+                    Some((Ok(as_event(&v)), rx))
+                }
+                // Done — cleanly, or with an error the first frame already
+                // outlived. Either way this POST's stream is over, and ending
+                // the stream is how the SDK is told so.
+                _ => None,
             }
-            // A notification: nothing came back, and nothing should have.
-            None if events.is_empty() => Ok(StreamableHttpPostResponse::Accepted),
-            None => Ok(StreamableHttpPostResponse::Sse(
-                Box::pin(futures::stream::iter(events)),
-                session,
-            )),
-        }
+        });
+        let head: Vec<Result<Sse, SseError>> = vec![Ok(as_event(&first))];
+        Ok(StreamableHttpPostResponse::Sse(
+            Box::pin(futures::stream::iter(head).chain(rest)),
+            session,
+        ))
     }
 
     /// End a session. Best-effort by design: a server that has already forgotten
@@ -197,6 +239,11 @@ impl StreamableHttpClient for AgentdHttp {
 
 /// The JSON-RPC id of a request, or `None` for a notification — which is what
 /// decides whether a reply is expected at all.
+///
+/// A RESPONSE the client is sending (the answer to a server→client elicitation
+/// or sampling request) carries an id too, and it is emphatically not one we are
+/// owed a reply for: the server acks it `202` with no body. Only a message with
+/// a `method` is a request of ours, so that is what the id is read from.
 fn request_id_of(message: &rmcp::model::ClientJsonRpcMessage) -> Option<i64> {
     serde_json::to_value(message)
         .ok()

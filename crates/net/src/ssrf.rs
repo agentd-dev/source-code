@@ -4,10 +4,29 @@
 //! A *pure* address classifier plus a DNS-resolving host guard. The
 //! acceptance bar from assessment §4 M6 is blunt: "HTTP client refuses
 //! RFC-1918 / link-local by default". This module is the mechanism; it is
-//! complete and tested but currently has no call site, because the only
-//! outbound HTTP (`intel/client.rs`) targets the operator-configured endpoint
-//! and is exempt. It exists to guard any future model/agent-supplied URL,
-//! composed at the call site that introduces one.
+//! composed at every call site that introduces a model/agent/peer-supplied
+//! URL (A2A push targets, `http` workflow nodes), while the only
+//! operator-configured outbound (`intel/client.rs`) is exempt.
+//!
+//! ## Resolve once, dial what you vetted
+//!
+//! A guard that resolves a name, likes the answer, and then lets the
+//! caller dial the *name* is decorative: the connect re-resolves, and an
+//! attacker who controls the authoritative DNS answers the guard with a
+//! public address and the connect with `169.254.169.254`. That is DNS
+//! rebinding, and it defeats an address check that does not carry its
+//! result forward.
+//!
+//! So the guard hands back the addresses it vetted
+//! ([`resolve_guarded`]) and the dial takes *addresses*, never a name
+//! ([`connect_vetted`] / [`connect_addrs`], which re-assert [`is_global`]
+//! on every address immediately before the syscall). TLS and the `Host`
+//! header stay on the original hostname — connect by IP, verify by name —
+//! so SNI and certificate validation are unaffected.
+//!
+//! [`guard_host`] is retained for the yes/no admission check at
+//! *registration* time, where there is no socket to dial yet; it is not
+//! sufficient on its own at delivery time.
 //!
 //! ## What "non-global" means here
 //!
@@ -41,7 +60,9 @@
 //! — never request bodies, headers, or secrets. The codebase is
 //! content-capture-off by default and this module keeps that contract.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -178,9 +199,14 @@ fn is_global_v6(ip: Ipv6Addr) -> bool {
 /// This is the deny-all-the-aliases stance: a hostname that resolves to
 /// both a public and a private address is rejected, because an attacker
 /// who controls DNS could otherwise race the second connect (a DNS
-/// rebinding pivot). Resolution uses `std`'s `ToSocketAddrs`; we append
-/// `:0` because the resolver needs a port grammar even though we ignore
-/// it.
+/// rebinding pivot).
+///
+/// **This answers a yes/no question and throws the addresses away**, so
+/// it is only sound where there is nothing to dial yet — admission of a
+/// push target at registration, config validation. Anything that goes on
+/// to open a socket MUST use [`resolve_guarded`] + [`connect_addrs`] (or
+/// [`connect_vetted`], which does both), or the connect re-resolves and
+/// the check it just passed means nothing.
 ///
 /// `allow_private == true` is the operator escape hatch — it skips the
 /// check entirely without even resolving, so trusted localhost/private
@@ -192,36 +218,161 @@ pub fn guard_host(host: &str, allow_private: bool) -> Result<(), SsrfError> {
     if allow_private {
         return Ok(());
     }
+    // Port 0 because we are only classifying: the resolver needs a port
+    // grammar and we discard the addresses anyway.
+    resolve_guarded(host, 0, false).map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// Resolver seam
+// ---------------------------------------------------------------------------
+
+/// How a host is turned into addresses. A plain `fn` pointer, not a
+/// trait object: the only production implementation is [`std_resolve`],
+/// and the seam exists so a test can install a *hostile* resolver that
+/// answers the guard and the dial differently — the rebinding shape this
+/// module has to survive.
+pub type ResolveFn = fn(&str, u16) -> io::Result<Vec<SocketAddr>>;
+
+/// The production resolver: `std`'s `ToSocketAddrs`, with the bracketed
+/// IPv6 literal form (`[::1]`, as URLs write it) unwrapped first because
+/// `ToSocketAddrs` does not accept the brackets on a bare host.
+pub fn std_resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    // An IP literal short-circuits DNS entirely — no syscall, and no
+    // opportunity for a resolver to answer with something else.
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    (host, port).to_socket_addrs().map(|it| it.collect())
+}
+
+// ---------------------------------------------------------------------------
+// Resolve-once guard + dial-what-you-vetted
+// ---------------------------------------------------------------------------
+
+/// Resolve `host:port` **once** and return the addresses, having rejected
+/// the whole host if *any* of them is non-global.
+///
+/// The returned vector is the only thing a caller may dial: passing the
+/// name to a second resolution is precisely the rebinding hole this
+/// exists to close.
+///
+/// `allow_private` still resolves (there has to be something to connect
+/// to) but skips the classification, matching [`guard_host`]'s escape
+/// hatch.
+pub fn resolve_guarded(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> Result<Vec<SocketAddr>, SsrfError> {
+    resolve_guarded_with(host, port, allow_private, std_resolve)
+}
+
+/// [`resolve_guarded`] against an injected resolver. Public so the
+/// rebinding regression test can drive both halves — guard and dial —
+/// through a resolver that changes its mind between them.
+pub fn resolve_guarded_with(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+    resolve: ResolveFn,
+) -> Result<Vec<SocketAddr>, SsrfError> {
     if host.is_empty() {
         return Err(reject(host, "empty host"));
     }
-
-    // A bare IP literal short-circuits DNS — `ToSocketAddrs` would
-    // resolve it too, but parsing first lets us reject `127.0.0.1`
-    // without a syscall and yields a sharper class string.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return check_addr(host, ip);
-    }
-    // IPv6 literals are commonly bracketed in URLs (`[::1]`).
-    if let Some(stripped) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-        && let Ok(ip) = stripped.parse::<IpAddr>()
-    {
-        return check_addr(host, ip);
-    }
-
-    let addrs = (host, 0u16)
-        .to_socket_addrs()
-        .map_err(|e| reject(host, format!("resolve failed: {e}")))?;
-
-    let mut saw_any = false;
-    for sa in addrs {
-        saw_any = true;
-        check_addr(host, sa.ip())?;
-    }
-    if !saw_any {
+    let addrs = resolve(host, port).map_err(|e| reject(host, format!("resolve failed: {e}")))?;
+    if addrs.is_empty() {
         return Err(reject(host, "no addresses resolved"));
     }
-    Ok(())
+    if !allow_private {
+        for sa in &addrs {
+            check_addr(host, sa.ip())?;
+        }
+    }
+    Ok(addrs)
+}
+
+/// Dial one of `addrs`, re-asserting the classifier on every entry first.
+///
+/// The re-check is not redundant paranoia: this is the last instruction
+/// before the syscall, so it is the only place that can promise the bytes
+/// go somewhere global. A caller that hands over an address list built
+/// any other way (a cached answer, a redirect target) gets the same
+/// refusal, and one non-global entry refuses the *whole* dial rather than
+/// falling through to the next address — the same deny-all-the-aliases
+/// stance [`resolve_guarded`] takes, so a mixed answer cannot be raced.
+///
+/// `host` is carried for diagnostics only. TLS/SNI and the `Host` header
+/// remain the caller's business and must stay on the original hostname.
+pub fn connect_addrs(
+    host: &str,
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    allow_private: bool,
+) -> io::Result<TcpStream> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no vetted addresses for {host}"),
+        ));
+    }
+    if !allow_private {
+        for sa in addrs {
+            if let Err(e) = check_addr(host, sa.ip()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    e.to_string(),
+                ));
+            }
+        }
+    }
+    // Every address was vetted above, so trying the next one on a
+    // connect failure cannot widen the target set — it is only
+    // dual-stack fallback.
+    let mut last: Option<io::Error> = None;
+    for sa in addrs {
+        match TcpStream::connect_timeout(sa, timeout) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+                stream.set_nodelay(true).ok();
+                return Ok(stream);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("cannot connect to {host}"))
+    }))
+}
+
+/// Guard and dial in one step: resolve once, vet, connect to a vetted
+/// address. This is what a model/peer-supplied URL must use instead of
+/// `http::connect_tcp`, which resolves the name a second time.
+pub fn connect_vetted(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    allow_private: bool,
+) -> io::Result<TcpStream> {
+    connect_vetted_with(host, port, timeout, allow_private, std_resolve)
+}
+
+/// [`connect_vetted`] against an injected resolver — the test seam.
+pub fn connect_vetted_with(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    allow_private: bool,
+    resolve: ResolveFn,
+) -> io::Result<TcpStream> {
+    let addrs = resolve_guarded_with(host, port, allow_private, resolve)
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+    connect_addrs(host, &addrs, timeout, allow_private)
 }
 
 /// Classify one resolved address, turning a non-global result into a

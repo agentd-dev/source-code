@@ -8,7 +8,9 @@
 //!
 //! Security: the SSRF classifier guards the resolved host — private/loopback/
 //! link-local targets are refused unless the node sets `allow_private: true`
-//! (for a declared internal API). `https://` verifies the server certificate.
+//! (for a declared internal API). The guard resolves once and the dial takes the
+//! addresses it vetted, so a name that answers the check public and the connect
+//! private cannot rebind its way in. `https://` verifies the server certificate.
 
 use std::time::{Duration, Instant};
 
@@ -225,7 +227,6 @@ fn do_http(
     allow_private: bool,
 ) -> Result<Value, String> {
     let u = crate::net::http::Url::parse(url)?;
-    crate::net::ssrf::guard_host(&u.host, allow_private).map_err(|e| e.to_string())?;
     let path = if query.is_empty() {
         u.path.clone()
     } else if u.path.contains('?') {
@@ -237,7 +238,16 @@ fn do_http(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let tcp = crate::net::http::connect_tcp(&u.host, u.port, timeout).map_err(|e| e.to_string())?;
+    // The guard and the dial are one step: a standalone `guard_host` followed by
+    // `connect_tcp` resolves the name twice, and a URL a model or a workflow
+    // author supplied is exactly where a hostile nameserver would answer the
+    // check public and the connect `169.254.169.254`. `connect_vetted` resolves
+    // once, classifies, and dials an address it vetted; TLS/SNI and the `Host`
+    // header stay on the hostname below. The refusal is a PermissionDenied
+    // carrying the same `SsrfError` text, so the `http: {e}` step error a
+    // workflow surfaces reads as it always did.
+    let tcp = crate::net::ssrf::connect_vetted(&u.host, u.port, timeout, allow_private)
+        .map_err(|e| e.to_string())?;
     let resp = if u.is_tls() {
         #[cfg(feature = "tls")]
         {

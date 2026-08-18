@@ -166,6 +166,7 @@ Most-used options:
 | `lifecycle.run_until` | `once` · `idle` · `forever` |
 | `lifecycle.exit_code_map` | remap the *policy* codes 3 and 7 (e.g. so a budget stop is not a pod failure) |
 | `a2a.listen` | serve the A2A surface (needs client auth off loopback) |
+| `webhooks.listen` | serve inbound webhooks — required by any `webhook` node (§5.7) |
 | `interface.enabled` | allow TUI/web clients to attach |
 | `security.exec.enabled` | the local command runner — off at two layers |
 
@@ -217,6 +218,43 @@ State is keyed `<prefix>/<instance>/<kind>/<id>`, where `instance` is
 `agent.name`. Identity is **not** a hash of the config — a hash would change on
 any routine edit and silently orphan in-flight runs. `--fresh` starts a new
 generation without resuming.
+
+### 5.7 Webhooks (inbound HTTP)
+
+A `webhook` **start** node — and a `wait` on `webhook` — needs a listener, or
+validation fails with *"a 'webhook' node (start or wait) is used but
+webhooks.listen is not set"*.
+
+```yaml
+webhooks:
+  listen: "https://0.0.0.0:8099"        # loopback http:// is allowed for dev
+  tls: { cert: /etc/tls/crt.pem, key: /etc/tls/key.pem }
+  default_auth:                          # one of hmac | bearer | header | none
+    hmac:
+      secret: "{{secret:GH_WEBHOOK_SECRET}}"
+      header: X-Hub-Signature-256        # default X-Signature
+      algo: sha256                       # the only supported algorithm
+      prefix: "sha256="                  # stripped before the constant-time compare
+```
+
+| Auth kind | What it checks |
+|---|---|
+| `hmac` | a signature over the **raw request body** (GitHub/Stripe style) — `secret`, `header`, `algo`, `prefix` |
+| `bearer` | a shared token in `Authorization: Bearer …`, constant-time matched |
+| `header` | an exact header match — `{name, equals}` |
+| `none` | **loopback only, dev.** An explicit opt-in; it does not buy a public bind |
+
+**Resolution order:** a node's own `auth` wins; otherwise the listener's
+`default_auth`.
+
+**A non-loopback listener must authenticate every route it serves** — otherwise
+startup is exit `2` naming the open routes as `workflow/node`. This is symmetric
+with `a2a.listen`: both are inbound surfaces that trigger work, and `none: true`
+does not exempt either. A loopback listener with no auth stays valid, so local
+development is unaffected.
+
+Per-node options on a `webhook` start node: **`path`**, `methods`, `auth`,
+`parallelism`, `on_overflow`, `idempotency`, `respond`, `filter`, `inputs`.
 
 ---
 

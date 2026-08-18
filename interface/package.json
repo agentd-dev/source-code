@@ -1,6 +1,6 @@
 {
   "name": "@agentd-dev/cli",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "The agentd display clients: the terminal UI (agentd-tui), the web UI (agentd-ui), and the thin-client core they share. agentd hosts all state — these only render it.",
   "license": "Apache-2.0",
   "type": "module",

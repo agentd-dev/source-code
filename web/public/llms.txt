@@ -1,0 +1,506 @@
+# agentd
+
+> The runtime for autonomous AI agents. One static Rust binary (~6.6 MiB, musl,
+> runs on `FROM scratch`) that runs an LLM agent as a **daemon**: a one-shot job,
+> a long-lived reactive daemon, or a durable DAG workflow. Tools come only from
+> remote **MCP** servers over HTTPS; it speaks **A2A** to other agents; it
+> executes nothing locally unless you compile *and* enable the guarded `exec`
+> runner. This file is the condensed reference for LLMs. Version 2.2.0.
+
+Canonical docs: https://agentd.dev/docs/ · Source: https://github.com/agentd-dev/source-code
+
+---
+
+## 1. The mental model
+
+Two loops, strictly separated:
+
+- **A supervisor that holds no model.** It owns lifecycle, triggers, limits, the
+  process tree and the kill ladder. It never talks to the LLM, so it cannot be
+  prompted out of stopping something.
+- **Subagent child processes** (the same binary, re-exec'd) run the agentic loop
+  — think, call a tool, observe, self-correct. The supervisor can always
+  `SIGKILL` them; cancellation is `killpg` on a process group, not a dropped
+  future.
+
+The reactor is a **blocking single-writer loop**: one thread drains channels,
+fires timers, dispatches turns and checkpoints. It is not async. Async exists
+only at the SDK seams.
+
+Everything durable is **checkpointed before the effect happens**, so a crash
+resumes rather than repeats-blindly.
+
+Protocols are not hand-rolled: MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)
+(the official Rust SDK) and A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs)
+(generated from the spec's protobufs), both running over agentd's own
+credentialed transport.
+
+---
+
+## 2. Install
+
+```sh
+curl -fsSL https://agentd.dev/install.sh | sh     # checksum-verified, no sudo
+docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
+cargo build -p agentd-cli --release               # from source; Rust 1.96+, no C toolchain
+```
+
+Release binaries are Linux musl, amd64 + arm64. `exec` and `cel` are **not**
+compiled into them — they need a source build.
+
+---
+
+## 3. The rule that prevents most mistakes
+
+**Validate before you run.** The whole configuration is assembled and checked
+before any side effect — no MCP connect, no LLM call, no socket bind:
+
+```sh
+agentd --validate-config -c agent.yaml    # exit 0 = good, exit 2 = bad, in milliseconds
+```
+
+Every problem in the document is reported in one pass, not just the first.
+
+Useful introspection, all side-effect-free:
+
+| Command | Prints |
+|---|---|
+| `agentd --config-schema=2` | the settings JSON Schema (authoritative) |
+| `agentd --workflow-schema` | the workflow schema + node registry (authoritative) |
+| `agentd --capabilities` | what this binary can actually do (features are compile-time) |
+| `agentd --help` | every config path, env var and flag |
+
+---
+
+## 4. Quickstart
+
+**One-shot job** — ask, answer, exit; the exit code is the terminal status:
+
+```sh
+agentd \
+  --instruction "Triage the newest issue and label it" \
+  --intelligence https://gateway.internal/v1 \
+  --mcp github=https://mcp-github.internal/mcp
+```
+
+**A daemon from a config file:**
+
+```yaml
+config_version: "2"
+agent:
+  name: triage
+  instruction: Triage new issues and label them.
+intelligence:
+  endpoints: https://gateway.internal/v1
+  model: gpt-5.1
+mcp:
+  servers:
+    - name: github
+      endpoint: https://mcp-github.internal/mcp
+workflows:
+  - name: nightly
+    steps:
+      go:   { kind: schedule, cron: "0 3 * * *" }
+      work: { kind: agent, depends_on: [go], instruction: "Triage today's issues" }
+      fin:  { kind: finish, depends_on: [work], status: completed }
+```
+
+```sh
+agentd -c agent.yaml          # run it
+agentd tui -c agent.yaml      # run it with a terminal UI attached
+agentd ui  -c agent.yaml      # run it with a browser UI attached
+```
+
+stdout carries the result; **stderr carries JSON-lines telemetry**, one
+structured event per line, trace-correlated.
+
+---
+
+## 5. Configuration
+
+### 5.1 Precedence
+
+```
+built-in default  <  config file(s)  <  env var  <  CLI flag
+```
+
+Each layer overrides the previous **key by key** — an unset env var never
+clobbers a lower layer.
+
+### 5.2 One name, three sources
+
+Every path in the schema is settable from all three, with names derived
+mechanically:
+
+| source | for the path `limits.run.steps` |
+|---|---|
+| file | `limits: { run: { steps: 5 } }` |
+| env | `AGENTD_LIMITS_RUN_STEPS` › `AGENT_LIMITS_RUN_STEPS` › `LIMITS_RUN_STEPS` |
+| flag | `--limits.run.steps 5` (also `--limits.run-steps`, `--limits-run-steps`) |
+
+Values are typed by the schema; a value that does not type is exit `2` naming
+the source. Setting a path **sets** it (a list/map from env or flag *replaces*
+the file's); the repeatable named flags `--mcp`, `--a2a-peer`, `--workflow`
+**add** one element.
+
+### 5.3 The 20 sections
+
+`agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`, `context`,
+`knowledge`, `search`, `skills`, `workflows`, `webhooks`, `limits`, `lifecycle`,
+`a2a`, `interface`, `observability`, `security`, plus `config_version` (must be
+`"2"`).
+
+Most-used options:
+
+| Path | What it does |
+|---|---|
+| `agent.name` | the instance identity — also the durable state's key |
+| `agent.instruction` | static text, or a resource URI to read and re-read |
+| `intelligence.endpoints` | one or more `https://` endpoints; a list is a failover order |
+| `intelligence.model` / `.dialect` / `.auth` | model, wire dialect (incl. Bedrock), per-endpoint credentials |
+| `intelligence.headers` | extra headers; credential-shaped values must be `{{secret:…}}` |
+| `mcp.servers[]` | `{name, endpoint, auth, tags}` — every tool agentd has |
+| `store.kind` | `file` (default for long-lived) · `mcp` · `http` · `memory` · `none` |
+| `limits.run.steps` / `.tokens` / `.deadline` | bound a single run |
+| `limits.max_runs` | global concurrent runs (default 8) |
+| `lifecycle.run_until` | `once` · `idle` · `forever` |
+| `lifecycle.exit_code_map` | remap the *policy* codes 3 and 7 (e.g. so a budget stop is not a pod failure) |
+| `a2a.listen` | serve the A2A surface (needs client auth off loopback) |
+| `interface.enabled` | allow TUI/web clients to attach |
+| `security.exec.enabled` | the local command runner — off at two layers |
+
+### 5.4 Config files and discovery
+
+`--config <path>` (repeatable, `-c`, or `AGENT_CONFIG=a.yaml:b.yaml`). YAML or
+JSON/JSONC. Several files compose into **one document** with JSON-Merge-Patch
+semantics (objects merge recursively, scalars and lists are replaced by the
+later file, an explicit `null` unsets).
+
+If an invocation names **no** config, agentd loads `.agentd.yml` (or
+`.agentd.yaml`) from the working directory — the way a linter finds its dotfile.
+It is only ever a fallback; naming a config means you have decided. A
+*discovered* file may not relax a security control (that needs an explicit
+`--config`). Both spellings present is exit `2`.
+
+### 5.5 Secrets
+
+Never inline. A file may carry **references** only:
+
+```yaml
+intelligence:
+  headers:
+    authorization: "Bearer {{secret:OPENAI_KEY}}"   # env
+    x-other: "{{secret-file:/run/secrets/tok}}"     # mounted file
+```
+
+A credential-shaped key with a literal value is refused at validation. A
+reference that fails to resolve is **exit 2 naming the reference** — never a
+silent start with the header missing.
+
+### 5.6 Durability (the store)
+
+State — conversations, tasks, workflow runs, timers, budget counters — is
+durable so a restart resumes rather than restarts.
+
+- `file` — the local filesystem. **The default for a long-lived instance.**
+  Atomic writes, `0700`/`0600`, an exclusive lock so two instances cannot share
+  a directory. Root: `store.file.path` › `$AGENTD_STATE_DIR` ›
+  `$XDG_STATE_HOME/agentd/state` › `$HOME/.local/state/agentd/state`.
+  **Durability is the filesystem's property, not agentd's**: on a container's
+  writable layer this survives a process restart but *not* a reschedule — mount
+  a volume, or use `mcp`/`http`.
+- `mcp` / `http` — a shared backend; what a fleet needs.
+- `memory` — dev/test only. `none` — no durability; refused for a long-lived
+  instance.
+
+State is keyed `<prefix>/<instance>/<kind>/<id>`, where `instance` is
+`agent.name`. Identity is **not** a hash of the config — a hash would change on
+any routine edit and silently orphan in-flight runs. `--fresh` starts a new
+generation without resuming.
+
+---
+
+## 6. Exit codes (a stable, machine-actionable contract)
+
+Treat changes as breaking; designed for a Kubernetes `podFailurePolicy`.
+
+| Code | Meaning | Scheduler hint |
+|---|---|---|
+| 0 | success (one-shot completed, or a clean SIGTERM drain) | Complete |
+| 1 | generic/unspecified failure | retriable |
+| 2 | config / usage error | **non-retriable** |
+| 3 | partial result | policy |
+| 4 | intelligence unreachable / auth failed after retries | retriable |
+| 5 | semantic — the task cannot be done / refused | **non-retriable** |
+| 6 | a required MCP server failed to connect or died | retriable |
+| 7 | budget exceeded (steps/tokens/deadline/tree) | policy |
+| 124 | hard wall-clock deadline (mnemonic to `timeout(1)`) | — |
+| 137 / 143 | SIGKILL / ungraceful SIGTERM (OS-set; often OOM at 137) | raise memory |
+
+A clean SIGTERM drain returns **0, not 143**.
+
+---
+
+## 7. Workflows
+
+A workflow is a **durable DAG**. Every step checkpoints before its effect, so a
+run survives a restart and resumes mid-flight. Cycles are not allowed; loops are
+expressed with `loop`/`iterate`/`foreach`.
+
+### 7.1 Definition
+
+```yaml
+workflows:
+  - name: pipeline          # required, [a-zA-Z_][a-zA-Z0-9_-]{0,63}
+    version: 3              # the dialect; defaults to 3
+    description: free text
+    armed: true             # false loads the definition without arming triggers
+    inputs:  { schema: {…} } # JSON Schema, enforced when a run is created
+    outputs: { schema: {…} }
+    concurrency: { max_runs: 4, on_overflow: queue }   # queue | drop | replace
+    limits: { steps: 50, tokens: 100000, deadline: 10m }
+    steps:                  # id -> step
+      a: { kind: … }
+      b: { kind: …, depends_on: [a] }
+```
+
+Instead of `steps`, a workflow may use `file:` (a path) or `uri:` (an MCP
+resource) — exactly one of the three.
+
+### 7.2 Start nodes — what makes a run
+
+| Kind | Fires when | Key options |
+|---|---|---|
+| `once` | armed at boot/restore, or `workflow.run` | `policy: ensure\|always` |
+| `manual` | `workflow.run` only | — |
+| `loop` | the previous run finished | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
+| `schedule` | cron or interval | `cron` (5-field), `every`, `tz` (UTC default), `jitter`, `catch_up`, `at` (one-shot) |
+| `subscribe` | an MCP resource changed (notify-then-read) | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver` |
+| `signal` | a named signal arrives | **`name`**, `filter`, `deliver` |
+| `event` | an internal event | **`on`** (`workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.timeout`, …) |
+| `a2a` | a principal sends a message | `command`, `roles`, `inputs` |
+| `webhook` | an inbound HTTP request | **`path`**, `methods`, `auth`, `idempotency`, `respond`, `parallelism` |
+
+A run's `run.start` names the node that fired; siblings are `skipped`. Start-node
+state (last fired, iteration, missed) is durable.
+
+### 7.3 The node catalogue
+
+Required fields in **bold**.
+
+**Control flow**
+
+| Kind | What it does |
+|---|---|
+| `switch` | branch on a value — **`on`**, **`cases`**, `default` |
+| `parallel` | run **`branches`** concurrently; `on_error` |
+| `foreach` | run **`body`** per element of **`over`**; `batch`, `collect`, `on_error`, `as` |
+| `batch` | like `foreach` but in groups — **`over`**, **`body`**, `by`, `size`, `parallel`, `rate` |
+| `iterate` | repeat **`body`** while/until a condition; `max_iterations`, `collect` |
+| `race` | first of **`branches`** to finish wins; `timeout`, `min_success` |
+| `join` | await **`handles`** from async children; `timeout`, `min`, `partials` |
+| `subgraph` | an inline nested graph — **`body`** |
+| `workflow` | start a child run — **`name`**, `mode: sync\|async\|detached`, `inputs`, `start`, `cascade` |
+| `wait` | block on **`on`**: `resource\|condition\|signal\|run\|subagent\|message\|webhook`; `timeout` |
+| `sleep` | wait **`duration`** |
+| `assert` | fail unless **`condition`** holds; `message` |
+| `fail` | end the run as failed — `message`, `code` |
+| `noop` | do nothing (a join point or a placeholder) |
+| `checkpoint` | force a durable checkpoint here |
+| `finish` | end the run — `status`, `output`, `reason` |
+
+**Data shaping** (deterministic, no model, no network)
+
+| Kind | What it does |
+|---|---|
+| `assign` / `transform` | compute **`value`** into the run's data; `writes`, `mode` |
+| `map` / `filter` | apply **`expr`** across **`over`**; `as` |
+| `reduce` | fold **`over`** with **`expr`**; `initial`, `acc` |
+| `sort` | order **`over`** by `by`, `order` |
+| `dedupe` | unique **`over`**, optionally `by` a key |
+| `chunk` | split **`value`** into **`size`** pieces; `by`, `overlap` |
+| `template` | render `text` with the run's data |
+| `parse` | parse **`text`** (`format`: json, yaml, …) |
+| `validate` | check **`value`** against **`schema`** |
+| `memory.get` / `.set` / `.list` / `.delete` | durable key/value — `key`, `value`, `ttl`, `prefix` |
+| `artifact.create` / `.get` / `.delete` | durable blobs — `name`, `mime`, `content`, `from_step`, `sensitive` |
+| `knowledge.search` / `.get` | a configured knowledge source — `query`, `top_k`, `filters` |
+| `search.query` / `.fetch` | a configured web/search source — `query`, `url`, `freshness`, `max_bytes` |
+
+**Integration**
+
+| Kind | What it does |
+|---|---|
+| `mcp.tool` | call a tool — **`server`**, **`tool`**, `args` |
+| `mcp.resource` | **`server`**, **`op`** (`read\|list\|prompt\|complete`), `uri`/`name` |
+| `tool` | call a tool by registry name — **`name`**, `args` |
+| `http` | an outbound request — **`url`**, `method`, `headers`, `body`/`json`, `expect`, `allow_private`, `sign`. SSRF-guarded: resolved once and dialled by vetted address |
+| `a2a.send` | send a message to a peer agent |
+| `a2a.delegate` | delegate an objective to a **`peer`** as a spec Task; `output_contract`, `timeout` |
+| `a2a.wait` | await a delegated task |
+| `workflow.signal` | send **`name`** to a waiting run; `payload`, `run` |
+| `workflow.wait` / `.cancel` | await or cancel **`run`**; `timeout`, `reason` |
+| `emit` | emit an internal event other workflows can start on |
+
+**Intelligence & agents** (these are the steps that cost tokens)
+
+| Kind | What it does |
+|---|---|
+| `agent` | a full agentic loop — **`instruction`**, `tools`, `servers`, `limits`, `context`, `output_schema` |
+| `think` | one model call — **`prompt`**, `output_schema`, `reads`, `check`, `retries` |
+| `subagent` | a child *process* with narrowed tools and trust — **`instruction`**, `mode`, `tools`, `servers`, `limits` |
+| `classify` | **`input`** into one of **`classes`** |
+| `extract` | **`input`** into **`output_schema`** |
+| `summarize` | shorten **`input`**; `length` |
+| `judge` | score **`input`** against a **`rubric`** |
+| `route` | pick one of **`choices`** for **`input`** |
+| `human` | ask a person — **`question`**, `schema`, `to`, `timeout`. Suspends durably; the answer can arrive after a restart |
+
+### 7.4 On every step
+
+`depends_on` · `when` (a CEL guard) · `retry {max, backoff}` · `timeout` ·
+`on_error: fail | continue | goto:<id>` · `idempotent` ·
+`on_replay: retry|skip|fail` · `output_schema` · `cache {key, ttl}` · `budget` ·
+`skills` · `otel {attributes}` · `description`.
+
+### 7.5 Semantics worth knowing
+
+- **Concurrency**: `concurrency.max_runs` per workflow (default 4) and
+  `limits.max_runs` globally (default 8). `on_overflow: queue` (default) parks
+  the start event and retries it on a later tick; `drop` discards it; `replace`
+  cancels the oldest run.
+- **Replay**: a step that was in flight when the process died is replayed on
+  restore. Make effects `idempotent`, or set `on_replay`.
+- **CEL** guards (`when`, `until`, `filter`) need the `cel` build feature, which
+  is *not* in the release binaries.
+- **Validation is author-time and fail-closed**: an unknown field or kind is
+  exit `2` naming the step, before anything runs.
+
+---
+
+## 8. Security model
+
+- **No local execution by default.** No `fs`/`shell`/`http` tool library. Every
+  capability is a remote MCP server you declare. The `exec` runner is off at two
+  layers (a cargo feature *and* `security.exec.enabled`).
+- **The lethal trifecta gate.** A grant that combines untrusted input +
+  sensitive data + egress is refused **at startup**, not mid-run. MCP servers
+  carry `tags`; an untagged server counts as untrusted input.
+- **Secrets by reference only** (§5.5), redacted everywhere they could surface —
+  `Debug`, logs, and the A2A `config` command.
+- **Scope narrows monotonically.** A subagent's `tools`/`servers` narrowing is
+  enforced at the catalogue *and* at dispatch, and re-applied after a tools
+  refresh, so a server adding a tool mid-session cannot widen a parent's grant.
+- **SSRF guard** on every model- and peer-supplied URL (`http` nodes, A2A push
+  targets, webhooks): resolved once, dialled by the vetted address, re-checked
+  at the syscall boundary. TLS/SNI stays on the hostname.
+- **Inbound listeners need authentication** off loopback — both `a2a.listen`
+  and `webhooks.listen` refuse to start otherwise.
+- HTTPS everywhere; plaintext `http://` is loopback-only, for dev.
+
+---
+
+## 9. Observability
+
+- **JSON-lines on stderr**, one event per line, trace-correlated
+  (`proc.start`, `run.start`, `step.start`, `step.done`, `tool.call`,
+  `run.done`, `proc.exit`, …).
+- `/healthz`, `/readyz`, `/metrics` (Prometheus text) behind the `metrics`
+  feature; OTLP trace+log export behind `otel`.
+- The **observation feed** is the same event stream the TUI and web UI render;
+  clients attach over A2A with a seq cursor and can resume.
+
+---
+
+## 10. Talking to it
+
+- **A2A** (`a2a.listen`) — other agents and your own display clients send
+  messages, commands and tasks. Push notifications are supported and guarded.
+- **TUI / web UI** — `agentd tui` / `agentd ui`, or detached with
+  `npm i -g @agentd-dev/cli` then `agentd-tui --endpoint <url>`. They are thin
+  clients: all state lives in the daemon.
+- **Served MCP** — agentd is addressable as an MCP server itself
+  (`agentd://` status and subagent resources).
+
+---
+
+## 11. Build features
+
+Compile-time; `--capabilities` reports what a given binary has.
+
+In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
+`config-watch`, `aauth`, `oauth`, and `tls` (on by default).
+
+**Not** in the release binaries — build from source to get them:
+`exec` (the local command runner) and `cel` (expression guards).
+
+---
+
+## 12. What agentd deliberately does not do
+
+Useful to know so you do not assume otherwise:
+
+- It ships **no built-in tools** — no filesystem, shell, or HTTP tool library
+  for the model. Capability comes from MCP servers you declare.
+- It has **no cycles** in workflows, and no generic "run this code" step.
+- It is **not a fleet coordinator**: the `file` store is single-writer, and
+  clustering/sharding was removed rather than half-finished. Partition upstream
+  (one subscription per replica, or the queue's own claim semantics).
+- It does **not** stream model tokens to display clients (deliberate — live
+  activity events instead).
+- It does **not** encrypt durable state at rest; point the store at an encrypted
+  volume if you need that.
+
+---
+
+## 13. Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| exit `2` immediately | config/usage error — run `--validate-config`, every problem is listed |
+| exit `4` in a loop | the intelligence endpoint is unreachable or auth fails; check `intelligence.auth` and `--login` |
+| exit `6` | a required MCP server would not connect or died |
+| exit `7` | a budget (steps/tokens/deadline) was exhausted — `lifecycle.exit_code_map` can make this non-fatal |
+| "store.kind is none but the instance is long-lived" | drop `store.kind` to get the file store, or configure `mcp`/`http` |
+| "is locked by pid N" | another agentd is using that state directory — give this one its own `agent.name` or `store.file.path` |
+| a workflow never fires | check `armed`, the start node's conditions, and that `--capabilities` shows the feature it needs (`cron`, `cel`) |
+| the trifecta gate refuses startup | tag your MCP servers; an untagged server counts as untrusted input |
+
+---
+
+## 14. Documentation index
+
+| Page | Covers |
+|---|---|
+| https://agentd.dev/docs/overview/ | what agentd is, in one page |
+| https://agentd.dev/docs/getting-started/ | checkout to a first run |
+| https://agentd.dev/docs/configuration/ | **the full config reference** — every path, type, default |
+| https://agentd.dev/docs/workflows/ | **the full workflow reference** — every node and field |
+| https://agentd.dev/docs/architecture/ | the two loops, the process tree, how a run flows |
+| https://agentd.dev/docs/harness/ | what keeps an agent bounded; durability and replay |
+| https://agentd.dev/docs/agent-loop/ | the agentic loop itself |
+| https://agentd.dev/docs/modes-and-triggers/ | one-shot, daemon, reactive, scheduled |
+| https://agentd.dev/docs/mcp/ | MCP client and served MCP |
+| https://agentd.dev/docs/a2a/ | the A2A surface, principals, tasks, commands |
+| https://agentd.dev/docs/intelligence/ | endpoints, dialects, failover, budgets |
+| https://agentd.dev/docs/authentication/ | per-endpoint credentials: static, OAuth2, AWS SigV4, SPIFFE |
+| https://agentd.dev/docs/aauth/ | AAuth agent identity |
+| https://agentd.dev/docs/security/ | the trifecta gate, tags, secrets, the exec runner |
+| https://agentd.dev/docs/subagents/ | the process tree, narrowing, limits |
+| https://agentd.dev/docs/interface/ | TUI and web UI, the observation feed |
+| https://agentd.dev/docs/observability/ | events, metrics, OTLP |
+| https://agentd.dev/docs/operations/ | running it in production |
+| https://agentd.dev/docs/deployment/ | containers, Kubernetes, volumes |
+| https://agentd.dev/docs/scaling/ | how a fleet partitions |
+| https://agentd.dev/docs/coding-agent/ | assembling a coding agent |
+| https://agentd.dev/docs/use-cases/ | worked shapes |
+| https://agentd.dev/docs/embedding/ | the engine as a Rust library |
+| https://agentd.dev/docs/why-rust/ | the dependency posture and measured footprint |
+| https://agentd.dev/docs/rfc-0027/ | RFC 0027 — the workflow dialect, normative |
+| https://agentd.dev/docs/rfc-0025/ | RFC 0025 — durable state and store adapters |
+| https://agentd.dev/docs/rfc-0029/ | RFC 0029 — A2A conversations, principals, commands |
+| https://agentd.dev/docs/rfc-0030/ | RFC 0030 — the config schema, normative |
+
+The authoritative machine-readable schemas are `agentd --config-schema=2` and
+`agentd --workflow-schema`; when this file and the binary disagree, the binary
+is right.

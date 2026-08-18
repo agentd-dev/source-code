@@ -898,6 +898,15 @@ details.doc-nav-group[open] > summary::before {
    and reads as a typo. Owned by the next item, it always wraps with it. */
 .speclist > span + span::before {
   content: "·";
-  margin: 0 0.55rem;
+  /* Tighter on a phone: at 390px the row overshot by four pixels, and three
+     separators at the roomier desktop margin are exactly where those pixels
+     went. Squeezing the gaps keeps all four facts on one line without dropping
+     a word the reader came for. */
+  margin: 0 0.4rem;
   opacity: 0.55;
+}
+@media (min-width: 640px) {
+  .speclist > span + span::before {
+    margin: 0 0.55rem;
+  }
 }

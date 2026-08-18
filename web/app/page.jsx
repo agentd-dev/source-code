@@ -192,8 +192,19 @@ export default function Home() {
           <div className="speclist mt-7 flex flex-wrap items-center gap-y-1 border-t border-[var(--line)] pt-4 font-mono text-xs text-[var(--dim)]">
             <span className="text-[var(--fg-strong)]">Rust</span>
             <span className="text-[var(--fg-strong)]">cloud-native</span>
-            <span>6.6 MiB static binary</span>
-            <span>&lt; 1 ms cold start</span>
+            {/* Below `sm` the qualifiers go ("static binary", "cold") and the
+                numbers stay: the row is four facts wide and a phone is not, and
+                the size and the latency are what the reader came for. Measured,
+                not guessed — at 390px the full row overshot by 4px and at 360px
+                by 20px. Each qualifier is a NESTED span so it stays inside its
+                item; `.speclist > span + span::before` only draws separators
+                between DIRECT children, so hiding one cannot strand a dot. */}
+            <span>
+              6.6 MiB<span className="hidden sm:inline"> static binary</span>
+            </span>
+            <span>
+              &lt; 1 ms<span className="hidden sm:inline"> cold</span> start
+            </span>
           </div>
         </div>
 

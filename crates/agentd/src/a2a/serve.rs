@@ -495,10 +495,12 @@ async fn dispatch(
     // first. Without this, a blocking send would never see the task settle and
     // a streaming send would be refused outright for want of an id.
     let body = match bare.as_str() {
-        "SendMessage" | "SendStreamingMessage" => match normalize_send(&app, &req, &params).await {
-            Some(rewritten) => Bytes::from(rewritten),
-            None => body,
-        },
+        "SendMessage" | "SendStreamingMessage" => {
+            match normalize_send(&app.bridge, &req, &params).await {
+                Some(rewritten) => Bytes::from(rewritten),
+                None => body,
+            }
+        }
         _ => body,
     };
 
@@ -541,7 +543,21 @@ async fn dispatch(
 ///   with `configuration.blocking: false`; the spec spells the same thing
 ///   `returnImmediately: true`. Translating here keeps those clients working
 ///   against a server that now speaks only the specification's field.
-async fn normalize_send(app: &Arc<App>, req: &Value, params: &Value) -> Option<Vec<u8>> {
+///
+/// Both rewrites write *into* `params`, which is whatever a remote caller put on
+/// the wire. Neither is attempted unless the params carry the shape the spec
+/// requires — an object with an object `message` — because the only way to write
+/// into a `Value` is through a path of objects, and serde_json's `IndexMut`
+/// *panics* rather than declining when the value under the path is a string, a
+/// number or an array (`params: []`, `params: {"message": "hi"}`). The release
+/// profile is `panic = "abort"`, so one malformed request would take the whole
+/// daemon down. A shape that cannot be rewritten is passed through untouched
+/// instead, and a2a-rs refuses it with the spec's -32602.
+async fn normalize_send(bridge: &Arc<A2aBridge>, req: &Value, params: &Value) -> Option<Vec<u8>> {
+    if !params.is_object() || !params.get("message").is_some_and(Value::is_object) {
+        return None;
+    }
+
     let mut req = req.clone();
     let mut changed = false;
 
@@ -550,26 +566,43 @@ async fn normalize_send(app: &Arc<App>, req: &Value, params: &Value) -> Option<V
         .unwrap_or("")
         .is_empty()
     {
-        let bridge = Arc::clone(&app.bridge);
+        let bridge = Arc::clone(bridge);
         if let Ok(v) = tokio::task::spawn_blocking(move || {
             bridge.call("NewTaskId", json!({}), Principal::anonymous())
         })
         .await
             && let Some(id) = v.get("id").and_then(Value::as_str)
+            && let Some(message) = param_object(&mut req, "message")
         {
-            req["params"]["message"]["taskId"] = json!(id);
+            message.insert("taskId".to_string(), json!(id));
             changed = true;
         }
     }
 
     if let Some(blocking) = params["configuration"]["blocking"].as_bool()
         && params["configuration"]["returnImmediately"].is_null()
+        && let Some(config) = param_object(&mut req, "configuration")
     {
-        req["params"]["configuration"]["returnImmediately"] = json!(!blocking);
+        config.insert("returnImmediately".to_string(), json!(!blocking));
         changed = true;
     }
 
     changed.then(|| serde_json::to_vec(&req).ok()).flatten()
+}
+
+/// `req.params.<field>` as a map to write into, or `None` when anything along
+/// that path is not an object. Every rewrite goes through here rather than
+/// through `IndexMut`, whose failure mode on a caller-controlled shape is a
+/// panic in the listener rather than a request that gets refused.
+fn param_object<'a>(
+    req: &'a mut Value,
+    field: &str,
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    req.as_object_mut()?
+        .get_mut("params")?
+        .as_object_mut()?
+        .get_mut(field)?
+        .as_object_mut()
 }
 
 /// One reactor round trip, answered as a JSON-RPC envelope.
@@ -719,7 +752,14 @@ fn feed_stream(
     let (newest, oldest, dropped) = feed.bounds();
     // The cursor predates the replay window: events were evicted past it, so
     // replay from the window start and tell the client to re-bootstrap.
-    let resync = after > 0 && dropped > 0 && after < oldest.saturating_sub(1);
+    let evicted = after > 0 && dropped > 0 && after < oldest.saturating_sub(1);
+    // The cursor is *ahead* of the feed, which is what every attached client
+    // holds across a daemon restart: the feed is in-memory and its seq begins
+    // again at 0. Honouring such a cursor silently kills the subscription —
+    // `since` only ever yields `seq > cursor`, so the client would sit through a
+    // whole restart's worth of events seeing nothing and never learn why.
+    let ahead = after > newest;
+    let resync = evicted || ahead;
     let start = if resync { 0 } else { after };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<axum::response::sse::Event>(64);
@@ -767,4 +807,76 @@ fn frame(id: &Value, payload: Value) -> axum::response::sse::Event {
         serde_json::to_string(&json!({"jsonrpc": "2.0", "id": id, "result": payload}))
             .unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bridge with a stand-in for the reactor: it answers `NewTaskId` with an
+    /// id, because a bridge whose loop is missing fails fast and would leave the
+    /// rewrite — the code that used to panic — unreached, making these tests pass
+    /// against the bug they exist to catch.
+    fn stub_bridge() -> Arc<A2aBridge> {
+        let resolver =
+            crate::a2a::Resolver::build(&crate::config::v2::A2a::default(), &|_| None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(crate::runtime::events::Event::A2a(req)) = rx.recv() {
+                let _ = req.reply.send(json!({"id": "task-stub"}));
+            }
+        });
+        A2aBridge::new(tx, resolver)
+    }
+
+    /// Params are remote input, and a send whose params are not the shape the
+    /// spec requires used to reach serde_json's `IndexMut` and panic the
+    /// listener — which under the release profile's `panic = "abort"` is a dead
+    /// daemon from one curl. Every one of these must come back "nothing to
+    /// rewrite" so the body travels on and a2a-rs answers it with -32602.
+    #[tokio::test]
+    async fn malformed_send_params_are_left_alone_rather_than_panicking() {
+        let bridge = stub_bridge();
+        for params in [
+            json!([]),
+            json!({"message": "hi"}),
+            json!({"message": 3}),
+            json!({"message": []}),
+            Value::Null,
+            json!("send"),
+            json!({}),
+        ] {
+            let req =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": params});
+            // Exactly how `dispatch` derives the params it passes in.
+            let p = req.get("params").cloned().unwrap_or_else(|| json!({}));
+            assert_eq!(
+                normalize_send(&bridge, &req, &p).await,
+                None,
+                "params {p} must not be rewritten"
+            );
+        }
+    }
+
+    /// The other half of the guard: a well-formed send must still be normalised
+    /// — both rewrites — because refusing every shape would "fix" the panic by
+    /// breaking the send path the protocol layer depends on.
+    #[tokio::test]
+    async fn a_well_formed_send_is_still_normalised() {
+        let bridge = stub_bridge();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {
+            "message": {"messageId": "m1", "role": "user", "parts": [{"kind": "text", "text": "hi"}]},
+            "configuration": {"blocking": false},
+        }});
+        let params = req["params"].clone();
+        let out = normalize_send(&bridge, &req, &params)
+            .await
+            .expect("a well-formed send is rewritten");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["params"]["message"]["taskId"], json!("task-stub"));
+        assert_eq!(
+            v["params"]["configuration"]["returnImmediately"],
+            json!(true)
+        );
+    }
 }

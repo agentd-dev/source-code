@@ -238,8 +238,23 @@ fn streamable_http_full_lifecycle() {
         .expect("tools/call");
     assert!(!result.is_error(), "call is not a tool-domain error");
 
-    // The notification carried on the SSE response was captured.
-    let notes = client.drain_notifications();
+    // The notification carried on the SSE response is captured — but WAIT for
+    // it rather than demanding it has already landed. `drain_notifications`
+    // returns what the SDK's reader task has queued so far, and that task is
+    // not synchronised with the return of an unrelated `tools/call`: the
+    // notification is delivered, just not necessarily before this line runs.
+    // Asserting immediately encoded a happens-before the transport never
+    // promised, and it failed roughly one run in six here and more often on a
+    // loaded CI runner. What the reactive path actually needs is that the wake
+    // ARRIVES, which is what this waits for.
+    let mut notes = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while notes.is_empty() && std::time::Instant::now() < deadline {
+        notes.extend(client.drain_notifications());
+        if notes.is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     assert_eq!(notes.len(), 1, "one resources/updated captured");
     assert_eq!(notes[0].method, "notifications/resources/updated");
 

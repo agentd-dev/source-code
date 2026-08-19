@@ -33,6 +33,7 @@ const UNDERSTAND = [
 ];
 
 const REFERENCE = [
+  { href: "/docs/node-registry/", t: "Node registry", d: "All 67 workflow nodes, and the five traps" },
   { href: "/docs/configuration/", t: "Configuration", d: "Every key, and how layers resolve" },
   { href: "/docs/interface/", t: "TUI & web UI", d: "The display clients and their protocol" },
   { href: "/docs/mcp/", t: "MCP", d: "Where tools and events come from" },

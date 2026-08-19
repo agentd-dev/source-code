@@ -5,7 +5,7 @@
 // registry generated from `agentd --workflow-schema`. Import a YAML config to
 // edit it, export the whole document back out. Multi-workflow: a config can hold
 // several workflows, switched by the tabs.
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -87,24 +87,86 @@ function Editor() {
   const [showYaml, setShowYaml] = useState(false);
   const [importText, setImportText] = useState("");
   const [importing, setImporting] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  // The node a connection is being dragged FROM, while the drag is in flight.
+  const [connectingFrom, setConnectingFrom] = useState(null);
   const [error, setError] = useState("");
   const fileRef = useRef(null);
+
+  // ── history ────────────────────────────────────────────────────────────────
+  // An editor without undo is a trap: every experiment costs the fear of not
+  // getting back. The snapshot is the whole workflow array, which is small
+  // (a config is tens of nodes, not thousands) and makes correctness trivial —
+  // no per-action inverse to get wrong.
+  //
+  // Dragging is the one thing that must NOT flood the stack: a single drag
+  // fires a position change per frame. `commit` coalesces by tag, so a whole
+  // drag collapses into one entry a person can undo in one keystroke.
+  const past = useRef([]);
+  const future = useRef([]);
+  const lastTag = useRef(null);
+  const [histVersion, setHistVersion] = useState(0);
+
+  const commit = useCallback(
+    (tag) => {
+      // Coalesce consecutive same-tag mutations (a drag, a text field) into one.
+      if (tag && tag === lastTag.current) return;
+      past.current = [...past.current.slice(-49), workflows];
+      future.current = [];
+      lastTag.current = tag || null;
+      setHistVersion((v) => v + 1);
+    },
+    [workflows]
+  );
+  const undo = useCallback(() => {
+    if (!past.current.length) return;
+    const prev = past.current[past.current.length - 1];
+    past.current = past.current.slice(0, -1);
+    future.current = [workflows, ...future.current];
+    lastTag.current = null;
+    setWorkflows(prev);
+    setHistVersion((v) => v + 1);
+  }, [workflows]);
+  const redo = useCallback(() => {
+    if (!future.current.length) return;
+    const next = future.current[0];
+    future.current = future.current.slice(1);
+    past.current = [...past.current, workflows];
+    lastTag.current = null;
+    setWorkflows(next);
+    setHistVersion((v) => v + 1);
+  }, [workflows]);
 
   const wf = workflows[active] || workflows[0];
   const nodes = wf?.nodes || [];
   const edges = wf?.edges || [];
 
-  // Write a mutation back into the active workflow.
+  // Write a mutation back into the active workflow. `tag` groups a burst of
+  // related changes into one undo entry; omit it for a discrete action.
   const updateActive = useCallback(
-    (patch) => {
+    (patch, tag) => {
+      commit(tag);
       setWorkflows((ws) => ws.map((w, i) => (i === active ? { ...w, ...patch } : w)));
     },
-    [active]
+    [active, commit]
   );
 
   const onNodesChange = useCallback(
-    (changes) => updateActive({ nodes: applyNodeChanges(changes, wf.nodes) }),
-    [wf, updateActive]
+    (changes) => {
+      // A drag emits a position change per frame; selection changes are not
+      // edits at all. Tagging the first as one unit and skipping the second
+      // keeps the undo stack made of things a person actually did.
+      const onlySelection = changes.every((c) => c.type === "select");
+      const dragging = changes.some((c) => c.type === "position" && c.dragging);
+      if (onlySelection) {
+        setWorkflows((ws) =>
+          ws.map((w, i) => (i === active ? { ...w, nodes: applyNodeChanges(changes, w.nodes) } : w))
+        );
+        return;
+      }
+      updateActive({ nodes: applyNodeChanges(changes, wf.nodes) }, dragging ? "drag" : null);
+    },
+    [wf, updateActive, active]
   );
   const onEdgesChange = useCallback(
     (changes) => updateActive({ edges: applyEdgeChanges(changes, wf.edges) }),
@@ -121,6 +183,36 @@ function Editor() {
       return canConnect(s, t, conn.source, conn.target).ok;
     },
     [wf]
+  );
+
+  // React Flow refuses an invalid connection SILENTLY — `isValidConnection`
+  // returns false and `onConnect` never fires, so the reason we already
+  // computed is never seen. Tracking the drag lets the canvas dim what cannot
+  // accept the edge while the user is still deciding, and lets a refused drop
+  // explain itself instead of just not happening.
+  const onConnectStart = useCallback((_e, { nodeId }) => {
+    setConnectingFrom(nodeId);
+    setError("");
+  }, []);
+
+  const onConnectEnd = useCallback(
+    (e) => {
+      const from = connectingFrom;
+      setConnectingFrom(null);
+      if (!from) return;
+      // Dropped on a node that refused it: say why, once, in the same place
+      // every other error appears.
+      const el = e.target?.closest?.("[data-id]");
+      const toId = el?.getAttribute?.("data-id");
+      if (!toId || toId === from) return;
+      const s = nodeById(wf.nodes, from)?.data.kind;
+      const t = nodeById(wf.nodes, toId)?.data.kind;
+      const verdict = canConnect(s, t, from, toId);
+      if (!verdict.ok) setError(verdict.why);
+      else if (wf.edges.some((x) => x.source === from && x.target === toId))
+        setError(`${toId} already depends on ${from}`);
+    },
+    [connectingFrom, wf]
   );
 
   const onConnect = useCallback(
@@ -180,6 +272,36 @@ function Editor() {
     [wf, updateActive]
   );
 
+  // Duplicate the selection, offset so it is visibly a copy rather than
+  // something that vanished under the original. Edges are deliberately NOT
+  // copied: a duplicated step almost always wants new wiring, and inheriting
+  // the original's dependencies silently is worse than re-drawing two edges.
+  const duplicateNode = useCallback(() => {
+    const src = nodeById(wf.nodes, selected);
+    if (!src) return;
+    const id = newStepId(wf.nodes.map((n) => n.id), src.data.kind);
+    const copy = {
+      ...src,
+      id,
+      position: { x: src.position.x + 40, y: src.position.y + 40 },
+      selected: false,
+      data: { ...src.data, spec: JSON.parse(JSON.stringify(src.data.spec ?? {})) },
+    };
+    updateActive({ nodes: [...wf.nodes, copy] });
+    setSelected(id);
+  }, [wf, selected, updateActive]);
+
+  // Match on the kind AND its blurb, so a search for what you want to do finds
+  // the node even when you do not know its name.
+  const paletteMatches = useMemo(() => {
+    const q = paletteQuery.trim().toLowerCase();
+    const all = CATEGORIES.flatMap((c) => kindsInCategory(c.id));
+    if (!q) return all;
+    return all.filter(
+      (k) => k.toLowerCase().includes(q) || (BLURBS[k] || "").toLowerCase().includes(q)
+    );
+  }, [paletteQuery]);
+
   const autoLayout = useCallback(() => {
     const next = wf.nodes.map((n) => ({ ...n }));
     layout(next, wf.edges);
@@ -232,6 +354,59 @@ function Editor() {
     });
     setSelected(null);
   };
+
+  // ── keyboard ────────────────────────────────────────────────────────────────
+  // The bindings people already know from n8n and every canvas tool, so nobody
+  // has to learn ours. Guarded on the event target: a Delete pressed inside a
+  // property field must delete a character, not the step being edited — that
+  // mistake is unrecoverable-feeling even with undo, because the field loses
+  // focus and the panel disappears.
+  useEffect(() => {
+    const typing = (el) =>
+      el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    const onKey = (e) => {
+      if (typing(e.target)) return;
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        e.shiftKey ? redo() : undo();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redo();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        duplicateNode();
+        return;
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedEdge) {
+          e.preventDefault();
+          deleteEdge(selectedEdge);
+        } else if (selected) {
+          e.preventDefault();
+          deleteNode();
+        }
+        return;
+      }
+      if (e.key === "l" || e.key === "L") {
+        e.preventDefault();
+        autoLayout();
+        return;
+      }
+      if (e.key === "Escape") {
+        setSelected(null);
+        setSelectedEdge(null);
+        setError("");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, redo, duplicateNode, autoLayout, selected, selectedEdge, deleteEdge, deleteNode]);
+
 
   // ── workflow tabs ───────────────────────────────────────────────────────────
   const addWorkflow = () => {
@@ -346,7 +521,26 @@ function Editor() {
                 ? `valid · ${issues.warnings.length} note${issues.warnings.length > 1 ? "s" : ""}`
                 : "valid"}
           </button>
-          <button onClick={autoLayout} className="btn-ghost">auto-layout</button>
+          {/* Undo is the affordance that makes every other one safe to try, so it
+              is visible rather than keyboard-only — and it shows whether there
+              is anything to undo, which is the question people actually have. */}
+          <button
+            onClick={undo}
+            disabled={!past.current.length}
+            title="undo (⌘Z)"
+            className="btn-ghost disabled:opacity-40"
+          >
+            undo
+          </button>
+          <button
+            onClick={redo}
+            disabled={!future.current.length}
+            title="redo (⇧⌘Z)"
+            className="btn-ghost disabled:opacity-40"
+          >
+            redo
+          </button>
+          <button onClick={autoLayout} className="btn-ghost" title="auto-layout (L)">auto-layout</button>
           <button onClick={() => setShowYaml((v) => !v)} className="btn-ghost">
             {showYaml ? "hide yaml" : "yaml"}
           </button>
@@ -365,35 +559,80 @@ function Editor() {
       <div className="flex min-h-0 flex-1">
         {/* palette */}
         <aside className="w-48 shrink-0 overflow-y-auto border-r border-[var(--line)] p-2 text-xs">
-          {CATEGORIES.map((c) => (
-            <div key={c.id} className="mb-3">
-              <div className="mb-1 flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full" style={{ background: c.accent }} />
-                <span className="font-semibold text-[var(--fg-strong)]">{c.label}</span>
+          {/* Sixty-seven kinds is too many to scan. Searching the NAME and the
+              blurb means "http" finds the http node and "wait" also finds
+              `join` — you look for what you want to do, not for what we named
+              it. Enter adds the single remaining match, so the fast path is
+              type-three-letters-Enter without touching the mouse. */}
+          <input
+            value={paletteQuery}
+            onChange={(e) => setPaletteQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && paletteMatches.length === 1) {
+                addNode(paletteMatches[0]);
+                setPaletteQuery("");
+              }
+              if (e.key === "Escape") setPaletteQuery("");
+            }}
+            placeholder="search nodes…"
+            aria-label="search nodes"
+            className="mb-3 w-full rounded border border-[var(--line)] bg-[var(--bg)] px-2 py-1 font-mono text-[11px] text-[var(--fg)] placeholder:text-[var(--dimmer)]"
+          />
+          {paletteQuery && paletteMatches.length === 0 && (
+            <p className="mb-3 text-[11px] text-[var(--dim)]">
+              nothing matches “{paletteQuery}”
+            </p>
+          )}
+          {CATEGORIES.map((c) => {
+            const kinds = kindsInCategory(c.id).filter((k) => paletteMatches.includes(k));
+            if (!kinds.length) return null;
+            return (
+              <div key={c.id} className="mb-3">
+                <div className="mb-1 flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full" style={{ background: c.accent }} />
+                  <span className="font-semibold text-[var(--fg-strong)]">{c.label}</span>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {kinds.map((k) => (
+                    <button
+                      key={k}
+                      onClick={() => addNode(k)}
+                      title={BLURBS[k] || (nodeInfo(k).implemented ? k : `${k} (not yet implemented)`)}
+                      className="rounded border border-[var(--line)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--fg)] hover:border-[color:var(--dim)] hover:text-[var(--fg-strong)]"
+                      style={{ opacity: nodeInfo(k).implemented ? 1 : 0.5 }}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="flex flex-wrap gap-1">
-                {kindsInCategory(c.id).map((k) => (
-                  <button
-                    key={k}
-                    onClick={() => addNode(k)}
-                    title={BLURBS[k] || (nodeInfo(k).implemented ? k : `${k} (not yet implemented)`)}
-                    className="rounded border border-[var(--line)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--fg)] hover:border-[color:var(--dim)] hover:text-[var(--fg-strong)]"
-                    style={{ opacity: nodeInfo(k).implemented ? 1 : 0.5 }}
-                  >
-                    {k}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
+            );
+          })}
+          <div className="mt-4 border-t border-[var(--line)] pt-3 text-[10px] leading-relaxed text-[var(--dim)]">
+            <div className="mb-1 font-semibold text-[var(--fg)]">shortcuts</div>
+            <div className="flex justify-between"><span>undo / redo</span><span className="font-mono">⌘Z ⇧⌘Z</span></div>
+            <div className="flex justify-between"><span>duplicate step</span><span className="font-mono">⌘D</span></div>
+            <div className="flex justify-between"><span>delete selection</span><span className="font-mono">Del</span></div>
+            <div className="flex justify-between"><span>auto-layout</span><span className="font-mono">L</span></div>
+            <div className="flex justify-between"><span>deselect</span><span className="font-mono">Esc</span></div>
+          </div>
         </aside>
 
         {/* canvas */}
         <div className="relative min-w-0 flex-1">
           <ReactFlow
-            nodes={nodes.map((n) =>
-              invalid.has(n.id) ? { ...n, data: { ...n.data, invalid: true } } : n,
-            )}
+            nodes={nodes.map((n) => {
+              const data = invalid.has(n.id) ? { ...n.data, invalid: true } : n.data;
+              // While a connection is in flight, fade every node that cannot
+              // be its target. Showing the legal landing places beats letting
+              // someone drag at a node that will silently refuse.
+              if (!connectingFrom || n.id === connectingFrom) return { ...n, data };
+              const sk = nodeById(nodes, connectingFrom)?.data.kind;
+              const ok =
+                canConnect(sk, n.data.kind, connectingFrom, n.id).ok &&
+                !edges.some((e) => e.source === connectingFrom && e.target === n.id);
+              return { ...n, data, style: { ...n.style, opacity: ok ? 1 : 0.35 } };
+            })}
             edges={edges.map((e) => ({
               ...e,
               selected: e.id === selectedEdge,
@@ -406,6 +645,8 @@ function Editor() {
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
+            onConnectStart={onConnectStart}
+            onConnectEnd={onConnectEnd}
             isValidConnection={isValidConnection}
             onNodeClick={(_, n) => {
               setSelected(n.id);

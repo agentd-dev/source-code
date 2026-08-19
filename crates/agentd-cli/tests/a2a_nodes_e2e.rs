@@ -10,6 +10,13 @@
 //!
 //! These tests drive a real daemon over a real A2A listener.
 
+// Both features are load-bearing, not incidental: without `a2a` there is no
+// listener to receive a message, and without `workflow` the configs below do
+// not load at all. Ungated, this file compiled into every feature combination
+// the CI matrix builds and failed each one at `wait_ready` — a daemon that
+// never becomes ready because the surface under test was never built.
+#![cfg(all(unix, feature = "a2a", feature = "workflow"))]
+
 mod common;
 
 use serde_json::{Value, json};

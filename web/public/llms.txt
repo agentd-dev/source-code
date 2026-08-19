@@ -515,6 +515,7 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/getting-started/ | checkout to a first run |
 | https://agentd.dev/docs/configuration/ | **the full config reference** — every path, type, default |
 | https://agentd.dev/docs/workflows/ | **the full workflow reference** — every node and field |
+| https://agentd.dev/docs/node-registry/ | **the node registry** — all 67 kinds with required fields, plus the five traps (references are `steps.<id>.output.<path>`; `switch` cases are strings; signals are edge-triggered) |
 | https://agentd.dev/docs/architecture/ | the two loops, the process tree, how a run flows |
 | https://agentd.dev/docs/harness/ | what keeps an agent bounded; durability and replay |
 | https://agentd.dev/docs/agent-loop/ | the agentic loop itself |

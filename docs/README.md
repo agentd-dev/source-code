@@ -42,6 +42,7 @@ Three properties make it different from an agent framework:
 | [agent-loop.md](agent-loop.md) | One turn end to end — context assembly, the round loop, tool dispatch, termination. |
 | [subagents.md](subagents.md) | Delegation as a process tree: narrowed context, distilled returns, depth limits. |
 | [workflows.md](workflows.md) | Durable DAGs: start nodes, the node catalogue, data flow, waits, resume. |
+- [node-registry.md](node-registry.md) — every workflow node, what it requires, and the traps that bite first.
 | [modes-and-triggers.md](modes-and-triggers.md) | Job or daemon, and the start nodes that decide when a run fires. |
 | [mcp.md](mcp.md) | Where tools and events come from: the client subset and the Streamable HTTP transport. |
 | [why-rust.md](why-rust.md) | The dependency moat, what is hand-rolled, and where the choice costs something. |

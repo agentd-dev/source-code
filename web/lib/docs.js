@@ -112,6 +112,13 @@ export const DOCS = [
     group: "concepts",
     blurb: "The durable DAG engine (RFC 0027) — the graph model, every node kind, durability, and worked examples.",
   },
+  {
+    slug: "node-registry",
+    file: "docs/node-registry.md",
+    title: "Node registry",
+    group: "reference",
+    blurb: "All 67 workflow nodes with their required fields, generated from the binary's own registry — plus the five things that are easy to get wrong.",
+  },
 
   // ── Operate ───────────────────────────────────────────────────
   {

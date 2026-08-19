@@ -855,6 +855,18 @@ impl Workflow {
     }
 }
 
+/// A JSON value's shape, for a diagnostic that says what was written.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// Parse + validate a dialect-3 document. Errors name every problem.
 pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     let mut errs = Vec::new();
@@ -1181,6 +1193,35 @@ fn parse_step(
     }
     // Kind-specific sanity.
     match kind.as_str() {
+        // A `switch` routes to ONE step id per case, as a string. A list reads
+        // naturally — `cases: {select: [prepare]}` — and is exactly wrong: the
+        // executor asks for a string, gets an array, finds no target, falls to
+        // `default`, finds an array there too, and fails the run at the moment
+        // the branch is taken. That is a silent trap for whoever writes the
+        // config and a confusing one for whoever debugs it, so it is refused
+        // here, where the message can say what to write instead.
+        "switch" => {
+            if let Some(cases) = spec.get("cases").and_then(Value::as_object) {
+                for (case, target) in cases {
+                    if !target.is_string() {
+                        errs.push(format!(
+                            "{at}: switch case {case:?} must name ONE step as a string \
+                             (got {}); write `{case}: some_step`, not a list",
+                            json_kind(target)
+                        ));
+                    }
+                }
+            }
+            if let Some(d) = spec.get("default")
+                && !d.is_string()
+            {
+                errs.push(format!(
+                    "{at}: switch default must name ONE step as a string (got {}); \
+                     write `default: some_step`, not a list",
+                    json_kind(d)
+                ));
+            }
+        }
         "finish" => {
             if let Some(st) = spec.get("status").and_then(Value::as_str)
                 && !matches!(st, "completed" | "failed" | "refused" | "cancelled")

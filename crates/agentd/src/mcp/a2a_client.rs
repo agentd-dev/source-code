@@ -94,6 +94,60 @@ pub fn delegate(
     }
 }
 
+/// **Fire-and-forget**: one `SendMessage`, no task await (RFC 0027 `a2a.send`).
+///
+/// The distinction from [`delegate`] is the whole point of having both. A
+/// delegation is a request/response — it opens a stream, follows the task to a
+/// terminal state, and hands back a distillate, which is right when the answer
+/// is what you wanted. A send is a NOTIFICATION: the step is done once the peer
+/// has accepted the message. That is what lets a workflow tell a peer something
+/// and carry on, and it is why a send does not take an `output_contract` — there
+/// is no output to shape.
+///
+/// The peer's own reply, if there is one, arrives later on the conversation and
+/// is picked up by `a2a.wait` (or a `wait {on: message}`), which is the async
+/// half a delegation cannot express.
+///
+/// Errors on connect / write / read / RPC error. Accepting is not the same as
+/// succeeding: a peer that answers 200 and then fails internally is invisible
+/// here by construction, which is what "fire and forget" means.
+pub fn send(
+    endpoint: &A2aEndpoint,
+    auth: PeerAuth,
+    parts: &Value,
+    context: Option<&str>,
+    deadline: Instant,
+) -> Result<Value, String> {
+    match endpoint {
+        A2aEndpoint::Https(url) => {
+            let ep = HttpEp::parse(url)?;
+            let mut conn = HttpConn::new(ep, auth);
+            let mut message = serde_json::Map::new();
+            message.insert("messageId".into(), Value::String(mint_message_id()));
+            message.insert("role".into(), Value::String("user".into()));
+            // A caller may hand us either a parts ARRAY or a bare string; the
+            // wire wants an array of parts, and a string is the common case.
+            message.insert(
+                "parts".into(),
+                match parts {
+                    Value::Array(_) => parts.clone(),
+                    Value::String(t) => serde_json::json!([{"text": t}]),
+                    Value::Null => serde_json::json!([]),
+                    other => serde_json::json!([{"data": other}]),
+                },
+            );
+            if let Some(ctx) = context.filter(|c| !c.is_empty()) {
+                message.insert("contextId".into(), Value::String(ctx.to_string()));
+            }
+            conn.call(
+                "SendMessage",
+                serde_json::json!({"message": Value::Object(message)}),
+                deadline,
+            )
+        }
+    }
+}
+
 /// How a streaming attempt resolved: a terminal outcome, or a task id whose
 /// terminal state must be RECOVERED over unary `GetTask` (an older peer's
 /// unary-final degradation, or a stream that broke after the run started —

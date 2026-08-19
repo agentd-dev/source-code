@@ -521,6 +521,29 @@ impl Runtime {
             self.event_to_task
                 .insert(ev.id.clone(), task_id.to_string());
         }
+        // An inbound message has three possible readers, in this order. Only one
+        // takes it: a message that woke a waiting step is an ANSWER, and a
+        // message that fired a workflow is a REQUEST — neither should also
+        // become a conversational turn, or the agent replies to itself.
+        //
+        // 1. A step suspended on this conversation (`a2a.wait` / `wait {on:
+        //    message}`) — the reply half of an asynchronous exchange.
+        let msg = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
+                         "text": text, "message_id": ev.payload.get("message_id").cloned()});
+        if self.deliver_a2a_message(&ctx, &msg, principal.as_deref()) > 0 {
+            self.log.info(
+                "a2a.message.delivered",
+                json!({"inbox_event": ev.id, "conversation": ctx}),
+            );
+            return;
+        }
+        // 2. An `a2a` START node whose command and roles match — a peer or an
+        //    operator asking for a workflow rather than a conversation.
+        if self.fire_a2a_start(ev, &ctx) {
+            return;
+        }
+        // 3. Otherwise it is what it looks like: something to answer.
+        #[allow(unused)]
         let skills = self.skills.references(&text);
         self.turn_queue.push_back(TurnJob::new(
             ctx,
@@ -530,6 +553,70 @@ impl Runtime {
             skills,
             text,
         ));
+    }
+
+    /// Without the `a2a` feature there is no listener to deliver a message, so a
+    /// replayed event simply degrades to a turn.
+    #[cfg(not(feature = "a2a"))]
+    fn fire_a2a_start(&mut self, _ev: &InboxEvent, _ctx: &str) -> bool {
+        false
+    }
+
+    /// Match an inbound A2A message against every `a2a` start node and fire the
+    /// first that accepts it. Returns whether a run was started.
+    ///
+    /// `command` selects on the command DataPart's `op` — absent means "any
+    /// message", which is how a workflow takes plain conversation as its
+    /// trigger. `roles` restricts which principals may fire it, and defaults to
+    /// no restriction beyond the authorization the listener already applied:
+    /// the start node narrows, it never widens.
+    #[cfg(feature = "a2a")]
+    fn fire_a2a_start(&mut self, ev: &InboxEvent, ctx: &str) -> bool {
+        let op = ev.payload.get("parts").and_then(|parts| {
+            crate::runtime::a2a_server::command_op(&json!({"parts": parts.clone()}))
+        });
+        let role = ev.payload["role"].as_str().unwrap_or("");
+        let specs: Vec<(String, String, serde_json::Map<String, Value>)> = self
+            .workflows
+            .values()
+            .flat_map(|w| {
+                w.start_steps()
+                    .into_iter()
+                    .filter(|s| s.kind == "a2a")
+                    .map(|s| (w.name.clone(), s.id.clone(), s.spec.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (workflow, node, spec) in specs {
+            if let Some(want) = spec.get("command").and_then(Value::as_str)
+                && Some(want) != op.as_deref()
+            {
+                continue;
+            }
+            if let Some(roles) = spec.get("roles").and_then(Value::as_array)
+                && !roles.is_empty()
+                && !roles.iter().any(|r| r.as_str() == Some(role))
+            {
+                continue;
+            }
+            let payload = json!({
+                "conversation": ctx,
+                "principal": ev.principal,
+                "role": role,
+                "command": op,
+                "parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
+                "text": ev.payload.get("text").cloned().unwrap_or(Value::Null),
+                "message_id": ev.payload.get("message_id").cloned().unwrap_or(Value::Null),
+            });
+            self.log.info(
+                "start.a2a.fired",
+                json!({"workflow": workflow, "node": node, "conversation": ctx,
+                       "command": op, "role": role}),
+            );
+            self.fire_start(&workflow, &node, &spec, payload, "a2a");
+            return true;
+        }
+        false
     }
 
     // ---- children ----------------------------------------------------------

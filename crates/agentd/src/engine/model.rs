@@ -123,7 +123,7 @@ pub const KINDS: &[KindInfo] = &[
         true,
         &["command", "roles", "inputs"],
         &[],
-        false,
+        true,
         false,
     ),
     k(
@@ -413,9 +413,9 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a.send",
         false,
-        &["to", "parts", "context"],
+        &["to", "parts", "context", "timeout"],
         &["to"],
-        false,
+        true,
         false,
     ),
     k(
@@ -431,7 +431,7 @@ pub const KINDS: &[KindInfo] = &[
         false,
         &["conversation", "timeout"],
         &[],
-        false,
+        true,
         false,
     ),
     k(
@@ -1651,7 +1651,7 @@ mod tests {
         assert_eq!(ok.step("t").unwrap().on_error, OnError::Continue);
         assert_eq!(ok.step("t").unwrap().timeout_ms, Some(30_000));
         assert!(implemented_kinds().contains(&"agent"));
-        assert!(workflow_schema()["$defs"]["kinds"]["a2a.send"]["implemented"] == json!(false));
+        assert!(workflow_schema()["$defs"]["kinds"]["a2a.send"]["implemented"] == json!(true));
         assert!(workflow_schema()["$defs"]["kinds"]["foreach"]["implemented"] == json!(true));
     }
 }

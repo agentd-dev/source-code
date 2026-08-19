@@ -296,9 +296,9 @@ structural: model name plus endpoint *count*. Principal matchers are described,
 never dumped: a `bearer_ref` renders as `***`.
 
 Not every feature is in the released binary. `a2a`, `metrics`, `cron`, `otel`,
-`hot-reload`, `config-watch`, `aauth` and `oauth` ship in the published builds;
-`exec` and `cel` are build-from-source
-opt-ins. The manifest reflects the binary you actually have.
+`hot-reload`, `config-watch`, `aauth`, `oauth` and `cel` ship in the published
+builds; `exec` is the one build-from-source opt-in. The manifest reflects the
+binary you actually have.
 
 ### 4.2 `--config-schema=2` and `--validate-config`
 

@@ -27,8 +27,8 @@ $ agentd --version
 
 `install.sh --help` covers pinning a version (`--version v2.0.0`) and choosing
 the directory (`--dir ~/bin`). Release binaries are Linux/musl, amd64 and arm64;
-**`exec` and `cel` are not compiled into them** — those need the source build
-below.
+**`exec` is not compiled into them** — it needs the source build below.
+Everything else, including the `cel` expression guards, ships.
 
 Building from source: agentd is a single Cargo crate in a workspace. The build
 is pure Rust — no C toolchain, no `cmake` — and needs Rust 1.96 or newer. What

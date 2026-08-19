@@ -13,7 +13,7 @@ A2A `Deployment` — and when you want to *work with* it, attach a terminal or a
 browser: `agentd tui -c agent.yaml`.
 
 ```
-binary 6.6 MiB static (musl, FROM scratch) · 3.0 MiB download · cold start <1 ms
+binary 8.5 MiB static (musl, FROM scratch) · 3.6 MiB download · cold start <1 ms
 idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · AGPL-3.0
 ```
 
@@ -42,7 +42,7 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
    request signing, mTLS and the SSRF guard survive the adoption. Everything
    small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
    export, the inotify watch — is still hand-rolled on `std` + `libc`. What
-   ships is one 6.6 MiB static binary that starts in under a millisecond, idles
+   ships is one 8.5 MiB static binary that starts in under a millisecond, idles
    at 5.5 MiB on one thread, and lands as a single-layer `FROM scratch` image with no shell, no
    libc, and nothing to CVE-scan but agentd itself.
 2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
@@ -128,13 +128,15 @@ tells you what a given binary can actually do:
 ```console
 $ cargo build -p agentd-cli --release
 $ cargo build -p agentd-cli --release \
-    --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"   # the shipped set
+    --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"   # the shipped set
 $ cargo build -p agentd-cli --release --features a2a,exec   # + the local command runner
 ```
 
-`exec` and `cel` are deliberately absent from release binaries — the first
-because [running local commands is opt-in twice over](docs/security.md), the
-second because it is the one dependency-bearing feature.
+`exec` is deliberately absent from release binaries — [running local commands
+is opt-in twice over](docs/security.md). `cel` ships: expression guards (`when`,
+`until`, `filter`) are how a workflow branches, and a released binary that
+refuses them at validation was a cliff every non-trivial config fell off. It is
+the one dependency-bearing feature and costs about 1.8 MiB.
 
 ## Quickstart
 
@@ -451,8 +453,8 @@ feature set):
 
 | Metric | Value |
 |---|---|
-| Binary (static-PIE, runs on `scratch`) | **6.6 MiB** amd64 · 5.0 MiB arm64 |
-| Release download (amd64) | **3.0 MiB** `.tar.gz` → 6.6 MiB binary |
+| Binary (static-PIE, runs on `scratch`) | **8.5 MiB** amd64 · 6.3 MiB arm64 |
+| Release download (amd64) | **3.6 MiB** `.tar.gz` → 8.5 MiB binary |
 | Cold start (`--version` / `--capabilities`) | **< 1 ms** |
 | Idle daemon RSS (schedule workflow, file store) | **5.5 MiB**, 1 thread |
 | Idle daemon CPU | **1 jiffy / 6 s** — under 0.2% of a core |

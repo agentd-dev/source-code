@@ -27,7 +27,7 @@
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.96-alpine AS builder
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one

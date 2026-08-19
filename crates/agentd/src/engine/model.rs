@@ -1054,11 +1054,19 @@ fn parse_step(
     // Strict fields.
     let mut spec = Map::new();
     for (key, v) in o {
-        if COMMON_FIELDS.contains(&key.as_str()) {
-            continue;
-        }
+        // A field the KIND declares wins over the cross-cutting list, and the
+        // order matters: `output_schema` is both. `extract` declares it and
+        // *requires* it, but the required check below looks in `spec`, so
+        // skipping it as a common field made `extract` impossible to satisfy —
+        // and the presets that merely accept it (`think`, `classify`, `judge`,
+        // `route`, `summarize`) read it from `spec` at dispatch, so they were
+        // silently never given a schema to shape the model's answer. The
+        // cross-cutting copy that validates a step's OUTPUT is taken from `o`
+        // directly, so both readings still work.
         if info.fields.contains(&key.as_str()) {
             spec.insert(key.clone(), v.clone());
+        } else if COMMON_FIELDS.contains(&key.as_str()) {
+            continue;
         } else {
             errs.push(format!(
                 "{at}: unknown field {key:?} for kind {kind:?} (allowed: {})",
@@ -1497,6 +1505,38 @@ pub fn workflow_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// `output_schema` is both a cross-cutting step field and a field several
+    /// kinds declare for themselves. The kind's reading must win: `extract`
+    /// REQUIRES it, and the required-field check reads `spec`, so while the
+    /// common-field skip came first `extract` could never validate — a
+    /// documented, "implemented" node that was impossible to use. The presets
+    /// that merely accept it were quietly affected too: they read it from
+    /// `spec` at dispatch, so they were never handed a schema at all.
+    #[test]
+    fn a_kind_that_declares_output_schema_receives_it() {
+        let doc = serde_json::json!({
+            "name": "w",
+            "steps": {
+                "go": {"kind": "manual"},
+                "e":  {"kind": "extract", "depends_on": ["go"], "input": "x",
+                       "output_schema": {"type": "object"}},
+                "t":  {"kind": "think", "depends_on": ["e"], "prompt": "p",
+                       "output_schema": {"type": "object"}},
+                "fin": {"kind": "finish", "depends_on": ["t"], "status": "completed"}
+            }
+        });
+        let wf = parse_workflow(&doc)
+            .unwrap_or_else(|e| panic!("extract must validate with an output_schema: {e:?}"));
+        // And the kind actually RECEIVES it, which is what the executor reads.
+        for id in ["e", "t"] {
+            let step = wf.steps.get(id).unwrap_or_else(|| panic!("step {id}"));
+            assert!(
+                step.field("output_schema").is_some(),
+                "{id}: the kind's own output_schema must reach the node spec"
+            );
+        }
+    }
+
     use super::*;
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {

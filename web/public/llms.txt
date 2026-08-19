@@ -1,6 +1,6 @@
 # agentd
 
-> The runtime for autonomous AI agents. One static Rust binary (~6.6 MiB, musl,
+> The runtime for autonomous AI agents. One static Rust binary (~8.5 MiB, musl,
 > runs on `FROM scratch`) that runs an LLM agent as a **daemon**: a one-shot job,
 > a long-lived reactive daemon, or a durable DAG workflow. Tools come only from
 > remote **MCP** servers over HTTPS; it speaks **A2A** to other agents; it
@@ -45,8 +45,8 @@ docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
 cargo build -p agentd-cli --release               # from source; Rust 1.96+, no C toolchain
 ```
 
-Release binaries are Linux musl, amd64 + arm64. `exec` and `cel` are **not**
-compiled into them — they need a source build.
+Release binaries are Linux musl, amd64 + arm64. `exec` is **not** compiled
+into them — it needs a source build. Everything else ships, including `cel`.
 
 ---
 
@@ -410,7 +410,8 @@ Required fields in **bold**.
 - **Replay**: a step that was in flight when the process died is replayed on
   restore. Make effects `idempotent`, or set `on_replay`.
 - **CEL** guards (`when`, `until`, `filter`) need the `cel` build feature, which
-  is *not* in the release binaries.
+  ships in the release binaries from 2.3.0. On an older binary they are refused
+  at validation, not ignored.
 - **Validation is author-time and fail-closed**: an unknown field or kind is
   exit `2` naming the step, before anything runs.
 

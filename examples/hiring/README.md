@@ -145,10 +145,12 @@ endpoints and mTLS certs and they run.
 
 ## Constraints worth knowing before you extend this
 
-- **No CEL on a release binary.** `when:`, `filter:` and `until:` need the `cel`
-  build feature, which is not compiled into the released binaries — a config
-  using them exits 2. Branch with `switch` on data, or with a model node
-  (`route`, `classify`, `judge`), as this config does.
+- **CEL ships from 2.3.0.** `when:`, `filter:` and `until:` need the `cel`
+  build feature, which is now in the released binaries; on 2.2.0 and earlier a
+  config using them exits 2. This config deliberately branches with `switch` on
+  data and with model nodes (`route`, `classify`, `judge`) instead, so it runs
+  on either — and because a decision you can read in the config beats one buried
+  in an expression.
 - **`a2a` start nodes, `a2a.send` and `a2a.wait` are not implemented** in 2.2.0.
   Outbound is `a2a.delegate`; inbound arrives as a turn.
 - **A long-lived instance needs a durable store.** Both use `store.kind: file`,

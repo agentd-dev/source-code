@@ -112,9 +112,11 @@ internal-mocks = []
 # CEL (Common Expression Language) for workflows: `{"op":"cel"}` predicates,
 # computed `assign.expr`, `infer.check` value constraints, and reactive `cel`
 # wake conditions — hermetic, non-Turing-complete, terminating expressions the
-# model can safely author. THE one gated exception to the zero-dep moat: the
-# default build carries none of it; a non-cel build REJECTS graphs using CEL at
-# define time (fail-closed, clear message). Rides `workflow`.
+# model can safely author. Off in the DEFAULT build, but IN the release feature
+# set since 2.3.0: `when`/`until`/`filter` are how a workflow branches, and a
+# published binary that refuses them at validation made every non-trivial config
+# a build-from-source job. A non-cel build still REJECTS graphs using CEL at
+# define time (fail-closed, clear message). Costs ~1.8 MiB. Rides `workflow`.
 cel = ["dep:cel-interpreter"]
 # AAuth [DRAFT] — agent-side auth for calling AAuth-protected MCP servers
 # (RFC 0023): an Ed25519 agent identity, an Agent-Provider token client

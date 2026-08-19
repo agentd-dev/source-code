@@ -72,14 +72,15 @@ integration.
 
 | Build | External crates |
 |---|---|
-| `--no-default-features` | 78 |
-| default (`tls` + MCP) | 91 |
-| shipped release feature set (adds A2A) | 187 |
+| `--no-default-features` | 75 |
+| default (`tls` + MCP) | 88 |
+| shipped release feature set (adds A2A) | 156 |
+| … plus CEL, shipped since 2.3.0 | 179 |
 
 An earlier version of this page counted three direct dependencies and had CI
 fail the build if that number moved. That gate is gone, replaced by one that
 guards what actually reaches a user: the release binary is still a **statically
-linked musl artifact that runs on `scratch`** — about 6.5 MiB, a 3 MiB download,
+linked musl artifact that runs on `scratch`** — about 8.5 MiB, a 3.6 MiB download,
 no shell, no libc, no package manager. The dependency count moved by two orders of
 magnitude; the attack surface of the thing that ships did not.
 
@@ -222,8 +223,8 @@ The artifact that ships is a static-PIE musl build (LTO, stripped,
 
 | | amd64 | arm64 |
 |---|---|---|
-| binary | 6,886,888 B (6.57 MiB) | 5,219,160 B (4.98 MiB) |
-| `.tar.gz` download | 3,143,992 B (3.00 MiB) | 2,926,502 B (2.79 MiB) |
+| binary | 8,890,184 B (8.48 MiB) | 6,591,640 B (6.29 MiB) |
+| `.tar.gz` download | 3,805,611 B (3.63 MiB) | 3,502,552 B (3.34 MiB) |
 
 That is the whole image too: `FROM scratch` plus this file.
 

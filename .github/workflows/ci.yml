@@ -54,7 +54,7 @@ jobs:
           - "--features aauth" # AAuth [DRAFT] — Ed25519 identity + RFC 9421 signing (ships build-from-source, like cel)
           - "--features a2a,hot-reload" # the combo that latently broke once
           - "--release --features internal-mocks" # debug auto-enables it; --release exercises the opt-in path
-          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,workflow" # the release-artifact set
+          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel" # the release-artifact set, exactly
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +127,7 @@ jobs:
         run: |
           cargo build --release --locked -p agentd-cli \
             --target x86_64-unknown-linux-musl \
-            --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
+            --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
       - name: Assert it is statically linked and runs
         run: |
           bin=target/x86_64-unknown-linux-musl/release/agentd

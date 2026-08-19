@@ -25,7 +25,7 @@ permissions:
 # build-from-source by design (the moat holds in shipped artifacts). (The 1.x
 # serve-mcp/serve-https/events/cluster/workflow features were removed in 2.0.)
 env:
-  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
+  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

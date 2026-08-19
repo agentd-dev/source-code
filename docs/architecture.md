@@ -363,7 +363,7 @@ claim it protected — *you can hold the whole trust boundary in your head* — 
 longer one agentd can make, and pretending otherwise would be worse than
 retiring it. What replaced it is a gate on the thing a user actually receives:
 the release binary must still be a statically linked musl artifact that runs on
-`scratch` — about 6.5 MiB for the shipped feature set, with no shell, no libc
+`scratch` — about 8.5 MiB for the shipped feature set, with no shell, no libc
 and no package manager.
 
 The build stays pure Rust. The SDKs pull `rustls` with its default features,
@@ -518,7 +518,7 @@ ticking.
 The resulting footprint, on a stripped x86_64 glibc release build (`opt-level =
 "z"`, LTO, `panic = "abort"`, one codegen unit): 2.88 MiB with
 `--no-default-features`, 3.83 MiB with default `tls`, 4.43 MiB with the shipped
-set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth`. Release
+set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel`. Release
 artifacts are cross-compiled static-musl for `x86_64` and `aarch64`, plus a
 multi-arch, cosign-signed OCI image with an SPDX SBOM.
 

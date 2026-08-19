@@ -214,14 +214,14 @@ it **larger** than `--drain-timeout`.
 agentd is statically linkable — one musl artifact with no shell and no libc in
 the image, whatever the build needed to produce it. It runs **no local shell or
 filesystem tools** — every external effect leaves through MCP or A2A — so the
-image stays small (a 6.6 MiB binary on `scratch`). The recommended entrypoint is
+image stays small (an 8.5 MiB binary on `scratch`). The recommended entrypoint is
 `agentd` itself: it sets
 `PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
 own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
 
 The published image (`Dockerfile` at the repo root) ships the **cloud-native
 feature set** by default —
-`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"` (the same
+`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"` (the same
 set the release workflow builds). `a2a` brings the A2A SDK and the async stack
 its listener runs on; `aauth` is a direct edge on `ring`, already in the tree as
 rustls's crypto provider; the rest are hand-rolled and add no dependency. What
@@ -250,7 +250,7 @@ posture.
 # syntax=docker/dockerfile:1
 # Static musl binary on scratch — the cloud-native feature set.
 FROM rust:1-alpine AS build
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .

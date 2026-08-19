@@ -770,11 +770,23 @@ impl Runtime {
             return err_obj(-32000, "the agent is draining");
         }
         let message = &params["message"];
-        if let Some(op) = command_op(message) {
+        // An `a2a` START NODE registers its command. A workflow declaring
+        // `{kind: a2a, command: "review.start"}` is what makes `review.start`
+        // something a peer may ask for — otherwise the built-in list would be
+        // the entire command surface and a start node could never be reached,
+        // because an unknown op is refused before the message ever becomes an
+        // inbox event. A registered command therefore skips command dispatch
+        // and takes the ordinary message path: written ahead to the durable
+        // inbox, then matched against the start nodes (roles included) by the
+        // reactor. A built-in wins, so a workflow cannot shadow `status`.
+        let declared =
+            command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
+        if !declared && let Some(op) = command_op(message) {
             return self.a2a_command(principal, &op, message);
         }
         let text = message_text(message);
-        if text.trim().is_empty() {
+        // A command DataPart carries no text, and that is not an empty message.
+        if text.trim().is_empty() && !declared {
             return err_obj(
                 ::mcp::rpc::INVALID_PARAMS,
                 "message has no text or command part",
@@ -832,7 +844,14 @@ impl Runtime {
             }
         };
         // Write-ahead the message; the loop turns it into a conversation turn.
-        let payload = json!({"context_id": ctx_id, "text": text, "parts": message["parts"], "task": task_id, "message_id": message_id});
+        let payload = json!({"context_id": ctx_id, "text": text, "parts": message["parts"],
+        "task": task_id, "message_id": message_id,
+        "role": match principal.role {
+            crate::config::v2::Role::Operator => "operator",
+            crate::config::v2::Role::User => "user",
+            crate::config::v2::Role::Agent => "agent",
+            crate::config::v2::Role::Anonymous => "anonymous",
+        }});
         match self.accept_event(kinds::A2A_MESSAGE, Some(principal.id.clone()), payload) {
             Ok(inbox_id) => {
                 self.event_to_task.insert(inbox_id, task_id.clone());
@@ -862,6 +881,17 @@ impl Runtime {
     /// once; `workflow.run` links its task to the run it starts. The
     /// `interface.*` / debug reads (RFC 0032) are **taskless** — pure reads
     /// that create no durable task, so a display client can poll them freely.
+    /// Whether any loaded workflow has an `a2a` start node declaring `op` as its
+    /// command. This is what turns a start node into a registered part of the
+    /// A2A command surface (see the call site in `a2a_send`).
+    fn workflow_declares_a2a_command(&self, op: &str) -> bool {
+        self.workflows.values().any(|w| {
+            w.start_steps().into_iter().any(|s| {
+                s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op)
+            })
+        })
+    }
+
     fn a2a_command(&mut self, principal: &Principal, op: &str, message: &Value) -> Value {
         if !principal.may_command(op) {
             return err_obj(

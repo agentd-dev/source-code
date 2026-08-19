@@ -249,17 +249,35 @@ impl Runtime {
                 Some("a2a.delegate requires the 'a2a' build feature".into()),
                 0,
             ),
-            "a2a.send" | "a2a.wait" => {
-                self.finish_step_pub(
+            #[cfg(feature = "a2a")]
+            "a2a.send" => self.step_a2a_send(run_id, step_id, spec),
+            #[cfg(not(feature = "a2a"))]
+            "a2a.send" => self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some("a2a.send requires the 'a2a' build feature".into()),
+                0,
+            ),
+            // `a2a.wait` suspends on a CONVERSATION, exactly as `wait {on:
+            // message}` does — same durable wait record, so the same arrival
+            // hook resolves both and a restart resumes either. The spelling
+            // exists because a workflow that sent with `a2a.send` reads better
+            // awaiting with `a2a.wait` than with a generic `wait`.
+            "a2a.wait" => {
+                let conv = spec
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let timeout = spec
+                    .get("timeout")
+                    .and_then(crate::engine::model::duration_ms_opt);
+                self.suspend_wait(
                     run_id,
                     step_id,
-                    StepStatus::Failed,
-                    None,
-                    Some(format!(
-                        "{}: A2A conversations land with the A2A v2 phase (P5)",
-                        step.kind
-                    )),
-                    0,
+                    wait_record("message", json!({"conversation": conv}), timeout),
                 );
             }
             "classify" | "extract" | "summarize" | "judge" | "route" => {
@@ -548,6 +566,57 @@ impl Runtime {
 
     /// Deliver a named signal: to `wait signal` steps (any run, or `run` only),
     /// to `signal` start nodes (P4 starts), and into the recent-signals view.
+    /// An A2A message arrived on a conversation: resolve every step suspended
+    /// waiting for one. Returns how many were woken.
+    ///
+    /// This is the half that was missing. `wait {on: message}` and `a2a.wait`
+    /// both suspend on a `{kind: message, conversation}` record, but nothing
+    /// ever resolved one — so before this they could only ever end by timing
+    /// out, which made the asynchronous half of an A2A conversation
+    /// inexpressible: you could send, but never be woken by the reply.
+    ///
+    /// A wait with an EMPTY conversation matches any conversation, which is how
+    /// a workflow awaits "the next thing anyone says" without knowing the id in
+    /// advance.
+    pub(crate) fn deliver_a2a_message(
+        &mut self,
+        conversation: &str,
+        message: &Value,
+        principal: Option<&str>,
+    ) -> u64 {
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for (rid, run) in &self.runs {
+            for (sid, st) in &run.steps {
+                if st.status == StepStatus::Suspended
+                    && let Some(w) = &st.wait
+                    && w["kind"] == "message"
+                {
+                    let want = w["conversation"].as_str().unwrap_or("");
+                    if want.is_empty() || want == conversation {
+                        hits.push((rid.clone(), sid.clone()));
+                    }
+                }
+            }
+        }
+        let mut delivered = 0u64;
+        for (rid, sid) in hits {
+            delivered += 1;
+            self.finish_step_pub(
+                &rid,
+                &sid,
+                StepStatus::Done,
+                Some(json!({
+                    "conversation": conversation,
+                    "message": message,
+                    "principal": principal,
+                })),
+                None,
+                0,
+            );
+        }
+        delivered
+    }
+
     pub(crate) fn deliver_signal(
         &mut self,
         name: &str,
@@ -798,6 +867,160 @@ impl Runtime {
             .ok();
     }
 
+    /// Resolve a configured A2A peer into a dialable endpoint plus its client
+    /// auth (bearer headers, a per-request SigV4 signer, an mTLS identity).
+    ///
+    /// Shared by `a2a.delegate` and `a2a.send`, which differ only in what they
+    /// do once connected — everything up to the socket is identical, and it is
+    /// ~140 lines of credential plumbing that must not drift between the two.
+    #[cfg(feature = "a2a")]
+    // `timeout` bounds only the interactive credential fetch, which lives behind
+    // `oauth`; without that feature there is nothing to bound and the parameter
+    // is genuinely unused. Keeping it in the signature keeps both callers
+    // identical across feature sets.
+    #[cfg_attr(not(feature = "oauth"), allow(unused_variables))]
+    fn a2a_peer_conn(
+        &self,
+        peer_name: &str,
+        timeout: Duration,
+        what: &str,
+    ) -> Result<(crate::config::A2aEndpoint, crate::mcp::a2a_client::PeerAuth), String> {
+        let Some(peer) = self
+            .settings
+            .a2a
+            .peers
+            .iter()
+            .find(|p| p.name == peer_name)
+            .cloned()
+        else {
+            return Err(format!("{what}: no such peer {peer_name:?} (a2a.peers)"));
+        };
+        let spec_v1 = crate::config::A2aPeerSpec {
+            name: peer.name.clone(),
+            endpoint: peer.endpoint.clone(),
+            headers: peer
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            client_cert: peer.client_cert.clone(),
+            client_key: peer.client_key.clone(),
+        };
+        let endpoint = spec_v1
+            .endpoint_of()
+            .map_err(|e| format!("{what}: peer endpoint: {e}"))?;
+        #[allow(unused_mut)]
+        let mut headers = crate::mcp::auth::resolve_headers(&spec_v1.headers)
+            .map_err(|e| format!("{what}: peer headers: {e}"))?;
+        // RFC 0031: a peer `auth:` block resolves at dial time. A body-INDEPENDENT
+        // bearer (static / oauth2 device-login / spiffe jwt) is baked into the
+        // static headers; SigV4 (`kind: aws`) covers the exact body, so it rides
+        // as a PER-REQUEST signer on `PeerAuth` (re-run on every POST).
+        #[cfg(feature = "oauth")]
+        let mut peer_signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>> = None;
+        #[cfg(feature = "oauth")]
+        if let Some(a) = &peer.auth {
+            let aspec = a.to_spec();
+            let target = format!("a2a:{}", peer.name);
+            if aspec.kind == "aws" {
+                let s = crate::auth::aws::SigV4Signer::from_spec(&aspec, &target)
+                    .map_err(|e| format!("{what}: peer aws auth: {e}"))?;
+                peer_signer = Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>);
+            } else if let Some(signer) = crate::auth::device::signer_for(&aspec, &target, timeout)
+                .map_err(|e| format!("{what}: peer auth: {e}"))?
+            {
+                for (k, v) in signer.sign("POST", &peer.endpoint, "/", &[]) {
+                    headers.push((k, v));
+                }
+            }
+        }
+        #[allow(unused_mut)]
+        let mut auth = crate::mcp::a2a_client::PeerAuth {
+            headers,
+            ..Default::default()
+        };
+        #[cfg(feature = "oauth")]
+        {
+            auth.signer = peer_signer;
+        }
+        #[cfg(feature = "tls")]
+        if let (Some(cert), Some(key)) = (&spec_v1.client_cert, &spec_v1.client_key) {
+            let id = std::fs::read(cert)
+                .and_then(|c| std::fs::read(key).map(|k| (c, k)))
+                .map_err(|e| e.to_string())
+                .and_then(|(c, k)| {
+                    crate::net::tls::ClientIdentity::from_pem(&c, &k).map_err(|e| e.to_string())
+                })
+                .map_err(|e| format!("{what}: peer mtls: {e}"))?;
+            auth.identity = Some(id);
+        }
+        Ok((endpoint, auth))
+    }
+
+    /// `a2a.send {to, parts, context?, timeout?}` — notify a peer, do not wait.
+    ///
+    /// The step completes when the peer ACCEPTS the message, not when it has
+    /// done anything about it. That is the difference from `a2a.delegate`, and
+    /// it is what makes the asynchronous shape expressible: send, keep working,
+    /// and pick the reply up later with `a2a.wait` on the same conversation.
+    #[cfg(feature = "a2a")]
+    fn step_a2a_send(&mut self, run_id: &str, step_id: &str, spec: &Map<String, Value>) {
+        let peer_name = spec
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let parts = spec.get("parts").cloned().unwrap_or(Value::Null);
+        let context = spec
+            .get("context")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let timeout = spec
+            .get("timeout")
+            .and_then(crate::engine::model::duration_ms_opt)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30));
+        let (endpoint, auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.send") {
+            Ok(v) => v,
+            Err(e) => {
+                self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                return;
+            }
+        };
+        let tx = self.events_tx.clone();
+        let (r, st) = (run_id.to_string(), step_id.to_string());
+        self.executing
+            .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
+        self.log.info(
+            "a2a.send",
+            json!({"run": run_id, "step": step_id, "to": peer_name}),
+        );
+        std::thread::Builder::new()
+            .name(format!("a2a.send:{peer_name}"))
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + timeout;
+                let (output, is_error, error) = match crate::mcp::a2a_client::send(
+                    &endpoint,
+                    auth,
+                    &parts,
+                    context.as_deref(),
+                    deadline,
+                ) {
+                    Ok(v) => (v, false, None),
+                    Err(e) => (Value::Null, true, Some(e)),
+                };
+                let _ = tx.send(super::events::Event::StepDone {
+                    run: r,
+                    step: st,
+                    output,
+                    is_error,
+                    error,
+                    tokens: 0,
+                });
+            })
+            .ok();
+    }
+
     /// `a2a.delegate {peer, objective, output_contract?, timeout?}` (RFC 0020 client).
     #[cfg(feature = "a2a")]
     fn step_a2a_delegate(&mut self, run_id: &str, step_id: &str, spec: &Map<String, Value>) {
@@ -820,146 +1043,13 @@ impl Runtime {
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(120));
-        let Some(peer) = self
-            .settings
-            .a2a
-            .peers
-            .iter()
-            .find(|p| p.name == peer_name)
-            .cloned()
-        else {
-            self.finish_step_pub(
-                run_id,
-                step_id,
-                StepStatus::Failed,
-                None,
-                Some(format!(
-                    "a2a.delegate: no such peer {peer_name:?} (a2a.peers)"
-                )),
-                0,
-            );
-            return;
-        };
-        let spec_v1 = crate::config::A2aPeerSpec {
-            name: peer.name.clone(),
-            endpoint: peer.endpoint.clone(),
-            headers: peer
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            client_cert: peer.client_cert.clone(),
-            client_key: peer.client_key.clone(),
-        };
-        let endpoint = match spec_v1.endpoint_of() {
-            Ok(e) => e,
+        let (endpoint, auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.delegate") {
+            Ok(v) => v,
             Err(e) => {
-                self.finish_step_pub(
-                    run_id,
-                    step_id,
-                    StepStatus::Failed,
-                    None,
-                    Some(format!("a2a.delegate: peer endpoint: {e}")),
-                    0,
-                );
+                self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                 return;
             }
         };
-        #[allow(unused_mut)]
-        let mut headers = match crate::mcp::auth::resolve_headers(&spec_v1.headers) {
-            Ok(h) => h,
-            Err(e) => {
-                self.finish_step_pub(
-                    run_id,
-                    step_id,
-                    StepStatus::Failed,
-                    None,
-                    Some(format!("a2a.delegate: peer headers: {e}")),
-                    0,
-                );
-                return;
-            }
-        };
-        // RFC 0031: a peer `auth:` block resolves at dial time. A body-INDEPENDENT
-        // bearer (static / oauth2 device-login / spiffe jwt) is baked into the
-        // static headers; SigV4 (`kind: aws`) covers the exact body, so it rides
-        // as a PER-REQUEST signer on `PeerAuth` (re-run on every POST).
-        #[cfg(feature = "oauth")]
-        let mut peer_signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>> = None;
-        #[cfg(feature = "oauth")]
-        if let Some(a) = &peer.auth {
-            let aspec = a.to_spec();
-            let target = format!("a2a:{}", peer.name);
-            if aspec.kind == "aws" {
-                match crate::auth::aws::SigV4Signer::from_spec(&aspec, &target) {
-                    Ok(s) => {
-                        peer_signer = Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>)
-                    }
-                    Err(e) => {
-                        self.finish_step_pub(
-                            run_id,
-                            step_id,
-                            StepStatus::Failed,
-                            None,
-                            Some(format!("a2a.delegate: peer aws auth: {e}")),
-                            0,
-                        );
-                        return;
-                    }
-                }
-            } else {
-                match crate::auth::device::signer_for(&aspec, &target, timeout) {
-                    Ok(Some(signer)) => {
-                        for (k, v) in signer.sign("POST", &peer.endpoint, "/", &[]) {
-                            headers.push((k, v));
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        self.finish_step_pub(
-                            run_id,
-                            step_id,
-                            StepStatus::Failed,
-                            None,
-                            Some(format!("a2a.delegate: peer auth: {e}")),
-                            0,
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-        #[allow(unused_mut)]
-        let mut auth = crate::mcp::a2a_client::PeerAuth {
-            headers,
-            ..Default::default()
-        };
-        #[cfg(feature = "oauth")]
-        {
-            auth.signer = peer_signer;
-        }
-        #[cfg(feature = "tls")]
-        if let (Some(cert), Some(key)) = (&spec_v1.client_cert, &spec_v1.client_key) {
-            match std::fs::read(cert)
-                .and_then(|c| std::fs::read(key).map(|k| (c, k)))
-                .map_err(|e| e.to_string())
-                .and_then(|(c, k)| {
-                    crate::net::tls::ClientIdentity::from_pem(&c, &k).map_err(|e| e.to_string())
-                }) {
-                Ok(id) => auth.identity = Some(id),
-                Err(e) => {
-                    self.finish_step_pub(
-                        run_id,
-                        step_id,
-                        StepStatus::Failed,
-                        None,
-                        Some(format!("a2a.delegate: peer mtls: {e}")),
-                        0,
-                    );
-                    return;
-                }
-            }
-        }
         let tx = self.events_tx.clone();
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing

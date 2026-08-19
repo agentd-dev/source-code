@@ -207,9 +207,12 @@ Invalid inputs are not an error you can catch: the event is logged as
 
 ## The node catalogue
 
-There are 67 kinds. Three — `a2a`, `a2a.send` and `a2a.wait` — are not wired to
-an executor, and the *parser* refuses them, so a document that merely mentions
-one fails to load. Use `a2a.delegate` for outbound agent-to-agent work.
+There are 67 kinds, and all of them are wired. The four A2A ones split by
+direction and by whether they block: `a2a` is a START node (an inbound message
+whose command matches begins a run), `a2a.send` notifies a peer without waiting,
+`a2a.wait` suspends until a message lands on a conversation, and `a2a.delegate`
+is the request/response pairing of the two — send an objective, block, take the
+result.
 
 Every step also accepts the cross-cutting fields, on any kind:
 `kind`, `depends_on`, `when`, `retry`, `timeout`, `on_error`, `idempotent`,

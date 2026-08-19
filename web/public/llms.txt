@@ -316,7 +316,7 @@ resource) — exactly one of the three.
 | `subscribe` | an MCP resource changed (notify-then-read) | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver` |
 | `signal` | a named signal arrives | **`name`**, `filter`, `deliver` |
 | `event` | an internal event | **`on`** (`workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.timeout`, …) |
-| `a2a` | a principal sends a message | `command`, `roles`, `inputs` |
+| `a2a` | a principal sends a message whose command matches | `command` (absent = any message), `roles`, `inputs` |
 | `webhook` | an inbound HTTP request | **`path`**, `methods`, `auth`, `idempotency`, `respond`, `parallelism` |
 
 A run's `run.start` names the node that fired; siblings are `skipped`. Start-node
@@ -373,9 +373,9 @@ Required fields in **bold**.
 | `mcp.resource` | **`server`**, **`op`** (`read\|list\|prompt\|complete`), `uri`/`name` |
 | `tool` | call a tool by registry name — **`name`**, `args` |
 | `http` | an outbound request — **`url`**, `method`, `headers`, `body`/`json`, `expect`, `allow_private`, `sign`. SSRF-guarded: resolved once and dialled by vetted address |
-| `a2a.send` | send a message to a peer agent |
-| `a2a.delegate` | delegate an objective to a **`peer`** as a spec Task; `output_contract`, `timeout` |
-| `a2a.wait` | await a delegated task |
+| `a2a.send` | notify a peer and continue — **`to`**, `parts`, `context`, `timeout`. Does NOT wait for a result |
+| `a2a.delegate` | delegate an objective to a **`peer`** and block for the result; `output_contract`, `timeout` |
+| `a2a.wait` | suspend until a message arrives on a `conversation`; `timeout`. The reply half of `a2a.send` |
 | `workflow.signal` | send **`name`** to a waiting run; `payload`, `run` |
 | `workflow.wait` / `.cancel` | await or cancel **`run`**; `timeout`, `reason` |
 | `emit` | emit an internal event other workflows can start on |

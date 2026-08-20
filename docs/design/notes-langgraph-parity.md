@@ -1,3 +1,6 @@
+> **Superseded.** This note describes a pre-2.0 design; several rows do not match the shipped engine.
+> The current analysis is [notes-langgraph-parity-2026-08.md](notes-langgraph-parity-2026-08.md).
+
 # LangGraph ↔ agentd — the parity notebook (internal)
 
 **Status:** informal engineering notes, not normative (RFC 0021 + `docs/workflows.md`
@@ -35,7 +38,7 @@ The framing difference that explains everything else:
 | Human-in-the-loop | `interrupt(payload)` + `Command(resume=value)` | `human` node → A2A `input-required` → `SendMessage{taskId}` | ✅ and **wire-standard** (any A2A client, no SDK) |
 | Checkpointing | per-superstep, Postgres/SQLite savers | per-superstep envelopes → **any MCP server** (`state.put/get/list`) | ✅, storage-agnostic by protocol |
 | Threads / resume | `thread_id` + checkpointer | stable `checkpoint.key` + `--workflow-resume server:key` | ✅ |
-| Time travel / fork | `get_state_history`, `update_state`, replay | `state.get {seq}` → resume `@seq` under a new run-id; edit-the-board fork via plain MCP calls | ✅ |
+| Time travel / fork | `get_state_history`, `update_state`, replay | `--workflow-resume` resumes a run; there is **no checkpoint history**, so no listing past states, editing one, or forking from it | ❌ — this row described a pre-2.0 design and was never true of the shipped engine (verified 2026-08-20; see notes-langgraph-parity-2026-08.md §26) |
 | Loop safety | `recursion_limit` (one number, one error) | step budget + token pool + deadline + visit caps + progress guard, typed `reason`s | ✅ agentd richer |
 | Retry policies | per-node `retry_policy` | per-node `retry {max, backoff_ms}` | ✅ |
 | Node caching | `cache_policy (key_func, ttl)` | ❌ declined — the MCP server caches | stance |

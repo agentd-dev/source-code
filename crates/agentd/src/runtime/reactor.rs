@@ -77,6 +77,13 @@ pub enum PendingKind {
         standalone: bool,
         /// The `auto` fallback judge is running (or already ran) for this ask.
         auto_fired: bool,
+        /// The answer's declared shape (`human.schema` / `ask_human.schema`).
+        ///
+        /// It was accepted, forwarded to clients so they could render a form,
+        /// and then never applied to what came back — so a gate could declare
+        /// it wanted `{decision: "file"|"hold"}` and the run would proceed on
+        /// "maybe later". Carried here so the reply can be checked against it.
+        schema: Option<Value>,
     },
 }
 

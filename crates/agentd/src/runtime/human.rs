@@ -65,6 +65,9 @@ impl Runtime {
             .and_then(|t| crate::config::parse_duration(t).ok())
             .unwrap_or(ASK_TIMEOUT);
         let deadline_ms = now_ms() + timeout.as_millis() as u64;
+        // The declared answer shape, carried so the reply can be checked
+        // against it rather than merely advertised to clients.
+        let schema = args.get("schema").cloned().filter(|v| !v.is_null());
 
         // A human can answer only through the interface surface.
         #[cfg(feature = "a2a")]
@@ -74,7 +77,7 @@ impl Runtime {
 
         if available {
             #[cfg(feature = "a2a")]
-            return self.human_gate(caller, question, deadline_ms);
+            return self.human_gate(caller, question, deadline_ms, schema);
         }
         let _ = caller;
         // No channel: the configured fallback (RFC 0032 §16).
@@ -99,6 +102,7 @@ impl Runtime {
                     deadline_ms,
                     standalone: false,
                     auto_fired: false,
+                    schema: schema.clone(),
                 })
             }
             AskHumanFallback::Auto => {
@@ -110,6 +114,7 @@ impl Runtime {
                     deadline_ms: now_ms() + AUTO_GRACE_MS,
                     standalone: false,
                     auto_fired: true,
+                    schema: schema.clone(),
                 })
             }
         }
@@ -123,6 +128,7 @@ impl Runtime {
         caller: &super::tools::ToolCaller,
         question: String,
         deadline_ms: u64,
+        schema: Option<Value>,
     ) -> super::tools::ToolOutcome {
         use super::children::ChildKind;
         use super::tools::ToolOutcome;
@@ -218,7 +224,30 @@ impl Runtime {
             deadline_ms,
             standalone,
             auto_fired: false,
+            schema,
         })
+    }
+
+    /// Put a rejected gate back, with the reason appended to the question.
+    ///
+    /// The alternative is failing the step, which throws away a human who is
+    /// still sitting there — and the usual cause is a typo, not a refusal.
+    fn reask_human(&mut self, mut p: super::reactor::PendingTool, question: &str, why: &str) {
+        let amended = format!("{question}\n\n(previous answer rejected: {why})");
+        if let PendingKind::Human { question: q, .. } = &mut p.kind {
+            *q = amended.clone();
+        }
+        #[cfg(feature = "a2a")]
+        if let PendingKind::Human { task, .. } = &p.kind {
+            use crate::a2a::tasks::State;
+            let task = task.clone();
+            if let Some(t) = self.tasks.get_mut(&task) {
+                t.transition(State::InputRequired, Some(amended));
+            }
+            self.task_persist(&task);
+            self.task_sync(&task);
+        }
+        self.pending.push(p);
     }
 
     /// Resolve pending ask `i` with an answer. `via` marks who decided
@@ -226,12 +255,49 @@ impl Runtime {
     pub(crate) fn human_answer(&mut self, i: usize, text: &str, via: &str) {
         let p = self.pending.remove(i);
         let PendingKind::Human {
-            task, standalone, ..
+            task,
+            standalone,
+            schema,
+            question,
+            ..
         } = &p.kind
         else {
             return;
         };
         let (task, standalone) = (task.clone(), *standalone);
+        // The declared answer shape was advertised to clients and never applied
+        // to what came back, so a gate could ask for
+        // `{decision: "file"|"hold"}` and the run would proceed on "maybe
+        // later". Check it here — and re-ask rather than fail, because the
+        // person is still there and a second try is cheaper than a dead run.
+        if let Some(schema) = schema.clone() {
+            let value = match crate::mcp::elicit::shape_reply(&json!(text), &schema) {
+                ::mcp::inbound::Answer::Accept(v) => v,
+                // Cancel/Decline: the person declined to answer in the declared
+                // shape, which is a real answer, not a validation failure.
+                _ => json!(text),
+            };
+            if let Err(errs) = crate::jsonschema::validate(&schema, &value) {
+                let q = question.clone();
+                self.log.info(
+                    "human.answer.rejected",
+                    json!({"task": task, "errors": errs, "via": via}),
+                );
+                // An `auto` judge that cannot produce the shape must not spin.
+                if via == "auto" {
+                    self.human_task_fail(
+                        &task,
+                        &format!(
+                            "auto-answer does not match the declared schema: {}",
+                            errs.join("; ")
+                        ),
+                    );
+                    return;
+                }
+                self.reask_human(p, &q, &errs.join("; "));
+                return;
+            }
+        }
         // The asker has to still BE there to receive it. A child that died with
         // its gate open took its `ToolResult` slot with it, so `reply` would
         // write into a closed pipe and a human's decision would vanish leaving
@@ -555,6 +621,9 @@ impl Runtime {
                     deadline_ms,
                     standalone: false,
                     auto_fired: false,
+                    // A gate re-armed on restore: the definition's schema is
+                    // reapplied by the step, not carried in the wait record.
+                    schema: None,
                 },
                 started_ms: now_ms(),
             });

@@ -1507,7 +1507,42 @@ fn reachable(wf: &Workflow, from: &str, to: &str) -> bool {
     false
 }
 
+/// A `human` gate inside a body that can run several copies at once.
+///
+/// Only ONE gate can be live per run today: the second suspended `human` has no
+/// task of its own to be answered through, so it waits for a reply that can
+/// never be addressed to it. Inside `foreach`/`parallel`/`batch`/`race` that is
+/// not a rare shape, it is the normal one — a gate per item. Refused at load
+/// until each gate carries its own identity, because failing at validation is
+/// much kinder than hanging at item two.
+fn validate_human_in_concurrent_bodies(wf: &Workflow, errs: &mut Vec<String>) {
+    fn walk(wf_name: &str, owner: &str, body: &Body, errs: &mut Vec<String>) {
+        for s in body.steps.values() {
+            if s.kind == "human" {
+                errs.push(format!(
+                    "workflow {wf_name:?} step {:?}: a `human` gate inside {owner:?} is not \
+                     supported — only one gate can be live per run, so a second item would \
+                     wait forever. Gate before or after the fan-out instead.",
+                    s.id
+                ));
+            }
+            for nested in s.body.iter().chain(s.branches.values()) {
+                walk(wf_name, owner, nested, errs);
+            }
+        }
+    }
+    for s in wf.steps.values() {
+        if !matches!(s.kind.as_str(), "foreach" | "batch" | "parallel" | "race") {
+            continue;
+        }
+        for body in s.body.iter().chain(s.branches.values()) {
+            walk(&wf.name, &s.id, body, errs);
+        }
+    }
+}
+
 fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
+    validate_human_in_concurrent_bodies(wf, errs);
     validate_concurrent_writes(wf, errs);
     let name = &wf.name;
     let starts: Vec<&Step> = wf.start_steps();

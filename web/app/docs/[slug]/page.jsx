@@ -55,6 +55,29 @@ function Pre({ children }) {
     const chart = (Array.isArray(code) ? code.join("") : String(code)).replace(/\n$/, "");
     return <Mermaid chart={chart} />;
   }
+  // ```tui blocks are REAL frames, rendered by the shipped TUI against a mirror
+  // and captured by interface/tools/frames.mjs. Giving them terminal chrome
+  // says "this is the program", which a bare code block does not — and the
+  // frames regenerate from the code, so they cannot drift into fiction.
+  if (cls.includes("language-tui")) {
+    const code = child.props.children;
+    const text = (Array.isArray(code) ? code.join("") : String(code)).replace(/\n$/, "");
+    const [first, ...rest] = text.split("\n");
+    const titled = first.startsWith("# ");
+    return (
+      <div className="term term-doc">
+        <div className="panel-title">
+          <span className="dots">
+            <i />
+            <i />
+            <i />
+          </span>
+          <span className="ml-1">{titled ? first.slice(2) : "agentd tui"}</span>
+        </div>
+        <pre>{titled ? rest.join("\n") : text}</pre>
+      </div>
+    );
+  }
   return <pre>{children}</pre>;
 }
 

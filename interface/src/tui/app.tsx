@@ -535,6 +535,7 @@ export function App(props: AppProps): React.JSX.Element {
         subDetail ? (
           <SubagentDetail
             handle={subDetail.handle}
+            killAsk={killAsk === subDetail.handle}
             summary={s.subagents.get(subDetail.handle) as { [k: string]: Json } | undefined}
             detail={subDetail.detail as { [k: string]: Json } | null}
             debug={info?.debug === true}

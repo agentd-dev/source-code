@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build the hosted web UI (code.agentd.dev) as a static tarball AND an OCI
+# image, so a deploy is picking an artifact rather than running a build.
+#
+# What ships is a thin client: one bundle, a shell, a stylesheet. There is no
+# backend and no credential in the image — the page talks to the user's own
+# daemon from their browser. That is what makes it safe to host publicly, and
+# the `no-backend` assertion below is there to keep it true.
+name: hosted-ui
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["interface/**", ".github/workflows/hosted-ui.yml"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the image to ghcr (otherwise build only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE: ghcr.io/agentd-dev/agentd-ui
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+
+      - name: Install
+        working-directory: interface
+        run: npm ci --no-audit --no-fund
+
+      # The clients are the product surface; a broken bundle is worse hosted
+      # than local, because nobody can roll back their own browser.
+      - name: Typecheck and test
+        working-directory: interface
+        run: |
+          npx tsc --noEmit -p .
+          npm test
+
+      - name: Build
+        working-directory: interface
+        run: npm run build
+
+      # The one property that makes public hosting defensible: the image serves
+      # static files and nothing else. If a backend ever appears, this fails and
+      # the security note in the Dockerfile stops being true silently.
+      - name: Assert the bundle stays a thin client
+        working-directory: interface
+        run: |
+          if grep -rIlE '(process\.env\.(AGENTD_)?(SECRET|TOKEN|KEY))' dist/web/ ; then
+            echo "::error::a secret-shaped env reference reached the hosted bundle"
+            exit 1
+          fi
+          test -f dist/web/index.html && test -f dist/web/app.js
+          echo "bundle: $(du -sh dist/web | cut -f1)"
+
+      - name: Tarball
+        working-directory: interface
+        run: |
+          tar czf ../agentd-ui-static.tar.gz -C dist/web .
+          sha256sum ../agentd-ui-static.tar.gz | tee ../SHA256SUMS.ui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentd-ui-static
+          path: |
+            agentd-ui-static.tar.gz
+            SHA256SUMS.ui
+          retention-days: 30
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build (and push on main / tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: interface
+          file: interface/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' || inputs.publish == true }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A built image that does not serve is a deploy outage discovered by
+      # users; check it here where it costs nothing.
+      - name: Smoke-test the image
+        run: |
+          docker build -t ui:smoke -f interface/Dockerfile interface
+          docker run -d --rm --name ui-smoke -p 8080:8080 ui:smoke
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz >/dev/null
+          curl -fsS http://127.0.0.1:8080/ >/dev/null
+          curl -fsS http://127.0.0.1:8080/app.js >/dev/null
+          # The SPA fallback and the CSP are both load-bearing; assert them.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/deep/route)" = "200"
+          curl -sI http://127.0.0.1:8080/ | grep -qi 'content-security-policy' \
+            || { echo "::error::the CSP header is missing — check add_header inheritance in deploy/nginx.conf"; exit 1; }
+          docker stop ui-smoke

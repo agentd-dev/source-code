@@ -210,16 +210,11 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
             task={gate}
             form={gateForm}
             onAnswer={(value) => {
-              void (async () => {
-                try {
-                  const text = typeof value === 'string' ? value : JSON.stringify(value);
-                  const sent = await client.send(text, { contextId: ctxRef.current, taskId: gate.id });
-                  if (sent.task) mirror.adoptTasks([sent.task]);
-                  mirror.localEcho(sent.messageId, sent.task?.contextId ?? ctxRef.current, text, gate.id);
-                } catch (e) {
-                  mirror.note(e instanceof Error ? e.message : String(e), 'error');
-                }
-              })();
+              // The same path a typed reply takes. The parent owns the client
+              // and the conversation id, and it already routes a plain message
+              // to the open gate — so an answer picked from the form should not
+              // need its own way in.
+              onSend(typeof value === 'string' ? value : JSON.stringify(value));
             }}
           />
         ) : null}
@@ -477,6 +472,22 @@ function Subagents({ mirror, client }: { mirror: Mirror; client: AgentdClient })
       </div>
     </div>
   );
+}
+
+/** A step's state as a class, so severity reads as form and not only as a word. */
+function stepClass(st: { phase: string; status?: string }): string {
+  if (st.phase === 'start') return 'is-running';
+  switch (st.status) {
+    case 'done':
+      return 'is-done';
+    case 'pruned':
+    case 'skipped':
+      return 'is-skipped';
+    case 'suspended':
+      return 'is-waiting';
+    default:
+      return 'is-failed';
+  }
 }
 
 /** A SUBAGENT status as a class, so state reads as colour and not only as text.

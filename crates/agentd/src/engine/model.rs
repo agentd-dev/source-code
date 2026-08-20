@@ -1228,6 +1228,38 @@ fn parse_step(
                 ));
             }
         }
+        // `collect.mode` and `assign.mode` reach `write_var`, which falls through
+        // to overwrite on anything it does not recognise — so `mode: appned`
+        // silently overwrote instead of appending. The set is closed; check it
+        // where the typo is still a config error.
+        "foreach" | "batch" | "iterate" | "parallel" | "race" | "subgraph"
+            if spec.contains_key("collect") =>
+        {
+            if let Some(m) = spec
+                .get("collect")
+                .and_then(|c| c.get("mode"))
+                .and_then(Value::as_str)
+                && !matches!(m, "overwrite" | "append" | "merge" | "union")
+            {
+                errs.push(format!(
+                    "{at}: collect.mode {m:?} must be overwrite|append|merge|union"
+                ));
+            }
+        }
+        // `human.to` and `human.reply_uri` are accepted and then ignored — the
+        // gate is answered over A2A by whoever holds the task. Rather than
+        // pretend to route, refuse them: a field that silently does nothing is
+        // worse than one that does not exist.
+        "human" => {
+            for f in ["to", "reply_uri"] {
+                if spec.contains_key(f) {
+                    errs.push(format!(
+                        "{at}: human.{f} is not implemented — a gate is answered over A2A by \
+                         whoever holds the task; remove it (see docs/node-registry.md)"
+                    ));
+                }
+            }
+        }
         "finish" => {
             if let Some(st) = spec.get("status").and_then(Value::as_str)
                 && !matches!(st, "completed" | "failed" | "refused" | "cancelled")
@@ -1370,7 +1402,113 @@ fn parse_body(at: &str, bv: &Value, depth: usize, errs: &mut Vec<String>) -> Opt
 }
 
 /// Graph-level validation (RFC 0027 §8).
+/// Two steps that can run in the same wave, both writing one var with modes
+/// that disagree, is a silent last-write-wins race: which value survives
+/// depends on completion order, which is not a thing the author controls.
+///
+/// `append`/`merge` are reducers — several writers combining is the point.
+/// `overwrite` is not: two overwriters, or an overwriter racing a reducer, is
+/// the shape with no defensible answer, so it is refused where it is still a
+/// config error rather than an intermittent wrong number.
+fn validate_concurrent_writes(wf: &Workflow, errs: &mut Vec<String>) {
+    use std::collections::BTreeMap;
+    let mut writers: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    for s in wf.steps.values() {
+        if !matches!(s.kind.as_str(), "assign" | "transform") {
+            continue;
+        }
+        let key = s
+            .spec
+            .get("writes")
+            .and_then(Value::as_str)
+            .unwrap_or(s.id.as_str());
+        let mode = s
+            .spec
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("overwrite");
+        writers.entry(key).or_default().push((s.id.as_str(), mode));
+    }
+    for (key, ws) in writers {
+        if ws.len() < 2 {
+            continue;
+        }
+        // Ordered pairs cannot race; only steps with no path between them can.
+        for (i, (a, ma)) in ws.iter().enumerate() {
+            for (b, mb) in ws.iter().skip(i + 1) {
+                if reachable(wf, a, b) || reachable(wf, b, a) {
+                    continue;
+                }
+                // Nor can two arms of the same switch: exactly one is taken, so
+                // they are mutually EXCLUSIVE rather than concurrent. Ordering
+                // is expressed by the routing edge here, not by `depends_on`,
+                // which is why the reachability walk above cannot see it.
+                if exclusive_by_switch(wf, a, b) {
+                    continue;
+                }
+                // append/merge/union are reducers — several writers combining
+                // is the point. Only an overwriter has no defensible answer.
+                if *ma == "overwrite" || *mb == "overwrite" {
+                    errs.push(format!(
+                        "workflow {:?}: steps {a:?} and {b:?} can run concurrently and both \
+                         write {key:?} (modes {ma}/{mb}) — the surviving value would depend on \
+                         completion order; order them with depends_on, or use append/merge",
+                        wf.name
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Whether two steps are arms of one `switch` — at most one of them ever runs.
+fn exclusive_by_switch(wf: &Workflow, a: &str, b: &str) -> bool {
+    for s in wf.steps.values() {
+        if s.kind != "switch" {
+            continue;
+        }
+        let mut arms: Vec<&str> = s
+            .spec
+            .get("cases")
+            .and_then(Value::as_object)
+            .map(|c| c.values().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if let Some(d) = s.spec.get("default").and_then(Value::as_str) {
+            arms.push(d);
+        }
+        // Either arm may be the step itself or an ancestor of it: a whole
+        // branch hangs below one target.
+        let on_arm = |x: &str| arms.iter().any(|arm| *arm == x || reachable(wf, arm, x));
+        if on_arm(a) && on_arm(b) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `to` is reachable from `from` along `depends_on` edges.
+fn reachable(wf: &Workflow, from: &str, to: &str) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![to];
+    // Walk UP from `to`: it is reachable from `from` if `from` is an ancestor.
+    while let Some(cur) = stack.pop() {
+        if cur == from {
+            return true;
+        }
+        if !seen.insert(cur.to_string()) {
+            continue;
+        }
+        if let Some(s) = wf.steps.get(cur) {
+            for d in &s.depends_on {
+                stack.push(d.as_str());
+            }
+        }
+    }
+    false
+}
+
 fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
+    validate_concurrent_writes(wf, errs);
     let name = &wf.name;
     let starts: Vec<&Step> = wf.start_steps();
     if starts.is_empty() {

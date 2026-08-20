@@ -85,6 +85,9 @@ export function App(props: AppProps): React.JSX.Element {
   const [selected, setSelected] = useState(0);
   const [sugIndex, setSugIndex] = useState(0);
   const [subDetail, setSubDetail] = useState<{ handle: string; detail: Json | null } | null>(null);
+  // Stopping a subagent is not undoable, so it asks first — one keystroke to
+  // confirm, any other key to back out.
+  const [killAsk, setKillAsk] = useState<string | null>(null);
   const [spin, setSpin] = useState(0);
   const [logLines, setLogLines] = useState<Json[]>([]);
   const logCursor = useRef(0);
@@ -469,8 +472,28 @@ export function App(props: AppProps): React.JSX.Element {
           const handle = subs[selected];
           if (handle) openSubagent(handle);
         }
-      } else if (screen === 'subagents' && subDetail && (key.backspace || key.delete)) {
-        setSubDetail(null);
+      } else if (screen === 'subagents' && subDetail) {
+        // Control lives on the thing being controlled. `m` opens the composer
+        // pre-addressed to this subagent so a message is one keystroke away
+        // rather than a `/send <handle> …` you have to retype the handle into;
+        // `k` stops it — a subagent is a process the supervisor owns, so stop
+        // means stop rather than a request the child can decline.
+        if (key.backspace || key.delete || key.escape) setSubDetail(null);
+        else if (ch === 'm') {
+          const pre = `/send ${subDetail.handle} `;
+          setScreen('chat');
+          setInput(pre);
+          setCursor(pre.length);
+          setSubDetail(null);
+        } else if (ch === 'k') setKillAsk(subDetail.handle);
+        else if (killAsk && (ch === 'y' || ch === 'Y')) {
+          const h = killAsk;
+          setKillAsk(null);
+          void client
+            .subagentKill(h)
+            .then(() => mirror.note(`stopped ${h}`))
+            .catch((e: unknown) => mirror.note(`stop failed: ${String(e)}`));
+        } else if (killAsk) setKillAsk(null);
       }
     },
     { isActive: isRawModeSupported },

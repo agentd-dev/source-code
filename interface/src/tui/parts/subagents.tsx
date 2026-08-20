@@ -67,11 +67,14 @@ export function SubagentDetail({
   summary,
   detail,
   debug,
+  killAsk = false,
 }: {
   handle: string;
   summary: { [k: string]: Json } | undefined;
   detail: { [k: string]: Json } | null;
   debug: boolean;
+  /** Waiting for confirmation that this subagent should be stopped. */
+  killAsk?: boolean;
 }): React.JSX.Element {
   const d = detail ?? summary ?? {};
   const line = (label: string, v: Json | undefined, color?: string) =>
@@ -89,6 +92,9 @@ export function SubagentDetail({
         subagent {handle}
       </Text>
       {line('status', d.status, statusColor(String(d.status ?? '')))}
+      {!['running', 'spawning'].includes(String(d.status ?? '')) ? (
+        <Text color={theme.dim}>{'(not running — messaging and stopping apply to a live subagent)'}</Text>
+      ) : null}
       {line('mode', d.mode)}
       {line('attempt', d.attempt)}
       {line('tokens', d.tokens)}
@@ -101,7 +107,17 @@ export function SubagentDetail({
           (summary only — enable interface.debug, or /set interface.debug true, for instruction/result)
         </Text>
       ) : null}
-      <Text color={theme.dim}>{'\nesc/backspace back · tab next screen'}</Text>
+      {killAsk ? (
+        <Text color={theme.error} bold>
+          {'\nstop '}
+          {handle}
+          {'? y to confirm, any other key to cancel'}
+        </Text>
+      ) : (
+        <Text color={theme.dim}>
+          {'\nm message · k stop · esc/backspace back · tab next screen'}
+        </Text>
+      )}
     </Box>
   );
 }

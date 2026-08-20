@@ -701,6 +701,7 @@ pub struct Store {
     pub file: Option<StoreFile>,
     pub checkpoint: Checkpoint,
     pub durability: Durability,
+    pub retention: Retention,
     pub on_error: StoreOnError,
     pub audit: bool,
     pub timeout: Option<Dur>,
@@ -848,6 +849,27 @@ pub struct HttpOp {
 #[serde(deny_unknown_fields, default)]
 pub struct Checkpoint {
     pub debounce_ms: Option<u64>,
+}
+
+/// What to keep once a run is over.
+///
+/// A long-lived instance accumulates one durable record per run forever. On a
+/// laptop that is the difference between an agent that runs for a month and one
+/// that fills a disk — and the store had no eviction at all, so "forever" was
+/// literal.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Retention {
+    pub runs: RunRetention,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct RunRetention {
+    /// Keep at most this many terminal runs (newest first).
+    pub keep_last: Option<u32>,
+    /// Drop a terminal run older than this.
+    pub ttl: Option<Dur>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

@@ -140,6 +140,10 @@ fn top_level_properties(
                     "http": { "$ref": "#/$defs/StoreHttp" },
                     "file": { "$ref": "#/$defs/StoreFile" },
                     "checkpoint": { "type": "object", "additionalProperties": false, "properties": { "debounce_ms": { "type": "integer", "minimum": 0 } } },
+                    "retention": { "type": "object", "additionalProperties": false, "properties": {
+                        "runs": { "type": "object", "additionalProperties": false, "properties": {
+                            "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal runs" },
+                            "ttl": duration } } } },
                     "durability": { "type": "object", "additionalProperties": false, "properties": {
                         "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] } } },
                     "on_error": { "enum": ["halt", "degrade"] },

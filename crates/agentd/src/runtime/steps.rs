@@ -2051,6 +2051,50 @@ impl Runtime {
     }
 
     /// The run reached a terminal state: report, wake, plan bindings, counters.
+    /// Evict terminal runs beyond `store.retention.runs`.
+    ///
+    /// Without this a long-lived instance keeps one durable record per run
+    /// forever — on a laptop, the difference between an agent that runs for a
+    /// month and one that fills a disk. Only TERMINAL runs are candidates:
+    /// nothing in flight is ever dropped, whatever the policy says. Default is
+    /// unbounded, so an operator who has not thought about it keeps today's
+    /// behaviour.
+    fn evict_terminal_runs(&mut self) {
+        let policy = &self.settings.store.retention.runs;
+        let keep_last = policy.keep_last;
+        let ttl_ms = policy.ttl.as_ref().map(|d| d.0.as_millis() as u64);
+        if keep_last.is_none() && ttl_ms.is_none() {
+            return;
+        }
+        let now = now_ms();
+        // Newest first, so "keep the last N" is a prefix.
+        let mut terminal: Vec<(String, u64)> = self
+            .runs
+            .values()
+            .filter(|r| r.status.is_terminal())
+            .map(|r| (r.id.clone(), r.finished.unwrap_or(0)))
+            .collect();
+        terminal.sort_by_key(|(_, finished)| std::cmp::Reverse(*finished));
+
+        let mut drop: Vec<String> = Vec::new();
+        for (i, (id, finished)) in terminal.iter().enumerate() {
+            let over_count = keep_last.is_some_and(|k| i >= k as usize);
+            let over_age = ttl_ms.is_some_and(|t| now.saturating_sub(*finished) > t);
+            if over_count || over_age {
+                drop.push(id.clone());
+            }
+        }
+        for id in drop {
+            self.runs.remove(&id);
+            if let Err(e) = self.durable.delete(crate::state::Kind::Run, &id) {
+                self.log
+                    .warn("run.evict.fail", json!({"run": id, "err": e.to_string()}));
+                continue;
+            }
+            self.log.info("run.evicted", json!({"run": id}));
+        }
+    }
+
     pub(crate) fn on_run_terminal(&mut self, run_id: &str) {
         let Some(run) = self.runs.get(run_id) else {
             return;
@@ -2063,6 +2107,12 @@ impl Runtime {
         );
         #[cfg(feature = "a2a")]
         let a2a_task = run.task.clone();
+        // Eviction runs here because this is the only moment the candidate set
+        // grows. Deferred to the end of the function so the run's own
+        // completion handling (webhook reply, A2A task, feed) happens first —
+        // evicting a record before its result was delivered would be a fine way
+        // to lose an answer.
+        let evict_after = true;
         // A `respond: sync` webhook awaiting this run gets its result now.
         #[cfg(feature = "a2a")]
         self.webhook_sync_reply(run_id);
@@ -2180,6 +2230,9 @@ impl Runtime {
             self.a2a_task_for_run(tid, status.as_str(), output.as_ref(), error.as_deref());
         }
         self.checkpoint(false);
+        if evict_after {
+            self.evict_terminal_runs();
+        }
     }
 
     /// Cancel a run: cancel its children, fail suspended waits, mark cancelled.

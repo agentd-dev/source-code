@@ -182,6 +182,22 @@ export function elapsed(sinceMs: number, nowMs: number = Date.now()): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
 
+/**
+ * A duration, at the precision the number deserves (`120ms`, `1.4s`, `2m03s`).
+ *
+ * Distinct from `elapsed`, which counts whole seconds because it is watching a
+ * clock tick. Most steps finish in milliseconds, and rendering those as `0s`
+ * throws away the only interesting thing about them — that they were fast, and
+ * which one of them was not.
+ */
+export function duration(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m${String(Math.floor(s % 60)).padStart(2, '0')}s`;
+}
+
 /** Compact token count (`940`, `1.2k`, `18k`). */
 export function tokens(n: number): string {
   if (n < 1000) return String(n);

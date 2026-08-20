@@ -73,6 +73,10 @@ export function normalizeTask(t: Json): TaskView | null {
     principal: ((meta?.['agentd/principal'] ?? o.principal) as string) ?? undefined,
     updated: epochMs(status?.timestamp) ?? epochMs(o.updated) ?? 0,
     history: Array.isArray(history) ? history : undefined,
+    // A gate's answer shape, when the daemon declared one. It is what lets a
+    // client offer the actual choices instead of a text box the person has to
+    // guess the wording for.
+    askSchema: (meta?.['agentd/ask_schema'] as Json) ?? undefined,
   };
 }
 

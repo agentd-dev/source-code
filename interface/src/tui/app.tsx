@@ -27,10 +27,14 @@ import {
   TERMINAL_STATES,
   activityLine,
   applySuggestion,
+  askAnswer,
+  askForm,
   prepare,
   suggest,
   workflowNames,
 } from '../client/index.js';
+import type { AskForm } from '../client/index.js';
+import { GatePrompt } from './parts/gate.js';
 import { theme } from './theme.js';
 import { Transcript } from './parts/transcript.js';
 import { TaskList } from './parts/tasks.js';
@@ -150,21 +154,43 @@ export function App(props: AppProps): React.JSX.Element {
   }, [screen, s.info?.debug, client]);
 
   // Track the newest input-required gate so a plain reply answers it.
+  const gate = active.find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED');
   useEffect(() => {
-    const gate = active.find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED');
     inputTaskRef.current = gate?.id;
   });
+  // The form the gate's schema describes. A gate that declared no schema keeps
+  // the old behaviour exactly: type an answer into the composer.
+  const gateForm = useMemo(() => askForm(gate?.askSchema), [gate?.id, gate?.askSchema]);
+  const [gatePick, setGatePick] = useState<string[]>([]);
+  // A new gate must not inherit the previous one's selection.
+  useEffect(() => {
+    setGatePick([]);
+  }, [gate?.id]);
 
   // Rows the body may use: the terminal minus the chrome (top edge, composer,
   // suggestions, bottom edge — which wraps on narrow terminals). The
   // fullscreen composer is boxed, so it costs its two border rows too; get
   // this wrong and the viewport overflows and clips its own newest message.
   const composerRows = 1 + (props.fullscreen !== false && isRawModeSupported ? 2 : 0);
+  // The gate's options sit between the transcript and the composer, so they
+  // cost rows the transcript may not also use — one per option, one for the
+  // hint, and one more for the free-text line when `other…` is selected.
+  const gateRows =
+    screen === 'chat' && gate && gateForm.kind !== 'text'
+      ? (gateForm.kind === 'bool'
+          ? 2
+          : gateForm.kind === 'one' || gateForm.kind === 'many'
+            ? gateForm.options.length + (gateForm.other ? 1 : 0)
+            : 0) +
+        1 +
+        (gatePick.includes('__other__') ? 1 : 0)
+      : 0;
   const bodyRows = Math.max(
     3,
     rows -
       (2 +
         composerRows +
+        gateRows +
         (suggestions.length > 0 ? 1 : 0) +
         // The bottom edge wraps to a second line only on a narrow terminal.
         (columns < 100 && (s.info?.display?.bottom?.length ?? 8) > 6 ? 1 : 0)),
@@ -385,6 +411,43 @@ export function App(props: AppProps): React.JSX.Element {
 
   useInput(
     (ch, key) => {
+      // A form-shaped gate takes the number keys, so picking an option is one
+      // keystroke instead of typing its wording. Only when the composer is
+      // EMPTY: someone mid-sentence typing "1" means the character, and
+      // stealing it would be maddening.
+      if (screen === 'chat' && gate && gateForm.kind !== 'text' && input.length === 0) {
+        const rows =
+          gateForm.kind === 'bool'
+            ? ['yes', 'no']
+            : gateForm.kind === 'one' || gateForm.kind === 'many'
+              ? [...gateForm.options, ...(gateForm.other ? ['__other__'] : [])]
+              : [];
+        const n = Number(ch);
+        if (Number.isInteger(n) && n >= 1 && n <= rows.length) {
+          const v = rows[n - 1];
+          setGatePick((cur) =>
+            gateForm.kind === 'many'
+              ? cur.includes(v)
+                ? cur.filter((x) => x !== v)
+                : [...cur, v]
+              : [v],
+          );
+          return;
+        }
+        if (key.return && gatePick.length > 0 && !gatePick.includes('__other__')) {
+          const answer = askAnswer(gateForm, gatePick, '');
+          const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
+          setGatePick([]);
+          void client
+            .send(text, { taskId: gate.id })
+            .then((sent) => {
+              if (sent.task) mirror.adoptTasks([sent.task]);
+              mirror.localEcho(sent.messageId, sent.task?.contextId ?? '', text, gate.id);
+            })
+            .catch((e: unknown) => mirror.note(String(e), 'error'));
+          return;
+        }
+      }
       // Suggestions capture Tab/↑/↓ while visible (chat only).
       if (screen === 'chat' && suggestions.length > 0) {
         if (key.tab) {
@@ -513,7 +576,11 @@ export function App(props: AppProps): React.JSX.Element {
       ? {
           text:
             active[0].state === 'TASK_STATE_INPUT_REQUIRED'
-              ? 'waiting for your answer'
+              ? // A form-shaped gate lists its options below, so the working
+                // line does not repeat the wait.
+                gateForm.kind === 'text'
+                ? 'waiting for your answer'
+                : 'waiting for your choice'
               : activityLine(mirror.activityFor(active[0].id)) +
                 (active.length > 1 ? ` · ${active.length} tasks` : ''),
           frame: spin,
@@ -546,6 +613,13 @@ export function App(props: AppProps): React.JSX.Element {
       ) : (
         <DebugScreen s={s} logLines={logLines} />
       )}
+      {screen === 'chat' && gate && gateForm.kind !== 'text' ? (
+        <GatePrompt
+          form={gateForm}
+          picked={gatePick}
+          other={input}
+        />
+      ) : null}
       {screen === 'chat' ? (
         isRawModeSupported ? (
           <Box flexDirection="column">

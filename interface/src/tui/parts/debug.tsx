@@ -6,6 +6,7 @@
  */
 import React from 'react';
 import { Box, Text } from 'ink';
+import { duration } from '../../client/index.js';
 import type { FeedEvent, Json, MirrorState } from '../../client/index.js';
 import { ago, shortId, theme } from '../theme.js';
 
@@ -88,7 +89,11 @@ function Runs({ s }: { s: MirrorState }): React.JSX.Element {
                 <Text color={stepColour(st)}>{glyph(st)}</Text>{' '}
                 <Text>{st.step.padEnd(18)}</Text>
                 <Text color={theme.dim}>{(st.kind ?? '').padEnd(14)}</Text>
-                <Text color={stepColour(st)}>{st.phase === 'start' ? 'running' : (st.status ?? '')}</Text>
+                <Text color={stepColour(st)}>{(st.phase === 'start' ? 'running' : (st.status ?? '')).padEnd(10)}</Text>
+                {/* How long it took, once it is over. A run's slow step is the
+                    thing you are usually looking for, and it is invisible
+                    without this. */}
+                {st.ms !== undefined ? <Text color={theme.dim}>{duration(st.ms)}</Text> : null}
                 {st.err ? <Text color={theme.error}> {one(st.err)}</Text> : null}
               </Text>
             ))}

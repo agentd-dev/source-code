@@ -159,6 +159,13 @@ export const DOCS = [
       "The display clients: one daemon, many synchronized surfaces — pairing-code login, live activity, approvals, steering.",
   },
   {
+    slug: "hosting-the-ui",
+    file: "docs/hosting-the-ui.md",
+    title: "Hosting the web UI",
+    group: "operate",
+    blurb: "Running the thin client on a public domain — what agentd had to change, what a user configures, and why Safari cannot do it.",
+  },
+  {
     slug: "operations",
     file: "docs/operations.md",
     title: "Operations",

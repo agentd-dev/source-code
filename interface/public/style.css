@@ -271,3 +271,90 @@ button.mini:disabled { opacity: .4; cursor: default; }
   .pane.split { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .masterlist { border-right: 0; border-bottom: 1px solid var(--line); max-height: 34vh; }
 }
+
+/* ── hosted setup ───────────────────────────────────────────────────────────
+   A hosted page has a configuration step a locally-served one does not, and
+   getting it wrong produces a CORS failure that names no cause. So the
+   instructions carry the real origin, and the browser caveat is stated where
+   it will be read rather than in a doc nobody opens after it already broke. */
+.setup { margin: 4px 0 14px; border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; }
+.setup summary { color: var(--accent); font-size: 12px; cursor: pointer; }
+.setup p { color: var(--dim); font-size: 12px; margin: 8px 0 6px; line-height: 1.55; }
+.setup pre {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 3px;
+  padding: 8px 10px; margin: 0 0 8px; overflow-x: auto;
+  font-size: 11.5px; line-height: 1.5; color: var(--fg);
+}
+.setup .warn-note { color: var(--warn); }
+.setup .warn-note strong { color: var(--warn); }
+.setup code { color: var(--command); }
+
+/* A workflow-maintained status value (`memory:<key>`). Given its own colour
+   because it is neither daemon identity nor a counter — it is whatever this
+   deployment decided is worth watching. */
+.chip-mem {
+  color: var(--command);
+  border: 1px solid var(--line); border-radius: 3px;
+  padding: 0 5px; font-size: 11px;
+}
+
+/* ── a gate's form ──────────────────────────────────────────────────────────
+   The schema already says what the acceptable answers are, so the person picks
+   one instead of guessing the wording — and the answer is the right shape when
+   it arrives. Sits directly above the composer, which still accepts free text
+   for anything the form cannot express. */
+.gate {
+  margin: 8px 0 4px; padding: 10px 12px;
+  background: var(--panel); border: 1px solid var(--warn); border-left-width: 2px;
+  border-radius: 4px;
+}
+.gate-q { color: var(--fg); font-size: 13px; line-height: 1.5; margin-bottom: 8px; }
+.gate-opts { display: flex; flex-wrap: wrap; gap: 6px; }
+.gate-opt {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg); color: var(--fg); font: inherit; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 3px; padding: 4px 10px; cursor: pointer;
+}
+.gate-opt:hover { border-color: var(--dim); }
+.gate-opt.on { border-color: var(--accent); color: var(--accent); }
+/* A radio reads as one-of, a checkbox as any-of — the shape of the control
+   should say which without the hint being read. */
+.gate-opt .dot, .gate-opt .box {
+  width: 9px; height: 9px; border: 1px solid currentColor; display: inline-block;
+}
+.gate-opt .dot { border-radius: 50%; }
+.gate-opt .box { border-radius: 2px; }
+.gate-opt.on .dot, .gate-opt.on .box { background: var(--accent); }
+.gate-other {
+  margin-top: 8px; width: 100%; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 3px; padding: 5px 8px;
+  font: inherit; font-size: 12px;
+}
+.gate-other:focus { outline: none; border-color: var(--accent); }
+.gate-actions { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
+.gate-hint { color: var(--dim); font-size: 11px; }
+
+/* ── duration, and a readability pass ───────────────────────────────────────
+   Colour here carries meaning, not decoration: an agent's words, a person's
+   words, a command, a failure and a measurement each read differently at a
+   glance so the eye can skip what it is not looking for. Durations are dim and
+   tabular — they should be findable when scanned for and invisible otherwise,
+   and digits that line up are comparable down a column. */
+.took, .step-ms {
+  color: var(--dim); font-size: 11px; margin-left: 8px;
+  font-variant-numeric: tabular-nums;
+}
+/* A slow step is the thing people are usually looking for; let it stand out
+   without shouting, since "slow" is a judgement the reader makes. */
+.step.is-running .step-ms { color: var(--warn); }
+
+/* The transcript's roles, kept distinct. */
+.row.agent .mark { color: var(--accent); }
+.row.user .mark { color: var(--user); }
+.row.cmd .mark, .row.cmd .body { color: var(--command); }
+.row.err .mark, .row.err .body { color: var(--error); }
+.row.note .mark, .row.note .body { color: var(--dim); }
+.row .gate { color: var(--warn); }
+/* Body text stays the readable neutral even when its mark is coloured — a
+   whole line in an accent colour is harder to read, not easier. */
+.row.agent .body { color: var(--fg); }

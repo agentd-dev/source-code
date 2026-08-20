@@ -20,6 +20,7 @@
  */
 import React from 'react';
 import { Box, Static, Text } from 'ink';
+import { duration } from '../../client/index.js';
 import type { TranscriptEntry } from '../../client/index.js';
 import { SPINNER, theme } from '../theme.js';
 
@@ -101,6 +102,14 @@ function Row({ e, columns }: { e: TranscriptEntry; columns?: number }): React.JS
               <Text color={theme.warn}>{'⏎ reply to continue'}</Text>
             </Box>
           ) : null}
+          {/* What the live counter settled at. Without it the number vanishes
+              at the moment it became a fact, and "how long did that take?" is
+              the question people ask about an agent more than any other. */}
+          {e.ms !== undefined && !e.inputRequired ? (
+            <Box marginLeft={GUTTER}>
+              <Text color={theme.dim}>{duration(e.ms)}</Text>
+            </Box>
+          ) : null}
         </Box>
       );
     case 'command':
@@ -111,10 +120,15 @@ function Row({ e, columns }: { e: TranscriptEntry; columns?: number }): React.JS
       );
     case 'error':
       return (
-        <Box marginTop={1}>
+        <Box flexDirection="column" marginTop={1}>
           <Marked mark="✗" markColor={theme.error} color={theme.error}>
             {e.text}
           </Marked>
+          {e.ms !== undefined ? (
+            <Box marginLeft={GUTTER}>
+              <Text color={theme.dim}>{duration(e.ms)}</Text>
+            </Box>
+          ) : null}
         </Box>
       );
     default:

@@ -193,17 +193,17 @@ agentd 2.3.0 triage-1 debug
 feed
     1 run           {"id":"pipeline-01M0C0","workflow":"pipeline","status":"running","steps":"3/7"}
     2 step          {"run":"pipeline-01M0C0","step":"fetch","kind":"mcp.tool","phase":"start"}
-    3 step          {"run":"pipeline-01M0C0","step":"fetch","phase":"done","status":"done","tokens"…
     4 step          {"run":"pipeline-01M0C0","step":"triage","kind":"extract","phase":"start","atte…
-    5 step          {"run":"pipeline-01M0C0","step":"triage","phase":"done","status":"done","tokens…
     6 step          {"run":"pipeline-01M0C0","step":"notify","kind":"a2a.send","phase":"start"}
+    3 step          {"run":"pipeline-01M0C0","step":"fetch","phase":"done","status":"done","tokens"…
+    5 step          {"run":"pipeline-01M0C0","step":"triage","phase":"done","status":"done","tokens…
     7 subagent      {"handle":"sa-review","mode":"supervised","status":"running","tokens":4120,"upd…
     8 subagent      {"handle":"sa-lint","mode":"detached","status":"failed","tokens":260,"updated":…
 runs
 pipeline-01M0C0        running    3/7
   ◐ notify            a2a.send      running
-  ● triage            extract       done
-  ● fetch             mcp.tool      done
+  ● triage            extract       done      1.0s
+  ● fetch             mcp.tool      done      140ms
 subagents / children
 sub sa-review          running    4120 tok
 sub sa-lint            failed     260 tok
@@ -295,7 +295,48 @@ defaults. The layout is also **runtime-shapeable**:
 `/set interface.display.bottom ["conn","model","tokens"]` re-shapes every
 connected client at once.
 
-### 5.2 Runtime settings (`/set`) — and their deliberate limit
+### 5.2 Status values a workflow maintains (`memory:<key>`)
+
+The chrome's vocabulary is fixed, because a client has to know how to render
+each item. But a `memory:<key>` item renders whatever a **workflow** wrote to
+that key — which makes the status line extensible without the daemon learning to
+compute anything.
+
+That distinction matters. agentd executes nothing locally, so it cannot shell
+out to `git` to find your branch. It does not have to: a workflow reads the
+value from wherever it actually lives — an MCP server, an HTTP endpoint, a
+webhook — and writes it to a key the chrome names.
+
+```yaml
+interface:
+  display:
+    top: [name, model, "memory:git.branch", "memory:git.pr"]
+    bottom: [conn, tokens, "memory:deploy.state"]
+
+workflows:
+  - name: repo-status
+    steps:
+      tick:   { kind: schedule, every: 30s }
+      read:   { kind: mcp.tool, depends_on: [tick], server: git, tool: status }
+      branch: { kind: memory.set, depends_on: [read], key: "git.branch",
+                value: "{{ steps.read.output.branch }}", ttl: 2m }
+      fin:    { kind: finish, depends_on: [branch], status: completed }
+```
+
+Two behaviours are deliberate:
+
+- **An unset key renders nothing**, not an empty slot — a blank status reads as
+  broken, an absent one reads as not-yet-filled.
+- **TTL is honoured.** Give the key a TTL slightly longer than the schedule
+  that refreshes it, and the slot empties when the workflow stops running. A
+  branch name still sitting there after its producer died is worse than no
+  branch name, because it looks current.
+
+The same mechanism carries anything worth watching: a PR number, a deploy
+state, a queue depth, an on-call name. The client renders the value without
+knowing what it means.
+
+### 5.3 Runtime settings (`/set`) — and their deliberate limit
 
 `config.set` (operator) updates a whitelisted set of knobs in the running
 daemon, no restart:
@@ -308,7 +349,7 @@ config file + SIGHUP hot reload (see configuration.md §11) — the daemon never
 mutates config it doesn't own. `/config` prints the full effective document,
 `/config a2a.listen` one value.
 
-### 5.3 Pairing-code login (`interface.pairing`)
+### 5.4 Pairing-code login (`interface.pairing`)
 
 The no-copy way to connect a browser or a remote TUI:
 

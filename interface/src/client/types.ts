@@ -58,6 +58,8 @@ export interface TaskView {
   principal?: string;
   updated: number;
   history?: Json[];
+  /** The shape a gate's answer must take, if the gate declared one. */
+  askSchema?: Json;
 }
 
 /** One `SubscribeToEvents` feed event (RFC 0032 §4). */
@@ -89,7 +91,8 @@ export interface InterfaceInfo {
   feed: { ring: number; method: string };
   ops: string[];
   /** The daemon-decided chrome layout (RFC 0032 §12). */
-  display?: { top: string[]; bottom: string[] };
+  display?: { top: string[]; bottom: string[] ; /** Resolved values for `memory:<key>` items in the layout. */
+    values?: { [item: string]: Json }};
   pairing?: { enabled: boolean };
 }
 
@@ -145,6 +148,15 @@ export interface TranscriptEntry {
   pending?: boolean;
   /** The task stopped at input-required — answer it to continue. */
   inputRequired?: boolean;
+  /**
+   * How long the turn took, once it is over.
+   *
+   * The live row already counts up while the agent works; this is what the
+   * count settled at. Without it the number vanishes at exactly the moment it
+   * became a fact — and "how long did that take?" is the question people ask
+   * about an agent more than any other.
+   */
+  ms?: number;
 }
 
 /** Connection lifecycle of the observation channel. */
@@ -208,4 +220,8 @@ export type StepRow = {
   tokens?: number;
   err?: string;
   at: number;
+  /** When the step started, so a finished row can show how long it took. */
+  startedAt?: number;
+  /** Milliseconds from start to done — present once the step finished. */
+  ms?: number;
 };

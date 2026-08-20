@@ -19,10 +19,14 @@ import {
   TranscriptEntry,
   activityLine,
   applySuggestion,
+  askAnswer,
+  askForm,
+  duration,
   prepare,
   suggest,
   workflowNames,
 } from '../client/index.js';
+import type { AskForm } from '../client/index.js';
 
 type Screen = 'chat' | 'tasks' | 'subagents' | 'debug';
 
@@ -58,6 +62,15 @@ function counters(m: Mirror):
 /** One display item for the top/bottom edges (RFC 0032 §12). */
 function EdgeItem({ name, mirror, endpoint, active }: { name: string; mirror: Mirror; endpoint: string; active: number }): React.JSX.Element | null {
   const s = mirror.getState();
+  // `memory:<key>`: a value a workflow maintains — a branch, a PR, a deploy
+  // state. The client renders it without knowing what it means, which is what
+  // makes the status line extensible without the daemon learning to compute
+  // anything. An unset key renders nothing rather than a blank slot.
+  if (name.startsWith('memory:')) {
+    const v = s.info?.display?.values?.[name];
+    if (v === undefined || v === null || v === '') return null;
+    return <span className="chip-mem">{typeof v === 'string' ? v : JSON.stringify(v)}</span>;
+  }
   switch (name) {
     case 'name':
       return <span className="name">{((s.card as { name?: string } | undefined)?.name ?? 'agentd') as string}</span>;
@@ -133,6 +146,10 @@ function Row({ e }: { e: TranscriptEntry }): React.JSX.Element {
         <span className="body">
           {e.text}
           {e.inputRequired ? <span className="gate"> ⏎ reply to continue</span> : null}
+          {/* What the live counter settled at. */}
+          {e.ms !== undefined && !e.inputRequired ? (
+            <span className="took">{duration(e.ms)}</span>
+          ) : null}
         </span>
       </div>
     );
@@ -176,6 +193,10 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
   });
   useEffect(() => setSugIndex(0), [input]);
   const active = mirror.activeTasks();
+  // The open gate, and the form its schema describes. A gate that declared no
+  // schema falls through to the composer, which is what always happened.
+  const gate = active.find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED');
+  const gateForm = useMemo(() => askForm(gate?.askSchema), [gate?.id, gate?.askSchema]);
   const suggestions: Suggestion[] = suggest(input, s);
   const accept = (i: number) => setInput(applySuggestion(input, suggestions[i] ?? suggestions[0]));
   return (
@@ -184,6 +205,24 @@ function Chat({ mirror, onSend }: { mirror: Mirror; onSend: (text: string) => vo
         {s.transcript.map((e) => (
           <Row key={e.key} e={e} />
         ))}
+        {gate && gateForm.kind !== 'text' ? (
+          <GateForm
+            task={gate}
+            form={gateForm}
+            onAnswer={(value) => {
+              void (async () => {
+                try {
+                  const text = typeof value === 'string' ? value : JSON.stringify(value);
+                  const sent = await client.send(text, { contextId: ctxRef.current, taskId: gate.id });
+                  if (sent.task) mirror.adoptTasks([sent.task]);
+                  mirror.localEcho(sent.messageId, sent.task?.contextId ?? ctxRef.current, text, gate.id);
+                } catch (e) {
+                  mirror.note(e instanceof Error ? e.message : String(e), 'error');
+                }
+              })();
+            }}
+          />
+        ) : null}
         {active.length > 0 ? (
           <div className="working">
             ⠿{' '}
@@ -530,6 +569,10 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
                         <span className="step-kind">{st.kind ?? ''}</span>
                         <span className="step-state">
                           {st.phase === 'start' ? 'running' : (st.status ?? '')}
+                          {/* The slow step is usually what you came to find. */}
+                          {st.ms !== undefined ? (
+                            <span className="step-ms">{duration(st.ms)}</span>
+                          ) : null}
                         </span>
                         {st.attempt && st.attempt > 1 ? (
                           <span className="step-attempt">attempt {st.attempt}</span>
@@ -602,6 +645,14 @@ export function App({ defaults }: { defaults: Defaults }): React.JSX.Element {
 
 function Connect({ onConnect, stored }: { onConnect: (d: Defaults) => void; stored: Defaults }): React.JSX.Element {
   const [endpoint, setEndpoint] = useState(stored.endpoint ?? 'http://127.0.0.1:8420');
+  // A page served from a non-loopback origin is a HOSTED one, and its user has
+  // a configuration step a locally-served page does not. Detecting it here
+  // means the instructions appear exactly when they are needed, carrying the
+  // real origin rather than a placeholder to adapt.
+  const origin = typeof location !== 'undefined' ? location.origin : '';
+  const hosted =
+    typeof location !== 'undefined' &&
+    !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
   const [bearer, setBearer] = useState('');
   const [code, setCode] = useState('');
   const [err, setErr] = useState('');
@@ -629,9 +680,28 @@ function Connect({ onConnect, stored }: { onConnect: (d: Defaults) => void; stor
       <div className="connect">
         <h1>agentd</h1>
         <p>
-          Connect to a running agentd. The daemon needs <code>interface.enabled: true</code> (and your
-          origin in <code>interface.origins</code> when this page isn't served from localhost).
+          Connect to your own running agentd. This page holds nothing: the endpoint and
+          credential stay in your browser, and every request goes straight from here to your
+          daemon.
         </p>
+        {hosted ? (
+          <details className="setup" open>
+            <summary>What your daemon needs</summary>
+            <p>
+              A hosted page is a non-loopback origin, so the daemon has to be told this one may
+              reach it. Add to your config and restart:
+            </p>
+            <pre>{`interface:
+  enabled: true
+  origins: ["${origin}"]`}</pre>
+            <p className="warn-note">
+              <strong>Safari cannot do this.</strong> It is the one browser that blocks an HTTPS
+              page from reaching <code>http://localhost</code>, and no setting on this page can
+              change that. Use Chrome, Edge or Firefox — or run <code>agentd ui</code> locally,
+              which serves the same interface from the daemon itself.
+            </p>
+          </details>
+        ) : null}
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -804,5 +874,98 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
       </div>
       <div className="statusbar">{edge(bottom)}</div>
     </div>
+  );
+}
+
+/**
+ * The form a gate's schema describes.
+ *
+ * A gate that says "one of these three" should offer three options, not a text
+ * box the person has to guess the wording for — and then guess again when the
+ * answer is rejected. The schema already knows the acceptable answers, so the
+ * only job here is to show them.
+ */
+function GateForm({
+  task,
+  form,
+  onAnswer,
+}: {
+  task: TaskView;
+  form: AskForm;
+  onAnswer: (value: Json) => void;
+}): React.JSX.Element {
+  const [picked, setPicked] = useState<string[]>(() =>
+    form.kind === 'many' ? (form.def ?? []) : form.kind === 'one' && form.def ? [form.def] : [],
+  );
+  const [other, setOther] = useState('');
+  const multi = form.kind === 'many';
+  const options =
+    form.kind === 'bool'
+      ? ['yes', 'no']
+      : form.kind === 'one' || form.kind === 'many'
+        ? form.options
+        : [];
+  const allowOther = (form.kind === 'one' || form.kind === 'many') && form.other;
+
+  const toggle = (v: string) =>
+    setPicked((cur) =>
+      multi ? (cur.includes(v) ? cur.filter((x) => x !== v) : [...cur, v]) : [v],
+    );
+  const ready =
+    picked.length > 0 && (!picked.includes('__other__') || other.trim().length > 0);
+
+  return (
+    <form
+      className="gate"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (ready) onAnswer(askAnswer(form, picked, other));
+      }}
+    >
+      <div className="gate-q">{task.message ?? 'The agent needs your input.'}</div>
+      <div className="gate-opts">
+        {options.map((o) => (
+          <button
+            type="button"
+            key={o}
+            className={`gate-opt ${picked.includes(o) ? 'on' : ''}`}
+            aria-pressed={picked.includes(o)}
+            onClick={() => toggle(o)}
+          >
+            <span className={multi ? 'box' : 'dot'} aria-hidden="true" />
+            {o}
+          </button>
+        ))}
+        {allowOther ? (
+          <button
+            type="button"
+            className={`gate-opt ${picked.includes('__other__') ? 'on' : ''}`}
+            aria-pressed={picked.includes('__other__')}
+            onClick={() => toggle('__other__')}
+          >
+            <span className={multi ? 'box' : 'dot'} aria-hidden="true" />
+            other…
+          </button>
+        ) : null}
+      </div>
+      {picked.includes('__other__') ? (
+        <input
+          className="gate-other"
+          value={other}
+          onChange={(e) => setOther(e.target.value)}
+          placeholder="your answer"
+          aria-label="your answer"
+          autoFocus
+        />
+      ) : null}
+      <div className="gate-actions">
+        <button className="mini" type="submit" disabled={!ready}>
+          {multi ? `answer (${picked.filter((p) => p !== '__other__').length + (other.trim() ? 1 : 0)})` : 'answer'}
+        </button>
+        <span className="gate-hint">
+          {multi ? 'pick any number' : 'pick one'} · or type a reply below
+        </span>
+      </div>
+    </form>
   );
 }

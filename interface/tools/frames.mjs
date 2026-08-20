@@ -54,14 +54,24 @@ function populate(mirror) {
   mirror.setConn('ready');
   mirror.apply({ seq: 1, ts: 1, kind: 'run', data: { id: 'pipeline-01M0C0', workflow: 'pipeline', status: 'running', steps: '3/7' } });
   const step = (n, s, extra = {}) => mirror.apply({ seq: n, ts: n, kind: 'step', data: { run: 'pipeline-01M0C0', step: s, ...extra } });
+  // Durations are measured from the events the client sees, so the fixture has
+  // to actually take time — otherwise every step documents itself as `0ms` and
+  // the column looks broken rather than fast.
   step(2, 'fetch', { kind: 'mcp.tool', phase: 'start' });
-  step(3, 'fetch', { phase: 'done', status: 'done', tokens: 0 });
   step(4, 'triage', { kind: 'extract', phase: 'start', attempt: 1 });
-  step(5, 'triage', { phase: 'done', status: 'done', tokens: 1840 });
   step(6, 'notify', { kind: 'a2a.send', phase: 'start' });
+  return mirror;
+}
+
+/** Finish the two steps that complete, after real elapsed time. */
+async function settle(mirror) {
+  const step = (n, s, extra = {}) => mirror.apply({ seq: n, ts: n, kind: 'step', data: { run: 'pipeline-01M0C0', step: s, ...extra } });
+  await tick(140);
+  step(3, 'fetch', { phase: 'done', status: 'done', tokens: 0 });
+  await tick(900);
+  step(5, 'triage', { phase: 'done', status: 'done', tokens: 1840 });
   mirror.apply({ seq: 7, ts: 7, kind: 'subagent', data: { handle: 'sa-review', mode: 'supervised', status: 'running', tokens: 4120, updated: Date.now() } });
   mirror.apply({ seq: 8, ts: 8, kind: 'subagent', data: { handle: 'sa-lint', mode: 'detached', status: 'failed', tokens: 260, updated: Date.now() } });
-  return mirror;
 }
 
 const frames = {};
@@ -75,6 +85,7 @@ async function capture(name, setup, cols = 92, rows = 26) {
 
 await capture('chat', async (m) => {
   populate(m);
+  await settle(m);
   m.apply({ seq: 20, ts: 20, kind: 'message', data: { messageId: 'm1', contextId: 'c1', principal: 'operator', text: 'Triage the newest issue' } });
   m.apply({ seq: 21, ts: 21, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: 21 } } } });
   await tick();
@@ -82,6 +93,7 @@ await capture('chat', async (m) => {
 
 await capture('subagents', async (m, ui) => {
   populate(m);
+  await settle(m);
   await tick();
   ui.stdin.write('\t');           // chat -> tasks
   await tick();
@@ -92,6 +104,7 @@ await capture('subagents', async (m, ui) => {
 // The detail view, where the control verbs live.
 await capture('subagent-detail', async (m, ui) => {
   populate(m);
+  await settle(m);
   await tick();
   ui.stdin.write('\t'); await tick();
   ui.stdin.write('\t'); await tick();
@@ -101,6 +114,7 @@ await capture('subagent-detail', async (m, ui) => {
 // The same view asking to confirm a stop.
 await capture('subagent-stop', async (m, ui) => {
   populate(m);
+  await settle(m);
   await tick();
   ui.stdin.write('\t'); await tick();
   ui.stdin.write('\t'); await tick();
@@ -110,8 +124,36 @@ await capture('subagent-stop', async (m, ui) => {
 
 await capture('debug', async (m, ui) => {
   populate(m);
+  await settle(m);
   await tick();
   for (let i = 0; i < 3; i++) { ui.stdin.write('\t'); await tick(); }
+});
+
+// A gate whose schema says "one of these three" — the form, not a text box.
+await capture('gate-choice', async (m) => {
+  populate(m);
+  await settle(m);
+  m.apply({ seq: 30, ts: 30, kind: 'message', data: { messageId: 'g1', contextId: 'c1', principal: 'operator', text: 'Ship the release?' } });
+  m.apply({ seq: 31, ts: 31, kind: 'task', data: { task: {
+    id: 'gate1', contextId: 'c1',
+    status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: 31,
+              message: { parts: [{ text: 'Candidate sa-review found 3 regressions. How should I proceed?' }] } },
+    metadata: { 'agentd/ask_schema': { type: 'string', enum: ['ship anyway', 'hold for fixes', 'roll back'] } },
+  } } });
+  await tick(80);
+});
+
+// A multi-select with an "other" escape hatch.
+await capture('gate-multi', async (m) => {
+  populate(m);
+  await settle(m);
+  m.apply({ seq: 32, ts: 32, kind: 'task', data: { task: {
+    id: 'gate2', contextId: 'c1',
+    status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: 32,
+              message: { parts: [{ text: 'Which checks should I run before merging?' }] } },
+    metadata: { 'agentd/ask_schema': { type: 'array', items: { anyOf: [{ enum: ['unit', 'integration', 'e2e'] }, { type: 'string' }] } } },
+  } } });
+  await tick(80);
 });
 
 process.stdout.write(JSON.stringify(frames, null, 2));

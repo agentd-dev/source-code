@@ -280,6 +280,8 @@ export class Mirror {
         const rows = this.state.steps.get(run) ?? [];
         const phase = data.phase === 'done' ? 'done' : 'start';
         const existing = rows.findIndex((r) => r.step === step && r.phase === 'start');
+        const now = Date.now();
+        const startedAt = phase === 'done' ? rows[existing]?.startedAt : now;
         const row: StepRow = {
           step,
           kind: (data.kind as string) ?? rows[existing]?.kind,
@@ -288,7 +290,13 @@ export class Mirror {
           attempt: data.attempt as number | undefined,
           tokens: data.tokens as number | undefined,
           err: (data.err as string) ?? undefined,
-          at: Date.now(),
+          at: now,
+          startedAt,
+          // How long the step took. Measured from the events the client
+          // actually saw rather than from daemon clocks, so it is honest about
+          // being the observer's view — and a step whose start was missed
+          // (joined mid-run) reports no duration rather than a wrong one.
+          ms: phase === 'done' && startedAt !== undefined ? now - startedAt : undefined,
         };
         if (phase === 'done' && existing >= 0) rows[existing] = row;
         else rows.push(row);
@@ -406,6 +414,14 @@ export class Mirror {
       });
     } else if (terminal && known) {
       const failed = t.state !== 'TASK_STATE_COMPLETED';
+      // When the work began: the prompt that started it, else the task's own
+      // first transition. A turn adopted mid-flight has neither and reports no
+      // duration rather than a number measured from when we happened to look.
+      const started =
+        this.state.transcript.find((e) => e.taskId === t.id && e.kind === 'user')?.ts ??
+        (Array.isArray(t.history) && t.history.length > 0
+          ? ((t.history[0] as { ts?: number })?.ts ?? 0)
+          : 0);
       const text = t.artifacts[0] ?? t.message ?? (failed ? whyItEnded(t.state) : '');
       if (text.length > 0) {
         this.upsertEntry({
@@ -415,6 +431,9 @@ export class Mirror {
           kind: failed ? 'error' : 'agent',
           text,
           taskId: t.id,
+          // Measured across the task's own life, so it is the daemon's view of
+          // the work rather than the client's view of the network.
+          ms: t.updated > 0 && started > 0 ? Math.max(0, t.updated - started) : undefined,
         });
       }
       // The user prompt that started it is no longer pending.

@@ -187,3 +187,77 @@ test('a run with many steps stays bounded in client memory', () => {
   }
   assert.ok(m.state.steps.get('big').length <= 200, 'the ring is capped');
 });
+
+test('a gate schema becomes the form a person can actually answer', async () => {
+  const { askForm, askAnswer } = await import('../dist/client/index.js');
+
+  // Single choice. The gate says "one of these three"; the client should offer
+  // three options rather than a text box the person guesses the wording for.
+  const one = askForm({ type: 'string', enum: ['file', 'hold', 'reject'] });
+  assert.equal(one.kind, 'one');
+  assert.deepEqual(one.options, ['file', 'hold', 'reject']);
+  assert.equal(one.other, false, 'no free text unless the schema allows it');
+  assert.equal(askAnswer(one, ['hold'], ''), 'hold');
+
+  // The common gate shape is a one-property object; the person should be asked
+  // the question, not shown a JSON envelope.
+  const wrapped = askForm({
+    type: 'object',
+    properties: { decision: { type: 'string', enum: ['approve', 'deny'] } },
+  });
+  assert.equal(wrapped.kind, 'one');
+  assert.deepEqual(wrapped.options, ['approve', 'deny']);
+
+  // Multi-select.
+  const many = askForm({ type: 'array', items: { enum: ['a', 'b', 'c'] } });
+  assert.equal(many.kind, 'many');
+  assert.deepEqual(askAnswer(many, ['a', 'c'], ''), ['a', 'c']);
+
+  // "Other" is offered ONLY when the schema says a value outside the list is
+  // acceptable — otherwise a free-text box invites an answer that is then
+  // rejected, which is worse than not offering it.
+  const withOther = askForm({
+    anyOf: [{ enum: ['red', 'green'] }, { type: 'string' }],
+  });
+  assert.equal(withOther.kind, 'one');
+  assert.equal(withOther.other, true);
+  assert.equal(askAnswer(withOther, ['__other__'], 'chartreuse'), 'chartreuse');
+
+  const manyOther = askForm({ type: 'array', items: { anyOf: [{ enum: ['x'] }, { type: 'string' }] } });
+  assert.equal(manyOther.other, true);
+  assert.deepEqual(askAnswer(manyOther, ['x', '__other__'], 'y'), ['x', 'y']);
+
+  // Booleans, and the fallback that has always existed.
+  assert.equal(askForm({ type: 'boolean' }).kind, 'bool');
+  assert.equal(askAnswer(askForm({ type: 'boolean' }), ['yes'], ''), true);
+  assert.equal(askForm(undefined).kind, 'text');
+  assert.equal(askForm({ type: 'string' }).kind, 'text');
+  // A default the schema declares is carried so the client can preselect it.
+  assert.equal(askForm({ type: 'string', enum: ['a', 'b'], default: 'b' }).def, 'b');
+});
+
+test('durations are measured, formatted at the right precision, and honest about gaps', async () => {
+  const { duration, Mirror } = await import('../dist/client/index.js');
+
+  // Most steps finish in milliseconds; rendering those as "0s" throws away the
+  // only interesting thing about them.
+  assert.equal(duration(120), '120ms');
+  assert.equal(duration(1400), '1.4s');
+  assert.equal(duration(12_000), '12s');
+  assert.equal(duration(125_000), '2m05s');
+  assert.equal(duration(-5), '0ms', 'a clock skew must not render as negative');
+
+  // A step's duration is measured across the two events the client saw.
+  const m = new Mirror();
+  m.apply({ seq: 1, ts: 1, kind: 'step', data: { run: 'r', step: 's1', kind: 'noop', phase: 'start' } });
+  await new Promise((r) => setTimeout(r, 25));
+  m.apply({ seq: 2, ts: 2, kind: 'step', data: { run: 'r', step: 's1', phase: 'done', status: 'done' } });
+  const row = m.state.steps.get('r')[0];
+  assert.ok(row.ms >= 20, `expected a measured duration, got ${row.ms}`);
+
+  // A step whose START was never seen (client attached mid-run) reports NO
+  // duration rather than one measured from when we happened to look.
+  m.apply({ seq: 3, ts: 3, kind: 'step', data: { run: 'r', step: 'late', phase: 'done', status: 'done' } });
+  const late = m.state.steps.get('r').find((x) => x.step === 'late');
+  assert.equal(late.ms, undefined, 'an unobserved start must not be invented');
+});

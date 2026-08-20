@@ -17,5 +17,8 @@ export {
   tokens,
   triggerToken,
   workflowNames,
+  duration,
 } from './composer.js';
 export type { Prepared, Suggestion } from './composer.js';
+export { askForm, askAnswer } from './askform.js';
+export type { AskForm } from './askform.js';

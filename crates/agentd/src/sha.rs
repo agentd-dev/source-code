@@ -35,9 +35,21 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
     let mut w = [0u32; 64];
-    for block in msg.chunks_exact(64) {
-        for (i, c) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+    // `as_chunks` rather than `chunks_exact`: the chunk size is a constant, so
+    // the compiler can hand back fixed-size ARRAYS and `from_be_bytes` takes one
+    // directly — no indexing, and no bounds checks to elide. (Rust 1.98's
+    // `clippy::chunks_exact_to_array` asks for this.)
+    // `as_chunks` rather than `chunks_exact`: the size is a constant, so the
+    // compiler hands back fixed-size ARRAYS and `from_be_bytes` takes one
+    // directly — no indexing and no bounds checks to elide. (Rust 1.98's
+    // `clippy::chunks_exact_to_array` asks for this.) The padding above makes
+    // the length an exact multiple of 64, so the remainder is empty by
+    // construction; the compression still runs once PER block.
+    let (blocks, _) = msg.as_chunks::<64>();
+    for block in blocks {
+        let (words, _) = block.as_chunks::<4>();
+        for (i, c) in words.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*c);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -140,6 +152,31 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A message spanning SEVERAL blocks.
+    ///
+    /// The single-block vectors pass under a rewrite that flattens the word
+    /// loop across every block at once — it only goes wrong from block two,
+    /// where `w` is indexed past 64. That is exactly the mistake a
+    /// `chunks_exact` → `as_chunks` conversion invites, so it gets a test.
+    #[test]
+    fn a_multi_block_message_digests_correctly() {
+        // openssl: printf 'a%.0s' {1..200} | sha256sum
+        assert_eq!(
+            sha256_hex(&[b'a'; 200]),
+            "c2a908d98f5df987ade41b5fce213067efbcc21ef2240212a41e54b5e7c28ae5"
+        );
+        // The boundary cases either side of one block: 64 bytes pads into a
+        // SECOND block, 63 fits in one.
+        assert_eq!(
+            sha256_hex(&[b'b'; 64]),
+            "a0fab1377f49a759b57f63318262ebe89fabfc990e8e93ceac2984561482b9d4"
+        );
+        assert_eq!(
+            sha256_hex(&[b'a'; 63]),
+            "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34"
+        );
+    }
+
     use super::sha256_hex;
 
     /// FIPS 180-4 / NIST CAVP known-answer vectors.

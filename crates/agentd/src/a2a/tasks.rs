@@ -97,6 +97,14 @@ pub struct Task {
     /// The status message (for `input-required` and terminal explanations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The shape a gate's answer must take (`human.schema` / `ask_human`).
+    ///
+    /// Carried on the task because the QUESTION alone does not tell a client
+    /// how to ask it. With the schema, "pick one of these three" renders as
+    /// three options instead of a text box the person has to guess the wording
+    /// for — and the answer is already the right shape when it comes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_schema: Option<Value>,
     /// Artifact ids delivered on this task.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
@@ -123,6 +131,7 @@ impl Task {
     pub fn new(id: &str, context_id: &str, principal: Option<&str>, link: Link) -> Task {
         let now = now_ms();
         Task {
+            ask_schema: None,
             id: id.to_string(),
             context_id: context_id.to_string(),
             state: State::Submitted,

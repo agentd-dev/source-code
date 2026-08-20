@@ -1164,6 +1164,7 @@ fn unreachable_wf() -> Workflow {
     // Only reached if the definition vanished mid-scheduling; an empty
     // workflow makes `resolve_step` return None and the guard skips.
     Workflow {
+        state: Default::default(),
         name: String::new(),
         version: 3,
         description: None,

@@ -825,6 +825,29 @@ impl Runtime {
                     .and_then(Value::as_str)
                     .unwrap_or(step_id)
                     .to_string();
+                // A declared `state` key carries a schema; a write that breaks
+                // it fails the step where the bad value is produced, rather
+                // than three steps later where a template reads a shape nobody
+                // expected. This is the whole reason to declare state.
+                if let Some(schema) = self
+                    .definition_for_run(run_id)
+                    .and_then(|wf| wf.state.get(&key).and_then(|d| d.schema.clone()))
+                    && let Err(errs) = crate::jsonschema::validate(&schema, &value)
+                {
+                    self.finish_step_pub(
+                        run_id,
+                        step_id,
+                        StepStatus::Failed,
+                        None,
+                        Some(format!(
+                            "assign: value does not match the schema declared for state \
+                             {key:?}: {}",
+                            errs.join("; ")
+                        )),
+                        0,
+                    );
+                    return;
+                }
                 let mode = spec
                     .get("mode")
                     .and_then(Value::as_str)

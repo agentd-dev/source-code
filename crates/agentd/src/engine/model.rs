@@ -788,11 +788,31 @@ pub struct WorkflowLimits {
     pub budget: Option<Value>,
 }
 
+/// One declared run variable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StateDecl {
+    /// A JSON Schema the written value must satisfy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    /// How concurrent writes combine: `overwrite | append | merge | union`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reducer: Option<String>,
+}
+
 /// A parsed, validated workflow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
     pub name: String,
     pub version: u32,
+    /// Declared run variables: `{key: {type, reducer}}`.
+    ///
+    /// Optional, and the point is to make concurrent writes a DECLARED policy
+    /// instead of a heuristic. Without it the parser can only guess from the
+    /// modes two racing writers happen to use; with it, the workflow states
+    /// what a key is and how writes to it combine, and disagreement is a config
+    /// error rather than a value that depends on completion order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub state: BTreeMap<String, StateDecl>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default = "default_true")]
@@ -888,6 +908,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         "concurrency",
         "limits",
         "outputs",
+        "state",
         "steps",
         "file",
         "uri",
@@ -1015,7 +1036,45 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     if !errs.is_empty() {
         return Err(errs);
     }
+    // `state` declarations: each key names a schema and/or a reducer.
+    let mut state: BTreeMap<String, StateDecl> = BTreeMap::new();
+    if let Some(decls) = obj.get("state") {
+        match decls.as_object() {
+            None => errs.push("state must be an object of {key: {schema, reducer}}".into()),
+            Some(map) => {
+                for (key, decl) in map {
+                    let Some(d) = decl.as_object() else {
+                        errs.push(format!("state {key:?}: must be an object"));
+                        continue;
+                    };
+                    for f in d.keys() {
+                        if !matches!(f.as_str(), "schema" | "reducer") {
+                            errs.push(format!(
+                                "state {key:?}: unknown field {f:?} (allowed: schema, reducer)"
+                            ));
+                        }
+                    }
+                    let schema = d.get("schema").cloned();
+                    if let Some(sc) = &schema
+                        && let Err(e) = jsonschema::check_schema(sc)
+                    {
+                        errs.push(format!("state {key:?}: schema: {}", e.join("; ")));
+                    }
+                    let reducer = d.get("reducer").and_then(Value::as_str).map(str::to_string);
+                    if let Some(r) = &reducer
+                        && !matches!(r.as_str(), "overwrite" | "append" | "merge" | "union")
+                    {
+                        errs.push(format!(
+                            "state {key:?}: reducer {r:?} must be overwrite|append|merge|union"
+                        ));
+                    }
+                    state.insert(key.clone(), StateDecl { schema, reducer });
+                }
+            }
+        }
+    }
     let mut wf = Workflow {
+        state,
         name,
         version,
         description: obj
@@ -1410,6 +1469,39 @@ fn parse_body(at: &str, bv: &Value, depth: usize, errs: &mut Vec<String>) -> Opt
 /// `overwrite` is not: two overwriters, or an overwriter racing a reducer, is
 /// the shape with no defensible answer, so it is refused where it is still a
 /// config error rather than an intermittent wrong number.
+fn validate_declared_state(wf: &Workflow, errs: &mut Vec<String>) {
+    for s in wf.steps.values() {
+        if !matches!(s.kind.as_str(), "assign" | "transform") {
+            continue;
+        }
+        let key = s
+            .spec
+            .get("writes")
+            .and_then(Value::as_str)
+            .unwrap_or(s.id.as_str());
+        let Some(decl) = wf.state.get(key) else {
+            continue;
+        };
+        // A declared reducer is the policy for that key; a step that writes it
+        // with a different mode is contradicting the declaration, which is the
+        // kind of disagreement that should not survive to runtime.
+        if let Some(want) = &decl.reducer {
+            let mode = s
+                .spec
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("overwrite");
+            if mode != want {
+                errs.push(format!(
+                    "workflow {:?} step {:?}: writes {key:?} with mode {mode:?}, but state \
+                     declares reducer {want:?}",
+                    wf.name, s.id
+                ));
+            }
+        }
+    }
+}
+
 fn validate_concurrent_writes(wf: &Workflow, errs: &mut Vec<String>) {
     use std::collections::BTreeMap;
     let mut writers: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
@@ -1444,6 +1536,17 @@ fn validate_concurrent_writes(wf: &Workflow, errs: &mut Vec<String>) {
                 // is expressed by the routing edge here, not by `depends_on`,
                 // which is why the reachability walk above cannot see it.
                 if exclusive_by_switch(wf, a, b) {
+                    continue;
+                }
+                // A declared reducer settles it: the workflow has stated how
+                // writes to this key combine, which is exactly the policy the
+                // heuristic below is guessing at.
+                if wf
+                    .state
+                    .get(key)
+                    .and_then(|d| d.reducer.as_deref())
+                    .is_some()
+                {
                     continue;
                 }
                 // append/merge/union are reducers — several writers combining
@@ -1543,6 +1646,7 @@ fn validate_human_in_concurrent_bodies(wf: &Workflow, errs: &mut Vec<String>) {
 
 fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
     validate_human_in_concurrent_bodies(wf, errs);
+    validate_declared_state(wf, errs);
     validate_concurrent_writes(wf, errs);
     let name = &wf.name;
     let starts: Vec<&Step> = wf.start_steps();
@@ -1693,6 +1797,13 @@ pub fn workflow_schema() -> Value {
             "armed": {"type": "boolean", "default": true},
             "inputs": {"type": "object", "properties": {"schema": {"type": "object"}}},
             "outputs": {"type": "object", "properties": {"schema": {"type": "object"}}},
+            "state": {"type": "object", "additionalProperties": {"type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "schema": {"type": "object", "description": "a JSON Schema every write to this key must satisfy"},
+                    "reducer": {"enum": ["overwrite", "append", "merge", "union"],
+                                "description": "how concurrent writes to this key combine; declaring it makes concurrency a policy rather than a race"}}},
+                "description": "declared run variables — {key: {schema, reducer}}"},
             "concurrency": {"type": "object", "properties": {"max_runs": {"type": "integer", "minimum": 1}, "on_overflow": {"enum": ["queue", "drop", "replace"]}}},
             "limits": {"type": "object", "properties": {"steps": {"type": "integer"}, "tokens": {"type": "integer"}, "deadline": {"type": "string"}, "budget": {"type": "object"}}},
             "steps": {"type": "object", "additionalProperties": {"$ref": "#/$defs/step"}, "minProperties": 1}

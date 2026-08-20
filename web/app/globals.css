@@ -761,6 +761,90 @@ details.doc-nav-group[open] > summary::before {
   font-size: 0.9rem;
   font-family: var(--sans);
 }
+/* Inside a table, a code token must NOT break mid-word.
+   `overflow-wrap: anywhere` is right in prose — a long identifier in a sentence
+   would otherwise push the whole page sideways — but a table has somewhere
+   better to put the overflow: it scrolls. Applied there too it shattered the
+   kind column into `swi/tch`, `par/alle/l`, `cla/ssif/y`, which is unreadable
+   and, on a reference page whose first column IS the identifier, defeats the
+   table. Keeping tokens whole gives each cell a real minimum width, which is
+   what makes the table exceed its container and the horizontal scroll engage. */
+.prose-agent :where(td, th) :where(code) {
+  overflow-wrap: normal;
+  word-break: keep-all;
+  white-space: nowrap;
+}
+/* Prose cells still wrap; only the first column is held to one line, because a
+   kind name split across lines stops being a name you can scan for. */
+.prose-agent :where(td:first-child, th:first-child) {
+  white-space: nowrap;
+}
+.prose-agent :where(td, th) {
+  vertical-align: top;
+  padding: 0.4rem 0.7rem;
+}
+/* A scrolling table lays out at max-content, so a prose column would stretch to
+   one enormous line. Holding it to a readable measure keeps the scroll short
+   enough that the description is still reachable rather than a screen away. */
+.prose-agent :where(td:last-child) {
+  max-width: 34ch;
+  white-space: normal;
+}
+/* Below the breakpoint a table stops being a table. Columns become labelled
+   lines inside one block per row, so nothing is off-screen and nothing needs a
+   sideways scroll to read. The labels come from `rehypeTableLabels`, which
+   stamps each cell with its header at build time. */
+@media (max-width: 780px) {
+  .prose-agent :where(table) {
+    display: block;
+    overflow-x: visible;
+  }
+  .prose-agent :where(thead) {
+    /* The header lives on each cell now; repeating it up here says it twice. */
+    display: none;
+  }
+  .prose-agent :where(tbody, tr, td) {
+    display: block;
+    width: auto;
+  }
+  .prose-agent :where(tr) {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.6rem 0.8rem;
+    margin: 0.7rem 0;
+    background: var(--panel);
+  }
+  .prose-agent :where(td) {
+    border: 0;
+    padding: 0.2rem 0;
+    max-width: none;
+  }
+  /* The label, and then the value under it — the shape of a definition list,
+     which is what a one-row table always was on a narrow screen. */
+  .prose-agent :where(td)[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 0.1rem;
+  }
+  /* An empty cell would otherwise render as a label with nothing under it. */
+  .prose-agent :where(td):empty {
+    display: none;
+  }
+  /* Inside a card there is room to wrap between chips, but never mid-token. */
+  .prose-agent :where(td, th) :where(code) {
+    white-space: normal;
+    overflow-wrap: normal;
+    word-break: keep-all;
+  }
+  .prose-agent :where(td:first-child, th:first-child) {
+    white-space: normal;
+  }
+}
 .prose-agent :where(th) {
   font-family: var(--mono);
   font-size: 0.78rem;

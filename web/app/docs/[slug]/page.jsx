@@ -85,6 +85,44 @@ const H = (level) =>
     return <Tag id={slugify(headingText(children))}>{children}</Tag>;
   };
 
+/** Stamp every `td` with its column's header text, at BUILD time.
+ *
+ * On a phone a four-column reference table has nowhere to go: squeeze it and
+ * the identifiers shatter mid-word, scroll it and the column saying what the
+ * thing DOES sits off-screen. The fix is to stop being a table below the
+ * breakpoint and become one labelled block per row — which needs each cell to
+ * know its column name. A rehype plugin does that during static rendering, so
+ * nothing ships to the browser and the page stays a server component. */
+function rehypeTableLabels() {
+  const text = (n) =>
+    n.type === "text" ? n.value || "" : (n.children || []).map(text).join("");
+  const walk = (node) => {
+    if (node.tagName === "table") {
+      const kids = node.children || [];
+      const head = kids.find((c) => c.tagName === "thead");
+      const headRow = (head?.children || []).find((c) => c.tagName === "tr");
+      const labels = (headRow?.children || [])
+        .filter((c) => c.tagName === "th")
+        .map((c) => text(c).trim());
+      for (const section of kids) {
+        for (const row of section.children || []) {
+          if (row.tagName !== "tr") continue;
+          let i = 0;
+          for (const cell of row.children || []) {
+            if (cell.tagName !== "td") continue;
+            const label = labels[i++];
+            if (label) {
+              cell.properties = { ...(cell.properties || {}), "data-label": label };
+            }
+          }
+        }
+      }
+    }
+    for (const child of node.children || []) walk(child);
+  };
+  return (tree) => walk(tree);
+}
+
 const MD = { a: MdLink, pre: Pre, h2: H(2), h3: H(3), h4: H(4) };
 
 /** Pull `##` / `###` headings out of the raw markdown for the on-page rail. */
@@ -210,7 +248,7 @@ export default async function DocPage({ params }) {
         </header>
 
         <div className="prose prose-agent max-w-none">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeTableLabels]} components={MD}>
             {stripTitle(doc.raw)}
           </ReactMarkdown>
         </div>

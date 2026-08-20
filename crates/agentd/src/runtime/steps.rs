@@ -717,12 +717,43 @@ impl Runtime {
             .get_mut(run_id)
             .expect("present")
             .begin_step(step_id);
+        // A breakpoint set with `workflow.pause {before_step}` stops here — the
+        // step has not begun, so the run can be inspected in the state it is in
+        // rather than one effect later.
+        if self
+            .runs
+            .get(run_id)
+            .and_then(|r| r.break_before.as_deref())
+            == Some(step_id)
+        {
+            if let Some(r) = self.runs.get_mut(run_id) {
+                r.status = RunStatus::Paused;
+                r.break_before = None;
+                r.dirty = true;
+                r.steps.entry(step_id.to_string()).or_default().status = StepStatus::Pending;
+            }
+            self.log
+                .info("run.paused", json!({"run": run_id, "before_step": step_id}));
+            self.checkpoint(true);
+            return;
+        }
         // Durable `running` BEFORE the effect (RFC 0025 §7).
         crate::state::kill_point("step.running");
         self.checkpoint(false);
         self.log.info(
             "step.start",
             json!({"run": run_id, "step": step_id, "kind": step.kind, "attempt": attempt}),
+        );
+        // The observation feed carried run-level counts only — "3 done, 1
+        // running" — so a display client could see that a run was moving but
+        // never WHAT was moving. One event per transition turns that into a
+        // usable inner loop. Operator-scoped, because a step id and its kind
+        // describe the workflow's internals.
+        self.feed_push(
+            "step",
+            crate::runtime::a2a_server::FeedVis::Operator,
+            json!({"run": run_id, "step": step_id, "kind": step.kind,
+                   "phase": "start", "attempt": attempt}),
         );
         let data = match &scope {
             Some(sc) => self.scoped_data(run_id, sc),
@@ -1825,6 +1856,17 @@ impl Runtime {
             .map(|s| s.attempt)
             .unwrap_or(1);
         self.log.info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        self.feed_push(
+            "step",
+            crate::runtime::a2a_server::FeedVis::Operator,
+            json!({"run": run_id, "step": step_id, "phase": "done",
+                   "status": crate::runtime::nested::StatusLabel::as_label(&status), "attempt": attempt, "tokens": tokens,
+                   // Same 2 KiB cap the run drill-down applies: a step output can
+                   // be an entire document, and a feed is not the place for it.
+                   "err": error.as_deref().map(|e| {
+                       e.chars().take(2048).collect::<String>()
+                   })}),
+        );
         if matches!(status, StepStatus::Failed | StepStatus::Timeout) {
             // Retry?
             if let Some(retry) = &step.retry
@@ -2286,6 +2328,34 @@ impl Runtime {
             }
             "workflow.pause" | "workflow.resume" => {
                 let pause = name == "workflow.pause";
+                // `before_step`: pause the run the moment a named step is about
+                // to start, rather than immediately. This is a breakpoint —
+                // "stop when you reach `notify`" — which is what you actually
+                // want when debugging a graph, and it needs no new surface
+                // because pause already exists and already survives a restart.
+                if pause
+                    && let Some(id) = args.get("run").and_then(Value::as_str)
+                    && let Some(step) = args.get("before_step").and_then(Value::as_str)
+                {
+                    let known = self
+                        .definition_for_run(id)
+                        .is_some_and(|wf| wf.steps.contains_key(step));
+                    if !known {
+                        return err(format!(
+                            "before_step {step:?} is not a step of this run's workflow"
+                        ));
+                    }
+                    match self.runs.get_mut(id) {
+                        None => return err(format!("no such run {id:?}")),
+                        Some(r) => {
+                            r.break_before = Some(step.to_string());
+                            r.dirty = true;
+                        }
+                    }
+                    self.log
+                        .info("run.breakpoint", json!({"run": id, "before_step": step}));
+                    return ToolOutcome::Ready(json!({"run": id, "break_before": step}), false);
+                }
                 if let Some(id) = args.get("run").and_then(Value::as_str) {
                     match self.runs.get_mut(id) {
                         None => return err(format!("no such run {id:?}")),

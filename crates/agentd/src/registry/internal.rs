@@ -434,9 +434,19 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "workflow.pause",
         "workflow",
-        "Pause a run (or disarm a workflow's start nodes).",
-        obj(json!({"run": s("Run id"), "name": s("Workflow name")}), &[]),
-        open_obj(json!({"ok": {"type": "boolean"}}), &["ok"]),
+        "Pause a run (or disarm a workflow's start nodes). With `before_step`, \
+         set a BREAKPOINT instead: the run keeps going and pauses just before \
+         that step starts, so it can be inspected in the state it is in rather \
+         than one effect later. Durable — it survives a restart.",
+        obj(
+            json!({"run": s("Run id"), "name": s("Workflow name"),
+                   "before_step": s("Pause just before this step starts (a breakpoint)")}),
+            &[],
+        ),
+        open_obj(
+            json!({"ok": {"type": "boolean"}, "break_before": {"type": "string"}}),
+            &[],
+        ),
         true,
         ROOT_ONLY,
     );

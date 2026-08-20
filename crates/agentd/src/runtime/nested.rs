@@ -1185,7 +1185,7 @@ pub enum BodyState {
     Failed(String),
 }
 
-trait StatusLabel {
+pub(crate) trait StatusLabel {
     fn as_label(&self) -> &'static str;
 }
 impl StatusLabel for StepStatus {

@@ -294,83 +294,168 @@ function Tasks({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
 
 function Subagents({ mirror, client }: { mirror: Mirror; client: AgentdClient }): React.JSX.Element {
   const s = mirror.getState();
-  const [open, setOpen] = useState<{ handle: string; detail: Json | null } | null>(null);
   const subs = [...s.subagents.values()] as { [k: string]: Json }[];
-  const openOne = (handle: string) => {
-    setOpen({ handle, detail: null });
+  // Master–detail, not a drill-down. A subagent tree is something you watch
+  // while it moves: pushing the list off-screen to read one child means losing
+  // sight of the others exactly when a second one starts misbehaving.
+  const [sel, setSel] = useState<string | null>(null);
+  const [detail, setDetail] = useState<Json | null>(null);
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const handle = sel ?? (subs[0] ? String(subs[0].handle ?? '') : null);
+  useEffect(() => {
+    if (!handle) return;
+    setDetail(null);
+    let live = true;
     void client
       .subagentGet(handle)
-      .then((d) => setOpen((cur) => (cur?.handle === handle ? { handle, detail: d } : cur)))
+      .then((d) => live && setDetail(d))
       .catch(() => {
         /* summary-only (debug off) — the view says so */
       });
-  };
-  if (open) {
-    const summary = (s.subagents.get(open.handle) ?? {}) as { [k: string]: Json };
-    const d = (open.detail ?? summary) as { [k: string]: Json };
-    const field = (label: string, v: Json | undefined, cls = '') =>
-      v === undefined || v === null ? null : (
-        <div className="field" key={label}>
-          <span className="k">{label}</span>
-          <span className={cls}>{typeof v === 'string' ? v : JSON.stringify(v, null, 1)}</span>
-        </div>
-      );
+    return () => {
+      live = false;
+    };
+  }, [handle, client]);
+
+  if (subs.length === 0) {
     return (
       <div className="pane">
-        <div className="scroll detail">
-          <button className="mini" onClick={() => setOpen(null)}>
-            ← back to subagents
-          </button>
-          <h2>subagent {open.handle}</h2>
-          {field('status', d.status)}
-          {field('mode', d.mode)}
-          {field('attempt', d.attempt)}
-          {field('tokens', d.tokens)}
-          {field('instruction', d.instruction)}
-          {field('result', d.result)}
-          {field('error', d.error, 'err')}
-          {field('requested_by', d.requested_by)}
-          {!s.info?.debug ? (
-            <div className="row note">summary only — enable interface.debug (or /set interface.debug true) for instruction/result</div>
-          ) : null}
+        <div className="empty">
+          <h2>No subagents yet</h2>
+          <p>
+            The agent spawns a subagent when it delegates — each one is a real child
+            process the supervisor can stop. They will appear here as they start,
+            and you can message or stop one from this screen.
+          </p>
         </div>
       </div>
     );
   }
+
+  const summary = (handle ? (s.subagents.get(handle) ?? {}) : {}) as { [k: string]: Json };
+  const d = (detail ?? summary) as { [k: string]: Json };
+  const status = String(d.status ?? '');
+  const warm = status === 'running' || status === 'spawning';
+
+  const act = async (fn: () => Promise<unknown>, ok: string) => {
+    setBusy(true);
+    setNote(null);
+    try {
+      await fn();
+      setNote(ok);
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const field = (label: string, v: Json | undefined, cls = '') =>
+    v === undefined || v === null ? null : (
+      <div className="field" key={label}>
+        <span className="k">{label}</span>
+        <span className={cls}>{typeof v === 'string' ? v : JSON.stringify(v, null, 1)}</span>
+      </div>
+    );
+
   return (
-    <div className="pane">
-      <div className="scroll">
-        {subs.length === 0 ? (
-          <div className="row note">no subagents yet — the agent spawns them as it delegates</div>
-        ) : (
-          <table className="grid clickable">
-            <thead>
-              <tr>
-                <th>handle</th>
-                <th>mode</th>
-                <th>status</th>
-                <th>tokens</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {subs.map((x, i) => (
-                <tr key={String(x.handle ?? i)} onClick={() => openOne(String(x.handle ?? ''))}>
-                  <td>{String(x.handle ?? '')}</td>
-                  <td>{String(x.mode ?? '')}</td>
-                  <td className={String(x.status) === 'completed' ? 'st-done' : String(x.status) === 'running' ? 'st-working' : String(x.status) === 'failed' ? 'st-failed' : 'st-queued'}>
-                    {String(x.status ?? '')}
-                  </td>
-                  <td>{String(x.tokens ?? 0)}</td>
-                  <td className="dim">open ›</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+    <div className="pane split">
+      <aside className="masterlist">
+        {subs.map((x, i) => {
+          const h = String(x.handle ?? i);
+          const st = String(x.status ?? '');
+          return (
+            <button
+              key={h}
+              className={`subrow ${h === handle ? 'is-sel' : ''} ${subagentClass(st)}`}
+              onClick={() => setSel(h)}
+            >
+              <span className="subrow-h">{h}</span>
+              <span className="subrow-meta">
+                {String(x.mode ?? '')} · {String(x.tokens ?? 0)} tok
+              </span>
+              <span className="subrow-st">{st}</span>
+            </button>
+          );
+        })}
+      </aside>
+
+      <div className="scroll detail">
+        <header className="detail-head">
+          <h2>{handle}</h2>
+          <span className={`pill ${subagentClass(status)}`}>{status || 'unknown'}</span>
+        </header>
+
+        {field('mode', d.mode)}
+        {field('attempt', d.attempt)}
+        {field('tokens', d.tokens)}
+        {field('instruction', d.instruction)}
+        {field('result', d.result)}
+        {field('error', d.error, 'err')}
+        {field('requested_by', d.requested_by)}
+        {!s.info?.debug ? (
+          <div className="row note">
+            summary only — enable interface.debug (or /set interface.debug true) for
+            instruction and result
+          </div>
+        ) : null}
+
+        {/* Control. A subagent is a process, so "stop" means stop. */}
+        <div className="controls">
+          <form
+            className="chat"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const text = msg.trim();
+              if (!text || !handle) return;
+              setMsg('');
+              void act(() => client.subagentSend(handle, text), 'message delivered');
+            }}
+          >
+            <input
+              value={msg}
+              onChange={(e) => setMsg(e.target.value)}
+              placeholder={warm ? `message ${handle}…` : 'only a running subagent can be messaged'}
+              disabled={!warm || busy}
+              aria-label="message this subagent"
+            />
+            <button className="mini" type="submit" disabled={!warm || busy || !msg.trim()}>
+              send
+            </button>
+          </form>
+          <button
+            className="mini danger"
+            disabled={!warm || busy || !handle}
+            onClick={() => handle && void act(() => client.subagentKill(handle), 'stopped')}
+          >
+            stop
+          </button>
+        </div>
+        {note ? <div className="row note">{note}</div> : null}
       </div>
     </div>
   );
+}
+
+/** A SUBAGENT status as a class, so state reads as colour and not only as text.
+ *  (Distinct from `stateClass` above, which maps A2A task states.) */
+function subagentClass(status: string): string {
+  switch (status) {
+    case 'running':
+    case 'spawning':
+      return 'is-running';
+    case 'completed':
+      return 'is-done';
+    case 'failed':
+    case 'crashed':
+    case 'killed':
+      return 'is-failed';
+    default:
+      return 'is-idle';
+  }
 }
 
 function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): React.JSX.Element {
@@ -415,8 +500,8 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
   return (
     <div className="pane">
       <div className="debug">
-        <section>
-          <h3>feed</h3>
+        <section className="wide">
+          <h3 data-count={String(s.feedLog.length)}>feed</h3>
           {s.feedLog.slice(-14).map((e) => (
             <div key={e.seq} className="line">
               {e.seq} <span className="k">{e.kind}</span> {line(e.data)}
@@ -424,7 +509,7 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
           ))}
         </section>
         <section>
-          <h3>runs</h3>
+          <h3 data-count={String(s.runs.size)}>runs</h3>
           {[...s.runs.values()].slice(-10).map((r, i) => {
             const o = r as { [k: string]: Json };
             const id = (o.id as string) ?? String(i);
@@ -459,7 +544,7 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
           })}
         </section>
         <section>
-          <h3>subagents / children</h3>
+          <h3 data-count={String(s.subagents.size + s.children.size)}>subagents / children</h3>
           {[...s.subagents.values()].slice(-6).map((x, i) => {
             const o = x as { [k: string]: Json };
             return (
@@ -477,8 +562,8 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
             );
           })}
         </section>
-        <section>
-          <h3>log</h3>
+        <section className="wide">
+          <h3 data-count={String(log.length)}>log</h3>
           {log.slice(-14).map((l, i) => (
             <div key={(l.seq as number) ?? i} className="line">
               {String(l.level ?? '')} <span className="k">{String(l.event ?? '')}</span> {line(l)}

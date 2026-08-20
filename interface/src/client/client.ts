@@ -262,6 +262,22 @@ export class AgentdClient {
     return this.commandResult('subagent.send', { handle, message });
   }
 
+  /**
+   * Stop a subagent.
+   *
+   * The supervisor owns the process group, so this is a real kill rather than
+   * a request the child can decline — which is the point of being able to do
+   * it from a UI at all.
+   */
+  async subagentKill(handle: string, reason?: string): Promise<Json> {
+    return this.commandResult('subagent.kill', reason ? { handle, reason } : { handle });
+  }
+
+  /** A subagent's status (works without `interface.debug`, unlike `.get`). */
+  async subagentStatus(handle: string): Promise<Json> {
+    return this.commandResult('subagent.status', { handle });
+  }
+
   /** A conversation's working plan. */
   async planGet(id?: string): Promise<Json> {
     return this.commandResult('plan.get', id ? { id } : {});

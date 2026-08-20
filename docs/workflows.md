@@ -604,3 +604,22 @@ The failure modes that cost the most debugging time:
 - [RFC 0025 — Durable state and store adapters](../rfcs/0025-durable-state-and-store-adapters.md) and [RFC 0026 — Agent loop and lifecycle](../rfcs/0026-agent-loop-and-lifecycle.md).
 - [Lifecycle and triggers](modes-and-triggers.md), [Configuration](configuration.md), [Security](security.md).
 - `agentd --workflow-schema` — the node registry your build actually compiled.
+
+## Declared state
+
+A workflow may declare what its run variables are:
+
+```yaml
+state:
+  score: {schema: {type: integer, minimum: 0, maximum: 100}}
+  log:   {reducer: append}
+```
+
+A declared **schema** gates the write: an `assign` producing a value that breaks
+it fails at the step that produced it, not three steps later where a template
+reads a shape nobody expected. A declared **reducer** states how concurrent
+writes combine, which turns the concurrent-write check from a heuristic into a
+policy — a step writing that key with a contradicting `mode` is a config error,
+and a key with a declared reducer is exempt from the race check entirely.
+
+Both are optional; a workflow that declares nothing behaves exactly as before.

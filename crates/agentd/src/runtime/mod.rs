@@ -435,6 +435,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
     rt.timers.restore(restored.timers());
     rt.artifacts.restore(restored.of(Kind::Artifact));
+    let mut replayed: Vec<(String, String)> = Vec::new();
     for env in restored.of(Kind::Run) {
         match serde_json::from_value::<crate::engine::RunState>(env.state.clone()) {
             Ok(mut r) => {
@@ -450,6 +451,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
                             );
                             st.status = StepStatus::Pending;
                             st.worker = None;
+                            // The step's `on_replay` policy is applied in a
+                            // second pass: the definitions are not loaded yet
+                            // here, and the policy lives in the definition.
+                            replayed.push((r.id.clone(), id.clone()));
                         }
                     }
                     r.status = crate::engine::RunStatus::Running;
@@ -511,7 +516,6 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         }
     }
 
-    // Workflows (RFC 0027) — refused definitions are a config error.
     if let Err(errs) = rt.load_workflows() {
         for e in &errs {
             log.error("config.invalid", json!({"error": e}));
@@ -521,6 +525,53 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             json!({"code": crate::exit::USAGE, "err": "workflow definitions"}),
         );
         return crate::exit::USAGE;
+    }
+    // Workflows (RFC 0027) — refused definitions are a config error.
+    // `on_replay` was published in the JSON Schema, documented, and read by
+    // nothing: every in-flight step was re-executed on restore regardless. Now
+    // the declared policy decides. `retry` (the default) keeps the old
+    // behaviour, so this only changes runs that asked for something else.
+    if !replayed.is_empty() {
+        let policies: Vec<(String, String, crate::engine::model::OnReplay)> = replayed
+            .iter()
+            .filter_map(|(rid, sid)| {
+                let wf_name = rt.runs.get(rid)?.workflow.clone();
+                let step = rt.workflows.get(&wf_name)?.steps.get(sid)?;
+                Some((rid.clone(), sid.clone(), step.on_replay))
+            })
+            .collect();
+        for (rid, sid, policy) in policies {
+            match policy {
+                crate::engine::model::OnReplay::Retry => {}
+                crate::engine::model::OnReplay::Skip => {
+                    if let Some(r) = rt.runs.get_mut(&rid) {
+                        r.end_step(&sid, StepStatus::Skipped, None, None);
+                    }
+                    rt.log.info(
+                        "restore.step.skipped",
+                        json!({"run": rid, "step": sid, "on_replay": "skip"}),
+                    );
+                }
+                crate::engine::model::OnReplay::Fail => {
+                    if let Some(r) = rt.runs.get_mut(&rid) {
+                        r.end_step(
+                            &sid,
+                            StepStatus::Failed,
+                            None,
+                            Some(
+                                "step was in flight when the process died and its \
+                                 on_replay policy is `fail`"
+                                    .into(),
+                            ),
+                        );
+                    }
+                    rt.log.warn(
+                        "restore.step.failed",
+                        json!({"run": rid, "step": sid, "on_replay": "fail"}),
+                    );
+                }
+            }
+        }
     }
     // RFC 0026 §8: `auto` ⇒ the job shape when there is no A2A listener and no
     // long-lived start node; `idle` ⇒ job shape; `drained` ⇒ a daemon.

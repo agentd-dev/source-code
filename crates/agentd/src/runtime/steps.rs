@@ -480,18 +480,25 @@ impl Runtime {
             self.on_run_terminal(run_id);
             return;
         }
-        if let Some(cap) = wf.limits.steps
+        // A workflow that declares no budget inherits the instance's
+        // `limits.run.*`. Previously a definition that was silent about limits
+        // ran unbounded — the one shape where a single mistake can spend the
+        // whole day's tokens, and the instance-wide knob that exists to prevent
+        // it was documented as if it already applied.
+        let step_cap = wf.limits.steps.or(self.settings.limits.run.steps);
+        let token_cap = wf.limits.tokens.or(self.settings.limits.run.tokens);
+        if let Some(cap) = step_cap
             && self.runs.get(run_id).is_some_and(|r| r.steps_run >= cap)
         {
             self.runs.get_mut(run_id).expect("present").finish(
                 RunStatus::Failed,
                 None,
-                Some(format!("exhausted steps: limits.steps = {cap}")),
+                Some(format!("exhausted steps: limit {cap}")),
             );
             self.on_run_terminal(run_id);
             return;
         }
-        if let Some(cap) = wf.limits.tokens
+        if let Some(cap) = token_cap
             && self.runs.get(run_id).is_some_and(|r| r.tokens >= cap)
         {
             self.runs.get_mut(run_id).expect("present").finish(
@@ -547,12 +554,32 @@ impl Runtime {
             }
             Ok(Next::Waiting) | Ok(Next::Terminal) => {}
             Ok(Next::Stalled) => {
-                self.log.warn("run.stalled", json!({"run": run_id}));
-                self.runs.get_mut(run_id).expect("present").finish(
-                    RunStatus::Stalled,
-                    None,
-                    Some("no ready step and no finish reached".into()),
+                // "No ready step" is a symptom, not a diagnosis. Almost always
+                // something upstream failed and its dependents could never
+                // become ready — so name the first failed ancestor rather than
+                // leaving whoever reads this to walk the graph themselves.
+                let culprit = self.first_failed_step(run_id);
+                let why = match &culprit {
+                    Some((sid, err)) => format!(
+                        "no ready step and no finish reached — step {sid:?} failed first: {err}"
+                    ),
+                    None => "no ready step and no finish reached".to_string(),
+                };
+                self.log.warn(
+                    "run.stalled",
+                    json!({"run": run_id, "blocked_by": culprit.as_ref().map(|(s, _)| s)}),
                 );
+                // A stall caused by a failure is a FAILED run, not a stalled
+                // one: the distinction matters to an exit code and to a caller.
+                let status = if culprit.is_some() {
+                    RunStatus::Failed
+                } else {
+                    RunStatus::Stalled
+                };
+                self.runs
+                    .get_mut(run_id)
+                    .expect("present")
+                    .finish(status, None, Some(why));
                 self.on_run_terminal(run_id);
             }
             Err(e) => {
@@ -564,6 +591,32 @@ impl Runtime {
                 self.on_run_terminal(run_id);
             }
         }
+    }
+
+    /// The earliest step of a run that failed, with its error.
+    ///
+    /// Used to explain a stall: a run with no ready step is usually a run whose
+    /// dependency chain is blocked behind a failure that was routed away from
+    /// `on_error: fail`, and the failure is what a person needs to see.
+    fn first_failed_step(&self, run_id: &str) -> Option<(String, String)> {
+        let run = self.runs.get(run_id)?;
+        run.steps
+            .iter()
+            .filter(|(_, st)| {
+                matches!(
+                    st.status,
+                    StepStatus::Failed | StepStatus::Timeout | StepStatus::Cancelled
+                )
+            })
+            .min_by_key(|(_, st)| st.finished.unwrap_or(u64::MAX))
+            .map(|(id, st)| {
+                (
+                    id.clone(),
+                    st.error
+                        .clone()
+                        .unwrap_or_else(|| "no error recorded".into()),
+                )
+            })
     }
 
     /// The template data of a run (RFC 0027 §3): memory is a read-through map
@@ -710,7 +763,23 @@ impl Runtime {
             st.wait = Some(json!({"cache_key": k}));
         }
         match step.kind.as_str() {
-            "noop" | "checkpoint" => self.finish_step(
+            "checkpoint" => {
+                // Documented as "force a durable checkpoint here rather than at
+                // the next natural boundary", and implemented as an alias for
+                // `noop` — so the one step whose entire purpose is to write did
+                // not write. `true` forces the write rather than letting the
+                // policy decide.
+                self.checkpoint(true);
+                self.finish_step(
+                    run_id,
+                    step_id,
+                    StepStatus::Done,
+                    Some(Value::Null),
+                    None,
+                    0,
+                );
+            }
+            "noop" => self.finish_step(
                 run_id,
                 step_id,
                 StepStatus::Done,
@@ -852,6 +921,34 @@ impl Runtime {
                     _ => RunStatus::Failed,
                 };
                 let output = spec.get("output").cloned();
+                // `outputs.schema` was checked for well-formedness at parse time
+                // and then never applied — a workflow could declare the shape of
+                // its result and return anything at all. Enforce it here, where
+                // the result actually exists. A completed run whose output does
+                // not match what it promised is a FAILED run: a caller reading
+                // the declared shape is the whole reason to declare one.
+                if matches!(status, RunStatus::Completed)
+                    && let Some(schema) = self
+                        .definition_for_run(run_id)
+                        .and_then(|wf| wf.outputs_schema.clone())
+                {
+                    let value = output.clone().unwrap_or(Value::Null);
+                    if let Err(errs) = crate::jsonschema::validate(&schema, &value) {
+                        self.finish_step_pub(
+                            run_id,
+                            step_id,
+                            StepStatus::Failed,
+                            None,
+                            Some(format!(
+                                "finish: output does not match the workflow's declared \
+                                 outputs.schema: {}",
+                                errs.join("; ")
+                            )),
+                            0,
+                        );
+                        return;
+                    }
+                }
                 let reason = spec
                     .get("reason")
                     .and_then(Value::as_str)
@@ -1733,9 +1830,27 @@ impl Runtime {
             if let Some(retry) = &step.retry
                 && attempt <= retry.max
             {
-                let backoff = retry
+                // Exponential, with jitter. Without it every step that failed
+                // in the same wave — the usual case, since they usually failed
+                // for the same upstream reason — retries in lockstep and
+                // rebuilds the thundering herd the backoff exists to break up.
+                // Deterministic per (run, step, attempt): no RNG, so a replay
+                // reproduces the same schedule.
+                let base = retry
                     .backoff_ms
                     .saturating_mul(1u64 << (attempt.saturating_sub(1)).min(10));
+                let backoff = if base == 0 {
+                    0
+                } else {
+                    let mut h: u64 = 1469598103934665603;
+                    for b in run_id.bytes().chain(step_id.bytes()).chain([attempt as u8]) {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(1099511628211);
+                    }
+                    // ±20% around the base.
+                    let spread = (base / 5).max(1);
+                    base.saturating_sub(spread) + (h % (spread * 2 + 1))
+                };
                 self.log.info("step.retry", json!({"run": run_id, "step": step_id, "attempt": attempt, "backoff_ms": backoff}));
                 if backoff == 0 {
                     if let Some(st) = self

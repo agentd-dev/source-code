@@ -3343,6 +3343,26 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // the pre-flight check exists to prevent. Reported after the structural
     // checks above so the more basic error still leads. `file:`/`uri:` refs
     // resolve at startup, so only inline definitions are checkable here.
+    // `store.durability.{a2a,steps}` is parsed, published in the schema, and
+    // surfaced in the manifest — and read by no writer. `eventual` therefore
+    // promised a weaker-but-faster durability that was never implemented, on the
+    // one guarantee agentd exists to make. Refusing the value is better than
+    // honouring it: a durability dial nobody wired is a lie, and implementing it
+    // would trade away the property the product is for. `strict` (the default)
+    // is what the engine already does, so only a config that asked for the
+    // unimplemented setting fails, and it fails saying so.
+    for (path, level) in [
+        ("store.durability.a2a", s.store.durability.a2a),
+        ("store.durability.steps", s.store.durability.steps),
+    ] {
+        if level == Some(DurabilityLevel::Eventual) {
+            d.errors.push(format!(
+                "{path}: `eventual` is not implemented — every durable write is strict \
+                 (checkpoint-before-effect). Remove the key; `strict` is the default and \
+                 the only behaviour."
+            ));
+        }
+    }
     for w in &s.workflows {
         if w.get("steps").is_none() {
             continue;

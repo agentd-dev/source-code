@@ -529,6 +529,38 @@ fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
             .any(|(k, v)| k == "access-control-allow-origin" && v == "https://ui.example"),
         "{headers:?}"
     );
+    // Private Network Access: a page on a PUBLIC origin reaching a daemon on
+    // loopback is the shape Chrome gates. It sends this header on the preflight
+    // and drops the real request unless the answer grants it — so a hosted UI
+    // at code.agentd.dev fails with an unexplained CORS error without this.
+    let (code, headers) = send(
+        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Private-Network: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    );
+    assert_eq!(code, 204);
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "access-control-allow-private-network" && v == "true"),
+        "the PNA grant must be present when asked for: {headers:?}"
+    );
+    // It is NOT volunteered when the browser did not ask — a header nobody
+    // requested is noise, and this one names a capability.
+    let (_, headers) = send(
+        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nAccess-Control-Request-Method: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    );
+    assert!(
+        !headers
+            .iter()
+            .any(|(k, _)| k == "access-control-allow-private-network"),
+        "{headers:?}"
+    );
+    // And an origin that is NOT configured gets nothing, PNA request or not:
+    // the grant rides the existing allow-list rather than widening it.
+    let (code, _) = send(
+        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Private-Network: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    );
+    assert_eq!(code, 403, "an unconfigured origin must be refused");
+
     // A POST from it → 200 + echo.
     let body =
         json!({"jsonrpc": "2.0", "id": 1, "method": "GetAgentCard", "params": {}}).to_string();

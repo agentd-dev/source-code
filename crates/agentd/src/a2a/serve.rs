@@ -291,6 +291,21 @@ impl CardFromRuntime {
 /// A CORS preflight. A browser UI served from a configured origin (RFC 0032 §7)
 /// has to be told it may POST here; every other origin is refused, which is the
 /// same DNS-rebind answer the POST itself gives.
+///
+/// **Private Network Access.** A page on a public origin — a hosted UI at
+/// `https://code.agentd.dev` — reaching a daemon on loopback or a LAN address
+/// is exactly the shape browsers now gate: Chrome sends
+/// `Access-Control-Request-Private-Network: true` on the preflight and drops
+/// the real request unless the answer carries
+/// `Access-Control-Allow-Private-Network: true`. Without it a hosted client
+/// fails with a CORS error that names no cause, which is a miserable thing to
+/// debug from the outside.
+///
+/// The grant is deliberately narrow: it rides on the SAME origin allow-list as
+/// everything else, so answering it says only "the origin you already
+/// configured may reach this daemon", never "any website may". An origin that
+/// is not in `interface.origins` is refused before this header is ever
+/// considered.
 async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let origin = headers
         .get(header::ORIGIN)
@@ -299,7 +314,11 @@ async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -> Response 
     if !origin_allowed(origin, &app.extra_origins) {
         return (StatusCode::FORBIDDEN, "").into_response();
     }
-    (
+    let wants_private_network = headers
+        .get("access-control-request-private-network")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let mut resp = (
         StatusCode::NO_CONTENT,
         [
             (header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.to_string()),
@@ -314,7 +333,14 @@ async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -> Response 
             (header::ACCESS_CONTROL_MAX_AGE, "600".to_string()),
         ],
     )
-        .into_response()
+        .into_response();
+    if wants_private_network {
+        resp.headers_mut().insert(
+            "access-control-allow-private-network",
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
+    resp
 }
 
 /// Grant the caller's origin on a real response, so the browser hands the body

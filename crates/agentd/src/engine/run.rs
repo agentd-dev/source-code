@@ -140,6 +140,11 @@ pub struct Start {
 /// The durable run record (RFC 0025 §3.3 `run`, RFC 0027 §9).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunState {
+    /// Stop this run just before the named step starts (a breakpoint set with
+    /// `workflow.pause {before_step}`). Durable, so it survives a restart —
+    /// which is the point: the interesting bugs are the ones that need one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub break_before: Option<String>,
     pub id: String,
     pub workflow: String,
     pub workflow_hash: String,
@@ -207,6 +212,7 @@ impl RunState {
             }
         }
         RunState {
+            break_before: None,
             id: id.to_string(),
             workflow: wf.name.clone(),
             workflow_hash: wf.hash.clone(),

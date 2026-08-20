@@ -180,7 +180,9 @@ fn top_level_properties(
                     "depth": { "type": "integer", "minimum": 0 }, "breadth": { "type": "integer", "minimum": 1 },
                     "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string", "description": "`<burst>/<per>s`, e.g. `8/2s`" } } },
                 "inline_max_bytes": { "type": "integer", "minimum": 1 },
-                "step_timeout": duration } }));
+                "step_timeout": duration,
+                "workflow": { "type": "object", "additionalProperties": false, "properties": {
+                    "fan_out": { "type": "integer", "minimum": 1, "description": "max concurrent lanes a foreach/batch body may use; a definition asking for more is refused at load" } } } } }));
     m.insert("lifecycle".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "run_until": { "enum": ["auto", "idle", "drained"] },
                 "idle_grace": duration,

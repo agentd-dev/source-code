@@ -1039,7 +1039,9 @@ impl Runtime {
                                 if let Some(st) = run.steps.get_mut(&sid)
                                     && st.status == StepStatus::Pending
                                 {
-                                    st.status = StepStatus::Skipped;
+                                    // Pruned, not skipped: the case was not
+                                    // chosen, so its whole tail is dead.
+                                    st.status = StepStatus::Pruned;
                                     skipped.push(sid);
                                 }
                             }

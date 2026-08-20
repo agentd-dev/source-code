@@ -961,6 +961,19 @@ pub struct Limits {
     pub subagents: SubagentLimits,
     pub inline_max_bytes: Option<u64>,
     pub step_timeout: Option<Dur>,
+    pub workflow: WorkflowLimits,
+}
+
+/// Ceilings a workflow definition is checked against at load time.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct WorkflowLimits {
+    /// The most concurrent lanes a `foreach`/`batch` body may use. A definition
+    /// asking for more is REFUSED at load rather than quietly clamped: silent
+    /// clamping is how a workflow ends up running eight-wide while its author
+    /// believes it runs fifty, and the whole point of the field whitelist is
+    /// that a knob either does what it says or fails loudly.
+    pub fan_out: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -3337,6 +3350,31 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         if let Err(errs) = crate::engine::model::parse_workflow(w) {
             // The parser's messages already name the workflow and the step.
             d.errors.extend(errs);
+        }
+        // Fan-out is checked HERE rather than in the parser because the ceiling
+        // is a config value the parser cannot see.
+        let cap = s
+            .limits
+            .workflow
+            .fan_out
+            .unwrap_or(crate::engine::model::MAX_BATCH_PARALLEL as u32);
+        let wname = w.get("name").and_then(Value::as_str).unwrap_or("?");
+        if let Some(steps) = w.get("steps").and_then(Value::as_object) {
+            for (sid, step) in steps {
+                let want = step.get("parallel").and_then(Value::as_u64).or_else(|| {
+                    step.get("batch")
+                        .and_then(|b| b.get("parallel"))
+                        .and_then(Value::as_u64)
+                });
+                if let Some(want) = want
+                    && want > cap as u64
+                {
+                    d.errors.push(format!(
+                        "workflow {wname:?} step {sid:?}: parallel {want} exceeds \
+                         limits.workflow.fan_out ({cap}) — raise the limit or lower the step"
+                    ));
+                }
+            }
         }
     }
     d

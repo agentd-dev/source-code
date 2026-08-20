@@ -18,6 +18,12 @@ pub const DIALECT: u32 = 3;
 pub const MAX_STEPS: usize = 512;
 pub const MAX_NESTING: usize = 4;
 pub const MAX_BATCH_PARALLEL: u64 = 8;
+/// Lanes a `foreach`/`batch` uses when the definition does not say.
+///
+/// Was 1 — a fan-out that ran one item at a time, which is a loop with extra
+/// syntax. Four is concurrent enough to be worth writing `foreach` for and low
+/// enough not to stampede an MCP server that never asked for the traffic.
+pub const DEFAULT_FAN_OUT: u64 = 4;
 pub const MAX_ITERATIONS: u64 = 10_000;
 pub const MAX_ID_LEN: usize = 64;
 

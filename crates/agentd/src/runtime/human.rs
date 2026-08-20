@@ -69,6 +69,69 @@ impl Runtime {
         // against it rather than merely advertised to clients.
         let schema = args.get("schema").cloned().filter(|v| !v.is_null());
 
+        // The approval policy decides whether to ask AT ALL. It is checked
+        // before availability, because "do not interrupt me" is a decision the
+        // operator made and should hold whether or not a channel happens to
+        // exist.
+        match self.settings.agent.approval {
+            crate::config::v2::Approval::Ask => {}
+            crate::config::v2::Approval::Accept => {
+                // Accept what the ask RECOMMENDS. With nothing recommended
+                // there is nothing to accept, and inventing an answer to a
+                // question a person wanted asked is worse than asking it — so
+                // fall through to the judge instead of guessing.
+                let recommended = args
+                    .get("recommend")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .or_else(|| schema.as_ref().and_then(|s| s.get("default").cloned()));
+                if let Some(v) = recommended {
+                    let text = match &v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.log.info(
+                        "human.auto_accepted",
+                        json!({"question": question, "answer": text, "policy": "accept"}),
+                    );
+                    self.audit(super::audit::AuditEvent {
+                        action: "ask_human.accepted",
+                        target: json!({"question": question}),
+                        outcome: "accept",
+                        principal: Some("policy"),
+                        role: None,
+                        request_id: None,
+                    });
+                    return ToolOutcome::Ready(
+                        json!({"reply": text, "timed_out": false, "via": "accept"}),
+                        false,
+                    );
+                }
+                let ask = self.next_id("ask");
+                self.spawn_human_judge(&ask, &question);
+                return ToolOutcome::Deferred(PendingKind::Human {
+                    task: ask,
+                    question,
+                    deadline_ms: now_ms() + AUTO_GRACE_MS,
+                    standalone: false,
+                    auto_fired: true,
+                    schema,
+                });
+            }
+            crate::config::v2::Approval::Auto => {
+                let ask = self.next_id("ask");
+                self.spawn_human_judge(&ask, &question);
+                return ToolOutcome::Deferred(PendingKind::Human {
+                    task: ask,
+                    question,
+                    deadline_ms: now_ms() + AUTO_GRACE_MS,
+                    standalone: false,
+                    auto_fired: true,
+                    schema,
+                });
+            }
+        }
+
         // A human can answer only through the interface surface.
         #[cfg(feature = "a2a")]
         let available = self.settings.interface.enabled && self.a2a_sink.is_some();
@@ -202,6 +265,11 @@ impl Runtime {
         };
 
         if let Some(t) = self.tasks.get_mut(&task_id) {
+            // The schema travels WITH the gate: the question says what is being
+            // asked, the schema says how to ask it. Without it a client can
+            // only offer a text box and hope the person types one of the words
+            // the schema would have listed.
+            t.ask_schema = schema.clone();
             t.transition(State::InputRequired, Some(question.clone()));
         }
         self.task_persist(&task_id);

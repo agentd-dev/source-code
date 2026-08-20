@@ -103,6 +103,12 @@ fn agentd_metadata(t: &Task) -> Value {
     if let Some(p) = &t.principal {
         m["agentd/principal"] = json!(p);
     }
+    // A gate's answer shape, so a client can render the right control rather
+    // than a text box. Namespaced like everything else agentd adds, so a spec
+    // peer that does not know it simply ignores it.
+    if let Some(sch) = &t.ask_schema {
+        m["agentd/ask_schema"] = sch.clone();
+    }
     if !t.history.is_empty() {
         // A proto `Struct` has one number type (double), so the stored epoch
         // milliseconds would render as `1786977070754.0`. Rendering the moment

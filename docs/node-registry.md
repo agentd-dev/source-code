@@ -10,7 +10,7 @@ the binary ever disagree, the binary is right; regenerate from
 
 ---
 
-## Before the tables: five things that are easy to get wrong
+## Before the tables: six things that are easy to get wrong
 
 These are the traps, in the order people hit them.
 
@@ -36,17 +36,23 @@ not `cases: {select: [prepare]}`. A list used to validate and then silently
 match nothing at runtime; it is now refused at load time with a message saying
 what to write.
 
-**3. Signals are edge-triggered.** `workflow.signal` wakes waiters that are
+**3. A step's status can be `pruned`.** A branch nobody chose is `pruned`, not
+`skipped`, and the difference is load-bearing: a *skipped* step satisfies its
+dependents (that is how several start nodes work, and how uneven joins proceed),
+while a *pruned* one does not. A step is pruned only when EVERY inbound path is
+pruned — one live parent keeps it alive.
+
+**4. Signals are edge-triggered.** `workflow.signal` wakes waiters that are
 ALREADY suspended. A signal sent before the waiter parks is missed — there is no
 buffering. Two sibling steps in one run, one signalling and one waiting, is a
 race with no ordering primitive to fix it; signal across runs, or from a tool or
 an operator, where the waiter is demonstrably parked first.
 
-**4. CEL is a build feature.** `when`, `until`, `filter` and the `expr` of
+**5. CEL is a build feature.** `when`, `until`, `filter` and the `expr` of
 `map`/`filter`/`reduce` need it. It ships in the release binaries from 2.3.0; on
 an older binary a config using them **exits 2** rather than ignoring them.
 
-**5. Nested steps are scoped.** A step inside a `foreach`/`parallel`/`race`/
+**6. Nested steps are scoped.** A step inside a `foreach`/`parallel`/`race`/
 `subgraph` gets a compound id — `each[0].work`, `par{branch}.work`,
 `sub.work` — which is what you will see in the logs and what cancellation
 matches on.

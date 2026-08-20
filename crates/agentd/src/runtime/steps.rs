@@ -748,7 +748,9 @@ impl Runtime {
         // running" — so a display client could see that a run was moving but
         // never WHAT was moving. One event per transition turns that into a
         // usable inner loop. Operator-scoped, because a step id and its kind
-        // describe the workflow's internals.
+        // describe the workflow's internals. The feed itself is the A2A
+        // interface surface, so there is nothing to push to without it.
+        #[cfg(feature = "a2a")]
         self.feed_push(
             "step",
             crate::runtime::a2a_server::FeedVis::Operator,
@@ -1879,6 +1881,7 @@ impl Runtime {
             .map(|s| s.attempt)
             .unwrap_or(1);
         self.log.info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        #[cfg(feature = "a2a")]
         self.feed_push(
             "step",
             crate::runtime::a2a_server::FeedVis::Operator,

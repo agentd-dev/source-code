@@ -156,7 +156,11 @@ fn parallel_race_switch_subgraph_and_error_policies() {
     assert_eq!(v["race"], "fast");
     assert_eq!(v["sub"], "sub saw fast path");
     assert_eq!(v["guard"], "guard ran");
-    assert_eq!(v["skipped"], "skipped");
+    // A false guard now reports `pruned`, not `skipped`: the distinction is
+    // what stops the tail of an untaken branch from running. Note `goto_src`
+    // depends on this step AND on `guarded`, and still ran — one live parent is
+    // enough, which is the property that keeps uneven joins working.
+    assert_eq!(v["skipped"], "pruned");
     assert_eq!(v["rec"], "recovered");
     // The slow race branch was cancelled (its sleep timer disarmed; the step marked cancelled).
     assert!(

@@ -226,6 +226,16 @@ impl Runtime {
                     }
                 };
                 let batch = spec.get("batch").cloned().unwrap_or(json!({}));
+                // The ceiling is operator policy (`limits.workflow.fan_out`);
+                // a definition asking for more was already refused at load, so
+                // this clamp only ever bounds the DEFAULT.
+                let fan_out_cap = self
+                    .settings
+                    .limits
+                    .workflow
+                    .fan_out
+                    .map(u64::from)
+                    .unwrap_or(crate::engine::model::MAX_BATCH_PARALLEL);
                 let size = spec
                     .get("size")
                     .and_then(Value::as_u64)
@@ -236,9 +246,13 @@ impl Runtime {
                     .get("parallel")
                     .and_then(Value::as_u64)
                     .or_else(|| batch.get("parallel").and_then(Value::as_u64))
-                    .unwrap_or(1)
-                    .clamp(1, crate::engine::model::MAX_BATCH_PARALLEL)
-                    as usize;
+                    // Default to real concurrency. A fan-out that runs one at a
+                    // time is a loop with extra syntax, and it was the default
+                    // purely because the ceiling was low — the ceiling now lives
+                    // in `limits.workflow.fan_out` and over-asking is refused at
+                    // load, so the default can be what people expect.
+                    .unwrap_or(crate::engine::model::DEFAULT_FAN_OUT)
+                    .clamp(1, fan_out_cap) as usize;
                 let rate = spec
                     .get("rate")
                     .and_then(Value::as_str)
@@ -436,7 +450,7 @@ impl Runtime {
                         }
                         continue;
                     }
-                    StepStatus::Done | StepStatus::Skipped => continue,
+                    StepStatus::Done | StepStatus::Skipped | StepStatus::Pruned => continue,
                     StepStatus::Pending => {}
                 }
                 all_terminal = false;
@@ -1182,6 +1196,7 @@ impl StatusLabel for StepStatus {
             StepStatus::Done => "done",
             StepStatus::Failed => "failed",
             StepStatus::Skipped => "skipped",
+            StepStatus::Pruned => "pruned",
             StepStatus::Cancelled => "cancelled",
             StepStatus::Timeout => "timeout",
             StepStatus::Suspended => "suspended",

@@ -28,6 +28,16 @@ pub enum StepStatus {
     Timeout,
     /// Waiting on something durable (a timer, a gate, a signal, a budget).
     Suspended,
+    /// The branch this step sits on was not taken, so it will never run — and
+    /// neither will anything that depends ONLY on it.
+    ///
+    /// Distinct from `Skipped`, and the distinction is load-bearing. A skipped
+    /// step SATISFIES its dependents: that is what lets a workflow with several
+    /// start nodes fire one and still run the steps below the others, and what
+    /// lets an uneven join proceed without LangGraph's `defer=True`. A pruned
+    /// step must not satisfy anything, or the tail of a branch nobody chose
+    /// runs anyway — which it did, before this existed.
+    Pruned,
 }
 
 impl StepStatus {
@@ -37,6 +47,7 @@ impl StepStatus {
             StepStatus::Done
                 | StepStatus::Failed
                 | StepStatus::Skipped
+                | StepStatus::Pruned
                 | StepStatus::Cancelled
                 | StepStatus::Timeout
         )
@@ -371,6 +382,7 @@ impl RunState {
                     StepStatus::Done => "done",
                     StepStatus::Failed => "failed",
                     StepStatus::Skipped => "skipped",
+                    StepStatus::Pruned => "pruned",
                     StepStatus::Cancelled => "cancelled",
                     StepStatus::Timeout => "timeout",
                     StepStatus::Suspended => "suspended",
@@ -436,10 +448,31 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
                 ready.push(id.clone());
                 continue;
             }
-            let deps_ok = step
+            // Transitive pruning. A step whose dependencies are ALL pruned can
+            // never run, so it is pruned too and the wave carries down the dead
+            // branch. One live dependency is enough to keep the step alive —
+            // that is the uneven-join case, and it is why this is not simply
+            // "any pruned dep prunes me".
+            let pruned_deps = step
                 .depends_on
                 .iter()
-                .all(|d| run.steps.get(d).is_some_and(|s| s.status.is_satisfied()));
+                .filter(|d| {
+                    run.steps
+                        .get(*d)
+                        .is_some_and(|s| s.status == StepStatus::Pruned)
+                })
+                .count();
+            if !step.depends_on.is_empty() && pruned_deps == step.depends_on.len() {
+                run.end_step(&id, StepStatus::Pruned, None, None);
+                changed = true;
+                continue;
+            }
+            // A pruned dependency is not waited on: the live paths decide.
+            let deps_ok = step.depends_on.iter().all(|d| {
+                run.steps
+                    .get(d)
+                    .is_some_and(|s| s.status.is_satisfied() || s.status == StepStatus::Pruned)
+            });
             let deps_failed = step.depends_on.iter().any(|d| {
                 run.steps.get(d).is_some_and(|s| {
                     matches!(
@@ -462,7 +495,8 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
                 match crate::cel::eval_bool(expr, &vars) {
                     Ok(true) => {}
                     Ok(false) => {
-                        run.end_step(&id, StepStatus::Skipped, None, None);
+                        // Not taken, so nothing that depends only on it runs.
+                        run.end_step(&id, StepStatus::Pruned, None, None);
                         changed = true;
                         continue;
                     }
@@ -565,6 +599,79 @@ mod tests {
     use super::*;
     use crate::engine::model::parse_workflow;
 
+    fn start_at(node: &str) -> Start {
+        Start {
+            node: node.into(),
+            payload: json!({}),
+            ts: 0,
+        }
+    }
+
+    /// The branch nobody chose must not run, and neither must its TAIL — which
+    /// it did before `Pruned` existed, because `Skipped` satisfies dependents.
+    /// The join is why this cannot be "any pruned dep prunes me": `fin` has one
+    /// pruned parent and one live one, and must still run.
+    #[test]
+    fn an_untaken_branch_prunes_its_tail_but_not_a_live_join() {
+        let w = parse_workflow(&json!({
+            "name": "w", "steps": {
+                "go":  {"kind": "once"},
+                "la":  {"kind": "noop", "depends_on": ["go"]},
+                "ra":  {"kind": "noop", "depends_on": ["go"]},
+                "la2": {"kind": "noop", "depends_on": ["la"]},
+                "ra2": {"kind": "noop", "depends_on": ["ra"]},
+                "fin": {"kind": "finish", "depends_on": ["la2", "ra2"], "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let mut run = RunState::new("r", &w, start_at("go"), json!({}));
+        run.end_step("ra", StepStatus::Pruned, None, None);
+        run.end_step("la", StepStatus::Done, None, None);
+        let data = run.data(env_view("i", "r", None, None), json!({}));
+        let _ = schedule(&w, &mut run, &data).unwrap();
+        assert_eq!(
+            run.steps["ra2"].status,
+            StepStatus::Pruned,
+            "the dead branch's tail must be pruned, not run"
+        );
+
+        run.end_step("la2", StepStatus::Done, None, None);
+        let data = run.data(env_view("i", "r", None, None), json!({}));
+        match schedule(&w, &mut run, &data).unwrap() {
+            Next::Ready(r) => assert!(
+                r.iter().any(|s| s == "fin"),
+                "a join with one pruned and one live parent must run, got {r:?}"
+            ),
+            other => panic!("expected fin ready, got {other:?}"),
+        }
+    }
+
+    /// Sibling start nodes stay `Skipped`, which SATISFIES dependents — several
+    /// triggers, one fires, the graph below still runs. Pruning must not have
+    /// swallowed that distinction.
+    #[test]
+    fn sibling_start_nodes_still_satisfy_their_dependents() {
+        let w = parse_workflow(&json!({
+            "name": "w", "steps": {
+                "a":    {"kind": "once"},
+                "b":    {"kind": "manual"},
+                "work": {"kind": "noop", "depends_on": ["a", "b"]},
+                "fin":  {"kind": "finish", "depends_on": ["work"], "status": "completed"}
+            }
+        }))
+        .unwrap();
+        let mut run = RunState::new("r", &w, start_at("a"), json!({}));
+        assert_eq!(run.steps["b"].status, StepStatus::Skipped);
+        let data = run.data(env_view("i", "r", None, None), json!({}));
+        match schedule(&w, &mut run, &data).unwrap() {
+            Next::Ready(r) => assert!(
+                r.iter().any(|s| s == "work"),
+                "a step below several start nodes must run when one fired, got {r:?}"
+            ),
+            other => panic!("expected work ready, got {other:?}"),
+        }
+    }
+
     fn wf() -> Workflow {
         parse_workflow(&json!({
             "name": "w", "steps": {
@@ -601,7 +708,10 @@ mod tests {
             schedule(&w, &mut run, &data).unwrap(),
             Next::Ready(vec!["a".to_string()])
         );
-        assert_eq!(run.steps["b"].status, StepStatus::Skipped);
+        // A false guard PRUNES: "do not do this" now also means "do not do the
+        // things that exist only because of this". `c` still runs below, because
+        // its other parent `a` is live — pruning follows dead paths, not steps.
+        assert_eq!(run.steps["b"].status, StepStatus::Pruned);
         run.begin_step("a");
         let data = run.data(env_view("i", "r1", None, None), json!({}));
         assert_eq!(schedule(&w, &mut run, &data).unwrap(), Next::Waiting);

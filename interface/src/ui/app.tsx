@@ -427,9 +427,33 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
           <h3>runs</h3>
           {[...s.runs.values()].slice(-10).map((r, i) => {
             const o = r as { [k: string]: Json };
+            const id = (o.id as string) ?? String(i);
+            // What the run is DOING, not how many steps it has. Newest first, so
+            // the step that matters — the running one, or the one that failed —
+            // is at the top where the eye lands.
+            const steps = (s.steps.get(id) ?? []).slice(-6).reverse();
             return (
-              <div key={(o.id as string) ?? i} className="line">
-                <span className="k">{o.id as string}</span> {o.status as string} {line(o.steps ?? null)}
+              <div key={id} className="run">
+                <div className="line">
+                  <span className="k">{id}</span> {o.status as string} {line(o.steps ?? null)}
+                </div>
+                {steps.length > 0 ? (
+                  <ol className="steps">
+                    {steps.map((st, j) => (
+                      <li key={`${st.step}${j}`} className={`step ${stepClass(st)}`}>
+                        <span className="step-name">{st.step}</span>
+                        <span className="step-kind">{st.kind ?? ''}</span>
+                        <span className="step-state">
+                          {st.phase === 'start' ? 'running' : (st.status ?? '')}
+                        </span>
+                        {st.attempt && st.attempt > 1 ? (
+                          <span className="step-attempt">attempt {st.attempt}</span>
+                        ) : null}
+                        {st.err ? <span className="step-err">{st.err}</span> : null}
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
               </div>
             );
           })}

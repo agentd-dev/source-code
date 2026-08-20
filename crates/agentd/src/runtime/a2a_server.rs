@@ -1180,9 +1180,50 @@ impl Runtime {
             "display": {
                 "top": display.top.clone().unwrap_or_else(default_display_top),
                 "bottom": display.bottom.clone().unwrap_or_else(default_display_bottom),
+                // Values for any `memory:<key>` items in the layout.
+                //
+                // The chrome's vocabulary is fixed because a client has to know
+                // how to render each item — but a `memory:` item is rendered as
+                // whatever a WORKFLOW put there, which makes the status line
+                // extensible without the daemon growing the ability to compute
+                // anything. Branch, PR, deploy state, queue depth: a workflow
+                // reads it from an MCP server and writes it to a key, and the
+                // chrome shows it. The daemon still executes nothing locally.
+                "values": self.display_values(),
             },
             "pairing": {"enabled": self.a2a_pairing.is_some()},
         }})
+    }
+
+    /// Resolve the `memory:<key>` items in the configured layout to their
+    /// current values, so a client can render them without knowing what they
+    /// mean. A key that has never been written is omitted rather than shown
+    /// empty: a status slot that reads blank looks broken, while one that is
+    /// absent simply has not been filled yet.
+    fn display_values(&self) -> Value {
+        let d = &self.settings.interface.display;
+        let mut out = serde_json::Map::new();
+        for item in d.top.iter().flatten().chain(d.bottom.iter().flatten()) {
+            let Some(key) = item.strip_prefix("memory:") else {
+                continue;
+            };
+            // Straight to the store rather than through `Memory`, which caches
+            // behind a `&mut` — the chrome wants the current value, and a read
+            // for display should not be able to disturb anything.
+            //
+            // TTL is honoured: a status slot exists because a workflow keeps it
+            // fresh, so an EXPIRED value is exactly the case that must not be
+            // shown. A branch name still sitting there after the workflow that
+            // produced it stopped running is worse than an empty slot, because
+            // it looks current.
+            if let Ok(Some(env)) = self.durable.get(crate::state::Kind::Memory, key)
+                && let Ok(rec) = serde_json::from_value::<crate::context::memory::Record>(env.state)
+                && !rec.expired(crate::state::now_ms())
+            {
+                out.insert(item.clone(), rec.value);
+            }
+        }
+        Value::Object(out)
     }
 
     /// `pairing.code` (operator): the CURRENT rotating code + its remaining
@@ -1296,8 +1337,27 @@ impl Runtime {
                     None => Err("display lists take an array of item names".into()),
                 }
             }
+            // How much the operator wants to be asked changes with what the
+            // agent is doing — closely supervised somewhere unfamiliar, left
+            // alone once it is doing something watched twenty times. That is a
+            // decision made DURING a session, so it has to be settable in one.
+            "agent.approval" => match value.as_str() {
+                Some("ask") | Some("await") | Some("human") => {
+                    self.settings.agent.approval = crate::config::v2::Approval::Ask;
+                    Ok(json!("ask"))
+                }
+                Some("auto") => {
+                    self.settings.agent.approval = crate::config::v2::Approval::Auto;
+                    Ok(json!("auto"))
+                }
+                Some("accept") | Some("accept_all") | Some("yes") => {
+                    self.settings.agent.approval = crate::config::v2::Approval::Accept;
+                    Ok(json!("accept"))
+                }
+                _ => Err("agent.approval takes ask | auto | accept".into()),
+            },
             other => Err(format!(
-                "{other:?} is not runtime-settable; settable: interface.debug, interface.display.top, interface.display.bottom — everything else is the config file + SIGHUP (docs/configuration.md §11)"
+                "{other:?} is not runtime-settable; settable: interface.debug, interface.display.top, interface.display.bottom, agent.approval — everything else is the config file + SIGHUP (docs/configuration.md §11)"
             )),
         };
         match applied {

@@ -28,6 +28,19 @@ function counters(s: MirrorState):
 function item(name: string, c: ChromeCtx): React.JSX.Element | null {
   const { s } = c;
   const key = name;
+  // `memory:<key>` is whatever a WORKFLOW put there — a branch, a PR number, a
+  // deploy state. The client does not know what it means and does not need to:
+  // it renders the value the daemon resolved. An unset key renders nothing at
+  // all rather than an empty slot, because a blank status reads as broken.
+  if (name.startsWith('memory:')) {
+    const v = s.info?.display?.values?.[name];
+    if (v === undefined || v === null || v === '') return null;
+    return (
+      <Text key={key} color={theme.command}>
+        {typeof v === 'string' ? v : JSON.stringify(v)}
+      </Text>
+    );
+  }
   switch (name) {
     case 'name':
       return (

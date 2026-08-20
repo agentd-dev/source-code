@@ -94,7 +94,8 @@ fn top_level_properties(
                         "internal": tool_select, "mcp": tool_select, "code": tool_select } },
                     "max_parallel_turns": { "type": "integer", "minimum": 1 },
                     "conversation_budget": budget,
-                    "ask_human_fallback": { "enum": ["wait", "pause", "idle", "fail", "finish", "stop", "auto"], "description": "what ask_human does with no human channel (and, for auto, on an unanswered gate timeout): wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto)" }
+                    "ask_human_fallback": { "enum": ["wait", "pause", "idle", "fail", "finish", "stop", "auto"], "description": "what ask_human does with no human channel (and, for auto, on an unanswered gate timeout): wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto)" },
+                "approval": { "enum": ["ask", "auto", "accept"], "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via config.set" }
                 }
             }));
     m.insert("intelligence".to_string(), json!({

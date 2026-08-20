@@ -186,6 +186,40 @@ pub struct Agent {
     /// (park until the ask timeout), or `auto` (an LLM judge answers on the
     /// operator's behalf, conservatively, marked as auto).
     pub ask_human_fallback: AskHumanFallback,
+    /// What a gate does when a human COULD answer (RFC 0032 §16).
+    ///
+    /// `ask_human_fallback` governs the case where nobody can answer;
+    /// this governs whether to ask at all. They are separate because they are
+    /// separate questions: "there is no channel" is a fact about deployment,
+    /// "do not interrupt me" is a policy about attention.
+    pub approval: Approval,
+}
+
+/// How much a person wants to be asked (RFC 0032 §16).
+///
+/// Runtime-settable, because the right answer changes with what the agent is
+/// doing: you supervise closely while it is somewhere unfamiliar and stop
+/// wanting to be asked once it is doing something you have watched it do
+/// twenty times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Approval {
+    /// Ask a person and wait. The default: a gate exists because someone
+    /// wanted a decision, so the decision is theirs unless told otherwise.
+    #[default]
+    #[serde(alias = "await", alias = "human")]
+    Ask,
+    /// An LLM judge decides whether it is safe to proceed, conservatively, and
+    /// the answer is marked `via: auto` so nobody mistakes it for a person's.
+    Auto,
+    /// Take the recommendation without asking.
+    ///
+    /// Only usable when the ask CARRIES one — a `recommend` argument or a
+    /// schema `default`. With neither there is nothing to accept, and inventing
+    /// an answer would be worse than the interruption, so it degrades to
+    /// `auto` rather than guessing.
+    #[serde(alias = "accept_all", alias = "yes")]
+    Accept,
 }
 
 /// The `ask_human` fallback disposition (RFC 0032 §16).
@@ -3117,9 +3151,26 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         ("bottom", &s.interface.display.bottom),
     ] {
         for item in items.iter().flatten() {
+            // `memory:<key>` renders whatever a WORKFLOW wrote to that key —
+            // the extension point that lets the status line show a branch, a PR
+            // number or a deploy state without the daemon learning to compute
+            // any of them. The key still has to be a legal memory key, so a
+            // typo is caught here rather than silently never rendering.
+            if let Some(key) = item.strip_prefix("memory:") {
+                if key.is_empty() {
+                    d.errors.push(format!(
+                        "interface.display.{edge}: {item:?} names no memory key"
+                    ));
+                } else if let Err(e) = crate::context::memory::Memory::check_key(key) {
+                    d.errors
+                        .push(format!("interface.display.{edge}: {item:?}: {e}"));
+                }
+                continue;
+            }
             if !DISPLAY_ITEMS.contains(&item.as_str()) {
                 d.warnings.push(format!(
-                    "interface.display.{edge}: unknown item {item:?} (clients skip it); known: {}",
+                    "interface.display.{edge}: unknown item {item:?} (clients skip it); known: {}, \
+                     or memory:<key> for a value a workflow maintains",
                     DISPLAY_ITEMS.join(", ")
                 ));
             }

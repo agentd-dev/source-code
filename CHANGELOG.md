@@ -5,6 +5,84 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.3.0 — CEL in the box, and the branch nobody chose
+
+A feature-parity analysis against LangGraph and LangChain raised 59 candidate
+gaps; 56 survived adversarial refutation. This release is the roadmap that came
+out of it, and the headline is a correctness bug: **the branch a `switch` did
+not take still ran its whole tail.**
+
+Crates: `agentd-core` / `agentd-cli` / `agentd-conformance` **2.3.0**;
+`agentd-net` **0.4.0** and `agentd-mcp` **0.3.1** are unchanged. The display
+clients ship as `@agentd-dev/cli` **2.3.0**; the image is
+`ghcr.io/agentd-dev/agentd:2.3.0`.
+
+### Fixed
+
+- **An untaken branch ran its downstream.** `switch` marked the not-taken case
+  *targets* `Skipped` but never their descendants, and a skipped step satisfies
+  its dependents — so everything below the dead branch ran, sometimes before the
+  chosen branch's own steps. The satisfying behaviour could not simply be
+  removed: it is what lets a workflow with several start nodes fire one and
+  still run the graph below the others, and what lets an uneven join proceed.
+  So `Pruned` is now a distinct status — terminal, and **not** satisfying — with
+  the rule that a step is pruned only when *every* inbound path is pruned. One
+  live parent keeps it alive. A false `when` guard prunes for the same reason.
+  Sibling start nodes stay `Skipped` and keep satisfying.
+- **Fan-out was sequential by default and silently clamped at 8.** `foreach`
+  defaulted to one lane at a time — a loop with extra syntax — and a request for
+  more than the ceiling was quietly reduced, so a workflow could run eight-wide
+  while its author believed it ran fifty. The ceiling is now
+  `limits.workflow.fan_out`, over-asking is refused **at load** naming the step,
+  and the default is 4.
+- **A stall was reported as "no ready step"**, which is a symptom. It now names
+  the first failed ancestor, and a run blocked behind a failure ends `failed`
+  rather than `stalled`.
+- **Retry had no jitter**, so steps that failed in one wave retried in lockstep.
+  Deterministic per (run, step, attempt), so a replay reproduces the schedule.
+- **A workflow silent about limits ran unbounded.** It now inherits
+  `limits.run.*`, which the documentation already described as applying.
+
+### Added
+
+- **CEL ships in the released binaries.** `when`, `until`, `filter` and the
+  `expr` of `map`/`filter`/`reduce` are how a workflow branches, and they were
+  refused at load on every published build — so any non-trivial workflow was a
+  build-from-source job. It costs 1.86 MiB (6.62 → 8.48 MiB amd64) and 23
+  crates. `exec` stays out; that one is a security posture, not a size decision.
+- **The A2A workflow nodes.** `a2a` (start), `a2a.send` and `a2a.wait` were
+  refused by the parser; all three now work, which makes the asynchronous half
+  of an agent-to-agent conversation expressible. A workflow declaring
+  `{kind: a2a, command: "x"}` REGISTERS `x` as a command the listener accepts.
+  `wait {on: message}` is fixed by the same change — it could previously only
+  ever end by timing out.
+- **Declared state.** `state: {key: {schema, reducer}}` — a schema gates the
+  write at the step that produced it, and a declared reducer turns the
+  concurrent-write check from a heuristic into a policy.
+- **Retention.** `store.retention.runs: {keep_last, ttl}` evicts terminal runs;
+  before this a long-lived instance kept one record per run forever.
+- **Step-level debugging.** Every step transition emits a `step` feed event, and
+  `workflow.pause {before_step}` is a durable breakpoint.
+- **A node registry** at `docs/node-registry.md` — all 67 kinds with their
+  required fields, generated from the binary's own registry.
+
+### Changed
+
+- **Declared knobs now work or are refused.** `outputs.schema` was checked for
+  well-formedness and never applied; `on_replay` was published and read by
+  nothing; `checkpoint` was an alias for `noop`; `human.to`/`reply_uri` were
+  accepted and ignored; `collect.mode` typos fell through to overwrite;
+  `store.durability: eventual` promised weaker-but-faster writes that were never
+  wired. Each now does what it says, or fails saying it does not exist.
+- **Two concurrent steps overwriting one variable** is refused at load — a
+  last-write-wins race decided by completion order. Reducers, ordered pairs and
+  mutually exclusive `switch` arms are exempt.
+- **A `human` gate inside `foreach`/`parallel`/`batch`/`race`** is refused at
+  load until each gate carries its own identity; only one can be live per run,
+  so the second item would wait for a reply that can never reach it.
+- **A human's answer is checked against `human.schema`**, and a mismatch
+  re-asks rather than failing the step.
+
 ## v2.2.0 — durability by default, and the defects a real review found
 
 The headline feature is small and the bug list is not. A multi-agent review of

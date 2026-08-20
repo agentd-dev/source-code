@@ -10,6 +10,19 @@ import { Box, Text } from 'ink';
 import type { Json, MirrorState } from '../../client/index.js';
 import { ago, theme } from '../theme.js';
 
+/** A fixed-width column: pad short, TRUNCATE long.
+ *
+ * `padEnd` alone only pads — a value wider than its column overflows into the
+ * next one, which is how `supervised` + `running` rendered as
+ * `supervisedrunning`. A terminal table has no wrapping to save it, so the
+ * column has to enforce its own width, and always leave one space so adjacent
+ * values cannot touch even at exactly the limit. */
+function col(v: unknown, width: number): string {
+  const s = String(v ?? '');
+  const w = width - 1;
+  return (s.length > w ? `${s.slice(0, Math.max(1, w - 1))}…` : s).padEnd(width);
+}
+
 function statusColor(status: string): string {
   switch (status) {
     case 'running':
@@ -40,7 +53,7 @@ export function SubagentList({
   return (
     <Box flexDirection="column">
       <Text color={theme.dim} bold>
-        {'  handle               mode    status      tokens   updated'}
+        {`  ${col('handle', 21)}${col('mode', 12)}${col('status', 12)}${col('tokens', 9)}updated`}
       </Text>
       {subs.slice(0, 20).map((x, i) => {
         const status = String(x.status ?? '');
@@ -48,11 +61,11 @@ export function SubagentList({
           <Box key={String(x.handle ?? i)} flexDirection="row">
             <Text color={i === selected ? theme.accent : undefined} bold={i === selected}>
               {i === selected ? '▸ ' : '  '}
-              {String(x.handle ?? '').padEnd(21)}
+              {col(x.handle, 21)}
             </Text>
-            <Text color={theme.dim}>{String(x.mode ?? '').padEnd(8)}</Text>
-            <Text color={statusColor(status)}>{status.padEnd(12)}</Text>
-            <Text color={theme.dim}>{String(x.tokens ?? 0).padEnd(9)}</Text>
+            <Text color={theme.dim}>{col(x.mode, 12)}</Text>
+            <Text color={statusColor(status)}>{col(status, 12)}</Text>
+            <Text color={theme.dim}>{col(x.tokens ?? 0, 9)}</Text>
             <Text color={theme.dim}>{x.updated ? ago(Number(x.updated)) : ''}</Text>
           </Box>
         );

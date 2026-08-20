@@ -101,7 +101,130 @@ and stay there after you quit — handy for copying a session, piping, or
 keeping the transcript in your shell history. A non-interactive run (a pipe,
 CI) degrades to inline automatically.
 
-## 4. What you can do
+## 4. The screens
+
+Four screens, cycled with `Tab` (or jumped to with `/chat`, `/tasks`,
+`/subagents`, `/debug`). The web UI has the same four as tabs.
+
+Every frame below is **the real program** — rendered by the shipped TUI against
+a mirror driven with daemon-shaped events, captured by
+`interface/tools/frames.mjs`. They regenerate from the code, so they cannot
+drift into describing something agentd no longer does.
+
+### Chat — talking to the agent
+
+```tui
+# agentd tui — chat
+agentd 2.3.0 triage-1 debug
+▌  Triage the newest issue
+⠋ working
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ›                                                                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+● live http://127.0.0.1:8420 1 active [chat] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+The transcript shows every attached client's prompts (labelled by principal when
+they are not yours), command invocations and replies, so two people watching one
+agent see the same conversation. The line under it is the live activity: what
+the daemon is doing *right now*, ticking its own clock. `Esc` cancels the newest
+working task.
+
+### Subagents — the tree, and control over it
+
+A subagent is a real child process the supervisor owns. The list is live:
+
+```tui
+# agentd tui — subagents
+agentd 2.3.0 triage-1 debug
+  handle               mode        status      tokens   updated
+▸ sa-review            supervised  running     4120     0s
+  sa-lint              detached    failed      260      0s
+↑/↓ select · enter details · tab next screen
+● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+`↑`/`↓` selects, `Enter` opens it. The detail view is where the verbs are:
+
+```tui
+# agentd tui — subagent detail
+agentd 2.3.0 triage-1 debug
+subagent sa-review
+status        running
+mode          supervised
+attempt       1
+tokens        4120
+instruction   Review the diff for correctness regressions and report findings.
+requested_by  operator
+m message · k stop · esc/backspace back · tab next screen
+● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+- **`m` — message it.** Opens the composer pre-addressed to this subagent, so
+  talking to a running child is one keystroke rather than a `/send <handle> …`
+  you have to retype the handle into. Only a *warm* subagent can be messaged;
+  the view says so when it cannot.
+- **`k` — stop it.** The supervisor owns the process group, so this is a real
+  kill rather than a request the child can decline. It asks first, because
+  stopping is not undoable:
+
+```tui
+# agentd tui — confirming a stop
+agentd 2.3.0 triage-1 debug
+subagent sa-review
+status        running
+mode          supervised
+attempt       1
+tokens        4120
+instruction   Review the diff for correctness regressions and report findings.
+requested_by  operator
+stop sa-review? y to confirm, any other key to cancel
+● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+`instruction` and `result` need `interface.debug`; without it the view shows the
+summary the feed carries and says which fields are missing and why.
+
+### Debug — what the daemon is doing
+
+```tui
+# agentd tui — debug
+agentd 2.3.0 triage-1 debug
+feed
+    1 run           {"id":"pipeline-01M0C0","workflow":"pipeline","status":"running","steps":"3/7"}
+    2 step          {"run":"pipeline-01M0C0","step":"fetch","kind":"mcp.tool","phase":"start"}
+    3 step          {"run":"pipeline-01M0C0","step":"fetch","phase":"done","status":"done","tokens"…
+    4 step          {"run":"pipeline-01M0C0","step":"triage","kind":"extract","phase":"start","atte…
+    5 step          {"run":"pipeline-01M0C0","step":"triage","phase":"done","status":"done","tokens…
+    6 step          {"run":"pipeline-01M0C0","step":"notify","kind":"a2a.send","phase":"start"}
+    7 subagent      {"handle":"sa-review","mode":"supervised","status":"running","tokens":4120,"upd…
+    8 subagent      {"handle":"sa-lint","mode":"detached","status":"failed","tokens":260,"updated":…
+runs
+pipeline-01M0C0        running    3/7
+  ◐ notify            a2a.send      running
+  ● triage            extract       done
+  ● fetch             mcp.tool      done
+subagents / children
+sub sa-review          running    4120 tok
+sub sa-lint            failed     260 tok
+log (debug.events)
+—
+● live http://127.0.0.1:8420 [debug] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+The feed is the raw observation stream, sequence-numbered. Under `runs`, each
+run carries its **steps**: `◐` running, `●` done, `○` pruned (a branch nobody
+took), `◌` waiting, `✗` failed — so a run that is stuck shows the step it is
+stuck on, rather than a count that says three of seven and leaves you guessing
+which three.
+
+The web UI renders the same information with a severity stripe per row and a
+master–detail split for subagents, so the list stays on screen while you read
+one child — a tree is watched while it moves, and losing sight of the siblings
+is exactly the wrong thing when a second one starts misbehaving.
+
+## 5. Everything the clients can do
+
 
 Both clients speak the same surface:
 
@@ -151,7 +274,7 @@ Both clients speak the same surface:
   without the feed — the clients degrade to polling automatically), counters,
   and a prominent DRAINING notice.
 
-### 4.1 Configure the chrome (`interface.display`)
+### 5.1 Configure the chrome (`interface.display`)
 
 The **daemon** decides what its clients render in the top (header) and bottom
 (status bar) edges — every attached surface lays out the same:
@@ -172,7 +295,7 @@ defaults. The layout is also **runtime-shapeable**:
 `/set interface.display.bottom ["conn","model","tokens"]` re-shapes every
 connected client at once.
 
-### 4.2 Runtime settings (`/set`) — and their deliberate limit
+### 5.2 Runtime settings (`/set`) — and their deliberate limit
 
 `config.set` (operator) updates a whitelisted set of knobs in the running
 daemon, no restart:
@@ -185,7 +308,7 @@ config file + SIGHUP hot reload (see configuration.md §11) — the daemon never
 mutates config it doesn't own. `/config` prints the full effective document,
 `/config a2a.listen` one value.
 
-### 4.3 Pairing-code login (`interface.pairing`)
+### 5.3 Pairing-code login (`interface.pairing`)
 
 The no-copy way to connect a browser or a remote TUI:
 
@@ -210,7 +333,7 @@ token is 32 bytes of OS randomness, and sessions live in memory — restarting
 the daemon revokes everything. On a non-loopback listener, pairing counts as
 client auth (you can run TLS + pairing with no static bearer at all).
 
-## 5. Debug mode — the extra information
+## 6. Debug mode — the extra information
 
 ```yaml
 interface:
@@ -233,7 +356,7 @@ and only then render their debug screens. It unlocks:
 Treat `debug: true` as operator-grade exposure; leave it off in production
 unless you need it.
 
-## 6. The protocol (for other clients)
+## 7. The protocol (for other clients)
 
 Everything above is plain A2A JSON-RPC (RFC 0029) plus the RFC 0032 additions —
 any program can be a display client:
@@ -251,7 +374,7 @@ The reference implementation is the shared TypeScript core in
 with poll fallback, exported as the package's library entry point); both
 shipped UIs are ~thin renderers over it.
 
-## 7. Building the clients
+## 8. Building the clients
 
 ```sh
 cd interface

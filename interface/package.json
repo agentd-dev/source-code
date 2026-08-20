@@ -1,7 +1,7 @@
 {
   "name": "@agentd-dev/cli",
   "version": "2.3.0",
-  "description": "The agentd display clients: the terminal UI (agentd-tui), the web UI (agentd-ui), and the thin-client core they share. agentd hosts all state — these only render it.",
+  "description": "The agentd display clients: the terminal UI (agentd-tui), the web UI (agentd-ui), and the thin-client core they share. agentd hosts all state \u2014 these only render it.",
   "license": "AGPL-3.0-only",
   "type": "module",
   "main": "dist/client/index.js",
@@ -26,7 +26,8 @@
     "build:web": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json",
     "test": "npm run build:node && node --test test/*.test.mjs",
-    "start": "node dist/tui/cli.js"
+    "start": "node dist/tui/cli.js",
+    "frames": "npm run build:node && node tools/frames.mjs > ../docs/_generated/tui-frames.json && node tools/frames-md.mjs"
   },
   "dependencies": {
     "ink": "^7.1.1",

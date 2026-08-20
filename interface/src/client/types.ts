@@ -166,6 +166,12 @@ export interface MirrorState {
   paused: boolean;
   tasks: Map<string, TaskView>;
   runs: Map<string, Json>;
+  /** Per-run step detail, newest last, keyed by run id.
+   *
+   * The feed used to carry run-level counts only — "3 done, 1 running" — so a
+   * client could see that a run was moving but never WHAT was moving. The
+   * daemon now emits a `step` event per transition; this is where they land. */
+  steps: Map<string, StepRow[]>;
   conversations: Map<string, Json>;
   subagents: Map<string, Json>;
   children: Map<string, Json>;
@@ -190,3 +196,16 @@ export class RpcError extends Error {
 
 /** The server's "this surface is off" code (UNSUPPORTED_OPERATION). */
 export const UNSUPPORTED_OPERATION = -32004;
+
+/** One step transition, as the observation feed reports it. */
+export type StepRow = {
+  step: string;
+  kind?: string;
+  /** `start` then `done` — a step is running while it has no terminal status. */
+  phase: 'start' | 'done';
+  status?: string;
+  attempt?: number;
+  tokens?: number;
+  err?: string;
+  at: number;
+};

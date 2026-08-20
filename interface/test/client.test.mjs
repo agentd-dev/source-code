@@ -143,3 +143,47 @@ test('input-required surfaces as an answerable agent row', () => {
   assert.equal(row.text, 'Which region?');
   assert.equal(row.taskId, 't5');
 });
+
+test('step events collapse into one row per step and carry state', () => {
+  const m = new Mirror();
+  // A step's life is two feed events. The UI wants ONE row that changes state,
+  // not a scrolling pair — otherwise a run of twenty steps reads as forty
+  // lines and the thing you are looking for is buried.
+  m.apply({ seq: 1, ts: 10, kind: 'step', data: { run: 'r1', step: 'fetch', kind: 'assign', phase: 'start', attempt: 1 } });
+  let rows = m.state.steps.get('r1');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].phase, 'start');
+  assert.equal(rows[0].kind, 'assign');
+
+  m.apply({ seq: 2, ts: 20, kind: 'step', data: { run: 'r1', step: 'fetch', phase: 'done', status: 'done', tokens: 12 } });
+  rows = m.state.steps.get('r1');
+  assert.equal(rows.length, 1, 'the done event completes the row in place');
+  assert.equal(rows[0].phase, 'done');
+  assert.equal(rows[0].status, 'done');
+  // The kind came from the start event and must survive the completion.
+  assert.equal(rows[0].kind, 'assign');
+
+  // A failure keeps its error where the UI can show it.
+  m.apply({ seq: 3, ts: 30, kind: 'step', data: { run: 'r1', step: 'boom', kind: 'fail', phase: 'start' } });
+  m.apply({ seq: 4, ts: 40, kind: 'step', data: { run: 'r1', step: 'boom', phase: 'done', status: 'failed', err: 'downstream refused' } });
+  rows = m.state.steps.get('r1');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].status, 'failed');
+  assert.equal(rows[1].err, 'downstream refused');
+
+  // Steps are per-run, and a removed run takes its steps with it rather than
+  // leaking for the lifetime of the client.
+  m.apply({ seq: 5, ts: 50, kind: 'step', data: { run: 'r2', step: 'other', phase: 'start' } });
+  assert.equal(m.state.steps.get('r2').length, 1);
+  m.apply({ seq: 6, ts: 60, kind: 'run.removed', data: { id: 'r1' } });
+  assert.equal(m.state.steps.has('r1'), false);
+  assert.equal(m.state.steps.get('r2').length, 1, 'another run is untouched');
+});
+
+test('a run with many steps stays bounded in client memory', () => {
+  const m = new Mirror();
+  for (let i = 0; i < 300; i++) {
+    m.apply({ seq: i, ts: i, kind: 'step', data: { run: 'big', step: `s${i}`, phase: 'start' } });
+  }
+  assert.ok(m.state.steps.get('big').length <= 200, 'the ring is capped');
+});

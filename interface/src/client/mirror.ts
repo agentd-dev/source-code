@@ -17,6 +17,7 @@ import {
   InterfaceInfo,
   Json,
   MirrorState,
+  StepRow,
   TERMINAL_STATES,
   TaskView,
   TranscriptEntry,
@@ -50,6 +51,7 @@ export class Mirror {
     paused: false,
     tasks: new Map(),
     runs: new Map(),
+    steps: new Map(),
     conversations: new Map(),
     subagents: new Map(),
     children: new Map(),
@@ -262,7 +264,36 @@ export class Mirror {
         break;
       }
       case 'run.removed': {
-        if (typeof data.id === 'string') this.state.runs.delete(data.id);
+        if (typeof data.id === 'string') {
+          this.state.runs.delete(data.id);
+          this.state.steps.delete(data.id);
+        }
+        break;
+      }
+      case 'step': {
+        // A step's life is two events. Collapse them onto one row so the UI
+        // shows "what is happening" rather than a scrolling pair per step —
+        // `start` creates the row, `done` completes it in place.
+        const run = data.run as string | undefined;
+        const step = data.step as string | undefined;
+        if (!run || !step) break;
+        const rows = this.state.steps.get(run) ?? [];
+        const phase = data.phase === 'done' ? 'done' : 'start';
+        const existing = rows.findIndex((r) => r.step === step && r.phase === 'start');
+        const row: StepRow = {
+          step,
+          kind: (data.kind as string) ?? rows[existing]?.kind,
+          phase,
+          status: data.status as string | undefined,
+          attempt: data.attempt as number | undefined,
+          tokens: data.tokens as number | undefined,
+          err: (data.err as string) ?? undefined,
+          at: Date.now(),
+        };
+        if (phase === 'done' && existing >= 0) rows[existing] = row;
+        else rows.push(row);
+        // A long run should not grow without bound in a client's memory.
+        this.state.steps.set(run, rows.slice(-200));
         break;
       }
       case 'conversation': {

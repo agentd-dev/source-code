@@ -9,6 +9,36 @@ import { Box, Text } from 'ink';
 import type { FeedEvent, Json, MirrorState } from '../../client/index.js';
 import { ago, shortId, theme } from '../theme.js';
 
+/** A step's state as a glyph: running is open, done is filled, trouble is a cross. */
+function glyph(st: { phase: string; status?: string }): string {
+  if (st.phase === 'start') return '◐';
+  switch (st.status) {
+    case 'done':
+      return '●';
+    case 'pruned':
+    case 'skipped':
+      return '○';
+    case 'suspended':
+      return '◌';
+    default:
+      return '✗';
+  }
+}
+
+function stepColour(st: { phase: string; status?: string }): string {
+  if (st.phase === 'start') return theme.accent;
+  switch (st.status) {
+    case 'done':
+      return theme.agent;
+    case 'pruned':
+    case 'skipped':
+    case 'suspended':
+      return theme.dim;
+    default:
+      return theme.error;
+  }
+}
+
 function one(v: Json): string {
   const s = typeof v === 'string' ? v : JSON.stringify(v);
   return s.length > 100 ? `${s.slice(0, 100)}…` : s;
@@ -40,13 +70,31 @@ function Runs({ s }: { s: MirrorState }): React.JSX.Element {
         runs
       </Text>
       {runs.length === 0 ? <Text color={theme.dim}>none</Text> : null}
-      {runs.map((r, i) => (
-        <Text key={(r.id as string) ?? i} wrap="truncate-end">
-          <Text color={theme.command}>{shortId((r.id as string) ?? '?', 22).padEnd(23)}</Text>
-          <Text>{String(r.status ?? '').padEnd(11)}</Text>
-          <Text color={theme.dim}>{r.steps ? one(r.steps) : ''}</Text>
-        </Text>
-      ))}
+      {runs.map((r, i) => {
+        const id = (r.id as string) ?? String(i);
+        // Per-step detail, newest first — what a run is DOING, rather than how
+        // many steps it has. A run that is stuck shows the step it is stuck on.
+        const steps = (s.steps.get(id) ?? []).slice(-4).reverse();
+        return (
+          <Box key={id} flexDirection="column">
+            <Text wrap="truncate-end">
+              <Text color={theme.command}>{shortId(id, 22).padEnd(23)}</Text>
+              <Text>{String(r.status ?? '').padEnd(11)}</Text>
+              <Text color={theme.dim}>{r.steps ? one(r.steps) : ''}</Text>
+            </Text>
+            {steps.map((st, j) => (
+              <Text key={`${st.step}${j}`} wrap="truncate-end">
+                {'  '}
+                <Text color={stepColour(st)}>{glyph(st)}</Text>{' '}
+                <Text>{st.step.padEnd(18)}</Text>
+                <Text color={theme.dim}>{(st.kind ?? '').padEnd(14)}</Text>
+                <Text color={stepColour(st)}>{st.phase === 'start' ? 'running' : (st.status ?? '')}</Text>
+                {st.err ? <Text color={theme.error}> {one(st.err)}</Text> : null}
+              </Text>
+            ))}
+          </Box>
+        );
+      })}
     </Box>
   );
 }

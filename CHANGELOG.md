@@ -5,6 +5,113 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.5.0 — pressure, priority, and the fast lane
+
+An agent that accepts work it cannot finish is worse than one that says no.
+This release teaches the daemon to feel its own limits — disk, memory, CPU —
+and to degrade in the order the operator chose; it makes retries safe to send
+twice; and it makes the runtime fast where measurement, not intuition, said it
+was slow.
+
+Crates: `agentd-core` / `agentd-cli` **2.5.0**, `agentd-mcp` **0.4.0**
+(`RawResponse` gained response headers); `agentd-net` **0.4.0** unchanged.
+Display clients ship as `@agentd-dev/cli` **2.5.0**; the image is
+`ghcr.io/agentd-dev/agentd:2.5.0`.
+
+### Performance — measured, then fixed
+
+- **Data pipelines run at execution speed.** The scheduler now re-runs to a
+  fixpoint while inline steps (`assign`, `map`, `template`, `switch`…) keep
+  completing, instead of advancing one step per 200 ms tick. A 200-step chain:
+  **42.4 s → 2.26 s** (debug build).
+- **A child's answer wakes the loop.** Subagent and turn-worker frames ride the
+  same channel the reactor parks on, so a 5 ms answer no longer waits out the
+  tick. A cross-agent delegation round trip: **214 ms → 18 ms**. Reaps are
+  re-queued once behind the child's already-flushed frames, so "exited without
+  a result" cannot be a race.
+- **`subscribe` reads moved off the loop.** The notify-then-read for `subscribe`
+  start nodes ran on the reactor thread; a slow MCP server could stall the
+  daemon per update. Same fix the `wait on: resource` path already had.
+- **A2A streaming results arrive.** The server sent the terminal status frame
+  *before* the result artifact; a conformant client stops at terminal, so the
+  answer was dropped ("completed without a distillate"). Artifact now precedes
+  the final status, and the client recovers over unary `GetTask` when a peer
+  still orders it the old way.
+
+### Added
+
+- **Resource pressure** (`store.file.min_free`, default 256 MB): the daemon
+  watches the store filesystem's headroom (and the cgroup's memory), warns at
+  2×, and below the threshold **sheds new work while in-flight work drains** —
+  schedules skip with `start.shed`, webhooks answer `429` + `Retry-After`
+  (after authentication), queued turns stay queued, `workflow.run` and subagent
+  spawns refuse with the cause. Transitions log once
+  (`pressure.warn/shed/cleared`); metrics schema 1.2 adds
+  `agent_pressure_level`, `agent_disk_free_bytes`, `agent_runs_active`,
+  `agent_turns_queued`.
+- **Priority** — `priority: low|normal|high` on workflows and subagent spawns.
+  `low` sheds one pressure level early (at *warn*), higher-priority runs
+  schedule first each tick, and priority maps to OS niceness (`low` → +10,
+  `high` → −5 best-effort). A tiebreak under scarcity, not a reservation.
+- **OS resource caps for subagents.** `limits: {memory: 512MB, cpu: 5m}` become
+  `RLIMIT_AS` / `RLIMIT_CPU` between fork and exec — kernel-enforced, beside
+  the existing steps/tokens/deadline budgets. Verified in tests against
+  `/proc/<pid>/limits` of the live child.
+- **Idempotency for remote effects.** `http` (`idempotency: {header|query,
+  value?}`), `mcp.tool` (automatic `agent/idempotency_key` in `_meta`),
+  `a2a.send`/`a2a.delegate` (`idempotency: true` pins the A2A `messageId`).
+  The default key is derived — `sha256(run_id.step_id)`, stable across retries
+  by arithmetic, opaque on the wire — and `value:` substitutes an application
+  key. The old `mcp.tool` key named the *attempt*, which defeated the field's
+  purpose; the attempt now rides separately. Steps also see `env.step`,
+  `env.attempt`, `env.idempotency_key`.
+- **Unix-socket A2A for co-located instances.** `a2a.listen: unix:///path` and
+  peer `endpoint: unix:///path`: same protocol, no TCP or TLS — the socket file
+  is `0600` and every connection's `SO_PEERCRED` uid must be the daemon's own
+  user (or root), which is strictly stronger than loopback TCP. TLS material on
+  a unix listener is refused; webhooks deliberately stay `https://`.
+- **Config `vars`** — named values (any JSON type, nested) referenced as
+  `{{config.NAME}}` anywhere a string sits, substituted at load time so the
+  definition hash pins the *resolved* workflow; exact-token references keep the
+  value's type. The startup preflight now reports **every** unresolved
+  `{{secret:…}}` / `{{secret-file:…}}` / `{{config.…}}` reference across the
+  config and all loaded workflows in one refusal.
+- **`--prompt-missing`** — each missing `{{secret:NAME}}` is asked for on
+  `/dev/tty`, echo off, one by one; values live in process memory only and
+  resolve exactly like environment ones. Refused without a controlling
+  terminal. Tested against a real pty, including that the typed value is not
+  echoed and reaches the point of use.
+- **`--env <FILE>`** (repeatable) — a dependency-free dotenv subset loaded
+  before anything reads the environment; the real environment beats any file,
+  later files beat earlier. A malformed line refuses startup naming file:line.
+- **Workflow sources.** A `workflows:` entry can be fetched by `url:` (with
+  headers, timeout, and the same SSRF guard as `http` nodes; fail-closed at
+  startup) or discovered by `dir:` + `glob:` (`**` crosses directories; zero
+  matches is a refusal). `security.workflows.immutable: true` makes the loaded
+  set read-only for the agent itself — `workflow.create/update/delete` are
+  refused and logged `workflow.locked`.
+- **`subscribe window`** — `window: {samples: N}` (≤ 256) keeps a durable ring
+  of the last N read values and delivers it as `output.window`, oldest→newest:
+  the trend, not just the reading, for hardware-driver-style streams. The ring
+  accrues through a debounce — coalescing drops *firings*, the window keeps the
+  *samples*.
+- **Webhook arrival throttling** — `rate: "<burst>/<per>s"` per route: past the
+  burst the route answers `429` with a computed `Retry-After`, before anything
+  is written to the durable inbox. `parallelism` bounds how many run at once;
+  `rate` bounds how fast they arrive.
+
+### Changed
+
+- `agentd-mcp`'s `RawResponse` carries extra response headers (how the webhook
+  listener says `Retry-After`) — the 0.4.0 bump.
+- The `unix:` scheme, retired for MCP/intelligence endpoints in the 2.0 pivot,
+  returns **only** for A2A listeners and peers; `vsock:` stays retired.
+- Docs: `configuration.md` (vars, sources, `--env`/`--fresh`/`--prompt-missing`,
+  `min_free`), `operations.md` §7 (the shed/drain story), `workflows.md` and
+  the node registry (idempotency, `rate`, `window`, subagent caps, priority),
+  `a2a.md` (the unix-socket lane), `architecture.md` (the loop, as it now is —
+  with the measured numbers).
+
 ## v2.4.0 — the display clients grow up
 
 The clients could show you that an agent was working. This release is about

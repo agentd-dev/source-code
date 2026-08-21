@@ -96,6 +96,27 @@ impl Drop for Daemon {
 /// intelligence endpoint is never dialled — every method exercised here is
 /// answered by the protocol layer, not by a model.
 fn boot() -> (Daemon, String, tempdir::TempDir) {
+    // `free_port` binds a port, closes it, and hands back the number — so
+    // between that and the daemon binding, anything on the machine may take it.
+    // With thirteen tests each starting a daemon in parallel, that is not
+    // theoretical: it is the flake that made this job red intermittently, and
+    // it presented as a `ConnectionRefused` several lines later with no clue
+    // why. Retrying the whole boot is the honest fix; the port cannot be
+    // reserved without holding it, and holding it is what stops the daemon
+    // binding it.
+    for attempt in 1..=4 {
+        match try_boot() {
+            Ok(v) => return v,
+            Err(why) if attempt < 4 => {
+                eprintln!("oracle: boot attempt {attempt} failed ({why}); retrying");
+            }
+            Err(why) => panic!("agentd would not start after 4 attempts: {why}"),
+        }
+    }
+    unreachable!()
+}
+
+fn try_boot() -> Result<(Daemon, String, tempdir::TempDir), String> {
     let bin = agentd_bin();
     let tmp = tempdir::TempDir::new();
     let port = free_port();
@@ -113,21 +134,42 @@ fn boot() -> (Daemon, String, tempdir::TempDir) {
              observability:\n  log_level: warn\n"
         ),
     )
-    .expect("write config");
+    .map_err(|e| format!("write config: {e}"))?;
 
-    let child = Command::new(bin)
+    // Keep the daemon's stderr. It used to go to /dev/null, so when the daemon
+    // failed to start the test reported `ConnectionRefused` from a request
+    // several lines later and the actual reason — the port taken, the config
+    // refused — was gone. A harness that discards the only explanation turns a
+    // five-minute fix into an afternoon.
+    let logp = tmp.path().join("agentd.log");
+    let errf = std::fs::File::create(&logp).expect("create daemon log");
+    let mut child = Command::new(bin)
         .args(["--config", cfg.to_str().unwrap()])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(errf))
         .spawn()
         .expect("spawn agentd");
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(&addr).is_err() {
-        assert!(Instant::now() < deadline, "a2a listener never came up");
+    loop {
+        // A daemon that EXITED will never accept a connection, so waiting the
+        // full twenty seconds for it is just a slower way to say the same
+        // thing — badly. Check liveness first and report what it said.
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = std::fs::read_to_string(&logp).unwrap_or_default();
+            return Err(format!("exited before serving ({status}); stderr:\n{log}"));
+        }
+        if TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let log = std::fs::read_to_string(&logp).unwrap_or_default();
+            return Err(format!("listener never came up; stderr:\n{log}"));
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
-    (Daemon(child), addr, tmp)
+    Ok((Daemon(child), addr, tmp))
 }
 
 /// A throwaway directory that cleans up after itself (no dev-dependency needed

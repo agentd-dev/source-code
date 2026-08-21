@@ -144,7 +144,11 @@ fn warm_session_runs_a_turn_per_injected_event_then_ends_on_cancel() {
     let mut tree = Tree::new(Caps::default());
     let node = tree.mint_root().unwrap();
     let (tx, rx) = mpsc::channel();
-    let mut sub = spawn(Path::new(exe), &payload, node, tx).expect("spawn warm subagent");
+    let sink: agentd::supervisor::spawn::FrameSink = {
+        let tx = tx.clone();
+        std::sync::Arc::new(move |n, m| tx.send((n, m)).is_ok())
+    };
+    let mut sub = spawn(Path::new(exe), &payload, node, sink).expect("spawn warm subagent");
 
     // Turn 1 reacts to the payload's instruction, completes, and the session
     // stays warm (no terminal yet).
@@ -185,7 +189,11 @@ fn subagent_round_trips_ready_then_failed() {
     let node = tree.mint_root().unwrap();
 
     let (tx, rx) = mpsc::channel();
-    let _sub = spawn(Path::new(exe), &bogus_payload(), node, tx).expect("spawn subagent");
+    let sink: agentd::supervisor::spawn::FrameSink = {
+        let tx = tx.clone();
+        std::sync::Arc::new(move |n, m| tx.send((n, m)).is_ok())
+    };
+    let _sub = spawn(Path::new(exe), &bogus_payload(), node, sink).expect("spawn subagent");
 
     let msgs = drain_to_terminal(&rx, Instant::now() + Duration::from_secs(20));
 

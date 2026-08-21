@@ -65,7 +65,7 @@ pub struct Child {
 /// The children registry.
 pub struct Children {
     exe: PathBuf,
-    events: Sender<(NodeId, AgentMsg)>,
+    events: crate::supervisor::spawn::FrameSink,
     reap_tx: Sender<Reaped>,
     map: HashMap<NodeId, Child>,
     pid_to_node: HashMap<i32, NodeId>,
@@ -86,7 +86,7 @@ pub struct Children {
 impl Children {
     pub fn new(
         exe: PathBuf,
-        events: Sender<(NodeId, AgentMsg)>,
+        events: crate::supervisor::spawn::FrameSink,
         reap_tx: Sender<Reaped>,
     ) -> Children {
         Children {

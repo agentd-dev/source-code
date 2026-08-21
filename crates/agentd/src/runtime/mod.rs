@@ -391,22 +391,17 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // Child frames ride the SAME channel the loop parks on: a frame arriving
     // while the reactor is in `recv_timeout` must WAKE it, not wait for the
     // tick — a subagent's 5 ms answer used to cost 200 ms of latency exactly
-    // here (measured; the forwarder hop is nanoseconds against that). The
-    // supervisor stays decoupled from the runtime's Event type by the hop.
-    let (child_tx, child_raw_rx) = std::sync::mpsc::channel();
-    {
+    // here (measured). The readers send DIRECTLY — no forwarder thread — so
+    // that joining a child's reader is a real ordering guarantee: everything
+    // it wrote is IN the queue when join returns, and the reap requeued after
+    // it lands behind. (A hop thread broke exactly that on loaded machines:
+    // the requeued reap overtook frames still sitting in the hop's queue.)
+    let child_tx: crate::supervisor::spawn::FrameSink = {
         let events_tx = events_tx.clone();
-        std::thread::Builder::new()
-            .name("child-frames".into())
-            .spawn(move || {
-                while let Ok((node, msg)) = child_raw_rx.recv() {
-                    if events_tx.send(events::Event::Child(node, msg)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .ok();
-    }
+        std::sync::Arc::new(move |node, msg| {
+            events_tx.send(events::Event::Child(node, msg)).is_ok()
+        })
+    };
     let (reap_tx, reap_rx) = std::sync::mpsc::channel();
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agentd"));
 

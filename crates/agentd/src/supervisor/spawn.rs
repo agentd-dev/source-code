@@ -21,7 +21,6 @@ use crate::supervisor::tree::NodeId;
 use std::io;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -46,14 +45,21 @@ pub struct Subagent {
     _cgroup: Option<crate::supervisor::cgroup::CgroupGuard>,
 }
 
+/// Where a child's upward frames land. The reader thread calls this for every
+/// frame, **directly into the queue the consumer drains** — no intermediate
+/// hop, because ordering with other producers (the reap path) is established
+/// by joining the reader, and a hop thread would break that happens-before.
+/// Return `false` when the consumer is gone (stops the reader).
+pub type FrameSink = std::sync::Arc<dyn Fn(NodeId, AgentMsg) -> bool + Send + Sync>;
+
 /// Spawn a subagent that re-execs `exe` (normally `std::env::current_exe()`),
-/// delivering `payload`. Upward messages are forwarded to `events` tagged with
+/// delivering `payload`. Upward messages are handed to `events` tagged with
 /// `node`.
 pub fn spawn(
     exe: &Path,
     payload: &SpawnPayload,
     node: NodeId,
-    events: Sender<(NodeId, AgentMsg)>,
+    events: FrameSink,
 ) -> io::Result<Subagent> {
     let mut cmd = Command::new(exe);
     cmd.env(SUBAGENT_ENV, "1")
@@ -156,7 +162,7 @@ pub fn spawn(
             while let Ok(Some(bytes)) = frame::read_frame(&mut r) {
                 match serde_json::from_slice::<AgentMsg>(&bytes) {
                     Ok(msg) => {
-                        if events.send((node, msg)).is_err() {
+                        if !events(node, msg) {
                             break; // reactor dropped the channel
                         }
                     }

@@ -183,16 +183,16 @@ honours the lifecycle.
         routed item (RFC 0008 first-match)         shard-passed (§4)
                        │
                        ▼
-   ┌──────────┐  work.claim{key,ttl}   ┌─────────────────────────────┐
-   │  CLAIMED │◄──────────────────────►│  coordination MCP server     │
+   ┌──────────┐  work.claim{key,ttl}    ┌──────────────────────────────┐
+   │  CLAIMED │◄───────────────────────►│  coordination MCP server     │
    └────┬─────┘   granted=true          │  (source server OR a thin    │
         │                               │   claim/lease server)        │
         │ process (spawn/continue, RFC 0008 §3.3)                      │
         │   ├─ heartbeat: work.renew{key} every ttl/3 if long-running  │
         ▼                               │                              │
    ┌──────────┐  work.ack{key,run_id}   │                              │
-   │  DONE     ├──────────────────────► │  side effect deduped on key  │
-   └──────────┘                         └─────────────────────────────┘
+   │  DONE    ├────────────────────────►│  side effect deduped on key  │
+   └──────────┘                         └──────────────────────────────┘
         ▲  on clean drain / non-terminal wind-down:
         └─ work.release{key}  ──────────►  item immediately re-claimable
 

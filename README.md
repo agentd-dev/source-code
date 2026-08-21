@@ -77,19 +77,19 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
        │  config → validate → trifecta gate → mode driver → kill ladder   │
        │  limits: steps · tokens · deadline · depth · cgroup mem/pids     │
        └────────────┬─────────────────────────────────────┬───────────────┘
-                    │ spawn (re-exec, narrowed payload)    │ serve (optional)
-       ┌────────────▼────────────────┐        ┌────────────▼───────────────┐
-       │  subagent (agentic loop)    │        │  self-MCP over HTTP(S)     │
-       │  think → tool → observe …   │        │  tools · agent:// resources│
-       │  or: workflow driver        │        │  A2A Tasks · operator ctl  │
-       └──────┬───────────┬──────────┘        └────────────────────────────┘
-              │ HTTPS     │ HTTPS
-       ┌──────▼─────┐ ┌───▼──────────────┐
-       │ intelligence│ │ MCP servers      │
-       │ (one LLM    │ │ --mcp a=https://…│
-       │  endpoint,  │ │ --mcp b=https://…│
-       │  failover)  │ │  tools+resources │
-       └────────────┘ └──────────────────┘
+                    │ spawn (re-exec, narrowed payload)   │ serve (optional)
+       ┌────────────▼────────────────┐       ┌────────────▼───────────────┐
+       │  subagent (agentic loop)    │       │  self-MCP over HTTP(S)     │
+       │  think → tool → observe …   │       │  tools · agent:// resources│
+       │  or: workflow driver        │       │  A2A Tasks · operator ctl  │
+       └──────┬──────────────┬───────┘       └────────────────────────────┘
+              │ HTTPS        │ HTTPS
+       ┌──────▼──────┐  ┌────▼──────────────┐
+       │ intelligence│  │ MCP servers       │
+       │ (one LLM    │  │ --mcp a=https://… │
+       │  endpoint,  │  │ --mcp b=https://… │
+       │  failover)  │  │  tools+resources  │
+       └─────────────┘  └───────────────────┘
 ```
 
 Every network edge is HTTP(S) — the LLM, the MCP servers, the served self-MCP,

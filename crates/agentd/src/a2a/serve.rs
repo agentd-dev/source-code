@@ -94,13 +94,20 @@ struct App {
     log: Logger,
 }
 
+/// Where the listener binds: a TCP authority, or a unix socket path (the
+/// co-located-peer transport — same protocol, kernel-authenticated).
+pub enum Bind {
+    Tcp(String),
+    Unix(String),
+}
+
 /// Start the listener on its own runtime and thread.
 ///
 /// The runtime is separate from everything else agentd does: the reactor is a
 /// blocking single-threaded loop and must stay that way, so the async world is
 /// confined to this listener and reaches the runtime only through [`A2aBridge`].
 pub fn spawn(
-    bind: &str,
+    bind: Bind,
     opts: Opts,
     bridge: Arc<A2aBridge>,
     feed: Option<Arc<SharedFeed>>,
@@ -142,16 +149,35 @@ pub fn spawn(
         .route("/.well-known/agent.json", get(card))
         .with_state(Arc::clone(&app));
 
-    let listener = runtime
-        .block_on(tokio::net::TcpListener::bind(bind))
-        .map_err(|e| format!("a2a bind {bind}: {e}"))?;
-    let bound = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| bind.to_string());
-
-    let tls = opts.tls;
-    runtime.spawn(accept_loop(listener, router, tls, log));
+    let bound;
+    match &bind {
+        Bind::Tcp(authority) => {
+            let listener = runtime
+                .block_on(tokio::net::TcpListener::bind(authority))
+                .map_err(|e| format!("a2a bind {authority}: {e}"))?;
+            bound = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| authority.clone());
+            let tls = opts.tls;
+            runtime.spawn(accept_loop(listener, router, tls, log));
+        }
+        Bind::Unix(path) => {
+            // A stale socket file from a previous life refuses the bind;
+            // unlink it first — the flock on the state dir already guarantees
+            // there is no OTHER live instance of this agent.
+            let _ = std::fs::remove_file(path);
+            let listener = {
+                let _guard = runtime.enter();
+                tokio::net::UnixListener::bind(path).map_err(|e| format!("a2a bind {path}: {e}"))?
+            };
+            // 0600: the filesystem is the outer gate (peer-cred is the inner).
+            let _ =
+                std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+            bound = format!("unix:{path}");
+            runtime.spawn(accept_loop_unix(listener, router, log));
+        }
+    }
 
     Ok(Listener {
         bound,
@@ -190,6 +216,37 @@ async fn accept_loop(
                 }
                 None => serve_conn(sock, router, PeerId::default(), peer, log).await,
             }
+        });
+    }
+}
+
+/// Accept unix-socket connections forever. No TLS layer: the KERNEL is the
+/// authenticator — `SO_PEERCRED` names the calling process's uid, and only the
+/// daemon's own user (or root) gets past this gate. That is strictly stronger
+/// than loopback TCP (which every local user can dial), so the connection gets
+/// the loopback trust posture; a configured bearer still applies on top.
+async fn accept_loop_unix(listener: tokio::net::UnixListener, router: Router, log: Logger) {
+    let me = unsafe { libc::geteuid() };
+    loop {
+        let Ok((sock, _)) = listener.accept().await else {
+            continue;
+        };
+        let uid = match sock.peer_cred() {
+            Ok(cred) => cred.uid(),
+            Err(e) => {
+                log.warn("a2a.unix.denied", json!({"err": e.to_string()}));
+                continue;
+            }
+        };
+        if uid != me && uid != 0 {
+            log.warn("a2a.unix.denied", json!({"uid": uid, "reason": "peer uid"}));
+            continue;
+        }
+        let router = router.clone();
+        let log = log.clone();
+        tokio::spawn(async move {
+            let peer: SocketAddr = "127.0.0.1:0".parse().expect("static addr");
+            serve_conn(sock, router, PeerId::default(), peer, log).await;
         });
     }
 }

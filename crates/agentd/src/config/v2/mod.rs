@@ -132,6 +132,18 @@ fn string_or_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>,
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     pub config_version: Option<String>,
+    /// Operator-defined constants, referenced anywhere in this document and in
+    /// workflow definitions as `{{config.NAME}}` (dotted paths reach into
+    /// nested values). The template prefix is `config.` and NOT `vars.`
+    /// because `vars.*` already names a RUN's own variables — two things
+    /// called `vars` in one template language would be a permanent trap.
+    ///
+    /// Substitution is fail-closed: a reference to an undefined name refuses
+    /// startup naming every unresolved reference at once. In workflows the
+    /// values fold in at LOAD time, so they participate in the definition hash
+    /// — a var change is a definition change, and in-flight runs stay pinned
+    /// to the definition they started with.
+    pub vars: BTreeMap<String, Value>,
     pub agent: Agent,
     pub intelligence: Intelligence,
     pub mcp: Mcp,
@@ -768,6 +780,14 @@ pub enum StoreKind {
 pub struct StoreFile {
     #[serde(default)]
     pub path: Option<String>,
+    /// Shed new work when the store's filesystem has less than this free
+    /// (`256MB`, `1.5GiB`, plain bytes; `"0"` disables). Warn at twice it.
+    /// Default 256MB: a checkpoint failure at ENOSPC HALTS the daemon, so with
+    /// under a quarter-gig free, refusing new runs while draining the current
+    /// ones is almost certainly what the operator would have chosen — and the
+    /// alternative was choosing nothing and dying mid-write.
+    #[serde(default)]
+    pub min_free: Option<String>,
 }
 
 /// The `file` store's root directory (RFC 0033 §4), first that applies:
@@ -1429,6 +1449,28 @@ pub struct Security {
     pub aauth: Option<AAuth>,
     pub cgroup: Cgroup,
     pub exec: Exec,
+    pub workflows: WorkflowSecurity,
+}
+
+/// Whether the agent may rewrite its own workflows.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct WorkflowSecurity {
+    /// Refuse `workflow.create` / `.update` / `.delete` at runtime.
+    ///
+    /// Workflows are the agent's *standing instructions* — what it does when a
+    /// schedule fires or a webhook lands, unattended. An agent that can rewrite
+    /// them can quietly change what happens next time, and the change survives
+    /// the conversation that caused it. Anywhere a definition is reviewed
+    /// before it ships — a file in git, a config a deploy applies — self-update
+    /// is not a feature, it is a hole in that review.
+    ///
+    /// Off by default, because the runtime-created workflow is a real workflow
+    /// (`docs/workflows.md`); turn it on and definitions become read-only, from
+    /// the config and the store, for everyone: the model, a subagent, and an
+    /// operator over A2A alike. Loading is unaffected — the daemon still reads
+    /// files, URLs and directories at startup.
+    pub immutable: bool,
 }
 
 /// The local command-runner controls (RFC 0028 §exec). agentd's default posture
@@ -1478,9 +1520,207 @@ pub struct Cgroup {
     pub pids_max: Option<String>,
 }
 
+/// One `{{…}}` reference found by [`scan_references`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FoundRef {
+    /// `secret` | `secret-file` | `config`.
+    pub kind: &'static str,
+    pub name: String,
+    /// Where it sat (a dotted path into the document).
+    pub at: String,
+}
+
+/// Collect every `{{secret:…}}`, `{{secret-file:…}}` and `{{config.…}}`
+/// reference in `value`, with where each sits.
+///
+/// This exists so a deployment can be checked in ONE pass: the alternative —
+/// failing on whichever reference happens to be evaluated first — turns
+/// configuring a new instance into a guessing game played one restart at a
+/// time, entering values one failure per attempt.
+pub fn scan_references(value: &Value, at: &str, out: &mut Vec<FoundRef>) {
+    match value {
+        Value::String(s) => {
+            let mut rest = s.as_str();
+            while let Some(open) = rest.find("{{") {
+                let after = &rest[open + 2..];
+                let Some(close) = after.find("}}") else { break };
+                let token = after[..close].trim();
+                if let Some(n) = token.strip_prefix("secret:") {
+                    out.push(FoundRef {
+                        kind: "secret",
+                        name: n.trim().into(),
+                        at: at.into(),
+                    });
+                } else if let Some(p) = token.strip_prefix("secret-file:") {
+                    out.push(FoundRef {
+                        kind: "secret-file",
+                        name: p.trim().into(),
+                        at: at.into(),
+                    });
+                } else if let Some(c) = token.strip_prefix("config.") {
+                    out.push(FoundRef {
+                        kind: "config",
+                        name: c.trim().into(),
+                        at: at.into(),
+                    });
+                }
+                rest = &after[close + 2..];
+            }
+        }
+        Value::Array(a) => {
+            for (i, v) in a.iter().enumerate() {
+                scan_references(v, &format!("{at}[{i}]"), out);
+            }
+        }
+        Value::Object(o) => {
+            for (k, v) in o {
+                scan_references(v, &format!("{at}.{k}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The references in `value` that would NOT resolve right now — secrets against
+/// the environment (and any interactively-entered values), secret-files against
+/// the filesystem, `config.*` against `vars`. One message per missing
+/// reference, deduplicated, every location listed.
+pub fn missing_references(value: &Value, at: &str, vars: &BTreeMap<String, Value>) -> Vec<String> {
+    let mut found = Vec::new();
+    scan_references(value, at, &mut found);
+    let mut by_ref: BTreeMap<(&'static str, String), Vec<String>> = BTreeMap::new();
+    for r in found {
+        let missing = match r.kind {
+            "secret" => !crate::sec::secret::secret_available(&r.name),
+            "secret-file" => std::fs::metadata(&r.name).is_err(),
+            "config" => {
+                let mut parts = r.name.split('.');
+                let mut cur = parts.next().and_then(|p| vars.get(p));
+                for p in parts {
+                    cur = cur.and_then(|v| v.get(p));
+                }
+                cur.is_none()
+            }
+            _ => false,
+        };
+        if missing {
+            by_ref.entry((r.kind, r.name)).or_default().push(r.at);
+        }
+    }
+    by_ref
+        .into_iter()
+        .map(|((kind, name), ats)| {
+            let what = match kind {
+                "secret" => format!("{{{{secret:{name}}}}} is not set in the environment"),
+                "secret-file" => format!("{{{{secret-file:{name}}}}} is not readable"),
+                _ => format!("config.{name} is not defined in vars"),
+            };
+            format!("{what} (referenced at {})", ats.join(", "))
+        })
+        .collect()
+}
+
+/// Substitute `{{config.NAME}}` tokens in `value` from `vars`, appending every
+/// unresolved reference to `errs` (with `at` naming where it sat).
+///
+/// A string that IS exactly one token takes the variable's typed value — a
+/// number stays a number. A token embedded in a longer string is stringified
+/// into place. There is no escape syntax: an unresolved reference is an error
+/// rather than a literal, because a URL that still contains `{{config.region}}`
+/// at runtime is a bug wherever it was headed.
+pub fn substitute_config_vars(
+    value: &mut Value,
+    vars: &BTreeMap<String, Value>,
+    at: &str,
+    errs: &mut Vec<String>,
+) {
+    fn lookup<'a>(vars: &'a BTreeMap<String, Value>, path: &str) -> Option<&'a Value> {
+        let mut parts = path.split('.');
+        let mut cur = vars.get(parts.next()?)?;
+        for p in parts {
+            cur = cur.get(p)?;
+        }
+        Some(cur)
+    }
+    fn token_at(s: &str, from: usize) -> Option<(usize, usize, String)> {
+        let start = s[from..].find("{{config.")? + from;
+        let end = s[start..].find("}}")? + start + 2;
+        let name = s[start + 9..end - 2].trim().to_string();
+        Some((start, end, name))
+    }
+    match value {
+        Value::String(s) => {
+            // The whole string is one token: keep the value's TYPE.
+            if let Some((0, end, name)) = token_at(s, 0)
+                && end == s.len()
+            {
+                match lookup(vars, &name) {
+                    Some(v) => *value = v.clone(),
+                    None => errs.push(format!("{at}: config.{name} is not defined in vars")),
+                }
+                return;
+            }
+            let mut out = String::new();
+            let mut pos = 0;
+            while let Some((start, end, name)) = token_at(s, pos) {
+                out.push_str(&s[pos..start]);
+                match lookup(vars, &name) {
+                    Some(Value::String(v)) => out.push_str(v),
+                    Some(v) => out.push_str(&v.to_string()),
+                    None => {
+                        errs.push(format!("{at}: config.{name} is not defined in vars"));
+                        out.push_str(&s[start..end]);
+                    }
+                }
+                pos = end;
+            }
+            if pos > 0 {
+                out.push_str(&s[pos..]);
+                *s = out;
+            }
+        }
+        Value::Array(a) => {
+            for (i, v) in a.iter_mut().enumerate() {
+                substitute_config_vars(v, vars, &format!("{at}[{i}]"), errs);
+            }
+        }
+        Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                substitute_config_vars(v, vars, &format!("{at}.{k}"), errs);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Settings {
     /// Type a settings document. `source` names it in errors.
-    pub fn from_document(doc: Value, source: &str) -> Result<Settings, String> {
+    ///
+    /// `{{config.*}}` substitution happens here, before typing — so a var can
+    /// sit anywhere a string can: an endpoint, a path, a header. The
+    /// `workflows` array is deliberately left alone; workflow documents are
+    /// substituted at LOAD time instead (`load_workflows`), where the ones
+    /// arriving from files, URLs and directories can be treated identically to
+    /// inline ones.
+    pub fn from_document(mut doc: Value, source: &str) -> Result<Settings, String> {
+        let vars: BTreeMap<String, Value> = doc
+            .get("vars")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let workflows = doc.as_object_mut().and_then(|o| o.remove("workflows"));
+        let mut errs = Vec::new();
+        substitute_config_vars(&mut doc, &vars, source, &mut errs);
+        if let (Some(o), Some(w)) = (doc.as_object_mut(), workflows) {
+            o.insert("workflows".into(), w);
+        }
+        if !errs.is_empty() {
+            return Err(format!(
+                "{} unresolved config var reference(s):\n  {}",
+                errs.len(),
+                errs.join("\n  ")
+            ));
+        }
         serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))
     }
 
@@ -1540,6 +1780,7 @@ pub const V2_KEYS: &[&str] = &[
     "skills",
     "memory",
     "context",
+    "vars",
 ];
 
 /// v1 (flat) top-level keys.
@@ -2240,6 +2481,30 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         files,
         warnings: Vec::new(),
     };
+    // `--prompt-missing`, before validation: the person is standing at a
+    // terminal ready to supply what is missing, so ask FIRST and let the
+    // validation that follows see the values — otherwise the aggregate error
+    // below exits before a prompt could ever appear. Only in run mode: a
+    // `--validate-config` must stay side-effect-free and report, not converse.
+    if ask == Ask::Run && crate::config::prompt::prompt_missing_requested() {
+        let mut found = Vec::new();
+        scan_references(&loaded.doc, "config", &mut found);
+        let mut names: Vec<String> = found
+            .into_iter()
+            .filter(|r| r.kind == "secret" && !crate::sec::secret::secret_available(&r.name))
+            .map(|r| r.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            match crate::config::prompt::read_secret_from_tty(&format!("{name} (secret)")) {
+                Ok(v) => crate::sec::secret::set_prompted(&name, v),
+                // A failed prompt (no terminal, EOF) falls through to the
+                // normal aggregate refusal below, which names what is missing.
+                Err(_) => break,
+            }
+        }
+    }
     let diags = validate(&loaded);
     warnings.extend(diags.warnings);
     loaded.warnings = warnings;
@@ -2251,7 +2516,20 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         && !matches!(ask, Ask::Login(_) | Ask::Logout(_))
         && let Some(first) = diags.errors.first()
     {
-        return Err(usage(first.clone()));
+        // ALL of them, not the first. Failing on whichever error happens to
+        // sort first turns fixing a config into a loop of restart, read one
+        // line, fix one thing — the aggregate report is the whole point of
+        // validating everything up front.
+        let msg = if diags.errors.len() == 1 {
+            first.clone()
+        } else {
+            format!(
+                "{} configuration errors:\n  - {}",
+                diags.errors.len(),
+                diags.errors.join("\n  - ")
+            )
+        };
+        return Err(usage(msg));
     }
     if ask == Ask::Validate && !diags.errors.is_empty() {
         return Err(ConfigError::Validate(Err(diags
@@ -2696,7 +2974,12 @@ fn unresolved_secret_ref(value: &str) -> Option<String> {
     if !crate::sec::secret::has_secret_ref(value) {
         return None;
     }
-    crate::sec::secret::refs_resolvable(value, &|k| std::env::var(k).ok()).err()
+    // Interactively-entered values (`--prompt-missing`) count as resolvable:
+    // by the time the runtime dereferences the ref, the prompted store answers.
+    crate::sec::secret::refs_resolvable(value, &|k| {
+        crate::sec::secret::prompted_of(k).or_else(|| std::env::var(k).ok())
+    })
+    .err()
 }
 
 pub fn validate(loaded: &Loaded) -> Diagnostics {
@@ -3033,6 +3316,12 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(&mut d, format!("workflows[{i}] must be an object"));
             continue;
         };
+        // A `{dir}` entry names no workflow: it expands into one per matching
+        // file, and each file carries its own name. Requiring one here would
+        // mean inventing a name for a set.
+        if obj.contains_key("dir") {
+            continue;
+        }
         let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
         if name.trim().is_empty() {
             err(&mut d, format!("workflows[{i}] has no name"));
@@ -3042,13 +3331,19 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("workflows[]: duplicate workflow name '{name}'"),
             );
         }
-        let has_file = obj.contains_key("file");
-        let has_uri = obj.contains_key("uri");
-        let has_steps = obj.contains_key("steps");
-        if (has_file as u8 + has_uri as u8 + has_steps as u8) != 1 {
+        // One entry, one source. `dir` is not in this list because a dir entry
+        // returned above — it names a SET, and each file it expands to gets
+        // checked as its own entry.
+        let sources = ["file", "uri", "url", "steps"]
+            .iter()
+            .filter(|k| obj.contains_key(**k))
+            .count();
+        if sources != 1 {
             err(
                 &mut d,
-                format!("workflows['{name}'] must have exactly one of file | uri | steps"),
+                format!(
+                    "workflows['{name}'] must have exactly one of file | uri | url | steps (dir is a separate entry shape)"
+                ),
             );
         }
         if let Some(f) = obj.get("file").and_then(Value::as_str)
@@ -3108,6 +3403,20 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                         &mut d,
                         "a2a.listen plaintext http:// is allowed for loopback only; use https://"
                             .into(),
+                    );
+                }
+            }
+            Ok(super::ServeTarget::Unix { .. }) => {
+                // The kernel is the authenticator: only same-uid (or root)
+                // peers may connect, so TLS material is meaningless here and
+                // configuring it is a sign of a misunderstood posture.
+                if s.a2a.tls.cert.is_some()
+                    || s.a2a.tls.key.is_some()
+                    || s.a2a.tls.client_ca.is_some()
+                {
+                    err(
+                        &mut d,
+                        "a2a.listen is unix:// — the kernel authenticates peers (same-uid); a2a.tls does not apply and must be unset".into(),
                     );
                 }
             }
@@ -3201,6 +3510,12 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     }
     if let Some(l) = &s.webhooks.listen {
         match super::ServeTarget::parse(l) {
+            Ok(super::ServeTarget::Unix { .. }) => {
+                err(
+                    &mut d,
+                    "webhooks.listen does not support unix:// (webhooks are an external surface); use https://".into(),
+                );
+            }
             Ok(super::ServeTarget::Http { bind, tls }) => {
                 let loopback = crate::net::http::is_loopback_host(super::serve_host_of(&bind));
                 if tls && (s.webhooks.tls.cert.is_none() || s.webhooks.tls.key.is_none()) {
@@ -3293,10 +3608,20 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("a2a.peers[]: duplicate peer name '{}'", p.name),
             );
         }
-        if !p.endpoint.starts_with("https://") && !p.endpoint.starts_with("http://") {
+        let unix_peer = p.endpoint.starts_with("unix://") || p.endpoint.starts_with("unix:");
+        if unix_peer && !cfg!(unix) {
             err(
                 &mut d,
-                format!("a2a peer '{}': endpoint must be http(s)://", p.name),
+                format!("a2a peer '{}': unix:// endpoints are unix-only", p.name),
+            );
+        }
+        if !unix_peer && !p.endpoint.starts_with("https://") && !p.endpoint.starts_with("http://") {
+            err(
+                &mut d,
+                format!(
+                    "a2a peer '{}': endpoint must be http(s):// (or unix:///path for a co-located peer)",
+                    p.name
+                ),
             );
         }
         if p.client_cert.is_some() != p.client_key.is_some() {
@@ -3436,8 +3761,37 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             ));
         }
     }
+    // The reference preflight, aggregated: every secret, secret-file and config
+    // var an INLINE workflow mentions, checked now and reported TOGETHER.
+    // (Definitions arriving from files, URLs and directories get the same check
+    // at startup, after they are fetched.) Failing on whichever reference
+    // happens to be evaluated first turns configuring a deployment into a
+    // guessing game played one restart at a time.
+    for (i, w) in s.workflows.iter().enumerate() {
+        if w.get("steps").is_some() {
+            for msg in missing_references(w, &format!("workflows[{i}]"), &s.vars) {
+                err(&mut d, msg);
+            }
+        }
+    }
     for w in &s.workflows {
+        // A reference — file, uri, url or dir — resolves at startup, so there
+        // is nothing to parse here. Only inline definitions are checkable.
         if w.get("steps").is_none() {
+            // A credential in a `headers` value must be a reference, the same
+            // rule every other header in this config follows.
+            if let Some(h) = w.get("headers").and_then(Value::as_object) {
+                for (k, v) in h {
+                    if let Some(val) = v.as_str()
+                        && super::is_secret_shaped_key(k)
+                        && !crate::sec::secret::has_secret_ref(val)
+                    {
+                        d.errors.push(format!(
+                            "workflows: headers[{k:?}] looks like a credential — use {{{{secret:NAME}}}} rather than a literal"
+                        ));
+                    }
+                }
+            }
             continue;
         }
         if let Err(errs) = crate::engine::model::parse_workflow(w) {
@@ -3738,6 +4092,8 @@ pub fn help_text() -> String {
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
          \x20 --logout <target>          evict a cached credential\n\
+         \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
+         \x20 --env <FILE>               load a dotenv file into this process's environment (repeatable; real env wins, later files win)\n\
          \x20 -h, --help / -V, --version\n\
          \nREMOVED IN 2.0:\n",
     );
@@ -4273,6 +4629,100 @@ mod tests {
     }
 
     #[test]
+    fn config_vars_fold_typed_values_and_collect_every_miss() {
+        let file = write_tmp(
+            "config_version: \"2\"\n\
+             vars:\n  region: eu-1\n  port: 8443\n  team:\n    name: platform\n\
+             agent:\n  name: \"svc-{{config.region}}\"\n  instruction: serve\n  preflight: never\n\
+             intelligence:\n  endpoints: [https://x/v1]\n  model: m\n\
+             store:\n  kind: memory\n\
+             limits:\n  step_timeout: \"{{config.port}}s\"\n\
+             workflows:\n  - name: w\n    steps:\n\
+             \x20     s: {kind: once}\n\
+             \x20     c: {kind: http, depends_on: [s], url: \"https://api.{{config.region}}.example\", headers: {x-team: \"{{config.team.name}}\"}}\n\
+             \x20     f: {kind: finish, depends_on: [c]}\n",
+            "yaml",
+        );
+        let (l, _) = load(
+            &args(&["--config", file.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        // Embedded token: stringified into place, in config values…
+        assert_eq!(l.settings.agent.name.as_deref(), Some("svc-eu-1"));
+        // A folded scalar keeps its place in typed config too.
+        assert_eq!(
+            l.settings
+                .limits
+                .step_timeout
+                .as_ref()
+                .map(|d| d.0.as_secs()),
+            Some(8443)
+        );
+        // Workflow docs are deliberately NOT folded here: `load_workflows`
+        // folds them (so URL/file/dir sources get the identical treatment and
+        // the definition hash pins the RESOLVED doc) — the e2e proves that leg.
+        let wf = &l.settings.workflows[0];
+        assert_eq!(
+            wf.pointer("/steps/c/url").and_then(Value::as_str),
+            Some("https://api.{{config.region}}.example")
+        );
+
+        // Every unresolved reference is reported, in ONE refusal.
+        let bad = write_tmp(
+            "config_version: \"2\"\n\
+             vars:\n  set: yes\n\
+             agent:\n  name: \"{{config.gone}}\"\n  instruction: serve\n  preflight: never\n\
+             intelligence:\n  endpoints: [\"https://{{config.also_gone}}/v1\"]\n  model: m\n\
+             store:\n  kind: memory\n",
+            "yaml",
+        );
+        let err = load(
+            &args(&["--config", bad.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("config.gone"), "{err}");
+        assert!(err.contains("config.also_gone"), "{err}");
+        assert!(
+            err.contains("2 unresolved config var reference"),
+            "all misses in one report: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_references_name_every_gap_with_its_locations() {
+        let doc = serde_json::json!({
+            "a": "{{secret:SUB_WINDOW_TEST_UNSET}}",
+            "b": {"c": ["{{secret-file:/definitely/not/here}}", "{{config.gone}}"]},
+            "d": "{{secret:SUB_WINDOW_TEST_UNSET}} again",
+        });
+        let vars: std::collections::BTreeMap<String, Value> =
+            [("present".to_string(), serde_json::json!(1))].into();
+        let missing = missing_references(&doc, "cfg", &vars);
+        assert_eq!(missing.len(), 3, "{missing:?}");
+        let all = missing.join("\n");
+        assert!(
+            all.contains("{{secret:SUB_WINDOW_TEST_UNSET}} is not set"),
+            "{all}"
+        );
+        assert!(
+            all.contains("cfg.a") && all.contains("cfg.d"),
+            "both locations: {all}"
+        );
+        assert!(
+            all.contains("{{secret-file:/definitely/not/here}} is not readable"),
+            "{all}"
+        );
+        assert!(all.contains("config.gone is not defined in vars"), "{all}");
+        // A resolvable reference is not noise.
+        let ok = serde_json::json!({"x": "{{config.present}}"});
+        assert!(missing_references(&ok, "cfg", &vars).is_empty());
+    }
+
+    #[test]
     fn env_substitution_reaches_config_values_and_workflows() {
         let file = write_tmp(
             "config_version: \"2\"\n\
@@ -4596,6 +5046,7 @@ mod tests {
         let with_file = |path: Option<&str>| Store {
             file: Some(StoreFile {
                 path: path.map(str::to_string),
+                min_free: None,
             }),
             ..Store::default()
         };

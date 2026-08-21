@@ -279,3 +279,55 @@ fn a_sigkill_mid_batch_resumes_at_the_next_batch() {
     let v = stdout_json(&out2);
     assert_eq!(v, serde_json::json!([10, 20, 30, 40, 50, 60]));
 }
+
+#[test]
+fn config_vars_fold_into_workflow_definitions_at_load_keeping_types() {
+    // `{{config.*}}` tokens inside a workflow doc are folded when the workflow
+    // is LOADED — before the definition hash, before any run — so by run time
+    // they are plain values. An exact-token reference keeps the var's TYPE
+    // (port stays a number); an embedded one stringifies into place.
+    let steps = r#"{
+        "start": {"kind": "once"},
+        "t": {"kind": "template", "depends_on": ["start"], "text": "region={{config.region}} team={{config.team.name}}"},
+        "typed": {"kind": "assign", "depends_on": ["t"], "value": "{{config.port}}"},
+        "done": {"kind": "finish", "depends_on": ["typed"], "status": "completed",
+                 "output": {"text": "{{steps.t.output}}", "typed": "{{steps.typed.output}}"}}
+    }"#;
+    let cfg = job(
+        steps,
+        "vars:\n  region: eu-1\n  port: 8443\n  team:\n    name: platform\n",
+    );
+    let out = run_agentd(&cfg, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    let v = stdout_json(&out);
+    assert_eq!(
+        v["text"],
+        serde_json::json!("region=eu-1 team=platform"),
+        "{v}"
+    );
+    assert_eq!(
+        v["typed"],
+        serde_json::json!(8443),
+        "an exact-token config var keeps its type: {v}"
+    );
+}
+
+#[test]
+fn a_workflow_referencing_an_undefined_config_var_is_refused_at_startup() {
+    let steps = r#"{
+        "start": {"kind": "once"},
+        "t": {"kind": "template", "depends_on": ["start"], "text": "{{config.never_defined}}"},
+        "done": {"kind": "finish", "depends_on": ["t"], "status": "completed"}
+    }"#;
+    let cfg = job(steps, "vars:\n  region: eu-1\n");
+    let out = run_agentd(&cfg, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Fail-closed at admission (exit 2), naming the reference — not a run that
+    // dies later with a half-rendered value.
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("config.never_defined"),
+        "the refusal names the missing var:\n{stderr}"
+    );
+}

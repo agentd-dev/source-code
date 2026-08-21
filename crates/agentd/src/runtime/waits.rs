@@ -22,6 +22,31 @@ use serde_json::{Map, Value, json};
 use std::time::Duration;
 
 /// A durable wait record kept in `StepState.wait`.
+/// The message id an `idempotency:` declaration asks for — the step's derived
+/// key, or the declared `value` (an application-level identity, which is
+/// stronger: it also collides two different RUNS attempting the same
+/// real-world operation). `None` when the step declared nothing, keeping
+/// today's unique-per-send minting: a `goto` re-entry is a LOGICALLY new send,
+/// and silently deduping it on a peer would lose notifications — so retry
+///-safety here is opt-in, per node, like everywhere else.
+#[cfg(feature = "a2a")]
+fn idempotency_message_id(
+    spec: &Map<String, Value>,
+    run_id: &str,
+    step_id: &str,
+) -> Option<String> {
+    let idem = spec.get("idempotency")?;
+    if idem.as_bool() == Some(false) {
+        return None;
+    }
+    Some(
+        idem.get("value")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::engine::run::idempotency_key(run_id, step_id)),
+    )
+}
+
 pub(crate) fn wait_record(kind: &str, extra: Value, timeout_ms: Option<u64>) -> Value {
     let mut w = json!({"kind": kind, "since_ms": now_ms()});
     if let Some(t) = timeout_ms {
@@ -143,6 +168,7 @@ impl Runtime {
                     "tools",
                     "servers",
                     "limits",
+                    "priority",
                     "context",
                     "output_contract",
                     "output_schema",
@@ -987,6 +1013,7 @@ impl Runtime {
                 return;
             }
         };
+        let message_id = idempotency_message_id(spec, run_id, step_id);
         let tx = self.events_tx.clone();
         let (r, st) = (run_id.to_string(), step_id.to_string());
         self.executing
@@ -1004,6 +1031,7 @@ impl Runtime {
                     auth,
                     &parts,
                     context.as_deref(),
+                    message_id.as_deref(),
                     deadline,
                 ) {
                     Ok(v) => (v, false, None),
@@ -1050,6 +1078,7 @@ impl Runtime {
                 return;
             }
         };
+        let message_id = idempotency_message_id(spec, run_id, step_id);
         let tx = self.events_tx.clone();
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
@@ -1067,6 +1096,7 @@ impl Runtime {
                     auth,
                     &objective,
                     contract.as_deref(),
+                    message_id.as_deref(),
                     deadline,
                 ) {
                     crate::mcp::a2a_client::DelegateOutcome::Distillate(text) => (

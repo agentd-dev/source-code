@@ -9,6 +9,7 @@
  *
  *   node tools/frames.mjs > ../docs/_tui-frames.json
  */
+import './_force_color.mjs';
 import React from 'react';
 import { render } from 'ink-testing-library';
 import { Mirror } from '../dist/client/index.js';
@@ -43,7 +44,7 @@ function boot(cols = 92, rows = 26) {
 }
 
 const INFO = {
-  enabled: true, debug: true, version: '2.3.0', instance: 'triage-1', model: 'gpt-5.1',
+  enabled: true, debug: true, version: '2.5.0', instance: 'triage-1', model: 'gpt-5.1',
   protocol: 1, feed: { ring: 1024, method: 'SubscribeToEvents' }, ops: [],
 };
 

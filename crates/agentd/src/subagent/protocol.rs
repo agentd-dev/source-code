@@ -453,6 +453,18 @@ pub struct Limits {
     /// (Detector A, RFC 0003).
     pub deadline_ms: u64,
     pub max_depth: u32,
+    /// OS-level caps, applied between fork and exec (`setrlimit`) — real
+    /// resource allocation, not protocol accounting. `None` = inherit.
+    /// `memory_bytes` → `RLIMIT_AS`; `cpu_seconds` → `RLIMIT_CPU` (the kernel
+    /// sends SIGXCPU at the soft cap, SIGKILL at hard = soft + 5 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<u64>,
+    /// Niceness delta from `priority:` (`low` → +10, `high` → −5 best-effort —
+    /// raising needs privilege and is skipped silently without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nice: Option<i32>,
 }
 
 /// The correlation block stamped into the child's logs (RFC 0010
@@ -509,6 +521,9 @@ mod tests {
                 max_tokens: 100_000,
                 deadline_ms: 600_000,
                 max_depth: 4,
+                memory_bytes: None,
+                cpu_seconds: None,
+                nice: None,
             },
             telemetry: Telemetry {
                 run_id: "r1".into(),

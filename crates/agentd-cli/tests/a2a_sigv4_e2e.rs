@@ -82,7 +82,7 @@ fn outbound_a2a_is_sigv4_signed_for_aws_peer_auth() {
     };
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    match delegate(&ep, auth, "do the work", None, deadline) {
+    match delegate(&ep, auth, "do the work", None, None, deadline) {
         DelegateOutcome::Distillate(s) => assert_eq!(s, "signed ok"),
         DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
     }

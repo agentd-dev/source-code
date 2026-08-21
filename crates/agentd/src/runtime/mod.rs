@@ -12,7 +12,7 @@
 
 #[cfg(feature = "a2a")]
 pub mod a2a_server;
-pub mod activity; // live per-turn activity for the display clients (RFC 0032 §17)
+pub mod activity;
 pub mod artifacts;
 pub mod audit;
 pub mod children;
@@ -23,6 +23,7 @@ pub mod goal;
 pub mod http_node;
 pub mod human; // human-in-the-loop: ask_human gates + fallbacks (RFC 0032 §16)
 pub mod nested;
+pub mod pressure; // live per-turn activity for the display clients (RFC 0032 §17)
 pub mod reactor;
 pub mod reload;
 pub mod starts;
@@ -53,6 +54,59 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Run the 2.0 runtime for a loaded v2 configuration. Returns the exit code.
+/// Check every secret reference in `doc`; prompt for the promptable ones when
+/// `--prompt-missing` was given and a controlling terminal exists; report
+/// whatever is still missing — all of it, together — and return the exit code
+/// if startup cannot proceed.
+///
+/// Only `{{secret:NAME}}` is promptable: a missing `{{secret-file:…}}` is a
+/// path that does not exist (typing its CONTENT at a prompt would not make the
+/// file appear), and an undefined `{{config.…}}` is an authoring error whose
+/// fix belongs in the file, not in a terminal that will forget it.
+fn reference_preflight(
+    doc: &Value,
+    settings: &crate::config::v2::Settings,
+    at: &str,
+    log: &Logger,
+) -> Option<i32> {
+    let mut missing = crate::config::v2::missing_references(doc, at, &settings.vars);
+    if missing.is_empty() {
+        return None;
+    }
+    if crate::config::prompt::prompt_missing_requested() {
+        let mut found = Vec::new();
+        crate::config::v2::scan_references(doc, at, &mut found);
+        let mut names: Vec<String> = found
+            .into_iter()
+            .filter(|r| r.kind == "secret" && !crate::sec::secret::secret_available(&r.name))
+            .map(|r| r.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            match crate::config::prompt::read_secret_from_tty(&format!("{name} (secret)")) {
+                Ok(v) => crate::sec::secret::set_prompted(&name, v),
+                Err(e) => {
+                    log.error("prompt.failed", json!({"secret": name, "err": e}));
+                    break;
+                }
+            }
+        }
+        missing = crate::config::v2::missing_references(doc, at, &settings.vars);
+        if missing.is_empty() {
+            return None;
+        }
+    }
+    for m in &missing {
+        log.error("config.invalid", json!({"error": m}));
+    }
+    log.error(
+        "proc.exit",
+        json!({"code": crate::exit::USAGE, "err": format!("{} unresolved reference(s)", missing.len())}),
+    );
+    Some(crate::exit::USAGE)
+}
+
 pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     let settings = loaded.settings.clone();
     let instance = settings.instance_name();
@@ -85,6 +139,14 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
     crate::signals::install();
     crate::supervisor::reap::set_child_subreaper();
+
+    // The reference preflight, phase 1: every `{{secret:…}}` / `{{secret-file:…}}`
+    // visible in the assembled document, checked BEFORE anything dials out —
+    // reported together, optionally filled in interactively. Phase 2 runs after
+    // workflow loading, for definitions that arrive from files and URLs.
+    if let Some(code) = reference_preflight(&loaded.doc, &settings, "config", &log) {
+        return code;
+    }
     let envmap = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
 
     // Outbound trust anchor.
@@ -326,7 +388,25 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
 
     // Channels.
     let (events_tx, events_rx) = std::sync::mpsc::channel();
-    let (child_tx, child_rx) = std::sync::mpsc::channel();
+    // Child frames ride the SAME channel the loop parks on: a frame arriving
+    // while the reactor is in `recv_timeout` must WAKE it, not wait for the
+    // tick — a subagent's 5 ms answer used to cost 200 ms of latency exactly
+    // here (measured; the forwarder hop is nanoseconds against that). The
+    // supervisor stays decoupled from the runtime's Event type by the hop.
+    let (child_tx, child_raw_rx) = std::sync::mpsc::channel();
+    {
+        let events_tx = events_tx.clone();
+        std::thread::Builder::new()
+            .name("child-frames".into())
+            .spawn(move || {
+                while let Ok((node, msg)) = child_raw_rx.recv() {
+                    if events_tx.send(events::Event::Child(node, msg)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+    }
     let (reap_tx, reap_rx) = std::sync::mpsc::channel();
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agentd"));
 
@@ -337,6 +417,33 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             tokens::window_for_model(&model)
         }
     });
+    // Pressure watches the FILE store's filesystem (a memory/mcp/http store's
+    // durability does not live on this disk). `min_free` defaults to 256MB:
+    // a checkpoint failure at ENOSPC halts the daemon, so at that point
+    // shedding new work while draining is strictly better than dying mid-write.
+    let pressure = {
+        use crate::config::v2::StoreKind;
+        let (path, shed) = if settings.store.kind == StoreKind::File {
+            let root = crate::config::v2::file_store_root(&settings.store);
+            let min = settings
+                .store
+                .file
+                .as_ref()
+                .and_then(|f| f.min_free.as_deref())
+                .map(super::runtime::pressure::parse_bytes)
+                .transpose()
+                .unwrap_or_else(|e| {
+                    log.warn("config.warning", json!({"warning": format!("store.file.min_free: {e}; using the 256MB default")}));
+                    None
+                })
+                .unwrap_or(256 << 20);
+            (Some(root), min)
+        } else {
+            (None, 0)
+        };
+        std::sync::Arc::new(pressure::Pressure::new(path, shed))
+    };
+
     let mut rt = Runtime {
         instance: instance.clone(),
         run_id: run_id.clone(),
@@ -358,7 +465,6 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         timers: timers::Timers::new(),
         events_rx,
         events_tx,
-        child_rx,
         reap_rx,
         pending: Vec::new(),
         turn_queue: Default::default(),
@@ -419,6 +525,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         )),
         #[cfg(feature = "a2a")]
         webhook_sync: std::collections::HashMap::new(),
+        pressure: pressure.clone(),
+        pressure_seen: pressure::Level::Ok,
+        resched: false,
+        reap_deferred: Default::default(),
         settings_doc: loaded.doc.clone(),
         args: args.to_vec(),
         env: env.to_vec(),
@@ -527,6 +637,30 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         return crate::exit::USAGE;
     }
     // Workflows (RFC 0027) — refused definitions are a config error.
+    // Phase 2 of the reference preflight: the workflows are loaded now, so the
+    // ones that arrived from files, URLs and directories are visible. A secret
+    // that only a fetched definition mentions is found HERE, before any start
+    // node arms — not at 03:00 when the schedule first fires the step that
+    // needed it.
+    {
+        let mut all = serde_json::Map::new();
+        for (name, wf) in &rt.workflows {
+            let mut steps = serde_json::Map::new();
+            for (sid, step) in &wf.steps {
+                steps.insert(
+                    sid.clone(),
+                    Value::Object(step.spec.clone().into_iter().collect()),
+                );
+            }
+            all.insert(name.clone(), Value::Object(steps));
+        }
+        if let Some(code) =
+            reference_preflight(&Value::Object(all), &rt.settings, "workflows", &rt.log)
+        {
+            return code;
+        }
+    }
+
     // `on_replay` was published in the JSON Schema, documented, and read by
     // nothing: every in-flight step was re-executed on restore regardless. Now
     // the declared policy decides. `retry` (the default) keeps the old
@@ -679,14 +813,20 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // a daemon that can't serve its declared webhooks is misconfigured.
     #[cfg(feature = "a2a")]
     if rt.settings.webhooks.listen.is_some() {
-        let nodes: Vec<(String, String, serde_json::Map<String, serde_json::Value>)> = rt
+        let nodes: Vec<(
+            String,
+            String,
+            serde_json::Map<String, serde_json::Value>,
+            bool,
+        )> = rt
             .workflows
             .values()
             .flat_map(|wf| {
+                let low = wf.priority == crate::engine::model::Priority::Low;
                 wf.steps
                     .values()
                     .filter(|s| s.kind == "webhook")
-                    .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone()))
+                    .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone(), low))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -698,6 +838,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             rt.events_tx.clone(),
             &envmap,
             write_timeout,
+            rt.pressure.clone(),
             log.clone(),
         ) {
             log.error(

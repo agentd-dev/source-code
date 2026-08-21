@@ -438,6 +438,53 @@ message carried a command DataPart — so `a2a.SendMessage:workflow.run` and
 
 ---
 
+## 7. Resource pressure — shed new work, drain what is in flight
+
+The failure this machinery exists for is disk: the file store writes until
+`ENOSPC`, and a checkpoint failure is a **halting** condition. So the runtime
+watches the store filesystem's headroom (plus the cgroup's `memory.high`, when
+one is armed) and moves through three levels, assessed every ~2 s and logged
+once per **transition**, never per refusal:
+
+| level | event | what changes |
+|---|---|---|
+| ok | `pressure.cleared` | everything admits |
+| warn (< 2× `min_free`) | `pressure.warn` | **`priority: low` work already sheds** (workflows and subagent spawns that declared it); everything else still admits — the operator is told while there is still time to act |
+| shed (< `store.file.min_free`, default 256 MB) | `pressure.shed` | admission stops; in-flight work drains |
+
+"Admission stops" is the same decision at every door, so a pressed daemon is
+consistent rather than lucky:
+
+- **starts** — `loop`/`schedule`/`subscribe`/`signal` firings are skipped with a
+  `start.shed` line naming the cause (a schedule that quietly stopped while the
+  disk filled is a story the log must tell);
+- **webhooks** — `429 Too Many Requests` + `Retry-After: 30`, *after*
+  authentication (an unauthenticated probe learns nothing about load), *before*
+  the durable inbox write the disk may not be able to keep;
+- **conversation turns** — new turns stay **queued**, nothing is dropped;
+  dispatch resumes by itself when the level clears;
+- **subagent spawns** and **`workflow.run`** (the tool and the A2A command) —
+  refused with the cause in the error.
+
+Nothing running is interrupted: an agent that finishes its current job and takes
+no more has degraded; one that dies mid-checkpoint has corrupted its next
+restart's starting point. Tune with `store.file.min_free` (`"0"` disables the
+disk checks; a memory/mcp/http store never enables them — their durability does
+not live on this disk).
+
+On the wire, per-route **arrival throttling** composes with this:
+`rate: "<burst>/<per>s"` on a `webhook` node answers `429` with a computed
+`Retry-After` past its burst — `parallelism` bounds how many requests run at
+once, `rate` bounds how fast they arrive, and pressure sheds regardless of
+either.
+
+With `--features metrics`, the levels are scrapeable (schema 1.2):
+`agent_pressure_level` (0/1/2), `agent_disk_free_bytes` (absent without a file
+store), `agent_runs_active`, `agent_turns_queued` — the last two are the
+utilization pair to alert on *before* pressure does it for you.
+
+---
+
 ## See also
 
 - [Configuration reference](configuration.md) — the settings document, the

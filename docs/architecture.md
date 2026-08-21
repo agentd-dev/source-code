@@ -129,12 +129,11 @@ source, decides, checkpoints, and then blocks on exactly one wait.
 ```mermaid
 flowchart TD
   START(["run_loop"]) --> H["health tick — the heartbeat /healthz reads"]
-  H --> C1["1 · drain child control frames"]
-  C1 --> C2["2 · reap SIGCHLD, dispatch exits"]
-  C2 --> C3["3 · drain executor results"]
+  H --> C2["2 · reap SIGCHLD, dispatch exits<br/>(each reap re-queued once, behind its child's frames)"]
+  C2 --> C3["3 · drain events: child frames + executor results"]
   C3 --> C4["4 · fire due durable timers"]
   C4 --> C5["5 · process the durable inbox"]
-  C5 --> C6["6 · poll start nodes, waits, scheduled runs"]
+  C5 --> C6["6 · poll start nodes, waits, scheduled runs<br/>(re-scheduled to a fixpoint while inline steps finish)"]
   C6 --> C7["7 · dispatch turns, up to max_parallel_turns"]
   C7 --> C8["8 · poll pending waits + MCP notifications"]
   C8 --> C9["9 · child liveness tick"]
@@ -149,7 +148,7 @@ flowchart TD
     EX["executor threads for blocking MCP and HTTP"]
     CONN["one thread per served connection"]
   end
-  RT -. "tagged event" .-> C1
+  RT -. "tagged event" .-> C3
   EX -. "tagged event" .-> C3
   CONN -. "tagged event" .-> C3
 ```
@@ -162,10 +161,18 @@ drains.
 
 The wait at phase 12 is `next_wake().min(TICK)`, not `TICK`. A timer due in 3 ms
 fires in 3 ms; the 200 ms tick is a ceiling on how long the loop sleeps with
-nothing armed, not a scheduling granularity. That ceiling means this is not a
-pure blocking park — but it costs nothing measurable. A daemon built with the
-shipped feature set, idling on a schedule workflow, reports `Threads: 1`, `VmRSS`
-around 3.8 MiB, and **zero** accumulated CPU ticks over ten seconds.
+nothing armed, not a scheduling granularity. Two details make that claim true
+rather than aspirational. Child frames ride the SAME channel the loop parks on,
+so a subagent's answer *wakes* the loop instead of waiting out the tick — this
+was once worth ~200 ms per delegation round-trip (measured: 214 ms → 18 ms) —
+with each reap re-queued once behind its child's already-flushed frames so
+"exited without a result" cannot be a race. And after the scheduling pass, the
+loop re-schedules to a fixpoint while inline data steps (`assign`, `map`,
+`template`, `switch`…) keep completing synchronously, so a pure data pipeline
+advances at execution speed (measured: a 200-step chain, 42 s → 2.3 s in a
+debug build) instead of one step per tick. A daemon built with the shipped
+feature set, idling on a schedule workflow, reports `Threads: 1`, `VmRSS`
+around 5.5 MiB, and one accumulated CPU jiffy per ~6 s.
 
 ### Why not an async runtime
 

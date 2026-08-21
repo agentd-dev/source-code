@@ -39,6 +39,9 @@ fn bogus_payload() -> SpawnPayload {
             max_tokens: 10_000,
             deadline_ms: 10_000,
             max_depth: 4,
+            memory_bytes: None,
+            cpu_seconds: None,
+            nice: None,
         },
         telemetry: Telemetry {
             run_id: "itest".into(),

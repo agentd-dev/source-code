@@ -23,7 +23,7 @@ bare name. Writing `{{ hook.body.id }}` reads nothing; you want
 | `steps.<id>.output` | what a completed step returned |
 | `vars.<key>` | what `assign`/`transform` wrote (`writes:` names the key) |
 | `inputs` | the run's inputs, from the start node's `inputs` mapping |
-| `env` | instance, run id, instruction |
+| `env` | instance, run id, instruction — plus, per step: `env.step`, `env.attempt`, and `env.idempotency_key` (stable across retries of the step; `env.ts` is NOT) |
 | `memory.<key>` | durable memory, read through for keys the definition names |
 | `signals` | recently delivered signals |
 
@@ -67,11 +67,11 @@ matches on.
 | `manual` | — | `inputs` | Fires only on `workflow.run` (a tool call or an A2A command). Nothing arms it. |
 | `loop` | — | `interval` `delay` `until` `max_iterations` `backoff` `inputs` | Fires again each time the previous run finishes. `interval`/`delay` pace it, `until` and `max_iterations` stop it, `backoff` slows it after failures. |
 | `schedule` | — | `cron` `every` `tz` `jitter` `catch_up` `at` `inputs` | Fires on a 5-field UTC cron or an `every` interval. `at` is one-shot and consumes itself. `catch_up` decides what a missed window does. |
-| `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms`/`coalesce` collapse bursts; `filter` drops uninteresting reads. |
+| `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms`/`coalesce` collapse bursts; `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. |
 | `signal` | `name` | `filter` `deliver` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
 | `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.timeout`. |
 | `a2a` | — | `command` `roles` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts. `roles` narrows who may fire it. |
-| `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `idempotency` `respond` `filter` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. |
+| `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `rate` `idempotency` `respond` `filter` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. `rate: "<burst>/<per>s"` throttles arrivals (429 + Retry-After past it). |
 
 ### Control flow
 
@@ -135,12 +135,12 @@ matches on.
 
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
-| `mcp.tool` | `server` `tool` | `args` | Calls `tool` on a declared MCP `server` with `args`. The main way a workflow reaches the outside world. |
+| `mcp.tool` | `server` `tool` | `args` `idempotency` | Calls `tool` on a declared MCP `server` with `args`. The main way a workflow reaches the outside world. Always attaches a retry-stable `agent/idempotency_key` in `_meta`; `idempotency: {value: …}` substitutes an application key. |
 | `mcp.resource` | `server` `op` | `uri` `name` `arguments` `reference` `argument` | Reads MCP resources — `op: read|list|prompt|complete`. |
 | `tool` | `name` | `args` | Calls a tool by registry name, wherever it lives (internal, code-registered, or MCP). |
-| `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. |
-| `a2a.send` | `to` | `parts` `context` `timeout` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. |
-| `a2a.delegate` | `peer` `objective` | `output_contract` `timeout` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. |
+| `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` `idempotency` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. `idempotency: {header: NAME}` (or `{query: NAME}`) sends a retry-stable derived key; `value:` overrides it with an application key. |
+| `a2a.send` | `to` | `parts` `context` `timeout` `idempotency` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. |
+| `a2a.delegate` | `peer` `objective` | `output_contract` `timeout` `idempotency` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. `idempotency: true` pins the `messageId` across retries. |
 | `a2a.wait` | — | `conversation` `timeout` | Suspends until a message arrives on a `conversation`. The reply half of `a2a.send`. |
 | `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
 | `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |
@@ -153,7 +153,7 @@ matches on.
 |---|---|---|---|
 | `think` | `prompt` | `output_schema` `reads` `check` `retries` `skills` `system` | One model call. `output_schema` shapes the answer; `check`/`retries` re-ask until it conforms. |
 | `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. |
-| `subagent` | `instruction` | `mode` `workflow` `tools` `servers` `limits` `context` `output_contract` `output_schema` `skills` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. |
+| `subagent` | `instruction` | `mode` `workflow` `tools` `servers` `limits` `priority` `context` `output_contract` `output_schema` `skills` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. `limits` adds OS caps — `memory` (RLIMIT_AS), `cpu` (RLIMIT_CPU) — beside `steps`/`tokens`/`deadline`; `priority: low\|normal\|high` maps to niceness and sheds low first under pressure. |
 | `classify` | `input` `classes` | `prompt` `skills` | Puts `input` into one of `classes`. |
 | `extract` | `input` `output_schema` | `prompt` `skills` | Pulls `input` into the shape of `output_schema`. No tools — the safest way to read untrusted text. |
 | `summarize` | `input` | `length` `prompt` `skills` | Shortens `input` to `length`. |

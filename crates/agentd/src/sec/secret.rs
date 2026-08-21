@@ -37,6 +37,36 @@ fn trim_token(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+/// Values entered interactively at startup (`--prompt-missing`).
+///
+/// They live HERE — in process memory, consulted before the environment — and
+/// nowhere else: never written back to a config file (that is how secrets end
+/// up in git) and never exported into the environment (children would inherit
+/// them). A daemon restart re-prompts, which is the honest cost of not
+/// persisting a credential anywhere.
+static PROMPTED: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Record an interactively-entered value for `{{secret:NAME}}` resolution.
+pub fn set_prompted(name: &str, value: String) {
+    let mut g = PROMPTED.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(Default::default)
+        .insert(name.to_string(), value);
+}
+
+/// Whether `{{secret:NAME}}` would resolve right now (prompted or environment).
+pub fn secret_available(name: &str) -> bool {
+    prompted_of(name).is_some() || std::env::var(name).is_ok()
+}
+
+pub fn prompted_of(name: &str) -> Option<String> {
+    PROMPTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(name).cloned())
+}
+
 /// Resolve every `{{secret:NAME}}` / `{{secret-file:PATH}}` token in `template`
 /// against `env` (the process environment) and the local filesystem, returning
 /// the materialized string. Plain text passes through unchanged. A bad token
@@ -82,7 +112,9 @@ fn resolve_one(token: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Stri
         if name.is_empty() {
             return Err("empty {{secret:}} name".to_string());
         }
-        env(name).ok_or_else(|| format!("{{{{secret:{name}}}}} is not set in the environment"))
+        prompted_of(name)
+            .or_else(|| env(name))
+            .ok_or_else(|| format!("{{{{secret:{name}}}}} is not set in the environment"))
     } else {
         Err(format!(
             "unknown interpolation token '{{{{{token}}}}}' (want {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}})"

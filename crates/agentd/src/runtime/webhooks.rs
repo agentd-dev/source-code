@@ -147,6 +147,16 @@ struct Route {
     /// `respond: sync` — hold the response for the run's terminal result.
     respond_sync: bool,
     inflight: AtomicUsize,
+    /// Per-route arrival rate (`rate: "<burst>/<per>s"`). `parallelism` bounds
+    /// how many run at ONCE; this bounds how fast they ARRIVE — without it an
+    /// inbound burst is written to the durable inbox as fast as the socket
+    /// delivers it, which converts the burst straight into disk pressure.
+    rate: Option<std::sync::Mutex<crate::supervisor::tree::TokenBucket>>,
+    /// `Retry-After` for a rate refusal: roughly when a token will exist.
+    retry_after_s: u32,
+    /// The owning workflow declared `priority: low` — its admissions shed one
+    /// pressure level earlier (at warn).
+    low_priority: bool,
 }
 
 /// Decrement the route's in-flight counter on drop.
@@ -159,6 +169,8 @@ impl Drop for InflightGuard<'_> {
 
 pub struct WebhookHandler {
     routes: HashMap<String, Route>,
+    /// Admission-gates inbound requests under disk/memory pressure (429).
+    pressure: std::sync::Arc<super::pressure::Pressure>,
     /// The dynamic `wait: {on: webhook}` await callbacks (shared with the loop).
     callbacks: SharedCallbacks,
     events_tx: Sender<Event>,
@@ -278,6 +290,28 @@ impl WebhookHandler {
             self.log
                 .warn("webhook.denied", json!({"path": path, "reason": "auth"}));
             return R::text(401, "Unauthorized", b"authentication failed".to_vec());
+        }
+
+        // Admission, after authentication: an unauthenticated caller learns
+        // nothing about our load, and a legitimate one gets the honest HTTP
+        // answer — 429 with a Retry-After — instead of an inbox write the disk
+        // may be too full to keep.
+        if let Some(cause) = self.pressure.refusal(route.low_priority) {
+            let mut r = R::text(
+                429,
+                "Too Many Requests",
+                format!("shedding: {cause}").into_bytes(),
+            );
+            r.headers.push(("Retry-After", "30".into()));
+            return r;
+        }
+        if let Some(bucket) = &route.rate
+            && !bucket.lock().unwrap_or_else(|e| e.into_inner()).try_take()
+        {
+            let mut r = R::text(429, "Too Many Requests", b"rate limited".to_vec());
+            r.headers
+                .push(("Retry-After", route.retry_after_s.to_string()));
+            return r;
         }
         // Inbound backpressure (bounds concurrent handling per route; run-duration
         // limits are the workflow's own `concurrency`).
@@ -474,13 +508,39 @@ fn overflow_of(spec: &Map<String, Value>) -> Overflow {
 
 /// Spawn the webhook listener from the configured `webhook` start nodes. Each
 /// `nodes` entry is `(workflow, node, spec)`.
+/// Parse `"<burst>/<per>s"` — the same spelling `a2a.principals[].quotas.rate`
+/// uses, so an operator learns ONE rate syntax. Returns (burst, window secs).
+fn parse_rate(s: &str) -> Result<(u32, f64), String> {
+    let (b, p) = s
+        .split_once('/')
+        .ok_or_else(|| format!("want \"<burst>/<per>s\" (e.g. \"20/1s\"), got {s:?}"))?;
+    let burst: u32 = b
+        .trim()
+        .parse()
+        .map_err(|_| format!("burst must be a count, got {b:?}"))?;
+    let per = p.trim();
+    let secs: f64 = per
+        .strip_suffix('s')
+        .or_else(|| per.strip_suffix("sec"))
+        .unwrap_or(per)
+        .trim()
+        .parse()
+        .map_err(|_| format!("window must be seconds, got {p:?}"))?;
+    if burst == 0 || !secs.is_finite() || secs <= 0.0 {
+        return Err(format!("burst and window must be positive, got {s:?}"));
+    }
+    Ok((burst, secs))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_webhook_listener(
     webhooks: &Webhooks,
-    nodes: Vec<(String, String, Map<String, Value>)>,
+    nodes: Vec<(String, String, Map<String, Value>, bool)>,
     callbacks: SharedCallbacks,
     events_tx: Sender<Event>,
     env: &dyn Fn(&str) -> Option<String>,
     write_timeout: Duration,
+    pressure: std::sync::Arc<super::pressure::Pressure>,
     log: Logger,
 ) -> Result<(), String> {
     use std::path::Path;
@@ -491,7 +551,10 @@ pub(crate) fn spawn_webhook_listener(
     let crate::config::ServeTarget::Http {
         bind,
         tls: tls_scheme,
-    } = crate::config::ServeTarget::parse(listen).map_err(|e| format!("webhooks.listen: {e}"))?;
+    } = crate::config::ServeTarget::parse(listen).map_err(|e| format!("webhooks.listen: {e}"))?
+    else {
+        return Err("webhooks.listen does not support unix://; use https://".into());
+    };
 
     let acceptor = if tls_scheme {
         let cert = webhooks
@@ -516,7 +579,7 @@ pub(crate) fn spawn_webhook_listener(
     };
 
     let mut routes = HashMap::new();
-    for (workflow, node, spec) in nodes {
+    for (workflow, node, spec, low_priority) in nodes {
         let path = spec
             .get("path")
             .and_then(Value::as_str)
@@ -538,6 +601,20 @@ pub(crate) fn spawn_webhook_listener(
             .get("parallelism")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
+        let (rate, retry_after_s) = match spec.get("rate").and_then(Value::as_str) {
+            None => (None, 30),
+            Some(r) => {
+                let (burst, per_s) = parse_rate(r)
+                    .map_err(|e| format!("webhook node '{workflow}/{node}': rate: {e}"))?;
+                let retry = (per_s / burst.max(1) as f64).ceil().max(1.0) as u32;
+                (
+                    Some(std::sync::Mutex::new(
+                        crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / per_s),
+                    )),
+                    retry,
+                )
+            }
+        };
         if let Some(prev) = routes.insert(
             path.clone(),
             Route {
@@ -550,6 +627,9 @@ pub(crate) fn spawn_webhook_listener(
                 idem_header: idem_header(&spec),
                 respond_sync: spec.get("respond").and_then(Value::as_str) == Some("sync"),
                 inflight: AtomicUsize::new(0),
+                rate,
+                retry_after_s,
+                low_priority,
             },
         ) {
             return Err(format!(
@@ -568,6 +648,7 @@ pub(crate) fn spawn_webhook_listener(
     let route_paths: Vec<String> = routes.keys().cloned().collect();
     let handler = Arc::new(WebhookHandler {
         routes,
+        pressure,
         callbacks,
         events_tx,
         timeout: write_timeout,
@@ -774,5 +855,24 @@ impl crate::runtime::reactor::Runtime {
             step_id,
             super::waits::wait_record("signal", json!({"signal": token}), timeout_ms),
         );
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::parse_rate;
+
+    #[test]
+    fn rate_strings_parse_and_bad_ones_say_why() {
+        assert_eq!(parse_rate("20/1s"), Ok((20, 1.0)));
+        assert_eq!(parse_rate("8/2s"), Ok((8, 2.0)));
+        assert_eq!(parse_rate(" 5 / 0.5s "), Ok((5, 0.5)));
+        assert_eq!(parse_rate("3/10sec"), Ok((3, 10.0)));
+        assert_eq!(parse_rate("3/10"), Ok((3, 10.0)));
+        assert!(parse_rate("fast").is_err());
+        assert!(parse_rate("0/1s").is_err());
+        assert!(parse_rate("5/0s").is_err());
+        assert!(parse_rate("5/-1s").is_err());
+        assert!(parse_rate("x/1s").is_err());
     }
 }

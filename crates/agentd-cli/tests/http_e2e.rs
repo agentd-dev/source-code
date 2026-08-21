@@ -287,3 +287,101 @@ fn an_http_node_emits_a_signed_webhook_the_receiver_can_verify() {
     std::fs::remove_file(&cfg_path).ok();
     std::fs::remove_file(&stderr_path).ok();
 }
+
+// ---- idempotency: the derived key is stable across retries ------------------
+
+/// A mock that records every `Idempotency-Key` it sees and fails the FIRST
+/// attempt with a 500, so the step's retry re-sends. The two requests are one
+/// logical operation — the header must say so.
+fn spawn_flaky_idem_mock() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = keys.clone();
+    std::thread::spawn(move || {
+        for n in 0..4 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut reader = BufReader::new(stream);
+            let mut start = String::new();
+            if reader.read_line(&mut start).is_err() || start.is_empty() {
+                continue;
+            }
+            let mut len = 0usize;
+            let mut key = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                } else if lower.starts_with("idempotency-key:")
+                    && let Some((_, v)) = line.split_once(':')
+                {
+                    key = v.trim().to_string();
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            seen.lock().unwrap().push(key);
+            let mut s = reader.into_inner();
+            let resp: &[u8] = if n == 0 {
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"
+            };
+            let _ = s.write_all(resp);
+            let _ = s.flush();
+        }
+    });
+    (port, keys)
+}
+
+#[test]
+fn the_http_idempotency_key_is_derived_opaque_and_stable_across_retries() {
+    let (port, keys) = spawn_flaky_idem_mock();
+    let cfg = common::unique_path("agentd-http-idem", "yaml");
+    std::fs::write(&cfg, format!(
+        "config_version: \"2\"\n\
+         agent:\n  name: idem\n\
+         workflows:\n  - name: pay\n    steps:\n\
+         \x20     start: {{kind: once}}\n\
+         \x20     charge: {{kind: http, depends_on: [start], method: POST, url: \"http://127.0.0.1:{port}/charge\", body: {{amount: 5}}, allow_private: true, idempotency: {{header: Idempotency-Key}}, retry: {{max: 2, backoff: \"10ms\"}}}}\n\
+         \x20     done: {{kind: finish, depends_on: [charge], status: completed, output: {{ok: \"{{{{steps.charge.output.json.ok}}}}\"}}}}\n\
+         lifecycle:\n  run_until: idle\n  idle_grace: 1s\n\
+         observability:\n  log_level: info\n  log_content: true\n"
+    ))
+    .unwrap();
+    let daemon = spawn_daemon(&cfg);
+    assert!(
+        wait_for(
+            || daemon
+                .events("run.done")
+                .iter()
+                .any(|e| e["status"] == "completed"),
+            15
+        ),
+        "the run completed after the retry:\n{}",
+        daemon.stderr()
+    );
+    let keys = keys.lock().unwrap().clone();
+    assert_eq!(keys.len(), 2, "one failed attempt + one retry: {keys:?}");
+    assert_eq!(keys[0], keys[1], "retries carry the SAME key: {keys:?}");
+    assert_eq!(keys[0].len(), 32, "sha256-derived, truncated: {keys:?}");
+    assert!(
+        keys[0].chars().all(|c| c.is_ascii_hexdigit()),
+        "opaque hex — no run ids or step names on the wire: {keys:?}"
+    );
+    assert!(
+        !keys[0].contains("charge") && !keys[0].contains("pay"),
+        "{keys:?}"
+    );
+    std::fs::remove_file(&cfg).ok();
+}

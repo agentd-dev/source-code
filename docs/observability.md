@@ -501,9 +501,10 @@ served on the already-opt-in surface (`/metrics`). **No `prometheus` or `metrics
 crate** — it is plain text, no async, no SDK.
 
 The metric **names** and label **keys** are a **frozen, versioned contract**
-(`metrics_schema` = `1.1`, owned by `obs::metrics::METRICS_SCHEMA`). The set is
+(`metrics_schema` = `1.2`, owned by `obs::metrics::METRICS_SCHEMA`). The set is
 additive within the major — 1.1 added the `agent_budget_tokens_remaining` gauge
-and the `tokens_lifetime` limit value; a rename or removal bumps the major. A
+and the `tokens_lifetime` limit value; 1.2 the resource-pressure set below; a
+rename or removal bumps the major. A
 control plane authors scalers/alerts against it. Labels carry
 **bounded** values only — out-of-vocabulary values fold into an `other` slot so
 the cardinality is structurally bounded (the closed label set is a compile-time
@@ -571,6 +572,19 @@ Point-in-time gauges a horizontal scaler reads:
 - **`agent_inflight_reactions`** — reactions currently executing.
 - **`agent_subscriptions_active`** — reconciled declared subscriptions.
 - **`agent_reaction_lag_ms`** — age of the oldest un-routed pending event.
+
+#### Resource-pressure gauges (schema 1.2)
+
+- **`agent_pressure_level`** — 0 ok, 1 warn, 2 shedding (admission stopped,
+  in-flight work draining; the levels and gates are in
+  [`operations.md`](operations.md) §7).
+- **`agent_disk_free_bytes`** — free bytes on the file store's filesystem.
+  Deliberately **absent** without a file store: exporting the supervisor's local
+  free space when durability lives elsewhere would invite alerts on the wrong
+  disk.
+- **`agent_runs_active`** — workflow runs in a non-terminal state.
+- **`agent_turns_queued`** — conversation turns waiting for a dispatch slot
+  (parallelism, pause, drain, or shed — the event stream says which).
 
 (The legacy bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
 `agent_reactions_total`, etc. — are retained alongside the frozen set, additive

@@ -176,6 +176,8 @@ fn top_level_properties(
                 "max_loaded": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1 } } }),
     );
+    m.insert("vars".to_string(), json!({ "type": "object", "additionalProperties": true,
+                "description": "operator-defined constants; reference anywhere (and in workflows) as {{config.NAME}} — dotted paths reach nested values, unresolved references refuse startup" }));
     m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline dialect-3 definitions or {name, file|uri} references" }));
     m.insert("limits".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "max_runs": { "type": "integer", "minimum": 1 },
@@ -251,6 +253,8 @@ fn top_level_properties(
                 "traceparent": { "type": "string" } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
+                "workflows": { "type": "object", "additionalProperties": false, "properties": {
+                    "immutable": { "type": "boolean", "description": "refuse workflow.create/update/delete at runtime — definitions become read-only for the model, subagents and operators alike; loading from config/file/url/dir is unaffected" } } },
                 "tls_ca": { "type": "string" },
                 "aauth": { "$ref": "#/$defs/AAuth" },
                 "cgroup": { "type": "object", "additionalProperties": false, "properties": {
@@ -333,13 +337,22 @@ fn defs_properties(
     // RFC 0033 §4: the only knob is where the state lives, and it is optional —
     // an omitted `path` resolves through $AGENTD_STATE_DIR / $XDG_STATE_HOME.
     m.insert("StoreFile".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
+                "min_free": { "type": "string", "description": "shed new work below this much free disk (256MB, 1.5GiB, bytes; 0 disables); warn at twice it" },
                 "path": { "type": "string", "description": "the state root; default $AGENTD_STATE_DIR, else $XDG_STATE_HOME/agentd/state, else $HOME/.local/state/agentd/state, else the OS temp dir" } } }));
     m.insert("SkillSource".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["server"], "properties": {
                 "server": { "type": "string" }, "discover": { "enum": ["prompts", "resources", "auto"] }, "filter": { "type": "string" } } }));
     m.insert("WorkflowRef".to_string(), json!({ "type": "object", "required": ["name"], "properties": {
-                "name": { "type": "string" }, "armed": { "type": "boolean" }, "file": { "type": "string" }, "uri": { "type": "string" } },
+                "name": { "type": "string" }, "armed": { "type": "boolean" },
+                "file": { "type": "string", "description": "a path on disk" },
+                "uri": { "type": "string", "description": "an MCP resource (mcp://<server>/<uri>, or one a connected server serves)" },
+                "url": { "type": "string", "description": "fetched over HTTP(S) at startup; fail-closed if unreachable" },
+                "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "headers for `url` — credential values must be {{secret:…}} references" },
+                "timeout": duration,
+                "allow_private": { "type": "boolean", "description": "permit `url` to resolve to a private/loopback address" },
+                "dir": { "type": "string", "description": "load every matching file in a directory" },
+                "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses" } },
                 "additionalProperties": true,
-                "description": "a {name, file} / {name, uri} reference, or an inline dialect-3 definition (RFC 0027)" }));
+                "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline dialect-3 definition (RFC 0027)" }));
     m.insert("Principal".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["match", "role"], "properties": {
                 "match": { "type": "object", "additionalProperties": false, "properties": {
                     "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "aauth_agent": { "type": "string" }, "any": { "type": "boolean" } } },

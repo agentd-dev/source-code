@@ -53,6 +53,12 @@ pub enum Event {
     /// An inbound webhook awaiting a loop-computed reply (RFC 0027).
     #[cfg(feature = "a2a")]
     Webhook(Box<super::webhooks::WebhookRequest>),
+    /// A `subscribe` start node's notify-then-read finished off-loop.
+    SubscribeRead {
+        server: String,
+        uri: String,
+        content: Option<Value>,
+    },
     /// The 200 ms tick.
     Tick,
 }

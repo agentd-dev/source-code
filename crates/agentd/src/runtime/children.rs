@@ -122,6 +122,23 @@ impl Children {
     pub fn count_kind(&self, f: impl Fn(&ChildKind) -> bool) -> usize {
         self.map.values().filter(|c| f(&c.kind)).count()
     }
+    /// The OS pid of a live child (for logs; the reaper owns lifecycle).
+    pub fn pid_of(&self, node: NodeId) -> Option<i32> {
+        self.map.get(&node).map(|c| c.sub.pid())
+    }
+    /// Whether `pid` is a tracked child (a reap for an unknown pid needs no
+    /// frame-ordering deferral).
+    pub fn has_pid(&self, pid: i32) -> bool {
+        self.pid_to_node.contains_key(&pid)
+    }
+    /// Join `pid`'s stdout reader — after this, all its frames are queued.
+    pub fn join_reader_of(&mut self, pid: i32) {
+        if let Some(node) = self.pid_to_node.get(&pid)
+            && let Some(c) = self.map.get_mut(node)
+        {
+            c.sub.join_reader();
+        }
+    }
 
     /// Spawn a child (tracked with the reaper). The payload's `telemetry`
     /// must already carry the correlation ids.

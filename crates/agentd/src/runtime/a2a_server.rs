@@ -972,11 +972,22 @@ impl Runtime {
                     .or_else(|| data["workflow"].as_str())
                     .unwrap_or("")
                     .to_string();
-                if !self.workflows.contains_key(&name) {
+                let Some(wf) = self.workflows.get(&name) else {
                     return err_obj(
                         ::mcp::rpc::INVALID_PARAMS,
                         &format!("no such workflow {name:?}"),
                     );
+                };
+                // Same admission gate as every other way of starting work: a
+                // durable run begins with checkpoint writes, which is exactly
+                // what a full disk cannot absorb. Refuse before creating the
+                // task so nothing half-born needs cleanup. `priority: low`
+                // workflows shed one level earlier (at warn).
+                if let Some(cause) = self
+                    .pressure
+                    .refusal(wf.priority == crate::engine::model::Priority::Low)
+                {
+                    return err_obj(rpc_internal(), &format!("shedding: {cause}"));
                 }
                 let run_id = format!("{}-{}", name, crate::state::ulid::new());
                 let task_id = self.task_create(&ctx, principal, Link::Run { id: run_id.clone() });
@@ -2032,6 +2043,14 @@ impl Runtime {
         let allow_private = self.settings.a2a.push.allow_private;
         match self.tasks.get(id) {
             Some(t) => {
+                // Artifact BEFORE the terminal status: a conformant streaming
+                // client terminates on the terminal state (§3.5.2), so a result
+                // frame sent after it is a result nobody reads.
+                if t.state.is_terminal()
+                    && let Some(a) = crate::a2a::wire::result_artifact(t)
+                {
+                    sink.artifact(&t.id, &t.context_id, a.clone());
+                }
                 sink.status(
                     &t.id,
                     &t.context_id,
@@ -2039,11 +2058,6 @@ impl Runtime {
                     t.message.as_deref(),
                     t.updated,
                 );
-                if t.state.is_terminal()
-                    && let Some(a) = crate::a2a::wire::result_artifact(t)
-                {
-                    sink.artifact(&t.id, &t.context_id, a.clone());
-                }
                 // A caller that asked to be told rather than to watch. Fired
                 // from here because this is the one place every transition
                 // passes through, whatever caused it.
@@ -2193,10 +2207,15 @@ pub(crate) fn spawn_a2a_listener(
 ) -> Result<A2aServing, String> {
     use std::path::Path;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
-    let crate::config::ServeTarget::Http {
-        bind,
-        tls: tls_scheme,
-    } = crate::config::ServeTarget::parse(listen).map_err(|e| format!("a2a.listen: {e}"))?;
+    let target =
+        crate::config::ServeTarget::parse(listen).map_err(|e| format!("a2a.listen: {e}"))?;
+    let (bind, tls_scheme) = match &target {
+        crate::config::ServeTarget::Http { bind, tls } => (bind.clone(), *tls),
+        // A unix socket is bound by path; loopback-equivalent trust (stronger:
+        // the kernel gates by uid where loopback TCP admits every local user).
+        crate::config::ServeTarget::Unix { path } => (path.clone(), false),
+    };
+    let unix_listener = matches!(&target, crate::config::ServeTarget::Unix { .. });
     let server_bearer = match &a2a.bearer {
         Some(b) => {
             Some(crate::sec::secret::resolve(&b.0, env).map_err(|e| format!("a2a.bearer: {e}"))?)
@@ -2223,7 +2242,8 @@ pub(crate) fn spawn_a2a_listener(
     } else {
         None
     };
-    let loopback_listener = crate::net::http::is_loopback_host(crate::config::serve_host_of(&bind));
+    let loopback_listener =
+        unix_listener || crate::net::http::is_loopback_host(crate::config::serve_host_of(&bind));
     let require_auth = a2a.tls.client_ca.is_some()
         || server_bearer.is_some()
         || (pairing.is_some() && !loopback_listener);
@@ -2257,7 +2277,11 @@ pub(crate) fn spawn_a2a_listener(
     let bridge = A2aBridge::with_feed(events_tx, resolver, feed.clone());
 
     let listener = crate::a2a::serve::spawn(
-        &bind,
+        if unix_listener {
+            crate::a2a::serve::Bind::Unix(bind.clone())
+        } else {
+            crate::a2a::serve::Bind::Tcp(bind.clone())
+        },
         crate::a2a::serve::Opts {
             auth: crate::a2a::serve::Auth {
                 require_auth,

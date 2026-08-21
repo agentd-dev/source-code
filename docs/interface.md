@@ -115,7 +115,7 @@ drift into describing something agentd no longer does.
 
 ```tui
 # agentd tui — chat
-agentd 2.3.0 triage-1 debug
+agentd 2.5.0 triage-1 debug
 ▌  Triage the newest issue
 ⠋ working
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -136,7 +136,7 @@ A subagent is a real child process the supervisor owns. The list is live:
 
 ```tui
 # agentd tui — subagents
-agentd 2.3.0 triage-1 debug
+agentd 2.5.0 triage-1 debug
   handle               mode        status      tokens   updated
 ▸ sa-review            supervised  running     4120     0s
   sa-lint              detached    failed      260      0s
@@ -148,7 +148,7 @@ agentd 2.3.0 triage-1 debug
 
 ```tui
 # agentd tui — subagent detail
-agentd 2.3.0 triage-1 debug
+agentd 2.5.0 triage-1 debug
 subagent sa-review
 status        running
 mode          supervised
@@ -170,7 +170,7 @@ m message · k stop · esc/backspace back · tab next screen
 
 ```tui
 # agentd tui — confirming a stop
-agentd 2.3.0 triage-1 debug
+agentd 2.5.0 triage-1 debug
 subagent sa-review
 status        running
 mode          supervised
@@ -189,7 +189,7 @@ summary the feed carries and says which fields are missing and why.
 
 ```tui
 # agentd tui — debug
-agentd 2.3.0 triage-1 debug
+agentd 2.5.0 triage-1 debug
 feed
     1 run           {"id":"pipeline-01M0C0","workflow":"pipeline","status":"running","steps":"3/7"}
     2 step          {"run":"pipeline-01M0C0","step":"fetch","kind":"mcp.tool","phase":"start"}

@@ -10,6 +10,7 @@ use super::children::ChildKind;
 use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
+use crate::config::v2::substitute_config_vars;
 use crate::context::Msg;
 use crate::engine::model::{OnError, Step, Workflow, parse_workflow};
 use crate::engine::run::{
@@ -33,8 +34,55 @@ impl Runtime {
     /// ones from the store. Errors are collected (a bad definition is refused).
     pub(crate) fn load_workflows(&mut self) -> Result<(), Vec<String>> {
         let mut errs = Vec::new();
-        let docs = self.settings.workflows.clone();
+        // A `{dir}` entry expands into one entry per matching file BEFORE
+        // resolution, so everything downstream — parsing, naming, the duplicate
+        // check — sees the same shape it always did.
+        let mut docs: Vec<Value> = Vec::new();
+        for doc in self.settings.workflows.clone() {
+            match doc.get("dir").and_then(Value::as_str) {
+                None => docs.push(doc),
+                Some(dir) => {
+                    let pattern = doc
+                        .get("glob")
+                        .and_then(Value::as_str)
+                        .unwrap_or("*.yaml,*.yml,*.json");
+                    match expand_dir(dir, pattern) {
+                        Ok(paths) if paths.is_empty() => {
+                            // Silence here would mean a schedule that never
+                            // fires and no way to tell why.
+                            errs.push(format!("workflow dir {dir}: no file matched {pattern:?}"));
+                        }
+                        Ok(paths) => {
+                            for path in paths {
+                                let mut d = json!({"file": path});
+                                if let Some(a) = doc.get("armed") {
+                                    d["armed"] = a.clone();
+                                }
+                                docs.push(d);
+                            }
+                        }
+                        Err(e) => errs.push(format!("workflow dir {dir}: {e}")),
+                    }
+                }
+            }
+        }
         for doc in docs {
+            // `{{config.*}}` folds in at load, in two passes: the ENTRY first —
+            // so a var can sit in a `file:`, `url:` or `dir:` reference and in
+            // the headers that fetch it — and the RESOLVED document after, so a
+            // definition arriving from a file or URL is treated exactly like an
+            // inline one. Folding here (rather than at render time) puts the
+            // substituted values in the definition hash: a var change is a
+            // definition change, and in-flight runs stay pinned to what they
+            // started with.
+            let mut doc = doc;
+            // The entry pass covers only REFERENCE entries (a var in a `file:`,
+            // `url:` or the headers that fetch it). An inline definition skips
+            // it — the resolved pass below sees the same document, and running
+            // both would report every unresolved reference twice.
+            if doc.get("steps").is_none() {
+                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", &mut errs);
+            }
             let resolved = match (
                 doc.get("file").and_then(Value::as_str),
                 doc.get("uri").and_then(Value::as_str),
@@ -63,6 +111,28 @@ impl Runtime {
                         continue;
                     }
                 },
+                // A `url:` is fetched over HTTP(S), with operator-declared
+                // headers — the shape people already have for a definitions
+                // service or a raw git URL. Distinct from `uri:`, which is an
+                // MCP resource: both name "somewhere else", but only one of
+                // them makes the daemon dial.
+                (None, None) if doc.get("url").is_some() => {
+                    let url = doc["url"].as_str().unwrap_or_default().to_string();
+                    match self.fetch_workflow_url(&doc, &url) {
+                        Ok(mut d) => {
+                            if d.get("name").is_none()
+                                && let Some(n) = doc.get("name")
+                            {
+                                d["name"] = n.clone();
+                            }
+                            d
+                        }
+                        Err(e) => {
+                            errs.push(format!("workflow url {url}: {e}"));
+                            continue;
+                        }
+                    }
+                }
                 (None, Some(uri)) => match self.read_resource_any(uri) {
                     Ok(text) => match crate::config::file::parse_document(
                         &text,
@@ -88,6 +158,8 @@ impl Runtime {
                 },
                 _ => doc.clone(),
             };
+            let mut resolved = resolved;
+            substitute_config_vars(&mut resolved, &self.settings.vars, "workflow", &mut errs);
             match parse_workflow(&resolved) {
                 Ok(w) => {
                     self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
@@ -161,6 +233,46 @@ impl Runtime {
             }
         }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
+    }
+
+    /// Fetch a workflow definition over HTTP(S).
+    ///
+    /// Startup-time and fail-closed: an unreachable definitions service is a
+    /// daemon that would otherwise come up with a schedule silently missing, so
+    /// it refuses to start and says which URL. That matches how a required MCP
+    /// server behaves and is the safer half of the trade.
+    ///
+    /// Headers are operator-declared and resolve `{{secret:…}}` like every
+    /// other credential, so a token never sits in the config file. The URL is
+    /// SSRF-guarded like any other outbound request — an operator-chosen URL is
+    /// far more trustworthy than a model-chosen one, but `allow_private` is
+    /// still an explicit decision rather than an assumption.
+    fn fetch_workflow_url(&self, doc: &Value, url: &str) -> Result<Value, String> {
+        let headers: Vec<(String, String)> = doc
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let headers =
+            crate::mcp::auth::resolve_headers(&headers).map_err(|e| format!("headers: {e}"))?;
+        let timeout = doc
+            .get("timeout")
+            .and_then(Value::as_str)
+            .and_then(|t| crate::config::parse_duration(t).ok())
+            .unwrap_or(std::time::Duration::from_secs(20));
+        let allow_private = doc
+            .get("allow_private")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let text = crate::runtime::http_node::fetch_text(url, &headers, timeout, allow_private)?;
+        crate::config::file::parse_document(
+            &text,
+            crate::config::file::Format::detect(Some(std::path::Path::new(url)), &text),
+        )
     }
 
     /// Read a resource URI (`mcp://<server>/<uri>` or a URI a connected server lists).
@@ -417,13 +529,24 @@ impl Runtime {
         if self.paused {
             return; // operator hold (a2a.pause) — steps park until resume
         }
-        let ids: Vec<String> = self
+        // Higher-priority runs schedule first each tick, so under contention
+        // (fan-out slots, per-tick capacity) their ready steps win. Stable
+        // within a priority: BTreeMap order = name, then creation (ULID).
+        let mut ids: Vec<(std::cmp::Reverse<crate::engine::model::Priority>, String)> = self
             .runs
             .iter()
             .filter(|(_, r)| !r.status.is_terminal() && r.status != RunStatus::Paused)
-            .map(|(id, _)| id.clone())
+            .map(|(id, r)| {
+                let pr = self
+                    .workflows
+                    .get(&r.workflow)
+                    .map(|w| w.priority)
+                    .unwrap_or_default();
+                (std::cmp::Reverse(pr), id.clone())
+            })
             .collect();
-        for id in ids {
+        ids.sort_by_key(|a| a.0);
+        for (_, id) in ids {
             self.schedule_run(&id);
         }
     }
@@ -593,6 +716,27 @@ impl Runtime {
         }
     }
 
+    /// Refuse a definition-mutating tool when `security.workflows.immutable`.
+    ///
+    /// Applies to everyone — the model, a subagent, an operator over A2A —
+    /// because the point is that definitions are reviewed before they ship, and
+    /// a lock one caller can talk its way past is not a lock. Says how to change
+    /// them properly rather than only saying no.
+    fn workflows_locked(&self, tool: &str) -> Option<super::tools::ToolOutcome> {
+        if !self.settings.security.workflows.immutable {
+            return None;
+        }
+        self.log.warn("workflow.locked", json!({"tool": tool}));
+        Some(super::tools::ToolOutcome::Ready(
+            json!({"error": format!(
+                "{tool}: workflow definitions are immutable \
+                 (security.workflows.immutable) — edit the config, file or \
+                 directory they load from and reload"
+            )}),
+            true,
+        ))
+    }
+
     /// The earliest step of a run that failed, with its error.
     ///
     /// Used to explain a stall: a run with no ready step is usually a run whose
@@ -757,10 +901,20 @@ impl Runtime {
             json!({"run": run_id, "step": step_id, "kind": step.kind,
                    "phase": "start", "attempt": attempt}),
         );
-        let data = match &scope {
+        let mut data = match &scope {
             Some(sc) => self.scoped_data(run_id, sc),
             None => self.run_data(run_id),
         };
+        // Step-scoped env: the identity a RETRY of this step shares. Anything a
+        // template derives from these is stable across attempts — which is what
+        // makes `env.idempotency_key` an idempotency key and not a fresh id per
+        // try. (`env.ts` already exists for when a per-attempt value is what
+        // you want; the two must not be confused.)
+        if let Some(env) = data.get_mut("env") {
+            env["step"] = json!(step_id);
+            env["attempt"] = json!(attempt);
+            env["idempotency_key"] = json!(crate::engine::run::idempotency_key(run_id, step_id));
+        }
         let spec = match render_spec(&step, &data) {
             Ok(s) => s,
             Err(e) => {
@@ -1093,7 +1247,22 @@ impl Runtime {
                     );
                     return;
                 };
-                let meta = json!({"agent/idempotency_key": format!("{}/{run_id}/{step_id}#{attempt}", self.instance), "agent/instance": self.instance, "agent/run": run_id});
+                // The key must NOT vary by attempt — a retry that presents a
+                // fresh key is exactly the duplicate the key exists to prevent,
+                // so the old `…#{attempt}` suffix defeated the field's own
+                // name. The attempt rides separately for servers that want to
+                // OBSERVE retries without keying on them, and `idempotency:
+                // {value: …}` substitutes an application-level key (an order
+                // id) when one exists — which beats any run-derived key, since
+                // it also collides two different RUNS attempting the same
+                // real-world operation.
+                let key = spec
+                    .get("idempotency")
+                    .and_then(|i| i.get("value"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::engine::run::idempotency_key(run_id, step_id));
+                let meta = json!({"agent/idempotency_key": key, "agent/attempt": attempt, "agent/instance": self.instance, "agent/run": run_id});
                 let timeout = step
                     .timeout_ms
                     .map(std::time::Duration::from_millis)
@@ -1798,6 +1967,9 @@ impl Runtime {
         error: Option<String>,
         tokens: u64,
     ) {
+        // A terminal step may make dependents ready this very iteration — tell
+        // the loop to re-run scheduling before it parks (the inline fixpoint).
+        self.resched = true;
         let Some(wf) = self
             .runs
             .get(run_id)
@@ -2297,6 +2469,14 @@ impl Runtime {
                 let Some(w) = self.workflows.get(&wname) else {
                     return err(format!("no such workflow {wname:?}"));
                 };
+                if let Some(cause) = self
+                    .pressure
+                    .refusal(w.priority == crate::engine::model::Priority::Low)
+                {
+                    return err(format!(
+                        "workflow.run refused: {cause}; retry when it clears"
+                    ));
+                }
                 let start = match args.get("start").and_then(Value::as_str) {
                     Some(s) => match w.step(s) {
                         Some(st) if st.is_start() => s.to_string(),
@@ -2465,6 +2645,13 @@ impl Runtime {
                 err(format!("{name}: give run or name"))
             }
             "workflow.create" | "workflow.update" => {
+                // Workflows are STANDING instructions — what the agent does
+                // when a schedule fires or a webhook lands, unattended. An
+                // agent that can rewrite them changes what happens next time,
+                // and the change outlives the conversation that caused it.
+                if let Some(e) = self.workflows_locked(name) {
+                    return e;
+                }
                 let def = args["definition"].clone();
                 match parse_workflow(&def) {
                     Err(e) => err(format!("{name}: {}", e.join("; "))),
@@ -2516,6 +2703,9 @@ impl Runtime {
                 }
             }
             "workflow.delete" => {
+                if let Some(e) = self.workflows_locked(name) {
+                    return e;
+                }
                 let wname = args["name"].as_str().unwrap_or("").to_string();
                 if self.workflows.remove(&wname).is_none() {
                     return err(format!("no such workflow {wname:?}"));
@@ -2596,5 +2786,121 @@ fn collect_memory_keys(v: &Value, out: &mut Vec<String>) {
         Value::Array(a) => a.iter().for_each(|x| collect_memory_keys(x, out)),
         Value::Object(o) => o.values().for_each(|x| collect_memory_keys(x, out)),
         _ => {}
+    }
+}
+
+/// Expand a workflow directory into the files it contains.
+///
+/// `pattern` is a comma-separated list of shell-style globs relative to `dir`.
+/// `**` crosses directory boundaries, so `**/*.yaml` walks the tree and
+/// `*.yaml` does not — the distinction people already expect from every other
+/// tool that takes a glob.
+///
+/// Results are SORTED. A directory listing is in whatever order the filesystem
+/// feels like, and load order decides which of two same-named workflows is
+/// reported as the duplicate — a diagnostic that changed between machines would
+/// be worse than useless.
+fn expand_dir(dir: &str, pattern: &str) -> Result<Vec<String>, String> {
+    let root = std::path::Path::new(dir);
+    if !root.is_dir() {
+        return Err(format!("not a directory ({})", root.display()));
+    }
+    let pats: Vec<&str> = pattern
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let recursive = pats.iter().any(|p| p.contains("**"));
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let rd = std::fs::read_dir(&d).map_err(|e| e.to_string())?;
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                if recursive {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let rels = rel.to_string_lossy();
+            if pats.iter().any(|p| glob_match(p, &rels)) {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Shell-style glob matching: `*` within a segment, `**` across segments, `?`
+/// for one character. Small on purpose — a workflow directory does not need
+/// brace expansion or character classes, and a dependency for this would be a
+/// poor trade in a tree that counts them.
+fn glob_match(pat: &str, text: &str) -> bool {
+    // `**/x` should also match a bare `x` at the root: people write it meaning
+    // "at any depth", which includes none.
+    if let Some(rest) = pat.strip_prefix("**/")
+        && glob_match(rest, text)
+    {
+        return true;
+    }
+    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), text.chars().collect());
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => {
+                let doubled = p.get(1) == Some(&'*');
+                let rest = if doubled { &p[2..] } else { &p[1..] };
+                // A single `*` stops at a separator; `**` does not.
+                let mut i = 0;
+                loop {
+                    if go(rest, &t[i..]) {
+                        return true;
+                    }
+                    if i >= t.len() {
+                        return false;
+                    }
+                    if !doubled && t[i] == '/' {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            Some('?') if !t.is_empty() => go(&p[1..], &t[1..]),
+            Some(c) if t.first() == Some(c) => go(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    go(&p, &t)
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::glob_match;
+
+    #[test]
+    fn a_single_star_stays_inside_one_segment_and_double_crosses() {
+        // The distinction people expect from every other tool that takes a glob.
+        assert!(glob_match("*.yaml", "nightly.yaml"));
+        assert!(
+            !glob_match("*.yaml", "team/nightly.yaml"),
+            "* must not cross /"
+        );
+        assert!(glob_match("**/*.yaml", "team/nightly.yaml"));
+        assert!(glob_match("**/*.yaml", "a/b/c/deep.yaml"));
+        // `**/x` means "at any depth", and no depth is a depth — otherwise a
+        // recursive pattern silently skips the files at the root.
+        assert!(glob_match("**/*.yaml", "nightly.yaml"));
+
+        assert!(glob_match("flows/*.json", "flows/a.json"));
+        assert!(!glob_match("flows/*.json", "flows/a.yaml"));
+        assert!(!glob_match("*.yaml", "yaml"), "the dot is literal");
+        assert!(glob_match("?.yaml", "a.yaml"));
+        assert!(!glob_match("?.yaml", "ab.yaml"));
+        // A pattern with no wildcard is an exact name.
+        assert!(glob_match("nightly.yaml", "nightly.yaml"));
+        assert!(!glob_match("nightly.yaml", "nightly.yml"));
     }
 }

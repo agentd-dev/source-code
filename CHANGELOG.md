@@ -5,6 +5,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.5.1 — the answer must beat the obituary
+
+A patch on the day of 2.5.0, for a defect the release's own CI surfaced. The
+2.5.0 wake fix routed child frames through a forwarder thread; on a loaded
+machine the forwarder could be descheduled, a child's exit could overtake its
+final result frame, and a worker that had completed was failed as "worker
+exited without a result". Readers now send directly into the reactor's queue
+(a `FrameSink` closure — no hop thread), so joining a child's reader is a real
+ordering guarantee: every frame it wrote is queued before its reap is
+processed. Verified where it failed: the implicated suites pinned to 2 CPUs
+against busy-loop spinners, 130/130 green.
+
+Also: `schedule_at_once_e2e` now waits for outcomes instead of the runner's
+clock (the other thing a slow CI machine disproved).
+
+Crates: `agentd-core` / `agentd-cli` **2.5.1**; `agentd-mcp` 0.4.0 /
+`agentd-net` 0.4.0 unchanged. `@agentd-dev/cli` **2.5.1**;
+`ghcr.io/agentd-dev/agentd:2.5.1`.
+
 ## v2.5.0 — pressure, priority, and the fast lane
 
 An agent that accepts work it cannot finish is worse than one that says no.

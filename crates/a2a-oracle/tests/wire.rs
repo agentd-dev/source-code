@@ -409,9 +409,9 @@ fn a_task_we_return_parses_as_a_task() {
         TaskState::TASK_STATE_COMPLETED,
         "a status command is terminal: {wire}"
     );
-    assert!(!theirs.id.as_str().is_empty(), "task has no id: {wire}");
+    assert!(!theirs.id.is_empty(), "task has no id: {wire}");
     assert!(
-        !theirs.context_id.as_str().is_empty(),
+        !theirs.context_id.is_empty(),
         "a task must carry the context that groups it: {wire}"
     );
 
@@ -440,7 +440,7 @@ fn the_task_list_parses_as_a_task_list() {
         "both tasks should be enumerable: {listed}"
     );
     for t in &theirs.tasks {
-        assert!(!t.id.as_str().is_empty());
+        assert!(!t.id.is_empty());
     }
 }
 

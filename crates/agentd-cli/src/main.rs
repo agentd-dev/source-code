@@ -89,10 +89,78 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
     // before the settings model ever sees the argv (which would reject it as an
     // unknown argument), and recorded where `state::Durable::restore` reads it.
     let fresh = args.iter().any(|a| a == "--fresh");
-    let args: Vec<String> = args.iter().filter(|a| *a != "--fresh").cloned().collect();
-    let args = args.as_slice();
+    // `--prompt-missing` is the same kind of flag: an intent for THIS process's
+    // life (ask me for the secrets the preflight finds missing), not a setting
+    // a file could pin. Consumed here, recorded where the startup preflight
+    // reads it.
+    let prompt_missing = args.iter().any(|a| a == "--prompt-missing");
+    // `--env <FILE>` (repeatable): load dotenv files into THIS process's
+    // environment before anything reads it. Same family again — an input to
+    // this invocation, not a setting. Applied with real-environment-wins (a
+    // deployment override beats the checked-in file), then the layered config
+    // env is rebuilt so `AGENTD_*` keys from a file work like any other.
+    let mut env_files: Vec<String> = Vec::new();
+    {
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if let Some(v) = a.strip_prefix("--env=") {
+                env_files.push(v.to_string());
+            } else if a == "--env" {
+                match it.next() {
+                    Some(v) => env_files.push(v.clone()),
+                    None => {
+                        eprintln!("agentd: --env needs a file path");
+                        return exit::USAGE;
+                    }
+                }
+            }
+        }
+    }
+    let mut args2: Vec<String> = Vec::new();
+    {
+        let mut skip = false;
+        for a in args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if a == "--env" {
+                skip = true;
+                continue;
+            }
+            if a == "--fresh" || a == "--prompt-missing" || a.starts_with("--env=") {
+                continue;
+            }
+            args2.push(a.clone());
+        }
+    }
+    let args = args2.as_slice();
+    let env: Vec<(String, String)> = if env_files.is_empty() {
+        env.to_vec()
+    } else {
+        match agentd::config::envfile::load_files(&env_files) {
+            Ok(pairs) => {
+                for (k, v) in pairs {
+                    if std::env::var_os(&k).is_none() {
+                        // Single-threaded here — before signals, threads, or
+                        // any config read — which is what makes set_var sound.
+                        unsafe { std::env::set_var(&k, &v) };
+                    }
+                }
+                std::env::vars().collect()
+            }
+            Err(e) => {
+                eprintln!("agentd: {e}");
+                return exit::USAGE;
+            }
+        }
+    };
+    let env = env.as_slice();
     if fresh {
         agentd::state::request_fresh();
+    }
+    if prompt_missing {
+        agentd::config::prompt::request_prompt_missing();
     }
     let detected = match v2::probe(args, env) {
         Ok(d) => d,

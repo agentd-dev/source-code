@@ -360,6 +360,40 @@ main :is(.grid, .flex) > * {
   overflow-x: auto;
   overflow-wrap: normal;
   white-space: pre;
+  /* The prose stylesheet gives every `pre` its own border, radius and margin —
+     right for a code block standing alone, wrong for one that already sits
+     inside the .term chrome: the inner rounded box floats over the title bar
+     and the page shows two sets of corners. Inside the chrome, the pre is
+     CONTENT, and the chrome owns every visual. */
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+/* A frame embedded in prose keeps prose rhythm. */
+.prose-agent .term-doc {
+  margin: 1.5rem 0;
+}
+
+/* ── ANSI colours for captured TUI frames ───────────────────────────────────
+   The 16-colour SGR set Ink emits, mapped onto the terminal palette the site
+   already uses — so the docs show the program the way a terminal does, not a
+   monochrome transcript of it. Each class sets --an so inverse video can swap
+   the SAME colour into the background without a per-colour rule pair. */
+.term .an-green,  .term .an-bgreen  { --an: #3ddc84; color: var(--an); }
+.term .an-cyan,   .term .an-bcyan   { --an: #56c8ff; color: var(--an); }
+.term .an-yellow, .term .an-byellow { --an: #e0c060; color: var(--an); }
+.term .an-red,    .term .an-bred    { --an: #ff6b6b; color: var(--an); }
+.term .an-blue,   .term .an-bblue   { --an: #82aaff; color: var(--an); }
+.term .an-magenta,.term .an-bmagenta{ --an: #c792ea; color: var(--an); }
+.term .an-white,  .term .an-bwhite  { --an: #e8ecef; color: var(--an); }
+.term .an-black                      { --an: #11151a; color: var(--an); }
+.term .an-bblack                     { --an: #6b7683; color: var(--an); }
+.term .an-b { font-weight: 600; }
+.term .an-d { opacity: 0.62; }
+.term .an-inv {
+  background: var(--an, var(--term-fg));
+  color: var(--term-bg);
 }
 /* A phone has ~40 characters at the desktop size; a step down buys ~8 more,
    which is the difference between reading a command and scrolling to it. */

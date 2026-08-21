@@ -93,6 +93,31 @@ impl crate::runtime::reactor::Runtime {
                     .join("&")
             })
             .unwrap_or_default();
+        // `idempotency: {header|query, value?}` — the retry-safety declaration.
+        // The default value is derived from run+step identity, so every attempt
+        // of THIS step presents the same key and a deduping API treats a retry
+        // as the retry it is; `value:` substitutes an application key (already
+        // rendered, like every field) for APIs where the operation's real
+        // identity is a business fact such as an order id.
+        let mut query = query;
+        if let Some(idem) = spec.get("idempotency") {
+            let value = idem
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::engine::run::idempotency_key(run_id, step_id));
+            if let Some(h) = idem.get("header").and_then(Value::as_str) {
+                headers.push((h.to_string(), value));
+            } else if let Some(q) = idem.get("query").and_then(Value::as_str) {
+                let pair = format!("{}={}", pct(q), pct(&value));
+                if query.is_empty() {
+                    query = pair;
+                } else {
+                    query.push('&');
+                    query.push_str(&pair);
+                }
+            }
+        }
         // Body: `json` (serialized + Content-Type) takes precedence over `body`.
         let body: Vec<u8> = if let Some(j) = spec.get("json").filter(|v| !v.is_null()) {
             if !headers
@@ -217,6 +242,31 @@ fn header_value(v: &Value) -> String {
 
 /// The blocking request (executor thread): parse + SSRF-guard + connect (+TLS) +
 /// round-trip, returning `{status, ok, headers, body, json}`.
+/// GET a URL and return its body as text.
+///
+/// A thin wrapper over the same guarded path the `http` node uses, for callers
+/// that want a document rather than a step result — loading a workflow
+/// definition from a definitions service, say. Sharing the path matters: the
+/// SSRF guard, the single resolve and the vetted dial are the parts that must
+/// not be reimplemented slightly differently somewhere else.
+pub(crate) fn fetch_text(
+    url: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+    allow_private: bool,
+) -> Result<String, String> {
+    let v = do_http(url, "GET", "", headers, &[], timeout, allow_private)?;
+    let status = v.get("status").and_then(Value::as_u64).unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    match v.get("body") {
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(other) => Ok(other.to_string()),
+        None => Err("empty body".into()),
+    }
+}
+
 fn do_http(
     url: &str,
     method: &str,

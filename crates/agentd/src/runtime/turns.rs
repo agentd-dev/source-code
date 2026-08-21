@@ -151,6 +151,13 @@ other tools come from connected MCP servers. Be concise and factual; never inven
 
     /// Dispatch queued turns: per-context serialization + the parallel cap.
     pub(crate) fn dispatch_turns(&mut self) {
+        // Under pressure, new turns stay QUEUED rather than being dropped:
+        // nothing is lost, nothing new starts, and dispatch resumes by itself
+        // when the level clears. The transition is logged once by the tick, so
+        // this stays silent per turn.
+        if self.pressure.shedding() {
+            return;
+        }
         if self.paused {
             return; // operator hold (a2a.pause) — turns queue until resume
         }
@@ -789,6 +796,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 max_tokens: launch.max_tokens,
                 deadline_ms: launch.deadline_ms.max(1000),
                 max_depth: self.settings.limits.subagents.depth.unwrap_or(3),
+                memory_bytes: None,
+                cpu_seconds: None,
+                nice: None,
             },
             telemetry: Telemetry {
                 run_id: self.run_id.clone(),

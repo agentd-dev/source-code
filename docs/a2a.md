@@ -177,6 +177,46 @@ A workflow step (`a2a.delegate`) or the agent itself can then hand work to
 `reviewer` and wait for its result. The worker is an ordinary agentd: its own
 instruction, its own tools, its own budget — and its own fence.
 
+### Co-located peers: the unix-socket fast lane
+
+Two instances on the same host (or the same pod) can skip TCP and TLS entirely:
+one listens on a **unix domain socket**, the other names that socket as its
+peer endpoint. Same protocol, same tasks and artifacts — only the transport and
+the authenticator change.
+
+```yaml
+# instance B — the worker
+a2a:
+  listen: unix:///run/agentd/bee.sock
+
+# instance A — the delegator
+a2a:
+  peers:
+    - name: bee
+      endpoint: unix:///run/agentd/bee.sock
+```
+
+Why this is the fast lane: no TLS handshake per dial, no TCP stack, and data
+moves through the kernel's socket buffer — the cheapest IPC that still keeps
+the A2A contract (so moving the peer to another host later is a one-line
+endpoint change back to `https://`).
+
+Authentication changes shape rather than disappearing. TLS material is
+**refused** on a unix listener; the kernel authenticates instead: the socket
+file is created `0600`, and every connection's `SO_PEERCRED` uid must be the
+daemon's own user (or root) — a different local user is dropped before HTTP,
+logged as `a2a.unix.denied`. That is strictly stronger than loopback TCP, which
+any local user can dial; a connection that passes gets the loopback trust
+posture (operator in the single-user setup), and a configured `a2a.bearer`
+still applies on top. Webhooks deliberately do NOT take `unix://` — they are an
+external surface.
+
+Two instances can also hold sockets in *both* directions (each listens, each
+names the other as a peer) — then either side can `a2a.send`/`a2a.delegate` at
+any time, which is the "two agents agree to connect" pattern: the agreement is
+the pair of socket paths in their configs, and the filesystem's permissions are
+the contract.
+
 ## Where the display clients fit
 
 The TUI and web UI are A2A clients. They use the same listener, the same

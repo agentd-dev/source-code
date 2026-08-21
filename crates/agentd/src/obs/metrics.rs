@@ -43,7 +43,11 @@
 ///
 /// 1.1 (RFC 0025): additive — the `agent_budget_tokens_remaining` gauge and the
 /// `tokens_lifetime` value of the `agent_limit_exceeded_total{limit}` domain.
-pub const METRICS_SCHEMA: &str = "1.1";
+///
+/// 1.2: additive — the resource-pressure set: `agent_pressure_level` (0 ok /
+/// 1 warn / 2 shed), `agent_disk_free_bytes` (file-store filesystem headroom;
+/// absent without a file store), `agent_runs_active`, `agent_turns_queued`.
+pub const METRICS_SCHEMA: &str = "1.2";
 
 /// Terminal disposition of one supervised run.
 #[derive(Debug, Clone, Copy)]
@@ -408,6 +412,42 @@ pub fn set_budget_tokens_remaining(remaining: u64) {
     let _ = remaining;
 }
 
+/// Point-in-time set of the resource-pressure gauges (`agent_pressure_level`,
+/// `agent_disk_free_bytes`): the shed/drain state the admission gates act on
+/// and the disk headroom that (usually) drives it. `disk_free: None` = no file
+/// store on this instance — the byte gauge is then not emitted at all, because
+/// exporting the supervisor's local free space when durability lives elsewhere
+/// would invite alerts on the wrong disk.
+pub fn set_pressure(level: u64, disk_free: Option<u64>) {
+    #[cfg(feature = "metrics")]
+    {
+        imp::REGISTRY.pressure_level.store(level, Ordering::Relaxed);
+        imp::REGISTRY
+            .disk_free_bytes
+            .store(disk_free.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (level, disk_free);
+}
+
+/// Point-in-time set of the work-in-progress gauges (`agent_runs_active`,
+/// `agent_turns_queued`): non-terminal workflow runs, and conversation turns
+/// waiting for a dispatch slot (parallelism, pause, drain, or shed — the gauge
+/// does not say which; the event stream does).
+pub fn set_work_backlog(runs_active: u64, turns_queued: u64) {
+    #[cfg(feature = "metrics")]
+    {
+        imp::REGISTRY
+            .runs_active
+            .store(runs_active, Ordering::Relaxed);
+        imp::REGISTRY
+            .turns_queued
+            .store(turns_queued, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (runs_active, turns_queued);
+}
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -587,6 +627,11 @@ mod imp {
 
         // --- RFC 0025 §3.4: per-instance lifetime-budget balance gauge --------
         pub(super) budget_tokens_remaining: AtomicU64,
+        pub(super) pressure_level: AtomicU64,
+        /// `u64::MAX` = unknown/no file store; then the gauge is not emitted.
+        pub(super) disk_free_bytes: AtomicU64,
+        pub(super) runs_active: AtomicU64,
+        pub(super) turns_queued: AtomicU64,
 
         // --- agentd 2.0 (plan §3.11): the v2 runtime series ------------------
         turns_total: LabelCounter<{ TURN_KINDS.len() }>,
@@ -636,6 +681,10 @@ mod imp {
                 config_reloads: LabelCounter::new(),
                 config_generation: AtomicU64::new(0),
                 budget_tokens_remaining: AtomicU64::new(0),
+                pressure_level: AtomicU64::new(0),
+                disk_free_bytes: AtomicU64::new(u64::MAX),
+                runs_active: AtomicU64::new(0),
+                turns_queued: AtomicU64::new(0),
                 turns_total: LabelCounter::new(),
                 steps_total: LabelCounter::new(),
                 store_ops: LabelCounter::new(),
@@ -1076,6 +1125,35 @@ mod imp {
                 g(&self.budget_tokens_remaining),
             );
 
+            // --- resource pressure + work in progress (schema 1.2) -----------
+            gauge(
+                &mut s,
+                "agent_pressure_level",
+                "Resource-pressure level: 0 ok, 1 warn, 2 shedding (admission stopped, in-flight drains).",
+                g(&self.pressure_level),
+            );
+            let free = g(&self.disk_free_bytes);
+            if free != u64::MAX {
+                gauge(
+                    &mut s,
+                    "agent_disk_free_bytes",
+                    "Free bytes on the file store's filesystem (absent without a file store).",
+                    free,
+                );
+            }
+            gauge(
+                &mut s,
+                "agent_runs_active",
+                "Workflow runs in a non-terminal state.",
+                g(&self.runs_active),
+            );
+            gauge(
+                &mut s,
+                "agent_turns_queued",
+                "Conversation turns queued for a dispatch slot.",
+                g(&self.turns_queued),
+            );
+
             // --- reactive backlog — the RFC 0019 scaling signal set (§4.3) ---
             gauge(
                 &mut s,
@@ -1358,6 +1436,28 @@ mod imp {
             assert!(out.contains("agent_runs_failed_total 1"));
             assert!(out.contains("agent_tokens_input_total 100"));
             assert!(out.contains("agent_tokens_output_total 50"));
+        }
+
+        #[test]
+        fn pressure_gauges_emit_and_disk_free_is_absent_until_known() {
+            let r = Registry::new();
+            let out = r.render();
+            assert!(out.contains("# TYPE agent_pressure_level gauge"));
+            assert!(out.contains("agent_pressure_level 0"));
+            assert!(out.contains("agent_runs_active 0"));
+            assert!(out.contains("agent_turns_queued 0"));
+            // No file store → no byte reading → the gauge is NOT emitted (an
+            // exported 0 would read as "disk full" to an alert).
+            assert!(!out.contains("agent_disk_free_bytes"));
+            r.pressure_level.store(2, Ordering::Relaxed);
+            r.disk_free_bytes.store(123_456, Ordering::Relaxed);
+            r.runs_active.store(3, Ordering::Relaxed);
+            r.turns_queued.store(7, Ordering::Relaxed);
+            let out = r.render();
+            assert!(out.contains("agent_pressure_level 2"));
+            assert!(out.contains("agent_disk_free_bytes 123456"));
+            assert!(out.contains("agent_runs_active 3"));
+            assert!(out.contains("agent_turns_queued 7"));
         }
 
         #[test]

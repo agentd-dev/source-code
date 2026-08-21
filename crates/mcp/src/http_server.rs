@@ -660,6 +660,8 @@ pub struct RawResponse {
     pub reason: &'static str,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// Extra response headers (e.g. `Retry-After` on a 429). Names as written.
+    pub headers: Vec<(&'static str, String)>,
 }
 
 impl RawResponse {
@@ -670,6 +672,7 @@ impl RawResponse {
             reason,
             content_type: "application/json",
             body: body.into(),
+            headers: Vec::new(),
         }
     }
     /// A short text response.
@@ -679,6 +682,7 @@ impl RawResponse {
             reason,
             content_type: "text/plain",
             body: body.into(),
+            headers: Vec::new(),
         }
     }
 }
@@ -770,13 +774,20 @@ fn serve_conn_raw<S: Read + Write + Send + 'static>(
 }
 
 fn write_raw<S: Write>(stream: &mut S, resp: &RawResponse) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         resp.status,
         resp.reason,
         resp.content_type,
         resp.body.len()
     );
+    for (name, value) in &resp.headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
     stream.write_all(&resp.body)?;
     stream.flush()

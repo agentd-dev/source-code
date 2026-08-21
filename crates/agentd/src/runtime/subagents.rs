@@ -161,8 +161,11 @@ impl Runtime {
         if !self.spawn_bucket_take() {
             return err("subagent.run refused: spawn rate exceeded (limits.subagents.rate)".into());
         }
-        if crate::supervisor::cgroup::under_memory_pressure() {
-            return err("subagent.run refused: memory pressure".into());
+        if self.pressure.shedding() {
+            return err(format!(
+                "subagent.run refused: {} pressure (shedding new work; in-flight work drains)",
+                self.pressure.cause()
+            ));
         }
         // Tools / servers narrowing.
         let allow: Option<Vec<String>> = args.get("tools").and_then(Value::as_array).map(|a| {
@@ -211,6 +214,33 @@ impl Runtime {
             .and_then(|d| crate::config::parse_duration(d).ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(self.settings.limits.run.deadline().as_millis() as u64);
+        // OS-level allocation (RLIMIT_AS / RLIMIT_CPU, applied fork→exec) and
+        // the priority→niceness mapping. Parse errors refuse the spawn — a cap
+        // that silently failed to parse is a cap that silently does not exist.
+        let memory_bytes = match limits.get("memory").and_then(Value::as_str) {
+            None => None,
+            Some(m) => match crate::runtime::pressure::parse_bytes(m) {
+                Ok(b) => Some(b),
+                Err(e) => return err(format!("subagent.run: limits.memory: {e}")),
+            },
+        };
+        let cpu_seconds = match limits.get("cpu").and_then(Value::as_str) {
+            None => None,
+            Some(c) => match crate::config::parse_duration(c) {
+                Ok(d) => Some(d.as_secs().max(1)),
+                Err(e) => return err(format!("subagent.run: limits.cpu: {e}")),
+            },
+        };
+        let priority = match crate::engine::model::Priority::from_spec(args.get("priority")) {
+            Ok(p) => p,
+            Err(e) => return err(format!("subagent.run: {e}")),
+        };
+        if let Some(cause) = self
+            .pressure
+            .refusal(priority == crate::engine::model::Priority::Low)
+        {
+            return err(format!("subagent.run refused: {cause}"));
+        }
         let context_seed: Vec<SeedMessage> = args
             .get("context")
             .and_then(Value::as_array)
@@ -266,6 +296,9 @@ impl Runtime {
                 max_tokens: tokens,
                 deadline_ms: deadline_ms.max(1000),
                 max_depth: max_depth.saturating_sub(depth + 1),
+                memory_bytes,
+                cpu_seconds,
+                nice: priority.nice(),
             },
             telemetry: Telemetry {
                 run_id: self.run_id.clone(),
@@ -323,7 +356,7 @@ impl Runtime {
             Ok(node) => {
                 record.node = Some(node);
                 record.status = "running".into();
-                self.log.info("subagent.spawn", json!({"handle": handle, "mode": mode, "node": node.0, "depth": depth + 1, "servers": servers.len()}));
+                self.log.info("subagent.spawn", json!({"handle": handle, "mode": mode, "node": node.0, "pid": self.children.pid_of(node), "depth": depth + 1, "servers": servers.len(), "priority": priority.as_str(), "memory_bytes": memory_bytes, "cpu_seconds": cpu_seconds}));
                 self.subagents.insert(handle.clone(), record);
                 let _ = self.durable.put(
                     crate::state::Kind::Subagent,

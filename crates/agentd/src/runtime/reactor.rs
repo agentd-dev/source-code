@@ -186,6 +186,18 @@ pub struct Counters {
 }
 
 pub struct Runtime {
+    /// Resource pressure (disk headroom, cgroup memory): consulted at every
+    /// ADMISSION gate — start-node firing, webhook accept, `workflow.run`,
+    /// turn dispatch, subagent spawn — never on work already in flight.
+    pub(crate) pressure: std::sync::Arc<super::pressure::Pressure>,
+    /// The last level the tick reported, so transitions log exactly once.
+    pub(crate) pressure_seen: super::pressure::Level,
+    /// A step reached a terminal state since the last scheduling pass — its
+    /// dependents may be ready NOW (the same-iteration re-schedule fixpoint).
+    pub(crate) resched: bool,
+    /// Reaps already deferred once for frame ordering (by pid) — see
+    /// [`Runtime::on_reaped`].
+    pub(crate) reap_deferred: std::collections::HashSet<i32>,
     pub(crate) settings: Settings,
     /// The merged document the settings came from (restart-only diff base).
     pub(crate) settings_doc: Value,
@@ -214,7 +226,6 @@ pub struct Runtime {
     pub(crate) timers: Timers,
     pub(crate) events_rx: Receiver<Event>,
     pub(crate) events_tx: Sender<Event>,
-    pub(crate) child_rx: Receiver<(NodeId, AgentMsg)>,
     pub(crate) reap_rx: Receiver<Reaped>,
     pub(crate) pending: Vec<PendingTool>,
     pub(crate) turn_queue: VecDeque<TurnJob>,
@@ -317,10 +328,33 @@ impl Runtime {
         self.log.info("proc.ready", json!({"instance": self.instance, "job_shape": self.job_shape, "workflows": self.workflows.len(), "runs": self.runs.len(), "inbox_pending": self.inbox_queue.len()}));
         loop {
             crate::obs::health::tick();
-            // 1. Child frames.
-            while let Ok((node, msg)) = self.child_rx.try_recv() {
-                self.on_child_frame(node, msg);
+            // Pressure transitions are logged HERE, once per change, so the
+            // per-request gates can refuse silently instead of each writing its
+            // own line per refusal — under real pressure that would be a log
+            // flood on top of a disk that is already full.
+            {
+                let level = self.pressure.level();
+                if level != self.pressure_seen {
+                    let free = self
+                        .pressure
+                        .disk_free
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let detail = json!({
+                        "level": level.as_str(),
+                        "cause": self.pressure.cause(),
+                        "disk_free_bytes": if free == u64::MAX { Value::Null } else { json!(free) },
+                    });
+                    match level {
+                        super::pressure::Level::Ok => self.log.info("pressure.cleared", detail),
+                        super::pressure::Level::Warn => self.log.warn("pressure.warn", detail),
+                        super::pressure::Level::Shed => self.log.warn("pressure.shed", detail),
+                    }
+                    self.pressure_seen = level;
+                }
             }
+            // 1. Child frames.
+            // (child frames arrive as Event::Child on the main channel — they
+            // wake the parked loop instead of waiting for the tick)
             // 2. Reaped children.
             let _ = crate::signals::take_child_exit();
             crate::supervisor::reaper::reap_and_dispatch();
@@ -342,6 +376,18 @@ impl Runtime {
             self.poll_starts();
             self.poll_waits();
             self.schedule_runs();
+            // Inline steps (assign/map/template/switch…) complete synchronously
+            // inside that pass, which makes their dependents ready NOW — without
+            // this fixpoint a pure data pipeline advanced ONE step per 200 ms
+            // tick (measured: 200 chained assigns = 42 s; with it, milliseconds).
+            // Bounded for the loop's honesty: effectful steps complete via
+            // events, so only inline chains re-enter here, and `limits.run.steps`
+            // already caps how long one can be.
+            let mut passes = 0;
+            while std::mem::take(&mut self.resched) && passes < 1024 {
+                self.schedule_runs();
+                passes += 1;
+            }
             // 7. Turns.
             self.dispatch_turns();
             // 8. Pending waits + MCP notifications.
@@ -355,6 +401,23 @@ impl Runtime {
             self.checkpoint(false);
             crate::obs::metrics::set_inbox_pending(self.inbox_queue.len() as u64);
             crate::obs::metrics::set_context_tokens(self.contexts.max_est_tokens());
+            {
+                let free = self
+                    .pressure
+                    .disk_free
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                crate::obs::metrics::set_pressure(
+                    self.pressure_seen as u64,
+                    (free != u64::MAX).then_some(free),
+                );
+                crate::obs::metrics::set_work_backlog(
+                    self.runs
+                        .values()
+                        .filter(|r| !r.status.is_terminal())
+                        .count() as u64,
+                    self.turn_queue.len() as u64,
+                );
+            }
             // 10.5. The interface feed's section diff (RFC 0032 §4): publish
             // run/conversation/subagent/child/status deltas to attached display
             // clients. A no-op unless `interface.enabled`; rate-limited inside.
@@ -413,6 +476,11 @@ impl Runtime {
                 let ask = id.trim_start_matches("human.judge:").to_string();
                 self.on_human_judge(&ask, &result);
             }
+            Event::SubscribeRead {
+                server,
+                uri,
+                content,
+            } => self.on_subscribe_read(&server, &uri, content),
             Event::Background { .. } | Event::Tick => {}
         }
     }
@@ -672,6 +740,19 @@ impl Runtime {
     }
 
     fn on_reaped(&mut self, r: Reaped) {
+        // Frames-before-reap. A child's terminal frame rides the same event
+        // queue as everything else (that is what makes its arrival WAKE the
+        // loop), so a reap racing ahead of it would read as "worker exited
+        // without a result". Restore the invariant by construction: join the
+        // child's reader thread — bounded, its pipe has already EOF'd — so
+        // every frame it ever wrote is IN the queue, then requeue the reap
+        // BEHIND them. FIFO does the rest; one deferral suffices.
+        if !self.reap_deferred.remove(&r.pid) && self.children.has_pid(r.pid) {
+            self.children.join_reader_of(r.pid);
+            self.reap_deferred.insert(r.pid);
+            let _ = self.events_tx.send(Event::Reaped(r));
+            return;
+        }
         let Some((node, child)) = self.children.on_reaped(&r) else {
             return;
         };

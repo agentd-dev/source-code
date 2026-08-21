@@ -71,6 +71,10 @@ pub fn delegate(
     auth: PeerAuth,
     objective: &str,
     output_contract: Option<&str>,
+    // See [`send`]: a stable id makes a retried delegation attach to the task
+    // the first attempt created on a deduping peer, instead of starting a
+    // second one.
+    message_id: Option<&str>,
     deadline: Instant,
 ) -> DelegateOutcome {
     // The sole transport is HTTP(S), presenting the peer client-auth material
@@ -83,7 +87,7 @@ pub fn delegate(
         A2aEndpoint::Https(url) => match HttpEp::parse(url) {
             Ok(ep) => {
                 let mut conn = HttpConn::new(ep, auth);
-                match conn.call_streaming(objective, output_contract, deadline) {
+                match conn.call_streaming(objective, output_contract, message_id, deadline) {
                     Err(e) => DelegateOutcome::Error(e),
                     Ok(StreamOutcome::Done(outcome)) => outcome,
                     Ok(StreamOutcome::Recover(task_id)) => poll_task(&mut conn, &task_id, deadline),
@@ -116,6 +120,10 @@ pub fn send(
     auth: PeerAuth,
     parts: &Value,
     context: Option<&str>,
+    // An explicit message id (the step's idempotency key): the A2A spec dedups
+    // on `messageId`, so a retry presenting the same id is recognised as the
+    // same send by a conforming peer — retry-safety with no new wire field.
+    message_id: Option<&str>,
     deadline: Instant,
 ) -> Result<Value, String> {
     match endpoint {
@@ -123,7 +131,14 @@ pub fn send(
             let ep = HttpEp::parse(url)?;
             let mut conn = HttpConn::new(ep, auth);
             let mut message = serde_json::Map::new();
-            message.insert("messageId".into(), Value::String(mint_message_id()));
+            message.insert(
+                "messageId".into(),
+                Value::String(
+                    message_id
+                        .map(str::to_string)
+                        .unwrap_or_else(mint_message_id),
+                ),
+            );
             message.insert("role".into(), Value::String("user".into()));
             // A caller may hand us either a parts ARRAY or a bare string; the
             // wire wants an array of parts, and a string is the common case.
@@ -234,10 +249,29 @@ struct HttpEp {
     path: String,
     host_header: String,
     tls: bool,
+    /// `unix:///path` peer: dial this socket instead of TCP — the co-located
+    /// fast lane (no TLS handshake, no TCP stack; the kernel authenticates).
+    socket: Option<String>,
 }
 
 impl HttpEp {
     fn parse(url: &str) -> Result<HttpEp, String> {
+        if let Some(path) = url
+            .strip_prefix("unix://")
+            .or_else(|| url.strip_prefix("unix:"))
+        {
+            if path.is_empty() {
+                return Err(format!("a2a: unix peer needs a socket path: {url}"));
+            }
+            return Ok(HttpEp {
+                host: String::new(),
+                port: 0,
+                path: "/".to_string(),
+                host_header: "localhost".to_string(),
+                tls: false,
+                socket: Some(path.to_string()),
+            });
+        }
         let u = crate::net::http::Url::parse(url)
             .map_err(|e| format!("a2a: bad peer url {url}: {e}"))?;
         let path = if u.path.is_empty() || u.path == "/" {
@@ -251,6 +285,7 @@ impl HttpEp {
             host: u.host,
             port: u.port,
             path,
+            socket: None,
         })
     }
 }
@@ -296,6 +331,11 @@ impl HttpConn {
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
+        if let Some(socket) = &self.ep.socket {
+            let s = crate::net::unixsock::connect(socket, timeout)
+                .map_err(|e| format!("a2a: cannot reach peer socket {socket}: {e}"))?;
+            return Ok(Box::new(s));
+        }
         let tcp = crate::net::http::connect_tcp(&self.ep.host, self.ep.port, timeout)
             .map_err(|e| format!("a2a: cannot reach peer {}: {e}", self.ep.host))?;
         if self.ep.tls {
@@ -328,11 +368,14 @@ impl HttpConn {
         &mut self,
         objective: &str,
         output_contract: Option<&str>,
+        explicit_message_id: Option<&str>,
         deadline: Instant,
     ) -> Result<StreamOutcome, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let message_id = mint_message_id();
+        let message_id = explicit_message_id
+            .map(str::to_string)
+            .unwrap_or_else(mint_message_id);
         let params = a2a::send_message_params(objective, output_contract, &message_id);
         let req = Request::new(Id::Num(id), "SendStreamingMessage", Some(params));
         let body =
@@ -466,9 +509,19 @@ impl HttpConn {
                     let outcome = match state {
                         "TASK_STATE_COMPLETED" => match distillate {
                             Some(text) => DelegateOutcome::Distillate(text),
-                            None => DelegateOutcome::Error(
-                                "a2a: remote completed without a distillate artifact".into(),
-                            ),
+                            // Completed but no artifact frame reached us (some
+                            // peers order the final status first): the task is
+                            // real — recover the artifacts over unary GetTask
+                            // instead of calling a finished delegation an error.
+                            None => {
+                                return Ok(match &task_id {
+                                    Some(tid) => StreamOutcome::Recover(tid.clone()),
+                                    None => StreamOutcome::Done(DelegateOutcome::Error(
+                                        "a2a: remote completed without a distillate artifact"
+                                            .into(),
+                                    )),
+                                });
+                            }
                         },
                         "TASK_STATE_REJECTED" => DelegateOutcome::Error(
                             "a2a: remote agent rejected the objective".into(),
@@ -730,7 +783,7 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "streamed answer"),
             DelegateOutcome::Error(e) => panic!("expected streamed distillate: {e}"),
         }
@@ -750,7 +803,7 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "recovered answer"),
             DelegateOutcome::Error(e) => panic!("expected recovery: {e}"),
         }
@@ -767,7 +820,7 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("FAILED"), "{e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }
@@ -793,6 +846,7 @@ mod tests {
             PeerAuth::default(),
             "do the work",
             Some("one line"),
+            None,
             deadline,
         ) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "http distilled answer"),
@@ -840,7 +894,7 @@ mod tests {
             ..Default::default()
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, auth, "obj", None, deadline) {
+        match delegate(&ep, auth, "obj", None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "authed"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -862,7 +916,7 @@ mod tests {
         )]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "immediate"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -874,7 +928,7 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            delegate(&ep, PeerAuth::default(), "obj", None, deadline),
+            delegate(&ep, PeerAuth::default(), "obj", None, None, deadline),
             DelegateOutcome::Error(_)
         ));
     }
@@ -885,7 +939,7 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-w", TaskState::TASK_STATE_WORKING, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
-        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
         }
@@ -896,7 +950,7 @@ mod tests {
         let url = serve_http_error_fixture();
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        match delegate(&ep, PeerAuth::default(), "obj", None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("rpc error"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }

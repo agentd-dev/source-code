@@ -566,6 +566,23 @@ pub fn deadline_passed(run: &RunState) -> bool {
 }
 
 /// The `env` view (curated, secret-free) the templates see.
+/// The idempotency key for one step of one run: stable across retries and
+/// replays BY ARITHMETIC — it is derived from identity every attempt of the
+/// same logical operation already shares — and distinct across runs because
+/// run ids are. Hashed so the remote learns nothing: a raw `run.step` would
+/// leak ULID timestamps and internal step names to every API that logs its
+/// keys, which is the good instinct behind wanting keys random. Deterministic
+/// derivation gets the opacity without the persistence, and without the
+/// crash-window a mint-then-store scheme has to defend forever.
+///
+/// Anything time-based or random here would be WRONG: specs re-render on every
+/// attempt, so a fresh value per attempt is precisely the duplicate-charge the
+/// mechanism exists to prevent.
+pub fn idempotency_key(run_id: &str, step_id: &str) -> String {
+    let h = crate::sha::sha256_hex(format!("{run_id}.{step_id}").as_bytes());
+    h[..32].to_string()
+}
+
 pub fn env_view(
     instance: &str,
     run_id: &str,
@@ -604,6 +621,39 @@ pub fn render_spec(step: &Step, data: &Data) -> Result<Map<String, Value>, Strin
 mod tests {
     use super::*;
     use crate::engine::model::parse_workflow;
+
+    /// The whole point of the key: RETRIES of one step share it, different
+    /// operations do not, and the remote learns nothing from it.
+    #[test]
+    fn idempotency_keys_are_stable_per_step_and_opaque() {
+        let a = idempotency_key("run-01ABC", "charge");
+        assert_eq!(
+            a,
+            idempotency_key("run-01ABC", "charge"),
+            "a retry carries the SAME key"
+        );
+        assert_ne!(
+            a,
+            idempotency_key("run-01ABC", "refund"),
+            "another step is another operation"
+        );
+        assert_ne!(
+            a,
+            idempotency_key("run-02XYZ", "charge"),
+            "another run is another operation"
+        );
+        // Scoped ids make fan-out iterations distinct operations automatically.
+        assert_ne!(
+            idempotency_key("r", "each[0].call"),
+            idempotency_key("r", "each[1].call")
+        );
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "hex only: {a}");
+        assert!(
+            !a.contains("run-01ABC") && !a.contains("charge"),
+            "leaks nothing"
+        );
+    }
 
     fn start_at(node: &str) -> Start {
         Start {

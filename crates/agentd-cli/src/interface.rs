@@ -154,7 +154,12 @@ fn client_endpoint(s: &v2::Settings) -> Result<String, String> {
         .as_deref()
         .ok_or("the interface needs an A2A listener (a2a.listen is not set)")?;
     let agentd::config::ServeTarget::Http { bind, tls } =
-        agentd::config::ServeTarget::parse(listen).map_err(|e| format!("a2a.listen: {e:?}"))?;
+        agentd::config::ServeTarget::parse(listen).map_err(|e| format!("a2a.listen: {e:?}"))?
+    else {
+        return Err(
+            "agentd tui/ui dials over HTTP; a2a.listen is unix:// — add an http(s) listener for the display client".into(),
+        );
+    };
     let (host, port) = split_authority(&bind);
     if port == "0" {
         return Err("a2a.listen uses an ephemeral port (:0); the client needs a fixed one".into());

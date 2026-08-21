@@ -22,12 +22,29 @@ const TITLES = {
   'agentd tui — debug': 'debug',
 };
 
+/** The colour codes chalk emits. The MARKDOWN gets the stripped text — a fence
+ * full of escape bytes is unreadable on GitHub and churns every diff — while
+ * the site reads the coloured original from `web/lib/tui-frames.json`, keyed by
+ * the fence's own title so the two can never pair up wrongly. */
+const stripAnsi = (s) => s.replace(/\u001b\[[0-9;]*m/g, '');
+
 let replaced = 0;
 md = md.replace(/```tui\n# ([^\n]+)\n[\s\S]*?```/g, (whole, title) => {
   const key = TITLES[title.trim()];
   if (!key || !frames[key]) return whole;
   replaced += 1;
-  return '```tui\n# ' + title + '\n' + frames[key].replace(/\s+$/gm, '').trimEnd() + '\n```';
+  const plain = stripAnsi(frames[key]).replace(/\s+$/gm, '').trimEnd();
+  return '```tui\n# ' + title + '\n' + plain + '\n```';
 });
 writeFileSync(path, md);
-console.error(`spliced ${replaced} frame(s) into docs/interface.md`);
+
+// The site's copy: coloured, keyed by title.
+const byTitle = {};
+for (const [title, key] of Object.entries(TITLES)) {
+  if (frames[key]) byTitle[title] = frames[key].replace(/\s+$/gm, '').trimEnd();
+}
+writeFileSync(
+  new URL('../../web/lib/tui-frames.json', import.meta.url),
+  JSON.stringify(byTitle, null, 1),
+);
+console.error(`spliced ${replaced} frame(s) into docs/interface.md; wrote web/lib/tui-frames.json`);

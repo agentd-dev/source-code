@@ -57,6 +57,48 @@ fn post(addr: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, S
     (code, b)
 }
 
+/// Like [`post`], but also returns the raw response header block.
+fn post_hdrs(
+    addr: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, String) {
+    let mut s = TcpStream::connect(addr).expect("connect webhook");
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let mut head = format!(
+        "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(body.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let mut reader = BufReader::new(s);
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    let code: u16 = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let mut hdrs = String::new();
+    loop {
+        let mut l = String::new();
+        reader.read_line(&mut l).unwrap();
+        if l.trim().is_empty() {
+            break;
+        }
+        hdrs.push_str(&l);
+    }
+    let mut b = String::new();
+    reader.read_to_string(&mut b).unwrap();
+    (code, hdrs, b)
+}
+
 fn sign(secret: &str, body: &str) -> String {
     let mac = agentd::sha::hmac_sha256(secret.as_bytes(), body.as_bytes());
     format!("sha256={}", agentd::sha::to_hex(&mac))
@@ -366,4 +408,204 @@ fn a_respond_sync_webhook_returns_the_run_result_inline() {
         "the sync response carries the run output: {resp}"
     );
     std::fs::remove_file(&cfg).ok();
+}
+
+// ---- arrival-rate limiting + pressure shedding ------------------------------
+
+fn rate_config(llm: &str, port: u16) -> String {
+    format!(
+        "config_version: \"2\"\n\
+         agent:\n  name: ratehook\n  instruction: You handle webhooks.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: memory\n\
+         webhooks:\n  listen: http://127.0.0.1:{port}\n\
+         workflows:\n  - name: on-hook\n    steps:\n\
+         \x20     h: {{kind: webhook, path: /hooks/rated, methods: [POST], rate: \"2/60s\", auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+         \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
+         \x20     f: {{kind: finish, depends_on: [a]}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n"
+    )
+}
+
+#[test]
+fn a_rated_route_admits_its_burst_then_answers_429_with_retry_after() {
+    let secret = "topsecret";
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&rate_config(&llm.uri, port));
+    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
+    wait_ready(&addr);
+
+    let body = r#"{"n":1}"#;
+    let sig = sign(secret, body);
+    // The burst (2 tokens over 60s: no refill inside this test) is admitted…
+    for n in 1..=2 {
+        let (code, _) = post(
+            &addr,
+            "/hooks/rated",
+            &[
+                ("X-Signature", &sig),
+                ("Idempotency-Key", &format!("r-{n}")),
+            ],
+            body,
+        );
+        assert_eq!(code, 202, "request {n} of the burst is admitted");
+    }
+    // …the third is rate-limited, with a Retry-After a client can pace off.
+    let (code, hdrs, resp) = post_hdrs(
+        &addr,
+        "/hooks/rated",
+        &[("X-Signature", &sig), ("Idempotency-Key", "r-3")],
+        body,
+    );
+    assert_eq!(code, 429, "the post-burst request is refused: {resp}");
+    assert!(
+        hdrs.to_ascii_lowercase().contains("retry-after: 30"),
+        "429 carries Retry-After (60s window / burst 2): {hdrs}"
+    );
+    assert!(resp.contains("rate limited"), "the body says why: {resp}");
+    // The two admitted requests really did fire runs (auth+rate compose).
+    assert!(
+        wait_for(|| daemon.events("run.start").len() >= 2, 10),
+        "both admitted webhooks fired runs:\n{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
+fn shed_config(llm: &str, port: u16, store_dir: &str) -> String {
+    format!(
+        "config_version: \"2\"\n\
+         agent:\n  name: shedhook\n  instruction: You handle webhooks.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: 999999GB\n\
+         webhooks:\n  listen: http://127.0.0.1:{port}\n\
+         workflows:\n  - name: on-hook\n    steps:\n\
+         \x20     h: {{kind: webhook, path: /hooks/shed, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+         \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
+         \x20     f: {{kind: finish, depends_on: [a]}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n"
+    )
+}
+
+#[test]
+fn a_daemon_under_disk_pressure_sheds_webhooks_with_429() {
+    let secret = "topsecret";
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "never reached"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    // min_free of ~1PB puts any real filesystem below the shed threshold: the
+    // daemon comes up already shedding, so the gate itself is what we observe.
+    let store_dir = common::unique_path("wh-shed-store", "d");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let cfg = write_config(&shed_config(&llm.uri, port, &store_dir));
+    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
+    wait_ready(&addr);
+
+    let body = r#"{"n":1}"#;
+    let sig = sign(secret, body);
+    let (code, hdrs, resp) = post_hdrs(
+        &addr,
+        "/hooks/shed",
+        &[("X-Signature", &sig), ("Idempotency-Key", "s-1")],
+        body,
+    );
+    assert_eq!(code, 429, "a shedding daemon refuses admission: {resp}");
+    assert!(
+        hdrs.to_ascii_lowercase().contains("retry-after"),
+        "the shed refusal carries Retry-After: {hdrs}"
+    );
+    assert!(resp.contains("shedding"), "the body says why: {resp}");
+    // …and the operator was told, once, at the transition.
+    assert!(
+        wait_for(|| !daemon.events("pressure.shed").is_empty(), 5),
+        "the shed transition is logged:\n{}",
+        daemon.stderr()
+    );
+    // A bad signature still answers 401, not 429: auth is checked first, so an
+    // unauthenticated probe learns nothing about our load.
+    let (code, _) = post(
+        &addr,
+        "/hooks/shed",
+        &[
+            ("X-Signature", "sha256=deadbeef"),
+            ("Idempotency-Key", "s-2"),
+        ],
+        body,
+    );
+    assert_eq!(code, 401, "auth precedes admission");
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&store_dir).ok();
+}
+
+/// Free bytes on `/` (statvfs), so the test can engineer the WARN band.
+fn free_bytes_root() -> u64 {
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        let path = std::ffi::CString::new("/").unwrap();
+        assert_eq!(libc::statvfs(path.as_ptr(), &mut st), 0, "statvfs /");
+        (st.f_bavail as u64) * (st.f_frsize as u64)
+    }
+}
+
+#[test]
+fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
+    let secret = "topsecret";
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    // min_free at 2/3 of the actual free space puts the daemon in the WARN
+    // band (shed < free < 2×shed): low-priority admissions shed, normal ones
+    // do not — priority's teeth, observed on the wire.
+    let min_free = free_bytes_root() * 2 / 3;
+    let store_dir = common::unique_path("wh-warn-store", "d");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let cfg = write_config(&format!(
+        "config_version: \"2\"\n\
+         agent:\n  name: warnhook\n  instruction: You handle webhooks.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: \"{min_free}\"\n\
+         webhooks:\n  listen: http://127.0.0.1:{port}\n\
+         workflows:\n  - name: bulk\n    priority: low\n    steps:\n\
+         \x20     h: {{kind: webhook, path: /hooks/bulk, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+         \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
+         \x20     f: {{kind: finish, depends_on: [a]}}\n\
+         \x20 - name: urgent\n    steps:\n\
+         \x20     h: {{kind: webhook, path: /hooks/urgent, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+         \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
+         \x20     f: {{kind: finish, depends_on: [a]}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n",
+        llm = llm.uri
+    ));
+    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
+    wait_ready(&addr);
+
+    let body = r#"{"n":1}"#;
+    let sig = sign(secret, body);
+    let (code, _, resp) = post_hdrs(
+        &addr,
+        "/hooks/bulk",
+        &[("X-Signature", &sig), ("Idempotency-Key", "w-1")],
+        body,
+    );
+    assert_eq!(code, 429, "low priority sheds at warn: {resp}");
+    assert!(resp.contains("low-priority"), "the body says why: {resp}");
+    let (code, _) = post(
+        &addr,
+        "/hooks/urgent",
+        &[("X-Signature", &sig), ("Idempotency-Key", "w-2")],
+        body,
+    );
+    assert_eq!(code, 202, "normal priority still admits at warn");
+    assert!(
+        wait_for(|| !daemon.events("pressure.warn").is_empty(), 5),
+        "the warn transition is logged:\n{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&store_dir).ok();
 }

@@ -36,7 +36,10 @@ pub struct Subagent {
     pgid: i32,
     /// Set once the reactor has reaped this child — suppresses Drop signalling.
     reaped: bool,
-    _reader: JoinHandle<()>,
+    /// The stdout reader thread. Joinable: after the child exits its pipe EOFs
+    /// and the reader finishes promptly — the reactor joins it before acting on
+    /// a reap, so every frame the child wrote is in the event queue first.
+    reader: Option<JoinHandle<()>>,
     /// The child's own cgroup leaf (`security.cgroup`), held for its lifetime —
     /// its Drop writes `cgroup.kill` + removes the leaf (the atomic teardown
     /// backstop). `None` when cgroups are not configured. RFC 0009 §cgroup.
@@ -63,11 +66,42 @@ pub fn spawn(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: only async-signal-safe calls between fork and exec.
+        // Copy the OS caps out of the payload: the pre_exec closure runs
+        // between fork and exec and may only touch plain values.
+        let mem = payload.limits.memory_bytes;
+        let cpu = payload.limits.cpu_seconds;
+        let nice = payload.limits.nice;
+        // SAFETY: only async-signal-safe calls between fork and exec
+        // (setpgid/setrlimit/setpriority all are).
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 // Own process group → the kill ladder can target the subtree.
                 libc::setpgid(0, 0);
+                if let Some(bytes) = mem {
+                    let lim = libc::rlimit {
+                        rlim_cur: bytes as libc::rlim_t,
+                        rlim_max: bytes as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if let Some(secs) = cpu {
+                    // Soft cap = the declared budget (SIGXCPU); hard cap 5 s
+                    // later (SIGKILL) so a child ignoring SIGXCPU still dies.
+                    let lim = libc::rlimit {
+                        rlim_cur: secs as libc::rlim_t,
+                        rlim_max: secs.saturating_add(5) as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CPU, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if let Some(n) = nice {
+                    // Lowering priority always works; raising needs
+                    // CAP_SYS_NICE — best-effort by design, never an error.
+                    let _ = libc::setpriority(libc::PRIO_PROCESS, 0, n);
+                }
                 Ok(())
             });
         }
@@ -137,7 +171,7 @@ pub fn spawn(
         writer,
         pgid,
         reaped: false,
-        _reader: reader,
+        reader: Some(reader),
         _cgroup: cgroup,
     })
 }
@@ -145,6 +179,14 @@ pub fn spawn(
 impl Subagent {
     pub fn pid(&self) -> i32 {
         self.child.id() as i32
+    }
+    /// Wait for the stdout reader to finish (bounded: the pipe has EOF'd once
+    /// the child is reapable). After this, every frame the child ever wrote has
+    /// been forwarded.
+    pub fn join_reader(&mut self) {
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
     }
     pub fn pgid(&self) -> i32 {
         self.pgid

@@ -49,8 +49,9 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | `outputs` | `{schema: …}` — checked for well-formedness only (see below) |
 | `concurrency` | `{max_runs, on_overflow}` — default 4 runs, `queue` |
 | `limits` | `{steps, tokens, deadline, budget}` for the whole run |
+| `priority` | `low\|normal\|high` (default `normal`) — contention weight: `low` admissions shed one pressure level early (at *warn*), and each tick schedules ready steps of higher-priority runs first. A tiebreak under scarcity, not a reservation. |
 | `steps` | the graph: an object of step id to step |
-| `file` / `uri` | load the document from a path or an MCP resource instead of inline |
+| `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:`+`glob:` scan — see the configuration doc §6.1) |
 
 A complete, runnable example:
 
@@ -136,10 +137,10 @@ counts as satisfied, so a step depending on any of them still runs.
 | `manual` | `inputs` |
 | `loop` | `interval`, `delay`, `until`, `max_iterations`, `backoff`, `inputs` |
 | `schedule` | `cron`, `every`, `tz`, `jitter`, `catch_up`, `at`, `inputs` |
-| `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `inputs` |
+| `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window`, `inputs` |
 | `signal` | **`name`**, `filter`, `deliver`, `inputs` |
 | `event` | **`on`**, `filter`, `inputs` |
-| `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `idempotency`, `respond`, `filter`, `inputs` |
+| `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`, `inputs` |
 
 Behaviour the field names do not give away:
 
@@ -156,13 +157,25 @@ Behaviour the field names do not give away:
   reads them.
 - `subscribe` is notify-then-read: an MCP resource update makes it re-read the
   resource and apply the CEL `filter` over `content`. `debounce_ms` keeps the
-  newest payload and fires when the window closes.
+  newest payload and fires when the window closes. `window: {samples: N}`
+  (N ≤ 256) additionally keeps a durable ring of the last N read values and
+  delivers it as `output.window`, oldest→newest — for streams where the signal
+  is a trend, not a reading. The ring accrues on every filter-passing update,
+  including ones a debounce coalesces away: debouncing drops *firings*, the
+  window keeps the *samples*.
 - `event` fires on lifecycle events. A terminal run raises `workflow.finished`
   when it completed, `workflow.failed` when it failed, stalled, was cancelled or
   was refused.
 - `webhook` deduplicates on the `Idempotency-Key` header by default — a replay
   answers `200 duplicate` and fires no second run. `respond: sync` holds the
-  response open until the run reaches a terminal state.
+  response open until the run reaches a terminal state. `rate: "<burst>/<per>s"`
+  (e.g. `"20/1s"`, the same spelling as A2A quotas) bounds how fast requests are
+  *admitted* — past the burst the route answers `429` with a `Retry-After`,
+  before anything is written to the durable inbox. `parallelism` bounds how many
+  run at once; `rate` bounds how fast they arrive. Under resource pressure
+  (see the operations doc) every route sheds with `429` regardless of `rate` —
+  authentication is still checked first, so an unauthenticated probe learns
+  nothing about load.
 
 A trigger's `inputs` is a mapping rendered against `{payload, env}` and lands in
 the run as the `inputs` namespace, validated against the workflow's
@@ -225,7 +238,7 @@ Every step also accepts the cross-cutting fields, on any kind:
 |---|---|
 | `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system` |
 | `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system` |
-| `subagent` | **`instruction`**, `mode`, `workflow`, `tools`, `servers`, `limits`, `context`, `output_contract`, `output_schema`, `skills` |
+| `subagent` | **`instruction`**, `mode`, `workflow`, `tools`, `servers`, `limits`, `priority`, `context`, `output_contract`, `output_schema`, `skills` |
 | `classify` | **`input`**, **`classes`**, `prompt`, `skills` |
 | `extract` | **`input`**, **`output_schema`**, `prompt`, `skills` |
 | `summarize` | **`input`**, `length`, `prompt`, `skills` |
@@ -244,11 +257,11 @@ validation error.
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `http` | **`url`**, `method`, `headers`, `query`, `body`, `json`, `timeout`, `expect`, `allow_private`, `sign` |
-| `mcp.tool` | **`server`**, **`tool`**, `args` |
+| `http` | **`url`**, `method`, `headers`, `query`, `body`, `json`, `timeout`, `expect`, `allow_private`, `sign`, `idempotency` |
+| `mcp.tool` | **`server`**, **`tool`**, `args`, `idempotency` |
 | `mcp.resource` | **`server`**, **`op`**, `uri`, `name`, `arguments`, `reference`, `argument` |
 | `tool` | **`name`**, `args` |
-| `a2a.delegate` | **`peer`**, **`objective`**, `output_contract`, `timeout` |
+| `a2a.delegate` | **`peer`**, **`objective`**, `output_contract`, `timeout`, `idempotency` |
 | `memory.get` / `.set` / `.list` / `.delete` | `key`, `value`, `ttl`, `prefix`, `limit` |
 | `artifact.create` / `.get` / `.delete` | `name`, `mime`, `content`, `from_step`, `sensitive`, `id` |
 | `knowledge.search` / `.get`, `search.query` / `.fetch` | `query`, `top_k`, `filters`, `id`, `uri`, `url`, `kind`, `limit`, `freshness`, `max_bytes` |
@@ -257,10 +270,33 @@ validation error.
 `{status, ok, headers, body, json}`. Success is any status in 200..400 unless
 `expect` lists codes; the default timeout is 30 s; private, loopback and
 link-local targets are refused unless the step sets `allow_private: true`.
-`mcp.tool` attaches an idempotency key, `{instance}/{run}/{step}#{attempt}`, in
-the call's `_meta`, so a server can recognise a duplicate delivery. It names the
-*attempt*, not the step: a replay after a crash re-executes with the counter
-already incremented, so it arrives under a new key.
+Steps that reach a remote can declare **idempotency** — the retry-safety
+handshake with APIs that deduplicate:
+
+```yaml
+charge:
+  kind: http
+  method: POST
+  url: https://api.example/charges
+  idempotency: { header: Idempotency-Key }   # or {query: idem}, or value: "{{inputs.order_id}}"
+  retry: { max: 2, backoff: 2s }
+```
+
+The default key is **derived**: `sha256(run_id.step_id)`, 32 hex chars. Stable
+across attempts by arithmetic — every retry of this step, including a replay
+after a crash, presents the same key — unique per run because run ids are, and
+opaque on the wire (a raw `run.step` key would leak ULID timestamps and internal
+step names to every API that logs its idempotency keys). `value:` substitutes an
+application key (an order id), which is *stronger* when one exists: it also
+collides two different runs attempting the same real-world operation. `mcp.tool`
+always attaches the key as `agent/idempotency_key` in the call's `_meta`
+(`agent/attempt` rides separately, for servers that want to observe retries
+without keying on them); `a2a.send`/`a2a.delegate` opt in with
+`idempotency: true`, which pins the A2A `messageId` across retries. The attempt
+counter is never part of the key — that would defeat the field's own name. The
+same derived key is also in every subagent step's environment as
+`env.idempotency_key` (with `env.step` and `env.attempt`); anything a template
+derives from those is retry-stable, where `env.ts` is deliberately not.
 
 ### Shape data
 
@@ -494,9 +530,11 @@ stateDiagram-v2
 That ordering is the whole guarantee, and it is honest about its cost. A crash
 between the durable `Running` write and the effect completing means restore finds
 the step `Running`, resets it to `Pending` and re-executes it. Semantics are
-**at-least-once**, not exactly-once: the MCP path's idempotency key is per
-*attempt*, so a replay arrives under a new one, and `http` and `tool` steps
-depend on the callee to deduplicate.
+**at-least-once**, not exactly-once: the effect can land and the crash eat the
+acknowledgement, in which case the replay re-sends. What makes that safe is the
+idempotency key above — stable across the replay, so a deduplicating callee
+treats the re-send as the retry it is. A callee that does not deduplicate sees
+the operation at least once, `idempotency` field or not.
 `on_replay: retry|skip|fail` looks like an escape hatch, but no runtime code
 consults it — the replay policy is hardwired. Suspended steps keep their wait
 record and are swept again; pending inbox events are re-queued, so an

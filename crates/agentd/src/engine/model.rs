@@ -102,6 +102,7 @@ pub const KINDS: &[KindInfo] = &[
             "filter",
             "deliver",
             "on_no_listener",
+            "window",
             "inputs",
         ],
         &["server", "uri"],
@@ -141,6 +142,7 @@ pub const KINDS: &[KindInfo] = &[
             "auth",
             "parallelism",
             "on_overflow",
+            "rate",
             "idempotency",
             "respond",
             "filter",
@@ -375,7 +377,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "mcp.tool",
         false,
-        &["server", "tool", "args"],
+        &["server", "tool", "args", "idempotency"],
         &["server", "tool"],
         true,
         false,
@@ -411,6 +413,7 @@ pub const KINDS: &[KindInfo] = &[
             "expect",
             "allow_private",
             "sign",
+            "idempotency",
         ],
         &["url"],
         true,
@@ -419,7 +422,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a.send",
         false,
-        &["to", "parts", "context", "timeout"],
+        &["to", "parts", "context", "timeout", "idempotency"],
         &["to"],
         true,
         false,
@@ -427,7 +430,13 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a.delegate",
         false,
-        &["peer", "objective", "output_contract", "timeout"],
+        &[
+            "peer",
+            "objective",
+            "output_contract",
+            "timeout",
+            "idempotency",
+        ],
         &["peer", "objective"],
         true,
         false,
@@ -557,6 +566,7 @@ pub const KINDS: &[KindInfo] = &[
             "tools",
             "servers",
             "limits",
+            "priority",
             "context",
             "output_contract",
             "output_schema",
@@ -804,6 +814,12 @@ pub struct StateDecl {
 pub struct Workflow {
     pub name: String,
     pub version: u32,
+    /// Scheduling weight under contention (RFC: pressure §priority). `low`
+    /// admissions shed one pressure level EARLIER (at `warn`, not just `shed`),
+    /// and ready steps of higher-priority runs are scheduled first each tick.
+    /// It is a tiebreak under scarcity, not a reservation.
+    #[serde(default)]
+    pub priority: Priority,
     /// Declared run variables: `{key: {type, reducer}}`.
     ///
     /// Optional, and the point is to make concurrent writes a DECLARED policy
@@ -834,6 +850,52 @@ pub struct Workflow {
 
 fn default_true() -> bool {
     true
+}
+
+/// Contention priority — for workflows and subagent spawns. Ordering matters:
+/// higher is more important.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl Priority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::Low => "low",
+            Priority::Normal => "normal",
+            Priority::High => "high",
+        }
+    }
+    /// Parse from a spec value; `None` field = `Normal`, junk = `Err`.
+    pub fn from_spec(v: Option<&Value>) -> Result<Priority, String> {
+        match v.and_then(Value::as_str) {
+            None if v.is_none() => Ok(Priority::Normal),
+            Some("low") => Ok(Priority::Low),
+            Some("normal") => Ok(Priority::Normal),
+            Some("high") => Ok(Priority::High),
+            other => Err(format!(
+                "priority must be low|normal|high, got {:?}",
+                other
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.map(|x| x.to_string()).unwrap_or_default())
+            )),
+        }
+    }
+    /// The niceness delta OS-level allocation uses (`setpriority`): `low`
+    /// yields CPU (+10), `high` asks for more (−5, granted only with
+    /// CAP_SYS_NICE), `normal` inherits.
+    pub fn nice(self) -> Option<i32> {
+        match self {
+            Priority::Low => Some(10),
+            Priority::Normal => None,
+            Priority::High => Some(-5),
+        }
+    }
 }
 
 impl Workflow {
@@ -912,6 +974,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         "steps",
         "file",
         "uri",
+        "priority",
     ];
     for key in obj.keys() {
         if !TOP.contains(&key.as_str()) {
@@ -942,6 +1005,13 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         errs.push(format!("workflow {name:?}: `start`/`nodes` are dialect 1/2 — use `steps` with start nodes (docs/workflows.md §migration)"));
     }
     let armed = obj.get("armed").and_then(Value::as_bool).unwrap_or(true);
+    let priority = match Priority::from_spec(obj.get("priority")) {
+        Ok(p) => p,
+        Err(e) => {
+            errs.push(format!("workflow {name:?}: {e}"));
+            Priority::Normal
+        }
+    };
     let inputs_schema = match obj.get("inputs") {
         None => None,
         Some(v) => {
@@ -1077,6 +1147,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         state,
         name,
         version,
+        priority,
         description: obj
             .get("description")
             .and_then(Value::as_str)
@@ -1256,8 +1327,87 @@ fn parse_step(
     {
         errs.push(format!("{at}: output_schema: {}", e.join("; ")));
     }
+    // `idempotency` shapes. Validated per kind because the transports differ:
+    // HTTP names WHERE the key travels (a header or a query parameter), the
+    // others only ever override its VALUE. `true` means "the default derived
+    // key", which for `mcp.tool` is already automatic.
+    if let Some(idem) = spec.get("idempotency") {
+        match kind.as_str() {
+            "http" => {
+                let ok = idem.as_object().is_some_and(|o| {
+                    let hdr = o.get("header").map(|v| v.is_string());
+                    let qry = o.get("query").map(|v| v.is_string());
+                    let val = o.get("value").is_none_or(|v| v.is_string());
+                    let known = o
+                        .keys()
+                        .all(|k| matches!(k.as_str(), "header" | "query" | "value"));
+                    known && val && matches!((hdr, qry), (Some(true), None) | (None, Some(true)))
+                });
+                if !ok {
+                    errs.push(format!(
+                        "{at}: http idempotency takes {{header: NAME}} or {{query: NAME}} \
+                         (exactly one), with an optional string value"
+                    ));
+                }
+            }
+            "mcp.tool" | "a2a.send" | "a2a.delegate" => {
+                let ok = idem.is_boolean()
+                    || idem.as_object().is_some_and(|o| {
+                        o.keys().all(|k| k == "value")
+                            && o.get("value").is_none_or(|v| v.is_string())
+                    });
+                if !ok {
+                    errs.push(format!(
+                        "{at}: idempotency takes true or {{value: \"…\"}} on this kind"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
     // Kind-specific sanity.
     match kind.as_str() {
+        // `rate: "<burst>/<per>s"` — arrival throttling, the same spelling as
+        // `a2a.principals[].quotas.rate`. Checked here so a typo surfaces with
+        // the other definition errors, not as a startup refusal.
+        "webhook" => {
+            if let Some(r) = spec.get("rate") {
+                let ok = r.as_str().is_some_and(|r| {
+                    r.split_once('/').is_some_and(|(b, p)| {
+                        let per = p.trim();
+                        let per = per
+                            .strip_suffix('s')
+                            .or_else(|| per.strip_suffix("sec"))
+                            .unwrap_or(per);
+                        b.trim().parse::<u32>().is_ok_and(|b| b > 0)
+                            && per.trim().parse::<f64>().is_ok_and(|s| s > 0.0)
+                    })
+                });
+                if !ok {
+                    errs.push(format!(
+                        "{at}: rate must be \"<burst>/<per>s\" (e.g. \"20/1s\")"
+                    ));
+                }
+            }
+        }
+        // `window: {samples: N}` — deliver the last N read values as an array
+        // (the trend, not just the latest reading — the hardware-stream shape).
+        // N is capped because the ring rides the durable start-state: every
+        // sample is checkpointed, so an unbounded window would convert a fast
+        // sensor into disk pressure. Past 256, aggregate at the source.
+        "subscribe" => {
+            if let Some(w) = spec.get("window") {
+                let ok = w.as_object().is_some_and(|o| {
+                    o.keys().all(|k| k == "samples")
+                        && o.get("samples")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|n| (1..=256).contains(&n))
+                });
+                if !ok {
+                    errs.push(format!("{at}: window takes {{samples: 1..=256}}"));
+                }
+            }
+        }
         // A `switch` routes to ONE step id per case, as a string. A list reads
         // naturally — `cases: {select: [prepare]}` — and is exactly wrong: the
         // executor asks for a string, gets an array, finds no target, falls to
@@ -1872,6 +2022,64 @@ mod tests {
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {
         parse_workflow(&doc)
+    }
+
+    #[test]
+    fn workflow_priority_parses_and_rejects_junk() {
+        let w = wf(json!({"name": "w", "priority": "low", "steps": {
+            "s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}}))
+        .unwrap();
+        assert_eq!(w.priority, Priority::Low);
+        let w = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}}))
+        .unwrap();
+        assert_eq!(w.priority, Priority::Normal, "default");
+        let e = wf(json!({"name": "w", "priority": "urgent", "steps": {
+            "s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}}))
+        .unwrap_err();
+        assert!(e.iter().any(|m| m.contains("low|normal|high")), "{e:?}");
+        // Priority orders: High > Normal > Low (schedule sort relies on it).
+        assert!(Priority::High > Priority::Normal && Priority::Normal > Priority::Low);
+    }
+
+    #[test]
+    fn webhook_rate_and_subscribe_window_validate_their_shapes() {
+        // Well-formed: both parse.
+        let ok = wf(json!({"name": "w", "steps": {
+            "h": {"kind": "webhook", "path": "/x", "rate": "20/1s"},
+            "s": {"kind": "subscribe", "server": "m", "uri": "u://v", "window": {"samples": 64}},
+            "f": {"kind": "finish", "depends_on": ["h", "s"]},
+        }}));
+        assert!(ok.is_ok(), "{ok:?}");
+        // A malformed rate is a definition error, not a startup surprise.
+        for bad in ["fast", "0/1s", "5/0s", "5"] {
+            let e = wf(json!({"name": "w", "steps": {
+                "h": {"kind": "webhook", "path": "/x", "rate": bad},
+                "f": {"kind": "finish", "depends_on": ["h"]},
+            }}))
+            .unwrap_err();
+            assert!(
+                e.iter().any(|m| m.contains("rate must be")),
+                "rate {bad:?}: {e:?}"
+            );
+        }
+        // window: bounded, object-shaped, samples-only.
+        for bad in [
+            json!(64),
+            json!({"samples": 0}),
+            json!({"samples": 300}),
+            json!({"samples": 4, "mean": true}),
+        ] {
+            let e = wf(json!({"name": "w", "steps": {
+                "s": {"kind": "subscribe", "server": "m", "uri": "u://v", "window": bad},
+                "f": {"kind": "finish", "depends_on": ["s"]},
+            }}))
+            .unwrap_err();
+            assert!(
+                e.iter().any(|m| m.contains("window takes")),
+                "window {bad:?}: {e:?}"
+            );
+        }
     }
 
     #[test]

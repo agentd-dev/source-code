@@ -69,8 +69,9 @@ value the model reads and adapts to — never an exception, never a crash.
 | 4 | total | records in the registry ≥ `limits.subagents.total` | 64 |
 | 5 | depth | requester depth ≥ `limits.subagents.depth` | 3 |
 | 6 | rate | spawn-rate bucket empty (`limits.subagents.rate`) | `8/2s` |
-| 7 | memory | cgroup unit at 95% of its `memory.high` | — |
+| 7 | pressure | resource pressure is shedding (disk headroom below `store.file.min_free`, or cgroup memory) — and at **warn** already, when the spawn declares `priority: low` | — |
 | 8 | trifecta | the narrowed servers carry untrusted-input **and** sensitive **and** egress tags | refuse unless `security.allow_trifecta` |
+| 9 | caps | `limits.memory` / `limits.cpu` / `priority` malformed | — |
 
 Only then does the reactor mint a handle (`sub-<n>`), build the payload, stage a
 `subagent/<handle>` record at status `spawned`, and fork. The durable write lands
@@ -117,6 +118,33 @@ get A2A peers or the AAuth identity — both are hardcoded empty on spawn — so
 cannot delegate onward over A2A and does not sign under the tree identity. It has
 **no internal self-tools at all**: its surface is the tools of its granted MCP
 servers, plus `resource.read` when those servers expose resources.
+
+## Resource allocation — what a parent can cap
+
+The `limits` a spawn declares are two different kinds of cap, and both are real:
+
+```yaml
+kind: subagent
+instruction: churn through the archive
+priority: low                       # sheds first under pressure; runs at nice +10
+limits:
+  steps: 40                         # protocol budget: the child's loop refuses step 41
+  tokens: 200000                    #   …and counts every model call against this
+  deadline: 10m                     #   …and arms its own wall-clock deadline
+  memory: 512MB                     # OS cap: RLIMIT_AS, set between fork and exec
+  cpu: 5m                           # OS cap: RLIMIT_CPU — SIGXCPU at 5m, SIGKILL 5s later
+```
+
+`steps`/`tokens`/`deadline` are **protocol budgets** — enforced by the child's
+own loop and audited by the supervisor. `memory`/`cpu` are **kernel caps** —
+`setrlimit` between fork and exec, so a child that misbehaves (a runaway
+allocation in a tool, a spin) is stopped by the OS even if its loop never gets
+the chance. `priority` maps to niceness (`low` → +10, `high` → −5 best-effort;
+raising needs `CAP_SYS_NICE` and is skipped silently without it) — so under CPU
+contention the kernel itself favours the important child — and to admission:
+`low` spawns shed one pressure level early (at warn). Verify caps landed with
+`/proc/<pid>/limits`; the `subagent.spawn` event logs the pid and the applied
+values.
 
 ## Depth and breadth in practice
 

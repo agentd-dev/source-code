@@ -265,7 +265,13 @@ impl Runtime {
                     if let Some(fire_at) = st["debounce_until"].as_u64()
                         && now >= fire_at
                     {
-                        let payload = st["pending_payload"].clone();
+                        let mut payload = st["pending_payload"].clone();
+                        // The sample ring may have grown since the payload was
+                        // coalesced — deliver the ring as of NOW, not as of the
+                        // update that armed the debounce.
+                        if payload.get("window").is_some() {
+                            payload["window"] = st["window"].clone();
+                        }
                         let mut st2 = self.start_state(&workflow, &node);
                         st2.as_object_mut().map(|o| {
                             o.remove("debounce_until");
@@ -305,6 +311,22 @@ impl Runtime {
         kind: &str,
         run_id: Option<&str>,
     ) {
+        // Admission gate: a fired start under pressure is SKIPPED — logged with
+        // its cause, so a schedule that quietly stopped firing while the disk
+        // filled is a story the log tells, not a mystery. In-flight runs keep
+        // draining; that is the point of shedding here rather than dying at the
+        // next checkpoint.
+        let low = self
+            .workflows
+            .get(workflow)
+            .is_some_and(|w| w.priority == crate::engine::model::Priority::Low);
+        if let Some(cause) = self.pressure.refusal(low) {
+            self.log.warn(
+                "start.shed",
+                json!({"workflow": workflow, "node": node, "kind": kind, "cause": cause}),
+            );
+            return;
+        }
         let inputs = match spec.get("inputs") {
             Some(mapping) => {
                 let mut data = crate::engine::template::Data::new();
@@ -421,15 +443,52 @@ impl Runtime {
         if matches.is_empty() {
             return;
         }
-        // Notify-then-read.
-        let content = self
-            .mcp
-            .get(server)
-            .and_then(|c| c.read_resource(uri).ok())
-            .map(|r| {
-                let t = r.text();
-                serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t))
-            });
+        // Notify-then-read, OFF the loop (same shape as `on_resource_updated`):
+        // the read is a network round trip bounded only by the MCP server's
+        // patience, and subscriptions are the reactivity hot path — an inline
+        // read here handed a slow server the whole daemon per update. The read
+        // thread reports back as an event; the filter/window/debounce state
+        // machine below runs on the loop when it lands.
+        let Some(client) = self.mcp.get(server).cloned() else {
+            return; // the server went away between the notification and here
+        };
+        let tx = self.events_tx.clone();
+        let (srv, u) = (server.to_string(), uri.to_string());
+        std::thread::Builder::new()
+            .name(format!("mcp.subscribe:{server}"))
+            .spawn(move || {
+                let content = client.read_resource(&u).ok().map(|r| {
+                    let t = r.text();
+                    serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t))
+                });
+                let _ = tx.send(super::events::Event::SubscribeRead {
+                    server: srv,
+                    uri: u,
+                    content,
+                });
+            })
+            .ok();
+    }
+
+    /// The loop half of a `subscribe` update: the off-loop read landed; apply
+    /// filter → window ring → debounce/fire per matching start node.
+    pub(crate) fn on_subscribe_read(&mut self, server: &str, uri: &str, content: Option<Value>) {
+        let matches: Vec<(String, String, Map<String, Value>)> = self
+            .workflows
+            .values()
+            .filter(|w| w.armed)
+            .flat_map(|w| {
+                w.start_steps()
+                    .into_iter()
+                    .filter(|s| {
+                        s.kind == "subscribe"
+                            && s.field_str("server") == Some(server)
+                            && s.field_str("uri") == Some(uri)
+                    })
+                    .map(|s| (w.name.clone(), s.id.clone(), s.spec.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         for (workflow, node, spec) in matches {
             // filter (CEL over the read).
             if let Some(filter) = spec.get("filter").and_then(Value::as_str) {
@@ -442,7 +501,36 @@ impl Runtime {
                     continue;
                 }
             }
-            let payload = json!({"server": server, "uri": uri, "content": content});
+            // `window: {samples: N}`: keep a ring of the last N read values in
+            // the durable start-state, so the fired run sees the trend, not
+            // just the reading that happened to fire it. The ring accrues on
+            // every (filter-passing) update — including updates a debounce
+            // window coalesces away, which is the point: coalescing drops
+            // FIRINGS, the window keeps the SAMPLES.
+            let window_n = spec
+                .get("window")
+                .and_then(|w| w.get("samples"))
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            if let Some(n) = window_n {
+                let mut st = self.start_state(&workflow, &node);
+                let mut ring: Vec<Value> = st["window"].as_array().cloned().unwrap_or_default();
+                ring.push(content.clone().unwrap_or(Value::Null));
+                if ring.len() > n {
+                    let drop = ring.len() - n;
+                    ring.drain(..drop);
+                }
+                st["window"] = Value::Array(ring);
+                self.set_start_state(&workflow, &node, st);
+            }
+            let mut payload = json!({"server": server, "uri": uri, "content": content});
+            if window_n.is_some() {
+                payload["window"] = self.start_state(&workflow, &node)["window"]
+                    .as_array()
+                    .cloned()
+                    .map(Value::Array)
+                    .unwrap_or_else(|| json!([]));
+            }
             let debounce = spec.get("debounce_ms").and_then(Value::as_u64).unwrap_or(0);
             if debounce > 0 {
                 // Coalesce: newest payload wins; fire when the window elapses.

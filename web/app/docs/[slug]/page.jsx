@@ -1,5 +1,6 @@
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
+import tuiFrames from "../../../lib/tui-frames.json";
 import remarkGfm from "remark-gfm";
 import { DOCS, GROUPS, docsInGroup, readDoc, slugForFile } from "../../../lib/docs";
 import Mermaid from "../../components/Mermaid";
@@ -59,11 +60,17 @@ function Pre({ children }) {
   // and captured by interface/tools/frames.mjs. Giving them terminal chrome
   // says "this is the program", which a bare code block does not — and the
   // frames regenerate from the code, so they cannot drift into fiction.
+  //
+  // The fence itself carries STRIPPED text (readable on GitHub, diff-stable);
+  // the coloured original lives in web/lib/tui-frames.json keyed by the
+  // fence's title, so the site shows the program the way a terminal does.
   if (cls.includes("language-tui")) {
     const code = child.props.children;
     const text = (Array.isArray(code) ? code.join("") : String(code)).replace(/\n$/, "");
     const [first, ...rest] = text.split("\n");
     const titled = first.startsWith("# ");
+    const title = titled ? first.slice(2) : "agentd tui";
+    const ansi = tuiFrames[title.trim()];
     return (
       <div className="term term-doc">
         <div className="panel-title">
@@ -72,13 +79,75 @@ function Pre({ children }) {
             <i />
             <i />
           </span>
-          <span className="ml-1">{titled ? first.slice(2) : "agentd tui"}</span>
+          <span className="ml-1">{title}</span>
         </div>
-        <pre>{titled ? rest.join("\n") : text}</pre>
+        <pre>{ansi ? ansiSpans(ansi) : titled ? rest.join("\n") : text}</pre>
       </div>
     );
   }
   return <pre>{children}</pre>;
+}
+
+/** SGR colour names for the 16-colour codes chalk emits. */
+const ANSI_NAMES = {
+  30: "black", 31: "red", 32: "green", 33: "yellow",
+  34: "blue", 35: "magenta", 36: "cyan", 37: "white",
+  90: "bblack", 91: "bred", 92: "bgreen", 93: "byellow",
+  94: "bblue", 95: "bmagenta", 96: "bcyan", 97: "bwhite",
+};
+
+/**
+ * A captured TUI frame's ANSI escapes, as styled spans.
+ *
+ * Runs at build time (this is a server component), so the browser gets plain
+ * HTML. Deliberately covers only what Ink actually emits — the 16 SGR colours,
+ * bold, dim, inverse, and their resets — rather than a whole terminal
+ * emulator: anything unrecognised drops its escape and keeps its text, so a
+ * new code can never make a frame unreadable, only uncoloured.
+ */
+function ansiSpans(text) {
+  const out = [];
+  const state = { fg: null, bold: false, dim: false, inv: false };
+  let buf = "";
+  let key = 0;
+  const flush = () => {
+    if (!buf) return;
+    const classes = [];
+    if (state.fg) classes.push(`an-${state.fg}`);
+    if (state.bold) classes.push("an-b");
+    if (state.dim) classes.push("an-d");
+    if (state.inv) classes.push("an-inv");
+    out.push(
+      classes.length ? (
+        <span key={key++} className={classes.join(" ")}>
+          {buf}
+        </span>
+      ) : (
+        buf
+      ),
+    );
+    buf = "";
+  };
+  for (const part of text.split(/(\u001b\[[0-9;]*m)/)) {
+    const m = /^\u001b\[([0-9;]*)m$/.exec(part);
+    if (!m) {
+      buf += part;
+      continue;
+    }
+    flush();
+    for (const code of (m[1] || "0").split(";").map(Number)) {
+      if (code === 0) Object.assign(state, { fg: null, bold: false, dim: false, inv: false });
+      else if (code === 1) state.bold = true;
+      else if (code === 2) state.dim = true;
+      else if (code === 7) state.inv = true;
+      else if (code === 22) (state.bold = false), (state.dim = false);
+      else if (code === 27) state.inv = false;
+      else if (code === 39) state.fg = null;
+      else if (ANSI_NAMES[code]) state.fg = ANSI_NAMES[code];
+    }
+  }
+  flush();
+  return out;
 }
 
 /** Slugify a heading the same way rehype-slug would, so the TOC links land. */

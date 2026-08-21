@@ -16,8 +16,10 @@
 //! and `--<path>` flags for every config-file path), [`watch`] (the inotify
 //! reload trigger).
 
+pub mod envfile;
 pub mod file;
 pub mod paths;
+pub mod prompt;
 pub mod v2;
 #[cfg(all(unix, feature = "config-watch"))]
 pub mod watch;
@@ -119,6 +121,10 @@ pub enum ServeTarget {
     /// production control plane (`https://`); plaintext (`http://`) is admitted
     /// only for a loopback host (dev/tests).
     Http { bind: String, tls: bool },
+    /// Bind a **unix domain socket** at `path` (`unix:///run/agentd/a2a.sock`) —
+    /// the co-located-peers transport: same HTTP/1.1 + JSON-RPC over the socket,
+    /// no TLS (the kernel authenticates the peer by uid), no TCP overhead.
+    Unix { path: String },
 }
 
 impl ServeTarget {
@@ -158,6 +164,22 @@ impl ServeTarget {
                 tls,
             });
         }
+        if let Some(path) = spec
+            .strip_prefix("unix://")
+            .or_else(|| spec.strip_prefix("unix:"))
+        {
+            if path.is_empty() {
+                return Err(usage(format!("unix listener needs a socket path: {spec}")));
+            }
+            if !cfg!(unix) {
+                return Err(usage(format!(
+                    "unix:// listeners are unix-only (got: {spec}); use https://"
+                )));
+            }
+            return Ok(ServeTarget::Unix {
+                path: path.to_string(),
+            });
+        }
         Err(usage(format!(
             "--serve-mcp: want https://host:port (or loopback http://host:port for dev): {spec}"
         )))
@@ -176,7 +198,11 @@ impl Config {
         target: &ServeTarget,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), ConfigError> {
-        let ServeTarget::Http { bind, tls } = target;
+        let ServeTarget::Http { bind, tls } = target else {
+            // A unix listener authenticates by kernel peer credentials
+            // (same-uid); the TLS/bearer material below does not apply.
+            return Ok(());
+        };
         let (bind, tls) = (bind.as_str(), *tls);
         if tls {
             match (&self.serve_cert, &self.serve_key) {
@@ -283,9 +309,10 @@ impl A2aPeerSpec {
 /// peer, unlike the `--serve-mcp` listen form which may wildcard).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A2aEndpoint {
-    /// Dial an A2A peer over HTTP(S) — the sole transport (pivot):
+    /// Dial an A2A peer over HTTP(S) — the remote transport (pivot):
     /// `https://host[:port][/path]` (or loopback `http://` for dev/tests). The
-    /// raw URL, parsed by the A2A client's HTTP dialer.
+    /// raw URL, parsed by the A2A client's HTTP dialer. A co-located peer may
+    /// instead be dialled by `unix:///path` (same URL string, socket dial).
     Https(String),
 }
 
@@ -308,8 +335,23 @@ impl A2aEndpoint {
             }
             return Ok(A2aEndpoint::Https(spec.to_string()));
         }
+        // `unix:///run/agentd/peer.sock` — the co-located fast lane: same A2A
+        // protocol over a unix socket, authenticated by the kernel (uid) and
+        // the socket file's mode instead of TLS. The client dialer branches on
+        // the same string, so the variant stays one.
+        if let Some(path) = spec
+            .strip_prefix("unix://")
+            .or_else(|| spec.strip_prefix("unix:"))
+        {
+            if path.is_empty() || !cfg!(unix) {
+                return Err(usage(format!(
+                    "--a2a-peer: unix: endpoint needs a socket path (unix-only): {spec}"
+                )));
+            }
+            return Ok(A2aEndpoint::Https(spec.to_string()));
+        }
         Err(usage(format!(
-            "--a2a-peer: endpoint must be https://host[:port] (or loopback http:// for dev): {spec}"
+            "--a2a-peer: endpoint must be https://host[:port] (or loopback http:// for dev, or unix:///path for a co-located peer): {spec}"
         )))
     }
 }
@@ -3497,8 +3539,9 @@ mod tests {
         assert!(base(&["--serve-mcp", "https://127.0.0.1:8443"]).is_err());
         // Loopback plaintext needs no auth (dev).
         assert!(base(&["--serve-mcp", "http://127.0.0.1:9000"]).is_ok());
-        // TLS material on a socket / plaintext target is rejected.
-        assert!(base(&["--serve-mcp", "unix:/x.sock", "--serve-bearer", "t"]).is_err());
+        // TLS material on a plaintext target is rejected; a unix target skips
+        // the TLS/auth material checks entirely (the kernel authenticates).
+        assert!(base(&["--serve-mcp", "unix:/x.sock", "--serve-bearer", "t"]).is_ok());
         assert!(base(&["--serve-mcp", "http://127.0.0.1:9000", "--serve-cert", "/x"]).is_err());
         // Serve auth flags without --serve-mcp is a misconfig.
         assert!(base(&["--serve-bearer", "t"]).is_err());
@@ -3506,13 +3549,17 @@ mod tests {
 
     #[test]
     fn serve_target_retired_socket_schemes_are_rejected() {
-        // The unix:/vsock: serve targets are gone (pivot Phase 3) — exit 2.
-        for bad in [
-            "unix:/run/agentd.sock",
-            "vsock:5005",
-            "vsock:2:5005",
-            "tcp:1234",
-        ] {
+        // `unix:` returned for co-located peers (kernel-authenticated fast
+        // lane); vsock:/tcp: stay retired — exit 2.
+        assert!(matches!(
+            ServeTarget::parse("unix:/run/agentd.sock"),
+            Ok(ServeTarget::Unix { ref path }) if path == "/run/agentd.sock"
+        ));
+        assert!(matches!(
+            ServeTarget::parse("unix:///run/agentd.sock"),
+            Ok(ServeTarget::Unix { ref path }) if path == "/run/agentd.sock"
+        ));
+        for bad in ["vsock:5005", "vsock:2:5005", "tcp:1234"] {
             assert!(
                 matches!(ServeTarget::parse(bad), Err(ConfigError::Usage(_))),
                 "{bad} must be a usage error"
@@ -3586,10 +3633,17 @@ mod tests {
         assert_eq!(c.a2a_peers[0].name, "mesh");
         assert_eq!(c.a2a_peers[0].endpoint, "https://peer.example:8443/a2a");
 
-        // The retired socket schemes and non-loopback plaintext are rejected at
+        // A unix peer endpoint parses (the co-located fast lane)…
+        assert!(
+            Config::load(
+                &args(&["--a2a-peer", "mesh=unix:/run/peer.sock"]),
+                &base_env()
+            )
+            .is_ok()
+        );
+        // …while vsock, non-loopback plaintext, and bare tcp stay rejected at
         // load (exit 2) before any side effect.
         for bad in [
-            "mesh=unix:/run/peer.sock",
             "mesh=vsock:2:5005",
             "mesh=http://peer.example:9000",
             "mesh=tcp:9000",

@@ -806,7 +806,21 @@ fn a_live_subagent_is_observable_and_drillable() {
         .as_str()
         .expect("a subagent exists")
         .to_string();
-    let got = command(&addr, 4, "subagent.get", json!({"handle": handle}));
+    // Drill in and wait for the terminal state — the daemon now answers
+    // status queries faster than a subagent completes, so "already completed
+    // by the time we ask" is a timing artifact, not a contract.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let got = loop {
+        let got = command(&addr, 4, "subagent.get", json!({"handle": handle}));
+        if got["subagent"]["status"] == "completed" {
+            break got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subagent never completed: {got}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let sub = &got["subagent"];
     assert_eq!(sub["status"], "completed", "{got}");
     assert_eq!(sub["mode"], "sync");
@@ -989,4 +1003,67 @@ fn the_tui_passthrough_spawns_the_client_and_ties_lifetimes() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&daemon_log);
     std::fs::remove_file(&cfg).ok();
+}
+
+/// `security.workflows.immutable`: the agent may RUN its workflows, never
+/// rewrite them.
+///
+/// A workflow is a STANDING instruction — what happens when a schedule fires or
+/// a webhook lands, unattended. An agent that can rewrite one changes what
+/// happens next time, and the change outlives the conversation that caused it.
+/// Where definitions are reviewed before they ship — a file in git, a config a
+/// deploy applies — self-update is a hole in that review.
+///
+/// Driven through the MODEL, because that is the only path that can reach these
+/// tools: they are not exposed over A2A, and a workflow `tool` step is refused
+/// the grant at load.
+#[test]
+fn an_immutable_daemon_refuses_the_model_rewriting_its_workflows() {
+    let llm = spawn_mock_llm(&json!({"turns": [
+        {"tool_calls": [{"name": "workflow.create", "arguments": {"definition": {
+            "name": "sneaky",
+            "steps": {"go": {"kind": "manual"},
+                      "fin": {"kind": "finish", "depends_on": ["go"], "status": "completed"}}
+        }}}]},
+        {"content": "could not change it"}
+    ]}));
+    let (daemon, addr, _cfg) = spawn_bound(|port| {
+        iface_config(
+            &llm.uri,
+            port,
+            true,
+            "security:\n  workflows:\n    immutable: true\n",
+        )
+    });
+
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
+        "message": {"messageId": "m1", "role": "ROLE_USER",
+                    "parts": [{"text": "add a workflow called sneaky"}]}
+    }})
+    .to_string();
+    let _ = post_raw(&addr, &body);
+
+    // The refusal is AUDITED, not merely returned to the model — an operator
+    // reading the log should see that the agent tried, which is the point of
+    // logging a refusal at all.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut log = String::new();
+    while Instant::now() < deadline {
+        log = std::fs::read_to_string(&daemon.stderr_path).unwrap_or_default();
+        if log.contains("workflow.locked") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        log.contains("\"event\":\"workflow.locked\""),
+        "the model's workflow.create was not refused (no audit line):\n{log}"
+    );
+    // And nothing was DEFINED: a refusal that still writes is not a refusal.
+    // Checked on the definition event, not on the name — the name appears in
+    // the log either way, because the attempt itself is recorded.
+    assert!(
+        !log.contains("\"event\":\"workflow.defined\""),
+        "a locked daemon defined the workflow anyway:\n{log}"
+    );
 }

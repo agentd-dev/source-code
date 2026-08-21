@@ -213,9 +213,12 @@ SPIFFE) and `intelligence.dialect` / `intelligence.headers` /
 | `--listen <TARGET>` | `a2a.listen` | `SERVE_MCP` | *(off)* | Arm the A2A listener — the daemon's external channel and operator control (RFC 0029): `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). `--serve-mcp` is the same alias. Needs `--features a2a`. |
 | `--serve-cert` / `--serve-key` / `--serve-client-ca` | `a2a.tls.cert` / `.key` / `.client_ca` | — | *(none)* | The listener's server certificate, private key, and client-CA bundle for mTLS. An `https://` listen without cert+key is exit `2`. |
 | `--serve-bearer <T>` | `a2a.bearer` | `SERVE_BEARER` | *(none)* | Static bearer token accepted by the listener. From a *file* it must be a `{{secret:…}}` reference. |
-| `--a2a-peer name=<ENDPOINT>` | `a2a.peers` *(adds one)* | — | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`). Repeatable. Needs `--features a2a`. |
+| `--a2a-peer name=<ENDPOINT>` | `a2a.peers` *(adds one)* | — | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`, or `unix:///path` for a co-located instance). Repeatable. Needs `--features a2a`. |
 | `--workflow <FILE>` | `workflows` *(adds one)* | — | *(none)* | Append a workflow definition (dialect 3, RFC 0027) to `workflows:` as `{name: <file stem>, file: <path>}` — its start node is the trigger. Repeatable; the same as an inline `workflows:` entry. See [RFC 0027](../rfcs/0027-workflow-dialect-3.md). |
 | `--allow-trifecta` | `security.allow_trifecta` | `ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
+| `--env <FILE>` | *(process env)* | — | *(none)* | Load a dotenv file into this process's environment before anything reads it — `${VAR}` expansion, `{{secret:NAME}}` resolution, subagent inheritance all see it. Repeatable: later files win; the **real environment always wins** over any file. `KEY=VALUE`, `export` prefix ok, `#` comments, `'…'` literal, `"…"` with `\n`-style escapes, no `$VAR` interpolation inside the file. A malformed line refuses startup naming file:line. |
+| `--fresh` | *(process intent)* | — | *(none)* | Start a NEW durable-store generation instead of resuming (RFC 0033 §3.2); the previous generation stays on the store. |
+| `--prompt-missing` | *(process intent)* | — | *(none)* | Ask interactively on `/dev/tty` (echo off) for each `{{secret:NAME}}` the startup preflight finds missing. Values live in process memory only; a restart re-asks. Refused without a controlling terminal (§12.3). |
 
 Durable runs **resume automatically** from the store on restart (RFC 0025); a
 workflow's own `resume_policy` (`force` to always restart it) is the per-graph
@@ -424,10 +427,10 @@ long-lived **daemon**, and what wakes it:
 | `manual` | only when explicitly triggered (`workflow.run`, or an A2A `workflow.run` command) | — |
 | `loop` | repeatedly, on an interval, until a condition | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
 | `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: "02:00Z"`; plus `tz`, `jitter`, `catch_up` |
-| `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener` |
+| `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window` |
 | `signal` | when a named signal arrives | `name` (required), `filter`, `deliver` |
 | `event` | on a runtime event | `on` (required — e.g. `workflow_finished`), `filter` |
-| `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `idempotency`, `respond` |
+| `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond` |
 
 The **long-lived** kinds — `loop`, `schedule`, `subscribe`, `signal`, `event`,
 `webhook` — make the instance a daemon under `run_until: auto`, and a daemon is
@@ -454,6 +457,40 @@ runtime does, so a mistyped field is caught before the first side effect (§2).
 The **job** shape needs no workflow at all: `agentd --instruction "…"
 --intelligence https://…` expands to a `once → agent → finish` workflow, runs one
 turn, and exits (RFC 0030 §5).
+
+### 6.1 Where definitions come from
+
+An entry in `workflows:` is any ONE of:
+
+```yaml
+workflows:
+  - name: inline-one                # inline: the steps live in this file
+    steps: { … }
+  - name: from-file                 # a local file (YAML or JSON)
+    file: ./workflows/triage.yaml
+  - name: from-url                  # fetched at startup, fail-closed
+    url: https://config.internal/workflows/triage.yaml
+    headers: { authorization: "Bearer {{secret:WF_TOKEN}}" }
+    timeout: 10s                    # default 30s
+    allow_private: true             # the fetch rides the same SSRF guard as http nodes
+  - dir: ./workflows                # every match becomes a workflow, named by file stem
+    glob: "**/*.yaml"               # `*` within a segment, `**` crosses segments
+```
+
+A `url` fetch happens once, at startup, before validation — an unreachable URL
+or a non-parsing body is exit `2`, not a daemon that silently runs without the
+workflow. `headers` follows the same no-inline-credential rule as every other
+header map (§3). A `dir` with zero matches is also exit `2`: an empty glob is
+almost always a typo, and fail-open here means a reactive daemon with no
+reactions. However a definition arrived, it is hashed and pinned identically —
+a run started under one hash finishes under it.
+
+**`security.workflows.immutable: true`** makes the loaded set read-only for the
+*agent itself*: `workflow.create` / `workflow.update` / `workflow.delete` tool
+calls are refused (logged as `workflow.locked`), so a model cannot rewrite its
+own standing orders — the definitions are exactly what the operator deployed,
+GitOps-style. Operators change them the same way they always did: edit the
+source and restart (or hot-reload).
 
 > **Scope.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions. The
 > A2A listener (`a2a.listen`) is HTTP(S) with mTLS/bearer auth (loopback
@@ -717,21 +754,22 @@ each path is equally reachable from env and flags (§1.1), so
 | Section | Carries |
 |---|---|
 | `config_version` | `"2"`. Optional, but pin it. |
+| `vars` | Named values (any JSON type, nestable) referenced as `{{config.NAME}}` anywhere a string sits — see §12.4. |
 | `agent` | `name`, `instruction`, `prompt`, `preflight`, `wake_on`, `tools` (`internal`/`mcp`/`code` allow-lists), `max_parallel_turns`, `conversation_budget`, `ask_human_fallback`, `on_workflow_finished`. |
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `pricing`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
-| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. |
-| `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` references (§6). |
+| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. |
+| `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck` (RFC 0026). |
 | `limits` | `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
 | `lifecycle` | `run_until`, `idle_grace`, `drain_timeout`, `run_id`, `exit_code_map`, `watch_config` (§6, §9). |
-| `a2a` | `listen`, `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `peers[]`, `conversation_ttl` (RFC 0029). |
+| `a2a` | `listen` (`https://host:port`, loopback `http://`, or `unix:///path` for co-located peers — kernel-authenticated, no TLS), `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `peers[]` (endpoints may also be `unix:///path`), `conversation_ttl` (RFC 0029). |
 | `webhooks` | `listen`, `tls{}`, `default_auth{}` for `webhook` nodes. |
 | `interface` | The TUI/web-UI surface served on the A2A listener: `enabled`, `origins[]`, `display{}`, `pairing{}`, `debug` (RFC 0032). |
 | `memory`, `context`, `knowledge`, `search`, `skills` | Working-memory caps, context window/compaction, and the MCP servers backing knowledge, search, and the skill catalogue. |
 | `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink}`. |
-| `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`. |
+| `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`, `workflows{immutable}`. |
 
 **The `store` section, and the default a daemon now gets.** `store.kind` picks
 the adapter: `mcp` (a coordination MCP server's `state.*` tools), `http` (a plain
@@ -773,7 +811,7 @@ an id of `../..` is a filename, never a directory hop). Nothing about the key
 changes with the adapter, so an instance that outgrows `file` and moves to `mcp`
 keeps the identity of everything it wrote.
 
-Four things to know before relying on it:
+Five things to know before relying on it:
 
 - **One process per directory, enforced.** On open the adapter takes an
   exclusive `flock` on `<root>/.lock`; a second one fails at startup naming the
@@ -793,6 +831,16 @@ Four things to know before relying on it:
   the same as `store_file: {path, defaulted}`. On a container's writable layer
   the state survives a process restart and **not** a reschedule — mount a
   volume, or use `mcp`/`http` ([`deployment.md`](deployment.md)).
+- **The disk is watched — `store.file.min_free`.** A checkpoint that hits
+  `ENOSPC` halts the daemon, so the runtime measures the store filesystem's
+  headroom (~every 2 s) and **sheds before that happens**: below `min_free`
+  (default `256MB`; `1.5GiB`, plain bytes, `"0"` disables) no new work is
+  admitted — schedules skip with a `start.shed` line, webhooks answer `429
+  Retry-After`, queued turns stay queued — while everything in flight drains
+  normally. Warn at twice the threshold. Transitions are logged once
+  (`pressure.warn` / `pressure.shed` / `pressure.cleared`) and exported as
+  `agent_pressure_level` / `agent_disk_free_bytes` (§10). See
+  [`operations.md`](operations.md) for the full shed/drain story.
 - **`0700` directories, `0600` files, no encryption at rest.** The state holds
   conversation content and tool results, and is protected exactly as the
   credential cache is: by the user the daemon runs as. If that is not enough,
@@ -818,6 +866,47 @@ exit `2` before the first dial. The resolved value is never stored in the
 settings or logged — header NAMES only ever reach the logs, and the operator-only
 A2A `config` command returns the merged document with the `{{secret:…}}`
 references still unresolved.
+
+The startup preflight collects **every** unresolved reference across the config
+and all loaded workflow definitions and reports them together — one restart
+fixes the list, not one line per restart. Interactively, `--prompt-missing`
+turns that list into prompts: each missing `{{secret:NAME}}` is asked for on
+`/dev/tty` (echo off, one by one — the same experience as `agentd login`),
+values live only in process memory, and a restart re-asks. Without a controlling
+terminal the flag refuses and the normal aggregate error stands. Prompted values
+resolve exactly like environment ones — including inside workflow steps — they
+are just never persisted anywhere.
+
+### 12.4 `vars` — named values for the config and its workflows
+
+```yaml
+vars:
+  region: eu-1
+  api_base: "https://api.eu-1.internal"
+  batch: { size: 20, parallel: 4 }
+
+intelligence:
+  endpoints: ["{{config.api_base}}/v1"]
+
+workflows:
+  - name: sync
+    steps:
+      pull: { kind: http, url: "{{config.api_base}}/items?region={{config.region}}" }
+      # exact-token references keep the var's TYPE:
+      each: { kind: batch, over: "{{steps.pull.output.json}}", size: "{{config.batch.size}}" }
+```
+
+`{{config.NAME}}` (dotted paths reach into nested values) is substituted at
+**load time** — before validation, before the definition hash — so a workflow
+fetched from a URL and one written inline resolve identically, and the hash pins
+the *resolved* definition. A string that is exactly one token takes the value
+typed (`size` above is a number); embedded tokens stringify into place. The
+namespace is deliberately `config.`, not `vars.` — `vars.` is the *run*
+namespace `assign` writes at runtime; these are deployment constants. An
+undefined reference is exit `2`, all misses reported together; there is no
+escape syntax, because a URL still containing `{{config.region}}` at runtime is
+a bug wherever it was headed. Values are plain data, not secrets — credentials
+keep using `{{secret:…}}`, which the credential lint still enforces per §12.3.
 
 A YAML example (`/etc/agentd/config.yaml`):
 

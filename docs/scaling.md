@@ -45,14 +45,14 @@ agentd does not de-duplicate that for you. A `subscribe` start node fires on
 every notification the server sends *this* instance; it has no view of its
 siblings. Something has to make exactly one replica own each item.
 
-```
-        item:  queue:///pending   updated → the server notifies every subscriber
-                       │
-   ┌───────────────────┼───────────────────┐
-   ▼                   ▼                   ▼
- replica 0          replica 1           replica 2
-   │                   │                   │
-   └──────── one of them must own it ──────┘
+```mermaid
+flowchart TD
+    Q["queue:///pending updated —\nthe server notifies every subscriber"] --> R0["replica 0"]
+    Q --> R1["replica 1"]
+    Q --> R2["replica 2"]
+    R0 -.-> O(["one of them must own it"])
+    R1 -.-> O
+    R2 -.-> O
 ```
 
 Three shapes solve it. Pick the one whose coordination already exists in your

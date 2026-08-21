@@ -118,38 +118,38 @@ The rewrite starts from scratch. This RFC is the target.
 
 ```
                     ┌──────────────────────────────────────────────┐
-                    │              agentd (main process)           │
-                    │                 = SUPERVISOR (a REACTOR)      │
-                    │           no LLM dependency, never reasons    │
-                    │                                               │
+                    │            agentd (main process)             │
+                    │            = SUPERVISOR (a REACTOR)          │
+                    │        no LLM dependency, never reasons      │
+                    │                                              │
   INSTRUCTION ─────▶│  • parse + validate config (env/flags/file)  │
   intelligence ────▶│  • connect MCP servers (as CLIENT)           │──┐ MCP client
-  MCP server defs ─▶│  • serve agentd's own MCP (as SERVER)       │◀─┘ MCP server
-                    │  • arm triggers: once │ loop │ reactive │ sch │
+  MCP server defs ─▶│  • serve agentd's own MCP (as SERVER)        │◀─┘ MCP server
+                    │  • arm triggers: once │ loop │ reactive │ sch│
                     │  • subscribe to MCP resources  ◀──────────── │── notifications/
                     │  • recv_timeout(merged mpsc): one blocking   │   resources/updated
                     │    wait over every reader thread + timers    │   (URI only → re-read)
-                    │  • spawn + supervise subagent processes       │
-                    │  • detect dead/stuck, reap, kill, restart     │
-                    └───────────────┬───────────────────────────────┘
+                    │  • spawn + supervise subagent processes      │
+                    │  • detect dead/stuck, reap, kill, restart    │
+                    └───────────────┬──────────────────────────────┘
                                     │ spawn / control (process tree)
               ┌─────────────────────┼─────────────────────┐
               ▼                     ▼                     ▼
-     ┌────────────────┐   ┌────────────────┐    ┌────────────────┐
-     │  subagent A    │   │  subagent B    │    │  subagent C    │
-     │  (process,     │   │  (process)     │    │  (process)     │
-     │   own pgroup)  │   │                │    │  spawns its    │
-     │  AGENTIC LOOP: │   │  AGENTIC LOOP  │    │  own children  │
-     │  think→tool→   │   │                │    │   ▼   ▼        │
-     │  observe→…     │   │                │    │  D    E        │
-     │  + control thr │   │                │    │                │
-     └───────┬────────┘   └────────────────┘    └────────────────┘
-             │ tool calls
-             ▼
-   ┌───────────────────────────────────────────────────────┐
+     ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
+     │  subagent A    │    │  subagent B    │    │  subagent C    │
+     │  (process,     │    │  (process)     │    │  (process)     │
+     │   own pgroup)  │    │                │    │  spawns its    │
+     │  AGENTIC LOOP: │    │  AGENTIC LOOP  │    │  own children  │
+     │  think→tool→   │    │                │    │   ▼   ▼        │
+     │  observe→…     │    │                │    │  D    E        │
+     │  + control thr │    │                │    │                │
+     └────────┬───────┘    └────────────────┘    └────────────────┘
+              │ tool calls
+              ▼
+   ┌────────────────────────────────────────────────────────┐
    │  MCP servers (external): filesystem, github, db, …     │
    │  + agentd's own self-MCP (subagent.*, subscribe, exec) │
-   └───────────────────────────────────────────────────────┘
+   └────────────────────────────────────────────────────────┘
 ```
 
 Two loops, deliberately separated:

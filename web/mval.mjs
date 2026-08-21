@@ -20,4 +20,6 @@ function run(file, label) {
   });
 }
 run('/root/agentd-dev/source-code/docs/architecture.md', 'CONTROL');
+run('/root/agentd-dev/source-code/docs/interface.md', 'INTERFACE');
+run('/root/agentd-dev/source-code/docs/scaling.md', 'SCALING');
 run('/root/agentd-dev/source-code/docs/security.md', 'SECURITY');

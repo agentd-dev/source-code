@@ -296,9 +296,9 @@ under a `_cred/` prefix), keyed by a hash of `(endpoint, provider, principal)`. 
 needed and interactivity is permitted:
 
 ```
-┌─ authorize agentd ────────────────────────────────┐
+┌─ authorize agentd ─────────────────────────────────┐
 │  endpoint  mcp:github                              │
-│  visit     https://github.com/login/device        │
+│  visit     https://github.com/login/device         │
 │  code      WDJB-MJHT                               │
 │  waiting…  (expires in 15:00 · Ctrl-C to cancel)   │
 └────────────────────────────────────────────────────┘

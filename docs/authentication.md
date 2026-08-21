@@ -211,7 +211,7 @@ and the published image have it).
 
 ```console
 $ agentd --login mcp:github --config app.yaml
-┌─ authorize agentd ──────────────────────────────
+┌─ authorize agentd ───────────────────────────────
 │  target   mcp:github
 │  visit    https://github.com/login/device
 │  code     WDJB-MJHT

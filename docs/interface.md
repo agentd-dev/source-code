@@ -8,12 +8,11 @@ colleague's browser — and every surface shows the same conversation, tasks and
 runs, live, because each one watches the same daemon feed. None of them holds
 any truth of its own.
 
-```
-             ┌────────────┐   SubscribeToEvents (SSE feed)   ┌───────────┐
-  agentd ────┤ A2A listener├──────────────────────────────────┤ agentd-tui│
-  (state,    │ (a2a.listen)│◄────── SendMessage / Cancel ─────┤ agentd-ui │
-   tools,    └────────────┘                                   │ browser…  │
-   secrets)        one daemon, N synchronized displays        └───────────┘
+```mermaid
+flowchart LR
+    D["agentd\nstate · tools · secrets"] --- L["A2A listener\n(a2a.listen)"]
+    L -- "SubscribeToEvents — the SSE feed" --> C["agentd-tui · agentd-ui\nbrowser…"]
+    C -- "SendMessage / Cancel" --> L
 ```
 
 ## 1. Enable it

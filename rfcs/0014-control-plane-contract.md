@@ -55,20 +55,20 @@ and indexes the five concrete contracts that follow.
 ## 2. The data-plane / control-plane split
 
 ```
-        ┌──────────────────────────  agentctl (separate repo)  ──────────────────────────┐
-        │  kubectl agent[s] …  │  agentctl CLI  │  k8s operator (CRDs: Agent / AgentFleet) │
-        └───────────────┬───────────────────────────────┬──────────────────────────────────┘
-                        │ kube-apiserver proxy           │ reconcile → Pods/Deployments/Jobs
-                        ▼                                 ▼
-        ┌─────────────────────  agentctl node-agent (DaemonSet, per node)  ─────────────────┐
-        │   talks to each local agent pod over **vsock** — control + telemetry             │
-        └───────────────────────────────────┬──────────────────────────────────────────────┘
-              vsock (mgmt: serve-mcp)  ▲      │   ▲  vsock (intelligence: dial-out)
-                                       │      ▼   │
-        ┌──────────────────────────────┴──────────┴───────────────────────────────────────┐
-        │   agent pod  (data plane)  — may run with NO cluster network at all             │
-        │   · serves its self-MCP over vsock (mgmt profile)  · dials intelligence over vsock│
-        └──────────────────────────────────────────────────────────────────────────────────┘
+        ┌──  agentctl (separate repo)  ──────────────────────────────────────────────────────┐
+        │  kubectl agent[s] …  │  agentctl CLI  │  k8s operator (CRDs: Agent / AgentFleet)   │
+        └───────────────┬───────────────────────────────┬────────────────────────────────────┘
+                        │ kube-apiserver proxy          │ reconcile → Pods/Deployments/Jobs
+                        ▼                               ▼
+        ┌──  agentctl node-agent (DaemonSet, per node)  ─────────────────────────────────────┐
+        │   talks to each local agent pod over **vsock** — control + telemetry               │
+        └───────────────────────────────────┬────────────────────────────────────────────────┘
+              vsock (mgmt: serve-mcp)  ▲    │   ▲  vsock (intelligence: dial-out)
+                                       │    ▼   │
+        ┌──────────────────────────────┴────────┴────────────────────────────────────────────┐
+        │   agent pod  (data plane)  — may run with NO cluster network at all                │
+        │   · serves its self-MCP over vsock (mgmt)  · dials intelligence over vsock         │
+        └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The load-bearing idea is to make **vsock bidirectional**. agentd already dials

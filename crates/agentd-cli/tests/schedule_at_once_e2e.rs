@@ -82,11 +82,34 @@ fn wait_bounded(mut child: Child, err_path: &str, what: &str) -> (Option<i32>, S
     }
 }
 
-/// Run a daemon for `ms`, then SIGTERM it and collect its stderr.
-fn run_daemon(config: &str, state_dir: &str, ms: u64) -> (Option<i32>, String) {
+/// Run a daemon until `marker` appears in its telemetry (bounded), HOLD it
+/// alive `hold_ms` longer, then SIGTERM and collect. The hold is the point in
+/// the one-shot test: the daemon must keep ticking past the outcome without
+/// repeating it — while a fixed pre-outcome delay just races the CI runner's
+/// load (observed: a 587 ms cold start ate a 900 ms budget and SIGTERM landed
+/// between "start fired" and "run started").
+fn run_daemon_until(
+    config: &str,
+    state_dir: &str,
+    marker: &str,
+    hold_ms: u64,
+) -> (Option<i32>, String) {
     let (child, err_path) = spawn_daemon(config, state_dir);
     let pid = child.id() as i32;
-    std::thread::sleep(Duration::from_millis(ms));
+    let deadline = Instant::now() + HARD_TIMEOUT;
+    loop {
+        let log = std::fs::read_to_string(&err_path).unwrap_or_default();
+        if !events(&log, marker).is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {marker:?} within {HARD_TIMEOUT:?}:
+{log}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(hold_ms));
     unsafe { libc::kill(pid, libc::SIGTERM) };
     wait_bounded(child, &err_path, "SIGTERMed life")
 }
@@ -115,10 +138,10 @@ fn a_schedule_with_at_fires_exactly_once_and_not_again_after_a_restart() {
     let dir = state_root("at-once");
     let cfg = at_config(&dir);
 
-    // Life 1: the instant has passed, so the run fires immediately — and then
+    // Life 1: the instant has passed, so the run fires and completes — and then
     // the daemon keeps ticking for the best part of a second. Every one of
     // those ticks used to fire it again.
-    let (code, first) = run_daemon(&cfg, &dir, 900);
+    let (code, first) = run_daemon_until(&cfg, &dir, "run.done", 700);
     assert_eq!(code, Some(0), "life 1 drains; stderr:\n{first}");
     let fired = events(&first, "start.fired");
     let sched: Vec<&serde_json::Value> = fired.iter().filter(|e| e["kind"] == "schedule").collect();
@@ -138,8 +161,10 @@ fn a_schedule_with_at_fires_exactly_once_and_not_again_after_a_restart() {
     assert_eq!(done[0]["status"], "completed");
 
     // Life 2: the same state directory. "Already fired" is durable, so nothing
-    // re-arms — an in-memory flag would have re-fired here.
-    let (code, second) = run_daemon(&cfg, &dir, 500);
+    // re-arms — an in-memory flag would have re-fired here. Wait for the
+    // consumed one-shot to be REPORTED (the positive assertion below), then
+    // hold: the negative assertions get their window without racing startup.
+    let (code, second) = run_daemon_until(&cfg, &dir, "start.schedule.done", 500);
     assert_eq!(code, Some(0), "life 2 drains; stderr:\n{second}");
     assert!(
         events(&second, "restore.fresh").is_empty(),

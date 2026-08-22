@@ -198,6 +198,13 @@ pub struct Runtime {
     /// Reaps already deferred once for frame ordering (by pid) — see
     /// [`Runtime::on_reaped`].
     pub(crate) reap_deferred: std::collections::HashSet<i32>,
+    /// Outbound token buckets for steps that declare `rate:`, keyed like the
+    /// breaker (`workflow/unscoped-step`). In-memory on purpose: a rate is a
+    /// statement about LIVE traffic, and a restart briefly refilling the burst
+    /// is harmless where a durable bucket would be bookkeeping for its own
+    /// sake. The paired f64 is the window seconds, for computing the wait.
+    pub(crate) step_rates:
+        std::collections::HashMap<String, (crate::supervisor::tree::TokenBucket, f64, u32)>,
     pub(crate) settings: Settings,
     /// The merged document the settings came from (restart-only diff base).
     pub(crate) settings_doc: Value,

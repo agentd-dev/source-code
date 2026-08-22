@@ -257,11 +257,11 @@ validation error.
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `http` | **`url`**, `method`, `headers`, `query`, `body`, `json`, `timeout`, `expect`, `allow_private`, `sign`, `idempotency` |
-| `mcp.tool` | **`server`**, **`tool`**, `args`, `idempotency` |
+| `http` | **`url`**, `method`, `headers`, `query`, `body`, `json`, `timeout`, `expect`, `allow_private`, `sign`, `idempotency`, `breaker`, `rate` |
+| `mcp.tool` | **`server`**, **`tool`**, `args`, `idempotency`, `breaker`, `rate` |
 | `mcp.resource` | **`server`**, **`op`**, `uri`, `name`, `arguments`, `reference`, `argument` |
 | `tool` | **`name`**, `args` |
-| `a2a.delegate` | **`peer`**, **`objective`**, `output_contract`, `timeout`, `idempotency` |
+| `a2a.delegate` | **`peer`**, **`objective`**, `output_contract`, `timeout`, `idempotency`, `breaker`, `rate` |
 | `memory.get` / `.set` / `.list` / `.delete` | `key`, `value`, `ttl`, `prefix`, `limit` |
 | `artifact.create` / `.get` / `.delete` | `name`, `mime`, `content`, `from_step`, `sensitive`, `id` |
 | `knowledge.search` / `.get`, `search.query` / `.fetch` | `query`, `top_k`, `filters`, `id`, `uri`, `url`, `kind`, `limit`, `freshness`, `max_bytes` |
@@ -297,6 +297,60 @@ counter is never part of the key — that would defeat the field's own name. The
 same derived key is also in every subagent step's environment as
 `env.idempotency_key` (with `env.step` and `env.attempt`); anything a template
 derives from those is retry-stable, where `env.ts` is deliberately not.
+
+The same kinds can declare a **circuit breaker** — `retry`'s cross-run
+sibling. `retry` (exponential, with deterministic ±20 % jitter so a wave of
+failures does not retry in lockstep) remembers failures *within one step of
+one run*; when the remote is genuinely down, every new run still walks into
+it and burns its budget against a dependency that needs the opposite. The
+breaker remembers **across runs**:
+
+```yaml
+charge:
+  kind: http
+  method: POST
+  url: https://api.example/charges
+  retry:   { max: 2, backoff: 2s }
+  breaker: { failures: 5, cooldown: 60s }
+```
+
+After `failures` **consecutive** failures (any success resets the count) the
+circuit opens: further attempts fail *immediately* — no connection, no
+timeout wait, and the fast-fail error starts with `breaker open`, so
+`on_error: continue` plus a `switch` on the error is a fallback route. Once
+`cooldown` has passed, exactly **one** attempt is let through as a probe —
+concurrent runs keep failing fast while it is in flight — and its outcome
+decides: success closes the circuit (`breaker.closed` in the log), failure
+re-opens it for another cooldown (`breaker.reopen`). The state is **durable**
+(a breaker that forgets on restart re-learns the outage by re-hammering the
+dependency) and keyed by the step's *unscoped* id, so every fan-out iteration
+of `each[n].charge` shares the one breaker of the one dependency they share.
+It is per instance: two replicas keep independent opinions of the remote,
+which is the honest scope for what is really a local observation. Transitions
+log once (`breaker.open` / `breaker.probe` / `breaker.closed`); guarded calls
+do not.
+
+The third sibling is **`rate`** — outbound throttling, the mirror of a
+webhook's inbound `rate` and in the same spelling:
+
+```yaml
+call: { kind: http, url: "https://api.example/item/{{item}}",
+        rate: "10/1s" }
+```
+
+Where the breaker answers "the remote is *down*", `rate` answers "the remote
+has a *quota*": past the burst, the step **waits** for a token instead of
+failing — it suspends on a durable timer one token-interval out
+(`step.rate_wait` in the log) and re-enters when it fires, so a 500-item
+fan-out drains at ten calls a second instead of arriving as a wave. The wait
+consumes neither an attempt nor a retry (the step has not attempted
+anything), and iterations share one bucket the way they share one breaker —
+keyed by the unscoped step id, per instance, in memory (a restart refills the
+burst; a rate is a statement about live traffic, not durable bookkeeping).
+
+Together the three cover the failure taxonomy of calling out: `retry` for
+*transient* faults, `breaker` for *outages*, `rate` for *quotas* — declared
+per step, composing with `on_error`, `when`, and each other.
 
 ### Shape data
 

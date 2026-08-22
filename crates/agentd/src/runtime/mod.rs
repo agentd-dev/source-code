@@ -15,6 +15,7 @@ pub mod a2a_server;
 pub mod activity;
 pub mod artifacts;
 pub mod audit;
+pub mod breaker;
 pub mod children;
 pub mod events;
 #[cfg(feature = "exec")]
@@ -524,6 +525,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         pressure_seen: pressure::Level::Ok,
         resched: false,
         reap_deferred: Default::default(),
+        step_rates: Default::default(),
         settings_doc: loaded.doc.clone(),
         args: args.to_vec(),
         env: env.to_vec(),

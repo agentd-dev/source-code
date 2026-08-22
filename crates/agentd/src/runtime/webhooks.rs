@@ -508,30 +508,6 @@ fn overflow_of(spec: &Map<String, Value>) -> Overflow {
 
 /// Spawn the webhook listener from the configured `webhook` start nodes. Each
 /// `nodes` entry is `(workflow, node, spec)`.
-/// Parse `"<burst>/<per>s"` — the same spelling `a2a.principals[].quotas.rate`
-/// uses, so an operator learns ONE rate syntax. Returns (burst, window secs).
-fn parse_rate(s: &str) -> Result<(u32, f64), String> {
-    let (b, p) = s
-        .split_once('/')
-        .ok_or_else(|| format!("want \"<burst>/<per>s\" (e.g. \"20/1s\"), got {s:?}"))?;
-    let burst: u32 = b
-        .trim()
-        .parse()
-        .map_err(|_| format!("burst must be a count, got {b:?}"))?;
-    let per = p.trim();
-    let secs: f64 = per
-        .strip_suffix('s')
-        .or_else(|| per.strip_suffix("sec"))
-        .unwrap_or(per)
-        .trim()
-        .parse()
-        .map_err(|_| format!("window must be seconds, got {p:?}"))?;
-    if burst == 0 || !secs.is_finite() || secs <= 0.0 {
-        return Err(format!("burst and window must be positive, got {s:?}"));
-    }
-    Ok((burst, secs))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_webhook_listener(
     webhooks: &Webhooks,
@@ -604,7 +580,7 @@ pub(crate) fn spawn_webhook_listener(
         let (rate, retry_after_s) = match spec.get("rate").and_then(Value::as_str) {
             None => (None, 30),
             Some(r) => {
-                let (burst, per_s) = parse_rate(r)
+                let (burst, per_s) = crate::supervisor::tree::parse_rate(r)
                     .map_err(|e| format!("webhook node '{workflow}/{node}': rate: {e}"))?;
                 let retry = (per_s / burst.max(1) as f64).ceil().max(1.0) as u32;
                 (
@@ -860,7 +836,7 @@ impl crate::runtime::reactor::Runtime {
 
 #[cfg(test)]
 mod rate_tests {
-    use super::parse_rate;
+    use crate::supervisor::tree::parse_rate;
 
     #[test]
     fn rate_strings_parse_and_bad_ones_say_why() {

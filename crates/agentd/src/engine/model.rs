@@ -377,7 +377,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "mcp.tool",
         false,
-        &["server", "tool", "args", "idempotency"],
+        &["server", "tool", "args", "idempotency", "breaker", "rate"],
         &["server", "tool"],
         true,
         false,
@@ -414,6 +414,8 @@ pub const KINDS: &[KindInfo] = &[
             "allow_private",
             "sign",
             "idempotency",
+            "breaker",
+            "rate",
         ],
         &["url"],
         true,
@@ -422,7 +424,15 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a.send",
         false,
-        &["to", "parts", "context", "timeout", "idempotency"],
+        &[
+            "to",
+            "parts",
+            "context",
+            "timeout",
+            "idempotency",
+            "breaker",
+            "rate",
+        ],
         &["to"],
         true,
         false,
@@ -436,6 +446,8 @@ pub const KINDS: &[KindInfo] = &[
             "output_contract",
             "timeout",
             "idempotency",
+            "breaker",
+            "rate",
         ],
         &["peer", "objective"],
         true,
@@ -1365,6 +1377,53 @@ fn parse_step(
             _ => {}
         }
     }
+    // `breaker` — retry's cross-run sibling on the same remote-effect kinds.
+    // Both fields are REQUIRED: a breaker with no threshold or no cooldown is
+    // not a default anyone chose, it is a typo.
+    if let Some(b) = spec.get("breaker") {
+        if !matches!(
+            kind.as_str(),
+            "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
+        ) {
+            errs.push(format!(
+                "{at}: breaker applies to remote-effect kinds (http, mcp.tool, a2a.send, a2a.delegate)"
+            ));
+        } else {
+            let ok = b.as_object().is_some_and(|o| {
+                o.keys()
+                    .all(|k| matches!(k.as_str(), "failures" | "cooldown"))
+                    && o.get("failures")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|n| n >= 1)
+                    && o.get("cooldown")
+                        .and_then(Value::as_str)
+                        .is_some_and(|d| crate::config::parse_duration(d).is_ok())
+            });
+            if !ok {
+                errs.push(format!(
+                    "{at}: breaker takes {{failures: N>=1, cooldown: \"60s\"}}"
+                ));
+            }
+        }
+    }
+    // `rate` — outbound throttling on the same family: the step WAITS for a
+    // token rather than failing, so a fan-out cannot overrun a quota. Same
+    // spelling as every other rate in the config.
+    if let Some(r) = spec.get("rate")
+        && matches!(
+            kind.as_str(),
+            "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
+        )
+    {
+        let ok = r
+            .as_str()
+            .is_some_and(|r| crate::supervisor::tree::parse_rate(r).is_ok());
+        if !ok {
+            errs.push(format!(
+                "{at}: rate must be \"<burst>/<per>s\" (e.g. \"10/1s\")"
+            ));
+        }
+    }
     // Kind-specific sanity.
     match kind.as_str() {
         // `rate: "<burst>/<per>s"` — arrival throttling, the same spelling as
@@ -2040,6 +2099,45 @@ mod tests {
         assert!(e.iter().any(|m| m.contains("low|normal|high")), "{e:?}");
         // Priority orders: High > Normal > Low (schedule sort relies on it).
         assert!(Priority::High > Priority::Normal && Priority::Normal > Priority::Low);
+    }
+
+    #[test]
+    fn breaker_validates_shape_and_kind_family() {
+        let ok = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "c": {"kind": "http", "depends_on": ["s"], "url": "https://api.example",
+                  "breaker": {"failures": 5, "cooldown": "60s"}},
+            "f": {"kind": "finish", "depends_on": ["c"]},
+        }}));
+        assert!(ok.is_ok(), "{ok:?}");
+        for bad in [
+            json!({"failures": 0, "cooldown": "60s"}),
+            json!({"failures": 5}),
+            json!({"cooldown": "60s"}),
+            json!({"failures": 5, "cooldown": "sometimes"}),
+            json!({"failures": 5, "cooldown": "60s", "extra": 1}),
+        ] {
+            let e = wf(json!({"name": "w", "steps": {
+                "s": {"kind": "once"},
+                "c": {"kind": "http", "depends_on": ["s"], "url": "https://x", "breaker": bad},
+                "f": {"kind": "finish", "depends_on": ["c"]},
+            }}))
+            .unwrap_err();
+            assert!(e.iter().any(|m| m.contains("breaker takes")), "{e:?}");
+        }
+        // A breaker on a LOCAL kind is a category error, refused loudly.
+        let e = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "once"},
+            "a": {"kind": "assign", "depends_on": ["s"], "value": 1,
+                  "breaker": {"failures": 5, "cooldown": "60s"}},
+            "f": {"kind": "finish", "depends_on": ["a"]},
+        }}))
+        .unwrap_err();
+        assert!(
+            e.iter()
+                .any(|m| m.contains("unknown field") || m.contains("remote-effect")),
+            "{e:?}"
+        );
     }
 
     #[test]

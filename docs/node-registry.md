@@ -135,12 +135,12 @@ matches on.
 
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
-| `mcp.tool` | `server` `tool` | `args` `idempotency` | Calls `tool` on a declared MCP `server` with `args`. The main way a workflow reaches the outside world. Always attaches a retry-stable `agent/idempotency_key` in `_meta`; `idempotency: {value: …}` substitutes an application key. |
+| `mcp.tool` | `server` `tool` | `args` `idempotency` `breaker` `rate` | Calls `tool` on a declared MCP `server` with `args`. The main way a workflow reaches the outside world. Always attaches a retry-stable `agent/idempotency_key` in `_meta`; `idempotency: {value: …}` substitutes an application key. |
 | `mcp.resource` | `server` `op` | `uri` `name` `arguments` `reference` `argument` | Reads MCP resources — `op: read|list|prompt|complete`. |
 | `tool` | `name` | `args` | Calls a tool by registry name, wherever it lives (internal, code-registered, or MCP). |
-| `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` `idempotency` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. `idempotency: {header: NAME}` (or `{query: NAME}`) sends a retry-stable derived key; `value:` overrides it with an application key. |
-| `a2a.send` | `to` | `parts` `context` `timeout` `idempotency` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. |
-| `a2a.delegate` | `peer` `objective` | `output_contract` `timeout` `idempotency` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. `idempotency: true` pins the `messageId` across retries. |
+| `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` `idempotency` `breaker` `rate` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. `idempotency: {header: NAME}` (or `{query: NAME}`) sends a retry-stable derived key; `value:` overrides it with an application key. |
+| `a2a.send` | `to` | `parts` `context` `timeout` `idempotency` `breaker` `rate` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. |
+| `a2a.delegate` | `peer` `objective` | `output_contract` `timeout` `idempotency` `breaker` `rate` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. `idempotency: true` pins the `messageId` across retries. |
 | `a2a.wait` | — | `conversation` `timeout` | Suspends until a message arrives on a `conversation`. The reply half of `a2a.send`. |
 | `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
 | `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |
@@ -170,7 +170,9 @@ Every step accepts these regardless of kind:
 |---|---|
 | `depends_on` | the DAG edge. A non-start step with no dependency is refused as an unreachable root |
 | `when` | a CEL guard; the step is skipped when it is false (needs `cel`) |
-| `retry` | `{max, backoff}` — retry the step on failure |
+| `retry` | `{max, backoff}` — retry on failure: exponential doubling with deterministic ±20% jitter, durable timer between attempts |
+| `breaker` | `{failures, cooldown}` — cross-run circuit breaker, on the remote-effect kinds only (`http`, `mcp.tool`, `a2a.send`, `a2a.delegate`): opens after N consecutive failures, fails fast, one probe per cooldown; durable per `workflow/step` |
+| `rate` | `"<burst>/<per>s"` — outbound throttle on the same kinds: the step WAITS (durable timer, no attempt consumed) for a token, so fan-outs drain at the declared pace instead of bursting |
 | `timeout` | bound the step; a suspended step resumes as timed out |
 | `on_error` | `fail` (default) · `continue` · `goto:<step>` |
 | `output_schema` | validate the step's output; also SHAPES the answer for model kinds |

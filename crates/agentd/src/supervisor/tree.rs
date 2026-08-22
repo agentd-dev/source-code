@@ -30,6 +30,31 @@ pub struct TokenBucket {
     last: Instant,
 }
 
+/// Parse `"<burst>/<per>s"` — ONE rate spelling across the config surface
+/// (`a2a.principals[].quotas.rate`, webhook `rate`, step `rate`). Returns
+/// `(burst, window seconds)`.
+pub fn parse_rate(s: &str) -> Result<(u32, f64), String> {
+    let (b, p) = s
+        .split_once('/')
+        .ok_or_else(|| format!("want \"<burst>/<per>s\" (e.g. \"20/1s\"), got {s:?}"))?;
+    let burst: u32 = b
+        .trim()
+        .parse()
+        .map_err(|_| format!("burst must be a count, got {b:?}"))?;
+    let per = p.trim();
+    let secs: f64 = per
+        .strip_suffix('s')
+        .or_else(|| per.strip_suffix("sec"))
+        .unwrap_or(per)
+        .trim()
+        .parse()
+        .map_err(|_| format!("window must be seconds, got {p:?}"))?;
+    if burst == 0 || !secs.is_finite() || secs <= 0.0 {
+        return Err(format!("burst and window must be positive, got {s:?}"));
+    }
+    Ok((burst, secs))
+}
+
 impl TokenBucket {
     /// A bucket that starts full (`burst` tokens) and refills `per_sec` tokens
     /// each second up to `burst`.

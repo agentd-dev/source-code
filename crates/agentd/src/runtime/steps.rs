@@ -856,6 +856,63 @@ impl Runtime {
         else {
             return;
         };
+        // Outbound throttling (`rate:` on a remote-effect kind): consulted
+        // BEFORE `begin_step`, because a parked step has not attempted
+        // anything — waiting for a token must consume neither an attempt nor
+        // a retry. On an empty bucket the step suspends on a durable timer one
+        // token-interval out and re-enters this gate when it fires.
+        if matches!(
+            step.kind.as_str(),
+            "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
+        ) && let Some(rate) = step.spec.get("rate").and_then(Value::as_str)
+            && let Ok((burst, secs)) = crate::supervisor::tree::parse_rate(rate)
+        {
+            let workflow = self
+                .runs
+                .get(run_id)
+                .map(|r| r.workflow.clone())
+                .unwrap_or_default();
+            let key = super::breaker::key(&workflow, step_id);
+            let (bucket, window_s, b) = self.step_rates.entry(key.clone()).or_insert_with(|| {
+                (
+                    crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / secs),
+                    secs,
+                    burst,
+                )
+            });
+            if !bucket.try_take() {
+                // One token-interval, floored so a tight rate still parks
+                // meaningfully rather than hot-looping the scheduler.
+                let wait = ((*window_s * 1000.0) / (*b).max(1) as f64).max(20.0) as u64;
+                match self.timers.arm(
+                    &self.durable,
+                    now_ms() + wait,
+                    json!({"kind": "step_budget", "run": run_id, "step": step_id}),
+                    Value::Null,
+                ) {
+                    Ok(id) => {
+                        self.log.info(
+                            "step.rate_wait",
+                            json!({"run": run_id, "step": step_id, "rate": rate, "wait_ms": wait}),
+                        );
+                        self.runs
+                            .get_mut(run_id)
+                            .expect("present")
+                            .suspend_step(step_id, json!({"kind": "rate_wait", "timer": id}));
+                        self.checkpoint(false);
+                        return;
+                    }
+                    Err(e) => {
+                        // A store that cannot arm the wait must not turn a
+                        // throttle into a hot loop; proceed unthrottled and say so.
+                        self.log.warn(
+                            "step.rate_wait_fail",
+                            json!({"run": run_id, "step": step_id, "err": e.to_string()}),
+                        );
+                    }
+                }
+            }
+        }
         let attempt = self
             .runs
             .get_mut(run_id)
@@ -948,6 +1005,57 @@ impl Runtime {
                 .and_then(|r| r.steps.get_mut(step_id))
         {
             st.wait = Some(json!({"cache_key": k}));
+        }
+        // The circuit breaker (`breaker:` on a remote-effect kind): consulted
+        // BEFORE the effect is dispatched, on the loop, so an open circuit
+        // costs a map lookup instead of a connection + timeout. A fast-fail is
+        // an ordinary step failure carrying `breaker::OPEN_ERR` — retry and
+        // on_error compose with it; the recorder in `finish_step` skips it.
+        if matches!(
+            step.kind.as_str(),
+            "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
+        ) && let Some(cfg) = super::breaker::Config::of(step.spec.get("breaker"))
+        {
+            let workflow = self
+                .runs
+                .get(run_id)
+                .map(|r| r.workflow.clone())
+                .unwrap_or_default();
+            let key = super::breaker::key(&workflow, step_id);
+            let mut st = self
+                .durable
+                .manifest()
+                .breakers
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match super::breaker::gate(&mut st, cfg, now_ms()) {
+                super::breaker::Gate::Proceed => {}
+                super::breaker::Gate::Probe => {
+                    // This attempt claimed the half-open probe slot; the claim
+                    // is durable so a concurrent run (or a restart) sees it.
+                    self.durable.manifest_update(|m| {
+                        m.breakers.insert(key.clone(), st);
+                    });
+                    self.log
+                        .info("breaker.probe", json!({"breaker": key, "run": run_id}));
+                }
+                super::breaker::Gate::FastFail { retry_in_ms } => {
+                    self.finish_step(
+                        run_id,
+                        step_id,
+                        StepStatus::Failed,
+                        None,
+                        Some(format!(
+                            "{} — failing fast; next probe in {}ms",
+                            super::breaker::OPEN_ERR,
+                            retry_in_ms
+                        )),
+                        0,
+                    );
+                    return;
+                }
+            }
         }
         match step.kind.as_str() {
             "checkpoint" => {
@@ -2053,6 +2161,54 @@ impl Runtime {
             .map(|s| s.attempt)
             .unwrap_or(1);
         self.log.info("step.done", json!({"run": run_id, "step": step_id, "status": status, "attempt": attempt, "tokens": tokens, "err": error}));
+        // Feed the circuit breaker, when this step keeps one. Every ATTEMPT
+        // counts (a breaker measures calls, not runs) — except our own
+        // fast-fails: refusing to dial is not evidence about the remote.
+        if matches!(
+            step.kind.as_str(),
+            "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
+        ) && let Some(cfg) = super::breaker::Config::of(step.spec.get("breaker"))
+            && !matches!(status, StepStatus::Failed | StepStatus::Timeout if error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(super::breaker::OPEN_ERR)))
+            && matches!(
+                status,
+                StepStatus::Done | StepStatus::Failed | StepStatus::Timeout
+            )
+        {
+            let workflow = self
+                .runs
+                .get(run_id)
+                .map(|r| r.workflow.clone())
+                .unwrap_or_default();
+            let key = super::breaker::key(&workflow, step_id);
+            let mut st = self
+                .durable
+                .manifest()
+                .breakers
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let t = super::breaker::record(&mut st, cfg, status == StepStatus::Done, now_ms());
+            self.durable.manifest_update(|m| {
+                m.breakers.insert(key.clone(), st);
+            });
+            match t {
+                super::breaker::Transition::Opened { fails } => self.log.warn(
+                    "breaker.open",
+                    json!({"breaker": key, "consecutive_failures": fails,
+                           "cooldown": format!("{}ms", cfg.cooldown_ms)}),
+                ),
+                super::breaker::Transition::Reopened => self.log.warn(
+                    "breaker.reopen",
+                    json!({"breaker": key, "probe_failed": true}),
+                ),
+                super::breaker::Transition::Closed => {
+                    self.log.info("breaker.closed", json!({"breaker": key}))
+                }
+                super::breaker::Transition::None => {}
+            }
+        }
         #[cfg(feature = "a2a")]
         self.feed_push(
             "step",

@@ -108,6 +108,12 @@ pub struct Manifest {
     /// Start-node state per `<workflow>.<node>` (last fired, iteration, missed).
     #[serde(default)]
     pub starts: BTreeMap<String, Value>,
+    /// Circuit-breaker state per `<workflow>/<step>` (`runtime::breaker`):
+    /// consecutive failures, open/closed, the probe claim. Durable because a
+    /// breaker that forgets on restart re-learns the outage by re-hammering
+    /// the dependency — the opposite of its job.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub breakers: BTreeMap<String, Value>,
     /// Budget counters per window/scope (RFC 0026 §7).
     #[serde(default)]
     pub budget: Value,
@@ -958,6 +964,7 @@ impl Durable {
             updated: now_ms(),
             entities: Vec::new(),
             starts: BTreeMap::new(),
+            breakers: BTreeMap::new(),
             budget: Value::Null,
             lifecycle: Value::Null,
             config_digest: self.config_digest.clone(),

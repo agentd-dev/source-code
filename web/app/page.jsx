@@ -1,6 +1,7 @@
 import Link from "next/link";
 import Mermaid from "./components/Mermaid";
 import ConsoleDemos from "./components/ConsoleDemos";
+import InstallTabs from "./components/InstallTabs";
 
 /* ── page furniture ──────────────────────────────────────────────── */
 
@@ -49,10 +50,6 @@ function Card({ tag, title, children }) {
 }
 
 /* ── content ─────────────────────────────────────────────────────── */
-
-const INSTALL_CMD = `$ curl -fsSL https://agentd.dev/install.sh | sh
-agentd  checksum ok
-agentd  installed agentd to /usr/local/bin/agentd`;
 
 const TUI_CMD = `$ agentd tui --config coding.yaml
 
@@ -175,7 +172,7 @@ export default function Home() {
 
           <div className="mt-6 flex flex-wrap gap-3 sm:mt-7">
             <Link href="/docs/getting-started/" className="btn btn-primary">
-              Install
+              Get Started
             </Link>
             <Link href="/docs/overview/" className="btn">
               How it works
@@ -213,7 +210,7 @@ export default function Home() {
         </div>
 
         <div className="min-w-0 lg:col-start-1 lg:row-start-2">
-          <Term title="install · linux amd64/arm64 · checksum-verified">{INSTALL_CMD}</Term>
+          <InstallTabs />
         </div>
       </section>
 

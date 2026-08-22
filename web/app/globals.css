@@ -551,7 +551,10 @@ main :is(.grid, .flex) > * {
 .docs-shell {
   margin: 0 auto;
   max-width: 88rem;
-  padding: 0 1rem;
+  /* The top padding lives HERE, not in a utility class: this rule loads after
+     the utilities layer, so a `pt-*` on the element silently loses — which is
+     exactly how the title used to sit almost against the sticky header. */
+  padding: 3rem 1rem 2.5rem;
   display: grid;
   gap: 2.5rem;
   grid-template-columns: minmax(0, 1fr);

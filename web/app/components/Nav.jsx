@@ -30,6 +30,7 @@ const UNDERSTAND = [
   { href: "/docs/workflows/", t: "Workflows", d: "Durable DAGs, triggers, and resume" },
   { href: "/docs/subagents/", t: "Subagents", d: "Delegation as an OS process tree" },
   { href: "/docs/why-rust/", t: "Why Rust", d: "The dependency moat, and what it buys" },
+  { href: "/docs/pid-1/", t: "PID 1 — agentd as init", d: "Robots and appliances: the runtime as a Linux init" },
 ];
 
 const REFERENCE = [

@@ -311,7 +311,7 @@ export default async function DocPage({ params }) {
   const next = i >= 0 && i < order.length - 1 ? order[i + 1] : null;
 
   return (
-    <div className="docs-shell py-10">
+    <div className="docs-shell">
       {/* mobile: a compact grouped switcher */}
       <details className="panel lg:hidden">
         <summary className="panel-title cursor-pointer list-none">

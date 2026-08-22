@@ -99,6 +99,13 @@ export const DOCS = [
     blurb: "The dependency moat, what is hand-rolled, and where the choice costs something.",
   },
   {
+    slug: "pid-1",
+    file: "docs/pid1.md",
+    title: "PID 1 — agentd as init",
+    group: "concepts",
+    blurb: "A custom Linux whose init is the agent runtime — robots, appliances, and the boot story.",
+  },
+  {
     slug: "experience",
     file: "docs/experience.md",
     title: "Developer experience",

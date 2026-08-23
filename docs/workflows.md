@@ -563,8 +563,13 @@ double-delivers.
 ## Durability, checkpointing and resume
 
 The run record is written to the store before any of its steps executes. From
-then on, every step transitions to a durable `Running` and is checkpointed
-*before* its side effect runs.
+then on, every **effectful** step transitions to a durable `Running` and is
+checkpointed *before* its side effect runs. Pure data steps (`assign`, `map`,
+`filter`, `reduce`, `sort`, `dedupe`, `chunk`, `parse`, `switch`, `noop`,
+`assert`) have no effect to guard and ride the reactor tick's checkpoint
+instead — a crash replays them deterministically from the last durable state,
+and a completed `foreach` batch is still an explicit durability point ("a
+restart resumes at the next batch").
 
 ```mermaid
 stateDiagram-v2

@@ -185,7 +185,9 @@ Every step accepts these regardless of kind:
 
 ## Durability, and what a restart does
 
-Every step checkpoints before its effect. On restore:
+Every effectful step checkpoints before its effect (pure data steps replay
+deterministically from the last checkpoint instead of writing one each). On
+restore:
 
 - A step that was **Running** is replayed (`on_replay` decides: retry, skip, fail).
 - A step that was **Suspended** — `wait`, `sleep`, `human`, `a2a.wait` — resumes

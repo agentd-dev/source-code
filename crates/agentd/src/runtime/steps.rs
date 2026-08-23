@@ -163,7 +163,8 @@ impl Runtime {
             match parse_workflow(&resolved) {
                 Ok(w) => {
                     self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
-                    self.workflows.insert(w.name.clone(), w);
+                    self.workflows
+                        .insert(w.name.clone(), std::sync::Arc::new(w));
                 }
                 Err(e) => errs.extend(e),
             }
@@ -189,7 +190,8 @@ impl Runtime {
                                 "workflow.loaded",
                                 json!({"name": w.name, "source": "store"}),
                             );
-                            self.workflows.insert(w.name.clone(), w);
+                            self.workflows
+                                .insert(w.name.clone(), std::sync::Arc::new(w));
                         }
                         Err(e) => self.log.warn(
                             "workflow.stored.invalid",
@@ -579,16 +581,19 @@ impl Runtime {
         if let Some(w) = self.workflows.get(workflow)
             && w.hash == hash
         {
-            return Some(w);
+            return Some(w.as_ref());
         }
-        self.pinned.get(hash)
+        self.pinned.get(hash).map(|w| w.as_ref())
     }
 
-    pub(crate) fn definition_for_run(&self, run_id: &str) -> Option<Workflow> {
+    pub(crate) fn definition_for_run(&self, run_id: &str) -> Option<std::sync::Arc<Workflow>> {
         let run = self.runs.get(run_id)?;
         if let Some(w) = self.workflows.get(&run.workflow)
             && w.hash == run.workflow_hash
         {
+            // An Arc clone: a refcount bump, not a graph copy — this is on
+            // the per-step hot path (measured ~10% of a chain's cycles as a
+            // deep clone).
             return Some(w.clone());
         }
         self.pinned.get(&run.workflow_hash).cloned()
@@ -812,19 +817,32 @@ impl Runtime {
             Some(&self.instruction.text),
             self.settings.agent.prompt.as_deref(),
         );
-        // Memory read-through: resolve every `memory.<key>` the definition names.
+        // Memory read-through: resolve every `memory.<key>` the definition
+        // names. The key scan walks the whole definition, so it is memoized
+        // per content hash — this runs per STEP, and re-walking an unchanged
+        // definition every time was measured on the hot path.
         let mut memory = Map::new();
-        if let Some(wf) = self.definition_for_run(run_id) {
-            let mut keys: Vec<String> = Vec::new();
-            for s in wf.steps.values() {
-                for (_, v) in &s.spec {
-                    collect_memory_keys(v, &mut keys);
+        let hash = self
+            .runs
+            .get(run_id)
+            .map(|r| r.workflow_hash.clone())
+            .unwrap_or_default();
+        if !hash.is_empty() {
+            if !self.memory_keys.contains_key(&hash) {
+                let mut keys: Vec<String> = Vec::new();
+                if let Some(wf) = self.definition_for_run(run_id) {
+                    for s in wf.steps.values() {
+                        for (_, v) in &s.spec {
+                            collect_memory_keys(v, &mut keys);
+                        }
+                        if let Some(w) = &s.when {
+                            collect_memory_keys(&Value::String(w.clone()), &mut keys);
+                        }
+                    }
                 }
-                if let Some(w) = &s.when {
-                    collect_memory_keys(&Value::String(w.clone()), &mut keys);
-                }
+                self.memory_keys.insert(hash.clone(), keys);
             }
-            for k in keys {
+            for k in self.memory_keys.get(&hash).cloned().unwrap_or_default() {
                 if let Ok(v) = self.memory.get(&self.durable, &k)
                     && v["found"] == json!(true)
                 {
@@ -977,9 +995,14 @@ impl Runtime {
             self.checkpoint(true);
             return;
         }
-        // Durable `running` BEFORE the effect (RFC 0025 §7).
+        // Durable `running` BEFORE the effect (RFC 0025 §7). A pure data
+        // step has no effect to guard — a crash replays it deterministically
+        // from the last checkpoint — so an inline chain batches into the
+        // tick's single checkpoint instead of a serialize+write per step.
         crate::state::kill_point("step.running");
-        self.checkpoint(false);
+        if !crate::engine::model::pure_data_kind(&step.kind) {
+            self.checkpoint(false);
+        }
         self.log.info(
             "step.start",
             json!({"run": run_id, "step": step_id, "kind": step.kind, "attempt": attempt}),
@@ -2412,7 +2435,9 @@ impl Runtime {
                     OnError::Fail => {}
                 }
                 crate::state::kill_point("step.before_done");
-                self.checkpoint(false);
+                if !crate::engine::model::pure_data_kind(&step.kind) {
+                    self.checkpoint(false);
+                }
                 self.on_scoped_step_done(run_id, step_id);
                 return;
             }
@@ -2467,7 +2492,15 @@ impl Runtime {
                 .end_step(step_id, status, output, error);
         }
         crate::state::kill_point("step.before_done");
-        self.checkpoint(false);
+        // Pure steps ride the tick's checkpoint — unless this completion made
+        // the RUN terminal (a routed failure), which must land durably now.
+        let terminal_now = self
+            .runs
+            .get(run_id)
+            .is_some_and(|r| r.status.is_terminal());
+        if terminal_now || !crate::engine::model::pure_data_kind(&step.kind) {
+            self.checkpoint(false);
+        }
         if scope.is_some() {
             self.on_scoped_step_done(run_id, step_id);
         }
@@ -2899,7 +2932,10 @@ impl Runtime {
                 if let Some(n) = args.get("name").and_then(Value::as_str) {
                     match self.workflows.get_mut(n) {
                         None => return err(format!("no such workflow {n:?}")),
-                        Some(w) => w.armed = !pause,
+                        // The definitions are shared (`Arc`) on the hot path;
+                        // arming is the one mutation, and it is rare —
+                        // copy-on-write is the honest cost here.
+                        Some(w) => std::sync::Arc::make_mut(w).armed = !pause,
                     }
                     if !pause {
                         self.arm_workflows();
@@ -2951,7 +2987,7 @@ impl Runtime {
                         let arm = args.get("arm").and_then(Value::as_bool).unwrap_or(true);
                         let mut w = w;
                         w.armed = arm;
-                        self.workflows.insert(wname.clone(), w);
+                        self.workflows.insert(wname.clone(), std::sync::Arc::new(w));
                         self.log.info(
                             "workflow.defined",
                             json!({"name": wname, "hash": &hash[..12], "op": name}),

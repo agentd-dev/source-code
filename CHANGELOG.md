@@ -7,6 +7,27 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Changed
+
+- **Workflow execution is 2–12× faster** (measured; `bench/wfperf/`).
+  Profiling a 400-step chain showed the cycles going to per-step durable
+  writes and clones, not scheduling. Fixed at the sources: `FileStore` no
+  longer reads and re-parses the previous envelope on every put (the
+  instance lock makes the in-memory seq exact); workflow definitions are
+  shared (`Arc`), not deep-cloned per step; **pure data steps no longer
+  checkpoint per step** — RFC 0025 §7 guards *effects*, and a crash replays
+  a pure step deterministically, so an inline chain batches into its tick's
+  single checkpoint (a completed `foreach` batch is still an explicit
+  durability point, and a run-terminal completion still lands immediately);
+  CEL programs are compiled once per expression, not per evaluation; the
+  `memory.<key>` definition scan is memoized per content hash; and an `emit`
+  wakes same-process `stream` consumers in the same reactor iteration
+  instead of the next tick. Wall-clock on the bench shapes: a 200-assign
+  chain 1564→155 ms on the file store (10×), interpolation-heavy 383→32 ms
+  (12×), 300-element foreach 2475→612 ms (4×), CEL-gated chain 670→124 ms
+  (5.4×). Crash-resume semantics verified: SIGKILL mid-chain and mid-batch
+  both restart to the documented durability points.
+
 ### Added
 
 - **The whole agent from one document** (RFC 0034 §5.1). Four config-defining

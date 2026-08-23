@@ -121,6 +121,10 @@ impl super::reactor::Runtime {
         self.durable.manifest_update(|m| {
             m.streams.insert(stream.to_string(), meta);
         });
+        // Wake same-iteration consumers: without this a same-process
+        // produce->consume pipeline advances at tick cadence (up to 200 ms
+        // per hop) instead of engine speed.
+        self.stream_dirty = true;
         Ok(seq)
     }
 

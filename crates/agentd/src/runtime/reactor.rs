@@ -212,7 +212,7 @@ pub struct Runtime {
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
     /// Workflow definitions pinned by live runs after a reload (hash → definition).
-    pub(crate) pinned: BTreeMap<String, Workflow>,
+    pub(crate) pinned: BTreeMap<String, std::sync::Arc<Workflow>>,
     /// Retired definitions still owning live runs (`runtime::retire`), by hash.
     pub(crate) retiring: BTreeMap<String, super::retire::Retiring>,
     /// Definition hashes whose durable pin was written this life (one write
@@ -220,6 +220,11 @@ pub struct Runtime {
     pub(crate) pin_written: std::collections::HashSet<String>,
     /// The last payload per signal name (for `await`/`wait condition` views).
     pub(crate) recent_signals: BTreeMap<String, Value>,
+    /// Memoized `memory.<key>` references per definition content hash: the
+    /// scan walks the whole definition and `run_data` runs per step.
+    pub(crate) memory_keys: std::collections::HashMap<String, Vec<String>>,
+    /// An `emit` appended since the last stream poll (same-iteration wake).
+    pub(crate) stream_dirty: bool,
     pub(crate) log: Logger,
     pub(crate) instance: String,
     pub(crate) run_id: String,
@@ -232,7 +237,7 @@ pub struct Runtime {
     pub(crate) artifacts: Artifacts,
     pub(crate) skills: skills::Catalogue,
     pub(crate) governor: Governor,
-    pub(crate) workflows: BTreeMap<String, Workflow>,
+    pub(crate) workflows: BTreeMap<String, std::sync::Arc<Workflow>>,
     pub(crate) runs: BTreeMap<String, RunState>,
     pub(crate) children: Children,
     pub(crate) timers: Timers,
@@ -402,6 +407,22 @@ impl Runtime {
             while std::mem::take(&mut self.resched) && passes < 1024 {
                 self.schedule_runs();
                 passes += 1;
+            }
+            // 6.6. Streams appended in this iteration fire their consumers
+            // NOW: a same-process produce->consume pipeline advances at
+            // engine speed instead of paying the tick park per hop. Bounded
+            // like the fixpoint; an emit inside a fired consumer re-enters
+            // here, and `limits.run.steps` caps how deep that can go.
+            let mut stream_rounds = 0;
+            while std::mem::take(&mut self.stream_dirty) && stream_rounds < 64 {
+                self.poll_stream_starts();
+                self.schedule_runs();
+                let mut passes = 0;
+                while std::mem::take(&mut self.resched) && passes < 1024 {
+                    self.schedule_runs();
+                    passes += 1;
+                }
+                stream_rounds += 1;
             }
             // 7. Turns.
             self.dispatch_turns();

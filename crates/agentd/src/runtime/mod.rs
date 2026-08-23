@@ -542,6 +542,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         retiring: BTreeMap::new(),
         pin_written: Default::default(),
         recent_signals: BTreeMap::new(),
+        memory_keys: std::collections::HashMap::new(),
+        stream_dirty: false,
         settings,
         log: log.clone(),
     };

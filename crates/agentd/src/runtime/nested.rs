@@ -655,6 +655,11 @@ impl Runtime {
             if (from..to).all(|i| results.contains_key(&i.to_string())) {
                 batches_done += 1;
                 changed = true;
+                // A completed batch is a DURABILITY POINT ("a restart resumes
+                // at the next batch"). Body steps are commonly pure and no
+                // longer checkpoint per step, so the boundary persists here —
+                // one write per batch instead of one per element.
+                self.checkpoint(false);
                 crate::state::kill_point("batch.k");
             } else {
                 break;
@@ -1160,10 +1165,10 @@ fn iterate_output(progress: &Value, results: &[Value]) -> Value {
     }
 }
 
-fn unreachable_wf() -> Workflow {
+fn unreachable_wf() -> std::sync::Arc<Workflow> {
     // Only reached if the definition vanished mid-scheduling; an empty
     // workflow makes `resolve_step` return None and the guard skips.
-    Workflow {
+    std::sync::Arc::new(Workflow {
         state: Default::default(),
         name: String::new(),
         version: 3,
@@ -1178,7 +1183,7 @@ fn unreachable_wf() -> Workflow {
         steps: BTreeMap::new(),
         hash: String::new(),
         definition: Value::Null,
-    }
+    })
 }
 
 /// The state of one body instance.

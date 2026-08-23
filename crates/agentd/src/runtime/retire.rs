@@ -90,7 +90,7 @@ impl super::reactor::Runtime {
                         json!({"workflow": name, "hash": &hash[..12.min(hash.len())]}),
                     );
                     self.pin_written.insert(hash.clone());
-                    self.pinned.insert(hash, wf);
+                    self.pinned.insert(hash, std::sync::Arc::new(wf));
                 }
                 other => {
                     // No pin (a pre-pin store) or a corrupt one: the run meets
@@ -161,7 +161,8 @@ impl super::reactor::Runtime {
         }
 
         // 3. Pin, so the runs keep a definition to execute against.
-        self.pinned.insert(wf.hash.clone(), wf.clone());
+        self.pinned
+            .insert(wf.hash.clone(), std::sync::Arc::new(wf.clone()));
         let policy = wf.unload.policy;
         self.log.info(
             "workflow.retiring",

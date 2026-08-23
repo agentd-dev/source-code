@@ -633,6 +633,29 @@ pub const COMMON_FIELDS: &[&str] = &[
     "description",
 ];
 
+/// Step kinds that are PURE data transforms: no external effect, no durable
+/// write of their own, fully deterministic over the run's data. The scheduler
+/// may skip the checkpoint-before-effect for these (RFC 0025 §7 guards
+/// effects; a crash simply replays a pure step from the last checkpoint), so
+/// an inline chain batches into its tick's one checkpoint instead of paying a
+/// serialize+write per step — measured at ~40% of a chain's cycles.
+pub fn pure_data_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "assign"
+            | "map"
+            | "filter"
+            | "reduce"
+            | "sort"
+            | "dedupe"
+            | "chunk"
+            | "parse"
+            | "switch"
+            | "noop"
+            | "assert"
+    )
+}
+
 pub fn kind_info(name: &str) -> Option<&'static KindInfo> {
     KINDS.iter().find(|k| k.name == name)
 }

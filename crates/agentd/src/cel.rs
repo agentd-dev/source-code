@@ -137,7 +137,31 @@ mod imp {
     }
 
     pub fn eval(expr: &str, vars: &[(&str, &Value)]) -> Result<cel_interpreter::Value, String> {
-        let program = compile(expr)?;
+        // Programs are memoized per expression text: workflows evaluate the
+        // same `when:`/value expressions once per step per run, and the ANTLR
+        // parse (under its catch_unwind) dominated evaluation cost. The
+        // reactor is single-threaded, so a thread-local map IS the process
+        // cache; the cap only guards a pathological generator of unique
+        // expressions.
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        thread_local! {
+            static PROGRAMS: RefCell<HashMap<String, Rc<cel_interpreter::Program>>> =
+                RefCell::new(HashMap::new());
+        }
+        let program = PROGRAMS.with(|cache| -> Result<Rc<cel_interpreter::Program>, String> {
+            if let Some(p) = cache.borrow().get(expr) {
+                return Ok(p.clone());
+            }
+            let p = Rc::new(compile(expr)?);
+            let mut c = cache.borrow_mut();
+            if c.len() >= 4096 {
+                c.clear();
+            }
+            c.insert(expr.to_string(), p.clone());
+            Ok(p)
+        })?;
         let mut ctx = cel_interpreter::Context::default();
         for (name, value) in vars {
             ctx.add_variable_from_value(name.to_string(), to_cel(value));

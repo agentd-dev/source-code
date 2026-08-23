@@ -5,7 +5,18 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v2.7.0 — the event-driven company
+
+agentd becomes an event-driven agent, and the docs prove it with a company:
+durable event streams (RFC 0035 Phase A), an instruction document that can
+define the whole agent, workflow execution measured 2–12× faster, typed
+cross-agent commands, and `examples/startup/` — eleven instances running
+every role of a SaaS business except the two founders, written up as
+[The two-person company](https://agentd.dev/docs/two-person-company/).
+
+Crates: `agentd-core` / `agentd-cli` **2.7.0**; `agentd-mcp` 0.4.0 /
+`agentd-net` 0.4.0 unchanged. `@agentd-dev/cli` **2.7.0**;
+`ghcr.io/agentd-dev/agentd:2.7.0`.
 
 ### Added
 

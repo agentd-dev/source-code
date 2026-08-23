@@ -112,7 +112,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "stream",
         true,
-        &["stream", "subject", "filter", "from", "inputs"],
+        &["stream", "subject", "filter", "from", "rate", "inputs"],
         &["stream"],
         true,
         false,
@@ -136,7 +136,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a",
         true,
-        &["command", "roles", "inputs"],
+        &["command", "roles", "inputs", "schema"],
         &[],
         true,
         false,
@@ -155,6 +155,7 @@ pub const KINDS: &[KindInfo] = &[
             "respond",
             "filter",
             "inputs",
+            "signal",
         ],
         &["path"],
         true,
@@ -164,7 +165,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "switch",
         false,
-        &["on", "cases", "default"],
+        &["on", "cases", "default", "on_no_match"],
         &["on", "cases"],
         true,
         false,
@@ -242,6 +243,7 @@ pub const KINDS: &[KindInfo] = &[
             "conversation",
             "webhook",
             "timeout",
+            "on_timeout",
         ],
         &["on"],
         true,
@@ -345,6 +347,16 @@ pub const KINDS: &[KindInfo] = &[
         false,
     ),
     k("memory.list", false, &["prefix", "limit"], &[], true, false),
+    k(
+        "memory.push",
+        false,
+        &["key", "value"],
+        &["key", "value"],
+        true,
+        false,
+    ),
+    k("memory.shift", false, &["key"], &["key"], true, false),
+    k("memory.pop", false, &["key"], &["key"], true, false),
     k("memory.delete", false, &["key"], &["key"], true, false),
     k(
         "artifact.create",
@@ -435,6 +447,8 @@ pub const KINDS: &[KindInfo] = &[
         &[
             "to",
             "parts",
+            "command",
+            "args",
             "context",
             "timeout",
             "idempotency",
@@ -451,13 +465,15 @@ pub const KINDS: &[KindInfo] = &[
         &[
             "peer",
             "objective",
+            "command",
+            "args",
             "output_contract",
             "timeout",
             "idempotency",
             "breaker",
             "rate",
         ],
-        &["peer", "objective"],
+        &["peer"],
         true,
         false,
     ),
@@ -653,6 +669,7 @@ pub fn pure_data_kind(kind: &str) -> bool {
             | "switch"
             | "noop"
             | "assert"
+            | "validate"
     )
 }
 
@@ -1569,6 +1586,22 @@ fn parse_step(
                 }
             }
         }
+        // The typed A2A form: `command` carries the op, `args` its payload.
+        "a2a.delegate" => {
+            if spec.get("objective").is_none() && spec.get("command").is_none() {
+                errs.push(format!(
+                    "{at}: needs `objective` (prose) or `command` (typed)"
+                ));
+            }
+            if spec.get("args").is_some() && spec.get("command").is_none() {
+                errs.push(format!("{at}: `args` needs `command`"));
+            }
+        }
+        "a2a.send" => {
+            if spec.get("args").is_some() && spec.get("command").is_none() {
+                errs.push(format!("{at}: `args` needs `command`"));
+            }
+        }
         // `emit` publishes to a stream when `stream:` is present (RFC 0035);
         // the two addressing fields travel together or not at all.
         "emit" => {
@@ -1622,6 +1655,11 @@ fn parse_step(
                         ));
                     }
                 }
+            }
+            if let Some(m) = spec.get("on_no_match")
+                && !matches!(m.as_str(), Some("skip") | Some("fail"))
+            {
+                errs.push(format!("{at}: on_no_match must be \"skip\" or \"fail\""));
             }
             if let Some(d) = spec.get("default")
                 && !d.is_string()
@@ -2023,10 +2061,27 @@ fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
                 s.id
             ));
         }
+        if let Some(t) = s.field_str("on_timeout")
+            && !wf.steps.contains_key(t)
+        {
+            errs.push(format!(
+                "workflow {name:?} step {:?}: on_timeout names unknown step {t:?}",
+                s.id
+            ));
+        }
     }
+    // An `on_timeout` target is reached by ROUTING, not by a dependency —
+    // it must not depend on the wait (a satisfied wait would then fire it
+    // too), so it is exempt from the unreachable-root rule and seeds
+    // reachability off the step that routes to it.
+    let timeout_targets: BTreeSet<String> = wf
+        .steps
+        .values()
+        .filter_map(|s| s.field_str("on_timeout").map(str::to_string))
+        .collect();
     // A non-start step with no dependencies is an unreachable root.
     for s in wf.steps.values() {
-        if !s.is_start() && s.depends_on.is_empty() {
+        if !s.is_start() && s.depends_on.is_empty() && !timeout_targets.contains(&s.id) {
             errs.push(format!("workflow {name:?} step {:?}: a non-start step must depend on something (unreachable root)", s.id));
         }
     }
@@ -2046,6 +2101,14 @@ fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
                 && s.depends_on.iter().any(|d| reachable.contains(d))
             {
                 reachable.insert(s.id.clone());
+                changed = true;
+            }
+            // Routing edges reach too.
+            if reachable.contains(&s.id)
+                && let Some(t) = s.field_str("on_timeout")
+                && !reachable.contains(t)
+            {
+                reachable.insert(t.to_string());
                 changed = true;
             }
         }
@@ -2077,6 +2140,7 @@ pub fn valid_id(s: &str) -> bool {
 /// evaluates itself, and nested definitions).
 pub const RAW_FIELDS: &[(&str, &str)] = &[
     ("assert", "condition"),
+    ("validate", "schema"),
     ("map", "expr"),
     ("filter", "expr"),
     ("reduce", "expr"),

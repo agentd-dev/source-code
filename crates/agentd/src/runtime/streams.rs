@@ -157,12 +157,16 @@ impl super::reactor::Runtime {
                 .copied()
                 .unwrap_or_default();
             let mut st = self.start_state_pub(&workflow, &node);
+            let mut anchored = true;
             let mut offset = match st.get("offset").and_then(Value::as_u64) {
                 Some(o) => o,
                 None => {
                     // First arm: `from` decides where history begins for THIS
                     // consumer — `new` skips what already happened, `earliest`
-                    // replays the retained tail.
+                    // replays the retained tail. The anchor must PERSIST even
+                    // when nothing fires now: re-deriving "new" on a later
+                    // poll would skip every event emitted since this one.
+                    anchored = false;
                     let from = spec.get("from").and_then(Value::as_str).unwrap_or("new");
                     if from == "earliest" {
                         meta.first.saturating_sub(1)
@@ -180,6 +184,15 @@ impl super::reactor::Runtime {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            // `rate: "<burst>/<per>"` paces CONSUMPTION: matching events stay
+            // queued on the stream (durable, in order) and fire as tokens
+            // allow — which turns any stream into a worked-off queue. Only an
+            // event that WOULD fire spends a token; filtered-out ones pass
+            // freely.
+            let rate = spec
+                .get("rate")
+                .and_then(Value::as_str)
+                .and_then(|r| crate::supervisor::tree::parse_rate(r).ok());
             let start_offset = offset;
             let mut fired = 0usize;
             while offset < meta.seq && fired < BATCH {
@@ -221,6 +234,22 @@ impl super::reactor::Runtime {
                 if !id.is_null() && ids.contains(&id) {
                     continue;
                 }
+                if let Some((burst, secs)) = rate {
+                    let key = format!("stream:{workflow}/{node}");
+                    let (bucket, _, _) = self.step_rates.entry(key).or_insert_with(|| {
+                        (
+                            crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / secs),
+                            secs,
+                            burst,
+                        )
+                    });
+                    if !bucket.try_take() {
+                        // Paced out: leave THIS event unconsumed and stop —
+                        // the offset write below persists everything before it.
+                        offset -= 1;
+                        break;
+                    }
+                }
                 self.fire_start(&workflow, &node, &spec, event, "stream");
                 if !id.is_null() {
                     ids.push(id);
@@ -231,7 +260,7 @@ impl super::reactor::Runtime {
                 }
                 fired += 1;
             }
-            if offset != start_offset {
+            if offset != start_offset || !anchored {
                 st["offset"] = json!(offset);
                 st["last_ids"] = Value::Array(ids);
                 self.set_start_state_pub(&workflow, &node, st);

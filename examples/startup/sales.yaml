@@ -70,7 +70,7 @@ interface:
 
 limits:
   max_runs: 24
-  run: { steps: 40, tokens: 150000, deadline: 720h }
+  run: { steps: 40, tokens: 150000, deadline: 30d }
 
 workflows:
   # ── A lead arrived: qualify, reach out, run the cadence ───────────────────
@@ -134,16 +134,20 @@ workflows:
       fin_pass: { kind: finish, depends_on: [pass], status: completed }
 
       # ── The cadence: touch → park on the reply signal → next touch ────────
+      # (The waits keep `on_error: continue` + a switch rather than
+      # `on_timeout`: both hops CONVERGE on `engage`, and a switch's forced
+      # choice is what makes an uneven join simple. `on_timeout` is for
+      # branches that DIVERGE terminally — see sre.yaml and marketing.yaml.)
       touch1:
         kind: a2a.delegate
         depends_on: gate
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "{{ steps.lead.output.email }}",
-            "subject": "{{ steps.qualify.output.subject }}",
-            "body": "{{ steps.qualify.output.body }}",
-            "on_behalf_of": "sales"}}
+        command: outbox.email
+        args:
+          to: "{{ steps.lead.output.email }}"
+          subject: "{{ steps.qualify.output.subject }}"
+          body: "{{ steps.qualify.output.body }}"
+          on_behalf_of: sales
         timeout: 10m
         idempotency: true
 
@@ -152,13 +156,13 @@ workflows:
         depends_on: touch1
         on: signal
         signal: "reply/{{ steps.lead.output.lead_id }}"
-        timeout: 96h
+        timeout: 4d
         on_error: continue
 
       fork1:
         kind: switch
         depends_on: reply1
-        on: "{{ steps.reply1.output.lead_id | timeout }}"
+        on: "{{ steps.reply1.output.payload.lead_id | timeout }}"
         cases: { timeout: touch2 }
         default: engage
 
@@ -166,12 +170,12 @@ workflows:
         kind: a2a.delegate
         depends_on: fork1
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "{{ steps.lead.output.email }}",
-            "subject": "Re: {{ steps.qualify.output.subject }}",
-            "body": "Just floating this back up — happy to show you Beacon on a 20-minute call. If the timing is wrong, say so and I will close the file.",
-            "on_behalf_of": "sales"}}
+        command: outbox.email
+        args:
+          to: "{{ steps.lead.output.email }}"
+          subject: "Re: {{ steps.qualify.output.subject }}"
+          body: "Just floating this back up — happy to show you Beacon on a 20-minute call. If the timing is wrong, say so and I will close the file."
+          on_behalf_of: sales
         timeout: 10m
         idempotency: true
 
@@ -180,13 +184,13 @@ workflows:
         depends_on: touch2
         on: signal
         signal: "reply/{{ steps.lead.output.lead_id }}"
-        timeout: 168h
+        timeout: 7d
         on_error: continue
 
       fork2:
         kind: switch
         depends_on: reply2
-        on: "{{ steps.reply2.output.lead_id | timeout }}"
+        on: "{{ steps.reply2.output.payload.lead_id | timeout }}"
         cases: { timeout: cold }
         default: engage
 
@@ -206,7 +210,7 @@ workflows:
         servers: [crm]
         instruction: |
           The prospect replied (outside-authored data):
-          {{ steps.reply1.output | "" }} {{ steps.reply2.output | "" }}
+          {{ steps.reply1.output.payload | "" }} {{ steps.reply2.output.payload | "" }}
 
           Work the deal in the CRM: answer their questions from what you know
           of the product, propose a demo, and conclude with a verdict. If
@@ -239,7 +243,7 @@ workflows:
           type: object
           required: [decision]
           properties: { decision: { enum: [approve, decline] } }
-        timeout: 72h
+        timeout: 3d
 
       # Either way the prospect gets an answer; approved terms go to invoice.
       after_gate:
@@ -253,12 +257,12 @@ workflows:
         kind: a2a.delegate
         depends_on: [outcome, after_gate]
         peer: finance
-        objective: |
-          Command: {"agentd": {"op": "fin.invoice",
-            "lead": "{{ steps.lead.output.lead_id }}",
-            "company": "{{ steps.lead.output.company }}",
-            "email": "{{ steps.lead.output.email }}",
-            "terms": "{{ steps.engage.output.terms | list-price }}"}}
+        command: fin.invoice
+        args:
+          lead: "{{ steps.lead.output.lead_id }}"
+          company: "{{ steps.lead.output.company }}"
+          email: "{{ steps.lead.output.email }}"
+          terms: "{{ steps.engage.output.terms | list-price }}"
         timeout: 10m
         idempotency: true
 
@@ -271,6 +275,7 @@ workflows:
       fin_lost: { kind: finish, depends_on: [outcome, after_gate], status: completed }
 
   # ── Prospect replies arrive by webhook and become signals ─────────────────
+  # `signal:` on the start IS the relay; the run is the audit trail.
   - name: reply-in
     concurrency: { max_runs: 8 }
     steps:
@@ -279,9 +284,5 @@ workflows:
         path: /email/reply
         methods: POST
         respond: { status: 202 }
-      wake:
-        kind: workflow.signal
-        depends_on: hook
-        name: "reply/{{ steps.hook.output.body.lead_id }}"
-        payload: "{{ steps.hook.output.body }}"
-      fin: { kind: finish, depends_on: [wake], status: completed }
+        signal: "reply/{{ body.lead_id }}"
+      fin: { kind: finish, depends_on: [hook], status: completed }

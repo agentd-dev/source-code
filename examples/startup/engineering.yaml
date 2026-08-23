@@ -80,13 +80,24 @@ workflows:
         kind: a2a
         command: eng.bug
         roles: [agent, operator]
+        # The contract: a malformed bug report is refused AT THE LISTENER,
+        # synchronously, naming the mismatch — not three steps later.
+        schema:
+          type: object
+          required: [ticket, severity, summary]
+          properties:
+            ticket: { type: string }
+            severity: { enum: [low, normal, high] }
+            summary: { type: string }
 
       fix:
         kind: agent
         depends_on: cmd
         servers: [github]
         instruction: |
-          A bug was filed. Command payload: {{ steps.cmd.output.parts }}
+          A bug was filed: ticket {{ steps.cmd.output.args.ticket }}
+          (severity {{ steps.cmd.output.args.severity }}):
+          {{ steps.cmd.output.args.summary }}
 
           Reproduce it, fix the cause on a branch named for the ticket, push,
           and open a PR whose description cites the reproduction. End by
@@ -108,11 +119,13 @@ workflows:
         on: signal
         signal: "ci/{{ steps.fix.output.branch }}"
         timeout: 45m
+        # A CI that never reports IS a red verdict: rework, don't die.
+        on_timeout: rework
 
       verdict:
         kind: switch
         depends_on: ci
-        on: "{{ steps.ci.output.conclusion }}"
+        on: "{{ steps.ci.output.payload.conclusion | timeout }}"
         cases:
           success: verify
         default: rework
@@ -123,8 +136,8 @@ workflows:
         depends_on: verdict
         servers: [github]
         instruction: |
-          CI failed on {{ steps.fix.output.branch }}:
-          {{ steps.ci.output }}
+          CI failed (or never reported) on {{ steps.fix.output.branch }}:
+          {{ steps.ci.output.payload | no-verdict }}
           Fix the failure and push to the same branch. If the failure shows
           the approach is wrong, say so plainly instead of forcing it.
 
@@ -141,10 +154,10 @@ workflows:
         kind: a2a.delegate
         depends_on: [verdict, ci2]
         peer: qa
-        objective: |
-          Command: {"agentd": {"op": "qa.verify",
-            "branch": "{{ steps.fix.output.branch }}",
-            "pr": "{{ steps.fix.output.pr }}"}}
+        command: qa.verify
+        args:
+          branch: "{{ steps.fix.output.branch }}"
+          pr: "{{ steps.fix.output.pr }}"
         timeout: 1h
         idempotency: true
 
@@ -198,13 +211,20 @@ workflows:
         kind: a2a
         command: eng.ship
         roles: [agent, operator]
+        schema:
+          type: object
+          required: [pr]
+          properties:
+            pr: { type: string }
+            evidence: { type: string }
 
       gate:
         kind: human
         depends_on: cmd
         question: |
-          QA passed on staging: {{ steps.cmd.output.parts }} — merge and ship
-          to production?
+          QA passed {{ steps.cmd.output.args.pr }} on staging
+          ({{ steps.cmd.output.args.evidence }}) — merge and ship to
+          production?
         schema:
           type: object
           required: [decision]
@@ -223,16 +243,15 @@ workflows:
         depends_on: route
         servers: [github]
         instruction: |
-          The CTO approved. Merge the PR named in the payload
-          ({{ steps.cmd.output.parts }}) and confirm the merge landed.
+          The CTO approved. Merge {{ steps.cmd.output.args.pr }} and confirm
+          the merge landed.
 
       hold_note:
         kind: agent
         depends_on: route
         servers: [github]
         instruction: |
-          The CTO held the ship: comment on the PR
-          ({{ steps.cmd.output.parts }}) that it is approved-by-QA and
-          awaiting release, and leave it open.
+          The CTO held the ship: comment on {{ steps.cmd.output.args.pr }}
+          that it is approved-by-QA and awaiting release, and leave it open.
 
       fin: { kind: finish, depends_on: [merge, hold_note], status: completed }

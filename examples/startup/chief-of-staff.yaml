@@ -87,6 +87,9 @@ workflows:
         collect: true
         body:
           steps:
+            # Prose on purpose: a standup answer is a JUDGMENT ask for the
+            # peer's model, not a command for its registry. Typed
+            # `command`/`args` is for the calls a schema can hold.
             status:
               kind: a2a.delegate
               peer: "{{ member }}"
@@ -112,12 +115,12 @@ workflows:
         kind: a2a.delegate
         depends_on: digest
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "ceo@beacon.example",
-            "subject": "Standup — all desks",
-            "body": "{{ steps.digest.output }}",
-            "on_behalf_of": "chief-of-staff"}}
+        command: outbox.email
+        args:
+          to: "ceo@beacon.example"
+          subject: "Standup — all desks"
+          body: "{{ steps.digest.output }}"
+          on_behalf_of: chief-of-staff
         timeout: 10m
         idempotency: true
 
@@ -163,12 +166,12 @@ workflows:
         kind: a2a.delegate
         depends_on: synth
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "ceo@beacon.example",
-            "subject": "Weekly retro — proposed changes",
-            "body": "{{ steps.synth.output }}",
-            "on_behalf_of": "chief-of-staff"}}
+        command: outbox.email
+        args:
+          to: "ceo@beacon.example"
+          subject: "Weekly retro — proposed changes"
+          body: "{{ steps.synth.output }}"
+          on_behalf_of: chief-of-staff
         timeout: 10m
         idempotency: true
 

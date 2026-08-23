@@ -103,7 +103,7 @@ impl Runtime {
             ToolOutcome::Deferred(kind) => {
                 // The unit is parked on a wait, not thinking (RFC 0032 §17).
                 self.activity_park(node, name);
-                self.pending.push(PendingTool {
+                self.push_pending(PendingTool {
                     target: Target::Child(node, id),
                     name: name.to_string(),
                     kind,
@@ -383,6 +383,32 @@ impl Runtime {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             },
+            "memory.push" => match self.memory.push(
+                &self.durable,
+                args["key"].as_str().unwrap_or(""),
+                args.get("value").cloned().unwrap_or(Value::Null),
+                Some(&by),
+            ) {
+                Ok(v) => ok(v),
+                Err(e) => err(e),
+            },
+            "memory.shift" => match self.memory.shift(
+                &self.durable,
+                args["key"].as_str().unwrap_or(""),
+                Some(&by),
+            ) {
+                Ok(v) => ok(v),
+                Err(e) => err(e),
+            },
+            "memory.pop" => {
+                match self
+                    .memory
+                    .pop(&self.durable, args["key"].as_str().unwrap_or(""), Some(&by))
+                {
+                    Ok(v) => ok(v),
+                    Err(e) => err(e),
+                }
+            }
             "memory.delete" => match self
                 .memory
                 .delete(&self.durable, args["key"].as_str().unwrap_or(""))

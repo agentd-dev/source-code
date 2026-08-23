@@ -2168,6 +2168,17 @@ fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     if uri.starts_with("https://") {
         return Ok(());
     }
+    // `mock:<script>` — the offline dev endpoint (in-process mock LLM over
+    // loopback). Admitted only where the client can actually serve it: debug
+    // builds, or a release built `--features internal-mocks`.
+    if uri.starts_with("mock:") {
+        #[cfg(any(feature = "internal-mocks", debug_assertions))]
+        return Ok(());
+        #[cfg(not(any(feature = "internal-mocks", debug_assertions)))]
+        return Err(usage(format!(
+            "mock: intelligence needs a build with --features internal-mocks (got: {uri})"
+        )));
+    }
     if let Some(rest) = uri.strip_prefix("http://") {
         let authority = rest.split('/').next().unwrap_or(rest);
         // Split off the port: bracketed IPv6 keeps its brackets for the
@@ -2630,7 +2641,10 @@ pub(crate) fn truthy(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
-/// Parse `600s`, `5m`, `2h`, `500ms`, or a bare integer (seconds).
+/// Parse `600s`, `5m`, `2h`, `30d`, `2w`, `500ms`, or a bare integer
+/// (seconds). Days and weeks exist because retention, dunning, and cadence
+/// windows are naturally written in them — `30d` reads, `720h` gets checked
+/// with a calculator.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -2646,6 +2660,8 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         "s" => Duration::from_secs(n),
         "m" => Duration::from_secs(n * 60),
         "h" => Duration::from_secs(n * 3600),
+        "d" => Duration::from_secs(n * 86_400),
+        "w" => Duration::from_secs(n * 604_800),
         other => return Err(format!("unknown duration unit '{other}' in {s}")),
     };
     Ok(d)

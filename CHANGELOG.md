@@ -7,6 +7,52 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Added
+
+- **The convenience batch** — every gap the `examples/startup/` build-out
+  surfaced, closed at the source:
+  - `wait.on_timeout: <step>` — a deadline is an EXPECTED branch: the named
+    step runs (forced), the wait's dependents stay unfired, the run
+    continues. Replaces the `on_error: continue` + sentinel-`switch` idiom.
+  - **Typed A2A commands** — `a2a.send`/`a2a.delegate` take `command` +
+    `args` and send the DataPart the peer's `a2a` start actually matches on
+    (prose objectives reach the peer's *model*; commands now reach its
+    *registry*, deterministically). The `a2a` start takes `schema:` — a
+    payload contract enforced at the listener, synchronously, naming the
+    mismatch — and its runs read `{{steps.cmd.output.args.*}}` typed. A
+    command-fired run now completes its A2A task, so a delegate BLOCKS on
+    the command's actual output.
+  - `webhook` starts take `signal: "name/{{ body.field }}"` — the
+    webhook→signal relay workflow collapses into one field.
+  - `memory.push` / `memory.shift` / `memory.pop` — durable array
+    operations: the queue primitive (`{found: false}` on empty, so a drain
+    loop just stops), with no model call to mutate a list.
+  - `stream` starts take `rate: "<burst>/<per>"` — paced consumption turns
+    any stream into a worked-off queue (`1/1d` = one per day; events wait,
+    durably, in order).
+  - `human.asked` / `human.answered` internal events — a workflow
+    (`{kind: event, on: human.asked}`) can escalate an opening gate
+    out-of-band (mail the approver, ring a phone) instead of hoping someone
+    is watching a terminal.
+  - `switch` takes `on_no_match: skip` — an honest "else: do nothing"
+    (completes, prunes every branch) instead of a forced failure or a
+    dummy default step.
+  - Durations accept `d` (days) and `w` (weeks) everywhere — `30d`, not
+    `720h` — including rate windows.
+  - `intelligence.endpoints: mock:<script>` — the built-in mock LLM spawned
+    in-process: a whole agent runs offline with no key and no second
+    process (debug builds always; release under `--features
+    internal-mocks`).
+- **`validate` counts as a pure data step** (no per-step checkpoint), and
+  its `schema` field is no longer template-expanded.
+
+### Fixed
+
+- **A `from: new` stream consumer could skip events.** Its initial offset
+  was resolved on every poll but persisted only when something fired, so
+  everything emitted between arming and the first fire vanished. The anchor
+  now persists the moment it is resolved.
+
 ### Changed
 
 - **Workflow execution is 2–12× faster** (measured; `bench/wfperf/`).

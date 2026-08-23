@@ -333,6 +333,10 @@ impl Runtime {
             return;
         };
         let (task, standalone) = (task.clone(), *standalone);
+        self.fire_event_starts(
+            "human.answered",
+            &serde_json::json!({"task": task, "via": via}),
+        );
         // The declared answer shape was advertised to clients and never applied
         // to what came back, so a gate could ask for
         // `{decision: "file"|"hold"}` and the run would proceed on "maybe
@@ -680,7 +684,7 @@ impl Runtime {
                 "human.ask.restored",
                 json!({"task": task, "run": run, "step": step}),
             );
-            self.pending.push(super::reactor::PendingTool {
+            self.push_pending(super::reactor::PendingTool {
                 target: Target::Step(run, step),
                 name: "human".into(),
                 kind: PendingKind::Human {

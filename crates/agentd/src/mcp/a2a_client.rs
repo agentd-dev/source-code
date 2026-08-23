@@ -70,6 +70,9 @@ pub fn delegate(
     endpoint: &A2aEndpoint,
     auth: PeerAuth,
     objective: &str,
+    // A typed command envelope (`{"op": …, …args}`) — sent as the DataPart
+    // the peer's `a2a` start nodes match on, deterministically.
+    command: Option<&Value>,
     output_contract: Option<&str>,
     // See [`send`]: a stable id makes a retried delegation attach to the task
     // the first attempt created on a deduping peer, instead of starting a
@@ -87,7 +90,8 @@ pub fn delegate(
         A2aEndpoint::Https(url) => match HttpEp::parse(url) {
             Ok(ep) => {
                 let mut conn = HttpConn::new(ep, auth);
-                match conn.call_streaming(objective, output_contract, message_id, deadline) {
+                match conn.call_streaming(objective, command, output_contract, message_id, deadline)
+                {
                     Err(e) => DelegateOutcome::Error(e),
                     Ok(StreamOutcome::Done(outcome)) => outcome,
                     Ok(StreamOutcome::Recover(task_id)) => poll_task(&mut conn, &task_id, deadline),
@@ -367,6 +371,7 @@ impl HttpConn {
     fn call_streaming(
         &mut self,
         objective: &str,
+        command: Option<&Value>,
         output_contract: Option<&str>,
         explicit_message_id: Option<&str>,
         deadline: Instant,
@@ -376,7 +381,7 @@ impl HttpConn {
         let message_id = explicit_message_id
             .map(str::to_string)
             .unwrap_or_else(mint_message_id);
-        let params = a2a::send_message_params(objective, output_contract, &message_id);
+        let params = a2a::send_message_params_cmd(objective, command, output_contract, &message_id);
         let req = Request::new(Id::Num(id), "SendStreamingMessage", Some(params));
         let body =
             serde_json::to_vec(&req).map_err(|e| format!("a2a: encode streaming send: {e}"))?;
@@ -783,7 +788,7 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "streamed answer"),
             DelegateOutcome::Error(e) => panic!("expected streamed distillate: {e}"),
         }
@@ -803,7 +808,7 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "recovered answer"),
             DelegateOutcome::Error(e) => panic!("expected recovery: {e}"),
         }
@@ -820,7 +825,7 @@ mod tests {
         );
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("FAILED"), "{e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }
@@ -845,6 +850,7 @@ mod tests {
             &ep,
             PeerAuth::default(),
             "do the work",
+            None,
             Some("one line"),
             None,
             deadline,
@@ -894,7 +900,7 @@ mod tests {
             ..Default::default()
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, auth, "obj", None, None, deadline) {
+        match delegate(&ep, auth, "obj", None, None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "authed"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -916,7 +922,7 @@ mod tests {
         )]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Distillate(s) => assert_eq!(s, "immediate"),
             DelegateOutcome::Error(e) => panic!("unexpected error: {e}"),
         }
@@ -928,7 +934,7 @@ mod tests {
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            delegate(&ep, PeerAuth::default(), "obj", None, None, deadline),
+            delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline),
             DelegateOutcome::Error(_)
         ));
     }
@@ -939,7 +945,7 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-w", TaskState::TASK_STATE_WORKING, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
         }
@@ -950,7 +956,7 @@ mod tests {
         let url = serve_http_error_fixture();
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        match delegate(&ep, PeerAuth::default(), "obj", None, None, deadline) {
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("rpc error"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected error, got: {s}"),
         }

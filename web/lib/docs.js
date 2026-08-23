@@ -99,6 +99,13 @@ export const DOCS = [
     blurb: "The dependency moat, what is hand-rolled, and where the choice costs something.",
   },
   {
+    slug: "two-person-company",
+    file: "docs/two-person-company.md",
+    title: "The two-person company",
+    group: "concepts",
+    blurb: "An eleven-agent software company with two humans — the worked use case, and the reasoning behind every split.",
+  },
+  {
     slug: "pid-1",
     file: "docs/pid1.md",
     title: "PID 1 — agentd as init",

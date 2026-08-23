@@ -40,6 +40,51 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+/// Start the mock IN-PROCESS (once per script) and return its loopback
+/// address — the `intelligence.endpoints: mock:<script>` convenience, so a
+/// config runs fully offline in ONE process: no key, no network, no second
+/// terminal. Scripts are the same as the hidden mode's
+/// (`final` | `read` | `schedule` | `file:<playbook.json>`).
+pub fn inprocess(script: &str) -> Result<String, String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SERVERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let map = SERVERS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(addr) = map.lock().expect("mock servers").get(script) {
+        return Ok(addr.clone());
+    }
+    let addr_file = std::env::temp_dir().join(format!(
+        "agentd-mockintel-{}-{}.addr",
+        std::process::id(),
+        crate::sha::sha256_hex(script.as_bytes())
+            .chars()
+            .take(12)
+            .collect::<String>()
+    ));
+    let _ = std::fs::remove_file(&addr_file);
+    let (af, sc) = (addr_file.to_string_lossy().to_string(), script.to_string());
+    std::thread::Builder::new()
+        .name("mock-intel".into())
+        .spawn(move || run(&af, &sc))
+        .map_err(|e| format!("mock intelligence: spawn: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(addr) = std::fs::read_to_string(&addr_file) {
+            let addr = addr.trim().to_string();
+            if !addr.is_empty() {
+                map.lock()
+                    .expect("mock servers")
+                    .insert(script.to_string(), addr.clone());
+                return Ok(addr);
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("mock intelligence: server never announced its address".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Serve the mock LLM until the process is killed, announcing the bound
 /// loopback address through `addr_file`. Returns the exit code.
 pub fn run(addr_file: &str, script: &str) -> i32 {

@@ -457,7 +457,7 @@ pub fn command_op(message: &Value) -> Option<String> {
 }
 
 /// The full command DataPart object (`{op, ...args}`).
-fn command_data(message: &Value) -> Option<Value> {
+pub(crate) fn command_data(message: &Value) -> Option<Value> {
     message["parts"]
         .as_array()?
         .iter()
@@ -781,6 +781,29 @@ impl Runtime {
         // reactor. A built-in wins, so a workflow cannot shadow `status`.
         let declared =
             command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
+        // A declared command with a `schema:` is a CONTRACT: a payload that
+        // does not match is refused HERE, synchronously, with the mismatch —
+        // not accepted into the inbox to fail later where the caller cannot
+        // see it. This is what makes cross-agent commands as typed as tool
+        // calls.
+        if declared
+            && let Some(op) = command_op(message)
+            && let Some(schema) = self.a2a_command_schema(&op)
+        {
+            let mut payload = command_data(message).unwrap_or_else(|| json!({}));
+            if let Some(o) = payload.as_object_mut() {
+                o.remove("op");
+            }
+            if let Err(errs) = crate::jsonschema::validate(&schema, &payload) {
+                return err_obj(
+                    ::mcp::rpc::INVALID_PARAMS,
+                    &format!(
+                        "command {op:?} payload does not match its declared schema: {}",
+                        errs.join("; ")
+                    ),
+                );
+            }
+        }
         if !declared && let Some(op) = command_op(message) {
             return self.a2a_command(principal, &op, message);
         }
@@ -888,6 +911,17 @@ impl Runtime {
         self.workflows.values().any(|w| {
             w.start_steps().into_iter().any(|s| {
                 s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op)
+            })
+        })
+    }
+
+    /// The declared `schema` of a registered command's `a2a` start, if any.
+    fn a2a_command_schema(&self, op: &str) -> Option<Value> {
+        self.workflows.values().find_map(|w| {
+            w.start_steps().into_iter().find_map(|s| {
+                (s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op))
+                    .then(|| s.spec.get("schema").cloned())
+                    .flatten()
             })
         })
     }

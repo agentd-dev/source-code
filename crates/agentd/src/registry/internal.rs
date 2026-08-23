@@ -279,6 +279,45 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
     c(
+        "memory.push",
+        "memory",
+        "Append a value to the ARRAY at a memory key (created if absent) — the durable queue primitive.",
+        obj(
+            json!({"key": s("The key"), "value": any()}),
+            &["key", "value"],
+        ),
+        open_obj(
+            json!({"ok": {"type": "boolean"}, "key": {"type": "string"}, "length": {"type": "integer"}}),
+            &["ok"],
+        ),
+        true,
+        ALL,
+    );
+    c(
+        "memory.shift",
+        "memory",
+        "Remove and return the FIRST element of the array at a memory key ({found: false} on empty).",
+        obj(json!({"key": s("The key")}), &["key"]),
+        open_obj(
+            json!({"found": {"type": "boolean"}, "value": any(), "remaining": {"type": "integer"}}),
+            &["found"],
+        ),
+        true,
+        ALL,
+    );
+    c(
+        "memory.pop",
+        "memory",
+        "Remove and return the LAST element of the array at a memory key ({found: false} on empty).",
+        obj(json!({"key": s("The key")}), &["key"]),
+        open_obj(
+            json!({"found": {"type": "boolean"}, "value": any(), "remaining": {"type": "integer"}}),
+            &["found"],
+        ),
+        true,
+        ALL,
+    );
+    c(
         "memory.delete",
         "memory",
         "Delete a memory key.",
@@ -830,6 +869,9 @@ mod tests {
             "memory.get",
             "memory.set",
             "memory.list",
+            "memory.push",
+            "memory.shift",
+            "memory.pop",
             "memory.delete",
             "artifact.create",
             "artifact.get",

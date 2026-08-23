@@ -78,13 +78,20 @@ workflows:
         kind: a2a
         command: acct.lookup
         roles: [agent, operator]
+        schema:
+          type: object
+          properties:
+            phone: { type: string }
+            email: { type: string }
+            account_ref: { type: string }
+            query: {}
 
       look:
         kind: agent
         depends_on: cmd
         servers: [accounts]
         instruction: |
-          A front-line desk asks: {{ steps.cmd.output.parts }}
+          A front-line desk asks: {{ steps.cmd.output.args }}
           Identify the account (by phone, email, or id — whatever the
           payload carries) and answer with the MINIMAL fact set: account
           ref, plan, standing (good / past-due / paused), and — only if the
@@ -115,6 +122,13 @@ workflows:
         kind: a2a
         command: logs.tail
         roles: [agent, operator]
+        schema:
+          type: object
+          required: [account_ref]
+          properties:
+            account_ref: { type: string }
+            window: { type: string }
+            question: { type: string }
 
       dig:
         kind: agent
@@ -122,7 +136,7 @@ workflows:
         servers: [logs]
         instruction: |
           A desk asks about a customer's service history:
-          {{ steps.cmd.output.parts }}
+          {{ steps.cmd.output.args }}
           Query the logs for THAT customer only. Answer with: what happened,
           when (UTC), and the probable cause in one plain sentence — the
           reader is a support desk relaying to a customer. Never quote a raw

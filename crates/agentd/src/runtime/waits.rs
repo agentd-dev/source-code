@@ -210,7 +210,7 @@ impl Runtime {
                                 step.timeout_ms,
                             ),
                         );
-                        self.pending.push(super::reactor::PendingTool {
+                        self.push_pending(super::reactor::PendingTool {
                             target: Target::Step(run_id.to_string(), step_id.to_string()),
                             name: "subagent".into(),
                             kind,
@@ -250,7 +250,7 @@ impl Runtime {
                             step_id,
                             wait_record("human", json!({}), step.timeout_ms),
                         );
-                        self.pending.push(super::reactor::PendingTool {
+                        self.push_pending(super::reactor::PendingTool {
                             target: Target::Step(run_id.to_string(), step_id.to_string()),
                             name: "human".into(),
                             kind,
@@ -996,7 +996,41 @@ impl Runtime {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let parts = spec.get("parts").cloned().unwrap_or(Value::Null);
+        // `command` + `args` build the typed DataPart the peer's `a2a` start
+        // nodes match on; `parts` text (if any) rides along for the humans
+        // reading the transcript. Without `command`, `parts` goes as before.
+        let parts = match spec.get("command").and_then(Value::as_str) {
+            Some(cmd) => {
+                let mut env = serde_json::Map::new();
+                env.insert("op".into(), json!(cmd));
+                if let Some(args) = spec.get("args") {
+                    match args.as_object() {
+                        Some(o) => {
+                            for (k, v) in o {
+                                env.insert(k.clone(), v.clone());
+                            }
+                        }
+                        None => {
+                            self.finish_step_pub(
+                                run_id,
+                                step_id,
+                                StepStatus::Failed,
+                                None,
+                                Some("a2a.send: args must be a mapping".into()),
+                                0,
+                            );
+                            return;
+                        }
+                    }
+                }
+                let mut arr = vec![json!({"data": {"agentd": Value::Object(env)}})];
+                if let Some(t) = spec.get("parts").and_then(Value::as_str) {
+                    arr.push(json!({"text": t}));
+                }
+                Value::Array(arr)
+            }
+            None => spec.get("parts").cloned().unwrap_or(Value::Null),
+        };
         let context = spec
             .get("context")
             .and_then(Value::as_str)
@@ -1062,6 +1096,36 @@ impl Runtime {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // The typed form: `command` + `args` become the DataPart the peer's
+        // `a2a` start matches; `objective` text (optional here) rides along.
+        let command_env = match spec.get("command").and_then(Value::as_str) {
+            Some(cmd) => {
+                let mut env = serde_json::Map::new();
+                env.insert("op".into(), json!(cmd));
+                if let Some(args) = spec.get("args") {
+                    match args.as_object() {
+                        Some(o) => {
+                            for (k, v) in o {
+                                env.insert(k.clone(), v.clone());
+                            }
+                        }
+                        None => {
+                            self.finish_step_pub(
+                                run_id,
+                                step_id,
+                                StepStatus::Failed,
+                                None,
+                                Some("a2a.delegate: args must be a mapping".into()),
+                                0,
+                            );
+                            return;
+                        }
+                    }
+                }
+                Some(Value::Object(env))
+            }
+            None => None,
+        };
         let contract = spec
             .get("output_contract")
             .and_then(Value::as_str)
@@ -1095,6 +1159,7 @@ impl Runtime {
                     &endpoint,
                     auth,
                     &objective,
+                    command_env.as_ref(),
                     contract.as_deref(),
                     message_id.as_deref(),
                     deadline,

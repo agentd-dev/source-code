@@ -700,6 +700,18 @@ impl Runtime {
         let op = ev.payload.get("parts").and_then(|parts| {
             crate::runtime::a2a_server::command_op(&json!({"parts": parts.clone()}))
         });
+        // The typed command payload, `op` removed: a workflow reads
+        // `{{ steps.cmd.output.args.<field> }}` instead of parsing parts.
+        let args = ev.payload.get("parts").and_then(|parts| {
+            crate::runtime::a2a_server::command_data(&json!({"parts": parts.clone()})).map(
+                |mut d| {
+                    if let Some(o) = d.as_object_mut() {
+                        o.remove("op");
+                    }
+                    d
+                },
+            )
+        });
         let role = ev.payload["role"].as_str().unwrap_or("");
         let specs: Vec<(String, String, serde_json::Map<String, Value>)> = self
             .workflows
@@ -729,6 +741,11 @@ impl Runtime {
                 "principal": ev.principal,
                 "role": role,
                 "command": op,
+                "args": args.clone().unwrap_or(Value::Null),
+                // The A2A task tracking this message: carried onto the run so
+                // its terminal status completes the task — which is what lets
+                // a peer's `a2a.delegate {command}` BLOCK on the answer.
+                "task": ev.payload.get("task").cloned().unwrap_or(Value::Null),
                 "parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                 "text": ev.payload.get("text").cloned().unwrap_or(Value::Null),
                 "message_id": ev.payload.get("message_id").cloned().unwrap_or(Value::Null),

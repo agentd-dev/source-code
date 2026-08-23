@@ -7,7 +7,7 @@
 > | File | What it is |
 > |---|---|
 > | **`coding-agent.yaml`** | **A coding agent you pair with** — the config behind [docs/coding-agent.md](../docs/coding-agent.md). `agentd tui --config examples/coding-agent.yaml` starts the daemon *and* a terminal UI. Validated against the binary. |
-> | **`startup/`** | **A software company with two employees** — eleven instances run every role except CEO/CTO: ticket + SMS/voice support, engineering with CI-signal gates, QA, SRE incident lifecycle, sales cadences, finance dunning, marketing calendar + outreach, an egress-choke-point outbox, and a chief of staff. Third-party webhooks, signals, durable streams, MCP trust tags, HITL gates, A2A mesh, conversational interface — all of it, validated against the binary. |
+> | **`startup/`** | **A software company with two employees** — eleven instances run every role except CEO/CTO: ticket + SMS/voice support, engineering with CI-signal gates, QA, SRE incident lifecycle, sales cadences, finance dunning, marketing calendar + outreach, an egress-choke-point outbox, and a chief of staff. Third-party webhooks, signals, durable streams, MCP trust tags, HITL gates, A2A mesh, conversational interface — all of it, validated against the binary. The reasoning is written up as [docs/two-person-company.md](../docs/two-person-company.md). |
 > | **`hiring/`** | **A hiring agent, end to end** — two instances split by the lethal-trifecta gate: the CV-reading intake and the mail-sending actions side. |
 >
 > **Legacy (agentd 1.x — superseded, kept for reference):** the `run-*.sh`

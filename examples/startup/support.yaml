@@ -184,15 +184,18 @@ workflows:
         subject: "ticket.*"
         from: earliest
 
+      # Typed: the DataPart engineering's `a2a` start matches, checked
+      # against its declared schema at the listener — a malformed report is
+      # refused synchronously, not three steps later.
       file:
         kind: a2a.delegate
         depends_on: take
         peer: engineering
-        objective: |
-          Command: {"agentd": {"op": "eng.bug",
-            "ticket": "{{ steps.take.output.data.ticket }}",
-            "severity": "{{ steps.take.output.data.severity }}",
-            "summary": "{{ steps.take.output.data.summary }}"}}
+        command: eng.bug
+        args:
+          ticket: "{{ steps.take.output.data.ticket }}"
+          severity: "{{ steps.take.output.data.severity }}"
+          summary: "{{ steps.take.output.data.summary }}"
         timeout: 10m
         idempotency: true
 

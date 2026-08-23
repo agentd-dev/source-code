@@ -1,7 +1,7 @@
 # Beacon: a software startup with two employees
 
 Beacon sells uptime monitoring to small SaaS teams. It has a CEO, a CTO, and
-**ten agentd instances doing every other job in the company**. This directory
+**eleven agentd instances doing every other job in the company**. This directory
 is the complete configuration: one YAML file per role, wired together over
 A2A, driven by third-party webhooks, paced by schedules and signals, audited
 by durable event streams — and every instance is also a colleague you can
@@ -50,10 +50,12 @@ flowchart TD
 | Mechanism | Where to look |
 |---|---|
 | **Third-party webhooks** | helpdesk tickets (`support`), GitHub Actions verdicts (`engineering`), monitoring alerts firing AND resolving (`sre`), website leads + email replies (`sales`), Stripe payments (`finance`), outreach replies (`marketing`), Twilio SMS + call transcripts (`support-l1`). Every route is HMAC-authenticated. |
-| **Signals** | the incident run parks on `resolved/<alert_id>` until the all-clear webhook fires it (`sre`); each sales deal parks on `reply/<lead_id>` between cadence touches; marketing threads park on `mkt-reply/<person_id>`. A `wait {on: signal}` is durable — restarts don't lose a 10-day wait. |
+| **Signals** | the incident run parks on `resolved/<alert_id>` until the all-clear webhook fires it (`sre`); each sales deal parks on `reply/<lead_id>` between cadence touches; marketing threads park on `mkt-reply/<person_id>`. A `wait {on: signal}` is durable — restarts don't lose a 10-day wait — and a deadline is an expected branch: `on_timeout: <step>` routes escalation (`sre` pages the CTO, `marketing` closes the file). The webhook→signal relays are ONE FIELD on the webhook start (`signal: "resolved/{{ body.alert_id }}"`). |
 | **Workflows** | everywhere; the richest DAGs are `engineering/fix-bug` (agent → CI signal → switch → QA delegate), `finance/dunning` (delegate → durable sleep → check → switch → human gate), `sales/deal` (a month-long run per deal). |
 | **Event streams** | `support/escalations` decouples triage from follow-through; `sre/incidents` replays every incident through the postmortem desk exactly once; `finance/ledger` is the journal the monthly close reads; `outbox/sent` is the audit ledger of everything the company ever said. |
 | **MCP servers** | one per integration, tagged for trust: helpdesk, GitHub, staging, infra (with an `allow:` list of safe verbs only), status page, CRM, billing, email, social (LinkedIn/X/Instagram), web search, Twilio, the voice bridge, accounts, logs. |
+| **Typed A2A commands** | every cross-desk call a schema can hold uses `command:` + `args:` — the wire DataPart the receiving `a2a` start matches on, checked against its declared `schema:` at the listener (a malformed bug report is refused synchronously, naming the field). Judgment asks (the chief of staff standup questions) stay prose on purpose. |
+| **Durable queues** | the content calendar is a `memory.push`/`memory.shift` array — the daily slot pops one item as a data step, no model call; `human.asked` events turn every waiting approval into an email through the outbox (`finance/gate-notifier`). |
 | **Conversational experience** | every instance sets `interface.enabled` — `agentd-tui --endpoint http://127.0.0.1:<port>` opens a chat with that colleague. The chief-of-staff's `cos.brief` command answers "what's happening?" with live answers from every desk. |
 | **Human-in-the-loop** | refunds (`support`), production ships (`engineering`), stuck incidents page the CTO (`sre`), >20% discounts (`sales`), write-offs (`finance`), the weekly content calendar (`marketing`). `ask_human_fallback: wait` means an unanswered gate parks durably instead of guessing. |
 
@@ -133,6 +135,17 @@ Talk to a colleague:
 $ agentd-tui --endpoint http://127.0.0.1:8448     # the chief of staff
 > what's happening today?
 ```
+
+**Dry-run the whole company offline** — debug builds carry a mock LLM:
+
+```console
+$ cargo build --features a2a,workflow
+$ AGENT_INTELLIGENCE=mock:final ./target/debug/agentd --config examples/startup/sre.yaml
+$ curl -X POST 127.0.0.1:9444/alerts/firing -d '{"alert_id":"a1","service":"probes","severity":"critical"}'
+```
+
+No key, no network: `mock:<script>` spawns the intelligence in-process, and
+webhooks are plain HTTP you can curl.
 
 Every config validates against the binary:
 

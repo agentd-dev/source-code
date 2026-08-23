@@ -336,6 +336,7 @@ element is selected by URI scheme (RFC 0006):
 |---|---|---|
 | `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint (the default; `tls` feature). Pair with a token. |
 | `http:` | `http://127.0.0.1:8080` | **Loopback only** — a same-host dev gateway. Any other `http://` host is rejected. |
+| `mock:` | `mock:final`, `mock:file:play.json` | **Offline dev**: the built-in mock LLM, spawned in-process, dialled over loopback — a whole agent runs with no key, no network, no second terminal. Debug builds always carry it; a release binary needs `--features internal-mocks`. Scripts: `final` (answer immediately), `read`, `schedule`, `file:<playbook.json>` (scripted turns). |
 
 Every element's scheme is validated at startup; a non-`https`/non-loopback-`http`
 scheme on **any** element (e.g. `ftp://…`, or `http://` to a remote host) is exit
@@ -577,11 +578,14 @@ suffix. A bare integer means **seconds**.
 | `600s` | 600 seconds |
 | `5m` | 5 minutes (300 s) |
 | `2h` | 2 hours (7200 s) |
+| `30d` | 30 days |
+| `2w` | 2 weeks |
 | `30` | 30 seconds (bare = seconds) |
 
-Recognized units: `ms`, `s`, `m`, `h`. An empty string, an unparsable number, or
-an unknown unit is a usage error (exit `2`), e.g. `unknown duration unit 'd' in
-2d` or `invalid duration: nope`.
+Recognized units: `ms`, `s`, `m`, `h`, `d`, `w`. An empty string, an unparsable
+number, or an unknown unit is a usage error (exit `2`), e.g.
+`unknown duration unit 'x' in 2x` or `invalid duration: nope`. Rate windows
+(`rate: "<burst>/<per>"`) accept the same units — `1/1d` is one per day.
 
 ---
 

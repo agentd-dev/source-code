@@ -77,7 +77,7 @@ limits:
 
 streams:
   incidents:
-    retention: { max_events: 2000, max_age: 2160h }
+    retention: { max_events: 2000, max_age: 90d }
 
 workflows:
   # ── An alert fired: open an incident ──────────────────────────────────────
@@ -127,32 +127,22 @@ workflows:
 
       # Durable park: the resolved webhook (below) signals this exact alert.
       # A restart in mid-incident resumes the wait with its deadline intact.
-      # `on_error: continue` turns a timeout into `{error: …}` output, so the
-      # fork below can ROUTE on it instead of failing the incident.
+      # The deadline is an EXPECTED branch: `on_timeout` routes to the
+      # escalation tail; the success tail below stays untouched.
       resolved:
         kind: wait
         depends_on: inform
         on: signal
         signal: "resolved/{{ steps.alert.output.alert_id }}"
         timeout: 45m
-        on_error: continue
-
-      # The signal payload carries alert_id; a timeout carries only `error` —
-      # so the template's default IS the timeout marker. Switch prunes the
-      # branch not taken.
-      fork:
-        kind: switch
-        depends_on: resolved
-        on: "{{ steps.resolved.output.alert_id | timeout }}"
-        cases: { timeout: page_cto }
-        default: close
+        on_timeout: page_cto
 
       close:
         kind: agent
-        depends_on: fork
+        depends_on: resolved
         servers: [statuspage]
         instruction: |
-          The alert cleared: {{ steps.resolved.output }}. Close the
+          The alert cleared: {{ steps.resolved.output.payload }}. Close the
           status-page incident for {{ steps.alert.output.service }} honestly.
 
       record:
@@ -169,10 +159,11 @@ workflows:
 
       fin: { kind: finish, depends_on: [record], status: completed }
 
-      # ── The escalation tail (the fork's timeout case) ──
+      # ── The escalation tail. Reached ONLY by `on_timeout` routing, so it
+      # declares no dependencies: depending on the wait would also fire it
+      # when the alert clears.
       page_cto:
         kind: human
-        depends_on: fork
         question: |
           {{ steps.alert.output.service }} has been down 45+ minutes and my
           safe remediations did not clear alert
@@ -203,7 +194,8 @@ workflows:
 
       fin_manual: { kind: finish, depends_on: [record_manual], status: completed }
 
-  # ── The matching all-clear: webhook → signal ──────────────────────────────
+  # ── The matching all-clear: the webhook IS the signal ─────────────────────
+  # `signal:` on the start does the relay; the run is just the audit trail.
   - name: alert-resolved
     concurrency: { max_runs: 8 }
     steps:
@@ -212,12 +204,8 @@ workflows:
         path: /alerts/resolved
         methods: POST
         respond: { status: 202 }
-      wake:
-        kind: workflow.signal
-        depends_on: hook
-        name: "resolved/{{ steps.hook.output.body.alert_id }}"
-        payload: "{{ steps.hook.output.body }}"
-      fin: { kind: finish, depends_on: [wake], status: completed }
+        signal: "resolved/{{ body.alert_id }}"
+      fin: { kind: finish, depends_on: [hook], status: completed }
 
   # ── The postmortem desk ───────────────────────────────────────────────────
   # Every closed incident replays through here exactly once — even ones
@@ -247,15 +235,17 @@ workflows:
             followup: { type: string }
             postmortem: { type: string }
 
+      # Typed: the DataPart engineering's `a2a` start matches on, checked
+      # against its declared schema at the listener.
       followup:
         kind: a2a.delegate
         depends_on: write
         peer: engineering
-        objective: |
-          Command: {"agentd": {"op": "eng.bug",
-            "ticket": "postmortem-{{ steps.take.output.correlation }}",
-            "severity": "high",
-            "summary": "{{ steps.write.output.followup }}"}}
+        command: eng.bug
+        args:
+          ticket: "postmortem-{{ steps.take.output.correlation }}"
+          severity: high
+          summary: "{{ steps.write.output.followup }}"
         timeout: 10m
         idempotency: true
 

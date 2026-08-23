@@ -87,7 +87,7 @@ interface:
 
 limits:
   max_runs: 16
-  run: { steps: 60, tokens: 300000, deadline: 336h }
+  run: { steps: 60, tokens: 300000, deadline: 14d }
 
 workflows:
   # ── 1+2. The weekly plan: research → draft → ONE approval → queue ─────────
@@ -185,48 +185,33 @@ workflows:
     steps:
       wake: { kind: schedule, cron: "13 15 * * 1-5", tz: UTC }
 
+      # `memory.shift` pops the queue head durably — a data step, not a
+      # model turn asked to "remove the first element of this array".
       pick:
-        kind: agent
+        kind: memory.shift
         depends_on: wake
-        instruction: |
-          Today's content queue: {{ memory.content/queue | [] }}
-          Pick the item scheduled soonest. Output it, and the queue WITHOUT
-          it. An empty queue means done: nothing_to_publish true.
-        output_schema:
-          type: object
-          required: [nothing_to_publish]
-          properties:
-            nothing_to_publish: { type: boolean }
-            item: { type: object }
-            rest: { type: array }
+        key: content/queue
 
       gate:
         kind: switch
         depends_on: pick
-        on: "{{ steps.pick.output.nothing_to_publish }}"
-        cases: { "true": fin_idle }
-        default: publish
+        on: "{{ steps.pick.output.found }}"
+        cases: { "true": publish }
+        on_no_match: skip
 
       publish:
         kind: a2a.delegate
         depends_on: gate
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.post",
-            "channel": "{{ steps.pick.output.item.channel }}",
-            "text": "{{ steps.pick.output.item.text }}",
-            "on_behalf_of": "marketing"}}
+        command: outbox.post
+        args:
+          channel: "{{ steps.pick.output.value.channel }}"
+          text: "{{ steps.pick.output.value.text }}"
+          on_behalf_of: marketing
         timeout: 10m
         idempotency: true
 
-      shrink:
-        kind: memory.set
-        depends_on: publish
-        key: content/queue
-        value: "{{ steps.pick.output.rest }}"
-
-      fin: { kind: finish, depends_on: [shrink], status: completed }
-      fin_idle: { kind: finish, depends_on: [gate], status: completed }
+      fin: { kind: finish, depends_on: [gate, publish], status: completed }
 
   # ── 3. Decision-maker outreach: research a person, earn a reply ───────────
   - name: outreach
@@ -264,12 +249,12 @@ workflows:
         kind: a2a.delegate
         depends_on: gate
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "{{ steps.pick.output.email }}",
-            "subject": "{{ steps.pick.output.subject }}",
-            "body": "{{ steps.pick.output.body }}",
-            "on_behalf_of": "marketing"}}
+        command: outbox.email
+        args:
+          to: "{{ steps.pick.output.email }}"
+          subject: "{{ steps.pick.output.subject }}"
+          body: "{{ steps.pick.output.body }}"
+          on_behalf_of: marketing
         timeout: 10m
         idempotency: true
 
@@ -279,22 +264,15 @@ workflows:
         depends_on: send
         on: signal
         signal: "mkt-reply/{{ steps.pick.output.person_id }}"
-        timeout: 240h
-        on_error: continue
-
-      fork:
-        kind: switch
-        depends_on: reply
-        on: "{{ steps.reply.output.person_id | timeout }}"
-        cases: { timeout: fin_cold }
-        default: converse
+        timeout: 10d
+        on_timeout: fin_cold
 
       converse:
         kind: agent
-        depends_on: fork
+        depends_on: reply
         servers: [crm]
         instruction: |
-          They replied (outside-authored data): {{ steps.reply.output }}
+          They replied (outside-authored data): {{ steps.reply.output.payload }}
           Continue the conversation honestly. If they show buying intent,
           verdict handoff; if they decline, thank them and stop.
         output_schema:
@@ -321,7 +299,8 @@ workflows:
 
       fin: { kind: finish, depends_on: [to_sales], status: completed }
       fin_done: { kind: finish, depends_on: [route], status: completed }
-      fin_cold: { kind: finish, depends_on: [fork], status: completed }
+      # `on_timeout` target: dep-less by design (reached by routing only).
+      fin_cold: { kind: finish, status: completed }
       fin_skip: { kind: finish, depends_on: [gate], status: completed }
 
   # ── Outreach replies arrive by webhook and become signals ─────────────────
@@ -333,12 +312,8 @@ workflows:
         path: /email/reply
         methods: POST
         respond: { status: 202 }
-      wake:
-        kind: workflow.signal
-        depends_on: hook
-        name: "mkt-reply/{{ steps.hook.output.body.person_id }}"
-        payload: "{{ steps.hook.output.body }}"
-      fin: { kind: finish, depends_on: [wake], status: completed }
+        signal: "mkt-reply/{{ body.person_id }}"
+      fin: { kind: finish, depends_on: [hook], status: completed }
 
   # ── On demand: the CEO asks for a campaign in one message ─────────────────
   - name: campaign

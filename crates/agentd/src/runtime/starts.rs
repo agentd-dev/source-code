@@ -371,6 +371,14 @@ impl Runtime {
         self.set_start_state(workflow, node, st);
         let mut ev =
             json!({"workflow": workflow, "node": node, "payload": payload, "inputs": inputs});
+        // An A2A message carries its conversation and its tracking TASK; the
+        // run must link to both (the task completes with the run's outcome —
+        // that is what a peer's `a2a.delegate {command}` blocks on).
+        for k in ["conversation", "task"] {
+            if let Some(v) = ev["payload"].get(k).filter(|v| !v.is_null()).cloned() {
+                ev[k] = v;
+            }
+        }
         if let Some(rid) = run_id {
             ev["run_id"] = json!(rid);
         }
@@ -608,6 +616,27 @@ impl Runtime {
     }
 
     /// Fire `event` start nodes for an internal lifecycle event.
+    /// Push a deferred tool wait — and let the runtime NOTICE a human gate
+    /// opening: `human.asked` fires as an internal event, so a workflow
+    /// (`{kind: event, on: human.asked}`) can escalate it out-of-band — mail
+    /// the approver, ring a phone — instead of hoping someone is watching a
+    /// terminal.
+    pub(crate) fn push_pending(&mut self, p: super::reactor::PendingTool) {
+        if let super::reactor::PendingKind::Human {
+            task,
+            question,
+            deadline_ms,
+            ..
+        } = &p.kind
+        {
+            let payload = serde_json::json!({
+                "task": task, "question": question, "deadline_ms": deadline_ms,
+            });
+            self.fire_event_starts("human.asked", &payload);
+        }
+        self.pending.push(p);
+    }
+
     pub(crate) fn fire_event_starts(&mut self, event: &str, payload: &Value) {
         let matches: Vec<(String, String, Map<String, Value>)> = self
             .workflows

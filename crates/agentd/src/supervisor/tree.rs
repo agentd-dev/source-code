@@ -42,13 +42,22 @@ pub fn parse_rate(s: &str) -> Result<(u32, f64), String> {
         .parse()
         .map_err(|_| format!("burst must be a count, got {b:?}"))?;
     let per = p.trim();
-    let secs: f64 = per
-        .strip_suffix('s')
-        .or_else(|| per.strip_suffix("sec"))
+    // Bare numbers and the `s`/`sec` suffix parse as (possibly fractional)
+    // seconds; any other duration unit (`ms`/`m`/`h`/`d`/`w`) goes through
+    // the one duration parser — a dunning cadence writes `1/1d`, not
+    // `1/86400s`.
+    let secs: f64 = match per
+        .strip_suffix("sec")
+        .or_else(|| per.strip_suffix('s').filter(|v| !v.ends_with('m')))
         .unwrap_or(per)
         .trim()
         .parse()
-        .map_err(|_| format!("window must be seconds, got {p:?}"))?;
+    {
+        Ok(v) => v,
+        Err(_) => crate::config::parse_duration(per)
+            .map_err(|_| format!("window must be a duration, got {p:?}"))?
+            .as_secs_f64(),
+    };
     if burst == 0 || !secs.is_finite() || secs <= 0.0 {
         return Err(format!("burst and window must be positive, got {s:?}"));
     }

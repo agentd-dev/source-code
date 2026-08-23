@@ -400,6 +400,21 @@ pub(super) fn resolve(
     uri: &str,
     provider: Provider,
 ) -> Result<(Transport, String, String), IntelError> {
+    // `mock:<script>` — the offline dev endpoint: spawns the built-in mock
+    // LLM in-process and dials it over loopback. Debug builds always have
+    // it; release only under `--features internal-mocks` (production
+    // binaries stay free of test scaffolding).
+    #[cfg(any(feature = "internal-mocks", debug_assertions))]
+    if let Some(script) = uri.strip_prefix("mock:") {
+        let addr = super::mock::inprocess(script).map_err(IntelError::Unsupported)?;
+        return resolve(&format!("http://{addr}"), provider);
+    }
+    #[cfg(not(any(feature = "internal-mocks", debug_assertions)))]
+    if uri.starts_with("mock:") {
+        return Err(IntelError::Unsupported(
+            "mock: intelligence needs a build with --features internal-mocks".into(),
+        ));
+    }
     let url = Url::parse(uri).map_err(|_| {
         IntelError::Unsupported(format!(
             "intelligence endpoint must be https://host[:port][/path] (got: {uri})"

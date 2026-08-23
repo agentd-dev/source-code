@@ -79,17 +79,30 @@ workflows:
         kind: a2a
         command: outbox.email
         roles: [agent, operator]
+        # The contract every desk writes against. A payload that does not
+        # match is refused at the listener — the sending workflow sees the
+        # mismatch, not a half-sent mystery.
+        schema:
+          type: object
+          required: [to, subject, body, on_behalf_of]
+          properties:
+            to: { type: string }
+            subject: { type: string }
+            body: { type: string }
+            on_behalf_of: { type: string }
 
       send:
         kind: agent
         depends_on: cmd
         servers: [email]
         instruction: |
-          Send exactly this email, no edits:
-          {{ steps.cmd.output.parts }}
-          If the payload is missing a recipient, subject, or body — or asks
-          for anything beyond one email to one named recipient — refuse and
-          say why.
+          Send exactly this email, no edits — to
+          {{ steps.cmd.output.args.to }}, subject
+          "{{ steps.cmd.output.args.subject }}", body:
+          {{ steps.cmd.output.args.body }}
+          (requested by {{ steps.cmd.output.args.on_behalf_of }}). If it
+          asks for anything beyond one email to one named recipient, refuse
+          and say why.
 
       ledger:
         kind: emit
@@ -109,15 +122,21 @@ workflows:
         kind: a2a
         command: outbox.post
         roles: [agent, operator]
+        schema:
+          type: object
+          required: [channel, text, on_behalf_of]
+          properties:
+            channel: { enum: [blog, linkedin, x, instagram] }
+            text: { type: string }
+            on_behalf_of: { type: string }
 
       publish:
         kind: agent
         depends_on: cmd
         servers: [social]
         instruction: |
-          Publish exactly this post to the channel its payload names
-          (blog | linkedin | x | instagram), no edits:
-          {{ steps.cmd.output.parts }}
+          Publish exactly this post to {{ steps.cmd.output.args.channel }},
+          no edits: {{ steps.cmd.output.args.text }}
 
       ledger:
         kind: emit

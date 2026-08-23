@@ -69,16 +69,16 @@ matches on.
 | `schedule` | — | `cron` `every` `tz` `jitter` `catch_up` `at` `inputs` | Fires on a 5-field UTC cron or an `every` interval. `at` is one-shot and consumes itself. `catch_up` decides what a missed window does. |
 | `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms`/`coalesce` collapse bursts; `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. |
 | `signal` | `name` | `filter` `deliver` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
-| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
-| `stream` | `stream` | `subject` `filter` `from` `inputs` | Fires once per event on a declared stream (RFC 0035) — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits. Output is the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
-| `a2a` | — | `command` `roles` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts. `roles` narrows who may fire it. |
-| `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `rate` `idempotency` `respond` `filter` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. `rate: "<burst>/<per>s"` throttles arrivals (429 + Retry-After past it). |
+| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
+| `stream` | `stream` | `subject` `filter` `from` `rate` `inputs` | Fires once per event on a declared stream (RFC 0035) — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits; `rate: "<burst>/<per>"` paces consumption (events queue durably — `rate: "1/1d"` turns a stream into a worked-off daily queue). Output is the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
+| `a2a` | — | `command` `roles` `schema` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts; `schema` is the payload CONTRACT — a non-conforming command is refused at the listener, synchronously, naming the mismatch. `roles` narrows who may fire it. Output: `…output.args.*` (the typed payload), plus `parts`/`text`/`principal`. |
+| `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `rate` `idempotency` `respond` `filter` `signal` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. `rate: "<burst>/<per>s"` throttles arrivals (429 + Retry-After past it). `signal: "name/{{ body.field }}"` also fires that signal with the payload — the webhook→signal relay as one field. |
 
 ### Control flow
 
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
-| `switch` | `on` `cases` | `default` | Routes to ONE named step per case. Case values and `default` are step-id STRINGS, not lists. The chosen branch runs even if its deps are not terminal; the others are skipped. |
+| `switch` | `on` `cases` | `default` `on_no_match` | Routes to ONE named step per case. Case values and `default` are step-id STRINGS, not lists. The chosen branch runs even if its deps are not terminal; the others are skipped. No case and no default is a FAILURE unless `on_no_match: skip` — then the switch completes and every branch is pruned. |
 | `parallel` | `branches` | `on_error` | Runs every branch concurrently. `on_error` decides whether one failure fails the step. |
 | `foreach` | `over` `body` | `batch` `collect` `on_error` `as` | Runs `body` once per element of `over`. `batch {size, parallel, rate}` paces it; `collect` gathers outputs; `as` names the element. |
 | `batch` | `over` `body` | `by` `size` `parallel` `rate` `collect` `on_error` | Like `foreach` but the body sees a GROUP of elements — `size`/`by` form the groups. |
@@ -87,7 +87,7 @@ matches on.
 | `join` | `handles` | `timeout` `min` `partials` | Awaits async `handles` (from `workflow {mode: async}` or `subagent`). `min` and `partials` decide what "enough" means. |
 | `subgraph` | `body` | — | An inline nested graph. Scopes ids, so the same step names can repeat in different subgraphs. |
 | `workflow` | `name` | `inputs` `mode` `start` `version` `cascade` | Starts another workflow as a child run. `mode: sync` blocks, `async` returns a handle for `join`, `detached` forgets it. `cascade` propagates cancellation. |
-| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `webhook` `timeout` | Suspends until `on` resolves: `resource | condition | signal | run | subagent | message | webhook`. Durable — a restart resumes the wait. |
+| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `webhook` `timeout` `on_timeout` | Suspends until `on` resolves: `resource | condition | signal | run | subagent | message | webhook`. Durable — a restart resumes the wait. `on_timeout: <step>` makes the deadline an EXPECTED branch: the named step runs (forced), the wait's dependents stay unfired, the run continues. A signal wait's output is `{signal, payload, from}`. |
 | `sleep` | `duration` | — | Suspends for `duration`. Durable: the timer survives a restart. |
 | `assert` | `condition` | `message` | Fails the run unless `condition` holds. A guard you want loud. |
 | `fail` | — | `message` `code` | Ends the run as failed with `message`/`code`. |
@@ -116,6 +116,8 @@ matches on.
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
 | `memory.set` | `key` `value` | `ttl` | Writes a durable key/value, with optional `ttl`. |
+| `memory.push` | `key` `value` | — | Appends to the ARRAY at `key` (created if absent) — the durable queue primitive. |
+| `memory.shift` / `memory.pop` | `key` | — | Removes and returns the first / last element (`{found: false}` on empty — a drain loop just stops). |
 | `memory.get` | `key` | — | Reads a durable key. The result is `{found, value}`. |
 | `memory.list` | — | `prefix` `limit` | Lists keys under `prefix`, bounded by `limit`. |
 | `memory.delete` | `key` | — | Removes a durable key. |
@@ -140,8 +142,8 @@ matches on.
 | `mcp.resource` | `server` `op` | `uri` `name` `arguments` `reference` `argument` | Reads MCP resources — `op: read|list|prompt|complete`. |
 | `tool` | `name` | `args` | Calls a tool by registry name, wherever it lives (internal, code-registered, or MCP). |
 | `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` `idempotency` `breaker` `rate` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. `idempotency: {header: NAME}` (or `{query: NAME}`) sends a retry-stable derived key; `value:` overrides it with an application key. |
-| `a2a.send` | `to` | `parts` `context` `timeout` `idempotency` `breaker` `rate` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. |
-| `a2a.delegate` | `peer` `objective` | `output_contract` `timeout` `idempotency` `breaker` `rate` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. `idempotency: true` pins the `messageId` across retries. |
+| `a2a.send` | `to` | `parts` `command` `args` `context` `timeout` `idempotency` `breaker` `rate` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. `command` + `args` send the TYPED DataPart the peer's `a2a` start matches on — deterministic dispatch, not prose the peer's model interprets. |
+| `a2a.delegate` | `peer` | `objective` `command` `args` `output_contract` `timeout` `idempotency` `breaker` `rate` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. With `command` + `args` the payload is TYPED (and checked against the command's declared `schema` at the peer); the delegate blocks until the command's run finishes and returns its output. `idempotency: true` pins the `messageId` across retries. |
 | `a2a.wait` | — | `conversation` `timeout` | Suspends until a message arrives on a `conversation`. The reply half of `a2a.send`. |
 | `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
 | `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |

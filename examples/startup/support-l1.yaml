@@ -110,9 +110,9 @@ workflows:
         kind: a2a.delegate
         depends_on: hook
         peer: backoffice
-        objective: |
-          Command: {"agentd": {"op": "acct.lookup",
-            "phone": "{{ steps.hook.output.body.From }}"}}
+        command: acct.lookup
+        args:
+          phone: "{{ steps.hook.output.body.From }}"
         timeout: 3m
         idempotency: true
 
@@ -175,16 +175,16 @@ workflows:
         kind: a2a.delegate
         depends_on: cmd
         peer: backoffice
-        objective: |
-          Command: {"agentd": {"op": "acct.lookup",
-            "query": {{ steps.cmd.output.parts }}}}
+        command: acct.lookup
+        args:
+          query: "{{ steps.cmd.output.text }}"
         timeout: 2m
 
       speakable:
         kind: agent
         depends_on: fact
         instruction: |
-          The voice model asked: {{ steps.cmd.output.parts }}
+          The voice model asked: {{ steps.cmd.output.text }}
           The back office answered: {{ steps.fact.output }}
           Reply with ONE short spoken-register sentence a voice can read
           aloud. No markup, no lists, no account ids read in full.

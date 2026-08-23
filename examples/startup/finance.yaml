@@ -63,11 +63,11 @@ interface:
 
 limits:
   max_runs: 20
-  run: { steps: 40, tokens: 100000, deadline: 720h }
+  run: { steps: 40, tokens: 100000, deadline: 30d }
 
 streams:
   ledger:
-    retention: { max_events: 20000, max_age: 9600h }
+    retention: { max_events: 20000, max_age: 400d }
 
 workflows:
   # ── A payment failed: dunning, durably ────────────────────────────────────
@@ -97,18 +97,18 @@ workflows:
         kind: a2a.delegate
         depends_on: case
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "{{ steps.case.output.email }}",
-            "subject": "Your Beacon payment did not go through",
-            "body": "Invoice {{ steps.case.output.invoice_id }} for {{ steps.case.output.amount }} failed to process. Your monitoring keeps running — please update your card in the billing portal when you have a minute.",
-            "on_behalf_of": "finance"}}
+        command: outbox.email
+        args:
+          to: "{{ steps.case.output.email }}"
+          subject: "Your Beacon payment did not go through"
+          body: "Invoice {{ steps.case.output.invoice_id }} for {{ steps.case.output.amount }} failed to process. Your monitoring keeps running — please update your card in the billing portal when you have a minute."
+          on_behalf_of: finance
         timeout: 10m
         idempotency: true
 
       # Durable: the process can restart, redeploy, or crash — the timer
       # holds and the run resumes here.
-      wait1: { kind: sleep, depends_on: remind1, duration: 120h }
+      wait1: { kind: sleep, depends_on: remind1, duration: 5d }
 
       check1:
         kind: agent
@@ -133,16 +133,16 @@ workflows:
         kind: a2a.delegate
         depends_on: route1
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "{{ steps.case.output.email }}",
-            "subject": "Second notice — invoice {{ steps.case.output.invoice_id }}",
-            "body": "Our earlier note may have missed you: invoice {{ steps.case.output.invoice_id }} ({{ steps.case.output.amount }}) is still unpaid. Service pauses in 7 days if we cannot process it; reply here and a person will look at anything unusual.",
-            "on_behalf_of": "finance"}}
+        command: outbox.email
+        args:
+          to: "{{ steps.case.output.email }}"
+          subject: "Second notice — invoice {{ steps.case.output.invoice_id }}"
+          body: "Our earlier note may have missed you: invoice {{ steps.case.output.invoice_id }} ({{ steps.case.output.amount }}) is still unpaid. Service pauses in 7 days if we cannot process it; reply here and a person will look at anything unusual."
+          on_behalf_of: finance
         timeout: 10m
         idempotency: true
 
-      wait2: { kind: sleep, depends_on: remind2, duration: 168h }
+      wait2: { kind: sleep, depends_on: remind2, duration: 7d }
 
       check2:
         kind: agent
@@ -176,7 +176,7 @@ workflows:
           type: object
           required: [decision]
           properties: { decision: { enum: [write_off, keep_chasing] } }
-        timeout: 96h
+        timeout: 4d
 
       settle:
         kind: agent
@@ -233,12 +233,22 @@ workflows:
         kind: a2a
         command: fin.invoice
         roles: [agent, operator]
+        schema:
+          type: object
+          required: [lead, company, email, terms]
+          properties:
+            lead: { type: string }
+            company: { type: string }
+            email: { type: string }
+            terms: { type: string }
       raise:
         kind: agent
         depends_on: cmd
         servers: [ledger]
         instruction: |
-          Sales closed a deal: {{ steps.cmd.output.parts }}
+          Sales closed {{ steps.cmd.output.args.company }}
+          ({{ steps.cmd.output.args.email }}) at terms:
+          {{ steps.cmd.output.args.terms }}.
           Create the customer and the first invoice in billing, exactly as
           the terms state. If any figure is ambiguous, stop and say what is
           missing rather than inventing it.
@@ -268,12 +278,34 @@ workflows:
         kind: a2a.delegate
         depends_on: report
         peer: outbox
-        objective: |
-          Command: {"agentd": {"op": "outbox.email",
-            "to": "ceo@beacon.example",
-            "subject": "Monthly close",
-            "body": "{{ steps.report.output }}",
-            "on_behalf_of": "finance"}}
+        command: outbox.email
+        args:
+          to: "ceo@beacon.example"
+          subject: "Monthly close"
+          body: "{{ steps.report.output }}"
+          on_behalf_of: finance
         timeout: 10m
         idempotency: true
       fin: { kind: finish, depends_on: [send], status: completed }
+
+  # ── Gates never wait in silence ───────────────────────────────────────────
+  # `human.asked` fires whenever ANY gate on this instance opens (the
+  # write-off gate above included); this workflow turns it into an email, so
+  # the CEO learns about a pending approval without watching a terminal.
+  - name: gate-notifier
+    concurrency: { max_runs: 4 }
+    steps:
+      saw: { kind: event, on: human.asked }
+      mail:
+        kind: a2a.delegate
+        depends_on: saw
+        peer: outbox
+        command: outbox.email
+        args:
+          to: "ceo@beacon.example"
+          subject: "Approval waiting on the finance desk"
+          body: "A gate just opened: {{ steps.saw.output.payload.question }}"
+          on_behalf_of: finance
+        timeout: 10m
+        idempotency: true
+      fin: { kind: finish, depends_on: [mail], status: completed }

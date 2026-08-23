@@ -520,7 +520,7 @@ impl Runtime {
                             .get("timeout_ms")
                             .and_then(Value::as_u64)
                             .unwrap_or(3_600_000);
-                    self.pending.push(super::reactor::PendingTool {
+                    self.push_pending(super::reactor::PendingTool {
                         target: t,
                         name: "workflow.run".into(),
                         kind: PendingKind::Run {
@@ -1605,6 +1605,40 @@ impl Runtime {
                             0,
                         );
                     }
+                    // No case, no default: `on_no_match: skip` prunes every
+                    // branch and completes — for a switch whose "else" is
+                    // honestly "do nothing". The default stays fail-closed.
+                    None if step.field_str("on_no_match") == Some("skip") => {
+                        let scope_prefix = step_id
+                            .rsplit_once('.')
+                            .map(|(p, _)| format!("{p}."))
+                            .unwrap_or_default();
+                        let mut skipped = Vec::new();
+                        let others: Vec<String> = cases
+                            .values()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        if let Some(run) = self.runs.get_mut(run_id) {
+                            for tid in others {
+                                let sid = format!("{scope_prefix}{tid}");
+                                if let Some(st) = run.steps.get_mut(&sid)
+                                    && st.status == StepStatus::Pending
+                                {
+                                    st.status = StepStatus::Pruned;
+                                    skipped.push(sid);
+                                }
+                            }
+                        }
+                        self.finish_step(
+                            run_id,
+                            step_id,
+                            StepStatus::Done,
+                            Some(json!({"case": key, "matched": false, "skipped": skipped})),
+                            None,
+                            0,
+                        );
+                    }
                     None => self.finish_step(
                         run_id,
                         step_id,
@@ -1730,7 +1764,7 @@ impl Runtime {
                     .expect("present")
                     .suspend_step(step_id, wait);
                 if !matches!(kind, PendingKind::Timer { .. }) {
-                    self.pending.push(super::reactor::PendingTool {
+                    self.push_pending(super::reactor::PendingTool {
                         target: Target::Step(run_id.to_string(), step_id.to_string()),
                         name: name.to_string(),
                         kind,
@@ -2404,6 +2438,39 @@ impl Runtime {
                 .get_mut(run_id)
                 .expect("present")
                 .end_step(step_id, status, output, error);
+            // `on_timeout`: a deadline expiring on a wait is usually an
+            // EXPECTED branch (nobody replied, the alert never cleared), not
+            // a failure — route to the named step, forced, and keep the run
+            // alive. Only a real Timeout takes this edge; other errors still
+            // answer to `on_error`. The step itself stays `Timeout`, which
+            // does NOT satisfy dependents — so the success path and the
+            // timeout path are mutually exclusive by construction.
+            if status == StepStatus::Timeout
+                && let Some(t) = step.field_str("on_timeout")
+            {
+                let target = match &scope {
+                    Some(sc) => super::nested::scoped_id(&sc.parent, t),
+                    None => t.to_string(),
+                };
+                if let Some(st) = self
+                    .runs
+                    .get_mut(run_id)
+                    .and_then(|r| r.steps.get_mut(&target))
+                {
+                    st.status = StepStatus::Pending;
+                    st.forced = true;
+                }
+                self.log.info(
+                    "step.timeout_routed",
+                    json!({"run": run_id, "step": step_id, "to": t}),
+                );
+                crate::state::kill_point("step.before_done");
+                self.checkpoint(false);
+                if scope.is_some() {
+                    self.on_scoped_step_done(run_id, step_id);
+                }
+                return;
+            }
             if let Some(sc) = &scope {
                 // Inside a body: `continue` marks done-with-error, `goto` re-arms
                 // a sibling, `fail` leaves the step failed for the parent to judge.

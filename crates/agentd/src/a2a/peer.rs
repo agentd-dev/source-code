@@ -31,7 +31,29 @@ pub fn send_message_params(
     output_contract: Option<&str>,
     message_id: &str,
 ) -> Value {
+    send_message_params_cmd(objective, None, output_contract, message_id)
+}
+
+/// Like [`send_message_params`], optionally carrying a COMMAND DataPart
+/// (`{"data": {"agentd": {"op": …, …args}}}`) — the wire shape the peer's
+/// `a2a` start nodes actually match on. Text conventions reach the peer's
+/// MODEL; a DataPart reaches its REGISTRY, deterministically.
+pub fn send_message_params_cmd(
+    objective: &str,
+    command: Option<&Value>,
+    output_contract: Option<&str>,
+    message_id: &str,
+) -> Value {
     let mut m = Message::user_text(objective.to_string(), message_id.to_string());
+    if objective.trim().is_empty() {
+        // A command-only message: no empty text part on the wire.
+        m.parts.clear();
+    }
+    if let Some(env) = command
+        && let Ok(d) = serde_json::from_value(json!({ "agentd": env }))
+    {
+        m.parts.push(Part::data(d));
+    }
     if let Some(contract) = output_contract.filter(|c| !c.is_empty()) {
         m.parts
             .push(Part::text(format!("Required output: {contract}")));

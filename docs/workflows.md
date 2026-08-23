@@ -141,8 +141,8 @@ counts as satisfied, so a step depending on any of them still runs.
 | `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window`, `inputs` |
 | `signal` | **`name`**, `filter`, `deliver`, `inputs` |
 | `event` | **`on`**, `filter`, `inputs` |
-| `stream` | **`stream`**, `subject`, `filter`, `from`, `inputs` |
-| `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`, `inputs` |
+| `stream` | **`stream`**, `subject`, `filter`, `from`, `rate`, `inputs` |
+| `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`, `signal`, `inputs` |
 
 Behaviour the field names do not give away:
 
@@ -268,8 +268,8 @@ validation error.
 | `mcp.tool` | **`server`**, **`tool`**, `args`, `idempotency`, `breaker`, `rate` |
 | `mcp.resource` | **`server`**, **`op`**, `uri`, `name`, `arguments`, `reference`, `argument` |
 | `tool` | **`name`**, `args` |
-| `a2a.delegate` | **`peer`**, **`objective`**, `output_contract`, `timeout`, `idempotency`, `breaker`, `rate` |
-| `memory.get` / `.set` / `.list` / `.delete` | `key`, `value`, `ttl`, `prefix`, `limit` |
+| `a2a.delegate` | **`peer`**, `objective`, `command`, `args`, `output_contract`, `timeout`, `idempotency`, `breaker`, `rate` |
+| `memory.get` / `.set` / `.push` / `.shift` / `.pop` / `.list` / `.delete` | `key`, `value`, `ttl`, `prefix`, `limit` |
 | `artifact.create` / `.get` / `.delete` | `name`, `mime`, `content`, `from_step`, `sensitive`, `id` |
 | `knowledge.search` / `.get`, `search.query` / `.fetch` | `query`, `top_k`, `filters`, `id`, `uri`, `url`, `kind`, `limit`, `freshness`, `max_bytes` |
 
@@ -381,7 +381,7 @@ variable named after the step id when `writes` is absent. `mode` is
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `switch` | **`on`**, **`cases`**, `default` |
+| `switch` | **`on`**, **`cases`**, `default`, `on_no_match` |
 | `foreach` | **`over`**, **`body`**, `batch`, `collect`, `on_error`, `as` |
 | `batch` | **`over`**, **`body`**, `by`, `size`, `parallel`, `rate`, `collect`, `on_error` |
 | `iterate` | **`body`**, `while`, `until`, `max_iterations`, `collect` |
@@ -393,7 +393,7 @@ variable named after the step id when `writes` is absent. `mode` is
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `wait` | **`on`**, `server`, `uri`, `condition`, `signal`, `run`, `subagent`, `conversation`, `webhook`, `timeout` |
+| `wait` | **`on`**, `server`, `uri`, `condition`, `signal`, `run`, `subagent`, `conversation`, `webhook`, `timeout`, `on_timeout` |
 | `sleep` | **`duration`** |
 | `join` | **`handles`**, `timeout`, `min`, `partials` |
 | `human` | **`question`**, `schema`, `to`, `timeout`, `reply_uri` |

@@ -135,6 +135,77 @@ impl Memory {
         Ok(json!({"ok": true, "key": key, "meta": rec.meta()}))
     }
 
+    /// `memory.push {key, value}` — append to the ARRAY at `key`, creating it.
+    /// The durable queue primitive: producers push, a consumer shifts, and the
+    /// list survives restarts. Read-modify-write is atomic here because the
+    /// reactor is the single writer.
+    pub fn push(
+        &mut self,
+        d: &Durable,
+        key: &str,
+        value: Value,
+        by: Option<&str>,
+    ) -> Result<Value, String> {
+        let cur = self.get(d, key)?;
+        let mut arr = if cur["found"] == json!(true) {
+            match cur["value"].as_array() {
+                Some(a) => a.clone(),
+                None => return Err(format!("memory.push: the value at {key:?} is not an array")),
+            }
+        } else {
+            Vec::new()
+        };
+        arr.push(value);
+        let length = arr.len();
+        self.set(d, key, Value::Array(arr), None, by)?;
+        Ok(json!({"ok": true, "key": key, "length": length}))
+    }
+
+    /// `memory.shift {key}` — remove and return the FIRST element
+    /// (`{found: false}` on empty or absent — never an error, so a drain loop
+    /// can just stop).
+    pub fn shift(&mut self, d: &Durable, key: &str, by: Option<&str>) -> Result<Value, String> {
+        self.take(d, key, by, true)
+    }
+
+    /// `memory.pop {key}` — remove and return the LAST element.
+    pub fn pop(&mut self, d: &Durable, key: &str, by: Option<&str>) -> Result<Value, String> {
+        self.take(d, key, by, false)
+    }
+
+    fn take(
+        &mut self,
+        d: &Durable,
+        key: &str,
+        by: Option<&str>,
+        first: bool,
+    ) -> Result<Value, String> {
+        let cur = self.get(d, key)?;
+        if cur["found"] != json!(true) {
+            return Ok(json!({"found": false, "key": key, "remaining": 0}));
+        }
+        let mut arr = match cur["value"].as_array() {
+            Some(a) => a.clone(),
+            None => {
+                return Err(format!(
+                    "memory.{}: the value at {key:?} is not an array",
+                    if first { "shift" } else { "pop" }
+                ));
+            }
+        };
+        if arr.is_empty() {
+            return Ok(json!({"found": false, "key": key, "remaining": 0}));
+        }
+        let value = if first {
+            arr.remove(0)
+        } else {
+            arr.pop().expect("non-empty")
+        };
+        let remaining = arr.len();
+        self.set(d, key, Value::Array(arr), None, by)?;
+        Ok(json!({"found": true, "key": key, "value": value, "remaining": remaining}))
+    }
+
     /// `memory.get {key}` → `{value?, meta?, found}` (expired ⇒ not found).
     pub fn get(&mut self, d: &Durable, key: &str) -> Result<Value, String> {
         Self::check_key(key)?;

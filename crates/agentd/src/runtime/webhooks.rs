@@ -708,6 +708,37 @@ impl crate::runtime::reactor::Runtime {
             .map(|s| s.spec.clone());
         match spec {
             Some(spec) => {
+                // Declarative webhook→signal: `signal: "resolved/{{ body.alert_id }}"`
+                // on the start node fires the named signal with the webhook
+                // payload — the hook→workflow.signal→finish boilerplate
+                // collapses into one field. The run still fires (it is the
+                // audit trail); a workflow that exists only to relay is just
+                // the start plus a finish.
+                if let Some(tpl) = spec.get("signal").and_then(Value::as_str) {
+                    let data: crate::engine::template::Data = payload
+                        .as_object()
+                        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default();
+                    match crate::engine::template::render_str(tpl, &data) {
+                        Ok(Value::String(name)) if !name.is_empty() => {
+                            let resumed = self.deliver_signal(&name, payload.clone(), None, None);
+                            self.log.info(
+                                "webhook.signal",
+                                json!({"workflow": workflow, "node": node,
+                                       "signal": name, "resumed": resumed}),
+                            );
+                        }
+                        Ok(other) => self.log.warn(
+                            "webhook.signal.invalid",
+                            json!({"workflow": workflow, "node": node,
+                                   "err": format!("signal template must render to a string, got {other}")}),
+                        ),
+                        Err(e) => self.log.warn(
+                            "webhook.signal.invalid",
+                            json!({"workflow": workflow, "node": node, "err": e}),
+                        ),
+                    }
+                }
                 if respond_sync {
                     // Hold the response: fire with a known run id, and answer at
                     // `on_run_terminal` with the run's result.

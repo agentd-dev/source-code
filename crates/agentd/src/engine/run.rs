@@ -454,6 +454,18 @@ pub fn schedule(wf: &Workflow, run: &mut RunState, data: &Data) -> Result<Next, 
                 ready.push(id.clone());
                 continue;
             }
+            // An `on_timeout` target is reached by ROUTING only: dep-less by
+            // design (depending on the wait would also fire it on success),
+            // it stays parked until the timeout forces it.
+            if step.depends_on.is_empty()
+                && !step.is_start()
+                && wf
+                    .steps
+                    .values()
+                    .any(|s| s.field_str("on_timeout") == Some(id.as_str()))
+            {
+                continue;
+            }
             // Transitive pruning. A step whose dependencies are ALL pruned can
             // never run, so it is pruned too and the wave carries down the dead
             // branch. One live dependency is enough to keep the step alive —

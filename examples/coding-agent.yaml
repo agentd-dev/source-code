@@ -11,7 +11,7 @@
 #   agentd-tui --endpoint http://127.0.0.1:8420
 #
 # Point `security.exec.workdir` at the repository you want it to work in.
-config_version: "2"
+config_version: "1"
 
 agent:
   name: coder

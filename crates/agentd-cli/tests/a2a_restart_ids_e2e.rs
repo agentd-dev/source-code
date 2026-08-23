@@ -251,7 +251,7 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
     let cfg = write_config(
         "a2a-restart-ids",
         &format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: a2a-restart\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              mcp:\n  servers:\n    - name: store\n      endpoint: {}\n\
@@ -322,7 +322,7 @@ fn the_config_command_never_echoes_a_credential() {
     let cfg = write_config(
         "a2a-restart-config",
         &format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: a2a-redact\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n  \
              headers:\n    {HEADER_NAME}: \"Bearer {HEADER_TOKEN}\"\n\

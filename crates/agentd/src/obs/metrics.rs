@@ -342,7 +342,7 @@ pub fn record_config_reload(result: &str) {
     let _ = result;
 }
 
-/// A turn worker ran (`agent_turns_total{kind}`, agentd 2.0).
+/// A turn worker ran (`agent_turns_total{kind}`, agentd).
 pub fn record_turn(kind: &str) {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.record_turn(kind);
@@ -527,16 +527,16 @@ mod imp {
     /// catch-all that keeps the series bounded (RFC 0016 §4.2).
     const RELOAD_RESULTS: &[&str] = &["applied", "rejected", "other"];
 
-    /// `agent_turns_total{kind}` label domain (agentd 2.0, plan §3.11): a turn
+    /// `agent_turns_total{kind}` label domain (agentd, plan §3.11): a turn
     /// worker's context kind — a `root`/conversation turn, a `preflight` think, a
     /// `compaction` think — plus `other`.
     const TURN_KINDS: &[&str] = &["root", "preflight", "compaction", "knowledge", "other"];
 
-    /// `agent_steps_total{status}` label domain (agentd 2.0): a workflow step's
+    /// `agent_steps_total{status}` label domain (agentd): a workflow step's
     /// terminal status — `done` / `failed` / `skipped` — plus `other`.
     const STEP_STATUS: &[&str] = &["done", "failed", "skipped", "other"];
 
-    /// `agent_store_ops_total{result}` label domain (agentd 2.0, RFC 0025 §3.4):
+    /// `agent_store_ops_total{result}` label domain (agentd, RFC 0025 §3.4):
     /// a remote-store op outcome — `ok` / `conflict` (a CAS mismatch) / `error` —
     /// plus `other`.
     const STORE_RESULTS: &[&str] = &["ok", "conflict", "error", "other"];
@@ -633,7 +633,7 @@ mod imp {
         pub(super) runs_active: AtomicU64,
         pub(super) turns_queued: AtomicU64,
 
-        // --- agentd 2.0 (plan §3.11): the v2 runtime series ------------------
+        // --- agentd (plan §3.11): the v2 runtime series ------------------
         turns_total: LabelCounter<{ TURN_KINDS.len() }>,
         steps_total: LabelCounter<{ STEP_STATUS.len() }>,
         store_ops: LabelCounter<{ STORE_RESULTS.len() }>,
@@ -1230,11 +1230,11 @@ mod imp {
                 g(&self.restarts_tripped),
             );
 
-            // --- agentd 2.0 runtime series (plan §3.11) ----------------------
+            // --- agentd runtime series (plan §3.11) ----------------------
             labelled_counter(
                 &mut s,
                 "agent_turns_total",
-                "Turn-worker runs by context kind (agentd 2.0).",
+                "Turn-worker runs by context kind (agentd).",
                 "kind",
                 TURN_KINDS,
                 &self.turns_total,
@@ -1242,7 +1242,7 @@ mod imp {
             labelled_counter(
                 &mut s,
                 "agent_steps_total",
-                "Workflow steps by terminal status (agentd 2.0, RFC 0027).",
+                "Workflow steps by terminal status (agentd, RFC 0027).",
                 "status",
                 STEP_STATUS,
                 &self.steps_total,
@@ -1250,7 +1250,7 @@ mod imp {
             labelled_counter(
                 &mut s,
                 "agent_store_ops_total",
-                "Remote-store ops by result (agentd 2.0, RFC 0025).",
+                "Remote-store ops by result (agentd, RFC 0025).",
                 "result",
                 STORE_RESULTS,
                 &self.store_ops,
@@ -1264,13 +1264,13 @@ mod imp {
             gauge(
                 &mut s,
                 "agent_inbox_pending",
-                "Durable inbox events awaiting processing (agentd 2.0, RFC 0025).",
+                "Durable inbox events awaiting processing (agentd, RFC 0025).",
                 g(&self.inbox_pending),
             );
             gauge(
                 &mut s,
                 "agent_context_tokens",
-                "Estimated token size of the largest live conversation context (agentd 2.0).",
+                "Estimated token size of the largest live conversation context (agentd).",
                 g(&self.context_tokens),
             );
             s

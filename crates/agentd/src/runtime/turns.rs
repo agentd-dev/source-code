@@ -71,7 +71,7 @@ impl Runtime {
         };
         let mut s = String::new();
         s.push_str(&format!(
-            "You are {}, an autonomous, durable agent (agentd 2.0). You act by calling tools and reply when done. \
+            "You are {}, an autonomous, durable agent (agentd). You act by calling tools and reply when done. \
 Internal tools (memory.*, plan.*, artifact.*, subagent.*, workflow.*, sleep, think, finish, status, skills.*) are executed by your runtime and are durable; \
 other tools come from connected MCP servers. Be concise and factual; never invent tool results.\n",
             self.instance

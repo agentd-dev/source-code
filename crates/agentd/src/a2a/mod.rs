@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **A2A v2 surface** (RFC 0029): agentd 2.0's only external channel.
+//! The **A2A v2 surface** (RFC 0029): agentd's only external channel.
 //! Principals + roles + authorization ([`principals`]) and durable tasks +
 //! conversations ([`tasks`]). The transport binding (the HTTPS listener + the
 //! command/NL/gate routing into the runtime) is wired in the runtime at the

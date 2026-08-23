@@ -1,0 +1,199 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# services.yaml — Beacon's service catalog (RFC 0037).
+#
+# The ONE file that names every external service the company may use. Every
+# desk merges it in front of its own config:
+#
+#   agentd -c services.yaml -c support.yaml
+#
+# What lives HERE, once, instead of eleven times:
+#   • the endpoint each service is dialed at,
+#   • the ONE credential its consumers share (`agentd login service:<name>`
+#     for interactive auth kinds; static tokens resolve from env),
+#   • the AUTHORITATIVE trifecta tags — a floor no desk can under-declare:
+#     any server whose endpoint matches an entry gets the entry's tags
+#     unioned in before the lethal-trifecta gate runs,
+#   • the tool CEILING (`allow`/`exclude`) — the widest surface any desk may
+#     get; a desk's own `allow:` can only narrow it.
+#
+# This file therefore IS the fleet's secrets-and-services inventory: one
+# row per integration, one diff when a service moves, one place to audit.
+#
+# Turning the catalog from authority into allow-list — refuse ANY outbound
+# dial that matches no entry — is one line in any desk (or a shared
+# security.yaml layered the same way):
+#
+#   # security: { egress: closed }
+#
+# The one nuance the catalog cannot express: webhook SIGNING schemes.
+# GitHub's X-Hub-Signature-256 matches agentd's raw-body sha256 HMAC
+# natively; Stripe (`t=<ts>,v1=…`) and Twilio (HMAC-SHA1 over URL+params)
+# need a thin re-signing relay — see the finance.yaml and support-l1.yaml
+# headers.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "1"
+
+services:
+  # ── Customer-facing surfaces ───────────────────────────────────────────────
+
+  # The helpdesk (Intercom/Zendesk/Plain/Help Scout behind an MCP wrapper).
+  # Secret HELPDESK_TOKEN: scope to ticket read + reply ONLY — this key must
+  # not delete tickets or touch billing/admin; the narrow token is the
+  # enforcement, not the instruction. Ticket prose is customer-authored
+  # (untrusted_input) and replies leave through the same API (egress).
+  helpdesk:
+    endpoint: https://mcp.helpdesk.example/mcp
+    tags: { "*": [untrusted_input, egress] }
+    auth: { kind: static, token: "{{secret:HELPDESK_TOKEN}}" }
+
+  # Public product documentation, read-only. Deliberately untagged and
+  # unauthenticated: public content spends no trust legs.
+  docs:
+    endpoint: https://mcp.docs.beacon.example/mcp
+
+  # Twilio messaging. Secret TWILIO_TOKEN: scope to messages on THIS number.
+  # The ceiling strips everything but send/get/list at the registry — a
+  # second fence behind the narrow key.
+  twilio:
+    endpoint: https://mcp.twilio.example/mcp
+    tags: { "*": [untrusted_input, egress] }
+    auth: { kind: static, token: "{{secret:TWILIO_TOKEN}}" }
+    allow: [send_sms, get_message, list_messages]
+
+  # The voice bridge's control surface (the OpenAI realtime session's
+  # say/transfer/hangup + status). Secret VOICEBRIDGE_TOKEN: the bearer you
+  # mint for the bridge. The VOICE model's key lives in the bridge, never
+  # in any agentd config.
+  voicebridge:
+    endpoint: https://mcp.voice.beacon.example/mcp
+    tags: { "*": [untrusted_input, egress] }
+    auth: { kind: static, token: "{{secret:VOICEBRIDGE_TOKEN}}" }
+
+  # ── Internal systems of record ─────────────────────────────────────────────
+
+  # Customer accounts: identity, plan, billing status, monitors. Secret
+  # ACCOUNTS_TOKEN: READ-ONLY — account mutations deliberately have no path
+  # through any desk; the ceiling makes the read-only contract structural.
+  accounts:
+    endpoint: https://mcp.accounts.beacon.example/mcp
+    tags: { "*": [sensitive] }
+    auth: { kind: static, token: "{{secret:ACCOUNTS_TOKEN}}" }
+    allow: ["get_*", "list_*", "search_*"]
+
+  # The service-log search plane (Loki/Elastic/ClickHouse behind an MCP).
+  # Secret LOGS_TOKEN: query-only, scoped to the product's log streams,
+  # ideally with a per-query time-range cap.
+  logs:
+    endpoint: https://mcp.logs.beacon.example/mcp
+    tags: { "*": [sensitive] }
+    auth: { kind: static, token: "{{secret:LOGS_TOKEN}}" }
+    allow: ["query_*", "tail_*", "get_*"]
+
+  # Billing + the books (invoices, customers, subscriptions, ledger
+  # entries). Secret LEDGER_TOKEN: explicitly NOT payouts or bank/transfer
+  # endpoints — the company records money and pauses service; agents never
+  # MOVE money.
+  ledger:
+    endpoint: https://mcp.billing.example/mcp
+    tags: { "*": [sensitive] }
+    auth: { kind: static, token: "{{secret:LEDGER_TOKEN}}" }
+
+  # The CRM (contacts + deals). Secret CRM_TOKEN: read/write contacts and
+  # deals; no exports, no admin, no user management. Records contain
+  # prospect-authored text — hence untrusted_input beside sensitive.
+  crm:
+    endpoint: https://mcp.crm.example/mcp
+    tags: { "*": [sensitive, untrusted_input] }
+    auth: { kind: static, token: "{{secret:CRM_TOKEN}}" }
+
+  # ── Engineering surfaces ───────────────────────────────────────────────────
+
+  # GitHub (repo + PRs + Actions). Secret GITHUB_TOKEN: a fine-grained PAT
+  # or App token scoped to THIS repo, contents:rw + pull_requests:rw — NOT
+  # repo-admin, NOT org. The exclude is the registry's second fence: the
+  # destructive verbs are absent from every consumer, not discouraged.
+  github:
+    endpoint: https://mcp.github.example/mcp
+    tags: { "*": [sensitive] }
+    auth: { kind: static, token: "{{secret:GITHUB_TOKEN}}" }
+    exclude: ["delete_*", "admin_*"]
+
+  # The staging browser/API driver. Secret STAGING_TOKEN: scope to the
+  # STAGING environment only — if the same driver can reach production,
+  # that is an incident waiting for a typo.
+  staging:
+    endpoint: https://mcp.staging.beacon.example/mcp
+    tags: { "*": [sensitive] }
+    auth: { kind: static, token: "{{secret:STAGING_TOKEN}}" }
+
+  # Infra dashboards + the SAFE remediation verbs. Secret INFRA_TOKEN: the
+  # most dangerous credential in the company — scope it to exactly the
+  # verbs this ceiling names and NOTHING wider (a broad token behind a
+  # narrow filter is still a broad token if the server changes). The
+  # ceiling IS the safe set: reads plus restart/scale/rollback; destructive
+  # verbs are absent from the fleet by construction.
+  infra:
+    endpoint: https://mcp.infra.beacon.example/mcp
+    tags: { "*": [sensitive] }
+    auth: { kind: static, token: "{{secret:INFRA_TOKEN}}" }
+    allow: ["get_*", "list_*", "query_*", "restart_service", "scale_pool", "rollback_deploy"]
+
+  # ── Outbound mouths (egress-only, held by the outbox + SRE) ───────────────
+
+  # Transactional email (Postmark/Resend/SES). Secret EMAIL_TOKEN: sending
+  # domain with SPF+DKIM; inbound parse forwards replies to the sales /
+  # marketing reply routes with the lead/person id echoed back (embed it in
+  # the reply-to: reply+<id>@yourdomain).
+  email:
+    endpoint: https://mcp.email.example/mcp
+    tags: { "*": [egress] }
+    auth: { kind: static, token: "{{secret:EMAIL_TOKEN}}" }
+
+  # One cross-poster (Buffer/Typefully/Postiz…) for blog, LinkedIn, X,
+  # Instagram. Secret SOCIAL_TOKEN: one aggregator key beats four platform
+  # OAuth dances; per-network keys would mean per-network entries, all
+  # still egress-only.
+  social:
+    endpoint: https://mcp.social.example/mcp
+    tags: { "*": [egress] }
+    auth: { kind: static, token: "{{secret:SOCIAL_TOKEN}}" }
+
+  # The public status page. Secret STATUSPAGE_TOKEN: incident
+  # create/update/resolve on ONE page.
+  statuspage:
+    endpoint: https://mcp.statuspage.example/mcp
+    tags: { "*": [egress] }
+    auth: { kind: static, token: "{{secret:STATUSPAGE_TOKEN}}" }
+
+  # ── The model, and the internal mesh (so `egress: closed` is one line) ────
+
+  # The intelligence endpoint every desk dials. Closed mode covers it too:
+  # with this entry present, flipping the switch needs no other change.
+  openai:
+    kind: intelligence
+    endpoint: https://api.openai.com/v1
+
+  # The desks themselves, as A2A peers (the loopback mesh). Under closed
+  # egress a peer dial must also be catalogued — these eleven lines are the
+  # whole internal wiring, one per desk port (see README §Ports).
+  desk-support: { kind: peer, endpoint: "http://127.0.0.1:8441" }
+  desk-engineering: { kind: peer, endpoint: "http://127.0.0.1:8442" }
+  desk-qa: { kind: peer, endpoint: "http://127.0.0.1:8443" }
+  desk-sre: { kind: peer, endpoint: "http://127.0.0.1:8444" }
+  desk-sales: { kind: peer, endpoint: "http://127.0.0.1:8445" }
+  desk-finance: { kind: peer, endpoint: "http://127.0.0.1:8446" }
+  desk-outbox: { kind: peer, endpoint: "http://127.0.0.1:8447" }
+  desk-chief-of-staff: { kind: peer, endpoint: "http://127.0.0.1:8448" }
+  desk-marketing: { kind: peer, endpoint: "http://127.0.0.1:8449" }
+  desk-support-l1: { kind: peer, endpoint: "http://127.0.0.1:8450" }
+  desk-support-backoffice: { kind: peer, endpoint: "http://127.0.0.1:8451" }
+
+  # ── Research ───────────────────────────────────────────────────────────────
+
+  # Web search (Brave/Tavily/Kagi wrappers all fit). Secret SEARCH_TOKEN.
+  # Search results are attacker-reachable text — the untrusted_input tag is
+  # authoritative here so no desk can forget it.
+  websearch:
+    endpoint: https://mcp.search.example/mcp
+    tags: { "*": [untrusted_input] }
+    auth: { kind: static, token: "{{secret:SEARCH_TOKEN}}" }

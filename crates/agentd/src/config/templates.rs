@@ -167,11 +167,68 @@ fn compile_one(
                 }
             }
             if let Some(m) = t.mode.as_deref()
-                && m != "detached"
+                && !matches!(m, "detached" | "sync")
             {
                 errs.push(at(format!(
-                    "instance-tier children support mode `detached` only in this phase (got '{m}')"
+                    "instance-tier children support mode `detached` or `sync` (got '{m}')"
                 )));
+            }
+            // Phase B: `mode: sync` needs a `result: {workflow}` naming a
+            // machinery workflow — the composed reporter watches it complete.
+            let machinery_workflows: Vec<&str> = ex
+                .workflows
+                .iter()
+                .filter_map(|w| w.get("name").and_then(Value::as_str))
+                .collect();
+            let result_wf = t
+                .result
+                .as_ref()
+                .and_then(|r| r.get("workflow"))
+                .and_then(Value::as_str);
+            if t.mode.as_deref() == Some("sync") {
+                match result_wf {
+                    None => errs.push(at(
+                        "mode: sync needs `result: {workflow: <name>}` — the child workflow whose first completion resolves the spawn".into(),
+                    )),
+                    Some(w) if !machinery_workflows.contains(&w) => errs.push(at(format!(
+                        "result.workflow '{w}' is not one of this template's machinery workflows ({machinery_workflows:?})"
+                    ))),
+                    Some(_) => {}
+                }
+            } else if t.result.is_some() {
+                errs.push(at("`result` needs `mode: sync`".into()));
+            }
+            // Phase B: mirrored streams must exist on BOTH sides — the child
+            // declares them in machinery, the parent under its own `streams:`.
+            if let Some(mirrors) = &t.mirror_streams {
+                let machinery_streams: Vec<&str> = ex
+                    .config
+                    .get("streams")
+                    .and_then(Value::as_object)
+                    .map(|o| o.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                for m in mirrors {
+                    if !machinery_streams.contains(&m.as_str()) {
+                        errs.push(at(format!(
+                            "mirror_streams: '{m}' is not declared by this template's machinery (:::stream)"
+                        )));
+                    }
+                    if !s.streams.contains_key(m) {
+                        errs.push(at(format!(
+                            "mirror_streams: '{m}' is not declared under the PARENT's `streams:` — a mirror needs both ends"
+                        )));
+                    }
+                }
+            }
+            // The reporter and the mirrors dial home; without a parent
+            // listener they have nowhere to go.
+            if (t.mode.as_deref() == Some("sync")
+                || t.mirror_streams.as_ref().is_some_and(|m| !m.is_empty()))
+                && s.a2a.listen.is_none()
+            {
+                errs.push(at(
+                    "`mode: sync` / `mirror_streams` need the parent to serve A2A (`a2a.listen`) — the child reports over the parent peer".into(),
+                ));
             }
             if t.singleton
                 && t.until.as_deref().is_some_and(|u| !u.contains("{{params."))
@@ -277,8 +334,12 @@ fn validate_instance_machinery(
                 }
                 let mut tags = Vec::new();
                 for srv in &probe.mcp.servers {
-                    if let Err(e) = v2::egress_allows(&s.services, s.security.egress, &srv.endpoint)
-                    {
+                    if let Err(e) = v2::egress_allows(
+                        &s.services,
+                        s.security.egress,
+                        v2::ServiceKind::Mcp,
+                        &srv.endpoint,
+                    ) {
                         errs.push(at(format!("mcp server '{}': {e}", srv.name)));
                     }
                     match srv.tag_set() {

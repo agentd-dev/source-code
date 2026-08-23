@@ -49,7 +49,7 @@ pub(crate) type Up = Arc<Mutex<Stdout>>;
 /// indefinitely waiting for someone to walk back to their desk.
 const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The in-child self-handler for an agentd 2.0 subagent (RFC 0026 §6). A subagent
+/// The in-child self-handler for an agentd subagent (RFC 0026 §6). A subagent
 /// is a **flat child of the reactor** — it runs a ReAct loop over its granted
 /// MCP + code tools and reports its result; it has **no** in-child orchestration
 /// self-tools (no nested `subagent.spawn`, `schedule`, `subscribe`, `workflow.*`,
@@ -128,7 +128,7 @@ pub fn run() -> i32 {
     // cheap empty check per turn.
     let pending_swap: PendingSwap = Arc::new(Mutex::new(None));
 
-    // agentd 2.0: the reply slots for ToolRequest/BudgetRequest round-trips.
+    // agentd: the reply slots for ToolRequest/BudgetRequest round-trips.
     let replies = Arc::new(crate::subagent::replies::Replies::new());
 
     // The control reader runs on its own thread and owns stdin from here on,
@@ -229,7 +229,7 @@ pub fn run() -> i32 {
         }
     }
 
-    // agentd 2.0 (RFC 0026 §2): a TURN WORKER runs one turn over the supplied
+    // agentd (RFC 0026 §2): a TURN WORKER runs one turn over the supplied
     // context slice; internal tools round-trip to the supervisor. Same
     // connections + supervision as a subagent; a different loop.
     if payload.role == crate::subagent::protocol::Role::Turn {
@@ -774,7 +774,7 @@ fn spawn_control_thread(
             // Exits on Ok(None)/Err — the supervisor closed the channel.
             while let Ok(Some(bytes)) = frame::read_frame(&mut stdin) {
                 match serde_json::from_slice::<ControlMsg>(&bytes) {
-                    // agentd 2.0 round-trip answers: park them in the reply slots
+                    // agentd round-trip answers: park them in the reply slots
                     // the turn worker blocks on (RFC 0026 §2).
                     Ok(ControlMsg::ToolResult {
                         id,

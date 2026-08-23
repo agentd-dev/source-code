@@ -140,7 +140,8 @@ function Footer() {
           />
         </div>
         <div className="mt-10 flex flex-col gap-3 border-t border-[var(--line)] pt-6 text-xs text-[var(--dim)] sm:flex-row sm:items-center sm:justify-between">
-          <div>AGPL-3.0 · built in the open</div>
+          <div>AGPL-3.0 · fully open source — commercial licensing &amp; support:{" "}
+            <a href="mailto:agent@agentd.dev">agent@agentd.dev</a></div>
           <div className="flex gap-5">
             {/* The LLM-facing reference. Served from `web/public/` so it sits at
                 the site root, which is where the llms.txt convention expects a

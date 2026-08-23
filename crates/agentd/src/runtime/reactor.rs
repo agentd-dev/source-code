@@ -687,6 +687,13 @@ impl Runtime {
             self.event_to_task
                 .insert(ev.id.clone(), task_id.to_string());
         }
+        // RFC 0036 Phase B: `_instance.*` ops — a child reporting home. The
+        // runtime consumes them BEFORE any reader: never a wait's answer,
+        // never a start's request, never a conversational turn.
+        #[cfg(feature = "a2a")]
+        if self.handle_instance_op(ev) {
+            return;
+        }
         // An inbound message has three possible readers, in this order. Only one
         // takes it: a message that woke a waiting step is an ANSWER, and a
         // message that fired a workflow is a REQUEST — neither should also
@@ -1261,7 +1268,7 @@ impl Runtime {
             "workflows": self.workflows.values().map(|w| json!({"name": w.name, "hash": w.hash, "armed": w.armed, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
             "runs": self.runs.values().map(RunState::summary).collect::<Vec<_>>(),
             "conversations": self.contexts.status(),
-            "subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens})).collect::<Vec<_>>(),
+            "subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "template": s.template, "tier": s.tier, "pid": s.pid, "retire_at": s.retire_at})).collect::<Vec<_>>(),
             "children": self.children.status(),
             "timers": self.timers.status(),
             "inbox_pending": self.inbox_queue.len(),

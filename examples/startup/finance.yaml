@@ -19,11 +19,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY        — the model.
-#   LEDGER_TOKEN          — billing API key. Scope: invoices, customers,
-#                           subscriptions, ledger entries. Explicitly NOT
-#                           payouts or bank/transfer endpoints — this desk
-#                           records money and pauses service; it never
-#                           MOVES money.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c finance.yaml)
 #   STRIPE_WEBHOOK_SECRET — ⚠ the one integration nuance in this file:
 #                           Stripe's real Stripe-Signature header is
 #                           `t=<ts>,v1=HMAC(ts + "." + body)` — a scheme
@@ -43,7 +40,7 @@
 # are integer cents end-to-end — never floats, and the instruction's
 # "never round" leans on the server not rounding either.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: finance
@@ -71,10 +68,7 @@ store:
 mcp:
   servers:
     # Billing + the books (read/write invoices, ledger entries, subscriptions).
-    - name: ledger
-      endpoint: https://mcp.billing.example/mcp
-      tags: { "*": [sensitive] }
-      auth: { kind: static, token: "{{secret:LEDGER_TOKEN}}" }
+    - { name: ledger, service: ledger }
 
 webhooks:
   listen: http://127.0.0.1:9446

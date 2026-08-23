@@ -41,7 +41,7 @@ fn run_cfg(cfg_text: &str) -> (Option<i32>, String) {
 #[test]
 fn a_wait_timeout_routes_to_its_named_step_and_success_path_stays_pruned() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 400ms }\n\
          observability: { log_level: info, log_content: true }\n\
          workflows:\n  - name: w\n    steps:\n\
@@ -66,7 +66,7 @@ fn a_wait_timeout_routes_to_its_named_step_and_success_path_stays_pruned() {
 #[test]
 fn memory_push_and_shift_are_a_durable_queue() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: q }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: q }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 400ms }\n\
          observability: { log_level: info, log_content: true }\n\
          workflows:\n  - name: w\n    steps:\n\
@@ -89,7 +89,7 @@ fn memory_push_and_shift_are_a_durable_queue() {
 #[test]
 fn a_switch_with_on_no_match_skip_completes_instead_of_failing() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: sw }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: sw }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 400ms }\n\
          observability: { log_level: info, log_content: true }\n\
          workflows:\n  - name: w\n    steps:\n\
@@ -114,7 +114,7 @@ fn a_switch_with_on_no_match_skip_completes_instead_of_failing() {
 #[test]
 fn day_and_week_durations_parse() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: d }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: d }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 300ms }\n\
          limits: { run: { deadline: 30d } }\n\
          streams: { s: { retention: { max_age: 2w } } }\n\
@@ -132,7 +132,7 @@ fn a_paced_stream_consumer_leaves_the_backlog_queued() {
     // Three events, a consumer paced to a burst of 1: exactly one fires in
     // this life; the offset holds the other two for later lives.
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: paced }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: paced }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 600ms }\n\
          observability: { log_level: info, log_content: true }\n\
          streams: { jobs: { retention: { max_events: 100 } } }\n\
@@ -160,7 +160,7 @@ fn mock_intelligence_runs_a_model_step_fully_offline() {
     // key, no network, no second process. Debug builds always carry the
     // mock; release needs `--features internal-mocks`.
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: offline }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: offline }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -186,7 +186,7 @@ fn a_typed_command_round_trips_and_its_schema_refuses_bad_payloads() {
     // admission, and the fired run reads `{{steps.cmd.output.args.*}}` typed.
     let port = common::free_port();
     let cfg = format!(
-        "config_version: \"2\"\nagent: {{ name: self }}\nstore: {{ kind: memory }}\n\
+        "config_version: \"1\"\nagent: {{ name: self }}\nstore: {{ kind: memory }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 900ms }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
          a2a:\n  listen: http://127.0.0.1:{port}\n  peers:\n    - name: me\n      endpoint: http://127.0.0.1:{port}\n\
@@ -238,7 +238,7 @@ fn a_webhook_start_with_a_signal_field_wakes_the_parked_run() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\nagent: {{ name: wh }}\nstore: {{ kind: memory }}\n\
+            "config_version: \"1\"\nagent: {{ name: wh }}\nstore: {{ kind: memory }}\n\
              lifecycle: {{ run_until: idle, idle_grace: 800ms }}\n\
              observability: {{ log_level: info, log_content: true }}\n\
              webhooks: {{ listen: \"http://127.0.0.1:{port}\" }}\n\
@@ -301,7 +301,7 @@ fn a_human_gate_opening_fires_the_asked_event() {
     let cfg = format!("{dir}/c.yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"2\"\nagent: { name: gates, ask_human_fallback: wait }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: gates, ask_human_fallback: wait }\nstore: { kind: memory }\n\
          lifecycle: { run_until: drained }\n\
          observability: { log_level: info, log_content: true }\n\
          workflows:\n  - name: approval\n    steps:\n\

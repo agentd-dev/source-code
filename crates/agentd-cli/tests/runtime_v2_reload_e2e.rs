@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd 2.0 daemon lifecycle: a `run_until: drained` instance stays up,
+//! agentd daemon lifecycle: a `run_until: drained` instance stays up,
 //! applies a SIGHUP reload of the reloadable partition (RFC 0030 §6), refuses a
 //! restart-only change, and drains cleanly on SIGTERM (exit 0).
 #![cfg(all(feature = "hot-reload", unix))]
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 fn config(instruction: &str, name: &str, llm: &str) -> String {
     format!(
-        "config_version: \"2\"\nagent:\n  name: {name}\n  instruction: {instruction}\nintelligence:\n  endpoints: {llm}\n  model: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: {name}\n  instruction: {instruction}\nintelligence:\n  endpoints: {llm}\n  model: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
     )
 }
 

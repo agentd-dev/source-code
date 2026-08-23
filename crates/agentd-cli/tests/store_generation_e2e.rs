@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 fn config(mock_uri: &str, extra_step: &str, finish_after: &str) -> String {
     let path = common::unique_path("generation-v2", "yaml");
     let yaml = format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: generations\n\
          mcp:\n  servers:\n    - name: mock\n      endpoint: {mock_uri}\n\
          store:\n  kind: mcp\n  mcp:\n    server: mock\n\

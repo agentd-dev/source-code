@@ -147,7 +147,7 @@ fn spawn_daemon(config: &str) -> Daemon {
 /// caller-supplied cursor is handed to.
 fn config(port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: a2a-malformed\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
          store:\n  kind: memory\n\

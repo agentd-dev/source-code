@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The child-side **reply slots** for the agentd 2.0 round-trips (RFC 0026 §2):
+//! The child-side **reply slots** for the agentd round-trips (RFC 0026 §2):
 //! a turn worker sends `ToolRequest`/`BudgetRequest` frames up and blocks until
 //! the control-reader thread delivers the matching `ToolResult`/`BudgetGrant`
 //! here (by `id`). One mutex + condvar; a closed channel or a cancel wakes

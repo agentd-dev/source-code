@@ -5,7 +5,7 @@
 > a long-lived reactive daemon, or a durable DAG workflow. Tools come only from
 > remote **MCP** servers over HTTPS; it speaks **A2A** to other agents; it
 > executes nothing locally unless you compile *and* enable the guarded `exec`
-> runner. This file is the condensed reference for LLMs. Version 2.7.0.
+> runner. This file is the condensed reference for LLMs. Version 1.0.0 (unreleased).
 
 Canonical docs: https://agentd.dev/docs/ · Agent Skill: https://agentd.dev/SKILL.md · Source: https://github.com/agentd-dev/source-code
 
@@ -65,7 +65,7 @@ Useful introspection, all side-effect-free:
 
 | Command | Prints |
 |---|---|
-| `agentd --config-schema=2` | the settings JSON Schema (authoritative) |
+| `agentd --config-schema` | the settings JSON Schema (authoritative) |
 | `agentd --workflow-schema` | the workflow schema + node registry (authoritative) |
 | `agentd --capabilities` | what this binary can actually do (features are compile-time) |
 | `agentd --help` | every config path, env var and flag |
@@ -86,7 +86,7 @@ agentd \
 **A daemon from a config file:**
 
 ```yaml
-config_version: "2"
+config_version: "1"
 agent:
   name: triage
   instruction: Triage new issues and label them.
@@ -148,7 +148,7 @@ the file's); the repeatable named flags `--mcp`, `--a2a-peer`, `--workflow`
 `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`, `context`,
 `knowledge`, `search`, `skills`, `workflows`, `webhooks`, `limits`, `lifecycle`,
 `a2a`, `interface`, `observability`, `security`, plus `config_version` (must be
-`"2"`).
+`"1"`).
 
 Most-used options:
 
@@ -543,6 +543,6 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/rfc-0029/ | RFC 0029 — A2A conversations, principals, commands |
 | https://agentd.dev/docs/rfc-0030/ | RFC 0030 — the config schema, normative |
 
-The authoritative machine-readable schemas are `agentd --config-schema=2` and
+The authoritative machine-readable schemas are `agentd --config-schema` and
 `agentd --workflow-schema`; when this file and the binary disagree, the binary
 is right.

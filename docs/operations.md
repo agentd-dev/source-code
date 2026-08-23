@@ -9,7 +9,7 @@ into a live daemon.
 Almost everything here rides one surface — the **A2A listener** (`a2a.listen`,
 `--features a2a`) — which is off by default. A pure one-shot CLI run carries
 none of it. The exceptions are the three side-effect-free probes
-(`--capabilities`, `--config-schema=2`, `--validate-config`), which need no
+(`--capabilities`, `--config-schema`, `--validate-config`), which need no
 listener, no network, and no config beyond the files you point them at.
 
 The control-plane contracts are owned by RFCs
@@ -237,7 +237,7 @@ armed `workflows`, live `runs`, `conversations`, `subagents`, OS `children`,
 never the text), the active `model`, and recent `activity`.
 
 **`config`** answers with the effective merged settings document — the same
-document `--config-schema=2` describes. It carries `{{secret:…}}` **references**,
+document `--config-schema` describes. It carries `{{secret:…}}` **references**,
 never resolved secret values, which is why it is operator-only. Use it to confirm
 *what* an instance is actually running after a reload, without ever exposing a
 credential.
@@ -300,9 +300,9 @@ Not every feature is in the released binary. `a2a`, `metrics`, `cron`, `otel`,
 builds; `exec` is the one build-from-source opt-in. The manifest reflects the
 binary you actually have.
 
-### 4.2 `--config-schema=2` and `--validate-config`
+### 4.2 `--config-schema` and `--validate-config`
 
-`--config-schema=2` prints the settings **JSON Schema** (Draft 2020-12) and exits
+`--config-schema` prints the settings **JSON Schema** (Draft 2020-12) and exits
 `0` — every path, its type, its enum domain. `--workflow-schema` does the same for
 the workflow dialect plus the node registry. Both are how a controller (or an
 editor, or an admission webhook) learns the config surface without parsing docs.

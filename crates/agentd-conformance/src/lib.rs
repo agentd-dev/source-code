@@ -18,7 +18,7 @@ pub mod report;
 pub use harness::Harness;
 pub use report::Report;
 
-/// The conformance families. agentd 2.0: the v1-only families (`mcp-server`,
+/// The conformance families. agentd: the v1-only families (`mcp-server`,
 /// `mcp-client`, `work-claim`) were retired with the mode cut-over and rebuilt as
 /// the v2 families below (P7): the durable-store contract, the crash/restore
 /// durability contract, the internal tool registry, and A2A conversations.

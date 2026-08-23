@@ -136,7 +136,7 @@ every non-start step needs `depends_on`, and the graph must be acyclic and
 reachable from a start. A document that validates clean:
 
 ```yaml
-config_version: "2"
+config_version: "1"
 agent:
   name: releaser
   instruction: Keep the release queue moving.

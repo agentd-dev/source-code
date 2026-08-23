@@ -92,7 +92,7 @@ fn handle(stream: TcpStream, polls: &Arc<AtomicUsize>) {
 
 fn config(port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: login\n  instruction: x\n  preflight: never\n\
          intelligence:\n  endpoints: [https://api.openai.com/v1]\n  model: m\n\
          store:\n  kind: memory\n\

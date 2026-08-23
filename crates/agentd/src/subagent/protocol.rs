@@ -58,7 +58,7 @@ pub enum ControlMsg {
     /// `token` is a credential carried on the wire like [`SpawnPayload`]'s — it
     /// is NEVER logged (the swap event/logs carry transport+index only).
     SwapIntel(Box<SwapIntel>),
-    /// agentd 2.0 (RFC 0026 §2): the answer to an [`AgentMsg::ToolRequest`] —
+    /// agentd (RFC 0026 §2): the answer to an [`AgentMsg::ToolRequest`] —
     /// the supervisor executed the internal tool; `result` is the tool's
     /// output (or an error message when `is_error`).
     ToolResult {
@@ -67,7 +67,7 @@ pub enum ControlMsg {
         #[serde(default)]
         is_error: bool,
     },
-    /// agentd 2.0 (RFC 0026 §7): the answer to an [`AgentMsg::BudgetRequest`].
+    /// agentd (RFC 0026 §7): the answer to an [`AgentMsg::BudgetRequest`].
     /// `ok` = proceed now; else wait `wait_ms` and ask again (`wait`/`slow`),
     /// or the request is refused (`reason`); `model` = a degrade swap.
     BudgetGrant {
@@ -156,15 +156,15 @@ pub enum AgentMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active: Option<IntelActive>,
     },
-    /// agentd 2.0 (RFC 0026 §2): a turn worker / subagent asks the supervisor
+    /// agentd (RFC 0026 §2): a turn worker / subagent asks the supervisor
     /// to execute an **internal** tool (memory, plan, subagent.run, sleep…) —
     /// state changes are made by the state owner. Answered by
     /// [`ControlMsg::ToolResult`] with the same `id`.
     ToolRequest { id: u64, name: String, args: Value },
-    /// agentd 2.0 (RFC 0026 §7): budget admission before a model call.
+    /// agentd (RFC 0026 §7): budget admission before a model call.
     /// Answered by [`ControlMsg::BudgetGrant`].
     BudgetRequest { id: u64, estimate: u64 },
-    /// agentd 2.0: a `Role::Turn` worker finished its turn (terminal for the
+    /// agentd: a `Role::Turn` worker finished its turn (terminal for the
     /// worker). Carries the transcript delta, the usage, and the outcome.
     TurnDone { turn: Box<TurnResult> },
 }
@@ -233,7 +233,7 @@ pub struct SpawnPayload {
     /// parseable.
     #[serde(default)]
     pub warm: bool,
-    /// agentd 2.0 (RFC 0026 §2): the child's role. `agent` (default) is the
+    /// agentd (RFC 0026 §2): the child's role. `agent` (default) is the
     /// RFC 0009 subagent (ReAct loop / workflow driver); `turn` is a **turn
     /// worker** driven by `turn` below. `#[serde(default)]` keeps older frames
     /// parseable.
@@ -311,7 +311,7 @@ pub struct WorkflowResumeRef {
     pub force: bool,
 }
 
-/// The child's role (agentd 2.0, RFC 0026 §2).
+/// The child's role (agentd, RFC 0026 §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {

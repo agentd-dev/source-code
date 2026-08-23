@@ -113,7 +113,7 @@ fn a_subagent_granted_one_tool_gets_only_that_tool_and_is_refused_the_rest() {
         ]
     }));
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  instruction: delegate the search\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nobservability:\n  log_level: info\n  log_content: true\n",
+        "config_version: \"1\"\nagent:\n  instruction: delegate the search\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nobservability:\n  log_level: info\n  log_content: true\n",
         llm.uri,
         mock.uri()
     ));

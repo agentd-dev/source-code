@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The supervisor contract (agentd 2.0): the documented exit-code table (the
+//! The supervisor contract (agentd): the documented exit-code table (the
 //! `once` job maps its outcome to an exit code) and the v1→v2 migration gate.
 //! Driven by running the real binary and observing the exit code.
 //!
@@ -61,7 +61,7 @@ fn exit_bad_flag(h: &Harness) -> Outcome {
 }
 
 fn exit_retired_flag(h: &Harness) -> Outcome {
-    // agentd 2.0 removed the mode drivers; `--mode` is a retired flag.
+    // agentd removed the mode drivers; `--mode` is a retired flag.
     let r = h.run(&[
         "--mode",
         "reactive",

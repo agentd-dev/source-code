@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd 2.0 **A2A v2 transport** end to end (RFC 0029): a v2 daemon binds the
+//! agentd **A2A v2 transport** end to end (RFC 0029): a v2 daemon binds the
 //! real HTTPS listener (plaintext loopback here, so the wiring is exercised
 //! through the actual binary without cert plumbing — mTLS is covered by net's
 //! tls_server tests and the resolver unit tests). A JSON-RPC peer drives the
@@ -176,7 +176,7 @@ fn spawn_daemon(config: &str) -> Daemon {
 /// backed by the mock LLM and an in-memory store.
 fn a2a_config(llm: &str, port: u16, extra: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: a2a-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -331,7 +331,7 @@ fn capabilities_describes_the_v2_a2a_surface_without_side_effects() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("capabilities json");
-    assert_eq!(v["runtime"], "2.0");
+    assert_eq!(v["runtime"], "1");
     assert_eq!(v["a2a"]["listen"], format!("http://127.0.0.1:{port}"));
     let methods = v["a2a"]["methods"].as_array().unwrap();
     assert!(methods.iter().any(|m| m == "SendMessage") && methods.iter().any(|m| m == "GetTask"));

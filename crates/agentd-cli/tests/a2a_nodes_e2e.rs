@@ -137,7 +137,7 @@ fn an_a2a_start_node_turns_an_inbound_command_into_a_run() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -191,7 +191,7 @@ fn a_non_matching_message_is_still_a_conversation() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -238,7 +238,7 @@ fn an_a2a_wait_is_woken_by_the_message_it_waits_for() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\

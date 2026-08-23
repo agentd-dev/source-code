@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Trigger primitives. agentd 2.0 removed the v1 supervisor mode drivers
+//! Trigger primitives. agentd removed the v1 supervisor mode drivers
 //! (`mode`, `warm`, `router`); `timer` (cron) backs the v2 `schedule` start node.
 
 // The 5-field cron parser, feature-gated (no deps). The v2 `schedule` start node

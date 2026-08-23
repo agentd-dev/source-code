@@ -1338,7 +1338,7 @@ mod tests {
     #[test]
     fn the_digest_covers_workflows_store_and_limits_only() {
         let doc = json!({
-            "config_version": "2",
+            "config_version": "1",
             "agent": {"name": "a", "instruction": "one"},
             "workflows": [{"name": "w", "version": 3, "steps": {"s": {"kind": "once"}}}],
             "limits": {"run": {"steps": 10}},

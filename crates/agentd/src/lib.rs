@@ -14,17 +14,17 @@
 //! Module map (assessment §4.0). `agentloop` is named to avoid the `loop`
 //! keyword.
 
-pub mod a2a; // agentd 2.0 A2A surface: principals/roles/authorization + durable tasks (RFC 0029)
+pub mod a2a; // agentd A2A surface: principals/roles/authorization + durable tasks (RFC 0029)
 #[cfg(feature = "aauth")]
 pub mod aauth; // AAuth [DRAFT] — agent-side auth for AAuth-protected MCP (RFC 0023)
 pub mod agentloop; // the in-child ReAct loop + terminal-status state machine (v2 subagents)
 pub mod auth; // endpoint credential providers + durable token cache: OAuth device/refresh, AWS, SPIFFE (RFC 0031)
 pub mod cel; // CEL expression seam (feature `cel`; always compiled, fail-closed without it)
 pub mod config; // precedence (built-in<file<env<flag) + validate-at-startup; config::{file,yaml,paths,watch}
-pub mod context; // agentd 2.0 contexts: durable transcripts, plan, memory, compaction, skills (RFC 0026 §5)
-pub mod engine; // agentd 2.0 workflow engine v3: dialect-3 model, templates, durable runs + scheduler (RFC 0027)
+pub mod context; // agentd contexts: durable transcripts, plan, memory, compaction, skills (RFC 0026 §5)
+pub mod engine; // agentd workflow engine v3: dialect-3 model, templates, durable runs + scheduler (RFC 0027)
 pub mod exit; // the public exit-code table + terminal-status -> code map
-pub mod governor; // agentd 2.0 token governor: windowed durable budgets + tactics (RFC 0026 §7)
+pub mod governor; // agentd token governor: windowed durable budgets + tactics (RFC 0026 §7)
 pub mod identity; // instance identity from the k8s downward API (env-only, RFC 0015 §6)
 pub mod intel; // intelligence client + provider adapters
 pub mod jsonschema; // dependency-free JSON Schema subset validator (tool contracts, workflow schemas)
@@ -36,13 +36,13 @@ pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
 // `crate::net::*` keeps resolving across the runtime (mcp transport + intel).
 pub use ::net;
 pub mod obs; // logging, health, tracing, metrics
-pub mod registry; // agentd 2.0 tool registry: internal > code > MCP, contracts, overrides, grants (RFC 0028)
-pub mod runtime; // agentd 2.0 runtime: event loop, turn workers, lifecycle (RFC 0026)
+pub mod registry; // agentd tool registry: internal > code > MCP, contracts, overrides, grants (RFC 0028)
+pub mod runtime; // agentd runtime: event loop, turn workers, lifecycle (RFC 0026)
 pub mod sec; // secrets, tool-scope, gated exec
 pub mod sha; // dependency-free SHA-256 (content identity: workflow hashes, skill bodies, artifacts)
 pub mod signals;
-pub mod state; // agentd 2.0 durable state model: entities, manifest, inbox, timers, restore (RFC 0025)
-pub mod store; // agentd 2.0 remote state store adapters: 4-op contract over MCP tools / HTTP / memory (RFC 0025)
+pub mod state; // agentd durable state model: entities, manifest, inbox, timers, restore (RFC 0025)
+pub mod store; // agentd remote state store adapters: 4-op contract over MCP tools / HTTP / memory (RFC 0025)
 pub mod subagent; // supervisor<->subagent control protocol
 pub mod supervisor; // the reactor, process tree, spawn/reap/liveness/kill/restart
 pub mod tools; // CODE-REGISTERED tools — the embedder seam (RFC 0022 §4)

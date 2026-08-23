@@ -86,7 +86,7 @@ fn the_breaker_opens_survives_restarts_probes_and_closes() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: breakerbox\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n\
              workflows:\n  - name: pay\n    steps:\n\
@@ -175,7 +175,7 @@ fn a_rated_step_paces_a_fanout_instead_of_bursting() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: pacer\n\
              store:\n  kind: memory\n\
              workflows:\n  - name: sweep\n    steps:\n\

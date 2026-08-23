@@ -20,14 +20,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY       — the model.
-#   INFRA_TOKEN          — the infra API credential. This is the most
-#                          dangerous secret in the company: scope it to the
-#                          verbs the `allow:` list names and NOTHING wider —
-#                          the registry filter makes destructive tools
-#                          absent, but a broad token behind a narrow filter
-#                          is still a broad token if the server changes.
-#   STATUSPAGE_TOKEN     — status-page API key (incident create/update/
-#                          resolve on ONE page).
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c sre.yaml)
 #   ALERT_WEBHOOK_SECRET — set the same value on the monitoring stack's
 #                          webhook config. Alertmanager cannot sign; put
 #                          this desk's routes behind your ingress and have
@@ -46,7 +40,7 @@
 # public page. Idempotent per incident id — the correlation id below is the
 # alert id for exactly that reason.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: sre
@@ -76,18 +70,11 @@ store:
 
 mcp:
   servers:
-    # Dashboards + the safe remediation verbs (restart/scale/rollback).
-    - name: infra
-      endpoint: https://mcp.infra.beacon.example/mcp
-      tags: { "*": [sensitive] }
-      auth: { kind: static, token: "{{secret:INFRA_TOKEN}}" }
-      # The safe set, enforced at the registry — destructive verbs are absent
-      # from this instance, not merely discouraged by the instruction.
-      allow: ["get_*", "list_*", "query_*", "restart_service", "scale_pool", "rollback_deploy"]
-    - name: statuspage
-      endpoint: https://mcp.statuspage.example/mcp
-      tags: { "*": [egress] }
-      auth: { kind: static, token: "{{secret:STATUSPAGE_TOKEN}}" }
+    # Dashboards + the safe remediation verbs. The catalog's ceiling IS the
+    # safe set (reads + restart/scale/rollback) — destructive verbs are
+    # absent from the whole fleet, not merely discouraged here.
+    - { name: infra, service: infra }
+    - { name: statuspage, service: statuspage }
 
 webhooks:
   listen: http://127.0.0.1:9444

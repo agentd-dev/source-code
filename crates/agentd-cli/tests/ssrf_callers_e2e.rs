@@ -365,7 +365,7 @@ fn an_http_node_refuses_a_private_url_while_a_declared_one_still_reaches_its_ser
     let (port, seen) = spawn_receiver();
     let cfg_path = common::unique_path("agentd-ssrf-http", "yaml");
     let cfg = format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: caller\n  instruction: make a call\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\n\
          store:\n  kind: memory\n\

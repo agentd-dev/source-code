@@ -17,7 +17,7 @@
 # a model what it was doing. The instruction below still governs anything that
 # arrives as plain conversation (an operator asking a question).
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: hiring-actions

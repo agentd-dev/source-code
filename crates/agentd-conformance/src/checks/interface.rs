@@ -103,7 +103,7 @@ fn config(llm: &str, port: u16, interface: bool) -> String {
         ""
     };
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: iface-conf\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\

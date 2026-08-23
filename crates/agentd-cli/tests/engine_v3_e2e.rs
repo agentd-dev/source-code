@@ -41,7 +41,7 @@ fn events(stderr: &str, name: &str) -> Vec<serde_json::Value> {
 /// A job-shaped v2 document with one inline workflow (JSON steps for brevity).
 fn job(steps: &str, extra: &str) -> String {
     write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: engine\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"
+        "config_version: \"1\"\nagent:\n  name: engine\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"
     ))
 }
 
@@ -187,7 +187,7 @@ fn mcp_tool_steps_large_outputs_and_concurrent_runs() {
     // output becomes an artifact; the template dereferences it.
     let steps = steps.replace("XXXX", &"x".repeat(200));
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: engine\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nlimits:\n  inline_max_bytes: 512\nworkflows:\n  - name: pipe\n    concurrency: {{max_runs: 4}}\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n",
+        "config_version: \"1\"\nagent:\n  name: engine\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nlimits:\n  inline_max_bytes: 512\nworkflows:\n  - name: pipe\n    concurrency: {{max_runs: 4}}\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n",
         mock.uri()
     ));
     let inbox = common::unique_path("inbox", "json");
@@ -233,7 +233,7 @@ fn a_sigkill_mid_batch_resumes_at_the_next_batch() {
         "done": {"kind": "finish", "depends_on": ["each"], "status": "completed", "output": "{{steps.each.output}}"}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: chaos-batch\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n",
+        "config_version: \"1\"\nagent:\n  name: chaos-batch\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n",
         mock.uri()
     ));
     // Life 1: die when the first batch completes (`batch.k`).
@@ -347,7 +347,7 @@ fn a_start_whose_inputs_cannot_render_refuses_loudly_instead_of_firing_empty() {
         "f": {"kind": "finish", "depends_on": ["hit"], "status": "completed"}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: loudstart\nstore:\n  kind: memory\nworkflows:\n  - name: trigger\n    steps: {steps_trigger}\n  - name: watcher\n    steps: {steps_watcher}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: loudstart\nstore:\n  kind: memory\nworkflows:\n  - name: trigger\n    steps: {steps_trigger}\n  - name: watcher\n    steps: {steps_watcher}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n"
     ));
     let out = run_agentd(&cfg, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -369,7 +369,7 @@ fn an_unfiltered_event_watcher_never_triggers_itself() {
     // completion — an infinite loop of runs. Self-trigger suppression: an
     // event about workflow W never fires W's own event start.
     let cfg = write_config(
-        "config_version: \"2\"\nagent:\n  name: nolooper\nstore:\n  kind: memory\nworkflows:\n  - name: seed\n    steps:\n      s: {kind: once}\n      f: {kind: finish, depends_on: [s], status: completed}\n  - name: watcher\n    steps:\n      hit: {kind: event, on: workflow.finished}\n      f: {kind: finish, depends_on: [hit], status: completed}\nlifecycle:\n  run_until: idle\n  idle_grace: 800ms\nobservability:\n  log_level: info\n",
+        "config_version: \"1\"\nagent:\n  name: nolooper\nstore:\n  kind: memory\nworkflows:\n  - name: seed\n    steps:\n      s: {kind: once}\n      f: {kind: finish, depends_on: [s], status: completed}\n  - name: watcher\n    steps:\n      hit: {kind: event, on: workflow.finished}\n      f: {kind: finish, depends_on: [hit], status: completed}\nlifecycle:\n  run_until: idle\n  idle_grace: 800ms\nobservability:\n  log_level: info\n",
     );
     let out = run_agentd(&cfg, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);

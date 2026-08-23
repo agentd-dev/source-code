@@ -23,8 +23,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY      — the model.
-#   CRM_TOKEN           — CRM API key. Scope: contacts + deals read/write;
-#                         no exports, no admin, no user management.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c sales.yaml)
 #   LEAD_WEBHOOK_SECRET — invent it; your site's backend signs the lead
 #                         POST body (sha256 HMAC → X-Site-Signature) with
 #                         the same value. Unsigned lead routes get poisoned
@@ -36,7 +36,7 @@
 # that comes BACK into prompts later — the tag is how that round trip stays
 # honest. Upserts must be idempotent by external id (the lead_id).
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: sales
@@ -68,10 +68,7 @@ store:
 
 mcp:
   servers:
-    - name: crm
-      endpoint: https://mcp.crm.example/mcp
-      tags: { "*": [sensitive, untrusted_input] }
-      auth: { kind: static, token: "{{secret:CRM_TOKEN}}" }
+    - { name: crm, service: crm }
 
 webhooks:
   listen: http://127.0.0.1:9445

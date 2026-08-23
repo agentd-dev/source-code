@@ -210,7 +210,7 @@ fn spawn_bound_with(
 
 fn steer_config(llm: &str, port: u16, extra: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: steer-e2e\n  instruction: Test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\

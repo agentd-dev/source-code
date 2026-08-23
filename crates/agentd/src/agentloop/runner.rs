@@ -594,10 +594,17 @@ fn dispatch_tool(
     arguments: &Value,
 ) -> (String, bool) {
     match routing.get(name) {
-        Some(&i) => match servers[i].call_tool(name, Some(arguments.clone())) {
-            Ok(res) => (res.text(), res.is_error()),
-            Err(e) => (format!("tool transport error: {e}"), true),
-        },
+        Some(&i) => {
+            // RFC 0037 §4: a flat subagent paces its own calls too (its
+            // registry was seeded when it dialed its granted servers).
+            if let Err(e) = crate::mcp::pace::take(servers[i].name()) {
+                return (e, true);
+            }
+            match servers[i].call_tool(name, Some(arguments.clone())) {
+                Ok(res) => (res.text(), res.is_error()),
+                Err(e) => (format!("tool transport error: {e}"), true),
+            }
+        }
         None => (format!("error: no such tool '{name}'"), true),
     }
 }

@@ -42,7 +42,7 @@ fn config(dir: &str, marker: &str, with_wf: bool) -> String {
         String::new()
     };
     format!(
-        "config_version: \"2\"\nagent:\n  name: phoenix\n\
+        "config_version: \"1\"\nagent:\n  name: phoenix\n\
          store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
          workflows:\n  - name: idle\n    steps:\n\
          \x20     s: {{kind: manual}}\n\

@@ -2,10 +2,10 @@
 //! agentd entry point.
 //!
 //! Dispatches between three roles of the one binary: the **supervisor** (the
-//! agentd 2.0 runtime — parse + validate a v2 configuration, then run the
+//! agentd runtime — parse + validate a v2 configuration, then run the
 //! durable event loop, RFC 0026), the **subagent** re-exec, and the early-exit
 //! asks (`--help` / `--version` / `--config-schema` / `--validate-config` /
-//! `--capabilities`). agentd 2.0 removed the 1.x mode drivers and the flat v1
+//! `--capabilities`). agentd removed the 1.x mode drivers and the flat v1
 //! schema: a 1.x configuration is rejected with a migration hint.
 
 use agentd::config::ConfigError;
@@ -84,7 +84,7 @@ fn run() -> i32 {
     run_v2(&argv[1..], &env)
 }
 
-/// The agentd 2.0 supervisor: load + validate a v2 configuration and run it (or
+/// The agentd supervisor: load + validate a v2 configuration and run it (or
 /// answer an early-exit ask). A 1.x configuration — the flat schema or a `--mode`
 /// invocation — is rejected with a migration hint (`v2::load` also emits the
 /// precise v1/mixed/removed-flag diagnostics).
@@ -178,8 +178,8 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
     };
     if detected == Detected::V1 {
         eprintln!(
-            "agentd: this configuration speaks the 1.x schema, which agentd 2.0 removed. \
-Migrate to `config_version: \"2\"` with v2 sections (agent / intelligence / a2a / workflows); \
+            "agentd: this configuration speaks the 1.x schema, which agentd removed. \
+Migrate to `config_version: \"1\"` with v2 sections (agent / intelligence / a2a / workflows); \
 see docs/configuration.md."
         );
         return exit::USAGE;

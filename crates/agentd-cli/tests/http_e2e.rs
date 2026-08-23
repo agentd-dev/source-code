@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd 2.0 **outbound `http` node** (RFC 0027) end to end: a workflow makes a
+//! agentd **outbound `http` node** (RFC 0027) end to end: a workflow makes a
 //! real `POST` to a loopback REST endpoint (`allow_private: true`), the SSRF-
 //! guarded client sends the templated JSON body + headers, and the structured
 //! response `{status, ok, headers, body, json}` flows into the next step's data
@@ -171,7 +171,7 @@ fn an_http_node_posts_json_and_the_structured_response_flows_into_the_run() {
     let (port, seen, _mock) = spawn_mock_rest();
     let cfg_path = common::unique_path("agentd-http", "yaml");
     let cfg = format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: caller\n  instruction: make a call\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -242,7 +242,7 @@ fn an_http_node_emits_a_signed_webhook_the_receiver_can_verify() {
     // so the node is a verifiable webhook emitter. The secret comes through a
     // `{{secret:…}}` reference (never inline), fed by an env var.
     let cfg = format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: emitter\n  instruction: emit\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -349,7 +349,7 @@ fn the_http_idempotency_key_is_derived_opaque_and_stable_across_retries() {
     let (port, keys) = spawn_flaky_idem_mock();
     let cfg = common::unique_path("agentd-http-idem", "yaml");
     std::fs::write(&cfg, format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: idem\n\
          workflows:\n  - name: pay\n    steps:\n\
          \x20     start: {{kind: once}}\n\

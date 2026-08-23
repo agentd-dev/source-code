@@ -28,7 +28,7 @@ pub fn checks() -> Vec<Check> {
 
 fn store_config(llm: &str, store_endpoint: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: store-conf\n  instruction: finish the job\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          mcp:\n  servers:\n    - name: store\n      endpoint: {store_endpoint}\n\

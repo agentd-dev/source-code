@@ -125,7 +125,7 @@ fn try_boot() -> Result<(Daemon, String, tempdir::TempDir), String> {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: oracle\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\

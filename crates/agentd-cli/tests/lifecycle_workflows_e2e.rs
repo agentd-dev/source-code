@@ -76,7 +76,7 @@ fn a_daemon_registers_on_start_and_deregisters_during_drain() {
     std::fs::write(
         &cfg,
         format!(
-            r#"config_version: "2"
+            r#"config_version: "1"
 agent:
   name: hooked
 vars:

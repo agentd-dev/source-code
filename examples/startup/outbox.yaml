@@ -20,17 +20,8 @@
 # Secrets:
 #   OPENAI_API_KEY — tiny budget on purpose: this desk formats and refuses,
 #                    it does not compose.
-#   EMAIL_TOKEN    — transactional email API key (Postmark/Resend/SES),
-#                    sending-domain configured with SPF+DKIM, and — for the
-#                    reply loops sales and marketing run — inbound parse
-#                    forwarding replies to their /email/reply routes with
-#                    the lead_id/person_id echoed back (embed it in the
-#                    reply-to: reply+<id>@yourdomain).
-#   SOCIAL_TOKEN   — a cross-poster's key (Buffer/Typefully/Postiz…)
-#                    connected to the blog, LinkedIn, X and Instagram
-#                    accounts. One aggregator key here beats four platform
-#                    OAuth dances in an agent config; per-network keys mean
-#                    per-network servers, all still egress-only.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c outbox.yaml)
 #
 # MCP contract — `email`: send(to, subject, body[, reply_to]) → message id.
 # Idempotent by content hash or client message id (the a2a commands arrive
@@ -41,7 +32,7 @@
 # design pipeline; the server should refuse an imageless instagram post
 # rather than posting a blank.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: outbox
@@ -68,17 +59,11 @@ store:
 
 mcp:
   servers:
-    - name: email
-      endpoint: https://mcp.email.example/mcp
-      tags: { "*": [egress] }
-      auth: { kind: static, token: "{{secret:EMAIL_TOKEN}}" }
+    - { name: email, service: email }
     # One cross-posting server for the social channels marketing writes for:
     # blog, LinkedIn, X, Instagram. The `channel` field of `outbox.post`
     # picks the network.
-    - name: social
-      endpoint: https://mcp.social.example/mcp
-      tags: { "*": [egress] }
-      auth: { kind: static, token: "{{secret:SOCIAL_TOKEN}}" }
+    - { name: social, service: social }
 
 a2a:
   listen: http://127.0.0.1:8447

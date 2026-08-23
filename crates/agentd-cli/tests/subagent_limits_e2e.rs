@@ -70,7 +70,7 @@ fn subagent_limits_and_priority_reach_the_child_process() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  instruction: delegate with caps\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              lifecycle:\n  run_until: idle\n  idle_grace: 6s\n\

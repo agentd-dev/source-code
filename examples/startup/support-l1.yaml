@@ -34,12 +34,8 @@
 #   OPENAI_API_KEY        — this desk's own text model (SMS + wrap-ups).
 #                           The VOICE model's key lives in the bridge, not
 #                           here — agentd never touches audio or that key.
-#   TWILIO_TOKEN          — API key for the twilio MCP server. Scope:
-#                           messages on THIS number. The `allow:` list
-#                           below additionally strips everything but
-#                           send/get/list at the registry.
-#   VOICEBRIDGE_TOKEN     — the bearer you mint for the bridge's MCP
-#                           surface.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c support-l1.yaml)
 #   TWILIO_WEBHOOK_SECRET — ⚠ Twilio's real X-Twilio-Signature is
 #                           HMAC-SHA1 over URL + sorted form params — not
 #                           agentd's raw-body sha256. Same fix as Stripe
@@ -64,7 +60,7 @@
 #      essays. After hangup it POSTs {from, transcript} to
 #      /twilio/call-ended.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: support-l1
@@ -97,17 +93,11 @@ store:
 mcp:
   servers:
     # Twilio: inbound texts arrive as webhooks below; send_sms goes out here.
-    - name: twilio
-      endpoint: https://mcp.twilio.example/mcp
-      tags: { "*": [untrusted_input, egress] }
-      auth: { kind: static, token: "{{secret:TWILIO_TOKEN}}" }
-      allow: ["send_sms", "get_message", "list_messages"]
+    # The catalog ceiling strips everything but send/get/list.
+    - { name: twilio, service: twilio }
     # The voice bridge's control surface: what the OpenAI realtime session is
     # doing, plus say/transfer/hangup verbs for steering a live call.
-    - name: voicebridge
-      endpoint: https://mcp.voice.beacon.example/mcp
-      tags: { "*": [untrusted_input, egress] }
-      auth: { kind: static, token: "{{secret:VOICEBRIDGE_TOKEN}}" }
+    - { name: voicebridge, service: voicebridge }
 
 webhooks:
   listen: http://127.0.0.1:9450

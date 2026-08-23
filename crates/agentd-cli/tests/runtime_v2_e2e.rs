@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd 2.0 runtime (RFC 0026) end to end: a v2 configuration drives the new
+//! agentd runtime (RFC 0026) end to end: a v2 configuration drives the new
 //! event loop — the `--instruction` sugar workflow (`once → agent → finish`)
 //! runs a turn worker against the built-in mock LLM, internal tools round-trip
 //! to the supervisor, tool overrides map onto the mock MCP server, and a
@@ -83,7 +83,7 @@ fn the_instruction_job_runs_a_turn_with_tool_round_trips_through_the_new_loop() 
         {"content": "final answer: greeted"}
     ]}));
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  instruction: greet the user\nintelligence:\n  endpoints: {}\n  model: mock\nobservability:\n  log_level: info\n",
+        "config_version: \"1\"\nagent:\n  instruction: greet the user\nintelligence:\n  endpoints: {}\n  model: mock\nobservability:\n  log_level: info\n",
         llm.uri
     ));
     let out = run_agentd(&cfg, &[]);
@@ -148,7 +148,7 @@ fn tool_overrides_map_an_internal_contract_onto_the_mock_mcp_server() {
         )
         .unwrap();
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  instruction: read memory\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\ntools:\n  overrides:\n    memory.get:\n      server: mock\n      tool: state.get\n      args: '{{\"key\": \"{{{{args.key}}}}\"}}'\n      result: '{{\"found\": true, \"key\": \"{{{{args.key}}}}\", \"value\": {{{{result.structuredContent.state}}}}}}'\nobservability:\n  log_level: info\n  log_content: true\n",
+        "config_version: \"1\"\nagent:\n  instruction: read memory\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\ntools:\n  overrides:\n    memory.get:\n      server: mock\n      tool: state.get\n      args: '{{\"key\": \"{{{{args.key}}}}\"}}'\n      result: '{{\"found\": true, \"key\": \"{{{{args.key}}}}\", \"value\": {{{{result.structuredContent.state}}}}}}'\nobservability:\n  log_level: info\n  log_content: true\n",
         llm.uri,
         mock.uri()
     ));
@@ -181,7 +181,7 @@ fn a_sigkilled_instance_restores_from_the_store_and_finishes_the_job() {
     let mock = common::spawn_mock_mcp("mock://noop", false);
     let llm = spawn_mock_llm(&serde_json::json!({"turns": [{"content": "done after restart"}]}));
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: chaos\n  instruction: finish the job\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nobservability:\n  log_level: info\n",
+        "config_version: \"1\"\nagent:\n  name: chaos\n  instruction: finish the job\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nobservability:\n  log_level: info\n",
         llm.uri,
         mock.uri()
     ));
@@ -255,7 +255,7 @@ fn write_inbox(events: &serde_json::Value) -> String {
 /// and `run_until: idle` — the conversation-turn harness until P5's A2A server.
 fn conversation_config(llm: &str, mock: &str, extra: &str) -> String {
     write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: convo\n  instruction: You help the team.\n  preflight: always\nintelligence:\n  endpoints: {llm}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock}\nknowledge:\n  server: mock\n  auto_context:\n    on: turn\n    top_k: 3\nskills:\n  sources:\n    - server: mock\n      discover: auto\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"
+        "config_version: \"1\"\nagent:\n  name: convo\n  instruction: You help the team.\n  preflight: always\nintelligence:\n  endpoints: {llm}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock}\nknowledge:\n  server: mock\n  auto_context:\n    on: turn\n    top_k: 3\nskills:\n  sources:\n    - server: mock\n      discover: auto\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"
     ))
 }
 
@@ -392,7 +392,7 @@ fn a_status_intent_is_answered_deterministically_and_the_root_can_delegate() {
 fn a_fail_budget_tactic_fails_the_job_with_the_budget_exit_code() {
     let llm = spawn_mock_llm(&serde_json::json!({"turns": [{"content": "never admitted"}]}));
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  instruction: do work\nintelligence:\n  endpoints: {}\n  model: mock\n  budget:\n    windows:\n      - per: hour\n        tokens: 10\n    on_exhausted: fail\nobservability:\n  log_level: info\n",
+        "config_version: \"1\"\nagent:\n  instruction: do work\nintelligence:\n  endpoints: {}\n  model: mock\n  budget:\n    windows:\n      - per: hour\n        tokens: 10\n    on_exhausted: fail\nobservability:\n  log_level: info\n",
         llm.uri
     ));
     let out = run_agentd(&cfg, &[]);
@@ -430,7 +430,7 @@ fn a_long_conversation_compacts_its_context_and_restores_the_summary() {
         ]
     }));
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: compact\n  instruction: You help the team.\n  preflight: never\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\ncontext:\n  model_window: 300\n  compact_at: 0.5\n  keep_last: 2\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n",
+        "config_version: \"1\"\nagent:\n  name: compact\n  instruction: You help the team.\n  preflight: never\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\ncontext:\n  model_window: 300\n  compact_at: 0.5\n  keep_last: 2\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n",
         llm.uri,
         mock.uri()
     ));

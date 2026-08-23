@@ -1,6 +1,6 @@
 # RFC 0036: Subagent templates and instance-tier children
 
-**Status:** Phase A implemented (the `subagents:` section, flat + instance tiers, params discipline, unix-socket A2A wiring, `ttl`/`until`/`subagent.retire` retirement, instance caps, the registry changes); Phases B–C draft — see the implementation notes at the end
+**Status:** Phases A + B implemented — A: the `subagents:` section, flat + instance tiers, params discipline, unix-socket A2A wiring, `ttl`/`until`/`subagent.retire` retirement, instance caps, the registry changes; B: `mode: sync` via `result: {workflow}` (a composed reporter resolves the spawn with the child workflow's first output), `mirror_streams:` (child events forwarded into the parent's same-named streams), parent-window budget metering off the durable child's manifest, and template/tier/pid fleet fields in `status`. Phase C stays contingent — see the implementation notes
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the subagent process model (RFC 0009, RFC 0003, RFC 0026 §6); instruction documents (RFC 0034) become the definition carrier; A2A wiring rides RFC 0029 and the unix-socket listener (2.5.0); retirement extends RFC 0034 §7.
@@ -389,6 +389,31 @@ child (RFC 0003), sit under the tree-token ceiling, and count against
 - **Process-manager-only** (systemd template units over RFC 0034 docs):
   already works, stays the right answer for *standing* desks; this RFC is
   for children whose lifecycle belongs to a workflow, not an operator.
+
+## 11a. Implementation notes (Phase B, as shipped)
+
+- **Sync-result and stream mirroring are COMPOSITION, not machinery.** The
+  reporter (`_agentd_report`) is four existing nodes — an `event` start on
+  `workflow.finished`, a `switch … on_no_match: skip` pick, a
+  `workflow.wait` to fetch the run's output, and a typed `a2a.send` to the
+  `parent` peer; each mirror (`_agentd_mirror_<stream>`) is a `stream`
+  start plus the same send. The house rule held: no new node kinds.
+- **The `_instance.*` op namespace is the runtime's own.** The A2A server
+  admits `_instance.result`/`_instance.emit` to the inbox like a declared
+  command (operator/agent principals only); the REACTOR consumes them
+  before any reader — they can never wake a wait, fire a start, or become
+  a conversational turn. A mirrored event lands in the parent's stream
+  with `source: instance:<handle>` and an id prefixed by the handle.
+- **First completion wins** for `mode: sync` (later reports are ignored);
+  the spawn resolves while the child keeps running under its own
+  `ttl`/`until` lifecycle. Both sync and mirrors require the parent to
+  serve A2A — compile refuses the template otherwise.
+- **Budget metering reads the child's manifest.** Every ~5s the parent
+  reads a durable child's file-store manifest (its governor's
+  `lifetime_used`) and charges the DELTA against its own windows — no
+  control channel, no polling protocol, just the file the child already
+  writes. The stated blind spot: a `durable: false` child has no manifest,
+  so its usage is invisible to the parent by construction.
 
 ## 11. Implementation notes (Phase A, as shipped)
 

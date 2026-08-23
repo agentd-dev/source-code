@@ -32,7 +32,7 @@ fn config(dir: &str, with_consumer: bool) -> String {
         ""
     };
     format!(
-        "config_version: \"2\"\nagent:\n  name: eventful\n\
+        "config_version: \"1\"\nagent:\n  name: eventful\n\
          store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
          streams:\n  orders:\n    retention: {{ max_events: 100 }}\n\
          workflows:\n  - name: producer\n    steps:\n\
@@ -119,7 +119,7 @@ fn an_undeclared_stream_is_refused_at_startup() {
     let cfg = format!("{dir}/c.yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"2\"\nagent:\n  name: x\nstore:\n  kind: memory\n\
+        "config_version: \"1\"\nagent:\n  name: x\nstore:\n  kind: memory\n\
          workflows:\n  - name: w\n    steps:\n\
          \x20     s: {kind: once}\n\
          \x20     e: {kind: emit, depends_on: [s], stream: nope, subject: a.b}\n\

@@ -233,7 +233,7 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
 You wire a subscription to a run with a **`subscribe` start node** in a workflow:
 
 ```yaml
-config_version: "2"
+config_version: "1"
 intelligence: { endpoints: https://gw.example/v1, model: my-model }
 store: { kind: mcp, mcp: { server: state } }
 mcp: { servers: [ { name: fs, endpoint: https://mcp-fs.internal/mcp }, { name: state, endpoint: https://mcp-state.internal/mcp } ] }

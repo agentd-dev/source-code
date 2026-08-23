@@ -100,7 +100,7 @@ fn capped_config(concurrency: &str) -> String {
         "agentd-overflow",
         "yaml",
         &format!(
-            "config_version: \"2\"\nagent:\n  name: overflow\nworkflows:\n  - name: capped\n{concurrency}    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+            "config_version: \"1\"\nagent:\n  name: overflow\nworkflows:\n  - name: capped\n{concurrency}    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
         ),
     )
 }

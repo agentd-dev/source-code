@@ -169,7 +169,7 @@ without owning a runtime.
 
 When you want the kill ladder, cgroup limits, liveness, the durable store, and
 the exit-code contract AROUND the model, do what `agentd-cli/src/main.rs` does:
-install the re-exec dispatch, load a `config_version: "2"` document with
+install the re-exec dispatch, load a `config_version: "1"` document with
 `agentd::config::v2::load`, and call `agentd::runtime::run(&loaded, args, env)`
 — the reasoning then runs in killable children of *your* binary, and everything
 in this documentation set (the lifecycle, workflow triggers, and A2A) applies

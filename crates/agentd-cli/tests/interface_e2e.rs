@@ -195,7 +195,7 @@ fn spawn_bound_with(
 /// shape each test.
 fn iface_config(llm: &str, port: u16, debug: bool, extra: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: iface-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -429,7 +429,7 @@ fn the_interface_is_gated_off_by_default() {
     // NO interface block: the surface must refuse, the core must be untouched.
     let (_daemon, addr, cfg) = spawn_bound(|port| {
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
          agent:\n  name: iface-off\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -600,7 +600,7 @@ fn pairing_exchanges_the_rotating_code_for_a_session_token() {
     let (_daemon, addr, cfg) = spawn_bound_with(
         |port| {
             format!(
-                "config_version: \"2\"\n\
+                "config_version: \"1\"\n\
          agent:\n  name: pair-e2e\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -950,7 +950,7 @@ fn the_tui_passthrough_spawns_the_client_and_ties_lifetimes() {
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let cfg = write_config(&format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: tui-pass\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\

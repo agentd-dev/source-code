@@ -7,7 +7,7 @@ a malformed endpoint, a mistyped workflow step, or an unresolvable secret
 reference exits `2` in milliseconds, not after an LLM round-trip or an MCP
 handshake.
 
-The configuration is one nested **`config_version: "2"`** document, with the
+The configuration is one nested **`config_version: "1"`** document, with the
 sections `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`,
 `context`, `knowledge`, `search`, `skills`, `workflows`, `webhooks`, `limits`,
 `lifecycle`, `a2a`, `interface`, `observability`, `security`. Every
@@ -15,7 +15,7 @@ sections `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`,
 `AGENTD_LIMITS_MAX_RUNS`) and a flag (`--limits.max-runs`); a set of short
 spellings is wired up as **aliases** (`--instruction`, `--intelligence`,
 `--model`, `--mcp`, `--config`, `--log-level`, …). The authoritative machine-readable schema
-is **`agentd --config-schema=2`**; **`agentd --capabilities`** prints the
+is **`agentd --config-schema`**; **`agentd --capabilities`** prints the
 effective configured surface; **`agentd --validate-config`** validates without
 side effects (exit `2` on error).
 
@@ -114,7 +114,7 @@ RFC 0011 §5).
 
 | Check | Example diagnostic (exit 2) |
 |---|---|
-| `config_version` is `"2"` | `config_version must be "2" (got "3")` |
+| `config_version` is `"1"` | `config_version must be "1" (got "3")` |
 | every `intelligence.endpoints` element is `https://` (loopback `http://` for dev) | `intelligence endpoint must be https://host[:port][/path] (got: ftp://nope)` / `plaintext http:// intelligence is allowed for loopback only (dev); use https://` |
 | `intelligence.swap_policy` / `dialect` / `auth` are coherent | `intelligence.dialect: bedrock requires intelligence.auth.kind = aws (SigV4)` |
 | every `mcp.servers[]` has a unique non-reserved name, a valid endpoint, and parseable tags | `mcp.servers[]: a server has an empty name` · `mcp.servers[]: duplicate server name 'fs'` · `mcp server 'a': mcp endpoint must be https://host[:port][/path] (got: ftp://x)` |
@@ -145,7 +145,7 @@ sitting beside a `kind` that is not `file` (dead config, ignored), a non-loopbac
 route is an error, see below), an `interface.debug` with the
 interface off, and an unknown `interface.display` item.
 
-`-h`/`--help`, `-V`/`--version`, `--capabilities`, `--config-schema=2`,
+`-h`/`--help`, `-V`/`--version`, `--capabilities`, `--config-schema`,
 `--workflow-schema`, and `--validate-config` short-circuit and exit `0`
 (`--validate-config` exits `0` on a valid config, `2` if it collected any
 diagnostic). None of them need an instruction. An unrecognized argument is a
@@ -281,7 +281,7 @@ rolling `windows` (`{per: hour, tokens: 2000000}`), an `on_exhausted` tactic
 | `--metrics-addr <ADDR>` | `observability.metrics_addr` | `METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr — `host:port`, or `:port` for all IPv4 interfaces (read-only; restrict via firewall/NetworkPolicy if exposed). Needs `--features metrics`. |
 | `--traceparent <W3C>` | `observability.traceparent` | `TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id (RFC 0010). |
 | `--events-ring <N>` | `observability.events_ring` | — | `1024` | Capacity of the in-memory log ring the interface's debug feed tails. Installed only when `interface.enabled` **and** `interface.debug` are on (RFC 0032 §5). |
-| `--report-file <PATH>` | `observability.report_file` | — | *(off)* | Path for a run-outcome report file. Accepted by the schema; the 2.0 runtime does not write it — the terminal outcome is the `proc.exit` event and the A2A task artifact. |
+| `--report-file <PATH>` | `observability.report_file` | — | *(off)* | Path for a run-outcome report file. Accepted by the schema; the runtime does not write it — the terminal outcome is the `proc.exit` event and the A2A task artifact. |
 | `--cgroup <auto\|PATH>` | `security.cgroup.spec` | — | *(off)* | cgroup-v2 parent for spawned children (turn workers + subagents), each placed in its own leaf for atomic `cgroup.kill` teardown: `auto` (derive `<own-cgroup>/agent`) or an absolute path under `/sys/fs/cgroup`. Best-effort — disabled if not writable (RFC 0010). Linux only. |
 | `--cgroup-memory-max <SIZE>` | `security.cgroup.memory_max` | — | *(none)* | Per-child `memory.max`: `max` or a size (`512M`/`2G`/bytes). Needs a parent that can delegate the `memory` controller. |
 | `--cgroup-pids-max <N>` | `security.cgroup.pids_max` | — | *(none)* | Per-child `pids.max`: `max` or a count. **Counts threads** — set it generously. Needs delegation. |
@@ -301,7 +301,7 @@ and run time) is documented in [`security.md`](security.md) §11.
 |---|---|---|---|---|
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
 | `--validate-config` | — | — | — | Load + validate (files + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free. |
-| `--config-schema=2` | — | — | — | Print the settings JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free. |
+| `--config-schema` | — | — | — | Print the settings JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free. |
 | `--workflow-schema` | — | — | — | Print the workflow (dialect 3) JSON Schema + node registry to stdout and exit `0`. |
 | `--watch-config` | `lifecycle.watch_config` | `WATCH_CONFIG` | `false` | Watch each config file's parent directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs a `--config`/`AGENT_CONFIG` file (validated, exit `2`) and the `config-watch` build feature — without the feature the watch is simply not installed. See §11. |
 
@@ -446,12 +446,25 @@ endpoint, admission lists and tags, so review reads the outcome.
 A referencing server's credential caches under `service:<entry>` — one
 `agentd login service:billing` (or `login mcp:money`, which canonicalizes)
 serves every consumer of the entry. Multi-instance fleets share one catalog
-by merge order: `agentd -c services.yaml -c desk.yaml`. Not yet covered by
-`closed` (named out loud at validation): `intelligence.endpoints`,
-`a2a.peers`, the `http` step and HTTP store — RFC 0037 Phase B. The
-per-entry `rate:` paces workflow `mcp.tool` steps in this process; a dry
-bucket is a step failure a `retry:` absorbs, and rate changes take a
-restart.
+by merge order: `agentd -c services.yaml -c desk.yaml` —
+[`examples/startup/services.yaml`](https://github.com/agentd-dev/source-code/tree/main/examples/startup)
+is the reference deployment.
+
+Entries carry a `kind:` — `mcp` (default), `intelligence`, `peer`, `http` —
+and matching is kind-filtered, so one host may serve several kinds. `closed`
+covers **all four surfaces**: MCP dials, `intelligence.endpoints` (`mock:`
+excepted), `a2a.peers` (which take `service:` references exactly like MCP
+servers, inheriting endpoint/auth/headers — also the way peers get `agentd
+login`), the `http` step (literal URLs at load, templated at execution, plus
+a `kind: http` entry's `methods: [GET, POST]` ceiling in either mode), the
+HTTP store, workflow-reference URLs, and A2A push targets. The one surface
+deliberately outside: `observability.otel.endpoint` (validation says so).
+Two more per-entry knobs: `rate:` paces every consumer's calls **in each
+process** — the reactor's steps and the worker/subagent processes' own
+in-loop calls alike (a dry bucket is a tool/step failure a retry absorbs;
+rate changes take a restart) — and `breaker: {failures, cooldown}` is the
+default breaker POLICY for `mcp.tool` steps against the entry (state stays
+per step, as always).
 
 ---
 
@@ -785,7 +798,7 @@ It is the **lowest non-default precedence layer**: env and flags override it, an
 repeatable list flags (`--mcp`/`--a2a-peer`/`--workflow`) **add to** the file's
 lists. An unknown key is a hard error (`deny_unknown_fields` → exit `2`) naming
 the file and listing the fields that *are* allowed — the most common config typo,
-closed at parse time. Print the schema with `--config-schema=2` (Draft 2020-12,
+closed at parse time. Print the schema with `--config-schema` (Draft 2020-12,
 exit `0`); validate a candidate with `--validate-config`.
 
 ### 12.1 `.agentd.yml` — the project's own config
@@ -853,7 +866,7 @@ observability:                  observability:
 ### 12.3 What the file carries
 
 The file carries the **whole** schema — every section named at the top of this
-page, i.e. every path `agentd --config-schema=2` prints. There is no separate
+page, i.e. every path `agentd --config-schema` prints. There is no separate
 "file-only" subset:
 each path is equally reachable from env and flags (§1.1), so
 `limits.run.steps` ⇒ `AGENTD_LIMITS_RUN_STEPS` / `--limits.run.steps`, and
@@ -1021,7 +1034,7 @@ A YAML example (`/etc/agentd/config.yaml`):
 
 ```yaml
 # structural config; secrets stay in env / mounted files
-config_version: "2"
+config_version: "1"
 
 agent:
   name: triage
@@ -1120,11 +1133,11 @@ interleaving writes into it.
 ## 14. A complete example
 
 A **daemon** that serves A2A, watches a queue, and runs a durable workflow — the
-whole configuration in one `config_version: "2"` file:
+whole configuration in one `config_version: "1"` file:
 
 ```yaml
 # /etc/agentd/agentd.yaml
-config_version: "2"
+config_version: "1"
 
 agent:
   name: triage

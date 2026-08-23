@@ -109,7 +109,7 @@ OpenAI-compatible dialect leaves them in place.
 The registry decides what this caller may call, filtered by `agent.tools`:
 
 ```yaml
-config_version: "2"
+config_version: "1"
 agent:
   instruction: You keep the deploy pipeline healthy.
   tools:

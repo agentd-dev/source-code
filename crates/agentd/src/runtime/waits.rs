@@ -943,6 +943,7 @@ impl Runtime {
                 Some(endpoint) => crate::config::v2::A2aPeer {
                     name: peer_name.to_string(),
                     endpoint,
+                    service: None,
                     headers: std::collections::BTreeMap::new(),
                     client_cert: None,
                     client_key: None,
@@ -981,7 +982,13 @@ impl Runtime {
         #[cfg(feature = "oauth")]
         if let Some(a) = &peer.auth {
             let aspec = a.to_spec();
-            let target = format!("a2a:{}", peer.name);
+            // RFC 0037 Phase B: a catalog-referencing peer caches its shared
+            // credential under `service:<entry>` — one `agentd login
+            // service:<entry>` serves every consumer.
+            let target = match &peer.service {
+                Some(svc) => format!("service:{svc}"),
+                None => format!("a2a:{}", peer.name),
+            };
             if aspec.kind == "aws" {
                 let s = crate::auth::aws::SigV4Signer::from_spec(&aspec, &target)
                     .map_err(|e| format!("{what}: peer aws auth: {e}"))?;

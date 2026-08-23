@@ -32,6 +32,31 @@ impl Runtime {
 
     /// Load the configured workflows (inline / file / uri) + runtime-created
     /// ones from the store. Errors are collected (a bad definition is refused).
+    /// The breaker policy a step actually runs under (RFC 0037 Phase B): its
+    /// own `breaker:` wins; an `mcp.tool` step against a catalog-referencing
+    /// server otherwise inherits the entry's `breaker:` default. Gate and
+    /// recorder both use this, so they can never disagree.
+    pub(crate) fn effective_breaker(
+        &self,
+        step: &crate::engine::model::Step,
+    ) -> Option<super::breaker::Config> {
+        if let Some(cfg) = super::breaker::Config::of(step.spec.get("breaker")) {
+            return Some(cfg);
+        }
+        if step.kind != "mcp.tool" {
+            return None;
+        }
+        let server = step.field_str("server")?;
+        let svc = self
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.service.as_ref())?;
+        super::breaker::Config::of(self.settings.services.get(svc)?.breaker.as_ref())
+    }
+
     /// Resolve a parsed definition's durability class against the store
     /// default (`store.durability.work`): an explicit `durable:` wins; absent,
     /// `ephemeral` deployments run everything memory-only.
@@ -1116,7 +1141,7 @@ impl Runtime {
         if matches!(
             step.kind.as_str(),
             "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
-        ) && let Some(cfg) = super::breaker::Config::of(step.spec.get("breaker"))
+        ) && let Some(cfg) = self.effective_breaker(&step)
         {
             let workflow = self
                 .runs
@@ -2383,7 +2408,7 @@ impl Runtime {
         if matches!(
             step.kind.as_str(),
             "http" | "mcp.tool" | "a2a.send" | "a2a.delegate"
-        ) && let Some(cfg) = super::breaker::Config::of(step.spec.get("breaker"))
+        ) && let Some(cfg) = self.effective_breaker(&step)
             && !matches!(status, StepStatus::Failed | StepStatus::Timeout if error
                 .as_deref()
                 .is_some_and(|e| e.starts_with(super::breaker::OPEN_ERR)))

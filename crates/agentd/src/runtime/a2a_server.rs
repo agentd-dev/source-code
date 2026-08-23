@@ -786,8 +786,13 @@ impl Runtime {
         // and takes the ordinary message path: written ahead to the durable
         // inbox, then matched against the start nodes (roles included) by the
         // reactor. A built-in wins, so a workflow cannot shadow `status`.
-        let declared =
-            command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
+        // RFC 0036 Phase B: `_instance.*` ops are the runtime's own children
+        // reporting home (sync results, mirrored stream events). They take the
+        // inbox path like a declared command — the REACTOR consumes them
+        // before start matching; they never reach a model or a workflow.
+        let internal_op = command_op(message).is_some_and(|op| op.starts_with("_instance."));
+        let declared = internal_op
+            || command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
         // A declared command with a `schema:` is a CONTRACT: a payload that
         // does not match is refused HERE, synchronously, with the mismatch —
         // not accepted into the inbox to fail later where the caller cannot
@@ -1763,6 +1768,7 @@ impl Runtime {
         if let Err(e) = crate::config::v2::egress_allows(
             &self.settings.services,
             self.settings.security.egress,
+            crate::config::v2::ServiceKind::Http,
             &target.url,
         ) {
             return err_obj(
@@ -1999,7 +2005,7 @@ impl Runtime {
         let url = self.settings.a2a.listen.clone().unwrap_or_default();
         json!({
             "name": "agentd",
-            "description": "A durable agent (agentd 2.0) — conversations, workflows, and subagents over A2A.",
+            "description": "A durable agent (agentd) — conversations, workflows, and subagents over A2A.",
             "version": crate::VERSION,
             // How a peer actually reaches this instance. `supportedInterfaces`
             // is the field the current card carries; a card without one parses

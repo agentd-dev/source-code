@@ -1,6 +1,6 @@
 # agentd config reference (schema v2)
 
-Authoritative and complete: `agentd --config-schema=2`. This is the map — which
+Authoritative and complete: `agentd --config-schema`. This is the map — which
 section owns what, and the keys worth knowing in each.
 
 Every path here is also a flag (`--agent-instruction`) and an env var

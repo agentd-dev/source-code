@@ -54,7 +54,7 @@ fn a_loop_start_reruns_until_a_condition_and_an_event_start_reacts_to_completion
         "done": {"kind": "finish", "depends_on": ["bump"], "status": "completed"}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: loops\nstore:\n  kind: memory\nworkflows:\n  - name: looper\n    steps: {steps_loop}\n  - name: reactor\n    steps: {steps_event}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+        "config_version: \"1\"\nagent:\n  name: loops\nstore:\n  kind: memory\nworkflows:\n  - name: looper\n    steps: {steps_loop}\n  - name: reactor\n    steps: {steps_event}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
     ));
     let out = run_agentd(&cfg, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -92,7 +92,7 @@ fn a_schedule_start_fires_on_an_interval() {
         "done": {"kind": "finish", "depends_on": ["note"], "status": "completed"}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: sched\nstore:\n  kind: memory\nworkflows:\n  - name: cron\n    steps: {steps}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: sched\nstore:\n  kind: memory\nworkflows:\n  - name: cron\n    steps: {steps}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ));
     // The daemon runs; kill it after ~400ms and count the firings.
     let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -135,7 +135,7 @@ fn a_parent_workflow_runs_a_child_synchronously_and_a_signal_coordinates_two_run
                  "output": {"child_y": "{{vars.got}}", "signal_y": "{{steps.await_signal.output.payload.y}}"}}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: parent\nworkflows:\n  - name: child\n    steps: {child}\n  - name: parent\n    steps: {parent}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+        "config_version: \"1\"\nagent:\n  name: parent\nworkflows:\n  - name: child\n    steps: {child}\n  - name: parent\n    steps: {parent}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
     ));
     let out = run_agentd(&cfg, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -186,7 +186,7 @@ fn step_cache_memoizes_and_think_presets_classify_via_the_mock_llm() {
         "done": {"kind": "finish", "depends_on": ["class"], "status": "completed", "output": {"calls": "{{memory.calls}}", "class": "{{steps.class.output.class}}"}}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: cacher\nintelligence:\n  endpoints: {llm_uri}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n",
+        "config_version: \"1\"\nagent:\n  name: cacher\nintelligence:\n  endpoints: {llm_uri}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n",
         mock.uri()
     ));
     // Life 1: the classify step calls the model and is memoized.

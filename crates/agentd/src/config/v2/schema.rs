@@ -13,10 +13,10 @@
 use serde_json::{Map, Value, json};
 
 /// The schema's `x-agentd-contract-version` — the 2.0 config contract.
-pub const SCHEMA_CONTRACT_VERSION: &str = "2.0";
+pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 
 /// The document version this schema describes (`config_version`).
-pub const CONFIG_VERSION: &str = "2";
+pub const CONFIG_VERSION: &str = "1";
 
 pub fn schema() -> Value {
     let duration = json!({ "type": ["string", "integer"], "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds" });
@@ -64,7 +64,7 @@ pub fn schema() -> Value {
         "$id": format!("https://agentd.dev/schema/config/{SCHEMA_CONTRACT_VERSION}"),
         "x-agentd-contract-version": SCHEMA_CONTRACT_VERSION,
         "title": "agentd settings (v2)",
-        "description": "agentd 2.0 configuration document (YAML or JSON; several files merge in order; every path is also AGENTD_<PATH> and --<path>)",
+        "description": "agentd configuration document (YAML or JSON; several files merge in order; every path is also AGENTD_<PATH> and --<path>)",
         "type": "object",
         "additionalProperties": false,
         "properties": Value::Object(properties),
@@ -412,7 +412,11 @@ fn defs_properties(
                 "ttl": { "type": ["string", "integer"], "description": "instance tier: retire after this long (graceful drain)" },
                 "until": { "type": "string", "description": "instance tier: a signal name (templated over params) whose delivery in the child retires it" },
                 "singleton": { "type": "boolean", "description": "one live child; its A2A peer alias is the template name" },
-                "durable": { "type": "boolean", "description": "false = memory-only record (an instance child runs on a memory store; no restore-respawn); absent = the store.durability.work default" } } }));
+                "durable": { "type": "boolean", "description": "false = memory-only record (an instance child runs on a memory store; no restore-respawn); absent = the store.durability.work default" },
+                "result": { "type": "object", "additionalProperties": false, "required": ["workflow"], "properties": { "workflow": { "type": "string" } },
+                            "description": "instance mode: sync — resolve the spawn when the child's named workflow first completes, returning its output (needs a parent A2A listener)" },
+                "mirror_streams": { "type": "array", "items": { "type": "string" },
+                            "description": "child streams mirrored into the parent's same-named streams (declared on both sides; needs a parent A2A listener)" } } }));
     m.insert(
         "ParamSpec".to_string(),
         json!({ "type": "object", "additionalProperties": false, "properties": {

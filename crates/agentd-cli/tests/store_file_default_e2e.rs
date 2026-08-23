@@ -86,7 +86,7 @@ fn run_daemon(config: &str, state_dir: &str, ms: u64) -> (Option<i32>, String) {
 fn a_long_lived_instance_with_no_store_block_starts_on_the_file_store() {
     let dir = state_root("ll-default");
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: sched-default\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: sched-default\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ));
     let (code, stderr) = run_daemon(&cfg, &dir, 300);
     // It used to exit 2 here with "store.kind is none but the instance is
@@ -139,7 +139,7 @@ fn a_long_lived_instance_with_no_store_block_starts_on_the_file_store() {
 fn an_explicit_none_on_a_long_lived_instance_is_still_refused() {
     let dir = state_root("ll-explicit-none");
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: sched-explicit\nstore:\n  kind: none\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: sched-explicit\nstore:\n  kind: none\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ));
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--config", &cfg])
@@ -163,7 +163,7 @@ fn an_explicit_none_on_a_long_lived_instance_is_still_refused() {
 fn a_one_shot_instance_with_no_store_block_still_writes_nothing() {
     let dir = state_root("one-shot");
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: jobby\nworkflows:\n  - name: job\n    steps: {ONCE_STEPS}\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: jobby\nworkflows:\n  - name: job\n    steps: {ONCE_STEPS}\nobservability:\n  log_level: info\n"
     ));
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--config", &cfg])
@@ -195,7 +195,7 @@ fn state_survives_a_kill_and_the_second_life_resumes_instead_of_starting_fresh()
     // `store.file.path` is the first link of the root chain, so this run pins
     // its own directory regardless of the environment.
     let cfg = write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: resumer\nstore:\n  kind: file\n  file:\n    path: {dir}\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: resumer\nstore:\n  kind: file\n  file:\n    path: {dir}\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ));
     // Life 1: nothing on disk ⇒ a fresh restore, then the schedule writes.
     let (code, first) = run_daemon(&cfg, &dir, 300);

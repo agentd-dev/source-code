@@ -20,13 +20,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY — the model (small budget: lookups are short turns).
-#   ACCOUNTS_TOKEN — the account store's API key, READ-ONLY. This desk
-#                    answers questions; account MUTATIONS (email changes,
-#                    plan changes) deliberately have no path here — they
-#                    belong to flows with their own verification.
-#   LOGS_TOKEN     — the log platform's query key (Loki/Elastic/ClickHouse
-#                    behind an MCP), scoped to the product's log streams,
-#                    read-only, ideally with a per-query time-range cap.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c support-backoffice.yaml)
 #
 # MCP contract — `accounts`: lookup by phone/email/id → {plan, standing,
 # region, created}; recent billing events. The `allow:` list pins it to
@@ -40,7 +35,7 @@
 # (whatever returns here flows onward to customer channels); enforce a
 # server-side row cap.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: support-backoffice
@@ -69,19 +64,12 @@ store:
 
 mcp:
   servers:
-    # Customer accounts: identity, plan, billing status, monitors.
-    - name: accounts
-      endpoint: https://mcp.accounts.beacon.example/mcp
-      tags: { "*": [sensitive] }
-      auth: { kind: static, token: "{{secret:ACCOUNTS_TOKEN}}" }
-      allow: ["get_*", "list_*", "search_*"]
+    # Customer accounts: identity, plan, billing status, monitors. The
+    # catalog ceilings keep BOTH read-only by construction.
+    - { name: accounts, service: accounts }
     # The service-log search plane ("the special MCP"): per-customer probe
     # history, alert evaluations, delivery attempts.
-    - name: logs
-      endpoint: https://mcp.logs.beacon.example/mcp
-      tags: { "*": [sensitive] }
-      auth: { kind: static, token: "{{secret:LOGS_TOKEN}}" }
-      allow: ["query_*", "tail_*", "get_*"]
+    - { name: logs, service: logs }
 
 a2a:
   listen: http://127.0.0.1:8451

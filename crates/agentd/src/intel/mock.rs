@@ -22,7 +22,7 @@
 //! `slow`/`hang` hold the response to exercise the stuck/deadline detectors.
 //! Small enough to ship; it makes the loop + self-* tools observable end to end.
 //!
-//! **Programmable scripts** (agentd 2.0 e2e): `file:<path>` loads a JSON
+//! **Programmable scripts** (agentd e2e): `file:<path>` loads a JSON
 //! playbook so a test scripts any conversation without a new built-in:
 //!
 //! ```json

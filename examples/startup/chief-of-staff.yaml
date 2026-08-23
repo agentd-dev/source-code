@@ -21,7 +21,7 @@
 # the digest instruction treats "X did not answer" as REPORTABLE NEWS.
 # That is the general pattern for fan-outs over fallible peers.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: chief-of-staff

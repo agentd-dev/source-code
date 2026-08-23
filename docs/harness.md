@@ -292,7 +292,7 @@ tag check over the narrowed server set. Depth is derived from the *requester's s
 record, never read from the request — a child cannot claim to be shallower than it is.
 
 ```yaml
-config_version: "2"
+config_version: "1"
 
 limits:
   subagents:

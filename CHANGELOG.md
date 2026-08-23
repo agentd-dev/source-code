@@ -5,7 +5,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## Unreleased — v1.0.0, the relicense reset
+
+**agentd restarts its public numbering at v1.0.0 under a new license.** The
+whole tree — every crate (`agentd-core`, `agentd-cli`, `agentd-mcp`,
+`agentd-net`, `agentd-conformance`), the Node clients, the site and the docs
+— is now **AGPL-3.0-only**. agentd remains fully open source; commercial
+licensing (for proprietary embedding or AGPL-free use) and commercial
+support are available — contact **agent@agentd.dev**. The previously
+published 2.x/0.x artifacts are withdrawn (GitHub releases and tags removed,
+crates.io versions yanked); the `config_version` marker becomes `"1"` and
+version-branded strings drop the "2.0" era. Everything below this heading
+ships as **v1.0.0**; the 2.x entries further down record the same code's
+pre-reset history.
 
 ### Added
 
@@ -56,6 +68,29 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   shapes get a load-time warning (a durable parent waiting on a non-durable
   child fails its wait after a restart); the inbox, tasks, memory and
   credentials stay durable regardless of class.
+
+- **RFC 0037 Phase B — the whole outbound surface.** Catalog entries carry a
+  `kind:` (`mcp` / `intelligence` / `peer` / `http`; matching is
+  kind-filtered), `a2a.peers[].service:` references inherit like MCP servers
+  (and give peers `agentd login` via the shared `service:<entry>` credential),
+  and `closed` egress now covers intelligence endpoints, peers, the `http`
+  step (literals at load, templates at execution, plus per-entry
+  `methods:` ceilings), the HTTP store and workflow-reference URLs —
+  `observability.otel.endpoint` is the one named exception. Per-entry
+  `rate:` pacing now applies in EVERY process (turn workers and flat
+  subagents pace their own in-loop calls), and per-entry `breaker:` is the
+  default breaker policy for `mcp.tool` steps (state stays per step).
+  `examples/startup/` runs on a shared `services.yaml` as the reference
+  deployment.
+- **RFC 0036 Phase B — instance children grow up.** `mode: sync` with
+  `result: {workflow}` resolves the spawn with the child workflow's first
+  output (a composed reporter of existing nodes dials the internal
+  `_instance.result` op home; first completion wins; the child lives on);
+  `mirror_streams:` forwards child stream events into the parent's
+  same-named streams (`source: instance:<handle>`); a durable child's token
+  usage meters against the parent's budget windows off its manifest (a
+  non-durable child is invisible to the meter by construction); `status`
+  shows template/tier/pid/retire_at per child.
 
 ### Changed
 

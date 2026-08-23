@@ -68,7 +68,7 @@ fn agentd(dir: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
 /// A configuration whose only credential is a `{{secret:…}}` reference — the
 /// shape RFC 0017 §6 asks for (the file is secret-free; the value lives in the
 /// environment).
-const HEADER_REF: &str = "config_version: \"2\"\nstore: {kind: memory}\n\
+const HEADER_REF: &str = "config_version: \"1\"\nstore: {kind: memory}\n\
      intelligence:\n  endpoints: [\"https://intel.invalid/v1\"]\n  model: m\n\
      \x20 headers:\n    authorization: \"Bearer {{secret:AGENTD_TEST_ABSENT_INTEL_KEY}}\"\n";
 
@@ -117,7 +117,7 @@ fn an_unresolvable_intelligence_header_ref_is_exit_2_and_names_the_ref() {
 
 /// A grant that is the whole lethal trifecta by tags alone: an untrusted-input
 /// source, a sensitive+egress sink. Refused unless the operator lifts the gate.
-const TRIFECTA_MCP: &str = "config_version: \"2\"\nstore: {kind: memory}\n\
+const TRIFECTA_MCP: &str = "config_version: \"1\"\nstore: {kind: memory}\n\
      mcp:\n  servers:\n\
      \x20   - name: web\n      endpoint: https://mcp-web.invalid/mcp\n      tags: {\"*\": [untrusted_input]}\n\
      \x20   - name: vault\n      endpoint: https://mcp-vault.invalid/mcp\n      tags: {\"*\": [sensitive, egress]}\n";
@@ -187,7 +187,7 @@ fn a_multibyte_budget_reset_is_exit_2_not_a_panic() {
     let cfg = write(
         &dir,
         "budget.yaml",
-        "config_version: \"2\"\nstore: {kind: memory}\n\
+        "config_version: \"1\"\nstore: {kind: memory}\n\
          intelligence:\n  budget:\n    windows:\n      - per: day\n        tokens: 100\n        reset: \"0é:0Z\"\n",
     );
 
@@ -212,8 +212,8 @@ fn a_multibyte_budget_reset_is_exit_2_not_a_panic() {
 fn the_both_spellings_refusal_applies_only_to_discovery() {
     // Discovery still refuses: no order was stated.
     let ambiguous = workdir("cfg-ambiguous");
-    write(&ambiguous, ".agentd.yml", "config_version: \"2\"\n");
-    write(&ambiguous, ".agentd.yaml", "config_version: \"2\"\n");
+    write(&ambiguous, ".agentd.yml", "config_version: \"1\"\n");
+    write(&ambiguous, ".agentd.yaml", "config_version: \"1\"\n");
     let (code, err) = agentd(&ambiguous, &["--validate-config"], &[]);
     assert_eq!(code, 2, "two discovered spellings must refuse:\n{err}");
     assert!(err.contains(".agentd.yaml"), "{err}");
@@ -226,7 +226,7 @@ fn the_both_spellings_refusal_applies_only_to_discovery() {
     let a = write(
         &base,
         ".agentd.yml",
-        "config_version: \"2\"\nstore: {kind: memory}\nintelligence:\n  model: from-base\n",
+        "config_version: \"1\"\nstore: {kind: memory}\nintelligence:\n  model: from-base\n",
     );
     let b = write(
         &over,

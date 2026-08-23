@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Configuration schema v2** (RFC 0030) — the agentd 2.0 settings document.
+//! **Configuration schema v2** (RFC 0030) — the agentd settings document.
 //!
 //! One nested document (YAML or JSON; several files merge in order) whose
 //! every path is also `AGENTD_<PATH>` / `AGENT_<PATH>` / `<PATH>` and
@@ -547,13 +547,40 @@ pub struct Service {
     pub rate: Option<String>,
     #[serde(default)]
     pub timeout: Option<Dur>,
+    /// `kind: http` only — the METHOD ceiling for `http` steps against this
+    /// entry (`[GET, POST]`); absent = any method.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+    /// `kind: mcp` only — a default `breaker:` policy for `mcp.tool` steps
+    /// against this entry (same shape as the step field); a step's own
+    /// `breaker:` wins.
+    #[serde(default)]
+    pub breaker: Option<Value>,
 }
 
+/// What a catalog entry describes (RFC 0037 Phase B: all four outbound
+/// surfaces). Matching is KIND-FILTERED: an MCP dial only matches `mcp`
+/// entries, an `http` step only `http` entries, and so on — one host may
+/// legitimately serve several kinds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceKind {
     #[default]
     Mcp,
+    Intelligence,
+    Peer,
+    Http,
+}
+
+impl ServiceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceKind::Mcp => "mcp",
+            ServiceKind::Intelligence => "intelligence",
+            ServiceKind::Peer => "peer",
+            ServiceKind::Http => "http",
+        }
+    }
 }
 
 /// RFC 0037 §4: resolve `service:` references against the catalog and apply
@@ -620,17 +647,63 @@ pub fn resolve_services(s: &mut Settings) -> Vec<String> {
             }
         }
         union_tags(&mut srv.tags, &entry.tags);
+        srv.service_rate = entry.rate.clone();
     }
     // Decision 3 — the unconditional tag floor: ANY server whose endpoint
     // matches a catalog entry gets the entry's tags unioned in, referencing or
-    // inline, open or closed. This is the tag-laundering fix.
+    // inline, open or closed. This is the tag-laundering fix. (The entry's
+    // pacing applies to matched inline consumers too.)
     for srv in &mut s.mcp.servers {
         if srv.endpoint.is_empty() {
             continue;
         }
-        if let Some((_, entry)) = service_match(&services, &srv.endpoint) {
+        if let Some((name, entry)) = service_match(&services, ServiceKind::Mcp, &srv.endpoint) {
             union_tags(&mut srv.tags, &entry.tags);
+            if srv.service.is_none() {
+                srv.service = Some(name.clone());
+                srv.service_rate = entry.rate.clone();
+            }
         }
+    }
+    // RFC 0037 Phase B: `a2a.peers[].service` references resolve the same way
+    // against `kind: peer` entries — inherit, never restate.
+    for peer in &mut s.a2a.peers {
+        let Some(name) = peer.service.clone() else {
+            continue;
+        };
+        let entry = match services.get(&name) {
+            Some(e) if e.kind == ServiceKind::Peer => e,
+            Some(e) => {
+                errs.push(format!(
+                    "a2a peer '{}' references service '{name}', which is `kind: {}` (a peer reference needs `kind: peer`)",
+                    peer.name,
+                    e.kind.as_str()
+                ));
+                continue;
+            }
+            None => {
+                errs.push(format!(
+                    "a2a peer '{}' references unknown service '{name}' (services.{name} is not declared)",
+                    peer.name
+                ));
+                continue;
+            }
+        };
+        for (restated, what) in [
+            (!peer.endpoint.is_empty(), "endpoint"),
+            (peer.auth.is_some(), "auth"),
+            (!peer.headers.is_empty(), "headers"),
+        ] {
+            if restated {
+                errs.push(format!(
+                    "a2a peer '{}' references service '{name}' and restates `{what}` — a referencing consumer inherits connection settings from the catalog",
+                    peer.name
+                ));
+            }
+        }
+        peer.endpoint = entry.endpoint.clone();
+        peer.auth = entry.auth.clone();
+        peer.headers = entry.headers.clone();
     }
     errs
 }
@@ -657,16 +730,21 @@ fn union_tags(into: &mut BTreeMap<String, Vec<String>>, from: &BTreeMap<String, 
     }
 }
 
-/// Match a URL against the catalog (RFC 0037 §4): scheme + authority equal
-/// (host case-insensitive), and the URL's path extends the entry's path on a
-/// segment boundary. Returns the matching entry, refusing nothing — the
-/// caller decides what a non-match means (`Egress::Closed` refuses it).
+/// Match a URL against the catalog's entries OF ONE KIND (RFC 0037 §4):
+/// scheme + authority equal (host case-insensitive), and the URL's path
+/// extends the entry's path on a segment boundary. Returns the matching
+/// entry, refusing nothing — the caller decides what a non-match means
+/// (`Egress::Closed` refuses it).
 pub fn service_match<'a>(
     services: &'a BTreeMap<String, Service>,
+    kind: ServiceKind,
     url: &str,
 ) -> Option<(&'a String, &'a Service)> {
     let (scheme, authority, path) = split_url(url)?;
     services.iter().find(|(_, e)| {
+        if e.kind != kind {
+            return false;
+        }
         let Some((es, ea, ep)) = split_url(&e.endpoint) else {
             return false;
         };
@@ -698,17 +776,19 @@ fn split_url(url: &str) -> Option<(String, String, String)> {
 }
 
 /// RFC 0037 §5: the dial-time egress check. `Open` always passes; `Closed`
-/// requires the URL to match a catalog entry.
+/// requires the URL to match a catalog entry of the surface's kind.
 pub fn egress_allows(
     services: &BTreeMap<String, Service>,
     egress: Egress,
+    kind: ServiceKind,
     url: &str,
 ) -> Result<(), String> {
-    if egress == Egress::Open || service_match(services, url).is_some() {
+    if egress == Egress::Open || service_match(services, kind, url).is_some() {
         return Ok(());
     }
     Err(format!(
-        "security.egress is `closed` and {url} matches no services: catalog entry — catalog the endpoint to allow it"
+        "security.egress is `closed` and {url} matches no `kind: {}` services: catalog entry — catalog the endpoint to allow it",
+        kind.as_str()
     ))
 }
 
@@ -725,6 +805,10 @@ pub struct McpServer {
     /// tool ceiling.
     #[serde(default)]
     pub service: Option<String>,
+    /// NOT a config key: the referenced entry's `rate:`, stamped by
+    /// resolution so `to_spec` can carry it to every process's pace registry.
+    #[serde(skip)]
+    pub service_rate: Option<String>,
     #[serde(default)]
     pub ns: Option<String>,
     #[serde(default)]
@@ -792,6 +876,7 @@ impl McpServer {
             }),
             auth: self.auth.as_ref().map(|a| a.to_spec()),
             service: self.service.clone(),
+            rate: self.service_rate.clone(),
         })
     }
 }
@@ -1459,6 +1544,18 @@ pub struct SubagentTemplate {
     /// the deployment default (`store.durability.work`).
     #[serde(default)]
     pub durable: Option<bool>,
+    /// Instance tier, `mode: sync` (RFC 0036 Phase B): `{workflow: <name>}` —
+    /// the spawn resolves when the CHILD's named workflow first completes,
+    /// returning that run's output. Composed as a reporter workflow in the
+    /// child; requires the parent to have an A2A listener.
+    #[serde(default)]
+    pub result: Option<Value>,
+    /// Instance tier (RFC 0036 Phase B): child streams mirrored into the
+    /// PARENT's same-named streams — each event forwarded over the socket and
+    /// appended with source `instance:<handle>`. Requires the stream declared
+    /// on BOTH sides and a parent A2A listener.
+    #[serde(default)]
+    pub mirror_streams: Option<Vec<String>>,
 }
 
 /// One declared template parameter (RFC 0036 §5).
@@ -1791,7 +1888,14 @@ pub struct Quotas {
 #[serde(deny_unknown_fields)]
 pub struct A2aPeer {
     pub name: String,
+    /// Either a literal URL, or empty when `service:` references a `kind:
+    /// peer` catalog entry (RFC 0037 Phase B) — resolution fills it.
+    #[serde(default)]
     pub endpoint: String,
+    /// Reference a `services:` entry of `kind: peer`: inherit its connection
+    /// settings (restating `endpoint`/`auth`/`headers` here is refused).
+    #[serde(default)]
+    pub service: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -2677,18 +2781,18 @@ pub enum Ask {
 pub fn probe(args: &[String], env: &[(String, String)]) -> Result<Detected, ConfigError> {
     let env = super::debrand_env(env);
     let envmap: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    // A flag/env `config_version: "2"` selects the 2.0 runtime for a flag-only
-    // invocation (`agentd --config-version 2 --instruction …`).
+    // A flag/env `config_version: "1"` selects the full runtime for a flag-only
+    // invocation (`agentd --config-version 1 --instruction …`).
     let flag_v2 = args
         .windows(2)
-        .any(|w| matches!(w[0].as_str(), "--config-version" | "--config_version") && w[1] == "2")
+        .any(|w| matches!(w[0].as_str(), "--config-version" | "--config_version") && w[1] == "1")
         || args
             .iter()
-            .any(|a| a == "--config-version=2" || a == "--config_version=2")
+            .any(|a| a == "--config-version=1" || a == "--config_version=1")
         || envmap
             .get("AGENTD_CONFIG_VERSION")
             .or_else(|| envmap.get("CONFIG_VERSION"))
-            .is_some_and(|v| *v == "2");
+            .is_some_and(|v| *v == "1");
     let paths = super::config_paths_from_map(args, &envmap).paths;
     if paths.is_empty() {
         return Ok(if flag_v2 {
@@ -2752,14 +2856,14 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     match detect(&file_doc) {
         Detected::Mixed => {
             return Err(usage(
-                "config file mixes v1 keys (model/subscribe/mcp_servers/…) with v2 sections (agent/intelligence/…); \
-                 migrate the v1 keys (docs/configuration.md §migration)"
+                "config file mixes legacy flat keys (model/subscribe/mcp_servers/…) with settings sections (agent/intelligence/…); \
+                 migrate the legacy keys (docs/configuration.md §migration)"
                     .into(),
             ));
         }
         Detected::V1 => {
             return Err(usage(
-                "config file speaks the v1 schema; the 2.0 loader needs `config_version: \"2\"` or v2 sections".into(),
+                "config file speaks the retired flat schema; the loader needs `config_version: \"1\"` or settings sections (agent/intelligence/…)".into(),
             ));
         }
         _ => {}
@@ -2826,7 +2930,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         match a {
             "-h" | "--help" => ask = Ask::Help,
             "-V" | "--version" => ask = Ask::Version,
-            "--config-schema" | "--config-schema=2" => ask = Ask::Schema,
+            "--config-schema" | "--config-schema=1" => ask = Ask::Schema,
             "--workflow-schema" => ask = Ask::WorkflowSchema,
             "--validate-config" => ask = Ask::Validate,
             "--capabilities" => ask = Ask::Capabilities,
@@ -2854,7 +2958,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
             ) => {}
             _ => {
                 if let Some((flag, hint)) = REMOVED_FLAGS.iter().find(|(f, _)| *f == a) {
-                    return Err(usage(format!("{flag} was removed in agentd 2.0: {hint}")));
+                    return Err(usage(format!("{flag} was removed in agentd: {hint}")));
                 }
                 if let Some(alias) = ALIASES.iter().find(|al| al.flag == a) {
                     apply_alias(&mut doc, &bindings, alias, &mut it, &mut mcp_tags)?;
@@ -3614,8 +3718,73 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("services: entry name '{name}' must be [a-zA-Z0-9_-]+"),
             );
         }
-        if let Err(e) = super::mcp_endpoint_scheme_ok(&svc.endpoint) {
-            err(&mut d, format!("services.{name}: {e}"));
+        // The endpoint scheme is judged by the entry's KIND: a peer speaks
+        // A2A (https / loopback http / unix), everything else HTTPS-or-loopback.
+        match svc.kind {
+            ServiceKind::Peer => {
+                if let Err(e) = crate::config::A2aEndpoint::parse(&svc.endpoint) {
+                    err(&mut d, format!("services.{name}: {e}"));
+                }
+            }
+            _ => {
+                if let Err(e) = super::mcp_endpoint_scheme_ok(&svc.endpoint) {
+                    err(&mut d, format!("services.{name}: {e}"));
+                }
+            }
+        }
+        // Kind-specific fields: the tool surface (allow/exclude/tags/breaker)
+        // is `kind: mcp` vocabulary; `methods` is `kind: http` vocabulary.
+        if svc.kind != ServiceKind::Mcp {
+            for (set, what) in [
+                (svc.allow.is_some(), "allow"),
+                (!svc.exclude.is_empty(), "exclude"),
+                (!svc.tags.is_empty(), "tags"),
+                (svc.breaker.is_some(), "breaker"),
+            ] {
+                if set {
+                    err(
+                        &mut d,
+                        format!(
+                            "services.{name}: `{what}` applies to `kind: mcp` entries only (this entry is `kind: {}`)",
+                            svc.kind.as_str()
+                        ),
+                    );
+                }
+            }
+        }
+        if svc.methods.is_some() && svc.kind != ServiceKind::Http {
+            err(
+                &mut d,
+                format!(
+                    "services.{name}: `methods` applies to `kind: http` entries only (this entry is `kind: {}`)",
+                    svc.kind.as_str()
+                ),
+            );
+        }
+        if let Some(ms) = &svc.methods {
+            for m in ms {
+                if !matches!(
+                    m.as_str(),
+                    "GET" | "PUT" | "POST" | "DELETE" | "PATCH" | "HEAD"
+                ) {
+                    err(
+                        &mut d,
+                        format!(
+                            "services.{name}.methods: unknown method '{m}' (want GET|PUT|POST|DELETE|PATCH|HEAD, uppercase)"
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(b) = &svc.breaker
+            && crate::runtime::breaker::Config::of(Some(b)).is_none()
+        {
+            err(
+                &mut d,
+                format!(
+                    "services.{name}.breaker: want {{failures: N>=1, cooldown: \"60s\"}} — both fields required"
+                ),
+            );
         }
         for list in svc.tags.values() {
             for t in list {
@@ -3650,21 +3819,26 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(&mut d, format!("services.{name}.rate: {e}"));
         }
     }
-    // Matching must be unambiguous: no entry's endpoint may itself match
-    // another entry (identical or prefix-comparable endpoints).
+    // Matching must be unambiguous PER KIND: no entry's endpoint may itself
+    // match another entry of the same kind (identical or prefix-comparable).
+    // Different kinds on one host are legal — matching is kind-filtered.
     {
         let entries: Vec<(&String, &Service)> = s.services.iter().collect();
         for i in 0..entries.len() {
             for j in (i + 1)..entries.len() {
+                if entries[i].1.kind != entries[j].1.kind {
+                    continue;
+                }
+                let kind = entries[i].1.kind;
                 let one = BTreeMap::from([(entries[i].0.clone(), entries[i].1.clone())]);
                 let other = BTreeMap::from([(entries[j].0.clone(), entries[j].1.clone())]);
-                if service_match(&one, &entries[j].1.endpoint).is_some()
-                    || service_match(&other, &entries[i].1.endpoint).is_some()
+                if service_match(&one, kind, &entries[j].1.endpoint).is_some()
+                    || service_match(&other, kind, &entries[i].1.endpoint).is_some()
                 {
                     err(
                         &mut d,
                         format!(
-                            "services.{} and services.{} have prefix-comparable endpoints — URL matching must be unambiguous",
+                            "services.{} and services.{} have prefix-comparable endpoints of the same kind — URL matching must be unambiguous",
                             entries[i].0, entries[j].0
                         ),
                     );
@@ -3672,38 +3846,99 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
-    // Egress policy (RFC 0037 §5): closed ⇒ every configured MCP dial must be
-    // catalogued; surfaces the policy does not yet cover are named out loud.
+    // Egress policy (RFC 0037 §5, Phase B: all four outbound surfaces):
+    // closed ⇒ every configured dial must match a catalog entry of its kind.
     if s.security.egress == Egress::Closed {
+        let closed = |d: &mut Diagnostics, kind: ServiceKind, what: &str, url: &str| {
+            if service_match(&s.services, kind, url).is_none() {
+                d.errors.push(format!(
+                    "security.egress is closed and {what} ({url}) matches no `kind: {}` services: catalog entry — catalog the endpoint to allow it",
+                    kind.as_str()
+                ));
+            }
+        };
         for srv in &s.mcp.servers {
-            if !srv.endpoint.is_empty() && service_match(&s.services, &srv.endpoint).is_none() {
-                err(
+            if !srv.endpoint.is_empty() {
+                closed(
                     &mut d,
-                    format!(
-                        "security.egress is closed and mcp server '{}' ({}) matches no services: catalog entry — catalog the endpoint to allow it",
-                        srv.name, srv.endpoint
-                    ),
+                    ServiceKind::Mcp,
+                    &format!("mcp server '{}'", srv.name),
+                    &srv.endpoint,
                 );
             }
         }
-        let mut uncovered = Vec::new();
-        if !s.intelligence.endpoints.is_empty() {
-            uncovered.push("intelligence.endpoints");
+        for e in &s.intelligence.endpoints {
+            // `mock:` is the in-process test endpoint — no socket, no egress.
+            if !e.starts_with("mock:") {
+                closed(
+                    &mut d,
+                    ServiceKind::Intelligence,
+                    "intelligence endpoint",
+                    e,
+                );
+            }
         }
-        if !s.a2a.peers.is_empty() {
-            uncovered.push("a2a.peers");
+        for p in &s.a2a.peers {
+            if !p.endpoint.is_empty() {
+                closed(
+                    &mut d,
+                    ServiceKind::Peer,
+                    &format!("a2a peer '{}'", p.name),
+                    &p.endpoint,
+                );
+            }
         }
-        if s.store.kind == StoreKind::Http {
-            uncovered.push("store.http");
+        if s.store.kind == StoreKind::Http
+            && let Some(h) = &s.store.http
+        {
+            closed(
+                &mut d,
+                ServiceKind::Http,
+                "store.http.base_url",
+                &h.base_url,
+            );
+            // Ops that don't build on {base_url} dial their own literal hosts.
+            for (opname, op) in [
+                ("get", &h.get),
+                ("put", &h.put),
+                ("list", &h.list),
+                ("delete", &h.delete),
+            ] {
+                if let Some(op) = op
+                    && !op.url.starts_with("{base_url}")
+                    && !op.url.contains("{{")
+                {
+                    closed(
+                        &mut d,
+                        ServiceKind::Http,
+                        &format!("store.http.{opname}.url"),
+                        &op.url,
+                    );
+                }
+            }
         }
-        if s.workflows.iter().any(|w| w.get("url").is_some()) {
-            uncovered.push("workflows[].url");
+        for w in &s.workflows {
+            if let Some(u) = w.get("url").and_then(Value::as_str) {
+                closed(&mut d, ServiceKind::Http, "workflow reference url", u);
+            }
+            // Literal `http` step URLs are judged here; templated ones are
+            // checked at execution (`step_http`'s runtime gate).
+            if let Some(steps) = w.get("steps").and_then(Value::as_object) {
+                for (sid, st) in steps {
+                    if st.get("kind").and_then(Value::as_str) == Some("http")
+                        && let Some(u) = st.get("url").and_then(Value::as_str)
+                        && !u.contains("{{")
+                    {
+                        closed(&mut d, ServiceKind::Http, &format!("http step '{sid}'"), u);
+                    }
+                }
+            }
         }
-        if !uncovered.is_empty() {
-            d.warnings.push(format!(
-                "security.egress: closed covers MCP dials (and A2A push targets) in this phase; NOT yet covered: {} (RFC 0037 Phase B)",
-                uncovered.join(", ")
-            ));
+        // The one surface deliberately outside the policy: telemetry export.
+        if s.observability.otel.endpoint.is_some() {
+            d.warnings.push(
+                "security.egress: closed does not cover observability.otel.endpoint (telemetry export is operator plumbing, not agent egress)".into(),
+            );
         }
     }
     // subagent templates (RFC 0036): extraction, tier resolution and the
@@ -4695,7 +4930,7 @@ pub fn help_text() -> String {
          \nCONTROL:\n\
          \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
-         \x20 --config-schema=2          print the settings JSON Schema (v2) and exit\n\
+         \x20 --config-schema            print the settings JSON Schema and exit\n\
          \x20 --workflow-schema          print the workflow (dialect 3) JSON Schema + node registry and exit\n\
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
@@ -4980,7 +5215,7 @@ mod tests {
     fn detects_v1_v2_mixed_and_empty() {
         assert_eq!(detect(&json!({})), Detected::Empty);
         assert_eq!(detect(&json!({"model": "m"})), Detected::V1);
-        assert_eq!(detect(&json!({"config_version": "2"})), Detected::V2);
+        assert_eq!(detect(&json!({"config_version": "1"})), Detected::V2);
         assert_eq!(
             detect(&json!({"agent": {"instruction": "x"}})),
             Detected::V2
@@ -5016,7 +5251,7 @@ mod tests {
         // never reached the check and this config started happily. It is the
         // whole lethal trifecta: untrusted input, sensitive powers, an egress
         // path.
-        let cfg = "config_version: \"2\"\nstore: {kind: memory}\n\
+        let cfg = "config_version: \"1\"\nstore: {kind: memory}\n\
                    mcp:\n  servers:\n    - name: web\n      endpoint: https://mcp-web.internal/mcp\n      tags: {\"*\": [untrusted_input]}\n\
                    security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n";
         let f = write_tmp(cfg, "yaml");
@@ -5041,7 +5276,7 @@ mod tests {
 
         // exec WITHOUT an untrusted-input source is only two legs: still fine.
         let alone = write_tmp(
-            "config_version: \"2\"\nstore: {kind: memory}\n\
+            "config_version: \"1\"\nstore: {kind: memory}\n\
              security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n",
             "yaml",
         );
@@ -5062,7 +5297,7 @@ mod tests {
         // first real start. A typo'd step field used to validate clean and be
         // refused by `load_workflows` at startup — the worst possible split.
         let f = write_tmp(
-            "config_version: \"2\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], prompt: \"typo — agent steps take `instruction`\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
+            "config_version: \"1\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], prompt: \"typo — agent steps take `instruction`\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
             "yaml",
         );
         let e = load(
@@ -5080,7 +5315,7 @@ mod tests {
 
         // The same workflow, spelled correctly, still validates.
         let ok = write_tmp(
-            "config_version: \"2\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], instruction: \"do it\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
+            "config_version: \"1\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], instruction: \"do it\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
             "yaml",
         );
         load(
@@ -5165,7 +5400,7 @@ mod tests {
         assert_eq!(l.settings.store.kind, StoreKind::File);
         // A long-lived start node ⇒ the same default.
         let f = write_tmp(
-            "config_version: \"2\"\nworkflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
+            "config_version: \"1\"\nworkflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
             "yaml",
         );
         let (l, _) = load(
@@ -5246,7 +5481,7 @@ mod tests {
     #[test]
     fn config_vars_fold_typed_values_and_collect_every_miss() {
         let file = write_tmp(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              vars:\n  region: eu-1\n  port: 8443\n  team:\n    name: platform\n\
              agent:\n  name: \"svc-{{config.region}}\"\n  instruction: serve\n  preflight: never\n\
              intelligence:\n  endpoints: [https://x/v1]\n  model: m\n\
@@ -5285,7 +5520,7 @@ mod tests {
 
         // Every unresolved reference is reported, in ONE refusal.
         let bad = write_tmp(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              vars:\n  set: yes\n\
              agent:\n  name: \"{{config.gone}}\"\n  instruction: serve\n  preflight: never\n\
              intelligence:\n  endpoints: [\"https://{{config.also_gone}}/v1\"]\n  model: m\n\
@@ -5340,7 +5575,7 @@ mod tests {
     #[test]
     fn env_substitution_reaches_config_values_and_workflows() {
         let file = write_tmp(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: ${SVC_NAME}\n  instruction: serve\n  preflight: never\n\
              intelligence:\n  endpoints: [https://x/v1]\n  model: m\n\
              store:\n  kind: memory\n\
@@ -5381,6 +5616,7 @@ mod tests {
             name: "gh".into(),
             endpoint: "https://mcp.example".into(),
             service: None,
+            service_rate: None,
             ns: None,
             headers: BTreeMap::new(),
             tags: BTreeMap::new(),
@@ -5408,7 +5644,7 @@ mod tests {
     #[test]
     fn files_env_flags_layer_in_order_with_aliases() {
         let base = write_tmp(
-            "config_version: \"2\"\nagent:\n  instruction: from-file\nintelligence:\n  endpoints: [https://file.example/v1]\n  model: file-model\nlimits:\n  run:\n    steps: 10\nstore: { kind: memory }\n",
+            "config_version: \"1\"\nagent:\n  instruction: from-file\nintelligence:\n  endpoints: [https://file.example/v1]\n  model: file-model\nlimits:\n  run:\n    steps: 10\nstore: { kind: memory }\n",
             "yaml",
         );
         let over = write_tmp("intelligence:\n  model: over-model\n", "yml");
@@ -5473,10 +5709,7 @@ mod tests {
     fn removed_flags_name_their_replacement() {
         for (flag, _) in REMOVED_FLAGS {
             let e = load(&args(&[flag, "x"]), &base_env()).unwrap_err();
-            assert!(
-                format!("{e}").contains("removed in agentd 2.0"),
-                "{flag}: {e}"
-            );
+            assert!(format!("{e}").contains("removed in agentd"), "{flag}: {e}");
         }
         let e = load(&args(&["--mode", "reactive"]), &base_env()).unwrap_err();
         assert!(format!("{e}").contains("start node"), "{e}");
@@ -5490,14 +5723,14 @@ mod tests {
             &base_env(),
         )
         .unwrap_err();
-        assert!(format!("{e}").contains("mixes v1"), "{e}");
+        assert!(format!("{e}").contains("mixes legacy flat keys"), "{e}");
         let v1 = write_tmp("model: m\n", "yaml");
         let e = load(
             &args(&["--config", v1.path().to_str().unwrap()]),
             &base_env(),
         )
         .unwrap_err();
-        assert!(format!("{e}").contains("v1 schema"), "{e}");
+        assert!(format!("{e}").contains("retired flat schema"), "{e}");
     }
 
     #[test]
@@ -5534,7 +5767,7 @@ mod tests {
     fn validation_collects_the_rfc_0030_rules() {
         // A file with an inline credential is refused; the same value from env is fine.
         let e = load_doc(
-            "config_version: \"2\"\nintelligence:\n  endpoints: [https://i]\n  token: sk-inline\n",
+            "config_version: \"1\"\nintelligence:\n  endpoints: [https://i]\n  token: sk-inline\n",
         )
         .unwrap_err();
         assert!(format!("{e}").contains("inline credential"), "{e}");
@@ -5560,14 +5793,14 @@ mod tests {
         // Undeclared servers referenced by tools/store/knowledge/skills: the
         // startup path fast-fails on the first problem (exit 2)…
         let e = load_doc(
-            "config_version: \"2\"\nstore: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\n",
+            "config_version: \"1\"\nstore: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\n",
         )
         .unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)), "{e}");
 
         // --validate-config collects EVERYTHING.
         let f = write_tmp(
-            "config_version: \"2\"\nstore: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\nlifecycle: {exit_code_map: {\"4\": 300}}\n",
+            "config_version: \"1\"\nstore: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\nlifecycle: {exit_code_map: {\"4\": 300}}\n",
             "yaml",
         );
         let e = load(
@@ -5591,22 +5824,22 @@ mod tests {
         }
 
         // A2A listener rules.
-        let e = load_doc("config_version: \"2\"\nstore: {kind: memory}\na2a: {listen: \"https://0.0.0.0:8443\"}\n").unwrap_err();
+        let e = load_doc("config_version: \"1\"\nstore: {kind: memory}\na2a: {listen: \"https://0.0.0.0:8443\"}\n").unwrap_err();
         assert!(format!("{e}").contains("a2a.tls.cert"), "{e}");
-        let e = load_doc("config_version: \"2\"\nstore: {kind: memory}\na2a: {listen: \"http://0.0.0.0:8080\"}\n").unwrap_err();
+        let e = load_doc("config_version: \"1\"\nstore: {kind: memory}\na2a: {listen: \"http://0.0.0.0:8080\"}\n").unwrap_err();
         assert!(format!("{e}").contains("loopback"), "{e}");
         // Principals: `any` cannot be operator.
         let e = load_doc(
-            "config_version: \"2\"\na2a: {principals: [{match: {any: true}, role: operator}]}\n",
+            "config_version: \"1\"\na2a: {principals: [{match: {any: true}, role: operator}]}\n",
         )
         .unwrap_err();
         assert!(format!("{e}").contains("operator role"), "{e}");
         // Budget rules.
-        let e = load_doc("config_version: \"2\"\nintelligence: {budget: {windows: [{per: hour}], on_exhausted: degrade}}\n").unwrap_err();
+        let e = load_doc("config_version: \"1\"\nintelligence: {budget: {windows: [{per: hour}], on_exhausted: degrade}}\n").unwrap_err();
         assert!(format!("{e}").contains("tokens and/or requests"), "{e}");
         // Trifecta over the root grant.
         let e = load_doc(
-            "config_version: \"2\"\nmcp:\n  servers:\n    - {name: fs, endpoint: https://fs/mcp, tags: {\"*\": [untrusted_input, sensitive, egress]}}\n",
+            "config_version: \"1\"\nmcp:\n  servers:\n    - {name: fs, endpoint: https://fs/mcp, tags: {\"*\": [untrusted_input, sensitive, egress]}}\n",
         )
         .unwrap_err();
         assert!(format!("{e}").contains("lethal-trifecta"), "{e}");
@@ -5752,12 +5985,12 @@ mod tests {
     #[test]
     fn file_store_validation_diagnostics() {
         // `kind: file` needs no block at all.
-        let l = load_doc("config_version: \"2\"\nstore: {kind: file}\n").unwrap();
+        let l = load_doc("config_version: \"1\"\nstore: {kind: file}\n").unwrap();
         assert_eq!(l.settings.store.kind, StoreKind::File);
         assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
         // …and a long-lived instance is satisfied by it (no `store.kind is none`).
         let l = load_doc(
-            "config_version: \"2\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\na2a: {listen: \"http://127.0.0.1:8080\"}\n",
+            "config_version: \"1\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\na2a: {listen: \"http://127.0.0.1:8080\"}\n",
         )
         .unwrap();
         assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
@@ -5767,14 +6000,14 @@ mod tests {
         );
 
         // An explicitly empty path would resolve to the working directory.
-        let e = load_doc("config_version: \"2\"\nstore: {kind: file, file: {path: \"\"}}\n")
+        let e = load_doc("config_version: \"1\"\nstore: {kind: file, file: {path: \"\"}}\n")
             .unwrap_err();
         assert!(format!("{e}").contains("store.file.path is empty"), "{e}");
 
         // A block belonging to an adapter that is not selected is dead config:
         // a warning (it is ignored), not a refusal (it does no harm).
         let l = load_doc(
-            "config_version: \"2\"\nstore: {kind: memory, file: {path: /var/lib/agentd}}\n",
+            "config_version: \"1\"\nstore: {kind: memory, file: {path: /var/lib/agentd}}\n",
         )
         .unwrap();
         let d = validate(&l);
@@ -5788,7 +6021,7 @@ mod tests {
         );
         // No warning when the file adapter IS the selected one.
         let l =
-            load_doc("config_version: \"2\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\n")
+            load_doc("config_version: \"1\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\n")
                 .unwrap();
         assert!(
             !validate(&l)
@@ -5823,7 +6056,7 @@ mod tests {
     fn help_and_schema_asks_short_circuit_validation() {
         let (_, ask) = load(&args(&["--help"]), &[]).unwrap();
         assert_eq!(ask, Ask::Help);
-        let (_, ask) = load(&args(&["--config-schema=2"]), &[]).unwrap();
+        let (_, ask) = load(&args(&["--config-schema=1"]), &[]).unwrap();
         assert_eq!(ask, Ask::Schema);
         // `--workflow-schema` is a static, side-effect-free dump: it must resolve
         // even with no config file present (no intelligence endpoint, etc.).
@@ -5834,7 +6067,7 @@ mod tests {
 
     // ---- RFC 0037: service catalog & egress policy -------------------------
 
-    const CATALOG: &str = "config_version: \"2\"\nstore: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n";
+    const CATALOG: &str = "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
 
     #[test]
     fn service_reference_inherits_and_narrows() {
@@ -5919,7 +6152,7 @@ mod tests {
     #[test]
     fn unknown_service_reference_is_refused() {
         let f = write_tmp(
-            "config_version: \"2\"\nstore: {kind: memory}\nmcp:\n  servers:\n    - {name: x, service: nope}\n",
+            "config_version: \"1\"\nstore: {kind: memory}\nmcp:\n  servers:\n    - {name: x, service: nope}\n",
             "yaml",
         );
         let e = load(
@@ -5967,7 +6200,10 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{e}");
-        assert!(msg.contains("matches no services: catalog entry"), "{msg}");
+        assert!(
+            msg.contains("matches no `kind: mcp` services: catalog entry"),
+            "{msg}"
+        );
 
         let ok = write_tmp(
             &format!(
@@ -5985,7 +6221,7 @@ mod tests {
     #[test]
     fn ambiguous_catalog_endpoints_are_refused() {
         let f = write_tmp(
-            "config_version: \"2\"\nstore: {kind: memory}\nservices:\n  a: {endpoint: \"https://s.example/mcp\"}\n  b: {endpoint: \"https://s.example/mcp/deeper\"}\n",
+            "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  a: {endpoint: \"https://s.example/mcp\"}\n  b: {endpoint: \"https://s.example/mcp/deeper\"}\n",
             "yaml",
         );
         let e = load(
@@ -6011,19 +6247,84 @@ mod tests {
                 auth: None,
                 rate: None,
                 timeout: None,
+                methods: None,
+                breaker: None,
             },
         );
-        assert!(service_match(&services, "https://s.example/api").is_some());
-        assert!(service_match(&services, "https://s.example/api/v2").is_some());
+        let m = ServiceKind::Mcp;
+        assert!(service_match(&services, m, "https://s.example/api").is_some());
+        assert!(service_match(&services, m, "https://s.example/api/v2").is_some());
         assert!(
-            service_match(&services, "https://s.example/apiary").is_none(),
+            service_match(&services, m, "https://s.example/apiary").is_none(),
             "prefix match is on segment boundaries, not string prefixes"
         );
-        assert!(service_match(&services, "https://other.example/api").is_none());
+        assert!(service_match(&services, m, "https://other.example/api").is_none());
         assert!(
-            service_match(&services, "http://s.example/api").is_none(),
+            service_match(&services, m, "http://s.example/api").is_none(),
             "scheme must match"
         );
+        assert!(
+            service_match(&services, ServiceKind::Http, "https://s.example/api").is_none(),
+            "matching is kind-filtered"
+        );
+    }
+
+    #[test]
+    fn peer_references_resolve_and_all_four_kinds_gate_closed_egress() {
+        // Phase B: a `kind: peer` entry feeds a2a.peers[].service; closed mode
+        // covers intelligence endpoints, peers, and http-step literals too.
+        let f = write_tmp(
+            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\", auth: {kind: static, token: \"{{secret:PEER}}\"}}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
+            "yaml",
+        );
+        let (loaded, _) = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .expect("all surfaces catalogued ⇒ closed mode admits the config");
+        let p = &loaded.settings.a2a.peers[0];
+        assert_eq!(p.endpoint, "https://peer.example", "peer inherited");
+        assert!(p.auth.is_some(), "peer inherited auth");
+
+        let bad = write_tmp(
+            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\na2a:\n  peers:\n    - {name: rogue, endpoint: \"https://rogue.example\"}\n",
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", bad.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e}").contains("kind: peer"),
+            "an uncatalogued peer is refused naming the kind: {e}"
+        );
+
+        let badi = write_tmp(
+            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\nintelligence: {endpoints: \"https://rogue-intel.example/v1\"}\n",
+            "yaml",
+        );
+        let e = load(&args(&["--config", badi.path().to_str().unwrap()]), &[]).unwrap_err();
+        assert!(
+            format!("{e}").contains("kind: intelligence"),
+            "an uncatalogued intelligence endpoint is refused: {e}"
+        );
+    }
+
+    #[test]
+    fn kind_specific_entry_fields_are_validated() {
+        let f = write_tmp(
+            "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  x: {kind: http, endpoint: \"https://x.example\", tags: {\"*\": [egress]}}\n  y: {kind: mcp, endpoint: \"https://y.example\", methods: [GET]}\n",
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("`tags` applies to `kind: mcp`"), "{msg}");
+        assert!(msg.contains("`methods` applies to `kind: http`"), "{msg}");
     }
 
     #[test]

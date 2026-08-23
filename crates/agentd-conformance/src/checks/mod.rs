@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The conformance check families. Each module exposes `checks() -> Vec<Check>`.
 //!
-//! agentd 2.0 note: the v1-only families (`mcp-server` — the v1 self-MCP surface,
+//! agentd note: the v1-only families (`mcp-server` — the v1 self-MCP surface,
 //! `mcp-client` — the v1 reactive discovery path, `work-claim` — the `cluster`
 //! lease) were retired with the mode cut-over and rebuilt as the v2 families
 //! (P7): [`store`] (RFC 0025 durable-store contract), [`durability`] (the

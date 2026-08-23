@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **agentd 2.0 runtime** (RFC 0026): the supervisor's event loop over
+//! The **agentd runtime** (RFC 0026): the supervisor's event loop over
 //! durable state, the turn workers it spawns, and the lifecycle policy. Built
 //! beside the 1.x mode drivers and selected by a v2 configuration document;
 //! the 1.x drivers are removed at the P5 cut-over.
@@ -137,7 +137,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         level,
     )
     .with_content(settings.observability.log_content);
-    log.info("proc.start", json!({"version": crate::VERSION, "runtime": "2.0", "instance": instance, "config_files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()}));
+    log.info("proc.start", json!({"version": crate::VERSION, "runtime": "1", "instance": instance, "config_files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()}));
     for w in &loaded.warnings {
         log.warn("config.warning", json!({"warning": w}));
     }
@@ -242,6 +242,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         if let Err(e) = crate::config::v2::egress_allows(
             &settings.services,
             settings.security.egress,
+            crate::config::v2::ServiceKind::Mcp,
             &s.endpoint,
         ) {
             log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
@@ -886,7 +887,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         crate::obs::health::spawn_writer(
             std::path::PathBuf::from(path),
             run_id.clone(),
-            "2.0".into(),
+            "1".into(),
             std::time::Duration::from_secs(10),
         );
     }
@@ -1034,7 +1035,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         })
     });
     json!({
-        "runtime": "2.0",
+        "runtime": "1",
         "version": crate::VERSION,
         "agent": {"name": s.instance_name(), "instruction": s.agent.instruction.is_some(), "preflight": format!("{:?}", s.agent.preflight).to_lowercase()},
         "intelligence": {"model": s.intelligence.model, "endpoints": s.intelligence.endpoints.len()},

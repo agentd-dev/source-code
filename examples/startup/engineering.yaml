@@ -18,11 +18,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY        — the model.
-#   GITHUB_TOKEN          — a fine-grained PAT (or GitHub App token) scoped
-#                           to THIS repo: contents:rw + pull_requests:rw.
-#                           NOT repo-admin, NOT org — the `exclude:` below
-#                           strips delete_*/admin_* tools as a second fence,
-#                           but the token is the first.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c engineering.yaml)
 #   GITHUB_WEBHOOK_SECRET — the secret on the repo webhook
 #                           (Settings → Webhooks, event: "Workflow runs",
 #                           content-type JSON). GitHub signs sha256 HMAC of
@@ -37,7 +34,7 @@
 # the PR is not mergeable rather than force; keep tool outputs bounded
 # (a whole-repo read blows the context — expose search + ranged reads).
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: engineering
@@ -66,13 +63,9 @@ store:
 
 mcp:
   servers:
-    - name: github
-      endpoint: https://mcp.github.example/mcp
-      tags: { "*": [sensitive] }
-      auth: { kind: static, token: "{{secret:GITHUB_TOKEN}}" }
-      # Admission control at the registry: the fix loop needs code and PRs,
-      # not org administration. An excluded tool is absent, not disabled.
-      exclude: ["delete_*", "admin_*"]
+    # The catalog's exclude (delete_*/admin_*) is authoritative: the fix loop
+    # gets code and PRs, never org administration.
+    - { name: github, service: github }
 
 # GitHub Actions posts run conclusions here.
 webhooks:

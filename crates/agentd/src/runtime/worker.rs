@@ -152,6 +152,9 @@ impl McpCaller for McpClients<'_> {
         meta: Value,
         timeout: Duration,
     ) -> Result<(Value, bool), String> {
+        // RFC 0037 §4: this worker paces its own in-loop calls — the registry
+        // was seeded when THIS process dialed its clients.
+        crate::mcp::pace::take(server)?;
         let c = self
             .0
             .iter()

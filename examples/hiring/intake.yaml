@@ -10,7 +10,7 @@
 # Everything that CHANGES the world is delegated over A2A to `hiring-actions`,
 # which holds sensitive + egress and never sees raw CV prose.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: hiring-intake

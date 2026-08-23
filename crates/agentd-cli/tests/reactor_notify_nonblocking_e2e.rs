@@ -255,7 +255,7 @@ fn a_slow_resources_read_after_a_notification_does_not_stall_the_reactor() {
     std::fs::write(
         &cfg_path,
         format!(
-            "config_version: \"2\"\nagent:\n  name: notify-block\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}\nworkflows:\n  - name: watch\n    steps: {steps_watch}\n  - name: ticker\n    steps: {steps_ticker}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+            "config_version: \"1\"\nagent:\n  name: notify-block\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}\nworkflows:\n  - name: watch\n    steps: {steps_watch}\n  - name: ticker\n    steps: {steps_ticker}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
         ),
     )
     .expect("write config");

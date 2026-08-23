@@ -1,6 +1,6 @@
 # RFC 0037: Service catalog and egress policy
 
-**Status:** Phase A implemented (the `services:` catalog, `service:` references with narrowing, the unconditional tag floor, `security.egress: closed` over MCP dials + A2A push targets, catalog inheritance into RFC 0036 children, `agentd login service:<name>`, effective-surface output in `--validate-config`); Phases B–C draft — see the implementation notes at the end
+**Status:** Phases A + B implemented — A: the `services:` catalog, `service:` references with narrowing, the unconditional tag floor, `closed` egress over MCP dials + A2A push targets, catalog inheritance into RFC 0036 children, `agentd login service:<name>`, effective-surface output in `--validate-config`; B: all four entry kinds (`mcp`/`intelligence`/`peer`/`http` — kind-filtered matching), `a2a.peers[].service` references, `closed` coverage of intelligence endpoints/peers/the `http` step (+ its `methods:` ceiling)/the HTTP store, per-entry `breaker:` defaults, in-process pacing extended to turn-worker and subagent processes, and `examples/startup/services.yaml` as the reference deployment. Phase C stays contingent — see the implementation notes
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the configuration surface (RFC 0030); hardens the trifecta gate's inputs (RFC 0012 §3); credentials ride RFC 0031; the recommended posture for template-bearing deployments (RFC 0036 §8).
@@ -278,6 +278,38 @@ validate` prints the effective tool surface and tag set per consumer
 - **A secrets-manager integration** — orthogonal: RFC 0031 owns *how*
   credentials resolve; this RFC owns *where they are named and who may
   use them*.
+
+## 10a. Implementation notes (Phase B, as shipped)
+
+- **Kind-filtered matching.** An MCP dial matches only `kind: mcp` entries,
+  an `http` step only `kind: http`, and so on — one host may serve several
+  kinds; ambiguity is judged per kind. Kind-specific vocabulary is
+  validated: `allow`/`exclude`/`tags`/`breaker` are mcp-only, `methods`
+  http-only; a `peer` endpoint is judged by A2A rules (unix allowed).
+- **Pacing now covers every process.** `from_spec` — the one client
+  chokepoint in the reactor, each turn worker, and each flat subagent —
+  seeds a per-process registry from the spec's carried service+rate, and all
+  four dispatch sites (workflow `mcp.tool` steps, reactor mapped tools, the
+  worker's in-loop calls, the subagent's in-loop calls) draw from one
+  bucket per service per process. Cross-process coordination remains a
+  Phase C control-plane concern, as §4 said.
+- **Per-entry `breaker:` is a POLICY default, not shared state.** An
+  `mcp.tool` step against a referencing server inherits the entry's
+  `{failures, cooldown}` when it declares none; breaker STATE stays keyed
+  per workflow/step (the existing semantics — a breaker measures one step's
+  calls). Gate and recorder resolve the policy through one function, so
+  they cannot disagree.
+- **The `http` step is enforced at two points**: literal URLs at load,
+  templated URLs at execution — plus the `methods:` ceiling in either
+  egress mode. HTTP-store ops that do not build on `{base_url}` are judged
+  at load too. The one surface deliberately outside `closed` is
+  `observability.otel.endpoint` (telemetry export is operator plumbing);
+  validation says so instead of implying coverage.
+- **`kind: intelligence` coverage skips `mock:`** (the in-process test
+  endpoint has no socket). A catalog-referencing peer's credential caches
+  under `service:<entry>` — which also makes `agentd login` work for peers
+  for the first time (standalone peers still cache under `a2a:<name>`,
+  which `login` does not mint; catalog them to log in).
 
 ## 10. Implementation notes (Phase A, as shipped)
 

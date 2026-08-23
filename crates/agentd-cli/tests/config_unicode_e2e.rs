@@ -48,7 +48,7 @@ fn write_file(tag: &str, ext: &str, body: &str) -> String {
 fn json_config(intel: &str) -> String {
     format!(
         r#"{{
-  "config_version": "2",
+  "config_version": "1",
   "agent": {{ "name": "unicode", "instruction": "{INSTRUCTION}" }},
   "intelligence": {{ "endpoints": "{intel}", "model": "mock" }},
   "observability": {{ "log_level": "error" }}
@@ -65,7 +65,7 @@ fn jsonc_config(intel: &str) -> String {
     format!(
         r#"{{
   // 設定 — the agent identity, commented in 日本語
-  "config_version": "2",
+  "config_version": "1",
   /* 註釋: a block comment carrying 4-byte text 🎌 before the key */
   "agent": {{ "name": "unicode", "instruction": "{INSTRUCTION}"/* — glued to the quote */ }},
   "intelligence": {{ "endpoints": "{intel}", "model": "mock" }}, // ✅ 日本語 trailing
@@ -119,7 +119,7 @@ fn a_multibyte_char_welded_to_a_comment_survives() {
     // LAST thing before a comment opens and the FIRST thing after it closes,
     // with no ASCII in between to resynchronise on.
     let body = r#"{
-  "config_version": "2",
+  "config_version": "1",
   "agent": { "instruction": "—"/*—*/ },
   "intelligence": { "endpoints": "https://intel.example", "model": "日本語"//—
  }
@@ -131,7 +131,7 @@ fn a_multibyte_char_welded_to_a_comment_survives() {
     let _ = std::fs::remove_file(&path);
     // An escape sequence next to multibyte text must not eat the following byte
     // (the stripper skips `\` + one byte without looking at it).
-    let body = r#"{ "config_version": "2",
+    let body = r#"{ "config_version": "1",
   "agent": { "instruction": "a\"—\\éé" } }"#;
     let path = write_file("cfg-escape", "jsonc", body);
     let (doc, _) = agentd::config::file::read_document(&path).expect("config parses");
@@ -217,7 +217,7 @@ fn the_yaml_reader_round_trips_non_ascii_too() {
     // casting), and this test is what keeps that true. "One document model, two
     // syntaxes" has to include the document's text.
     let body = format!(
-        "config_version: \"2\"\n# 註釋 — a comment with 日本語\nagent:\n  instruction: \"{INSTRUCTION}\"  # ✅ trailing\n  name: unicode\nintelligence:\n  endpoints: https://intel.example\n  model: 日本語\n"
+        "config_version: \"1\"\n# 註釋 — a comment with 日本語\nagent:\n  instruction: \"{INSTRUCTION}\"  # ✅ trailing\n  name: unicode\nintelligence:\n  endpoints: https://intel.example\n  model: 日本語\n"
     );
     let path = write_file("cfg-unicode", "yaml", &body);
     let (doc, format) = agentd::config::file::read_document(&path).expect("yaml parses");

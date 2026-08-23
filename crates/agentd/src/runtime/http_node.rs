@@ -44,6 +44,39 @@ impl crate::runtime::reactor::Runtime {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_ascii_uppercase();
+        // RFC 0037 Phase B: the `http` step is a covered egress surface —
+        // `closed` mode requires a `kind: http` catalog entry (templated URLs
+        // are judged HERE, literals already at load), and a matching entry's
+        // `methods:` is a ceiling either mode.
+        {
+            use crate::config::v2 as cfgv2;
+            if let Err(e) = cfgv2::egress_allows(
+                &self.settings.services,
+                self.settings.security.egress,
+                cfgv2::ServiceKind::Http,
+                &url,
+            ) {
+                self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                return;
+            }
+            if let Some((name, entry)) =
+                cfgv2::service_match(&self.settings.services, cfgv2::ServiceKind::Http, &url)
+                && let Some(methods) = &entry.methods
+                && !methods.iter().any(|m| m == &method)
+            {
+                self.finish_step_pub(
+                    run_id,
+                    step_id,
+                    StepStatus::Failed,
+                    None,
+                    Some(format!(
+                        "http: {method} is outside services.{name}.methods ({methods:?}) — the catalog's method ceiling"
+                    )),
+                    0,
+                );
+                return;
+            }
+        }
         let mut headers: Vec<(String, String)> = spec
             .get("headers")
             .and_then(Value::as_object)

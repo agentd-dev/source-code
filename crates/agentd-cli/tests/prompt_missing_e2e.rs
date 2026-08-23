@@ -74,7 +74,7 @@ fn spawn_key_recorder() -> (u16, Arc<Mutex<Option<String>>>) {
 
 fn config(port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: pm\n\
          workflows:\n  - name: w\n    steps:\n\
          \x20     start: {{kind: once}}\n\

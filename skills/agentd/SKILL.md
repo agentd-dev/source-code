@@ -1,6 +1,6 @@
 ---
 name: agentd
-description: Install, configure, run and operate agentd — the durable agent daemon (config schema v2). Use when setting up agentd, writing or reviewing an agentd YAML config, wiring tools via MCP or the exec runner, attaching the TUI/web UI, building a coding agent on it, or diagnosing a non-zero agentd exit code.
+description: Install, configure, run and operate agentd — the durable agent daemon. Use when setting up agentd, writing or reviewing an agentd YAML config, wiring tools via MCP or the exec runner, attaching the TUI/web UI, building a coding agent on it, or diagnosing a non-zero agentd exit code.
 ---
 
 # agentd
@@ -23,7 +23,7 @@ Never debug a config by running it and watching what happens. Validate, read the
 error (it names the path), fix, re-validate. When unsure what a key is called:
 
 ```sh
-agentd --config-schema=2 | less    # every key, type and default
+agentd --config-schema | less    # every key, type and default
 agentd --capabilities              # what THIS binary was built with
 ```
 
@@ -48,7 +48,7 @@ Docker: `ghcr.io/agentd-dev/agentd:<version>` (multi-arch, cosign-signed).
 ## A minimal working config
 
 ```yaml
-config_version: "2"          # required; this is schema v2
+config_version: "1"          # required
 
 agent:
   name: helper

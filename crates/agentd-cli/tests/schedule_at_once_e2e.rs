@@ -129,7 +129,7 @@ const AT_STEPS: &str = r#"{
 
 fn at_config(dir: &str) -> String {
     write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: oneshot\nstore:\n  kind: file\n  file:\n    path: {dir}\n  checkpoint:\n    debounce_ms: 0\nworkflows:\n  - name: nightly\n    steps: {AT_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: oneshot\nstore:\n  kind: file\n  file:\n    path: {dir}\n  checkpoint:\n    debounce_ms: 0\nworkflows:\n  - name: nightly\n    steps: {AT_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ))
 }
 
@@ -199,7 +199,7 @@ const SLEEP_STEPS: &str = r#"{
 
 fn sleep_config(dir: &str) -> String {
     write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: napper\nstore:\n  kind: file\n  file:\n    path: {dir}\n  checkpoint:\n    debounce_ms: 0\nworkflows:\n  - name: nap\n    steps: {SLEEP_STEPS}\nlifecycle:\n  run_until: idle\n  idle_grace: 500ms\nobservability:\n  log_level: info\n"
+        "config_version: \"1\"\nagent:\n  name: napper\nstore:\n  kind: file\n  file:\n    path: {dir}\n  checkpoint:\n    debounce_ms: 0\nworkflows:\n  - name: nap\n    steps: {SLEEP_STEPS}\nlifecycle:\n  run_until: idle\n  idle_grace: 500ms\nobservability:\n  log_level: info\n"
     ))
 }
 

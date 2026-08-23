@@ -25,13 +25,8 @@
 # Secrets:
 #   OPENAI_API_KEY           — the model (the biggest drafting budget after
 #                              engineering; content is token-hungry).
-#   SEARCH_TOKEN             — the web-search MCP's key (Brave/Tavily/Kagi
-#                              wrappers all fit). Search results are
-#                              attacker-reachable text — hence the
-#                              untrusted_input tag and the instruction's
-#                              injection rule.
-#   CRM_TOKEN                — SAME key as sales or a second one; read
-#                              target accounts + write outreach notes.
+#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
+#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c marketing.yaml)
 #   MKT_REPLY_WEBHOOK_SECRET — the inbound-parse relay's signing secret,
 #                              same pattern as sales' /email/reply (embed
 #                              person_id in the reply-to at send time).
@@ -40,7 +35,7 @@
 # + fetch (url → readable text). Nuances: fetch must cap size and strip
 # markup; snippets are the default diet, full fetch is the exception.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "2"
+config_version: "1"
 
 agent:
   name: marketing
@@ -75,15 +70,9 @@ store:
 mcp:
   servers:
     # The open web: research, competitor pages, social listening.
-    - name: websearch
-      endpoint: https://mcp.search.example/mcp
-      tags: { "*": [untrusted_input] }
-      auth: { kind: static, token: "{{secret:SEARCH_TOKEN}}" }
-    # Target accounts and the people at them.
-    - name: crm
-      endpoint: https://mcp.crm.example/mcp
-      tags: { "*": [sensitive, untrusted_input] }
-      auth: { kind: static, token: "{{secret:CRM_TOKEN}}" }
+    - { name: websearch, service: websearch }
+    # Target accounts and the people at them (same catalog entry as sales).
+    - { name: crm, service: crm }
 
 # Replies to outreach come back here (the email provider forwards them).
 webhooks:

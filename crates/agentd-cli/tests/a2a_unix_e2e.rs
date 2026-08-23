@@ -96,7 +96,7 @@ fn two_instances_connect_and_delegate_over_a_unix_socket() {
     std::fs::write(
         &cfg_b,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: bee\n  instruction: You are B; answer briefly.\n  preflight: never\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -134,7 +134,7 @@ fn two_instances_connect_and_delegate_over_a_unix_socket() {
     std::fs::write(
         &cfg_a,
         format!(
-            "config_version: \"2\"\n\
+            "config_version: \"1\"\n\
              agent:\n  name: aye\n\
              a2a:\n  peers:\n    - name: bee\n      endpoint: \"unix://{sock}\"\n\
              workflows:\n  - name: ask\n    steps:\n\

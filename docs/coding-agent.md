@@ -61,7 +61,7 @@ cargo build --release --features a2a,exec
 **Configure** (`coding.yaml`):
 
 ```yaml
-config_version: "2"
+config_version: "1"
 
 agent:
   name: coder

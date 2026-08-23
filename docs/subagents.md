@@ -163,7 +163,7 @@ long-lived daemon eventually refuses on `limits.subagents.total` with nothing
 running. Raise it for daemons.
 
 ```yaml
-config_version: "2"
+config_version: "1"
 limits:
   run:                       # inherited by each subagent unless the call overrides
     steps: 500
@@ -358,6 +358,21 @@ uncatalogued endpoint under `security.egress: closed` (RFC 0037), declares a
 webhook start, or tries to define `webhooks:`/`a2a:`/`security:`/`store:`
 sections refuses the parent's startup with the template named.
 
+Three Phase-B conveniences ride the same wiring. **`mode: sync`** with
+`result: {workflow: <name>}` parks the spawn until the child's named workflow
+first completes, then resolves it with that run's output — a composed
+reporter workflow inside the child (existing nodes only) dials the parent's
+internal `_instance.result` op; the child keeps running under its own
+lifecycle. **`mirror_streams: [orders]`** forwards every event on the
+child's stream into the parent's same-named stream (source
+`instance:<handle>`), so parent consumers replay a fleet's history without
+knowing which child wrote it. Both need the parent to serve A2A
+(`a2a.listen`) — compile refuses the template otherwise. And a **durable
+child's token usage meters against the parent's budget windows**: the parent
+reads the child's manifest every few seconds and charges the delta — a
+`durable: false` child has no manifest and is invisible to the meter by
+construction.
+
 Instance children retire gracefully — `ttl:` elapsing, the `until:` signal
 arriving in the child, `subagent.retire {handle}`, or the parent's own
 shutdown (a parent death delivers SIGTERM via PDEATHSIG) all take the same
@@ -385,7 +400,7 @@ liveness deadline. A workflow `subagent` step honours its `timeout`, because tha
 wait is a durable step record:
 
 ```yaml
-config_version: "2"
+config_version: "1"
 workflows:
   - name: triage
     steps:

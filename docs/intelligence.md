@@ -402,7 +402,7 @@ the flag wins over env, which wins over the default.)
 | `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget for the run (default 2000000) |
 | `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline, e.g. `600s`, `5m` (default 3600s) |
 
-Every one of these is a `config_version: "2"` document path as well —
+Every one of these is a `config_version: "1"` document path as well —
 `intelligence.endpoints`, `intelligence.token`, `intelligence.model`,
 `intelligence.swap_policy`, `intelligence.dialect`, `limits.run.tokens`,
 `limits.run.deadline` — settable from a file, from `AGENTD_<PATH>`, or from

@@ -19,7 +19,7 @@ goes empty-and-final and exits, mapping its outcome to the exit-code table
 
 ## The config surface you will actually use
 
-Configuration is a `config_version: "2"` document (`--config` / `AGENT_CONFIG`,
+Configuration is a `config_version: "1"` document (`--config` / `AGENT_CONFIG`,
 YAML or JSON, repeatable + merged). **Every path in the schema is also an env var
 and a flag** (`limits.run.steps` ⇒ `AGENTD_LIMITS_RUN_STEPS` /
 `--limits-run-steps`), so a container overrides at deploy time without editing
@@ -49,7 +49,7 @@ also accepts the `=` form, so in a container `args:` list write the flag and its
 value as two entries. Each intelligence / MCP endpoint must be `https://…` (or
 loopback `http://` for a same-host dev gateway). Config is validated **before any
 side effect**:
-`agentd --validate-config` (exit 2 on error), `agentd --config-schema=2` (the
+`agentd --validate-config` (exit 2 on error), `agentd --config-schema` (the
 machine-readable schema), `agentd --capabilities` (the effective surface).
 
 > **Scope.** The external channel is **A2A** (`a2a.listen`, RFC 0029): one HTTPS
@@ -131,7 +131,7 @@ a file store does and does not survive in a container.
 
 ```yaml
 # /etc/agentd/triage.yaml
-config_version: "2"
+config_version: "1"
 agent: { instruction: "When a ticket is filed, triage it and assign an owner." }
 intelligence: { endpoints: https://gw.example/v1, model: my-model }
 mcp:

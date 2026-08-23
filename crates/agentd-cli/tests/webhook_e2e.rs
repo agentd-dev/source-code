@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd 2.0 **inbound webhook** surface (RFC 0027) end to end: a daemon binds a
+//! agentd **inbound webhook** surface (RFC 0027) end to end: a daemon binds a
 //! dedicated webhook listener; a signed HTTP POST fires a workflow run, an
 //! unsigned/badly-signed request is rejected 401, and a replay of the same
 //! idempotency key is deduplicated (no second run).
@@ -204,7 +204,7 @@ fn write_config(yaml: &str) -> String {
 
 fn config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: hook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -306,7 +306,7 @@ fn a_signed_webhook_fires_the_workflow_bad_signature_is_rejected_and_replays_ded
 
 fn await_config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: hookawait\n  instruction: You process callbacks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -376,7 +376,7 @@ fn a_respond_sync_webhook_returns_the_run_result_inline() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let cfg = write_config(&format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: sync\n  instruction: You process.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -414,7 +414,7 @@ fn a_respond_sync_webhook_returns_the_run_result_inline() {
 
 fn rate_config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: ratehook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -477,7 +477,7 @@ fn a_rated_route_admits_its_burst_then_answers_429_with_retry_after() {
 
 fn shed_config(llm: &str, port: u16, store_dir: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: shedhook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: 999999GB\n\
@@ -564,7 +564,7 @@ fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
     let store_dir = common::unique_path("wh-warn-store", "d");
     std::fs::create_dir_all(&store_dir).unwrap();
     let cfg = write_config(&format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: warnhook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: \"{min_free}\"\n\

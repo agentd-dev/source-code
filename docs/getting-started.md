@@ -39,7 +39,7 @@ $ git clone <repo> agent && cd agent
 $ cargo build -p agentd-cli --release
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
-agentd 2.0.0
+agentd.0
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops
@@ -219,7 +219,7 @@ run is durable, and the loop's iteration state survives a restart:
 
 ```yaml
 # poll.yaml
-config_version: "2"
+config_version: "1"
 intelligence: { endpoints: https://gw.example/v1, model: my-model }
 store: { kind: mcp, mcp: { server: state } }
 mcp:

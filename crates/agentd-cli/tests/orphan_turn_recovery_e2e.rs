@@ -143,7 +143,7 @@ fn a_sigkilled_root_turn_worker_fails_its_turn_and_releases_its_reservation() {
         "agentd-orphan",
         "yaml",
         &format!(
-            "config_version: \"2\"\nagent:\n  name: orphan\n  instruction: You answer questions.\n  preflight: never\n\
+            "config_version: \"1\"\nagent:\n  name: orphan\n  instruction: You answer questions.\n  preflight: never\n\
 intelligence:\n  endpoints: {}\n  model: mock\n  budget:\n    windows: [{{ per: hour, tokens: {WINDOW_TOKENS} }}]\n\
 store:\n  kind: memory\n\
 workflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\

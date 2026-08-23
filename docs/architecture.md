@@ -449,7 +449,7 @@ $ agentd \
 The same binary, woken by an MCP resource and keeping state across restarts:
 
 ```yaml
-config_version: "2"
+config_version: "1"
 
 agent:
   name: triage

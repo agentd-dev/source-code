@@ -49,7 +49,7 @@ fn job(steps: &str) -> String {
         "agentd-nested-cancel",
         "yaml",
         &format!(
-            "config_version: \"2\"\nagent:\n  name: nested-cancel\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+            "config_version: \"1\"\nagent:\n  name: nested-cancel\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
         ),
     )
 }

@@ -249,7 +249,7 @@ fn write_config(yaml: &str) -> String {
 /// subscribe, which is exactly the surface under test.
 fn two_principal_config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -388,7 +388,7 @@ fn rss_kb(pid: u32) -> u64 {
 /// from being about the size of the log file.
 fn loopback_config(port: u16) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: a2a-leak\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
          store:\n  kind: memory\n\

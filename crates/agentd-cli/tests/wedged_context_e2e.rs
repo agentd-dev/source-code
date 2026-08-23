@@ -116,7 +116,7 @@ fn a_turn_that_ends_inside_the_tool_loop_leaves_no_unanswered_tool_call_in_the_s
         "agentd-wedge",
         "yaml",
         &format!(
-            "config_version: \"2\"\nagent:\n  name: wedge\n  instruction: You help the team.\n  preflight: never\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n",
+            "config_version: \"1\"\nagent:\n  name: wedge\n  instruction: You help the team.\n  preflight: never\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n",
             llm.uri,
             mock.uri()
         ),

@@ -63,7 +63,7 @@ fn run(cfg: &str) -> Daemon {
 
 fn config(workdir: &str, cmd_step: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: exec\n  instruction: x\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1\n  model: m\n\
          store:\n  kind: memory\n\

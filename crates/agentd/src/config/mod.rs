@@ -403,6 +403,11 @@ pub struct McpServerSpec {
     /// keyed by it. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    /// The entry's `rate:` (resolved at config load) — seeds the per-process
+    /// pace registry at connect time, so worker and subagent processes pace
+    /// their own in-loop calls too. Travels in the spawn payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
 }
 
 /// The runtime shape of an MCP server's OAuth 2.1 client-credentials config
@@ -1380,7 +1385,7 @@ impl Config {
         // now, so this v1 path is unreachable (the binary routes v2 first).
         if capabilities {
             return Err(ConfigError::Capabilities(
-                "{\"note\":\"--capabilities is served by the agentd 2.0 loader\"}\n".to_string(),
+                "{\"note\":\"--capabilities is served by the agentd loader\"}\n".to_string(),
             ));
         }
 
@@ -2584,6 +2589,7 @@ fn apply_config_file(
             oauth: None,
             auth: None,
             service: None,
+            rate: None,
         });
     }
     c.subscribe.extend(cf.subscribe);
@@ -2821,7 +2827,7 @@ mod tests {
         // Nothing there yet.
         assert!(discovered_config_in(&dir).is_empty());
 
-        std::fs::write(dir.join(".agentd.yml"), "config_version: \"2\"\n").unwrap();
+        std::fs::write(dir.join(".agentd.yml"), "config_version: \"1\"\n").unwrap();
         let found = discovered_config_in(&dir);
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with(".agentd.yml"), "{found:?}");
@@ -2829,7 +2835,7 @@ mod tests {
         // Both spellings are reported, so the caller can refuse rather than
         // silently pick one: whichever it chose, somebody would be editing the
         // other and wondering why nothing changed.
-        std::fs::write(dir.join(".agentd.yaml"), "config_version: \"2\"\n").unwrap();
+        std::fs::write(dir.join(".agentd.yaml"), "config_version: \"1\"\n").unwrap();
         assert_eq!(discovered_config_in(&dir).len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);

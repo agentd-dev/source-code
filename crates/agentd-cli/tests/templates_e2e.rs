@@ -44,7 +44,7 @@ fn a_flat_template_spawns_with_folded_params_and_the_template_grant() {
     // it and fills the declared hole; `instruction` at the call site would be
     // refused (mutual exclusion is validated at workflow load).
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 900ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -76,7 +76,7 @@ fn a_flat_template_spawns_with_folded_params_and_the_template_grant() {
 #[test]
 fn freeform_spawns_are_refused_when_the_operator_disables_them() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 700ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -101,7 +101,7 @@ fn freeform_spawns_are_refused_when_the_operator_disables_them() {
 #[test]
 fn template_params_are_schema_checked_at_the_chokepoint() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 700ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -133,7 +133,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
     // by handle over the auto-wired unix socket; the ttl retires it through
     // the child's own graceful drain.
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: parent }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
          observability: { log_level: info, log_content: true }\n\
          subagents:\n\
@@ -186,7 +186,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
 #[test]
 fn a_singleton_instance_refuses_a_second_live_spawn() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: parent }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 1200ms }\n\
          observability: { log_level: info, log_content: true }\n\
          subagents:\n\
@@ -224,7 +224,7 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
 #[test]
 fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
     let (code, log) = run_cfg(
-        "config_version: \"2\"\nagent: { name: parent }\nstore: { kind: memory }\n\
+        "config_version: \"1\"\nagent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          subagents:\n\
         \x20 templates:\n\

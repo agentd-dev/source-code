@@ -36,7 +36,7 @@ is rigidity in exchange for resumability.
 
 ## The anatomy of a workflow document
 
-A workflow is an object under `workflows:` in a `config_version: "2"` settings
+A workflow is an object under `workflows:` in a `config_version: "1"` settings
 file. The top-level keys are a closed set — anything else is a parse error.
 
 | Key | Meaning |
@@ -58,7 +58,7 @@ file. The top-level keys are a closed set — anything else is a parse error.
 A complete, runnable example:
 
 ```yaml
-config_version: "2"
+config_version: "1"
 intelligence:
   endpoints: https://api.openai.com/v1
   model: gpt-5.1

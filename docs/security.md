@@ -77,7 +77,7 @@ Tags are parsed as snake-case strings from config only; an unrecognized tag is a
 config error (`config/v2/mod.rs:483`). Nothing the model or a server says feeds the gate.
 
 ```yaml
-config_version: "2"
+config_version: "1"
 mcp:
   servers:
     - { name: web,   endpoint: https://mcp-fetch.internal/mcp, tags: { "*": [untrusted_input] } }
@@ -163,16 +163,18 @@ Tags being config-only leaves one hole: the *author* of a config (or of an RFC
 tags, and any MCP declaration whose endpoint matches the entry gets those tags
 **unioned in before the gate runs** — referencing or inline, unconditionally.
 Under-tagging a catalogued endpoint is now impossible rather than undetected.
-`security.egress: closed` extends the catalog from authority to allow-list:
-an outbound MCP dial (and a caller-registered A2A push target) whose URL
-matches no entry is refused — at boot for configured servers and template
-machinery, at registration for push. There is deliberately no in-config
+`security.egress: closed` extends the catalog from authority to allow-list
+across **every outbound surface**: MCP dials, intelligence endpoints, A2A
+peers, the `http` step (with per-entry `methods:` ceilings), the HTTP store,
+workflow-reference URLs, and caller-registered A2A push targets — refused at
+boot for configured surfaces, at execution for templated ones. Entries carry
+a `kind:` and matching is kind-filtered. There is deliberately no in-config
 exception list: the way to allow an endpoint is to catalog it, which is
 exactly the reviewable event it should be. What the catalog does **not**
 bind: where a *compromised MCP server* can reach (network egress policy stays
-complementary — the entry list is what makes those rules derivable), and the
-Phase-B surfaces (`intelligence.endpoints`, `a2a.peers`, the `http`
-step/store), which `--validate-config` names out loud when `closed` is set.
+complementary — the entry list is what makes those rules derivable), and
+`observability.otel.endpoint` (telemetry export is operator plumbing;
+validation says so rather than implying coverage).
 
 ## The injection firewall
 

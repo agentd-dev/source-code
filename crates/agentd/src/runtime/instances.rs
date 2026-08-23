@@ -122,6 +122,28 @@ impl Runtime {
             .and_then(Value::as_bool)
             .or(t.spec.durable)
             .unwrap_or_else(|| self.work_durable_default());
+        // Phase B `mode: sync`: the spawn resolves when the child's declared
+        // result workflow first completes (the composed reporter dials home).
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .or(t.spec.mode.as_deref())
+            .unwrap_or("detached")
+            .to_string();
+        match mode.as_str() {
+            "detached" => {}
+            "sync" if t.spec.result.is_some() => {}
+            "sync" => {
+                return err(format!(
+                    "subagent.run: template '{tname}' has no `result: {{workflow}}` — mode: sync needs one"
+                ));
+            }
+            other => {
+                return err(format!(
+                    "subagent.run: instance children support mode detached|sync (got '{other}')"
+                ));
+            }
+        }
         let doc = match self.compose_instance_doc(
             t,
             &prose,
@@ -130,6 +152,7 @@ impl Runtime {
             &socket,
             until.as_deref(),
             durable,
+            &handle,
         ) {
             Ok(d) => d,
             Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
@@ -158,7 +181,7 @@ impl Runtime {
         let mut record = SubagentRecord {
             handle: handle.clone(),
             instruction: prose.clone(),
-            mode: "detached".into(),
+            mode: mode.clone(),
             status: "spawned".into(),
             attempt: 1,
             result: None,
@@ -193,11 +216,15 @@ impl Runtime {
                 );
                 self.subagents.insert(handle.clone(), record);
                 self.persist_subagent(&handle);
-                ToolOutcome::Ready(
-                    json!({"handle": handle, "status": "running", "tier": "instance",
-                           "peer": handle, "socket": socket}),
-                    false,
-                )
+                if mode == "sync" {
+                    ToolOutcome::Deferred(super::reactor::PendingKind::Subagent { handle })
+                } else {
+                    ToolOutcome::Ready(
+                        json!({"handle": handle, "status": "running", "tier": "instance",
+                               "peer": handle, "socket": socket}),
+                        false,
+                    )
+                }
             }
             Err(e) => {
                 record.status = "failed".into();
@@ -222,13 +249,14 @@ impl Runtime {
         socket: &str,
         until: Option<&str>,
         durable: bool,
+        handle: &str,
     ) -> Result<Value, String> {
         let mut doc = t.fragment.clone();
         if !doc.is_object() {
             doc = json!({});
         }
         fold_params_value(&mut doc, params);
-        doc["config_version"] = json!("2");
+        doc["config_version"] = json!(crate::config::v2::schema::CONFIG_VERSION);
         let agent = doc
             .as_object_mut()
             .expect("object")
@@ -248,6 +276,51 @@ impl Runtime {
             .or_insert_with(|| json!([]));
         if let Some(a) = list.as_array_mut() {
             a.extend(wfs);
+            // Phase B `mode: sync`: a composed REPORTER — pure existing nodes
+            // (event start → switch pick → workflow.wait → typed a2a.send) —
+            // dials the parent's `_instance.result` op when the declared
+            // workflow first completes. The op never reaches a model.
+            if let Some(rw) = t
+                .spec
+                .result
+                .as_ref()
+                .and_then(|r| r.get("workflow"))
+                .and_then(Value::as_str)
+            {
+                a.push(json!({
+                    "name": "_agentd_report", "version": 3, "steps": {
+                        "ev":   {"kind": "event", "on": "workflow.finished"},
+                        "pick": {"kind": "switch", "depends_on": ["ev"],
+                                 "on": "{{steps.ev.output.payload.workflow}}",
+                                 "cases": {rw: "get"}, "on_no_match": "skip"},
+                        "get":  {"kind": "workflow.wait", "depends_on": ["pick"],
+                                 "run": "{{steps.ev.output.payload.run}}", "timeout": "30s"},
+                        "send": {"kind": "a2a.send", "depends_on": ["get"], "to": "parent",
+                                 "command": "_instance.result",
+                                 "args": {"handle": handle,
+                                          "status": "{{steps.get.output.status}}",
+                                          "output": "{{steps.get.output.output}}"},
+                                 "timeout": "30s", "retry": {"max": 5, "backoff": "2s"}},
+                        "f":    {"kind": "finish", "depends_on": ["send"], "status": "completed"}
+                    }
+                }));
+            }
+            // Phase B `mirror_streams`: one composed forwarder per stream —
+            // every child event rides the socket into the parent's same-named
+            // stream (appended there with source `instance:<handle>`).
+            for m in t.spec.mirror_streams.iter().flatten() {
+                a.push(json!({
+                    "name": format!("_agentd_mirror_{m}"), "version": 3, "steps": {
+                        "ev":   {"kind": "stream", "stream": m, "from": "new"},
+                        "send": {"kind": "a2a.send", "depends_on": ["ev"], "to": "parent",
+                                 "command": "_instance.emit",
+                                 "args": {"handle": handle, "stream": m,
+                                          "event": "{{steps.ev.output}}"},
+                                 "timeout": "30s", "retry": {"max": 5, "backoff": "2s"}},
+                        "f":    {"kind": "finish", "depends_on": ["send"], "status": "completed"}
+                    }
+                }));
+            }
         }
         // Parent-owned composition: store, listener, lifecycle, security.
         doc["store"] = if durable {
@@ -419,6 +492,7 @@ impl Runtime {
     /// The per-tick maintenance pass: `ttl` retirement and the SIGTERM→SIGKILL
     /// escalation for children that ignored the drain.
     pub(crate) fn instances_tick(&mut self) {
+        self.meter_instances();
         let now = now_ms();
         let drain_ms = self.settings.lifecycle.drain_timeout().as_millis() as u64;
         let mut to_persist = Vec::new();
@@ -654,6 +728,150 @@ impl Runtime {
             .and_then(|s| s.socket.as_ref().map(|sock| format!("unix://{sock}")))
     }
 
+    /// RFC 0036 Phase B: consume a child's `_instance.*` report. Returns true
+    /// when the event was an internal op (consumed either way — a malformed
+    /// one is logged, never surfaced to a model).
+    #[cfg(feature = "a2a")]
+    pub(crate) fn handle_instance_op(&mut self, ev: &crate::state::InboxEvent) -> bool {
+        let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
+        let Some(op) = super::a2a_server::command_op(&message) else {
+            return false;
+        };
+        if !op.starts_with("_instance.") {
+            return false;
+        }
+        // Only the operator/agent trust levels may speak for a child (a unix
+        // same-uid caller is operator; a bearer-authenticated child is agent).
+        let role = ev.payload["role"].as_str().unwrap_or("");
+        if !matches!(role, "operator" | "agent") {
+            self.log.warn(
+                "instance.op.refused",
+                json!({"op": op, "role": role, "note": "internal ops need an operator/agent principal"}),
+            );
+            return true;
+        }
+        let args = super::a2a_server::command_data(&message).unwrap_or_else(|| json!({}));
+        let handle = args["handle"].as_str().unwrap_or("").to_string();
+        let live = self.subagents.get(&handle).is_some_and(|s| {
+            s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status)
+        });
+        if !live {
+            self.log.warn(
+                "instance.op.orphan",
+                json!({"op": op, "handle": handle, "note": "no live instance child by that handle"}),
+            );
+            return true;
+        }
+        match op.as_str() {
+            "_instance.result" => {
+                if let Some(s) = self.subagents.get_mut(&handle) {
+                    // First completion wins (RFC 0036 §9 Phase B: "the first
+                    // completed run"); later reports are ignored.
+                    if s.result.is_none() {
+                        s.result = Some(json!({
+                            "status": args.get("status").cloned().unwrap_or(Value::Null),
+                            "output": args.get("output").cloned().unwrap_or(Value::Null),
+                        }));
+                        s.updated = now_ms();
+                        s.dirty = true;
+                        self.log.info("instance.result", json!({"handle": handle}));
+                        self.persist_subagent(&handle);
+                    }
+                }
+            }
+            "_instance.emit" => {
+                let stream = args["stream"].as_str().unwrap_or("").to_string();
+                let event = args.get("event").cloned().unwrap_or(Value::Null);
+                let subject = event["subject"].as_str().unwrap_or("").to_string();
+                let correlation = event["correlation"].as_str().map(str::to_string);
+                let data = event.get("data").cloned().unwrap_or(Value::Null);
+                let id = format!("{handle}/{}", event["id"].as_str().unwrap_or("?"));
+                let source = format!("instance:{handle}");
+                match self.append_event(
+                    &stream,
+                    &subject,
+                    correlation.as_deref(),
+                    data,
+                    &id,
+                    &source,
+                ) {
+                    Ok(seq) => {
+                        self.stream_dirty = true;
+                        self.log.info(
+                            "instance.mirror",
+                            json!({"handle": handle, "stream": stream, "seq": seq}),
+                        );
+                    }
+                    Err(e) => self.log.warn(
+                        "instance.mirror.fail",
+                        json!({"handle": handle, "stream": stream, "err": e}),
+                    ),
+                }
+            }
+            other => self.log.warn(
+                "instance.op.unknown",
+                json!({"op": other, "handle": handle}),
+            ),
+        }
+        true
+    }
+
+    /// RFC 0036 Phase B budget metering: a DURABLE child's manifest carries
+    /// its governor counters — read the lifetime total every few seconds and
+    /// charge the DELTA against the parent's windows, so a spawned desk draws
+    /// down its sponsor. (A non-durable child has no manifest; its usage is
+    /// invisible by construction and documented as such.)
+    fn meter_instances(&mut self) {
+        let now = now_ms();
+        {
+            static LAST: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+            let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if now.saturating_sub(*g) < 5_000 {
+                return;
+            }
+            *g = now;
+        }
+        let candidates: Vec<(String, Option<String>, u64)> = self
+            .subagents
+            .values()
+            .filter(|s| {
+                s.tier.as_deref() == Some("instance") && s.durable && !is_terminal_status(&s.status)
+            })
+            .map(|s| (s.handle.clone(), s.config_path.clone(), s.tokens))
+            .collect();
+        for (handle, config, charged) in candidates {
+            let Some(dir) = config
+                .as_deref()
+                .and_then(|c| std::path::Path::new(c).parent().map(|p| p.to_path_buf()))
+            else {
+                continue;
+            };
+            let Some(total) = read_child_lifetime_tokens(&dir.join("state")) else {
+                continue;
+            };
+            let delta = total.saturating_sub(charged);
+            if delta == 0 {
+                continue;
+            }
+            self.governor.charge(
+                crate::wire::intel::Usage {
+                    input_tokens: delta,
+                    output_tokens: 0,
+                },
+                &[],
+            );
+            if let Some(s) = self.subagents.get_mut(&handle) {
+                s.tokens = total;
+                s.dirty = true;
+            }
+            self.log.info(
+                "instance.metered",
+                json!({"handle": handle, "delta_tokens": delta, "total_tokens": total}),
+            );
+            self.persist_subagent(&handle);
+        }
+    }
+
     fn instance_bucket_take(&mut self) -> bool {
         static BUCKET: std::sync::Mutex<Option<crate::supervisor::tree::TokenBucket>> =
             std::sync::Mutex::new(None);
@@ -722,6 +940,27 @@ fn parse_instance_rlimits(limits: &Option<Value>) -> Result<(Option<u64>, Option
     Ok((memory, cpu))
 }
 
+/// Read a child's lifetime token total from its file-store manifest
+/// (`<state>/agentd/<instance>/manifest/agent.json` — the instance segment is
+/// found by walking, since the child's name is composed). The manifest's
+/// `budget` is the child governor's `to_value()`: the `instance` scope's
+/// `lifetime_used`.
+fn read_child_lifetime_tokens(state_root: &std::path::Path) -> Option<u64> {
+    let prefix_dir = state_root.join("agentd");
+    for inst in std::fs::read_dir(prefix_dir).ok()? {
+        let manifest = inst.ok()?.path().join("manifest").join("agent.json");
+        if let Ok(text) = std::fs::read_to_string(&manifest)
+            && let Ok(env) = serde_json::from_str::<Value>(&text)
+            && let Some(used) = env
+                .pointer("/state/budget/instance/lifetime_used")
+                .and_then(Value::as_u64)
+        {
+            return Some(used);
+        }
+    }
+    None
+}
+
 /// The unix-socket path — kept under the sun path limit (~108 bytes) by
 /// falling back to the temp dir for deep state roots.
 fn instance_socket_path(dir: &std::path::Path, handle: &str) -> String {
@@ -757,5 +996,30 @@ fn validate_composed(doc: &Value) -> Result<(), String> {
         Ok(())
     } else {
         Err(errs.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_manifest_yields_its_lifetime_tokens() {
+        let dir = std::env::temp_dir().join(format!("agentd-meter-{}", std::process::id()));
+        let m = dir.join("agentd").join("parent%2Froom").join("manifest");
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(
+            m.join("agent.json"),
+            serde_json::to_string(&json!({
+                "v": 2, "kind": "manifest", "id": "agent", "seq": 9,
+                "state": {"generation": 1, "budget": {
+                    "instance": {"windows": [], "lifetime_used": 4242},
+                    "scopes": {}}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_child_lifetime_tokens(&dir), Some(4242));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

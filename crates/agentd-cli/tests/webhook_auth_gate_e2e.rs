@@ -63,7 +63,7 @@ fn validate(dir: &str, yaml: &str) -> (i32, String) {
 /// whose `auth` is spliced in verbatim (empty = declares none).
 fn config(listen: &str, listener_auth: &str, node_auth: &str) -> String {
     format!(
-        "config_version: \"2\"\n\
+        "config_version: \"1\"\n\
          agent:\n  name: hook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: [\"https://intel.invalid/v1\"]\n  model: mock\n\
          store: {{kind: memory}}\n\
@@ -167,7 +167,7 @@ fn an_explicit_none_auth_does_not_open_a_public_bind() {
 #[test]
 fn a_wait_on_webhook_callback_is_covered_by_the_gate() {
     let dir = workdir("wh-gate-wait");
-    let yaml = "config_version: \"2\"\n\
+    let yaml = "config_version: \"1\"\n\
          agent:\n  name: hook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: [\"https://intel.invalid/v1\"]\n  model: mock\n\
          store: {kind: memory}\n\

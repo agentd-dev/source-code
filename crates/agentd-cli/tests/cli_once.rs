@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Black-box CLI test of the agentd 2.0 supervisor (RFC 0026): the binary loads
+//! Black-box CLI test of the agentd supervisor (RFC 0026): the binary loads
 //! a v2 configuration, validates it, and — for a bare `once` job — spawns a root
 //! turn worker and maps the outcome to an exit code. With an unreachable
 //! intelligence endpoint the run fails fast with exit 4 (intel unavailable) and
@@ -59,7 +59,7 @@ fn yaml_config_path_env_and_generic_flags_pass_the_validation_gate() {
     let cfg = dir.path().join("agentd.yaml");
     std::fs::write(
         &cfg,
-        "# yaml config\nconfig_version: \"2\"\nlimits:\n  max_runs: 4\n",
+        "# yaml config\nconfig_version: \"1\"\nlimits:\n  max_runs: 4\n",
     )
     .unwrap();
     let base = |extra: &[&str], env: &[(&str, &str)]| {
@@ -95,7 +95,7 @@ fn yaml_config_path_env_and_generic_flags_pass_the_validation_gate() {
     assert_eq!(bad.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(stderr.contains("AGENTD_LIMITS_MAX_RUNS"), "{stderr}");
     // So is a YAML typo (unknown key), before any side effect.
-    std::fs::write(&cfg, "config_version: \"2\"\nmax_token: 5\n").unwrap();
+    std::fs::write(&cfg, "config_version: \"1\"\nmax_token: 5\n").unwrap();
     let typo = base(&[], &[]);
     let stderr = String::from_utf8_lossy(&typo.stderr);
     assert_eq!(typo.status.code(), Some(2), "stderr:\n{stderr}");
@@ -140,7 +140,7 @@ fn bad_flag_exits_2() {
 
 #[test]
 fn a_v1_mode_invocation_is_rejected_with_a_migration_hint() {
-    // agentd 2.0 removed the mode drivers; `--mode` is a retired flag (exit 2).
+    // agentd removed the mode drivers; `--mode` is a retired flag (exit 2).
     let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
         .args([

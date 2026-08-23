@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd 2.0 **chaos matrix** (RFC 0025 §5–§7, the durability contract): a
+//! agentd **chaos matrix** (RFC 0025 §5–§7, the durability contract): a
 //! workflow run is SIGKILLed at each of the runtime's durable-write kill points
 //! (`AGENTD_TEST_KILL_AT`), and the next life must **restore and complete it
 //! exactly once** — never a lost run, never a double-executed effect. The store
@@ -42,7 +42,7 @@ fn chaos_config(mock_uri: &str) -> String {
         "f": {"kind": "finish", "depends_on": ["c"], "status": "completed", "output": "done"}
     }"#;
     write_config(&format!(
-        "config_version: \"2\"\nagent:\n  name: chaos\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock_uri}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: chain\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: warn\n"
+        "config_version: \"1\"\nagent:\n  name: chaos\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock_uri}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: chain\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: warn\n"
     ))
 }
 

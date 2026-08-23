@@ -251,6 +251,15 @@ export const DOCS = [
   { slug: "rfc-0033", file: "rfcs/0033-file-store-and-instance-identity.md", title: "0033 · File store & instance identity", group: "rfc-core" },
   { slug: "rfc-0034", file: "rfcs/0034-instruction-documents-and-directives.md", title: "0034 · Instruction documents & directives", group: "rfc-core" },
   { slug: "rfc-0035", file: "rfcs/0035-event-streams.md", title: "0035 · Event streams", group: "rfc-core", tag: "draft" },
+  {
+    slug: "rfc-0036",
+    file: "rfcs/0036-subagent-templates.md",
+    title: "0036 · Subagent templates & instance children",
+    group: "rfc-core",
+    tag: "draft",
+    blurb:
+      "Operator-declared subagent templates whose instruction is a full instance definition — spawn a supervised child desk with its own workflows, signals and streams; the model fills declared params only.",
+  },
   { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "0022 · Embedding & code tools", group: "rfc-core" },
   { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "0023 · AAuth agent identity", group: "rfc-core", tag: "draft" },
   { slug: "rfc-0024", file: "rfcs/0024-evaluation-harness.md", title: "0024 · Evaluation harness", group: "rfc-core" },

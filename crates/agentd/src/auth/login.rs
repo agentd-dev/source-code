@@ -45,10 +45,23 @@ pub fn resolve_auth<'a>(settings: &'a Settings, target: &str) -> Result<&'a Auth
             .as_ref()
             .ok_or_else(|| format!("mcp server '{name}' has no `auth:` block to log in with"));
     }
+    // RFC 0037: a service-catalog entry's shared credential.
+    if let Some(name) = target.strip_prefix("service:") {
+        let e = settings
+            .services
+            .get(name)
+            .ok_or_else(|| format!("no service named '{name}' in the services: catalog"))?;
+        return e
+            .auth
+            .as_ref()
+            .ok_or_else(|| format!("services.{name} has no `auth:` block to log in with"));
+    }
     Err(format!(
-        "unknown login target '{target}' (expected `intelligence` or `mcp:<name>`)"
+        "unknown login target '{target}' (expected `intelligence`, `mcp:<name>` or `service:<name>`)"
     ))
 }
+
+pub use super::canonical_target;
 
 /// Build the OAuth2 request params from a config `auth:` block, discovering the
 /// token / device endpoints from the `issuer` when they are not pinned.
@@ -158,6 +171,7 @@ pub fn tokens_to_cred(t: &oauth2::Tokens) -> CachedCred {
 /// with a stderr prompt + real sleep, and cache the token. Returns a one-line
 /// success message for stdout (never the token).
 pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<String, String> {
+    let target = &canonical_target(settings, target);
     let auth = resolve_auth(settings, target)?;
     // AWS IAM Identity Center (SSO): a distinct device flow → temporary AWS creds.
     if auth.kind == AuthKind::Aws {
@@ -205,6 +219,8 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.endpoint.clone())
+    } else if let Some(name) = target.strip_prefix("service:") {
+        settings.services.get(name).map(|e| e.endpoint.clone())
     } else {
         None
     };

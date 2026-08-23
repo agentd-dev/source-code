@@ -47,6 +47,28 @@ impl Runtime {
 
     /// The base persona + instruction block.
     pub(crate) fn system_prompt(&self, ctx: Option<&ContextState>, extra: Option<&str>) -> String {
+        self.system_prompt_cards(ctx, extra, None)
+    }
+
+    /// [`Runtime::system_prompt`] with an explicit card selection: `cards`
+    /// (a step-level `context: {cards: [...]}`) wins, else `context.cards`
+    /// from the config, else every card. The persona line and the instruction
+    /// are not cards — they are always present; cards are the *environment*
+    /// sections (workflows, skills, memory, services, streams, signals,
+    /// peers, templates) whose token cost is the operator's/node's to spend.
+    pub(crate) fn system_prompt_cards(
+        &self,
+        ctx: Option<&ContextState>,
+        extra: Option<&str>,
+        cards: Option<&[String]>,
+    ) -> String {
+        let config_cards = self.settings.context.cards.as_deref();
+        let on = |name: &str| -> bool {
+            match cards.or(config_cards) {
+                Some(list) => list.iter().any(|c| c == name),
+                None => true,
+            }
+        };
         let mut s = String::new();
         s.push_str(&format!(
             "You are {}, an autonomous, durable agent (agentd 2.0). You act by calling tools and reply when done. \
@@ -65,7 +87,7 @@ other tools come from connected MCP servers. Be concise and factual; never inven
             s.push('\n');
         }
         // Workflows the agent can start.
-        if !self.workflows.is_empty() {
+        if on("workflows") && !self.workflows.is_empty() {
             s.push_str("\n## Workflows\n");
             for w in self.workflows.values() {
                 s.push_str(&format!(
@@ -79,29 +101,203 @@ other tools come from connected MCP servers. Be concise and factual; never inven
             }
         }
         // Skills catalogue + loaded bodies.
-        if let Some(cat) = self.skills.render_catalogue() {
-            s.push('\n');
-            s.push_str(&cat);
-        }
-        if let Some(c) = ctx {
-            let bodies: Vec<&skills::SkillBody> = c
-                .skills
-                .iter()
-                .filter_map(|r| self.skills.body(&r.hash))
-                .collect();
-            if let Some(b) = skills::render_bodies(&bodies) {
+        if on("skills") {
+            if let Some(cat) = self.skills.render_catalogue() {
                 s.push('\n');
-                s.push_str(&b);
+                s.push_str(&cat);
+            }
+            if let Some(c) = ctx {
+                let bodies: Vec<&skills::SkillBody> = c
+                    .skills
+                    .iter()
+                    .filter_map(|r| self.skills.body(&r.hash))
+                    .collect();
+                if let Some(b) = skills::render_bodies(&bodies) {
+                    s.push('\n');
+                    s.push_str(&b);
+                }
             }
         }
+        // The environment cards (RFC 0036/0037 + the durable-event fabric):
+        // what this instance can reach, emit, park on and spawn — so the model
+        // reasons over its ACTUAL surroundings instead of guessing at them.
+        if on("services") {
+            s.push_str(&self.services_card());
+        }
+        if on("streams") {
+            s.push_str(&self.streams_card());
+        }
+        if on("signals") {
+            s.push_str(&self.signals_card());
+        }
+        if on("peers") {
+            s.push_str(&self.peers_card());
+        }
+        if on("templates") {
+            s.push_str(&self.templates_card());
+        }
         // Memory hint.
-        if let Ok(list) = self.memory_keys_hint()
+        if on("memory")
+            && let Ok(list) = self.memory_keys_hint()
             && !list.is_empty()
         {
             s.push_str(&format!(
                 "\n## Memory\nKeys you can read with memory.get: {}\n",
                 list.join(", ")
             ));
+        }
+        s
+    }
+
+    /// `## Services` — the catalog (RFC 0037): names, tags and ceilings; never
+    /// credentials. Empty string when there is no catalog.
+    fn services_card(&self) -> String {
+        if self.settings.services.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("\n## Services (the external services this deployment may use)\n");
+        for (name, e) in self.settings.services.iter().take(16) {
+            let tags: Vec<&str> = e
+                .tags
+                .values()
+                .flatten()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let mut line = format!("- {name}");
+            if !tags.is_empty() {
+                line.push_str(&format!(" [{}]", tags.join(", ")));
+            }
+            if let Some(allow) = &e.allow {
+                line.push_str(&format!(" — tools: {}", allow.join(", ")));
+            }
+            if let Some(r) = &e.rate {
+                line.push_str(&format!(" (rate {r})"));
+            }
+            s.push_str(&line);
+            s.push('\n');
+        }
+        if self.settings.security.egress == crate::config::v2::Egress::Closed {
+            s.push_str("Egress is CLOSED: only these services are reachable.\n");
+        }
+        s
+    }
+
+    /// `## Streams` — the durable event streams (RFC 0035) with live depths.
+    fn streams_card(&self) -> String {
+        if self.settings.streams.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from(
+            "\n## Streams (durable events; publish with an emit step, consume with a stream start)\n",
+        );
+        for name in self.settings.streams.keys().take(16) {
+            s.push_str(&format!("- {name}\n"));
+        }
+        s
+    }
+
+    /// `## Signals` — what runs are parked on right now, and what fired
+    /// recently: the instance's live coordination state.
+    fn signals_card(&self) -> String {
+        let mut waiting: Vec<String> = Vec::new();
+        for (rid, run) in &self.runs {
+            for (sid, st) in &run.steps {
+                if st.status == crate::engine::run::StepStatus::Suspended
+                    && let Some(w) = &st.wait
+                    && w["kind"] == "signal"
+                    && let Some(name) = w["signal"].as_str()
+                {
+                    waiting.push(format!("- waiting: {name} (run {rid}, step {sid})"));
+                }
+            }
+        }
+        waiting.truncate(16);
+        let recent: Vec<String> = self
+            .recent_signals
+            .keys()
+            .rev()
+            .take(8)
+            .map(|k| format!("- fired recently: {k}"))
+            .collect();
+        if waiting.is_empty() && recent.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from(
+            "\n## Signals (durable coordination; deliver with workflow.signal)\n",
+        );
+        for l in waiting.into_iter().chain(recent) {
+            s.push_str(&l);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// `## Peers` — configured A2A peers plus live instance children.
+    fn peers_card(&self) -> String {
+        let mut lines: Vec<String> = self
+            .settings
+            .a2a
+            .peers
+            .iter()
+            .take(16)
+            .map(|p| format!("- {}", p.name))
+            .collect();
+        for rec in self.subagents.values() {
+            if rec.tier.as_deref() == Some("instance")
+                && !super::reactor::is_terminal_status(&rec.status)
+            {
+                lines.push(format!(
+                    "- {} (instance child of template '{}', {})",
+                    rec.handle,
+                    rec.template.as_deref().unwrap_or("?"),
+                    rec.status
+                ));
+            }
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from(
+            "\n## Peers (agents reachable with a2a.send / a2a.delegate)\n",
+        );
+        for l in lines.into_iter().take(24) {
+            s.push_str(&l);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// `## Subagent templates` — what this agent may instantiate (RFC 0036),
+    /// with the declared params (the only holes it may fill).
+    fn templates_card(&self) -> String {
+        if self.settings.subagents.templates.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from(
+            "\n## Subagent templates (spawn with subagent.run {template, params})\n",
+        );
+        for (name, t) in self.settings.subagents.templates.iter().take(16) {
+            let machinery = t.instruction.lines().any(|l| l.trim_start().starts_with(":::"));
+            let tier = if machinery { "instance" } else { "flat" };
+            let params: Vec<String> = t
+                .params
+                .iter()
+                .map(|(p, spec)| {
+                    if spec.required {
+                        format!("{p} (required)")
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect();
+            let mut line = format!("- {name} ({tier})");
+            if !params.is_empty() {
+                line.push_str(&format!(" — params: {}", params.join(", ")));
+            }
+            s.push_str(&line);
+            s.push('\n');
         }
         s
     }

@@ -114,6 +114,28 @@ mod imp {
 }
 
 pub use imp::{classify_status, is_init, set_child_subreaper};
+
+/// Set in an RFC 0036 instance-tier child's environment by the spawning
+/// parent. The child daemon sees it at startup and installs
+/// [`install_instance_pdeathsig`] so a parent crash retires the child
+/// gracefully (SIGTERM → its own drain) instead of orphaning a daemon.
+pub const INSTANCE_CHILD_ENV: &str = "AGENTD_INSTANCE_CHILD";
+
+/// PDEATHSIG(SIGTERM) for an instance-tier child — set post-exec by the child
+/// itself (the pre-exec value would not survive the execve), mirroring the
+/// subagent's SIGKILL install in `subagent::control`. SIGTERM, not SIGKILL:
+/// a daemon child has durable state worth a graceful drain.
+pub fn install_instance_pdeathsig() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+        // The parent may have died in the fork/exec window: PDEATHSIG only
+        // fires on deaths AFTER it is installed.
+        if libc::getppid() == 1 {
+            libc::raise(libc::SIGTERM);
+        }
+    }
+}
 // `reap_pending` is the one process-global `waitpid(-1)`; it must be called ONLY
 // from `reaper::reap_and_dispatch` (under the routes lock), so a stray caller
 // can't reopen the reap-before-register race or steal another reactor's child.

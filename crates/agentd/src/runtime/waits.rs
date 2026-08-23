@@ -163,8 +163,9 @@ impl Runtime {
                 let mut args = json!({});
                 for k in [
                     "instruction",
+                    "template",
+                    "params",
                     "mode",
-                    "workflow",
                     "tools",
                     "servers",
                     "limits",
@@ -173,6 +174,7 @@ impl Runtime {
                     "output_contract",
                     "output_schema",
                     "skills",
+                    "durable",
                 ] {
                     if let Some(v) = spec.get(k) {
                         args[k] = v.clone();
@@ -691,6 +693,21 @@ impl Runtime {
         }
         // Signal start nodes.
         delivered += self.fire_signal_starts(name, &payload, target_run.is_none());
+        // RFC 0036 §6 `until_signal`: this signal IS the retirement trigger —
+        // stop admitting, drain live runs, exit cleanly. The signal still
+        // delivered to whatever was parked on it first (above), so an
+        // all-clear both completes the waiting run and retires the instance.
+        if self
+            .settings
+            .lifecycle
+            .until_signal
+            .as_deref()
+            .is_some_and(|u| u == name)
+        {
+            self.log
+                .info("lifecycle.until_signal", json!({"signal": name}));
+            self.begin_drain("until_signal");
+        }
         delivered
     }
 
@@ -911,15 +928,32 @@ impl Runtime {
         timeout: Duration,
         what: &str,
     ) -> Result<(crate::config::A2aEndpoint, crate::mcp::a2a_client::PeerAuth), String> {
-        let Some(peer) = self
+        let configured = self
             .settings
             .a2a
             .peers
             .iter()
             .find(|p| p.name == peer_name)
-            .cloned()
-        else {
-            return Err(format!("{what}: no such peer {peer_name:?} (a2a.peers)"));
+            .cloned();
+        // RFC 0036 Decision 6: live instance children ARE peers — by handle,
+        // or by template name for a singleton. Configured peers win the name.
+        let peer = match configured {
+            Some(p) => p,
+            None => match self.instance_peer_endpoint(peer_name) {
+                Some(endpoint) => crate::config::v2::A2aPeer {
+                    name: peer_name.to_string(),
+                    endpoint,
+                    headers: std::collections::BTreeMap::new(),
+                    client_cert: None,
+                    client_key: None,
+                    auth: None,
+                },
+                None => {
+                    return Err(format!(
+                        "{what}: no such peer {peer_name:?} (a2a.peers or a live instance child)"
+                    ));
+                }
+            },
         };
         let spec_v1 = crate::config::A2aPeerSpec {
             name: peer.name.clone(),

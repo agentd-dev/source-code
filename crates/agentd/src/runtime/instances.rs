@@ -1,0 +1,755 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! **Instance-tier children** (RFC 0036 §6): a template whose instruction
+//! defines machinery spawns a FULL DAEMON — the same binary, `-c` a composed
+//! config — under the supervisor's reaper, wired to the parent as an A2A peer
+//! over a unix socket, retired by `ttl`/`until`/`subagent.retire` through the
+//! child's own graceful drain. The composed document is structured data: RFC
+//! 0034 extraction ran once at boot (`config::templates`), params folded in as
+//! data, and the §8.2 guard refused any spawn whose params introduced
+//! machinery — so the child's own re-extraction at boot finds only prose.
+
+use super::reactor::{Runtime, SubagentRecord, is_terminal_status};
+use super::tools::ToolOutcome;
+use crate::config::templates::{
+    CompiledTemplate, Tier, compile_templates, fold_params, fold_params_value,
+    params_introduced_machinery, validate_params,
+};
+use crate::state::now_ms;
+use crate::supervisor::reap::Reaped;
+use serde_json::{Map, Value, json};
+use std::path::PathBuf;
+
+/// Extra grace past the child's own drain window before SIGKILL.
+const KILL_GRACE_MS: u64 = 5_000;
+
+impl Runtime {
+    /// `subagent.run` with an instance-tier template (RFC 0036 §6).
+    pub(crate) fn instance_run(
+        &mut self,
+        caller: &super::tools::ToolCaller,
+        tname: &str,
+        args: &Value,
+    ) -> ToolOutcome {
+        let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        // Caps (Decision 10) — heavier than flat workers, so their own family.
+        let live = self
+            .subagents
+            .values()
+            .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
+            .count() as u32;
+        let il = &self.settings.limits.subagents.instances;
+        let breadth = il.breadth.unwrap_or(2);
+        if live >= breadth {
+            return err(format!(
+                "subagent.run refused: {live} instance children live (limits.subagents.instances.breadth = {breadth})"
+            ));
+        }
+        let total = il.total.unwrap_or(8) as usize;
+        let lifetime = self
+            .subagents
+            .values()
+            .filter(|s| s.tier.as_deref() == Some("instance"))
+            .count();
+        if lifetime >= total {
+            return err(format!(
+                "subagent.run refused: {lifetime} instance children spawned (limits.subagents.instances.total = {total})"
+            ));
+        }
+        if !self.instance_bucket_take() {
+            return err(
+                "subagent.run refused: instance spawn rate exceeded (limits.subagents.instances.rate)"
+                    .into(),
+            );
+        }
+        if self.pressure.shedding() {
+            return err(format!(
+                "subagent.run refused: {} pressure (shedding new work; in-flight work drains)",
+                self.pressure.cause()
+            ));
+        }
+        let compiled = match compile_templates(&self.settings) {
+            Ok(c) => c,
+            Err(es) => return err(format!("subagent.run: template compile: {}", es.join("; "))),
+        };
+        let Some(t) = compiled.get(tname) else {
+            return err(format!("subagent.run: no template '{tname}'"));
+        };
+        debug_assert_eq!(t.tier, Tier::Instance);
+        if t.spec.singleton
+            && let Some(s) = self.subagents.values().find(|s| {
+                s.template.as_deref() == Some(tname) && !is_terminal_status(&s.status)
+            })
+        {
+            return err(format!(
+                "subagent.run refused: template '{tname}' is a singleton and '{}' is live (retire it first)",
+                s.handle
+            ));
+        }
+        let params = match validate_params(
+            &t.spec.params,
+            args.get("params").unwrap_or(&Value::Null),
+        ) {
+            Ok(p) => p,
+            Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
+        };
+        let prose = fold_params(&t.cleaned, &params);
+        if params_introduced_machinery(&prose) {
+            return err(format!(
+                "subagent.run refused: params for template '{tname}' introduced directive machinery (RFC 0036 §8.2)"
+            ));
+        }
+        let handle = self.next_id("inst");
+        let dir = self.instance_dir(&handle);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return err(format!("subagent.run: create {}: {e}", dir.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let socket = instance_socket_path(&dir, &handle);
+        let until = t
+            .spec
+            .until
+            .as_ref()
+            .map(|u| fold_params(u, &params))
+            .filter(|u| !u.trim().is_empty());
+        // Durability class (call site > template > store.durability.work):
+        // non-durable ⇒ memory-only record, child on a memory store, no
+        // restore-respawn — the throwaway war-room shape.
+        let durable = args
+            .get("durable")
+            .and_then(Value::as_bool)
+            .or(t.spec.durable)
+            .unwrap_or_else(|| self.work_durable_default());
+        let doc = match self.compose_instance_doc(
+            t,
+            &prose,
+            &params,
+            &dir,
+            &socket,
+            until.as_deref(),
+            durable,
+        ) {
+            Ok(d) => d,
+            Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
+        };
+        // The composed document must be a bootable config NOW — a child that
+        // exits 2 on its first breath is a refusal we can make synchronously.
+        if let Err(e) = validate_composed(&doc) {
+            return err(format!("subagent.run: template '{tname}' composes an invalid config: {e}"));
+        }
+        let config_path = dir.join("config.json");
+        let rendered = serde_json::to_string_pretty(&doc).unwrap_or_default();
+        if let Err(e) = std::fs::write(&config_path, rendered) {
+            return err(format!("subagent.run: write {}: {e}", config_path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+        }
+        let retire_at = t.spec.ttl.map(|d| now_ms() + d.0.as_millis() as u64);
+        let mut record = SubagentRecord {
+            handle: handle.clone(),
+            instruction: prose.clone(),
+            mode: "detached".into(),
+            status: "spawned".into(),
+            attempt: 1,
+            result: None,
+            error: None,
+            requested_by: Some(
+                json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": 0}),
+            ),
+            tokens: 0,
+            created: now_ms(),
+            updated: now_ms(),
+            payload: None,
+            template: Some(tname.to_string()),
+            tier: Some("instance".into()),
+            pid: None,
+            config_path: Some(config_path.display().to_string()),
+            socket: Some(socket.clone()),
+            retire_at,
+            retiring_since: None,
+            durable,
+            node: None,
+            dirty: true,
+        };
+        match self.spawn_instance_process(&config_path, &dir, &t.spec.limits) {
+            Ok(pid) => {
+                record.pid = Some(pid);
+                record.status = "running".into();
+                self.log.info(
+                    "instance.spawn",
+                    json!({"handle": handle, "template": tname, "pid": pid,
+                           "socket": socket, "retire_at": retire_at, "until": until,
+                           "singleton": t.spec.singleton}),
+                );
+                self.subagents.insert(handle.clone(), record);
+                self.persist_subagent(&handle);
+                ToolOutcome::Ready(
+                    json!({"handle": handle, "status": "running", "tier": "instance",
+                           "peer": handle, "socket": socket}),
+                    false,
+                )
+            }
+            Err(e) => {
+                record.status = "failed".into();
+                record.error = Some(format!("spawn: {e}"));
+                self.subagents.insert(handle.clone(), record);
+                self.persist_subagent(&handle);
+                err(format!("subagent.run: instance spawn failed: {e}"))
+            }
+        }
+    }
+
+    /// Compose the child's settings document (RFC 0036 §6): frozen machinery +
+    /// folded prose + inherited intelligence/catalog + parent-owned store,
+    /// listener and lifecycle. Structured data end to end.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_instance_doc(
+        &self,
+        t: &CompiledTemplate,
+        prose: &str,
+        params: &Map<String, Value>,
+        dir: &std::path::Path,
+        socket: &str,
+        until: Option<&str>,
+        durable: bool,
+    ) -> Result<Value, String> {
+        let mut doc = t.fragment.clone();
+        if !doc.is_object() {
+            doc = json!({});
+        }
+        fold_params_value(&mut doc, params);
+        doc["config_version"] = json!("2");
+        let agent = doc
+            .as_object_mut()
+            .expect("object")
+            .entry("agent")
+            .or_insert_with(|| json!({}));
+        agent["name"] = json!(format!("{}/{}", self.instance, t.name));
+        agent["instruction"] = json!(prose);
+        // Machinery workflows join whatever a `:::config` block declared.
+        let mut wfs = t.workflows.clone();
+        for w in &mut wfs {
+            fold_params_value(w, params);
+        }
+        let list = doc
+            .as_object_mut()
+            .expect("object")
+            .entry("workflows")
+            .or_insert_with(|| json!([]));
+        if let Some(a) = list.as_array_mut() {
+            a.extend(wfs);
+        }
+        // Parent-owned composition: store, listener, lifecycle, security.
+        doc["store"] = if durable {
+            json!({"kind": "file", "file": {"path": dir.join("state").display().to_string()}})
+        } else {
+            json!({"kind": "memory"})
+        };
+        let mut a2a = json!({"listen": format!("unix://{socket}")});
+        if let Some(peer) = self.parent_peer_entry() {
+            a2a["peers"] = json!([peer]);
+        }
+        doc["a2a"] = a2a;
+        let mut lifecycle = json!({});
+        if let Some(u) = until {
+            lifecycle["until_signal"] = json!(u);
+        }
+        doc["lifecycle"] = lifecycle;
+        // The child inherits the parent's catalog and egress posture (RFC 0037
+        // Decision 5) and its trifecta override; a template cannot set these
+        // (REFUSED_FRAGMENT_KEYS).
+        if let Some(services) = self.settings_doc.get("services") {
+            doc["services"] = services.clone();
+        }
+        let mut security = json!({});
+        if self.settings.security.allow_trifecta {
+            security["allow_trifecta"] = json!(true);
+        }
+        if self.settings.security.egress == crate::config::v2::Egress::Closed {
+            security["egress"] = json!("closed");
+        }
+        if let Some(ca) = &self.settings.security.tls_ca {
+            security["tls_ca"] = json!(ca);
+        }
+        if security.as_object().is_some_and(|o| !o.is_empty()) {
+            doc["security"] = security;
+        }
+        // Intelligence: the parent's section, minus its budget (the child's
+        // budget is the template's grant) and minus any INLINE token (the env
+        // passthrough carries it; a secret REFERENCE rides along fine).
+        let mut intel = self
+            .settings_doc
+            .get("intelligence")
+            .cloned()
+            .unwrap_or(json!({}));
+        if let Some(o) = intel.as_object_mut() {
+            o.remove("budget");
+            if let Some(tok) = o.get("token").and_then(Value::as_str)
+                && !crate::sec::secret::has_secret_ref(tok)
+            {
+                o.remove("token");
+            }
+        }
+        if let Some(m) = &t.spec.model {
+            intel["model"] = json!(m);
+        }
+        if let Some(b) = &t.spec.budget {
+            intel["budget"] = b.clone();
+        }
+        doc["intelligence"] = intel;
+        Ok(doc)
+    }
+
+    /// The child's `parent` peer entry — only when the parent has a listener,
+    /// and never carrying an inline credential into a file on disk.
+    fn parent_peer_entry(&self) -> Option<Value> {
+        let listen = self.settings.a2a.listen.as_deref()?;
+        let endpoint = if let Some(rest) = listen
+            .strip_prefix("unix://")
+            .or_else(|| listen.strip_prefix("unix:"))
+        {
+            format!("unix://{rest}")
+        } else {
+            // A bind authority (possibly 0.0.0.0) → a dialable loopback URL.
+            listen
+                .replace("0.0.0.0", "127.0.0.1")
+                .replace("[::]", "[::1]")
+        };
+        let mut peer = json!({"name": "parent", "endpoint": endpoint});
+        if let Some(bearer) = &self.settings.a2a.bearer {
+            if crate::sec::secret::has_secret_ref(&bearer.0) {
+                peer["headers"] =
+                    json!({"Authorization": format!("Bearer {}", bearer.0)});
+            } else {
+                // An inline bearer must not be written to the child's config
+                // file; over a unix listener SO_PEERCRED covers same-uid
+                // children anyway.
+                self.log.warn(
+                    "instance.parent_peer",
+                    json!({"note": "a2a.bearer is inline (not a {{secret:…}} reference); the child gets no credential for its `parent` peer"}),
+                );
+            }
+        }
+        Some(peer)
+    }
+
+    /// Spawn the child daemon: same binary, `--config <path>`, config-alias env
+    /// scrubbed (the composed file is the child's whole config; only the
+    /// intelligence family passes through for credentials), own process group,
+    /// template rlimits, log to `<dir>/log`.
+    fn spawn_instance_process(
+        &mut self,
+        config_path: &std::path::Path,
+        dir: &std::path::Path,
+        limits: &Option<Value>,
+    ) -> Result<i32, String> {
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("log"))
+            .map_err(|e| format!("open log: {e}"))?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--config")
+            .arg(config_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(
+                log_file.try_clone().map_err(|e| e.to_string())?,
+            ))
+            .stderr(std::process::Stdio::from(log_file));
+        for (k, _) in std::env::vars() {
+            let alias = k.starts_with("AGENTD_") || k.starts_with("AGENT_");
+            let keep = k.contains("INTELLIGENCE");
+            if alias && !keep {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
+        let (memory_bytes, cpu_seconds) = parse_instance_rlimits(limits)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(b) = memory_bytes {
+                        let lim = libc::rlimit {
+                            rlim_cur: b,
+                            rlim_max: b,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(c) = cpu_seconds {
+                        let lim = libc::rlimit {
+                            rlim_cur: c,
+                            rlim_max: c + 5,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_CPU, &lim) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = crate::supervisor::reaper::spawn_tracked_pid(&self.children.reap_sender(), || {
+            cmd.spawn()
+        })
+        .map_err(|e| e.to_string())?;
+        let pid = child.id() as i32;
+        // The reaper owns the exit; the std handle would only race it.
+        std::mem::forget(child);
+        Ok(pid)
+    }
+
+    /// The per-tick maintenance pass: `ttl` retirement and the SIGTERM→SIGKILL
+    /// escalation for children that ignored the drain.
+    pub(crate) fn instances_tick(&mut self) {
+        let now = now_ms();
+        let drain_ms = self.settings.lifecycle.drain_timeout().as_millis() as u64;
+        let mut to_persist = Vec::new();
+        let mut retire = Vec::new();
+        let mut kill = Vec::new();
+        for s in self.subagents.values() {
+            if s.tier.as_deref() != Some("instance") || is_terminal_status(&s.status) {
+                continue;
+            }
+            match s.retiring_since {
+                None => {
+                    if s.retire_at.is_some_and(|at| now >= at) {
+                        retire.push((s.handle.clone(), "ttl"));
+                    }
+                }
+                Some(since) if now >= since + drain_ms + KILL_GRACE_MS => {
+                    kill.push(s.handle.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for (h, why) in retire {
+            self.retire_instance(&h, why);
+        }
+        for h in kill {
+            if let Some(s) = self.subagents.get_mut(&h)
+                && let Some(pid) = s.pid
+            {
+                self.log
+                    .warn("instance.kill", json!({"handle": h, "pid": pid, "note": "drain window elapsed"}));
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+                if let Some(s) = self.subagents.get_mut(&h) {
+                    s.retiring_since = Some(now); // reset the clock; the reap closes it
+                    to_persist.push(h.clone());
+                }
+            }
+        }
+        for h in to_persist {
+            self.persist_subagent(&h);
+        }
+    }
+
+    /// Begin graceful retirement: SIGTERM to the child's process group — the
+    /// child daemon drains its own runs and exits; the reap closes the record.
+    pub(crate) fn retire_instance(&mut self, handle: &str, why: &str) -> bool {
+        let Some(s) = self.subagents.get_mut(handle) else {
+            return false;
+        };
+        if s.tier.as_deref() != Some("instance") || is_terminal_status(&s.status) {
+            return false;
+        }
+        let Some(pid) = s.pid else {
+            return false;
+        };
+        if s.retiring_since.is_none() {
+            s.retiring_since = Some(now_ms());
+            s.status = "retiring".into();
+            s.dirty = true;
+            self.log
+                .info("instance.retire", json!({"handle": handle, "pid": pid, "why": why}));
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+            self.persist_subagent(handle);
+        }
+        true
+    }
+
+    /// A reaped pid that is not a control-channel child: an instance child
+    /// exited. Close the record; the pending-poll resolves any `subagent.await`.
+    pub(crate) fn on_instance_reaped(&mut self, r: &Reaped) -> bool {
+        let Some(handle) = self
+            .subagents
+            .values()
+            .find(|s| s.pid == Some(r.pid) && !is_terminal_status(&s.status))
+            .map(|s| s.handle.clone())
+        else {
+            return false;
+        };
+        let (status, error) = match (&r.outcome, self.subagents[&handle].retiring_since) {
+            (_, Some(_)) => ("retired", None),
+            (crate::supervisor::reap::WaitOutcome::Exited(0), None) => ("completed", None),
+            (crate::supervisor::reap::WaitOutcome::Exited(c), None) => {
+                ("failed", Some(format!("exit {c}")))
+            }
+            (crate::supervisor::reap::WaitOutcome::Signaled(sig), None) => {
+                ("crashed", Some(format!("signal {sig}")))
+            }
+        };
+        if let Some(s) = self.subagents.get_mut(&handle) {
+            s.status = status.into();
+            s.error = error;
+            s.result = Some(json!({"tier": "instance", "socket": s.socket, "config": s.config_path}));
+            s.updated = now_ms();
+            s.dirty = true;
+        }
+        self.log.info(
+            "instance.exited",
+            json!({"handle": handle, "pid": r.pid, "status": status}),
+        );
+        self.persist_subagent(&handle);
+        true
+    }
+
+    /// Restore-time respawn (RFC 0036 §6): live instance records whose config
+    /// still exists come back — their state is durable and their identity is
+    /// the handle. PDEATHSIG killed them with the old parent.
+    pub(crate) fn respawn_restored_instances(&mut self) {
+        let candidates: Vec<(String, String, Option<Value>)> = self
+            .subagents
+            .values()
+            .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
+            .filter_map(|s| {
+                s.config_path
+                    .clone()
+                    .map(|c| (s.handle.clone(), c, None))
+            })
+            .collect();
+        for (handle, config, limits) in candidates {
+            let path = PathBuf::from(&config);
+            let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            if !path.exists() {
+                if let Some(s) = self.subagents.get_mut(&handle) {
+                    s.status = "failed".into();
+                    s.error = Some("config lost across restart".into());
+                }
+                self.persist_subagent(&handle);
+                continue;
+            }
+            match self.spawn_instance_process(&path, &dir, &limits) {
+                Ok(pid) => {
+                    if let Some(s) = self.subagents.get_mut(&handle) {
+                        s.pid = Some(pid);
+                        s.status = "running".into();
+                        s.attempt += 1;
+                        s.retiring_since = None;
+                    }
+                    self.log
+                        .info("instance.respawn", json!({"handle": handle, "pid": pid}));
+                    self.persist_subagent(&handle);
+                }
+                Err(e) => {
+                    if let Some(s) = self.subagents.get_mut(&handle) {
+                        s.status = "failed".into();
+                        s.error = Some(format!("respawn: {e}"));
+                    }
+                    self.persist_subagent(&handle);
+                }
+            }
+        }
+    }
+
+    /// `subagent.send` to an instance child (RFC 0036 §5): the message rides
+    /// A2A over the child's unix socket and lands in its conversation surface.
+    /// Fire-and-forget from the reactor's view (a thread does the dial).
+    pub(crate) fn instance_send(&mut self, handle: &str, message: &str) -> ToolOutcome {
+        let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        let Some(s) = self.subagents.get(handle) else {
+            return err(format!("no such subagent {handle:?}"));
+        };
+        if is_terminal_status(&s.status) {
+            return err(format!("instance {handle:?} is not running ({})", s.status));
+        }
+        let Some(sock) = s.socket.clone() else {
+            return err(format!("instance {handle:?} has no A2A socket"));
+        };
+        #[cfg(feature = "a2a")]
+        {
+            let endpoint = match crate::config::A2aEndpoint::parse(&format!("unix://{sock}")) {
+                Ok(e) => e,
+                Err(e) => return err(format!("instance {handle:?}: {e}")),
+            };
+            let parts = json!([{"text": message}]);
+            let log = self.log.clone();
+            let h = handle.to_string();
+            std::thread::Builder::new()
+                .name(format!("inst.send:{handle}"))
+                .spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    match crate::mcp::a2a_client::send(
+                        &endpoint,
+                        Default::default(),
+                        &parts,
+                        None,
+                        None,
+                        deadline,
+                    ) {
+                        Ok(_) => log.info("instance.send", json!({"handle": h})),
+                        Err(e) => log.warn("instance.send", json!({"handle": h, "err": e})),
+                    }
+                })
+                .ok();
+            ToolOutcome::Ready(json!({"ok": true, "handle": handle, "delivery": "async"}), false)
+        }
+        #[cfg(not(feature = "a2a"))]
+        {
+            let _ = (message, &sock);
+            err(format!(
+                "instance {handle:?}: subagent.send to an instance child needs --features a2a"
+            ))
+        }
+    }
+
+    /// The A2A peer view of live instance children (RFC 0036 Decision 6): the
+    /// handle is the peer name; a `singleton: true` template's name is an
+    /// alias. Consulted by `a2a_peer_conn` after configured peers (its only
+    /// caller, hence the gate).
+    #[cfg(feature = "a2a")]
+    pub(crate) fn instance_peer_endpoint(&self, name: &str) -> Option<String> {
+        self.subagents
+            .values()
+            .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
+            .find(|s| {
+                s.handle == name
+                    || (s.template.as_deref() == Some(name)
+                        && self
+                            .settings
+                            .subagents
+                            .templates
+                            .get(name)
+                            .is_some_and(|t| t.singleton))
+            })
+            .and_then(|s| s.socket.as_ref().map(|sock| format!("unix://{sock}")))
+    }
+
+    fn instance_bucket_take(&mut self) -> bool {
+        static BUCKET: std::sync::Mutex<Option<crate::supervisor::tree::TokenBucket>> =
+            std::sync::Mutex::new(None);
+        let mut g = BUCKET.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            let rate = self
+                .settings
+                .limits
+                .subagents
+                .instances
+                .rate
+                .clone()
+                .unwrap_or_else(|| "4/1h".into());
+            let (burst, per_s) =
+                crate::supervisor::tree::parse_rate(&rate).unwrap_or((4, 3600.0));
+            *g = Some(crate::supervisor::tree::TokenBucket::new(
+                burst,
+                f64::from(burst) / per_s,
+            ));
+        }
+        g.as_mut().map(|b| b.try_take()).unwrap_or(true)
+    }
+
+    fn instance_dir(&self, handle: &str) -> PathBuf {
+        crate::config::v2::file_store_root(&self.settings.store)
+            .join("subagents")
+            .join(handle)
+    }
+
+    fn persist_subagent(&mut self, handle: &str) {
+        if let Some(s) = self.subagents.get(handle)
+            && s.durable
+        {
+            let _ = self.durable.put(
+                crate::state::Kind::Subagent,
+                handle,
+                serde_json::to_value(s).unwrap_or(Value::Null),
+                None,
+            );
+        }
+        if let Some(s) = self.subagents.get_mut(handle) {
+            s.dirty = false;
+        }
+    }
+}
+
+/// Instance rlimits: `{memory, cpu}` only (compile enforced it; parse here).
+fn parse_instance_rlimits(limits: &Option<Value>) -> Result<(Option<u64>, Option<u64>), String> {
+    let Some(l) = limits else {
+        return Ok((None, None));
+    };
+    let memory = match l.get("memory").and_then(Value::as_str) {
+        None => None,
+        Some(m) => Some(
+            crate::runtime::pressure::parse_bytes(m).map_err(|e| format!("limits.memory: {e}"))?,
+        ),
+    };
+    let cpu = match l.get("cpu").and_then(Value::as_str) {
+        None => None,
+        Some(c) => Some(
+            crate::config::parse_duration(c)
+                .map_err(|e| format!("limits.cpu: {e}"))?
+                .as_secs()
+                .max(1),
+        ),
+    };
+    Ok((memory, cpu))
+}
+
+/// The unix-socket path — kept under the sun path limit (~108 bytes) by
+/// falling back to the temp dir for deep state roots.
+fn instance_socket_path(dir: &std::path::Path, handle: &str) -> String {
+    let p = dir.join("a2a.sock");
+    let s = p.display().to_string();
+    if s.len() <= 100 {
+        s
+    } else {
+        std::env::temp_dir()
+            .join(format!("agentd-{handle}.sock"))
+            .display()
+            .to_string()
+    }
+}
+
+/// Boot the composed document through the same typing + resolution +
+/// validation a config file gets. Errors are the aggregate report.
+fn validate_composed(doc: &Value) -> Result<(), String> {
+    let mut settings = crate::config::v2::Settings::from_document(doc.clone(), "template")
+        .map_err(|e| e.to_string())?;
+    let res = crate::config::v2::resolve_services(&mut settings);
+    let loaded = crate::config::v2::Loaded {
+        settings,
+        doc: doc.clone(),
+        file_doc: doc.clone(),
+        files: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let diags = crate::config::v2::validate(&loaded);
+    let mut errs = res;
+    errs.extend(diags.errors);
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
+}

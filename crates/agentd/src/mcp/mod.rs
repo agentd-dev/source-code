@@ -53,8 +53,14 @@ pub fn from_spec(
     #[cfg(feature = "oauth")]
     let signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>> = if let Some(a) = &spec.auth
     {
-        crate::auth::device::signer_for(a, &format!("mcp:{}", spec.name), timeout)
-            .map_err(McpError::Transport)?
+        // RFC 0037: a catalog-referencing server caches its credential under
+        // `service:<entry>` so every consumer shares one login; standalone
+        // servers keep the per-server `mcp:<name>` key.
+        let target = match &spec.service {
+            Some(svc) => format!("service:{svc}"),
+            None => format!("mcp:{}", spec.name),
+        };
+        crate::auth::device::signer_for(a, &target, timeout).map_err(McpError::Transport)?
     } else if let Some(o) = &spec.oauth {
         Some(
             std::sync::Arc::new(oauth::OAuthBearerSigner::new(o.clone(), timeout))

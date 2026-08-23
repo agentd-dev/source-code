@@ -17,6 +17,7 @@
 //! reload trigger).
 
 pub mod directives;
+pub mod templates;
 pub mod envfile;
 pub mod file;
 pub mod paths;
@@ -396,6 +397,12 @@ pub struct McpServerSpec {
     /// legacy `oauth`/`aauth` when set. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthSpec>,
+    /// The `services:` catalog entry this server references (RFC 0037): the
+    /// credential cache key becomes `service:<name>` so every consumer of the
+    /// entry shares one cached login, and the per-instance `rate:` bucket is
+    /// keyed by it. Travels in the spawn payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
 }
 
 /// The runtime shape of an MCP server's OAuth 2.1 client-credentials config
@@ -2571,10 +2578,12 @@ fn apply_config_file(
             headers,
             tags,
             aauth: s.aauth,
-            // OAuth client-credentials + the unified `auth:` block are v2-only
-            // surfaces (RFC 0031); the legacy v1 path never carried them.
+            // OAuth client-credentials + the unified `auth:` block + the
+            // service catalog are v2-only surfaces (RFC 0031/0037); the legacy
+            // v1 path never carried them.
             oauth: None,
             auth: None,
+            service: None,
         });
     }
     c.subscribe.extend(cf.subscribe);

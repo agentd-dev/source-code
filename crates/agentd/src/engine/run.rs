@@ -186,8 +186,18 @@ pub struct RunState {
     pub finished: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u64>,
+    /// Durability class, resolved at creation from the workflow (default
+    /// true). `false` ⇒ this run is memory-only: the checkpoint skips it and
+    /// a restart forgets it — the fast path for recomputable work. Restored
+    /// records (all durable by construction) default true.
+    #[serde(default = "default_durable")]
+    pub durable: bool,
     #[serde(skip)]
     pub dirty: bool,
+}
+
+fn default_durable() -> bool {
+    true
 }
 
 impl RunState {
@@ -235,6 +245,7 @@ impl RunState {
             updated: now,
             finished: None,
             deadline_ms: wf.limits.deadline_ms.map(|d| now + d),
+            durable: wf.durable.unwrap_or(true),
             dirty: true,
         }
     }

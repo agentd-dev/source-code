@@ -32,6 +32,15 @@ impl Runtime {
 
     /// Load the configured workflows (inline / file / uri) + runtime-created
     /// ones from the store. Errors are collected (a bad definition is refused).
+    /// Resolve a parsed definition's durability class against the store
+    /// default (`store.durability.work`): an explicit `durable:` wins; absent,
+    /// `ephemeral` deployments run everything memory-only.
+    pub(crate) fn fill_durable_default(&self, w: &mut crate::engine::model::Workflow) {
+        if w.durable.is_none() {
+            w.durable = Some(self.work_durable_default());
+        }
+    }
+
     pub(crate) fn load_workflows(&mut self) -> Result<(), Vec<String>> {
         let mut errs = Vec::new();
         // A `{dir}` entry expands into one entry per matching file BEFORE
@@ -161,8 +170,9 @@ impl Runtime {
             let mut resolved = resolved;
             substitute_config_vars(&mut resolved, &self.settings.vars, "workflow", &mut errs);
             match parse_workflow(&resolved) {
-                Ok(w) => {
-                    self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
+                Ok(mut w) => {
+                    self.fill_durable_default(&mut w);
+                    self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
                     self.workflows
                         .insert(w.name.clone(), std::sync::Arc::new(w));
                 }
@@ -185,7 +195,8 @@ impl Runtime {
                     && let Some(def) = env.state.get("value")
                 {
                     match parse_workflow(def) {
-                        Ok(w) => {
+                        Ok(mut w) => {
+                            self.fill_durable_default(&mut w);
                             self.log.info(
                                 "workflow.loaded",
                                 json!({"name": w.name, "source": "store"}),
@@ -231,6 +242,28 @@ impl Runtime {
                         errs.push(format!("workflow {:?} step {:?}: {k} is unavailable (map it with tools.overrides or configure its server)", w.name, s.id));
                     }
                     _ => {}
+                }
+            }
+        }
+        // Mixed durability is legal but has one sharp edge worth a loud line:
+        // a DURABLE parent step waiting on a NON-durable child run resumes
+        // after a restart to find the run gone (the wait fails with "run does
+        // not exist"). Say so at load, where the shape is still a choice.
+        for w in self.workflows.values() {
+            if w.durable == Some(false) {
+                continue;
+            }
+            for st in w.steps.values() {
+                if st.kind == "workflow"
+                    && st.field_str("mode").unwrap_or("sync") != "detached"
+                    && let Some(target) = st.field_str("name")
+                    && self.workflows.get(target).is_some_and(|t| t.durable == Some(false))
+                {
+                    self.log.warn(
+                        "workflow.durability_mix",
+                        json!({"workflow": w.name, "step": st.id, "child": target,
+                               "note": "a durable parent waits on a non-durable child; after a restart the wait fails (the child run does not survive)"}),
+                    );
                 }
             }
         }
@@ -469,13 +502,17 @@ impl Runtime {
             .get("task")
             .and_then(Value::as_str)
             .map(str::to_string);
-        // Durable before anything runs.
-        if let Err(e) = self.durable.put(
-            Kind::Run,
-            &run_id,
-            serde_json::to_value(&run).unwrap_or(Value::Null),
-            Some(w.hash.clone()),
-        ) {
+        // Durable before anything runs — unless the workflow opted out of the
+        // class entirely (`durable: false`): a memory-only run writes nothing,
+        // here or at any checkpoint.
+        if run.durable
+            && let Err(e) = self.durable.put(
+                Kind::Run,
+                &run_id,
+                serde_json::to_value(&run).unwrap_or(Value::Null),
+                Some(w.hash.clone()),
+            )
+        {
             self.log.error(
                 "run.create.fail",
                 json!({"workflow": name, "err": e.to_string()}),
@@ -1459,6 +1496,13 @@ impl Runtime {
                     .unwrap_or("")
                     .to_string();
                 let args = spec.get("args").cloned().unwrap_or(json!({}));
+                // RFC 0037 §4: pace calls toward a rated catalog service. A dry
+                // bucket is a step failure (a refusal the workflow's `retry:`
+                // can absorb), never a hang.
+                if let Err(e) = self.service_rate_take(&server) {
+                    self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                    return;
+                }
                 let Some(client) = self.mcp.get(&server).cloned() else {
                     self.finish_step(
                         run_id,
@@ -1819,8 +1863,31 @@ impl Runtime {
                 }
             }
         }
-        // `context`: seed messages.
-        if let Some(seed) = spec.get("context").and_then(Value::as_array) {
+        // `context`: seed messages — a bare array, or the object form
+        // `{cards: [...], seed: [...]}` where `cards` controls which
+        // environment sections THIS step's system prompt carries (node-level
+        // context control; the config's `context.cards` is the default).
+        let step_cards: Option<Vec<String>> = spec
+            .get("context")
+            .and_then(Value::as_object)
+            .and_then(|o| o.get("cards"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
+        let seed_list = spec
+            .get("context")
+            .and_then(Value::as_array)
+            .or_else(|| {
+                spec.get("context")
+                    .and_then(Value::as_object)
+                    .and_then(|o| o.get("seed"))
+                    .and_then(Value::as_array)
+            });
+        if let Some(seed) = seed_list {
             for m in seed {
                 match (m["role"].as_str(), m["content"].as_str()) {
                     (Some("system"), Some(c)) => messages.push(Msg::system(c)),
@@ -1892,7 +1959,7 @@ impl Runtime {
                     "your conclusion"
                 }
             ),
-            None => self.system_prompt(None, extra.as_deref()),
+            None => self.system_prompt_cards(None, extra.as_deref(), step_cards.as_deref()),
         };
         let (tools, internal, routes) = if is_think {
             (Vec::new(), Vec::new(), BTreeMap::new())
@@ -2608,8 +2675,12 @@ impl Runtime {
             }
         }
         for id in drop {
+            // A non-durable run has nothing in the store to evict.
+            let was_durable = self.runs.get(&id).is_none_or(|r| r.durable);
             self.runs.remove(&id);
-            if let Err(e) = self.durable.delete(crate::state::Kind::Run, &id) {
+            if was_durable
+                && let Err(e) = self.durable.delete(crate::state::Kind::Run, &id)
+            {
                 self.log
                     .warn("run.evict.fail", json!({"run": id, "err": e.to_string()}));
                 continue;
@@ -3022,7 +3093,8 @@ impl Runtime {
                 let def = args["definition"].clone();
                 match parse_workflow(&def) {
                     Err(e) => err(format!("{name}: {}", e.join("; "))),
-                    Ok(w) => {
+                    Ok(mut w) => {
+                        self.fill_durable_default(&mut w);
                         if name == "workflow.create" && self.workflows.contains_key(&w.name) {
                             return err(format!(
                                 "workflow {:?} exists (use workflow.update)",

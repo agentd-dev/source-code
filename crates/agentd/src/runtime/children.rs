@@ -131,6 +131,12 @@ impl Children {
     pub fn has_pid(&self, pid: i32) -> bool {
         self.pid_to_node.contains_key(&pid)
     }
+    /// The reap channel — for supervised children spawned OUTSIDE this
+    /// registry (RFC 0036 instance-tier daemons, which have no control
+    /// channel) whose exits must still route to this reactor.
+    pub fn reap_sender(&self) -> Sender<Reaped> {
+        self.reap_tx.clone()
+    }
     /// Join `pid`'s stdout reader — after this, all its frames are queued.
     pub fn join_reader_of(&mut self, pid: i32) {
         if let Some(node) = self.pid_to_node.get(&pid)

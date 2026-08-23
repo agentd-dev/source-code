@@ -154,6 +154,26 @@ the config value. And code-registered (embedder) tools sit outside the accountin
 inserted with `Grant::all()` and an empty tag vector (`registry/mod.rs:244`), so an
 embedder whose native tool does egress or reads secrets defeats the budget silently.
 
+### The tag floor and closed egress (RFC 0037)
+
+Tags being config-only leaves one hole: the *author* of a config (or of an RFC
+0036 template) could point a server at the billing system and simply not write
+`sensitive` — the gate then reasons soundly from a false premise. The
+`services:` catalog closes it: an entry binds an endpoint to authoritative
+tags, and any MCP declaration whose endpoint matches the entry gets those tags
+**unioned in before the gate runs** — referencing or inline, unconditionally.
+Under-tagging a catalogued endpoint is now impossible rather than undetected.
+`security.egress: closed` extends the catalog from authority to allow-list:
+an outbound MCP dial (and a caller-registered A2A push target) whose URL
+matches no entry is refused — at boot for configured servers and template
+machinery, at registration for push. There is deliberately no in-config
+exception list: the way to allow an endpoint is to catalog it, which is
+exactly the reviewable event it should be. What the catalog does **not**
+bind: where a *compromised MCP server* can reach (network egress policy stays
+complementary — the entry list is what makes those rules derivable), and the
+Phase-B surfaces (`intelligence.endpoints`, `a2a.peers`, the `http`
+step/store), which `--validate-config` names out loud when `closed` is set.
+
 ## The injection firewall
 
 The defense that does the real work is process isolation plus a distilled return. A

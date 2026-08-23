@@ -595,11 +595,18 @@ fn redact_by_schema(v: &Value, node: &Value, defs: &Value) -> Value {
         None => node,
     };
     // A `oneOf` describes the same value several ways; a value is only as public
-    // as its least public reading, so every branch gets to redact.
+    // as its least public reading, so every branch gets to redact — and then the
+    // node's OWN siblings still apply (McpServer's endpoint-xor-service `oneOf`
+    // only constrains `required`; the secrets live in the sibling `properties`).
     if let Some(alts) = node.get("oneOf").and_then(Value::as_array) {
-        return alts
+        let folded = alts
             .iter()
             .fold(v.clone(), |acc, alt| redact_by_schema(&acc, alt, defs));
+        let mut rest = node.clone();
+        if let Some(o) = rest.as_object_mut() {
+            o.remove("oneOf");
+        }
+        return redact_by_schema(&folded, &rest, defs);
     }
     if is_secret_node(node) {
         return redact_value(v);
@@ -1746,6 +1753,18 @@ impl Runtime {
         };
         let allow_private = self.settings.a2a.push.allow_private;
         if let Err(e) = crate::a2a::push::check_url(&target.url, allow_private) {
+            return err_obj(
+                ::mcp::rpc::INVALID_PARAMS,
+                &format!("push url refused: {e}"),
+            );
+        }
+        // RFC 0037 §5: in `closed` mode a caller-chosen push target must ALSO
+        // match the service catalog — two locks, one door.
+        if let Err(e) = crate::config::v2::egress_allows(
+            &self.settings.services,
+            self.settings.security.egress,
+            &target.url,
+        ) {
             return err_obj(
                 ::mcp::rpc::INVALID_PARAMS,
                 &format!("push url refused: {e}"),

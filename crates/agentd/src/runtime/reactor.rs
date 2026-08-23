@@ -157,10 +157,39 @@ pub struct SubagentRecord {
     /// The payload (secret-free) for restore re-spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    /// RFC 0036: the template this child was instantiated from, and its tier
+    /// (`flat` | `instance`). Freeform spawns carry neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Instance tier: the child daemon's pid, config path, A2A socket and
+    /// (epoch-ms) retire-at deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_at: Option<u64>,
+    /// Instance tier: set when retirement began (SIGTERM sent); the tick
+    /// escalates to SIGKILL after the drain window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retiring_since: Option<u64>,
+    /// Durability class (default true). `false` ⇒ the record is memory-only:
+    /// never persisted, never restore-respawned — the fast path for throwaway
+    /// workers. Restored records (all persisted by construction) default true.
+    #[serde(default = "record_durable_default")]
+    pub durable: bool,
     #[serde(skip)]
     pub node: Option<NodeId>,
     #[serde(skip)]
     pub dirty: bool,
+}
+
+fn record_durable_default() -> bool {
+    true
 }
 
 /// The current instruction (RFC 0028 §3 `instruction.*`).
@@ -333,6 +362,15 @@ pub struct Runtime {
 
 impl Runtime {
     /// A fresh id (turn ids, handles).
+    /// The deployment's default durability class for work (runs + subagent
+    /// records): `store.durability.work: ephemeral` ⇒ false.
+    pub(crate) fn work_durable_default(&self) -> bool {
+        !matches!(
+            self.settings.store.durability.work,
+            Some(crate::config::v2::WorkDurability::Ephemeral)
+        )
+    }
+
     pub(crate) fn next_id(&mut self, prefix: &str) -> String {
         self.seq += 1;
         format!("{prefix}-{}", self.seq)
@@ -433,6 +471,9 @@ impl Runtime {
             for (node, health) in self.children.tick() {
                 self.on_unhealthy_child(node, health);
             }
+            // 9b. Instance-tier children (RFC 0036): ttl retirement + the
+            // SIGTERM→SIGKILL escalation for children that ignored the drain.
+            self.instances_tick();
             // 10. Checkpoints + the point-in-time observability gauges (§3.11).
             self.checkpoint(false);
             crate::obs::metrics::set_inbox_pending(self.inbox_queue.len() as u64);
@@ -820,6 +861,11 @@ impl Runtime {
             let _ = self.events_tx.send(Event::Reaped(r));
             return;
         }
+        // RFC 0036: an instance-tier daemon child has no control channel and
+        // no node — its exit closes the record directly.
+        if !self.children.has_pid(r.pid) && self.on_instance_reaped(&r) {
+            return;
+        }
         let Some((node, child)) = self.children.on_reaped(&r) else {
             return;
         };
@@ -1143,6 +1189,13 @@ impl Runtime {
         let mut failed: Option<String> = None;
         for run in self.runs.values_mut() {
             if run.dirty {
+                // A non-durable run (workflow `durable: false`, or the
+                // `store.durability.work: ephemeral` default) is memory-only:
+                // no serialization, no write, gone after a restart.
+                if !run.durable {
+                    run.dirty = false;
+                    continue;
+                }
                 crate::state::kill_point("step.before_done");
                 match self.durable.put(
                     Kind::Run,
@@ -1160,6 +1213,10 @@ impl Runtime {
         }
         for s in self.subagents.values_mut() {
             if s.dirty {
+                if !s.durable {
+                    s.dirty = false;
+                    continue;
+                }
                 match self.durable.put(
                     Kind::Subagent,
                     &s.handle,
@@ -1266,7 +1323,7 @@ impl Runtime {
 pub(crate) fn is_terminal_status(s: &str) -> bool {
     matches!(
         s,
-        "completed" | "failed" | "cancelled" | "refused" | "killed" | "crashed"
+        "completed" | "failed" | "cancelled" | "refused" | "killed" | "crashed" | "retired"
     )
 }
 

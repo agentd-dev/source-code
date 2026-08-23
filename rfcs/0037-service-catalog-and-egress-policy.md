@@ -1,6 +1,6 @@
 # RFC 0037: Service catalog and egress policy
 
-**Status:** Draft
+**Status:** Phase A implemented (the `services:` catalog, `service:` references with narrowing, the unconditional tag floor, `security.egress: closed` over MCP dials + A2A push targets, catalog inheritance into RFC 0036 children, `agentd login service:<name>`, effective-surface output in `--validate-config`); Phases B–C draft — see the implementation notes at the end
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the configuration surface (RFC 0030); hardens the trifecta gate's inputs (RFC 0012 §3); credentials ride RFC 0031; the recommended posture for template-bearing deployments (RFC 0036 §8).
@@ -279,7 +279,24 @@ validate` prints the effective tool surface and tag set per consumer
   credentials resolve; this RFC owns *where they are named and who may
   use them*.
 
-## 10. Cross-references
+## 10. Implementation notes (Phase A, as shipped)
+
+- **`rate:` paces this process's workflow `mcp.tool` steps.** A dry bucket is
+  a step *failure* (a refusal the workflow's `retry:` absorbs), never a hang.
+  Two honest bounds: model-initiated MCP calls run inside per-turn worker
+  processes and are not paced in Phase A, and rate changes take a restart
+  (the buckets are process-lifetime, the spawn-bucket precedent). §4's
+  "shared by every consumer of the entry in this process" is exactly what
+  shipped, no more.
+- **Login canonicalization**: `agentd login mcp:<name>` on a referencing
+  server canonicalizes to `service:<entry>` (as does `--logout`), so the
+  cached credential always lands under the key the connect path reads.
+- **Dial-time enforcement** is boot validation for configured servers and
+  template machinery, a startup-loop backstop before any socket, and a
+  registration-time check for A2A push targets. The `closed`-mode uncovered
+  surfaces (§5 Phase B) are named in a validation warning, not implied away.
+
+## 11. Cross-references
 
 RFC 0012 (trifecta gate — consumes effective tags) · RFC 0017/0030
 (config schema, merge, reload classes) · RFC 0019 (cross-instance

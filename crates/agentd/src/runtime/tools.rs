@@ -656,7 +656,9 @@ impl Runtime {
             "ask_human" => self.ask_human_tool(caller, args),
             // ---- subagents ----
             "subagent.run" | "subagent.send" | "subagent.kill" | "subagent.status"
-            | "subagent.await" | "subagent.list" => self.subagent_tool(caller, name, args),
+            | "subagent.await" | "subagent.list" | "subagent.retire" => {
+                self.subagent_tool(caller, name, args)
+            }
             // ---- workflows ----
             "workflow.run" | "workflow.list" | "workflow.status" | "workflow.cancel"
             | "workflow.wait" | "workflow.create" | "workflow.update" | "workflow.delete"
@@ -960,6 +962,47 @@ impl Runtime {
     /// An executor thread answered a child's mapped/MCP request.
     pub(crate) fn on_tool_done(&mut self, node: NodeId, req: u64, result: Value, is_error: bool) {
         self.reply_tool(node, req, result, is_error);
+    }
+
+    /// RFC 0037 §4 `rate:` — the per-instance pacing bucket toward a
+    /// catalogued service, shared by every consumer of the entry in this
+    /// process. `Ok(())` when the server maps to no rated entry or a token was
+    /// available; `Err(msg)` (a refusal, never a crash) when the bucket is dry.
+    pub(crate) fn service_rate_take(&self, server: &str) -> Result<(), String> {
+        let Some(srv) = self.settings.mcp.servers.iter().find(|s| s.name == server) else {
+            return Ok(());
+        };
+        let named = match &srv.service {
+            Some(n) => self.settings.services.get(n).map(|e| (n.clone(), e)),
+            None => crate::config::v2::service_match(&self.settings.services, &srv.endpoint)
+                .map(|(n, e)| (n.clone(), e)),
+        };
+        let Some((name, entry)) = named else {
+            return Ok(());
+        };
+        let Some(rate) = entry.rate.clone() else {
+            return Ok(());
+        };
+        // Process-lifetime buckets keyed by service (the spawn-bucket pattern);
+        // a reload that changes a rate takes effect on restart.
+        static BUCKETS: std::sync::Mutex<
+            Option<std::collections::HashMap<String, crate::supervisor::tree::TokenBucket>>,
+        > = std::sync::Mutex::new(None);
+        let (burst, per_s) = crate::supervisor::tree::parse_rate(&rate)
+            .map_err(|e| format!("services.{name}.rate: {e}"))?;
+        let mut g = BUCKETS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(std::collections::HashMap::new);
+        let b = map.entry(name.clone()).or_insert_with(|| {
+            crate::supervisor::tree::TokenBucket::new(burst, f64::from(burst) / per_s)
+        });
+        if b.try_take() {
+            Ok(())
+        } else {
+            let retry = (per_s / f64::from(burst.max(1))).ceil().max(1.0) as u32;
+            Err(format!(
+                "service '{name}' rate exceeded (services.{name}.rate: {rate} paces this instance); retry in ~{retry}s"
+            ))
+        }
     }
 }
 

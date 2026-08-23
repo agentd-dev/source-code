@@ -601,13 +601,17 @@ pub const KINDS: &[KindInfo] = &[
         true,
         false,
     ),
+    // RFC 0036: `template`/`params` instantiate a declared subagents.template;
+    // the vestigial `workflow` field (v1 in-child driver, silently ignored
+    // since its removal) is gone — Decision 11.
     k(
         "subagent",
         false,
         &[
             "instruction",
+            "template",
+            "params",
             "mode",
-            "workflow",
             "tools",
             "servers",
             "limits",
@@ -616,8 +620,9 @@ pub const KINDS: &[KindInfo] = &[
             "output_contract",
             "output_schema",
             "skills",
+            "durable",
         ],
-        &["instruction"],
+        &[],
         true,
         false,
     ),
@@ -892,6 +897,13 @@ pub struct Workflow {
     /// Retirement policy for live runs (`unload: {policy, timeout}`).
     #[serde(default)]
     pub unload: Unload,
+    /// Durability class: `Some(false)` ⇒ runs of this workflow are memory-only
+    /// (no checkpoints, gone after a restart — the fast path for recomputable
+    /// work); `Some(true)` ⇒ durable even under `store.durability.work:
+    /// ephemeral`. `None` in a freshly parsed document; the loader resolves it
+    /// against the store's default before the definition is armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<bool>,
     /// Declared run variables: `{key: {type, reducer}}`.
     ///
     /// Optional, and the point is to make concurrent writes a DECLARED policy
@@ -1086,6 +1098,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         "uri",
         "priority",
         "unload",
+        "durable",
     ];
     for key in obj.keys() {
         if !TOP.contains(&key.as_str()) {
@@ -1291,12 +1304,21 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
             }
         }
     }
+    let durable = match obj.get("durable") {
+        None => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(other) => {
+            errs.push(format!("workflow durable must be a boolean (got {other})"));
+            None
+        }
+    };
     let mut wf = Workflow {
         state,
         name,
         version,
         priority,
         unload,
+        durable,
         description: obj
             .get("description")
             .and_then(Value::as_str)
@@ -1600,6 +1622,29 @@ fn parse_step(
         "a2a.send" => {
             if spec.get("args").is_some() && spec.get("command").is_none() {
                 errs.push(format!("{at}: `args` needs `command`"));
+            }
+        }
+        // RFC 0036: a subagent step needs a definition — freeform prose or a
+        // declared template, never both, never neither.
+        "subagent" => {
+            match (spec.get("instruction").is_some(), spec.get("template").is_some()) {
+                (false, false) => errs.push(format!(
+                    "{at}: needs `instruction` (freeform) or `template` (a subagents.templates entry)"
+                )),
+                (true, true) => errs.push(format!(
+                    "{at}: `instruction` and `template` are mutually exclusive"
+                )),
+                _ => {}
+            }
+            if spec.get("params").is_some() && spec.get("template").is_none() {
+                errs.push(format!("{at}: `params` needs `template`"));
+            }
+            for k in ["tools", "servers"] {
+                if spec.get(k).is_some() && spec.get("template").is_some() {
+                    errs.push(format!(
+                        "{at}: `{k}` may not be combined with `template` — the template defines the grant"
+                    ));
+                }
             }
         }
         // `emit` publishes to a stream when `stream:` is present (RFC 0035);
@@ -2205,6 +2250,7 @@ pub fn workflow_schema() -> Value {
             "version": {"const": 3},
             "description": {"type": "string"},
             "armed": {"type": "boolean", "default": true},
+            "durable": {"type": "boolean", "description": "false = runs are memory-only (no checkpoints, gone after a restart) — the fast path for recomputable work; absent = the store.durability.work default (durable)"},
             "inputs": {"type": "object", "properties": {"schema": {"type": "object"}}},
             "outputs": {"type": "object", "properties": {"schema": {"type": "object"}}},
             "state": {"type": "object", "additionalProperties": {"type": "object",

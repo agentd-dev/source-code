@@ -146,7 +146,8 @@ fn top_level_properties(
                             "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal runs" },
                             "ttl": duration } } } },
                     "durability": { "type": "object", "additionalProperties": false, "properties": {
-                        "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] } } },
+                        "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] },
+                        "work": { "enum": ["durable", "ephemeral"], "description": "default durability CLASS for runs + subagent records: ephemeral = nothing persists unless a workflow/spawn says durable: true (the fast path); default durable" } } },
                     "on_error": { "enum": ["halt", "degrade"] },
                     "audit": { "type": "boolean" },
                     "timeout": duration
@@ -162,7 +163,9 @@ fn top_level_properties(
                 "compact_at": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
                 "keep_last": { "type": "integer", "minimum": 0 },
                 "model_window": { "type": "integer", "minimum": 1, "description": "the model's context window in tokens (overrides the value inferred from intelligence.model)" },
-                "plan": { "type": "object", "additionalProperties": false, "properties": { "max_items": { "type": "integer", "minimum": 1 } } } } }));
+                "plan": { "type": "object", "additionalProperties": false, "properties": { "max_items": { "type": "integer", "minimum": 1 } } },
+                "cards": { "type": "array", "items": { "enum": ["workflows", "skills", "memory", "services", "streams", "signals", "peers", "templates"] },
+                           "description": "which environment cards the system prompt carries; unset = all — a node overrides per step with context: {cards: [...]}" } } }));
     m.insert("knowledge".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "server": { "type": "string" },
                 "auto_context": { "type": "object", "additionalProperties": false, "properties": {
@@ -184,6 +187,11 @@ fn top_level_properties(
                 "max_events": { "type": "integer", "minimum": 1 },
                 "max_age": { "type": "string" } } } } } }),
     );
+    m.insert(
+        "services".to_string(),
+        json!({ "type": "object", "additionalProperties": { "$ref": "#/$defs/Service" },
+                "description": "the service catalog (RFC 0037): the named external services this deployment may use; mcp.servers entries reference entries via `service:` and may only narrow them" }),
+    );
     m.insert("vars".to_string(), json!({ "type": "object", "additionalProperties": true,
                 "description": "operator-defined constants; reference anywhere (and in workflows) as {{config.NAME}} — dotted paths reach nested values, unresolved references refuse startup" }));
     m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline dialect-3 definitions or {name, file|uri} references" }));
@@ -193,7 +201,9 @@ fn top_level_properties(
                     "steps": { "type": "integer", "minimum": 1 }, "tokens": { "type": "integer", "minimum": 1 }, "deadline": duration } },
                 "subagents": { "type": "object", "additionalProperties": false, "properties": {
                     "depth": { "type": "integer", "minimum": 0 }, "breadth": { "type": "integer", "minimum": 1 },
-                    "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string", "description": "`<burst>/<per>s`, e.g. `8/2s`" } } },
+                    "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string", "description": "`<burst>/<per>s`, e.g. `8/2s`" },
+                    "instances": { "type": "object", "additionalProperties": false, "description": "instance-tier children (RFC 0036): defaults 2 live / 8 lifetime / 4/1h", "properties": {
+                        "breadth": { "type": "integer", "minimum": 1 }, "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string" } } } } },
                 "inline_max_bytes": { "type": "integer", "minimum": 1 },
                 "step_timeout": duration,
                 "workflow": { "type": "object", "additionalProperties": false, "properties": {
@@ -204,7 +214,18 @@ fn top_level_properties(
                 "drain_timeout": duration,
                 "run_id": { "type": "string" },
                 "exit_code_map": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 255 }, "description": "remap the policy exit codes (3/7 only): {\"3\": N, \"7\": N}" },
-                "watch_config": { "type": "boolean" } } }));
+                "watch_config": { "type": "boolean" },
+                "until_signal": { "type": "string", "description": "delivery of this signal begins graceful shutdown — the RFC 0036 instance-child retirement trigger" } } }));
+    m.insert("subagents".to_string(), json!({ "type": "object", "additionalProperties": false,
+                "description": "subagent templates + spawn policy (RFC 0036): operator-declared definitions the model may instantiate, filling declared params only",
+                "properties": {
+                "allow_freeform": { "type": "boolean", "description": "false = templates are the ONLY spawn path (freeform flat-tier instruction spawns are refused); default true" },
+                "defaults": { "type": "object", "additionalProperties": false, "description": "applied to every spawn unless overridden at the template or call site", "properties": {
+                    "model": { "type": "string" }, "priority": { "enum": ["low", "normal", "high"] },
+                    "mode": { "enum": ["sync", "async", "detached", "warm"] },
+                    "limits": { "type": "object", "additionalProperties": true },
+                    "durable": { "type": "boolean", "description": "default durability class for spawns (false = memory-only records)" } } },
+                "templates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/SubagentTemplate" } } } }));
     m.insert("a2a".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev)" },
                 "tls": { "type": "object", "additionalProperties": false, "properties": {
@@ -273,7 +294,8 @@ fn top_level_properties(
                     "allow": { "type": "array", "items": { "type": "string" }, "description": "allow-listed command names (argv[0])" },
                     "workdir": { "type": "string" }, "timeout": duration,
                     "max_output": { "type": "integer" },
-                    "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } } } }));
+                    "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
+                "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused (RFC 0037 §5); default open" } } }));
 }
 
 fn defs_properties(
@@ -290,9 +312,12 @@ fn defs_properties(
                 "reset": { "type": "string", "pattern": "^[0-9]{2}:[0-9]{2}Z$", "description": "calendar-window reset time (UTC), e.g. 00:00Z" } } }));
     m.insert("Pricing".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "input_per_1k": { "type": "number", "minimum": 0 }, "output_per_1k": { "type": "number", "minimum": 0 }, "currency": { "type": "string" } } }));
-    m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
+    m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name"],
+                "oneOf": [ { "required": ["endpoint"] }, { "required": ["service"] } ],
+                "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
                 "endpoint": { "type": "string" },
+                "service": { "type": "string", "description": "reference a services: catalog entry — inherit its connection settings (restating endpoint/auth/headers is refused) and narrow its tool ceiling (RFC 0037)" },
                 "ns": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "description": "tool namespace prefix (`ns.tool`)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } } },
@@ -370,6 +395,43 @@ fn defs_properties(
                 "grants": { "type": "array", "items": { "type": "string" } },
                 "quotas": { "type": "object", "additionalProperties": false, "properties": {
                     "rate": { "type": "string" }, "budget": budget } } } }));
+    m.insert("SubagentTemplate".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["instruction"],
+                "description": "an operator-declared subagent definition (RFC 0036): `instruction` is a full RFC 0034 document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
+                "properties": {
+                "instruction": { "type": "string", "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives" },
+                "params": { "type": "object", "additionalProperties": { "$ref": "#/$defs/ParamSpec" }, "description": "the ONLY holes the model may fill, schema-validated at spawn" },
+                "servers": { "type": "array", "items": { "type": "string" }, "description": "flat tier: narrowing server grants from the parent's set" },
+                "tools": { "type": "array", "items": { "type": "string" }, "description": "flat tier: narrowing tool grants" },
+                "limits": { "type": "object", "additionalProperties": true, "description": "flat tier: the per-spawn limits object; instance tier: OS caps only (memory, cpu)" },
+                "mode": { "enum": ["sync", "async", "detached", "warm"], "description": "instance tier supports detached only (phase A)" },
+                "model": { "type": "string" }, "priority": { "enum": ["low", "normal", "high"] },
+                "skills": { "type": "array", "items": { "type": "string" } },
+                "context": { "type": "array", "items": { "type": "object" } },
+                "output_contract": { "type": "string" }, "output_schema": { "type": "object", "additionalProperties": true },
+                "budget": budget,
+                "ttl": { "type": ["string", "integer"], "description": "instance tier: retire after this long (graceful drain)" },
+                "until": { "type": "string", "description": "instance tier: a signal name (templated over params) whose delivery in the child retires it" },
+                "singleton": { "type": "boolean", "description": "one live child; its A2A peer alias is the template name" },
+                "durable": { "type": "boolean", "description": "false = memory-only record (an instance child runs on a memory store; no restore-respawn); absent = the store.durability.work default" } } }));
+    m.insert("ParamSpec".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
+                "type": { "enum": ["string", "number", "integer", "boolean"] },
+                "required": { "type": "boolean" },
+                "default": {},
+                "enum": { "type": "array" },
+                "description": { "type": "string" } } }));
+    m.insert("Service".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
+                "description": "a service-catalog entry (RFC 0037 §4): connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
+                "properties": {
+                "kind": { "enum": ["mcp"], "description": "phase A: mcp only (intelligence/peer/http reserved)" },
+                "endpoint": { "type": "string", "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)" },
+                "headers": string_map,
+                "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } },
+                          "description": "authoritative — unioned into any consumer whose endpoint matches, referencing or inline, open or closed" },
+                "allow": { "type": "array", "items": { "type": "string" }, "description": "the CEILING: the widest advertised-tool surface any consumer may get" },
+                "exclude": { "type": "array", "items": { "type": "string" }, "description": "never admitted, unioned into every consumer (beats allow)" },
+                "auth": { "$ref": "#/$defs/Auth" },
+                "rate": { "type": "string", "description": "per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`)" },
+                "timeout": duration } }));
     m.insert("A2aPeer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }, "endpoint": { "type": "string" },
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },

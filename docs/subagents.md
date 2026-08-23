@@ -302,6 +302,74 @@ restart. One further hazard: handle sequence numbers reset to zero on every star
 while restored records keep their `sub-N` handles, so a fresh handle can collide
 with and overwrite a restored record.
 
+## Templates and the instance tier (RFC 0036)
+
+The `subagents:` config section turns "what a worker here looks like" into an
+operator-declared, reviewable definition the model may *instantiate* but never
+author:
+
+```yaml
+subagents:
+  allow_freeform: true        # false = templates are the ONLY spawn path
+  defaults: {model: small-fast, priority: low}   # applied when nothing else set
+  templates:
+    researcher:                       # FLAT: no machinery in the instruction
+      instruction: "Research {{params.topic}}; reply with a source-linked brief."
+      params: {topic: {type: string, required: true}}
+      servers: [search]               # narrowing grants from the parent's set
+      mode: sync
+    incident-room:                    # INSTANCE: machinery ⇒ a child daemon
+      instruction: |
+        You are the war room for {{params.id}}.
+        :::workflow
+        name: on-update
+        version: 3
+        steps:
+          cmd: {kind: a2a, command: incident.update, roles: [agent, operator]}
+          f:   {kind: finish, depends_on: [cmd], status: completed, output: "..."}
+        :::
+      params: {id: {type: string, required: true}}
+      budget: {windows: [{per: day, tokens: 200000}], on_exhausted: refuse}
+      ttl: 3d                         # graceful retirement triggers
+      until: "closed/{{params.id}}"   # …or this signal delivered IN the child
+```
+
+One resolution rule, two tiers. A template whose instruction carries **no
+config-defining directives** spawns the flat worker described above — same
+chokepoint, same caps, the template's `servers`/`tools`/`limits`/`mode`
+merging under the call site's. A template that defines machinery
+(`:::workflow`, `:::mcp`, `:::stream`, `:::config`, `:::tools`) spawns an
+**instance-tier child**: a full agentd daemon composed by the parent (its own
+workflows, signal parks, streams, schedules, file store under the parent's
+state dir), supervised and reaped like any child, and auto-wired as an **A2A
+peer over a unix socket** — the spawn's `output.peer` is a name `a2a.send` /
+`a2a.delegate` accept immediately, so typed commands to the child work from
+the first tick. `singleton: true` additionally aliases the template name to
+the one live child and refuses a second spawn.
+
+The spawn call is `subagent.run {template, params}` (or the `subagent` step
+with `template:`/`params:`). Params are the **only** holes the model fills:
+schema-validated at the chokepoint (type/enum/required, defaults applied),
+folded into the definition as *data* — never re-parsed for directives; a
+param value that would introduce a `:::` fence refuses the spawn. Everything
+that can be judged earlier is: extraction runs once at the parent's boot,
+where a template that composes the lethal trifecta, points at an
+uncatalogued endpoint under `security.egress: closed` (RFC 0037), declares a
+webhook start, or tries to define `webhooks:`/`a2a:`/`security:`/`store:`
+sections refuses the parent's startup with the template named.
+
+Instance children retire gracefully — `ttl:` elapsing, the `until:` signal
+arriving in the child, `subagent.retire {handle}`, or the parent's own
+shutdown (a parent death delivers SIGTERM via PDEATHSIG) all take the same
+path: the child stops admitting, drains its runs within its
+`lifecycle.drain_timeout`, checkpoints and exits; SIGKILL only after the
+drain window. The record closes as `retired`, `subagent.await` resolves, and
+the child's store directory remains on disk as the audit trail. Across a
+parent restart, live instance children are respawned from their composed
+config — their state is durable and their identity is the handle. Caps are
+their own family: `limits.subagents.instances.{breadth, total, rate}`
+(defaults 2 live / 8 lifetime / `4/1h`).
+
 ## When not to use a subagent
 
 **When the parent needs the raw material.** Delegation is lossy by construction.
@@ -358,8 +426,15 @@ calls are pushed onto the interface feed, so display clients see them.
 
 | Tool | Notes |
 |---|---|
-| `subagent.run` | `instruction` required; `mode`, `servers`, `limits`, `context`, `output_contract`, `output_schema`, `tools` optional. `workflow` and `skills` are accepted by the schema and ignored. |
-| `subagent.send` | Warm only; refuses a non-warm or non-running handle. |
+| `subagent.run` | `instruction` (freeform) or `template` + `params` (RFC 0036) — one or the other, never both; `mode`, `limits`, `context`, `output_contract`, `output_schema` optional; `servers`/`tools` only without `template` (the template defines the grant). |
+| `subagent.send` | Warm subagents only — except instance-tier children, where the message rides A2A over the child's socket into its conversation surface. |
+| `subagent.retire` | Instance children only: begin graceful retirement (drain → clean exit); SIGKILL only after the drain window. |
+
+`durable: false` on a spawn (call site, template, `subagents.defaults`, or the
+deployment-wide `store.durability.work: ephemeral`) makes the record
+memory-only: never persisted, never restore-respawned — the fast path for
+throwaway workers. A non-durable **instance child** additionally runs on a
+memory store and is not respawned after a parent restart.
 | `subagent.status` | Status, mode, result, error, tokens. Safe to poll. |
 | `subagent.await` | Returns immediately if already terminal; `timeout` ignored. |
 | `subagent.kill` | Graceful cancel; marks the record `cancelled` at once. |

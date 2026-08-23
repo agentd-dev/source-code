@@ -5,6 +5,69 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Added
+
+- **The service catalog & egress policy (RFC 0037 Phase A).** A top-level
+  `services:` section names the external services a deployment may use — one
+  shared RFC 0031 credential per entry (`agentd login service:<name>`),
+  **authoritative trifecta tags** (an unconditional floor for any MCP server
+  whose endpoint matches, so under-tagging cannot launder a sensitive
+  endpoint past the gate), a tool-surface ceiling consumers can only narrow
+  (`mcp.servers[].service:` references inherit connection settings and may
+  not restate them), and per-instance `rate:` pacing of workflow `mcp.tool`
+  steps. `security.egress: closed` refuses any MCP dial or A2A push target
+  whose URL matches no entry; `--validate-config` prints each consumer's
+  effective endpoint, admission lists and tags.
+- **Subagent templates & instance-tier children (RFC 0036 Phase A).** A
+  `subagents:` section with operator-declared `templates:` whose
+  `instruction` is a full RFC 0034 document, section-wide `defaults:`, and
+  `allow_freeform: false` to make templates the only spawn path. One
+  resolution rule, two tiers: no machinery ⇒ the existing flat worker
+  (template fields merge under the call site's); machinery
+  (`:::workflow`/`:::mcp`/`:::stream`/`:::config`/`:::tools`) ⇒ an
+  **instance-tier child** — a full agentd daemon composed by the parent
+  (own workflows, signals, streams, file store), supervised and reaped,
+  auto-wired as an A2A peer over a unix socket (`output.peer` works with
+  `a2a.send`/`a2a.delegate` immediately), retired by `ttl:`/`until:` (a
+  signal delivered in the child; `lifecycle.until_signal`) or
+  `subagent.retire` through the child's own graceful drain, respawned after
+  a parent restart, and capped by `limits.subagents.instances.*`. The model
+  fills declared, schema-checked `params` only — extraction runs once at
+  boot on operator text, params fold in as data, and a param value that
+  would introduce a directive fence refuses the spawn.
+- **Environment cards in the model's context.** The system prompt now
+  carries what the instance can actually reach and park on: `## Services`
+  (catalog + closed-egress note), `## Streams`, `## Signals` (waits parked
+  right now + recently fired), `## Peers` (configured + live instance
+  children), and `## Subagent templates` (with declared params) — selectable
+  with `context.cards:` in config and per node via the `agent`/`think`
+  step's `context: {cards: […], seed: […]}` object form.
+
+- **Durability classes — the fast path for recomputable work.** A workflow
+  can opt out of persistence entirely with `durable: false` (runs are
+  memory-only: no run record, no checkpoints, forgotten by a restart — the
+  dominant per-step cost gone), a subagent spawn/template takes the same
+  knob (`durable: false` = no record, no restore-respawn; a non-durable
+  instance child runs on a memory store), and `store.durability.work:
+  ephemeral` flips the deployment default with `durable: true` opting
+  individual workflows back in. The default is unchanged: durable. Mixed
+  shapes get a load-time warning (a durable parent waiting on a non-durable
+  child fails its wait after a restart); the inbox, tasks, memory and
+  credentials stay durable regardless of class.
+
+### Changed
+
+- The `subagent` node/tool: `template` + `params` instantiate a declared
+  template (`instruction` and `template` are mutually exclusive;
+  `tools`/`servers` are refused with `template` — the template defines the
+  grant); the vestigial `workflow` field — accepted and silently ignored
+  since the v1 in-child driver was removed — is gone from the registry.
+- `subagent.send` to an instance-tier child delivers over its A2A socket
+  into the child's conversation; `subagent.retire` begins graceful
+  retirement (SIGKILL only after the drain window).
+
 ## v2.7.0 — the event-driven company
 
 agentd becomes an event-driven agent, and the docs prove it with a company:

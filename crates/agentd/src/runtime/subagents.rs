@@ -35,6 +35,15 @@ impl Runtime {
             "subagent.send" => {
                 let handle = args["handle"].as_str().unwrap_or("").to_string();
                 let message = args["message"].as_str().unwrap_or("").to_string();
+                // RFC 0036: an instance-tier child receives over its A2A
+                // socket — the message lands in its conversation surface.
+                if self
+                    .subagents
+                    .get(&handle)
+                    .is_some_and(|s| s.tier.as_deref() == Some("instance"))
+                {
+                    return self.instance_send(&handle, &message);
+                }
                 let Some(node) = self.subagents.get(&handle).and_then(|s| s.node) else {
                     return err(format!("subagent {handle:?} is not running"));
                 };
@@ -49,6 +58,27 @@ impl Runtime {
                     ToolOutcome::Ready(json!({"ok": true, "handle": handle}), false)
                 } else {
                     err(format!("subagent {handle:?}: send failed"))
+                }
+            }
+            "subagent.retire" => {
+                // RFC 0036 §6: begin graceful retirement of an instance child
+                // (SIGTERM → the child drains its own runs and exits cleanly).
+                let handle = args["handle"].as_str().unwrap_or("").to_string();
+                match self.subagents.get(&handle) {
+                    None => err(format!("no such subagent {handle:?}")),
+                    Some(s) if s.tier.as_deref() != Some("instance") => err(format!(
+                        "subagent {handle:?} is not an instance-tier child (use subagent.kill for flat workers)"
+                    )),
+                    Some(_) => {
+                        if self.retire_instance(&handle, "subagent.retire") {
+                            ToolOutcome::Ready(
+                                json!({"ok": true, "handle": handle, "status": "retiring"}),
+                                false,
+                            )
+                        } else {
+                            err(format!("subagent {handle:?} is not retirable (already terminal?)"))
+                        }
+                    }
                 }
             }
             "subagent.kill" => {
@@ -100,9 +130,22 @@ impl Runtime {
         }
     }
 
-    /// `subagent.run`: caps → durable record → spawn (RFC 0026 §6).
+    /// `subagent.run`: caps → durable record → spawn (RFC 0026 §6). A
+    /// `template:` reference (RFC 0036) resolves first — flat templates merge
+    /// into the args below; instance templates take the daemon-child path.
     fn subagent_run(&mut self, caller: &ToolCaller, args: &Value) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        let (eff_args, tmeta) = match self.resolve_spawn_args(args) {
+            Ok(x) => x,
+            Err(e) => return err(e),
+        };
+        if let Some((tname, tier)) = &tmeta
+            && tier == "instance"
+        {
+            let tname = tname.clone();
+            return self.instance_run(caller, &tname, &eff_args);
+        }
+        let args = &eff_args;
         let instruction = args["instruction"]
             .as_str()
             .unwrap_or("")
@@ -279,7 +322,12 @@ impl Runtime {
             intelligence: IntelConfig {
                 uri: self.intel_uri.clone(),
                 token: self.current_intel_bearer(),
-                model: Some(self.model.clone()),
+                // RFC 0036: a template/defaults `model:` overrides the parent's.
+                model: args
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some(self.model.clone())),
                 headers: self.intel_headers.clone(),
                 aws_auth: self.intel_aws_auth(),
                 dialect: self.intel_dialect(),
@@ -343,6 +391,17 @@ impl Runtime {
             created: now_ms(),
             updated: now_ms(),
             payload: Some(secret_free_payload(&payload)),
+            template: tmeta.as_ref().map(|(n, _)| n.clone()),
+            tier: tmeta.as_ref().map(|(_, t)| t.clone()),
+            pid: None,
+            config_path: None,
+            socket: None,
+            retire_at: None,
+            retiring_since: None,
+            durable: args
+                .get("durable")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| self.work_durable_default()),
             node: None,
             dirty: true,
         };
@@ -357,14 +416,17 @@ impl Runtime {
                 record.node = Some(node);
                 record.status = "running".into();
                 self.log.info("subagent.spawn", json!({"handle": handle, "mode": mode, "node": node.0, "pid": self.children.pid_of(node), "depth": depth + 1, "servers": servers.len(), "priority": priority.as_str(), "memory_bytes": memory_bytes, "cpu_seconds": cpu_seconds}));
+                let persist = record.durable;
                 self.subagents.insert(handle.clone(), record);
-                let _ = self.durable.put(
-                    crate::state::Kind::Subagent,
-                    &handle,
-                    serde_json::to_value(self.subagents.get(&handle).unwrap())
-                        .unwrap_or(Value::Null),
-                    None,
-                );
+                if persist {
+                    let _ = self.durable.put(
+                        crate::state::Kind::Subagent,
+                        &handle,
+                        serde_json::to_value(self.subagents.get(&handle).unwrap())
+                            .unwrap_or(Value::Null),
+                        None,
+                    );
+                }
                 if let Some(s) = self.subagents.get_mut(&handle) {
                     s.dirty = false;
                 }
@@ -380,6 +442,117 @@ impl Runtime {
                 err(format!("subagent.run: spawn failed: {e}"))
             }
         }
+    }
+
+    /// RFC 0036 §5: resolve `template:`/`params:` into effective spawn args.
+    /// Returns the args plus `(template, tier)` when a template was named.
+    /// Freeform spawns pass through with defaults applied — unless
+    /// `subagents.allow_freeform: false` refuses them.
+    fn resolve_spawn_args(&self, args: &Value) -> Result<(Value, Option<(String, String)>), String> {
+        use crate::config::templates as tpl;
+        let defaults = self.settings.subagents.defaults.clone();
+        let mut eff = args.clone();
+        let Some(o) = eff.as_object_mut() else {
+            return Err("subagent.run: args must be an object".into());
+        };
+        let tname = o
+            .get("template")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(tname) = tname else {
+            if self.settings.subagents.allow_freeform == Some(false) {
+                return Err(
+                    "subagent.run refused: freeform spawns are disabled (subagents.allow_freeform: false) — instantiate a declared template".into(),
+                );
+            }
+            apply_spawn_defaults(o, &defaults);
+            return Ok((eff, None));
+        };
+        if o.get("instruction")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err("subagent.run: `template` and `instruction` are mutually exclusive".into());
+        }
+        for k in ["tools", "servers"] {
+            if o.contains_key(k) {
+                return Err(format!(
+                    "subagent.run: `{k}` may not be passed with `template` — the template defines the grant"
+                ));
+            }
+        }
+        let compiled = tpl::compile_templates(&self.settings)
+            .map_err(|es| format!("subagent.run: template compile: {}", es.join("; ")))?;
+        let Some(t) = compiled.get(&tname) else {
+            return Err(format!(
+                "subagent.run: no template '{tname}' (subagents.templates declares: {:?})",
+                compiled.keys().collect::<Vec<_>>()
+            ));
+        };
+        let params = tpl::validate_params(
+            &t.spec.params,
+            o.get("params").unwrap_or(&Value::Null),
+        )
+        .map_err(|e| format!("subagent.run: template '{tname}': {e}"))?;
+        let folded = tpl::fold_params(&t.cleaned, &params);
+        if tpl::params_introduced_machinery(&folded) {
+            return Err(format!(
+                "subagent.run refused: params for template '{tname}' introduced directive machinery (RFC 0036 §8.2)"
+            ));
+        }
+        if t.tier == tpl::Tier::Instance {
+            // `instance_run` recompiles and refolds; hand it the validated
+            // params so refusals there are consistent with here.
+            o.insert("params".into(), Value::Object(params));
+            return Ok((eff, Some((tname, "instance".into()))));
+        }
+        // Flat: the template's fields merge under the call site's.
+        let spec = &t.spec;
+        o.insert("instruction".into(), json!(folded));
+        if let Some(v) = &spec.tools {
+            o.insert("tools".into(), json!(v));
+        }
+        if let Some(v) = &spec.servers {
+            o.insert("servers".into(), json!(v));
+        }
+        for (key, val) in [
+            ("limits", spec.limits.clone()),
+            ("skills", spec.skills.clone()),
+            ("output_schema", spec.output_schema.clone()),
+        ] {
+            if !o.contains_key(key)
+                && let Some(v) = val
+            {
+                o.insert(key.into(), v);
+            }
+        }
+        for (key, val) in [
+            ("mode", spec.mode.clone()),
+            ("priority", spec.priority.clone()),
+            ("model", spec.model.clone()),
+            ("output_contract", spec.output_contract.clone()),
+        ] {
+            if !o.contains_key(key)
+                && let Some(v) = val
+            {
+                o.insert(key.into(), json!(v));
+            }
+        }
+        if !o.contains_key("durable")
+            && let Some(v) = spec.durable
+        {
+            o.insert("durable".into(), json!(v));
+        }
+        // Template context seeds first, the call site's appended after.
+        if let Some(tc) = spec.context.as_ref().and_then(Value::as_array) {
+            let mut merged = tc.clone();
+            if let Some(cc) = o.get("context").and_then(Value::as_array) {
+                merged.extend(cc.clone());
+            }
+            o.insert("context".into(), json!(merged));
+        }
+        apply_spawn_defaults(o, &defaults);
+        Ok((eff, Some((tname, "flat".into()))))
     }
 
     fn spawn_bucket_take(&mut self) -> bool {
@@ -599,6 +772,35 @@ pub fn parse_rate(s: &str) -> (u32, f64) {
 
 /// The payload as stored (no credential: the intelligence token is re-supplied
 /// from the live settings on restore).
+/// RFC 0036 §4 `subagents.defaults`: applied to every spawn when neither the
+/// call site nor the template set the field.
+fn apply_spawn_defaults(
+    o: &mut serde_json::Map<String, Value>,
+    d: &crate::config::v2::SubagentDefaults,
+) {
+    for (key, val) in [
+        ("mode", d.mode.clone()),
+        ("model", d.model.clone()),
+        ("priority", d.priority.clone()),
+    ] {
+        if !o.contains_key(key)
+            && let Some(v) = val
+        {
+            o.insert(key.into(), json!(v));
+        }
+    }
+    if !o.contains_key("limits")
+        && let Some(l) = &d.limits
+    {
+        o.insert("limits".into(), l.clone());
+    }
+    if !o.contains_key("durable")
+        && let Some(v) = d.durable
+    {
+        o.insert("durable".into(), json!(v));
+    }
+}
+
 fn secret_free_payload(p: &SpawnPayload) -> Value {
     let mut clean = p.clone();
     clean.intelligence.token = None;

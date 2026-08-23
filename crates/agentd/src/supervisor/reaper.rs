@@ -79,6 +79,20 @@ pub fn spawn_tracked(
     Ok(sub)
 }
 
+/// [`spawn_tracked`] for a plain [`std::process::Child`] — an RFC 0036
+/// instance-tier child, which is a full daemon with no control channel. Same
+/// contract: the fork happens under the routes lock so the reaper can never
+/// `waitpid` the pid before it is registered.
+pub fn spawn_tracked_pid(
+    reap_tx: &Sender<Reaped>,
+    spawn_fn: impl FnOnce() -> io::Result<std::process::Child>,
+) -> io::Result<std::process::Child> {
+    let mut routes = routes();
+    let child = spawn_fn()?;
+    routes.insert(child.id() as i32, reap_tx.clone());
+    Ok(child)
+}
+
 /// Drain `waitpid(-1, WNOHANG)` and dispatch each reaped pid to its owning
 /// Supervisor. Unowned pids (orphans / foreign self-reaping children) are
 /// dropped. Called from each Supervisor's tick; the lock keeps the single

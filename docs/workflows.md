@@ -51,6 +51,7 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | `limits` | `{steps, tokens, deadline, budget}` for the whole run |
 | `priority` | `low\|normal\|high` (default `normal`) — contention weight: `low` admissions shed one pressure level early (at *warn*), and each tick schedules ready steps of higher-priority runs first. A tiebreak under scarcity, not a reservation. |
 | `unload` | `{policy: drain\|cancel\|detach, timeout}` — what happens to LIVE runs when this definition is retired (removed, replaced, or deleted). Default `drain`: they finish. See §retirement below. |
+| `durable` | default `true` (or the `store.durability.work` deployment default) — `false` makes runs memory-only: no run record, no checkpoints, forgotten by a restart. The fast path for recomputable work; see §durability. |
 | `steps` | the graph: an object of step id to step |
 | `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:`+`glob:` scan — see the configuration doc §6.1) |
 
@@ -561,6 +562,38 @@ start nodes. The `workflow.signal` *step* delivers immediately; the
 double-delivers.
 
 ## Durability, checkpointing and resume
+
+### The durability class — `durable: false` and the fast path
+
+Everything below assumes a **durable** workflow, which is the default. A
+workflow can opt out of the class entirely:
+
+```yaml
+workflows:
+  - name: enrich-and-post
+    durable: false        # runs are memory-only: no run record, no checkpoints
+    steps: { ... }
+```
+
+A non-durable run writes *nothing* to the store — not at creation, not at any
+checkpoint, not at retention — which removes the dominant per-step cost for
+work you would simply re-run: enrichment pipelines, fan-out scoring, cache
+warms, anything recomputable. The trade is exactly what it says: a restart
+forgets the run mid-flight (the consumed start event is not replayed), so
+signal parks, human gates and month-long waits do **not** belong in a
+non-durable workflow. One sharp edge is warned about at load: a durable
+parent's `workflow` step waiting on a non-durable child finds the child gone
+after a restart, and the wait fails with "run does not exist".
+
+The deployment-wide default flips with one line — `store.durability.work:
+ephemeral` makes every workflow (and subagent record) memory-only unless it
+says `durable: true`, the right posture for a pure-throughput instance whose
+work is all recomputable. Subagent spawns take the same knob per call or per
+template (`subagent.run {durable: false}`): the record is never persisted and
+never restore-respawned. The inbox, tasks, memory keys and credentials stay
+durable regardless of class.
+
+### The durable path
 
 The run record is written to the store before any of its steps executes. From
 then on, every **effectful** step transitions to a durable `Running` and is

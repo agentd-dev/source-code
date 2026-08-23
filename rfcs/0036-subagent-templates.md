@@ -1,6 +1,6 @@
 # RFC 0036: Subagent templates and instance-tier children
 
-**Status:** Draft
+**Status:** Phase A implemented (the `subagents:` section, flat + instance tiers, params discipline, unix-socket A2A wiring, `ttl`/`until`/`subagent.retire` retirement, instance caps, the registry changes); Phases B–C draft — see the implementation notes at the end
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the subagent process model (RFC 0009, RFC 0003, RFC 0026 §6); instruction documents (RFC 0034) become the definition carrier; A2A wiring rides RFC 0029 and the unix-socket listener (2.5.0); retirement extends RFC 0034 §7.
@@ -390,7 +390,39 @@ child (RFC 0003), sit under the tree-token ceiling, and count against
   already works, stays the right answer for *standing* desks; this RFC is
   for children whose lifecycle belongs to a workflow, not an operator.
 
-## 11. Cross-references
+## 11. Implementation notes (Phase A, as shipped)
+
+Two honest deviations and three mechanics worth recording:
+
+- **Budget is child-enforced in Phase A.** The template's `budget:` becomes
+  the child's own `intelligence.budget` (`on_exhausted: refuse` works as
+  written), but the parent-window metering of Decision 9's second half —
+  counting the child's usage against the parent's budget — moves to Phase B:
+  an instance child has no control channel, so metering needs either polling
+  or a usage stream, and neither belonged in the first cut.
+- **`subagent.retire` shipped in Phase A** (it was listed under lifecycle
+  policy); `subagent.send` to an instance child delivers over the socket as a
+  conversation message, and `subagent.await` resolves at retirement.
+- **The `parent` peer needs a parent listener.** Auto-wiring child→parent
+  only happens when `a2a.listen` is set (validation warns otherwise), and an
+  *inline* `a2a.bearer` is never written into the child's config file — only
+  a `{{secret:…}}` reference rides along; over a unix listener SO_PEERCRED
+  covers same-uid children with no credential at all.
+- **The §8.2 ordering is enforced by a spawn guard**: params fold into the
+  boot-extracted prose as data, and a folded result in which extraction finds
+  ANY directive (a param value smuggled a `:::` fence to line start) refuses
+  the spawn. The child's own boot re-extraction is therefore a no-op on
+  machinery — it sees only prose.
+- **Inheritance into the child**: the parent's `services:` catalog,
+  `security.egress`, `security.allow_trifecta` and `security.tls_ca` are
+  composed in (a template cannot set `security:` — §7); the parent's
+  `intelligence:` section rides along minus its budget and minus any inline
+  token (the env passthrough carries credentials; secret references ride in
+  the file). Live instance children respawn from their composed config after
+  a parent restart; a parent death reaches them as SIGTERM via PDEATHSIG, so
+  even the crash path is a graceful drain.
+
+## 12. Cross-references
 
 RFC 0003 (process tree, restart governor, hierarchical token accounting) ·
 RFC 0009 (spawn chokepoint, payload, caps) · RFC 0025/0033 (durable store,

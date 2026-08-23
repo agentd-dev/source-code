@@ -31,3 +31,21 @@ pub mod aws_sso;
 
 #[cfg(feature = "oauth")]
 pub mod browser;
+
+/// Canonicalize a login/logout target (RFC 0037): `mcp:<name>` on a server that
+/// references a catalog entry becomes `service:<entry>` — the key the daemon's
+/// connect path reads — so a login (or logout) lands where every consumer of
+/// the entry shares it. Feature-free: logout works without `oauth`.
+pub fn canonical_target(settings: &crate::config::v2::Settings, target: &str) -> String {
+    if let Some(name) = target.strip_prefix("mcp:")
+        && let Some(svc) = settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.service.clone())
+    {
+        return format!("service:{svc}");
+    }
+    target.to_string()
+}

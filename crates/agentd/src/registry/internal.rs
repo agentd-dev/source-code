@@ -124,12 +124,13 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "subagent.run",
         "subagent",
-        "Spawn a subagent with its own instruction. mode: sync (wait for the result), async (get a handle), detached (fire and forget), warm (stays alive; send it messages).",
+        "Spawn a subagent: freeform `instruction`, or `template` naming a declared subagents.templates entry (fill its declared `params` only — an instance-tier template brings its own workflows and runs as a peer daemon). mode: sync (wait for the result), async (get a handle), detached (fire and forget), warm (stays alive; send it messages).",
         obj(
             json!({
-                "instruction": s("The subagent's brief"),
+                "instruction": s("The subagent's brief (freeform; mutually exclusive with template)"),
+                "template": s("A subagents.templates entry to instantiate (RFC 0036)"),
+                "params": {"type": "object", "description": "Values for the template's declared params (schema-validated)"},
                 "mode": {"enum": ["sync", "async", "detached", "warm"], "default": "sync"},
-                "workflow": s("Run this workflow instead of a free agent loop"),
                 "tools": arr(json!({"type": "string"})),
                 "servers": arr(json!({"type": "string"})),
                 "limits": open_obj(json!({"steps": {"type": "integer"}, "tokens": {"type": "integer"}, "deadline": {"type": "string"}, "memory": s("OS memory cap for the child process, e.g. \"512MB\" (RLIMIT_AS)"), "cpu": s("OS CPU-time cap, e.g. \"5m\" (RLIMIT_CPU)")}), &[]),
@@ -137,13 +138,26 @@ pub fn contracts() -> Vec<Contract> {
                 "context": arr(open_obj(json!({"role": {"type": "string"}, "content": {"type": "string"}}), &["role", "content"])),
                 "output_contract": s("What the result must look like"),
                 "output_schema": {"type": "object"},
-                "skills": arr(json!({"type": "string"}))
+                "skills": arr(json!({"type": "string"})),
+                "durable": {"type": "boolean", "description": "false = a memory-only record: never persisted, never restore-respawned (the fast path for throwaway workers); absent = the store.durability.work default"}
             }),
-            &["instruction"],
+            &[],
         ),
         open_obj(
             json!({"handle": {"type": "string"}, "status": {"type": "string"}, "result": any()}),
             &["handle", "status"],
+        ),
+        true,
+        ROOT_WF,
+    );
+    c(
+        "subagent.retire",
+        "subagent",
+        "Begin graceful retirement of an instance-tier child (RFC 0036): it drains its own runs and exits cleanly; escalation to SIGKILL only after the drain window.",
+        obj(json!({"handle": s("The instance child's handle")}), &["handle"]),
+        open_obj(
+            json!({"ok": {"type": "boolean"}, "handle": {"type": "string"}, "status": {"type": "string"}}),
+            &["ok"],
         ),
         true,
         ROOT_WF,
@@ -865,6 +879,7 @@ mod tests {
             "subagent.status",
             "subagent.await",
             "subagent.list",
+            "subagent.retire",
             "code.run",
             "memory.get",
             "memory.set",

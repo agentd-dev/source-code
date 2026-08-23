@@ -23,6 +23,7 @@ pub mod exec; // guarded local command runner behind the `exec` tool (RFC 0028; 
 pub mod goal;
 pub mod http_node;
 pub mod human; // human-in-the-loop: ask_human gates + fallbacks (RFC 0032 §16)
+pub(crate) mod instances; // instance-tier template children (RFC 0036 §6)
 pub mod nested;
 pub mod pressure; // live per-turn activity for the display clients (RFC 0032 §17)
 pub mod reactor;
@@ -236,6 +237,16 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         .map(|d| d.0)
         .unwrap_or(Duration::from_secs(60));
     for s in &settings.mcp.servers {
+        // RFC 0037 §5: the dial-time backstop behind boot validation — an
+        // uncatalogued endpoint under `closed` never reaches the socket.
+        if let Err(e) = crate::config::v2::egress_allows(
+            &settings.services,
+            settings.security.egress,
+            &s.endpoint,
+        ) {
+            log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+            return crate::exit::USAGE;
+        }
         let spec = match s.to_spec() {
             Ok(sp) => sp,
             Err(e) => {
@@ -760,6 +771,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     rt.arm_long_lived_starts();
     rt.arm_goal();
     rt.respawn_restored_subagents();
+    rt.respawn_restored_instances();
     // The A2A v2 transport (RFC 0029): the HTTPS listener for conversations,
     // command DataParts, and durable tasks. A bind/TLS/principals failure at
     // startup is fatal — the daemon cannot serve its only external channel.

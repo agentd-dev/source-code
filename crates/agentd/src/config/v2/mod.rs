@@ -148,6 +148,13 @@ pub struct Settings {
     /// or `stream` node may reference it — fail-closed at startup.
     #[serde(default)]
     pub streams: BTreeMap<String, StreamCfg>,
+    /// The **service catalog** (RFC 0037): the named external services this
+    /// deployment may use. Entries carry connection settings, one shared
+    /// credential, authoritative trifecta tags and a tool-surface ceiling;
+    /// `mcp.servers` entries reference them via `service:`. Absent ⇒ no
+    /// catalog, today's behavior exactly.
+    #[serde(default)]
+    pub services: BTreeMap<String, Service>,
     pub vars: BTreeMap<String, Value>,
     pub agent: Agent,
     pub intelligence: Intelligence,
@@ -164,6 +171,10 @@ pub struct Settings {
     pub workflows: Vec<Value>,
     pub limits: Limits,
     pub lifecycle: Lifecycle,
+    /// Subagent templates + spawn policy (RFC 0036): operator-declared
+    /// definitions the model may instantiate (filling declared `params` only),
+    /// section-wide defaults, and the freeform-spawn switch.
+    pub subagents: Subagents,
     pub a2a: A2a,
     /// The display-client surface (RFC 0032): opt-in TUI/web-UI methods on the
     /// A2A listener (the global `SubscribeToEvents` feed + interface read ops).
@@ -505,11 +516,212 @@ pub struct Mcp {
     pub default_timeout: Option<Dur>,
 }
 
+/// A **service catalog entry** (RFC 0037 §4): a named external service this
+/// deployment may use — connection settings, one shared credential,
+/// authoritative trifecta tags (a floor for any matching endpoint, §3
+/// Decision 3), and a tool-surface ceiling consumers can only narrow.
+/// The catalog dials nothing; `mcp.servers` entries reference it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Service {
+    #[serde(default)]
+    pub kind: ServiceKind,
+    pub endpoint: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Authoritative trifecta tags: unioned into any consumer whose endpoint
+    /// matches this entry — referencing or inline, `open` or `closed` mode.
+    #[serde(default)]
+    pub tags: BTreeMap<String, Vec<String>>,
+    /// The CEILING: the widest advertised-tool surface any consumer may get.
+    /// A consumer `allow` pattern not subsumed by this list is refused.
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub auth: Option<Auth>,
+    /// Per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`),
+    /// shared by every consumer of the entry in this process.
+    #[serde(default)]
+    pub rate: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<Dur>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceKind {
+    #[default]
+    Mcp,
+}
+
+/// RFC 0037 §4: resolve `service:` references against the catalog and apply
+/// the unconditional tag floor (Decision 3). Mutates `mcp.servers` in place —
+/// after this, every server carries its effective endpoint, auth, headers,
+/// admission lists and tag set, so validation, the trifecta gate and the
+/// runtime all see the *outcome*. Returns the resolution errors (aggregated
+/// with validation's).
+pub fn resolve_services(s: &mut Settings) -> Vec<String> {
+    let services = s.services.clone();
+    let mut errs = Vec::new();
+    for srv in &mut s.mcp.servers {
+        let Some(name) = srv.service.clone() else {
+            continue;
+        };
+        let Some(entry) = services.get(&name) else {
+            errs.push(format!(
+                "mcp server '{}' references unknown service '{name}' (services.{name} is not declared)",
+                srv.name
+            ));
+            continue;
+        };
+        // Consumers reference, never restate (Decision 2): connection settings
+        // live in the catalog only.
+        for (restated, what) in [
+            (!srv.endpoint.is_empty(), "endpoint"),
+            (srv.auth.is_some(), "auth"),
+            (srv.oauth.is_some(), "oauth"),
+            (!srv.headers.is_empty(), "headers"),
+        ] {
+            if restated {
+                errs.push(format!(
+                    "mcp server '{}' references service '{name}' and restates `{what}` — a referencing consumer inherits connection settings from the catalog",
+                    srv.name
+                ));
+            }
+        }
+        srv.endpoint = entry.endpoint.clone();
+        srv.auth = entry.auth.clone();
+        srv.headers = entry.headers.clone();
+        if srv.timeout.is_none() {
+            srv.timeout = entry.timeout;
+        }
+        // The ceiling: consumer `allow` may only narrow (every consumer
+        // pattern must be subsumed by some catalog pattern); absent consumer
+        // `allow` inherits the ceiling itself. `exclude` unions.
+        match (&entry.allow, &mut srv.allow) {
+            (Some(ceil), Some(mine)) => {
+                for p in mine.iter() {
+                    if !ceil.iter().any(|c| pattern_subsumes(p, c)) {
+                        errs.push(format!(
+                            "mcp server '{}': allow pattern '{p}' widens the ceiling of service '{name}' (catalog allow: {ceil:?})",
+                            srv.name
+                        ));
+                    }
+                }
+            }
+            (Some(ceil), mine @ None) => *mine = Some(ceil.clone()),
+            _ => {}
+        }
+        for e in &entry.exclude {
+            if !srv.exclude.contains(e) {
+                srv.exclude.push(e.clone());
+            }
+        }
+        union_tags(&mut srv.tags, &entry.tags);
+    }
+    // Decision 3 — the unconditional tag floor: ANY server whose endpoint
+    // matches a catalog entry gets the entry's tags unioned in, referencing or
+    // inline, open or closed. This is the tag-laundering fix.
+    for srv in &mut s.mcp.servers {
+        if srv.endpoint.is_empty() {
+            continue;
+        }
+        if let Some((_, entry)) = service_match(&services, &srv.endpoint) {
+            union_tags(&mut srv.tags, &entry.tags);
+        }
+    }
+    errs
+}
+
+/// Does catalog pattern `ceiling` cover consumer pattern `p`? Patterns are the
+/// registry's trailing-`*` globs. A literal ceiling covers only itself; a
+/// glob ceiling covers any pattern whose fixed prefix extends the ceiling's.
+fn pattern_subsumes(p: &str, ceiling: &str) -> bool {
+    match ceiling.strip_suffix('*') {
+        Some(prefix) => p.strip_suffix('*').unwrap_or(p).starts_with(prefix),
+        None => p == ceiling,
+    }
+}
+
+/// Union `from` into `into` (per tool-pattern key; tag lists dedup).
+fn union_tags(into: &mut BTreeMap<String, Vec<String>>, from: &BTreeMap<String, Vec<String>>) {
+    for (k, list) in from {
+        let slot = into.entry(k.clone()).or_default();
+        for t in list {
+            if !slot.contains(t) {
+                slot.push(t.clone());
+            }
+        }
+    }
+}
+
+/// Match a URL against the catalog (RFC 0037 §4): scheme + authority equal
+/// (host case-insensitive), and the URL's path extends the entry's path on a
+/// segment boundary. Returns the matching entry, refusing nothing — the
+/// caller decides what a non-match means (`Egress::Closed` refuses it).
+pub fn service_match<'a>(
+    services: &'a BTreeMap<String, Service>,
+    url: &str,
+) -> Option<(&'a String, &'a Service)> {
+    let (scheme, authority, path) = split_url(url)?;
+    services.iter().find(|(_, e)| {
+        let Some((es, ea, ep)) = split_url(&e.endpoint) else {
+            return false;
+        };
+        scheme == es
+            && authority.eq_ignore_ascii_case(&ea)
+            && (ep.is_empty()
+                || ep == "/"
+                || path == ep
+                || (path.starts_with(&ep)
+                    && (ep.ends_with('/') || path.as_bytes().get(ep.len()) == Some(&b'/'))))
+    })
+}
+
+/// `scheme://authority/path` → (scheme, authority, path). `unix:` sockets
+/// have no authority; the socket path is the authority for matching purposes.
+fn split_url(url: &str) -> Option<(String, String, String)> {
+    if let Some(rest) = url.strip_prefix("unix://").or_else(|| url.strip_prefix("unix:")) {
+        return Some(("unix".into(), rest.to_string(), String::new()));
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, String::new()),
+    };
+    Some((scheme.to_string(), authority.to_string(), path))
+}
+
+/// RFC 0037 §5: the dial-time egress check. `Open` always passes; `Closed`
+/// requires the URL to match a catalog entry.
+pub fn egress_allows(
+    services: &BTreeMap<String, Service>,
+    egress: Egress,
+    url: &str,
+) -> Result<(), String> {
+    if egress == Egress::Open || service_match(services, url).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "security.egress is `closed` and {url} matches no services: catalog entry — catalog the endpoint to allow it"
+    ))
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
     pub name: String,
+    /// Either a literal URL, or empty when `service:` references a catalog
+    /// entry (RFC 0037 §4) — resolution fills it before anything dials.
+    #[serde(default)]
     pub endpoint: String,
+    /// Reference a `services:` catalog entry: inherit its connection settings
+    /// (restating `endpoint`/`auth`/`headers` here is refused) and narrow its
+    /// tool ceiling.
+    #[serde(default)]
+    pub service: Option<String>,
     #[serde(default)]
     pub ns: Option<String>,
     #[serde(default)]
@@ -576,6 +788,7 @@ impl McpServer {
                 scope: o.scope.clone(),
             }),
             auth: self.auth.as_ref().map(|a| a.to_spec()),
+            service: self.service.clone(),
         })
     }
 }
@@ -976,6 +1189,20 @@ pub struct RunRetention {
 pub struct Durability {
     pub a2a: Option<DurabilityLevel>,
     pub steps: Option<DurabilityLevel>,
+    /// The default durability CLASS for work (runs + subagent records):
+    /// `durable` (the default — everything checkpoints and survives a
+    /// restart) or `ephemeral` (nothing persists unless a workflow says
+    /// `durable: true` / a spawn passes `durable: true` — the fast path for
+    /// deployments that treat work as recomputable). The inbox, tasks,
+    /// memory and credentials stay durable regardless.
+    pub work: Option<WorkDurability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkDurability {
+    Durable,
+    Ephemeral,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1009,6 +1236,11 @@ pub struct Context {
     /// from `intelligence.model`) — the base of the compaction threshold.
     pub model_window: Option<u64>,
     pub plan: Plan,
+    /// Which environment cards the system prompt carries (`workflows`,
+    /// `skills`, `memory`, `services`, `streams`, `signals`, `peers`,
+    /// `templates`). Unset = all. A node overrides per step with
+    /// `context: {cards: [...]}`.
+    pub cards: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1126,6 +1358,121 @@ pub struct SubagentLimits {
     pub breadth: Option<u32>,
     pub total: Option<u32>,
     pub rate: Option<String>,
+    /// Instance-tier children (RFC 0036 §4): heavier than flat workers, so
+    /// they carry their own caps. Defaults 2 live / 8 lifetime / `4/1h`.
+    pub instances: InstanceLimits,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct InstanceLimits {
+    pub breadth: Option<u32>,
+    pub total: Option<u32>,
+    pub rate: Option<String>,
+}
+
+/// The `subagents:` section (RFC 0036 §4).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Subagents {
+    /// `false` makes templates the ONLY spawn path — every child the model can
+    /// create is a definition the operator reviewed. Default `true` (freeform
+    /// flat-tier spawns keep working; there is no freeform INSTANCE spawn
+    /// regardless).
+    pub allow_freeform: Option<bool>,
+    /// Applied to every spawn (flat and templated) unless overridden at the
+    /// template or call site.
+    pub defaults: SubagentDefaults,
+    /// Named, operator-authored definitions. A template whose `instruction`
+    /// carries no config-defining directives spawns the flat RFC 0009 worker;
+    /// one that defines machinery (`:::workflow`/`:::mcp`/`:::stream`/
+    /// `:::config`/`:::tools`) spawns an instance-tier child.
+    pub templates: BTreeMap<String, SubagentTemplate>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SubagentDefaults {
+    pub model: Option<String>,
+    pub priority: Option<String>,
+    pub mode: Option<String>,
+    /// Default durability class for spawns (see `SubagentTemplate::durable`).
+    pub durable: Option<bool>,
+    /// The per-spawn limits object the `subagent` step takes (`max_tokens`,
+    /// `deadline`, `memory`, `cpu`, `max_steps`) — kept raw; the spawn path
+    /// parses it exactly like call-site limits.
+    pub limits: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTemplate {
+    /// A full RFC 0034 instruction document. Directive extraction runs ONCE,
+    /// at boot, on this operator-authored text; `params` fold in at spawn as
+    /// data and are never re-parsed for directives (RFC 0036 §8.2).
+    pub instruction: String,
+    /// The ONLY holes the model may fill, schema-validated at spawn.
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamSpec>,
+    /// Flat tier only: narrowing grants from the parent's server/tool set.
+    #[serde(default)]
+    pub servers: Option<Vec<String>>,
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Flat tier: the full per-spawn limits object. Instance tier: OS caps
+    /// only (`memory`, `cpu`) — token ceilings live in `budget`.
+    #[serde(default)]
+    pub limits: Option<Value>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub skills: Option<Value>,
+    #[serde(default)]
+    pub context: Option<Value>,
+    #[serde(default)]
+    pub output_contract: Option<String>,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
+    /// Instance tier only: the child's own budget (the RFC 0030 `Budget`
+    /// shape), enforced in-child with `on_exhausted: refuse`.
+    #[serde(default)]
+    pub budget: Option<Value>,
+    /// Instance tier only: graceful retirement triggers (RFC 0034 §7 path).
+    #[serde(default)]
+    pub ttl: Option<Dur>,
+    /// A signal name (templated over params) whose delivery IN THE CHILD
+    /// retires it.
+    #[serde(default)]
+    pub until: Option<String>,
+    /// One live child at a time; its A2A peer alias is the template name.
+    #[serde(default)]
+    pub singleton: bool,
+    /// Durability class: `false` ⇒ the spawn's record is memory-only (and an
+    /// instance child runs on a memory store — no restore-respawn). Absent ⇒
+    /// the deployment default (`store.durability.work`).
+    #[serde(default)]
+    pub durable: Option<bool>,
+}
+
+/// One declared template parameter (RFC 0036 §5).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ParamSpec {
+    /// `string` (default) | `number` | `integer` | `boolean`.
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<Value>,
+    #[serde(rename = "enum", default)]
+    pub one_of: Option<Vec<Value>>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1137,6 +1484,11 @@ pub struct Lifecycle {
     pub run_id: Option<String>,
     pub exit_code_map: BTreeMap<String, i32>,
     pub watch_config: bool,
+    /// RFC 0036 §6: delivery of this signal begins graceful shutdown — the
+    /// retirement trigger a parent composes into an instance-tier child
+    /// (`until:` on the template), and available to any daemon that should
+    /// drain when a named signal arrives.
+    pub until_signal: Option<String>,
 }
 
 impl Lifecycle {
@@ -1495,6 +1847,19 @@ pub struct Security {
     pub cgroup: Cgroup,
     pub exec: Exec,
     pub workflows: WorkflowSecurity,
+    /// RFC 0037 §5: `closed` ⇒ an outbound MCP dial whose URL matches no
+    /// `services:` catalog entry is refused (boot-time for configured servers,
+    /// dial-time for everything else). Default `open`.
+    pub egress: Egress,
+}
+
+/// The egress policy (RFC 0037 §5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Egress {
+    #[default]
+    Open,
+    Closed,
 }
 
 /// Whether the agent may rewrite its own workflows.
@@ -2573,6 +2938,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     if doc.pointer("/store/kind").is_none() && settings.is_long_lived() {
         settings.store.kind = StoreKind::File;
     }
+    // RFC 0037: resolve `service:` references + apply the tag floor BEFORE
+    // validation and the trifecta gate, so both see effective servers.
+    let service_errors = resolve_services(&mut settings);
     let mut loaded = Loaded {
         settings,
         doc,
@@ -2604,7 +2972,8 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
             }
         }
     }
-    let diags = validate(&loaded);
+    let mut diags = validate(&loaded);
+    diags.errors.splice(0..0, service_errors);
     warnings.extend(diags.warnings);
     loaded.warnings = warnings;
     if ask != Ask::Validate
@@ -3190,7 +3559,19 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     .into(),
             );
         }
-        if let Err(e) = super::mcp_endpoint_scheme_ok(&srv.endpoint) {
+        if srv.endpoint.is_empty() {
+            // A `service:` reference is filled by resolution (an unknown name
+            // already errored there); a server with NEITHER is malformed.
+            if srv.service.is_none() {
+                err(
+                    &mut d,
+                    format!(
+                        "mcp server '{}' needs an `endpoint` or a `service:` catalog reference",
+                        srv.name
+                    ),
+                );
+            }
+        } else if let Err(e) = super::mcp_endpoint_scheme_ok(&srv.endpoint) {
             err(&mut d, format!("mcp server '{}': {e}", srv.name));
         }
         if let Err(e) = srv.tag_set() {
@@ -3217,6 +3598,123 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(&mut d, e);
             }
         }
+    }
+    // services catalog (RFC 0037 §6)
+    for (name, svc) in &s.services {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            err(
+                &mut d,
+                format!("services: entry name '{name}' must be [a-zA-Z0-9_-]+"),
+            );
+        }
+        if let Err(e) = super::mcp_endpoint_scheme_ok(&svc.endpoint) {
+            err(&mut d, format!("services.{name}: {e}"));
+        }
+        for list in svc.tags.values() {
+            for t in list {
+                if crate::sec::scope::TrifectaTag::parse(t).is_none() {
+                    err(
+                        &mut d,
+                        format!("services.{name} has unknown trifecta tag '{t}'"),
+                    );
+                }
+            }
+        }
+        for (h, v) in &svc.headers {
+            if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
+                err(
+                    &mut d,
+                    format!(
+                        "services.{name} header '{h}' looks like a credential but has an inline value; use a {{{{secret:…}}}} reference"
+                    ),
+                );
+            } else if let Some(e) = unresolved_secret_ref(v) {
+                err(&mut d, format!("services.{name} header '{h}': {e}"));
+            }
+        }
+        if let Some(auth) = &svc.auth {
+            for e in validate_auth_block(auth, &format!("services.{name}")) {
+                err(&mut d, e);
+            }
+        }
+        if let Some(r) = &svc.rate
+            && let Err(e) = crate::supervisor::tree::parse_rate(r)
+        {
+            err(&mut d, format!("services.{name}.rate: {e}"));
+        }
+    }
+    // Matching must be unambiguous: no entry's endpoint may itself match
+    // another entry (identical or prefix-comparable endpoints).
+    {
+        let entries: Vec<(&String, &Service)> = s.services.iter().collect();
+        for i in 0..entries.len() {
+            for j in (i + 1)..entries.len() {
+                let one = BTreeMap::from([(entries[i].0.clone(), entries[i].1.clone())]);
+                let other = BTreeMap::from([(entries[j].0.clone(), entries[j].1.clone())]);
+                if service_match(&one, &entries[j].1.endpoint).is_some()
+                    || service_match(&other, &entries[i].1.endpoint).is_some()
+                {
+                    err(
+                        &mut d,
+                        format!(
+                            "services.{} and services.{} have prefix-comparable endpoints — URL matching must be unambiguous",
+                            entries[i].0, entries[j].0
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    // Egress policy (RFC 0037 §5): closed ⇒ every configured MCP dial must be
+    // catalogued; surfaces the policy does not yet cover are named out loud.
+    if s.security.egress == Egress::Closed {
+        for srv in &s.mcp.servers {
+            if !srv.endpoint.is_empty() && service_match(&s.services, &srv.endpoint).is_none() {
+                err(
+                    &mut d,
+                    format!(
+                        "security.egress is closed and mcp server '{}' ({}) matches no services: catalog entry — catalog the endpoint to allow it",
+                        srv.name, srv.endpoint
+                    ),
+                );
+            }
+        }
+        let mut uncovered = Vec::new();
+        if !s.intelligence.endpoints.is_empty() {
+            uncovered.push("intelligence.endpoints");
+        }
+        if !s.a2a.peers.is_empty() {
+            uncovered.push("a2a.peers");
+        }
+        if s.store.kind == StoreKind::Http {
+            uncovered.push("store.http");
+        }
+        if s.workflows.iter().any(|w| w.get("url").is_some()) {
+            uncovered.push("workflows[].url");
+        }
+        if !uncovered.is_empty() {
+            d.warnings.push(format!(
+                "security.egress: closed covers MCP dials (and A2A push targets) in this phase; NOT yet covered: {} (RFC 0037 Phase B)",
+                uncovered.join(", ")
+            ));
+        }
+    }
+    // subagent templates (RFC 0036): extraction, tier resolution and the
+    // instance-machinery checks all run here, so a bad template refuses the
+    // PARENT's startup with the template named.
+    if let Err(errs) = crate::config::templates::compile_templates(s) {
+        for e in errs {
+            err(&mut d, e);
+        }
+    }
+    if !s.subagents.templates.is_empty() && s.a2a.listen.is_none() {
+        d.warnings.push(
+            "subagents.templates are declared but a2a.listen is unset — instance-tier children get no `parent` peer (they cannot call home)".into(),
+        );
     }
     let server_known = |n: &str| s.mcp.servers.iter().any(|x| x.name == n);
 
@@ -4315,6 +4813,9 @@ mod tests {
             "limits",
             "limits.run",
             "limits.subagents",
+            "limits.subagents.instances",
+            "subagents",
+            "subagents.defaults",
             "lifecycle",
             "a2a",
             "a2a.tls",
@@ -4368,6 +4869,9 @@ mod tests {
                     "tools.overrides" => json!({"memory.get": {"server": "s", "tool": "t"}}),
                     "store.mcp" => json!({"server": "s"}),
                     "streams" => json!({"orders": {"retention": {"max_events": 1}}}),
+                    "services" => json!({"billing": {"endpoint": "https://b.example/mcp"}}),
+                    "subagents.templates" => json!({"t": {"instruction": "do the thing"}}),
+                    "subagents.defaults.limits" => json!({"max_tokens": 1000}),
                     "store.http" => json!({"base_url": "https://s"}),
                     "security.aauth" => json!({"provider": "https://apd"}),
                     "lifecycle.exit_code_map" => json!({"3": 0}),
@@ -4873,6 +5377,7 @@ mod tests {
         let s = McpServer {
             name: "gh".into(),
             endpoint: "https://mcp.example".into(),
+            service: None,
             ns: None,
             headers: BTreeMap::new(),
             tags: BTreeMap::new(),
@@ -5322,5 +5827,206 @@ mod tests {
         let (_, ask) = load(&args(&["--workflow-schema"]), &[]).unwrap();
         assert_eq!(ask, Ask::WorkflowSchema);
         assert!(help_section().contains("intelligence.model"));
+    }
+
+    // ---- RFC 0037: service catalog & egress policy -------------------------
+
+    const CATALOG: &str = "config_version: \"2\"\nstore: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n";
+
+    #[test]
+    fn service_reference_inherits_and_narrows() {
+        let f = write_tmp(
+            &format!(
+                "{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing, allow: [charge_lookup], ns: fin}}\n"
+            ),
+            "yaml",
+        );
+        let (loaded, _) = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        let s = &loaded.settings.mcp.servers[0];
+        assert_eq!(s.endpoint, "https://billing.example/mcp", "inherited");
+        assert!(s.auth.is_some(), "inherited auth");
+        assert_eq!(s.headers["X-Env"], "prod", "inherited headers");
+        assert_eq!(s.allow.as_deref(), Some(&["charge_lookup".to_string()][..]));
+        assert_eq!(s.exclude, vec!["invoice_purge".to_string()], "exclude unions");
+        assert_eq!(s.tags["*"], vec!["sensitive"], "tag floor applied");
+        assert_eq!(s.ns.as_deref(), Some("fin"), "consumer-local ns kept");
+    }
+
+    #[test]
+    fn service_reference_without_allow_inherits_the_ceiling() {
+        let f = write_tmp(
+            &format!("{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing}}\n"),
+            "yaml",
+        );
+        let (loaded, _) = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        let s = &loaded.settings.mcp.servers[0];
+        assert_eq!(
+            s.allow.as_deref(),
+            Some(&["charge_lookup".to_string(), "invoice_*".to_string()][..]),
+            "absent consumer allow inherits the catalog ceiling"
+        );
+    }
+
+    #[test]
+    fn service_reference_refuses_restated_connection_settings() {
+        let f = write_tmp(
+            &format!(
+                "{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing, endpoint: \"https://other.example\"}}\n"
+            ),
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("restates `endpoint`"), "{msg}");
+    }
+
+    #[test]
+    fn service_allow_widening_is_refused() {
+        let f = write_tmp(
+            &format!(
+                "{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing, allow: [refund_all]}}\n"
+            ),
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("widens the ceiling"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_service_reference_is_refused() {
+        let f = write_tmp(
+            "config_version: \"2\"\nstore: {kind: memory}\nmcp:\n  servers:\n    - {name: x, service: nope}\n",
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("unknown service 'nope'"), "{e}");
+    }
+
+    #[test]
+    fn tag_floor_applies_to_inline_matching_servers() {
+        // Decision 3: an INLINE server pointing under a catalogued endpoint
+        // gets the entry's tags unioned in — under-tagging cannot launder a
+        // sensitive endpoint past the trifecta gate.
+        let f = write_tmp(
+            &format!(
+                "{CATALOG}mcp:\n  servers:\n    - {{name: sneaky, endpoint: \"https://billing.example/mcp/sub\"}}\n"
+            ),
+            "yaml",
+        );
+        let (loaded, _) = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.settings.mcp.servers[0].tags["*"],
+            vec!["sensitive"],
+            "the catalog's tags are a floor for any matching endpoint"
+        );
+    }
+
+    #[test]
+    fn egress_closed_refuses_uncatalogued_and_admits_catalogued() {
+        let f = write_tmp(
+            &format!(
+                "{CATALOG}security: {{egress: closed}}\nmcp:\n  servers:\n    - {{name: rogue, endpoint: \"https://rogue.example/mcp\"}}\n"
+            ),
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("matches no services: catalog entry"), "{msg}");
+
+        let ok = write_tmp(
+            &format!(
+                "{CATALOG}security: {{egress: closed}}\nmcp:\n  servers:\n    - {{name: money, service: billing}}\n"
+            ),
+            "yaml",
+        );
+        load(
+            &args(&["--config", ok.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .expect("a catalogued reference passes closed egress");
+    }
+
+    #[test]
+    fn ambiguous_catalog_endpoints_are_refused() {
+        let f = write_tmp(
+            "config_version: \"2\"\nstore: {kind: memory}\nservices:\n  a: {endpoint: \"https://s.example/mcp\"}\n  b: {endpoint: \"https://s.example/mcp/deeper\"}\n",
+            "yaml",
+        );
+        let e = load(
+            &args(&["--config", f.path().to_str().unwrap()]),
+            &base_env(),
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("prefix-comparable"), "{e}");
+    }
+
+    #[test]
+    fn service_match_respects_segment_boundaries() {
+        let mut services = BTreeMap::new();
+        services.insert(
+            "a".to_string(),
+            Service {
+                kind: ServiceKind::Mcp,
+                endpoint: "https://s.example/api".into(),
+                headers: BTreeMap::new(),
+                tags: BTreeMap::new(),
+                allow: None,
+                exclude: Vec::new(),
+                auth: None,
+                rate: None,
+                timeout: None,
+            },
+        );
+        assert!(service_match(&services, "https://s.example/api").is_some());
+        assert!(service_match(&services, "https://s.example/api/v2").is_some());
+        assert!(
+            service_match(&services, "https://s.example/apiary").is_none(),
+            "prefix match is on segment boundaries, not string prefixes"
+        );
+        assert!(service_match(&services, "https://other.example/api").is_none());
+        assert!(
+            service_match(&services, "http://s.example/api").is_none(),
+            "scheme must match"
+        );
+    }
+
+    #[test]
+    fn pattern_subsumption_covers_the_glob_grammar() {
+        assert!(pattern_subsumes("charge_lookup", "charge_lookup"));
+        assert!(pattern_subsumes("charge_lookup", "charge_*"));
+        assert!(pattern_subsumes("charge_*", "charge_*"));
+        assert!(pattern_subsumes("charge_x_*", "charge_*"));
+        assert!(!pattern_subsumes("charge_*", "charge_lookup"));
+        assert!(!pattern_subsumes("refund_all", "charge_*"));
+        assert!(pattern_subsumes("anything", "*"));
     }
 }

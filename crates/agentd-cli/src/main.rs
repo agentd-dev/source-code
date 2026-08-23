@@ -73,6 +73,13 @@ fn run() -> i32 {
         return agentd::subagent::control::run();
     }
 
+    // An RFC 0036 instance-tier child is a NORMAL daemon (`--config` composed
+    // by its parent) — the only difference is that a parent death should retire
+    // it gracefully rather than orphan it.
+    if std::env::var_os(agentd::supervisor::reap::INSTANCE_CHILD_ENV).is_some() {
+        agentd::supervisor::reap::install_instance_pdeathsig();
+    }
+
     let env: Vec<(String, String)> = std::env::vars().collect();
     run_v2(&argv[1..], &env)
 }
@@ -234,6 +241,18 @@ see docs/configuration.md."
             for w in &loaded.warnings {
                 eprintln!("{}", json!({"event": "config.warning", "msg": w}));
             }
+            // RFC 0037 §6: review reads the OUTCOME — the effective tool
+            // surface and tag set per consumer, post catalog resolution.
+            for s in &loaded.settings.mcp.servers {
+                if s.service.is_some() || !loaded.settings.services.is_empty() {
+                    eprintln!(
+                        "{}",
+                        json!({"event": "config.effective_server", "server": s.name,
+                               "service": s.service, "endpoint": s.endpoint,
+                               "allow": s.allow, "exclude": s.exclude, "tags": s.tags})
+                    );
+                }
+            }
             eprintln!(
                 "{}",
                 json!({"event": "config.valid", "schema": "2", "files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()})
@@ -276,6 +295,9 @@ see docs/configuration.md."
         }
         // `--logout <target>`: evict a cached credential (no feature needed).
         Ask::Logout(target) => {
+            // RFC 0037: `mcp:<name>` on a catalog-referencing server stores
+            // under `service:<entry>` — evict the key logins actually use.
+            let target = agentd::auth::canonical_target(&loaded.settings, &target);
             let dir = agentd::auth::cache::default_dir();
             match agentd::auth::cache::evict_file(&dir, &target) {
                 Ok(()) => {

@@ -1174,6 +1174,7 @@ fn unreachable_wf() -> std::sync::Arc<Workflow> {
         version: 3,
         priority: Default::default(),
         unload: Default::default(),
+        durable: None,
         description: None,
         armed: false,
         inputs_schema: None,

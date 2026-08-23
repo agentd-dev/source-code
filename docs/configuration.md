@@ -407,6 +407,52 @@ is `mcp.servers[]: a server has an empty name`; a repeated name is
 code-registered tools; and a non-`https`/non-loopback-`http` endpoint is rejected
 at startup. All exit `2`.
 
+### The service catalog — `services:` (RFC 0037)
+
+For deployments past a handful of servers, the catalog names the external
+services the deployment may use **once**, and `mcp.servers` entries reference
+them:
+
+```yaml
+services:
+  billing:
+    endpoint: https://billing.internal/mcp
+    auth: {kind: static, token: "{{secret:BILLING_MCP}}"}
+    tags: {"*": [sensitive]}          # authoritative — a floor, never a suggestion
+    allow: [charge_lookup, invoice_*] # the CEILING any consumer may get
+    rate: "60/1m"                     # this instance's pacing toward the service
+mcp:
+  servers:
+    - {name: money, service: billing, allow: [charge_lookup]}  # reference + narrow
+security:
+  egress: closed                      # only catalogued endpoints may be dialed
+```
+
+Three rules carry it. **Consumers reference, never restate** — `endpoint`,
+`auth` and `headers` on a referencing entry are refused; the effective tool
+surface is the intersection with the ceiling (a widening `allow` pattern is a
+startup error), excludes union, and an absent consumer `allow` inherits the
+ceiling itself. **Catalog tags are a floor, unconditionally** — any server
+whose endpoint matches an entry (referencing *or* inline, `open` *or*
+`closed`) gets the entry's tags unioned in before the trifecta gate runs, so
+under-tagging cannot launder a sensitive endpoint. **`security.egress:
+closed` makes the catalog enforceable** — a configured MCP server, an RFC
+0036 template's machinery, or a caller-registered A2A push target whose URL
+matches no entry is refused; URL matching is scheme + authority + path prefix
+on segment boundaries, and prefix-comparable entries are themselves a
+validation error. `--validate-config` prints each consumer's *effective*
+endpoint, admission lists and tags, so review reads the outcome.
+
+A referencing server's credential caches under `service:<entry>` — one
+`agentd login service:billing` (or `login mcp:money`, which canonicalizes)
+serves every consumer of the entry. Multi-instance fleets share one catalog
+by merge order: `agentd -c services.yaml -c desk.yaml`. Not yet covered by
+`closed` (named out loud at validation): `intelligence.endpoints`,
+`a2a.peers`, the `http` step and HTTP store — RFC 0037 Phase B. The
+per-entry `rate:` paces workflow `mcp.tool` steps in this process; a dry
+bucket is a step failure a `retry:` absorbs, and rate changes take a
+restart.
+
 ---
 
 ## 6. Process shape — `lifecycle.run_until` and start nodes
@@ -821,7 +867,7 @@ each path is equally reachable from env and flags (§1.1), so
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `pricing`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, allow[], exclude[], timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. `allow`/`exclude` gate the server's advertised tool names by glob (exclude beats allow; a gated-out tool never registers). |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
-| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. |
+| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
 | `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
 | `streams` | Declared event streams (RFC 0035): `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck` (RFC 0026). |

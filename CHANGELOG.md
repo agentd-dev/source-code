@@ -5,19 +5,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased — v1.0.0, the relicense reset
+## v1.0.0 — the relicense reset
 
 **agentd restarts its public numbering at v1.0.0 under a new license.** The
 whole tree — every crate (`agentd-core`, `agentd-cli`, `agentd-mcp`,
 `agentd-net`, `agentd-conformance`), the Node clients, the site and the docs
-— is now **AGPL-3.0-only**. agentd remains fully open source; commercial
-licensing (for proprietary embedding or AGPL-free use) and commercial
-support are available — contact **agent@agentd.dev**. The previously
-published 2.x/0.x artifacts are withdrawn (GitHub releases and tags removed,
-crates.io versions yanked); the `config_version` marker becomes `"1"` and
+— is now **AGPL-3.0-only**, and the git history was rewritten so no commit
+claims otherwise (the vendored `third_party/connectrpc` keeps its own
+Apache-2.0 license and attribution, as it must). agentd remains fully open
+source; commercial licensing (for proprietary embedding or AGPL-free use)
+and commercial support are available — contact **agent@agentd.dev**. The
+previously published 2.x/0.x artifacts are withdrawn (GitHub releases, tags
+and GHCR images deleted); the `config_version` marker becomes `"1"` and
 version-branded strings drop the "2.0" era. Everything below this heading
 ships as **v1.0.0**; the 2.x entries further down record the same code's
 pre-reset history.
+
+Crates: `agentd-core` / `agentd-cli` / `agentd-mcp` / `agentd-net`
+**1.0.0**. `@agentd-dev/cli` **1.0.0**; `ghcr.io/agentd-dev/agentd:1.0.0`.
 
 ### Added
 

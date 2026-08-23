@@ -12,7 +12,47 @@ export function generateStaticParams() {
 export async function generateMetadata({ params }) {
   const { slug } = await params;
   const doc = DOCS.find((d) => d.slug === slug);
-  return { title: doc ? `${doc.title} — agentd` : `agentd docs — ${slug}` };
+  if (!doc) return { title: `agentd docs — ${slug}` };
+  const title = `${doc.title} — agentd`;
+  // The registry blurb IS the search snippet — one sentence, written for a
+  // human deciding whether to click.
+  const description = doc.blurb || `${doc.title} — agentd documentation.`;
+  const url = `/docs/${doc.slug}/`;
+  return {
+    title,
+    description,
+    alternates: { canonical: url },
+    openGraph: {
+      title,
+      description,
+      type: "article",
+      url,
+      siteName: "agentd",
+      images: [{ url: "/og.png", width: 1200, height: 630, alt: "agentd" }],
+    },
+    twitter: {
+      card: "summary_large_image",
+      title,
+      description,
+      images: ["/og.png"],
+    },
+  };
+}
+
+/* Per-page structured data: the docs are technical articles about one piece
+   of software. Kept to facts the registry already holds, so it cannot drift. */
+function articleJsonLd(doc) {
+  return {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    headline: doc.title,
+    description: doc.blurb || undefined,
+    url: `https://agentd.dev/docs/${doc.slug}/`,
+    inLanguage: "en",
+    isPartOf: { "@id": "https://agentd.dev/#website" },
+    about: { "@id": "https://agentd.dev/#software" },
+    author: { "@type": "Organization", name: "the agentd project" },
+  };
 }
 
 // Map markdown links: a `*.md` doc the site hosts → its on-site route; a repo
@@ -312,6 +352,10 @@ export default async function DocPage({ params }) {
 
   return (
     <div className="docs-shell">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(articleJsonLd(doc)) }}
+      />
       {/* mobile: a compact grouped switcher */}
       <details className="panel lg:hidden">
         <summary className="panel-title cursor-pointer list-none">

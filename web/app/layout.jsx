@@ -24,13 +24,71 @@ export const metadata = {
     "kubernetes",
     "Rust",
   ],
+  applicationName: "agentd",
+  authors: [{ name: "the agentd project", url: "https://github.com/agentd-dev/source-code" }],
+  category: "technology",
+  alternates: { canonical: "/" },
+  robots: { index: true, follow: true },
   openGraph: {
     title: "agentd — a small, MCP-native agent runtime",
     description:
       "An instruction, tools from remote MCP servers over HTTPS, one static binary. Run the agentic loop as a one-shot, a daemon, or a durable workflow. Speaks A2A. Runs no code of its own.",
     type: "website",
     url: "https://agentd.dev",
+    siteName: "agentd",
+    locale: "en_US",
+    images: [
+      {
+        url: "/og.png",
+        width: 1200,
+        height: 630,
+        alt: "agentd — the runtime for autonomous AI agents",
+      },
+    ],
   },
+  twitter: {
+    card: "summary_large_image",
+    title: "agentd — a small, MCP-native agent runtime",
+    description:
+      "One static binary that runs the agentic loop — as a one-shot, a daemon, or a durable workflow. Tools over MCP, speaks A2A, runs no code of its own.",
+    images: ["/og.png"],
+  },
+};
+
+/* The knowledge-graph card (Google, Bing, wikis, LLM crawlers): who this
+   project is, in schema.org terms. Version and repo facts only — anything
+   that changes per release stays OUT so the markup cannot go stale. */
+const JSON_LD = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://agentd.dev/#software",
+      name: "agentd",
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "Linux, macOS",
+      description:
+        "A minimal, MCP-native runtime for autonomous AI agents: one static binary that runs the agentic loop as a one-shot job, a long-lived daemon, or a durable workflow. Tools come from remote MCP servers over HTTPS; it speaks A2A to other agents and runs no code of its own.",
+      url: "https://agentd.dev",
+      downloadUrl: "https://agentd.dev/install.sh",
+      installUrl: "https://agentd.dev/docs/getting-started/",
+      license: "https://www.apache.org/licenses/LICENSE-2.0",
+      offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      sameAs: [
+        "https://github.com/agentd-dev/source-code",
+        "https://crates.io/crates/agentd-cli",
+        "https://www.npmjs.com/package/@agentd-dev/cli",
+      ],
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://agentd.dev/#website",
+      url: "https://agentd.dev",
+      name: "agentd",
+      description: "Documentation and specifications for the agentd agent runtime.",
+      about: { "@id": "https://agentd.dev/#software" },
+    },
+  ],
 };
 
 /* Apply the stored theme before first paint — otherwise a dark-mode reader
@@ -132,6 +190,10 @@ export default function RootLayout({ children }) {
         <script dangerouslySetInnerHTML={{ __html: NO_FLASH }} />
       </head>
       <body className="min-h-screen">
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(JSON_LD) }}
+        />
         <Script
           defer
           strategy="afterInteractive"

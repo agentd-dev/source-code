@@ -1,7 +1,12 @@
 import Link from "next/link";
 import { GROUPS, docsInGroup } from "../../lib/docs";
 
-export const metadata = { title: "Documentation — agentd" };
+export const metadata = {
+  title: "Documentation — agentd",
+  description:
+    "Guides, concepts, operations and the full RFC set for agentd — the minimal, MCP-native agent runtime.",
+  alternates: { canonical: "/docs/" },
+};
 
 function Tag({ tag }) {
   if (!tag) return null;

@@ -334,7 +334,13 @@ template alias and a configured `a2a.peers` entry.
 template, fill declared holes. `allow_freeform: false` extends this to the
 flat tier. Widening never happens at spawn time: flat grants must be
 subsets of the parent's, and instance capability comes only from machinery
-the operator wrote and the trifecta gate passed.
+the operator wrote and the trifecta gate passed. The remaining review
+burden — auditing the *endpoints* a template's `:::mcp` machinery points
+at — is addressed by the service catalog (RFC 0037): with
+`security.egress: closed`, template machinery can only reference
+catalogued services, and template review shrinks to catalog names. A
+`closed` catalog is the recommended posture for template-bearing
+deployments.
 
 **8.2 Injection ordering.** Extraction happens once, on operator-authored
 text, at boot (RFC 0034 §4: directives execute by surface, not content).
@@ -391,4 +397,5 @@ RFC 0009 (spawn chokepoint, payload, caps) · RFC 0025/0033 (durable store,
 file store identity) · RFC 0026 §6 (`subagent.*` tools) · RFC 0029 (peers,
 principals, typed commands) · RFC 0030 (settings schema, `Budget`) ·
 RFC 0034 (instruction documents, extraction surface rule, retirement) ·
-RFC 0035 (streams; Phase B bridging).
+RFC 0035 (streams; Phase B bridging) · RFC 0037 (service catalog — the
+endpoint ceiling for template machinery).

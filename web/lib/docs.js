@@ -260,6 +260,15 @@ export const DOCS = [
     blurb:
       "Operator-declared subagent templates whose instruction is a full instance definition — spawn a supervised child desk with its own workflows, signals and streams; the model fills declared params only.",
   },
+  {
+    slug: "rfc-0037",
+    file: "rfcs/0037-service-catalog-and-egress-policy.md",
+    title: "0037 · Service catalog & egress policy",
+    group: "rfc-core",
+    tag: "draft",
+    blurb:
+      "A services: catalog of the external services a deployment may use — shared credentials, authoritative trifecta tags, tool ceilings — with security.egress: closed enforcing it at dial time.",
+  },
   { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "0022 · Embedding & code tools", group: "rfc-core" },
   { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "0023 · AAuth agent identity", group: "rfc-core", tag: "draft" },
   { slug: "rfc-0024", file: "rfcs/0024-evaluation-harness.md", title: "0024 · Evaluation harness", group: "rfc-core" },

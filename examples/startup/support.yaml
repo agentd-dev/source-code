@@ -11,6 +11,40 @@
 # (it replies through the helpdesk). NO sensitive server is attached here, so
 # the lethal-trifecta gate stays satisfied: a hostile ticket cannot reach
 # anything worth exfiltrating.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Services: a helpdesk with an API (Intercom, Zendesk, Plain, Help Scout —
+# anything an MCP server can wrap) configured to POST new-ticket webhooks;
+# an OpenAI-compatible intelligence endpoint.
+#
+# Secrets (env vars; `{{secret:NAME}}` resolves at startup, never logged):
+#   OPENAI_API_KEY          — platform.openai.com; plain completions scope.
+#   HELPDESK_TOKEN          — the helpdesk's API token. Scope it to ticket
+#                             read + reply ONLY: this desk must not be able
+#                             to delete tickets or touch billing/admin, and
+#                             the narrow token is the enforcement, not the
+#                             instruction.
+#   HELPDESK_WEBHOOK_SECRET — the shared secret you configure on the
+#                             helpdesk's outgoing-webhook settings. agentd
+#                             verifies sha256 HMAC of the RAW BODY against
+#                             the X-Helpdesk-Signature header; if your
+#                             helpdesk signs differently (most let you set a
+#                             custom header + HMAC-SHA256), match it here,
+#                             or front the route with a 20-line relay that
+#                             re-signs (see the Stripe note in finance.yaml).
+#
+# MCP contract — `helpdesk` server. The agent steps below rely on it
+# exposing, at minimum:
+#   - a ticket reader (get/list by id, returning subject/body/requester),
+#   - a reply tool (post a PUBLIC reply to a ticket),
+#   - a note/status tool (internal note, set status/tag).
+# Nuances: replies MUST be idempotent per (ticket, body) or retried steps
+# can double-post — dedupe on your side or accept at-least-once; list tools
+# should paginate defensively (an agent will happily ask for "all tickets").
+#
+# MCP contract — `docs` server: read-only product documentation (search +
+# fetch). It is deliberately untagged: public content, no trust legs spent.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -89,6 +123,13 @@ workflows:
   - name: ticket
     concurrency: { max_runs: 8, on_overflow: queue }
     steps:
+      # Configure the helpdesk to POST its "ticket created" event here. The
+      # 202 answers IMMEDIATELY (before the run does anything) — helpdesk
+      # webhook timeouts are short, and the run's outcome is not the
+      # webhook's business. Payload shape is whatever your helpdesk sends;
+      # the `extract` step below reads it with the model, so renaming fields
+      # costs nothing. If the provider retries deliveries, add
+      # `idempotency: {header: X-Delivery-Id}` to dedupe durably.
       hook:
         kind: webhook
         path: /helpdesk/ticket
@@ -96,7 +137,9 @@ workflows:
         respond: { status: 202 }
 
       # Typed fields out of the payload — later steps route on VALUES, not on
-      # prose we would otherwise paste into prompts.
+      # prose we would otherwise paste into prompts. `extract` is a MODEL
+      # call (the payload is prose-bearing); a strictly-machine payload
+      # would use the zero-token `validate` step instead (see finance).
       triage:
         kind: extract
         depends_on: hook
@@ -174,7 +217,12 @@ workflows:
 
   # ── The escalation desk ────────────────────────────────────────────────────
   # Consumes what triage emitted — including events published while this
-  # workflow was retired or the process was down (`from: earliest`).
+  # workflow was retired or the process was down (`from: earliest`). Two
+  # nuances worth knowing: the offset is durable per CONSUMER, so adding a
+  # second consumer workflow later replays the whole retained backlog into
+  # it once; and delivery is at-least-once with dedup by event id — the
+  # delegate below carries `idempotency: true` so even a crash-replayed
+  # escalation cannot double-file the bug.
   - name: escalation-desk
     concurrency: { max_runs: 2, on_overflow: queue }
     steps:

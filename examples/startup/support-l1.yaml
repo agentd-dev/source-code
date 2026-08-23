@@ -24,6 +24,45 @@
 # commands answer with minimal, structured facts and never raw records.
 #
 # Trust legs: untrusted_input + egress (both Twilio-facing servers).
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Services: a Twilio account with a phone number (SMS + Voice enabled), and
+# the VOICE BRIDGE — a small service you run (see its contract below).
+#
+# Secrets:
+#   OPENAI_API_KEY        — this desk's own text model (SMS + wrap-ups).
+#                           The VOICE model's key lives in the bridge, not
+#                           here — agentd never touches audio or that key.
+#   TWILIO_TOKEN          — API key for the twilio MCP server. Scope:
+#                           messages on THIS number. The `allow:` list
+#                           below additionally strips everything but
+#                           send/get/list at the registry.
+#   VOICEBRIDGE_TOKEN     — the bearer you mint for the bridge's MCP
+#                           surface.
+#   TWILIO_WEBHOOK_SECRET — ⚠ Twilio's real X-Twilio-Signature is
+#                           HMAC-SHA1 over URL + sorted form params — not
+#                           agentd's raw-body sha256. Same fix as Stripe
+#                           (finance.yaml header): a thin relay validates
+#                           Twilio's scheme, converts form-encoding to
+#                           JSON, and re-signs; this secret is the relay's.
+#
+# ── The voice bridge, precisely ──────────────────────────────────────────────
+# One service, three surfaces:
+#   1. Twilio side: answers the number's Voice webhook, upgrades to Media
+#      Streams, and pipes audio to an OpenAI Realtime session (the voice
+#      model + its key live HERE).
+#   2. MCP side (the `voicebridge` server below): exposes live-call verbs
+#      to agentd — say(text), transfer(to), end_call(), get_transcript() —
+#      so a workflow can steer a call in progress.
+#   3. A2A side: when the realtime model needs a FACT mid-call, the bridge
+#      sends this desk the `l1.lookup` command (data part:
+#      {"agentd": {"op": "l1.lookup", ...}}) and speaks the one-sentence
+#      answer it gets back. Latency budget: the caller is on the line —
+#      the whole round trip should be ≤2s, which is why call-assist is
+#      two cheap steps and the back office answers structured facts, not
+#      essays. After hangup it POSTs {from, transcript} to
+#      /twilio/call-ended.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 

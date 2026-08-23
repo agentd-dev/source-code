@@ -19,6 +19,26 @@
 # OUTBOX peer. Marketing reads outside-authored text (web + prospect replies)
 # and the CRM (sensitive): adding egress here would assemble the lethal
 # trifecta, and agentd would refuse to boot it. The split is the design.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Secrets:
+#   OPENAI_API_KEY           — the model (the biggest drafting budget after
+#                              engineering; content is token-hungry).
+#   SEARCH_TOKEN             — the web-search MCP's key (Brave/Tavily/Kagi
+#                              wrappers all fit). Search results are
+#                              attacker-reachable text — hence the
+#                              untrusted_input tag and the instruction's
+#                              injection rule.
+#   CRM_TOKEN                — SAME key as sales or a second one; read
+#                              target accounts + write outreach notes.
+#   MKT_REPLY_WEBHOOK_SECRET — the inbound-parse relay's signing secret,
+#                              same pattern as sales' /email/reply (embed
+#                              person_id in the reply-to at send time).
+#
+# MCP contract — `websearch` server: search (query → titles/urls/snippets)
+# + fetch (url → readable text). Nuances: fetch must cap size and strip
+# markup; snippets are the default diet, full fetch is the exception.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -163,6 +183,10 @@ workflows:
 
       # Durable queue: the daily slot below drains it one item per firing.
       # (Two setters, one per approval path — the finish joins the live one.)
+      # NOTE the replace-not-append semantics: a new week's calendar REPLACES
+      # whatever last week left undrained. Deliberate — stale content does
+      # not auto-publish a week late. If you want carryover, swap the
+      # memory.set for a foreach of memory.push and drain-first.
       queue:
         kind: memory.set
         depends_on: fold

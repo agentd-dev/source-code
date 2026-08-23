@@ -10,6 +10,38 @@
 #
 # Trust legs: sensitive (the books). Stripe webhooks are HMAC-authenticated
 # machine events, and all outbound mail goes through the outbox peer.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Services: Stripe (or any PSP with payment webhooks) and a billing/ledger
+# system an MCP server can wrap (Stripe itself doubles as one for
+# invoices+subscriptions; add your accounting tool for the books).
+#
+# Secrets:
+#   OPENAI_API_KEY        — the model.
+#   LEDGER_TOKEN          — billing API key. Scope: invoices, customers,
+#                           subscriptions, ledger entries. Explicitly NOT
+#                           payouts or bank/transfer endpoints — this desk
+#                           records money and pauses service; it never
+#                           MOVES money.
+#   STRIPE_WEBHOOK_SECRET — ⚠ the one integration nuance in this file:
+#                           Stripe's real Stripe-Signature header is
+#                           `t=<ts>,v1=HMAC(ts + "." + body)` — a scheme
+#                           agentd's generic raw-body HMAC cannot verify
+#                           directly. Terminate Stripe's scheme at a thin
+#                           relay (20 lines, or your gateway's transform)
+#                           that verifies v1 and re-signs the raw body as
+#                           plain sha256 HMAC into the same header — the
+#                           value HERE is the RELAY's secret. Twilio's
+#                           URL-based HMAC-SHA1 (support-l1) needs the same
+#                           treatment; GitHub's (engineering) does not.
+#
+# MCP contract — `ledger` server: get/create invoice, get payment status,
+# create ledger entry (write-off, note), pause/resume subscription, monthly
+# aggregates for the close. Nuances: EVERY write is idempotent by an
+# external key (the step's env.idempotency_key exists for this); amounts
+# are integer cents end-to-end — never floats, and the instruction's
+# "never round" leans on the server not rounding either.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -80,6 +112,10 @@ workflows:
         methods: POST
         respond: { status: 202 }
 
+      # Stripe's payload nests the invoice under data.object; the relay (see
+      # header) may also flatten it. Model extraction absorbs either shape.
+      # For a guaranteed-shape relay, swap `extract` for the zero-token
+      # `validate` step and reference fields directly.
       case:
         kind: extract
         depends_on: hook
@@ -261,6 +297,10 @@ workflows:
       fin: { kind: finish, depends_on: [note], status: completed }
 
   # ── Monthly close: the stream IS the journal ──────────────────────────────
+  # (The close reads billing via MCP for the numbers; the `ledger` stream is
+  # the durable cross-check — every dunning outcome, payment and invoice
+  # this desk ever saw, replayable. If the two disagree, THAT is the
+  # finding, and it goes in the report.)
   # Everything the month produced replays through the report — including
   # events booked while this workflow did not exist yet.
   - name: monthly-close

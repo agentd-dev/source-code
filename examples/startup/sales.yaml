@@ -11,6 +11,30 @@
 # Trust legs: untrusted_input (lead forms + prospect email are outside-
 # authored) + sensitive (the CRM). NOT egress — that is the outbox's leg, and
 # holding all three here is exactly what the lethal-trifecta gate refuses.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Services: the website's lead form POSTing here (your own frontend — so
+# signing is fully in your control); a CRM with an API (Attio, HubSpot,
+# Twenty…); an email provider configured to forward REPLIES to the outbox's
+# sends as inbound webhooks (Postmark/SendGrid/Resend inbound parse — set
+# the reply-to domain to one they receive, and forward to /email/reply with
+# a lead_id you embedded in the reply-to address or headers).
+#
+# Secrets:
+#   OPENAI_API_KEY      — the model.
+#   CRM_TOKEN           — CRM API key. Scope: contacts + deals read/write;
+#                         no exports, no admin, no user management.
+#   LEAD_WEBHOOK_SECRET — invent it; your site's backend signs the lead
+#                         POST body (sha256 HMAC → X-Site-Signature) with
+#                         the same value. Unsigned lead routes get poisoned
+#                         by bots within days — treat this as mandatory.
+#
+# MCP contract — `crm` server: create/update contact + deal, read a deal's
+# history, set stage/disposition. Nuances: it carries BOTH sensitive and
+# untrusted_input tags because CRM notes contain prospect-authored text
+# that comes BACK into prompts later — the tag is how that round trip stays
+# honest. Upserts must be idempotent by external id (the lead_id).
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -275,7 +299,13 @@ workflows:
       fin_lost: { kind: finish, depends_on: [outcome, after_gate], status: completed }
 
   # ── Prospect replies arrive by webhook and become signals ─────────────────
-  # `signal:` on the start IS the relay; the run is the audit trail.
+  # `signal:` on the start IS the relay; the run is the audit trail. The
+  # provider must include lead_id in the payload — embed it at SEND time
+  # (outbox puts it in the reply-to: reply+<lead_id>@…) so the inbound
+  # parse can echo it back. Signals are edge-triggered: a reply landing
+  # after `cold` closed the deal resumes nothing, by design — the run is
+  # over; a fresh reply shows up in the CRM for a human (or a future
+  # workflow) to notice.
   - name: reply-in
     concurrency: { max_runs: 8 }
     steps:

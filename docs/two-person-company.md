@@ -4,7 +4,7 @@
 whose only employees are the CEO and CTO — why it is shaped the way it is,
 what each design decision buys, and what a technical leader should actually
 take from it. The complete, validated configuration lives in
-[`examples/startup/`](https://github.com/agentd-dev/agentd/tree/main/examples/startup);
+[`examples/startup/`](https://github.com/agentd-dev/source-code/tree/main/examples/startup);
 this page is the reasoning behind it.*
 
 ---
@@ -182,7 +182,10 @@ automate it" pitches usually are not:
   registry (`allow: [get_*, restart_service, rollback_deploy]` on the SRE's
   infra server — the destructive verbs are *absent*, not discouraged).
 - **A place to run** — eleven small processes on one box is fine; state is
-  files on disk. The whole company dry-runs offline with the built-in mock
+  files on disk. (The example's README carries the full secrets-and-scopes
+  inventory — which token each desk holds, how narrow it must be, and the
+  one webhook-signature caveat — and every config's header documents the
+  MCP tool contract that desk's workflows actually rely on.) The whole company dry-runs offline with the built-in mock
   intelligence (`AGENT_INTELLIGENCE=mock:final`) and `curl` as the webhook
   source, which is also how you rehearse changes to it.
 
@@ -229,7 +232,7 @@ written in YAML you can diff.
 
 ## Where to go from here
 
-- [`examples/startup/`](https://github.com/agentd-dev/agentd/tree/main/examples/startup)
+- [`examples/startup/`](https://github.com/agentd-dev/source-code/tree/main/examples/startup)
   — the eleven configs, each validated against the binary, with the
   reasoning annotated inline.
 - [Security](security.md) — the trifecta gate, tags, and what "no tools of
@@ -238,6 +241,6 @@ written in YAML you can diff.
   full vocabulary the configs draw from.
 - [Events and streams](workflows.md) with [RFC 0035](/rfcs/0035) — the
   durable event fabric the institutional memory rides on.
-- [The hiring example](https://github.com/agentd-dev/agentd/tree/main/examples/hiring)
+- [The hiring example](https://github.com/agentd-dev/source-code/tree/main/examples/hiring)
   — the same trifecta discipline at two instances instead of eleven, with
   mTLS between them.

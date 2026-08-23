@@ -113,6 +113,36 @@ unplugged.
 | support-l1 | 8450 | 9450 |
 | support-backoffice | 8451 | — |
 
+## Secrets, services, and what each must be able to do
+
+Every `{{secret:NAME}}` in the configs is an env var, resolved at startup and
+redacted everywhere agentd logs. The full inventory — each file's header
+carries the per-desk detail (scopes, provider quirks, MCP tool contracts):
+
+| Secret | Desk | Service | Scope that matters |
+|---|---|---|---|
+| `OPENAI_API_KEY` | all | any OpenAI-compatible endpoint | per-desk daily token budgets are the payroll |
+| `HELPDESK_TOKEN` · `HELPDESK_WEBHOOK_SECRET` | support | Intercom/Zendesk/Plain… | ticket read+reply ONLY; webhook signs raw-body sha256 |
+| `GITHUB_TOKEN` · `GITHUB_WEBHOOK_SECRET` | engineering | GitHub + Actions | fine-grained PAT, this repo, contents+PRs; the webhook scheme is native |
+| `STAGING_TOKEN` | qa | a staging driver (Playwright-MCP…) | staging env only — never production |
+| `INFRA_TOKEN` · `STATUSPAGE_TOKEN` · `ALERT_WEBHOOK_SECRET` | sre | k8s/PaaS + status page + Alertmanager | the most dangerous token in the company — scope to the safe verbs |
+| `CRM_TOKEN` · `LEAD_WEBHOOK_SECRET` | sales, marketing | Attio/HubSpot/Twenty… | contacts+deals rw; your site signs its own lead POSTs |
+| `LEDGER_TOKEN` · `STRIPE_WEBHOOK_SECRET` | finance | Stripe + accounting | records money, never moves it; see the signature-relay note |
+| `SEARCH_TOKEN` · `MKT_REPLY_WEBHOOK_SECRET` | marketing | Brave/Tavily… + inbound email parse | search results are untrusted text |
+| `EMAIL_TOKEN` · `SOCIAL_TOKEN` | outbox | Postmark/Resend + Buffer/Typefully… | SPF+DKIM, inbound parse for reply loops; idempotent send is THE property to test |
+| `TWILIO_TOKEN` · `TWILIO_WEBHOOK_SECRET` · `VOICEBRIDGE_TOKEN` | support-l1 | Twilio + your voice bridge | messages on one number; the voice model's key lives in the bridge |
+| `ACCOUNTS_TOKEN` · `LOGS_TOKEN` | support-backoffice | account store + log platform | both READ-ONLY; log queries customer-scoped by construction |
+
+**The webhook-signature caveat, once:** agentd verifies a generic HMAC of the
+raw body against a named header. GitHub's `X-Hub-Signature-256` matches that
+scheme natively. Stripe (`t=…,v1=HMAC(ts.body)`) and Twilio (HMAC-SHA1 over
+URL+params) do not — front those two routes with a thin relay that verifies
+the provider's scheme and re-signs the raw body (or use your gateway's
+transform). Each file's header says which side of that line it is on. And
+never expose an UNSIGNED route: fake alerts aimed at an agent that can
+restart services, or fake leads aimed at one that emails people, are attacks,
+not noise.
+
 ## Running it
 
 Each file is one instance. Export the secrets each file names

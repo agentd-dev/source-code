@@ -15,6 +15,30 @@
 # log line that contains another customer's data.
 #
 # Trust legs: sensitive only.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Secrets:
+#   OPENAI_API_KEY — the model (small budget: lookups are short turns).
+#   ACCOUNTS_TOKEN — the account store's API key, READ-ONLY. This desk
+#                    answers questions; account MUTATIONS (email changes,
+#                    plan changes) deliberately have no path here — they
+#                    belong to flows with their own verification.
+#   LOGS_TOKEN     — the log platform's query key (Loki/Elastic/ClickHouse
+#                    behind an MCP), scoped to the product's log streams,
+#                    read-only, ideally with a per-query time-range cap.
+#
+# MCP contract — `accounts`: lookup by phone/email/id → {plan, standing,
+# region, created}; recent billing events. The `allow:` list pins it to
+# get/list/search verbs even if the server grows write tools later.
+#
+# MCP contract — `logs` ("the special MCP"): per-customer query over probe
+# results, alert evaluations, delivery attempts. Nuances that MATTER here:
+# every query must be customer-scoped (the tool takes account_ref, not a
+# free query string — cross-tenant reads should be unrepresentable);
+# responses are aggregates and single exemplar lines, never raw dumps
+# (whatever returns here flows onward to customer channels); enforce a
+# server-side row cap.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 

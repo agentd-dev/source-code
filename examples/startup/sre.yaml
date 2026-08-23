@@ -10,6 +10,41 @@
 #
 # Trust legs: sensitive (infra) + egress (the status page is public). No
 # untrusted input: alerts come authenticated from OUR monitoring.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Services: a monitoring stack that webhooks on alert transitions
+# (Alertmanager/Grafana both do), an infra control plane an MCP server can
+# wrap (Kubernetes, Nomad, your PaaS API), a status page with an API
+# (Instatus, Statuspage, or self-hosted).
+#
+# Secrets:
+#   OPENAI_API_KEY       — the model.
+#   INFRA_TOKEN          — the infra API credential. This is the most
+#                          dangerous secret in the company: scope it to the
+#                          verbs the `allow:` list names and NOTHING wider —
+#                          the registry filter makes destructive tools
+#                          absent, but a broad token behind a narrow filter
+#                          is still a broad token if the server changes.
+#   STATUSPAGE_TOKEN     — status-page API key (incident create/update/
+#                          resolve on ONE page).
+#   ALERT_WEBHOOK_SECRET — set the same value on the monitoring stack's
+#                          webhook config. Alertmanager cannot sign; put
+#                          this desk's routes behind your ingress and have
+#                          it (or a 10-line relay) add the sha256-HMAC
+#                          X-Alert-Signature header. Never expose an
+#                          unsigned alert route: firing FAKE alerts at an
+#                          agent that can restart services is an attack.
+#
+# MCP contract — `infra` server: read dashboards/metrics/deploys, plus the
+# three safe verbs (restart_service, scale_pool, rollback_deploy). Nuances:
+# the verbs MUST be idempotent (a crash-replayed restart is a restart);
+# rollback should refuse when there is nothing newer than the last deploy;
+# reads should return summaries, not raw metric series.
+#
+# MCP contract — `statuspage` server: create/update/resolve incident on the
+# public page. Idempotent per incident id — the correlation id below is the
+# alert id for exactly that reason.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -84,6 +119,11 @@ workflows:
   - name: incident
     concurrency: { max_runs: 4, on_overflow: queue }
     steps:
+      # Alertmanager: point a webhook receiver's `url` here for FIRING
+      # notifications and a second receiver at /alerts/resolved (below) —
+      # or one route reading `status` if you prefer; two routes keep the
+      # workflows honest. Group alerts per-service so one incident run maps
+      # to one page entry, not forty.
       hook:
         kind: webhook
         path: /alerts/firing
@@ -161,7 +201,11 @@ workflows:
 
       # ── The escalation tail. Reached ONLY by `on_timeout` routing, so it
       # declares no dependencies: depending on the wait would also fire it
-      # when the alert clears.
+      # when the alert clears. The CTO's answer arrives through any attached
+      # chat client; `human.asked` (see finance's gate-notifier pattern)
+      # is how it ALSO reaches a phone. If the CTO is silent for the 2h
+      # timeout too, the run fails — which run_until/alerting surfaces,
+      # deliberately: a stuck incident must never fail SILENTLY.
       page_cto:
         kind: human
         question: |

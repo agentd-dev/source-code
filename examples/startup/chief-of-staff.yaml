@@ -9,6 +9,17 @@
 # whole world is the other agents and the outbox.
 #
 # Trust legs: none. It talks to peers and sends mail through the outbox.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Secrets: OPENAI_API_KEY only. No third-party services, no MCP servers —
+# by construction the cheapest desk to run and the safest to give reach:
+# it can ASK every peer anything and can cause nothing but an email.
+#
+# Nuance worth copying: the standup foreach carries `on_error: continue`,
+# so one unreachable desk degrades the digest instead of killing it — and
+# the digest instruction treats "X did not answer" as REPORTABLE NEWS.
+# That is the general pattern for fan-outs over fallible peers.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 

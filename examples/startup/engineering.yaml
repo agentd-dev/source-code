@@ -10,6 +10,32 @@
 # Trust legs: sensitive (the repository). Bug summaries arrive over A2A from
 # peers that already treated customer prose as data; the instruction repeats
 # the rule anyway, because defense in depth is free here.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Services: a GitHub (or Forgejo/GitLab) repo with Actions CI, and a repo
+# webhook for workflow-run conclusions.
+#
+# Secrets:
+#   OPENAI_API_KEY        — the model.
+#   GITHUB_TOKEN          — a fine-grained PAT (or GitHub App token) scoped
+#                           to THIS repo: contents:rw + pull_requests:rw.
+#                           NOT repo-admin, NOT org — the `exclude:` below
+#                           strips delete_*/admin_* tools as a second fence,
+#                           but the token is the first.
+#   GITHUB_WEBHOOK_SECRET — the secret on the repo webhook
+#                           (Settings → Webhooks, event: "Workflow runs",
+#                           content-type JSON). GitHub signs sha256 HMAC of
+#                           the raw body into X-Hub-Signature-256 with a
+#                           "sha256=" prefix — EXACTLY the scheme configured
+#                           below; this integration is native, no relay.
+#
+# MCP contract — `github` server. The fix loop calls, at minimum: clone/
+# read-file/search-code, branch, commit+push, open PR, comment on PR, merge
+# PR. Nuances: pushes must be to branches (the instruction forbids main and
+# the token's branch-protection should too); merge should fail loudly if
+# the PR is not mergeable rather than force; keep tool outputs bounded
+# (a whole-repo read blows the context — expose search + ranged reads).
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -141,6 +167,8 @@ workflows:
           Fix the failure and push to the same branch. If the failure shows
           the approach is wrong, say so plainly instead of forcing it.
 
+      # Deliberately NO on_timeout here: one rework is a strategy, two is a
+      # loop. A second silent CI is a failed run a human should look at.
       ci2:
         kind: wait
         depends_on: rework
@@ -174,6 +202,11 @@ workflows:
   - name: ci-verdict
     concurrency: { max_runs: 8 }
     steps:
+      # GitHub's `workflow_run` event. The interesting fields arrive NESTED
+      # ({workflow_run: {head_branch, conclusion, html_url}}); the extract
+      # below flattens them — which is exactly why it is an extract and not
+      # a field-path assign: the mapping survives GitHub payload drift.
+      # GitHub retries failed deliveries, so the 202-first shape matters.
       hook:
         kind: webhook
         path: /github/actions

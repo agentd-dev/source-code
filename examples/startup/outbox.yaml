@@ -14,6 +14,32 @@
 #   - one place to rate-limit, hold, or unplug the company's voice.
 #
 # Trust legs: egress only. No sensitive stores, no untrusted feeds.
+#
+# ── What this desk needs to exist ────────────────────────────────────────────
+#
+# Secrets:
+#   OPENAI_API_KEY — tiny budget on purpose: this desk formats and refuses,
+#                    it does not compose.
+#   EMAIL_TOKEN    — transactional email API key (Postmark/Resend/SES),
+#                    sending-domain configured with SPF+DKIM, and — for the
+#                    reply loops sales and marketing run — inbound parse
+#                    forwarding replies to their /email/reply routes with
+#                    the lead_id/person_id echoed back (embed it in the
+#                    reply-to: reply+<id>@yourdomain).
+#   SOCIAL_TOKEN   — a cross-poster's key (Buffer/Typefully/Postiz…)
+#                    connected to the blog, LinkedIn, X and Instagram
+#                    accounts. One aggregator key here beats four platform
+#                    OAuth dances in an agent config; per-network keys mean
+#                    per-network servers, all still egress-only.
+#
+# MCP contract — `email`: send(to, subject, body[, reply_to]) → message id.
+# Idempotent by content hash or client message id (the a2a commands arrive
+# with idempotency pinned, so a retried delegate must not double-send —
+# this is THE property to test in an email server).
+# MCP contract — `social`: post(channel, text[, media]) → permalink.
+# Instagram requires media — the caption's image description is for your
+# design pipeline; the server should refuse an imageless instagram post
+# rather than posting a blank.
 # ─────────────────────────────────────────────────────────────────────────────
 config_version: "2"
 
@@ -69,7 +95,7 @@ limits:
 # outbound history.
 streams:
   sent:
-    retention: { max_events: 50000, max_age: 9600h }
+    retention: { max_events: 50000, max_age: 400d }
 
 workflows:
   - name: send-email

@@ -16,6 +16,7 @@
 //! and `--<path>` flags for every config-file path), [`watch`] (the inotify
 //! reload trigger).
 
+pub mod directives;
 pub mod envfile;
 pub mod file;
 pub mod paths;

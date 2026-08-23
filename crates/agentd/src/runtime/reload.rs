@@ -262,8 +262,10 @@ impl Runtime {
                 }
             }
         }
-        // Skills sources.
-        if old.skills != new.skills {
+        // Skills sources — the config section, or the instruction's inline
+        // `:::skill` definitions (they live on `agent`, but they land in this
+        // catalogue).
+        if old.skills != new.skills || old.agent.inline_skills != new.agent.inline_skills {
             let mut cat = crate::context::skills::Catalogue::new(
                 new.skills
                     .reference_prefix
@@ -281,27 +283,34 @@ impl Runtime {
                     cat.discover(&**c, mode, src.filter.as_deref());
                 }
             }
+            cat.add_inline(&new.agent.inline_skills);
             self.skills = cat;
             changed.push("skills");
         }
-        // Workflows: reload definitions; live runs stay pinned to their hash.
+        // Workflows: reload definitions. Retirement (runtime::retire) gives
+        // every old version the same exit — unsubscribe what nothing else
+        // wants, pin for live runs, apply its own `unload:` policy — whether
+        // it was removed outright or replaced by a new hash.
         if old.workflows != new.workflows {
-            let live: Vec<(String, String)> = self
-                .runs
-                .values()
-                .filter(|r| !r.status.is_terminal())
-                .map(|r| (r.workflow.clone(), r.workflow_hash.clone()))
-                .collect();
-            for (name, hash) in live {
-                if let Some(w) = self.workflows.get(&name)
-                    && w.hash == hash
-                {
-                    self.pinned.insert(hash, w.clone());
-                }
-            }
-            self.workflows.clear();
+            let previous = std::mem::take(&mut self.workflows);
             if let Err(errs) = self.load_workflows() {
+                self.workflows = previous; // the running set stays authoritative
                 return Err(ReloadRefused::Invalid(errs));
+            }
+            for (name, wf) in &previous {
+                let survives = self
+                    .workflows
+                    .get(name)
+                    .is_some_and(|new_wf| new_wf.hash == wf.hash);
+                if survives {
+                    continue;
+                }
+                let reason = if self.workflows.contains_key(name) {
+                    "replaced"
+                } else {
+                    "removed"
+                };
+                self.retire_workflow(wf, reason);
             }
             self.arm_workflows();
             changed.push("workflows");

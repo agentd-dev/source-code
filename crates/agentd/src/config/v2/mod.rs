@@ -186,6 +186,12 @@ pub struct Agent {
     /// the whole job — `agentd --prompt "…" --intelligence …` runs it once and
     /// exits with the answer on stdout.
     pub prompt: Option<String>,
+    /// Skills defined by `:::skill` directives in the instruction — DERIVED
+    /// (never a config key): `Settings::from_document` extracts them, the
+    /// runtime feeds them to the catalogue. In the struct so a reload diff
+    /// sees an edited inline skill as an agent change.
+    #[serde(skip)]
+    pub inline_skills: Vec<crate::config::directives::InlineSkill>,
     pub preflight: Preflight,
     pub wake_on: Option<Vec<WakeEvent>>,
     pub on_workflow_finished: OnWorkflowFinished,
@@ -1721,7 +1727,41 @@ impl Settings {
                 errs.join("\n  ")
             ));
         }
-        serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))
+        let mut settings: Settings =
+            serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))?;
+        // Colon-fence directives in the instruction (operator-authored text —
+        // this is the ONLY surface extraction runs on; conversation text is
+        // never parsed). `:::workflow` bodies join `workflows:` exactly as
+        // inline entries — same folding, validation, hashing, retirement —
+        // and the model reads the CLEANED text, where each block became a
+        // one-line note instead of machinery it might paraphrase.
+        if let Some(instr) = settings.agent.instruction.clone()
+            && !settings.agent.instruction_is_uri()
+            && instr.lines().any(|l| l.starts_with(":::"))
+        {
+            match crate::config::directives::extract(&instr) {
+                Ok(ex) => {
+                    settings.agent.instruction = Some(ex.cleaned);
+                    settings.agent.inline_skills = ex.skills;
+                    // (`{{config.*}}` inside a block already resolved: the doc
+                    // passed substitute_config_vars with the instruction in it.
+                    // A nameless block is refused by parse_workflow, the one
+                    // authority on that message.)
+                    settings.workflows.extend(ex.workflows);
+                }
+                Err(errs) => {
+                    return Err(format!(
+                        "{source}: agent.instruction directives:
+  {}",
+                        errs.join(
+                            "
+  "
+                        )
+                    ));
+                }
+            }
+        }
+        Ok(settings)
     }
 
     /// The `agent.name` fallback chain: config › downward-API instance ›
@@ -2727,9 +2767,17 @@ fn apply_instruction_sugar(doc: &mut Value) {
             .is_some_and(|s| !s.trim().is_empty())
     };
     let has_instruction = nonblank("/agent/instruction");
+    // An instruction that CARRIES a `:::workflow` directive has authored its
+    // machinery explicitly — extraction (from_document) will add it to
+    // `workflows:`, so generating a sugar `main` here would bolt a model loop
+    // onto a config that declared none.
+    let carries_workflow = doc
+        .pointer("/agent/instruction")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.lines().any(|l| l.starts_with(":::workflow")));
     // A prompt runs as a root turn, so an instruction+prompt pair needs no
     // sugar workflow at all — the prompt IS the job.
-    if has_workflows || !has_instruction || nonblank("/agent/prompt") {
+    if has_workflows || carries_workflow || !has_instruction || nonblank("/agent/prompt") {
         return;
     }
     let work = json!({

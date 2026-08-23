@@ -27,6 +27,7 @@ pub mod nested;
 pub mod pressure; // live per-turn activity for the display clients (RFC 0032 §17)
 pub mod reactor;
 pub mod reload;
+pub(crate) mod retire;
 pub mod starts;
 pub mod steps;
 pub mod subagents;
@@ -386,6 +387,13 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             None => log.warn("skills.source.unavailable", json!({"server": src.server})),
         }
     }
+    if !settings.agent.inline_skills.is_empty() {
+        let names = catalogue.add_inline(&settings.agent.inline_skills);
+        log.info(
+            "skills.discovered",
+            json!({"server": "instruction", "count": names.len(), "skills": names}),
+        );
+    }
 
     // Channels.
     let (events_tx, events_rx) = std::sync::mpsc::channel();
@@ -530,6 +538,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         args: args.to_vec(),
         env: env.to_vec(),
         pinned: BTreeMap::new(),
+        retiring: BTreeMap::new(),
         recent_signals: BTreeMap::new(),
         settings,
         log: log.clone(),

@@ -1168,6 +1168,7 @@ fn unreachable_wf() -> Workflow {
         name: String::new(),
         version: 3,
         priority: Default::default(),
+        unload: Default::default(),
         description: None,
         armed: false,
         inputs_schema: None,

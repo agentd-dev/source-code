@@ -504,6 +504,59 @@ and [RFC 0027](../rfcs/0027-workflow-dialect-3.md) for the full node registry
 
 ---
 
+
+### 6.2 Directives — an instruction that carries its machinery
+
+`agent.instruction` (inline, `--instruction-file`, or a config file) may embed
+**colon-fence directives** — the `:::type{attrs}` … `:::` container syntax
+MyST and ChatGPT readers already know:
+
+```yaml
+agent:
+  instruction: |
+    You watch the queue and keep things tidy.
+
+    :::workflow
+    name: triage
+    steps:
+      wake: { kind: subscribe, server: queue, uri: "queue://inbox" }
+      act:  { kind: agent, depends_on: [wake], instruction: "triage the item" }
+      done: { kind: finish, depends_on: [act] }
+    :::
+
+    :::skill{name=tidy description="how we tidy"}
+    Always sweep before you mop.
+    :::
+
+    :::context{title="ops notes"}
+    The queue drains overnight.
+    :::
+```
+
+Four directives, fail-closed (an unknown name is exit `2` naming this set):
+
+- **`:::workflow`** — the YAML body joins `workflows:` exactly as an inline
+  entry: same `{{config.*}}` folding, validation, hashing, pinning, and
+  retirement (§6.1, workflows doc §retirement). The model reads the *cleaned*
+  instruction, where the block became a one-line note — prose and machinery
+  never double-speak. An instruction that carries a workflow gets **no sugar
+  `main` loop**: it declared its machinery explicitly.
+- **`:::skill{name, description, when}`** — an **inline skill**: the body
+  joins the skills catalogue with no MCP server involved, referenced as
+  `@skill:<name>` like any discovered skill. Inline wins a name collision —
+  the operator wrote it closer to this agent than any server did.
+- **`:::context{title?}`** / **`:::example`** — model-facing: the fence goes,
+  the body stays, wrapped in `<reference>` / `<example>` tags.
+
+Editing the instruction and reloading (SIGHUP / `watch_config`) re-extracts:
+an embedded workflow whose body changed is **replaced** (new runs on the new
+hash, live runs finish pinned), one that disappeared is **retired** under its
+`unload:` policy. Directives are parsed **only** from operator-authored
+surfaces — never from conversation text, and (in this version) not from
+URI-fetched instructions or skill bodies; executing definitions out of less
+trusted text would be prompt injection as a feature. Nest a literal fence by
+giving the outer block more colons (`::::`).
+
 ## 7. Duration syntax
 
 Every duration-typed path — `limits.run.deadline` (`--deadline`),

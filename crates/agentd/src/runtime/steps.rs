@@ -2488,6 +2488,7 @@ impl Runtime {
         crate::obs::metrics::record_run_status(status.as_str());
         self.log.info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
         self.governor.drop_scope(&format!("run:{run_id}"));
+        self.retire_sweep();
         // Answer waiters (workflow.wait / run sync).
         let waiting: Vec<Target> = self
             .pending
@@ -2863,12 +2864,18 @@ impl Runtime {
                     return e;
                 }
                 let wname = args["name"].as_str().unwrap_or("").to_string();
-                if self.workflows.remove(&wname).is_none() {
+                let Some(wf) = self.workflows.remove(&wname) else {
                     return err(format!("no such workflow {wname:?}"));
-                }
+                };
                 let _ = self
                     .durable
                     .delete(Kind::Memory, &format!("{WORKFLOW_DEF_PREFIX}{wname}"));
+                // Delete used to vanish the definition out from under its own
+                // live runs, which then lost `definition_for_run` mid-flight.
+                // Retirement pins it and applies the workflow's `unload:`
+                // policy, so delete means "stop being a workflow", not "strand
+                // whatever you were doing".
+                self.retire_workflow(&wf, "deleted");
                 self.log.info("workflow.deleted", json!({"name": wname}));
                 ToolOutcome::Ready(json!({"ok": true}), false)
             }

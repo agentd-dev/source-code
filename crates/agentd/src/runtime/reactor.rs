@@ -213,6 +213,8 @@ pub struct Runtime {
     pub(crate) env: Vec<(String, String)>,
     /// Workflow definitions pinned by live runs after a reload (hash → definition).
     pub(crate) pinned: BTreeMap<String, Workflow>,
+    /// Retired definitions still owning live runs (`runtime::retire`), by hash.
+    pub(crate) retiring: BTreeMap<String, super::retire::Retiring>,
     /// The last payload per signal name (for `await`/`wait condition` views).
     pub(crate) recent_signals: BTreeMap<String, Value>,
     pub(crate) log: Logger,
@@ -372,6 +374,8 @@ impl Runtime {
             while let Ok(ev) = self.events_rx.try_recv() {
                 self.on_event(ev);
             }
+            // 3.5. Retiring workflows whose drain deadline passed.
+            self.retire_tick();
             // 4. Timers.
             let now = now_ms();
             for t in self.timers.fire(&self.durable, now) {

@@ -50,6 +50,7 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | `concurrency` | `{max_runs, on_overflow}` — default 4 runs, `queue` |
 | `limits` | `{steps, tokens, deadline, budget}` for the whole run |
 | `priority` | `low\|normal\|high` (default `normal`) — contention weight: `low` admissions shed one pressure level early (at *warn*), and each tick schedules ready steps of higher-priority runs first. A tiebreak under scarcity, not a reservation. |
+| `unload` | `{policy: drain\|cancel\|detach, timeout}` — what happens to LIVE runs when this definition is retired (removed, replaced, or deleted). Default `drain`: they finish. See §retirement below. |
 | `steps` | the graph: an object of step id to step |
 | `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:`+`glob:` scan — see the configuration doc §6.1) |
 
@@ -613,6 +614,31 @@ edit — one prompt string included — is a new identity.
 `pending` and `suspended` exist in the enum but are never assigned to a run. Step
 statuses are `pending`, `running`, `done`, `failed`, `skipped`, `cancelled`,
 `timeout` and `suspended`; the first two and `suspended` are non-terminal.
+
+
+### Retirement — how a definition leaves
+
+Three things remove a definition: a config reload that drops or changes it,
+`workflow.delete`, and (for instruction-embedded workflows) an instruction
+edit. All three now leave through **one path**:
+
+1. Starts are disarmed and the definition's MCP resource subscriptions are
+   released — unless another armed workflow still subscribes the same
+   `(server, uri)`, in which case the subscription is theirs now.
+2. The old definition is **pinned** for its live runs, which keep executing
+   against the hash they started with.
+3. New runs stop being admitted.
+4. The workflow's own `unload:` policy applies: **`drain`** (default) lets
+   live runs finish — bounded by `timeout`, after which what remains is
+   cancelled; **`cancel`** cancels them now; **`detach`** pins and forgets.
+5. When the last pinned run reaches a terminal status, the pin is released
+   (`workflow.unloaded` in the log; `workflow.retiring` marked the start).
+
+Replacing a definition is retirement plus arrival: the new version arms and
+takes new runs immediately, the old version's runs finish under their pinned
+hash. Across a *restart* the guarantee narrows to what `resume_policy`
+(RFC 0027 §9) already says: pins live in process memory, so a restored run
+whose definition changed on disk meets the resume policy, not the pin.
 
 ## Validation, and the errors you will actually hit
 

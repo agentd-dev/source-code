@@ -832,6 +832,9 @@ pub struct Workflow {
     /// It is a tiebreak under scarcity, not a reservation.
     #[serde(default)]
     pub priority: Priority,
+    /// Retirement policy for live runs (`unload: {policy, timeout}`).
+    #[serde(default)]
+    pub unload: Unload,
     /// Declared run variables: `{key: {type, reducer}}`.
     ///
     /// Optional, and the point is to make concurrent writes a DECLARED policy
@@ -862,6 +865,44 @@ pub struct Workflow {
 
 fn default_true() -> bool {
     true
+}
+
+/// What happens to a workflow's LIVE runs when its definition is retired —
+/// removed from the config, replaced by a new version, or `workflow.delete`d.
+/// Whatever the policy, retirement always disarms starts, unsubscribes the
+/// definition's MCP resources, stops admitting new runs, and pins the old
+/// definition for whatever keeps running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnloadPolicy {
+    /// Let live runs finish (bounded by `timeout`, then cancel). The default:
+    /// work that was admitted deserves to complete.
+    #[default]
+    Drain,
+    /// Cancel live runs now.
+    Cancel,
+    /// Pin and forget: live runs finish whenever they finish.
+    Detach,
+}
+
+impl UnloadPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnloadPolicy::Drain => "drain",
+            UnloadPolicy::Cancel => "cancel",
+            UnloadPolicy::Detach => "detach",
+        }
+    }
+}
+
+/// The `unload:` declaration (`{policy, timeout}`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Unload {
+    #[serde(default)]
+    pub policy: UnloadPolicy,
+    /// Drain bound in ms; `None` = unbounded (detach-like drain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Contention priority — for workflows and subagent spawns. Ordering matters:
@@ -987,6 +1028,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         "file",
         "uri",
         "priority",
+        "unload",
     ];
     for key in obj.keys() {
         if !TOP.contains(&key.as_str()) {
@@ -1022,6 +1064,43 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         Err(e) => {
             errs.push(format!("workflow {name:?}: {e}"));
             Priority::Normal
+        }
+    };
+    let unload = match obj.get("unload") {
+        None => Unload::default(),
+        Some(u) => {
+            let policy = match u.get("policy").and_then(Value::as_str) {
+                None | Some("drain") => UnloadPolicy::Drain,
+                Some("cancel") => UnloadPolicy::Cancel,
+                Some("detach") => UnloadPolicy::Detach,
+                Some(o) => {
+                    errs.push(format!(
+                        "workflow {name:?}: unload.policy {o:?} must be drain|cancel|detach"
+                    ));
+                    UnloadPolicy::Drain
+                }
+            };
+            let timeout_ms = match u.get("timeout") {
+                None => None,
+                Some(t) => match t.as_str().map(crate::config::parse_duration) {
+                    Some(Ok(d)) => Some(d.as_millis() as u64),
+                    _ => {
+                        errs.push(format!(
+                            "workflow {name:?}: unload.timeout must be a duration (\"60s\")"
+                        ));
+                        None
+                    }
+                },
+            };
+            if let Some(o) = u.as_object()
+                && o.keys()
+                    .any(|k| !matches!(k.as_str(), "policy" | "timeout"))
+            {
+                errs.push(format!(
+                    "workflow {name:?}: unload takes {{policy, timeout}}"
+                ));
+            }
+            Unload { policy, timeout_ms }
         }
     };
     let inputs_schema = match obj.get("inputs") {
@@ -1160,6 +1239,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         name,
         version,
         priority,
+        unload,
         description: obj
             .get("description")
             .and_then(Value::as_str)

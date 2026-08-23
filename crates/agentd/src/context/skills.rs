@@ -41,6 +41,9 @@ pub struct SkillSourceRef {
     /// The prompt name or the resource URI.
     #[serde(rename = "ref")]
     pub reference: String,
+    /// The body, for [`SkillSourceKind::Inline`] only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +51,9 @@ pub struct SkillSourceRef {
 pub enum SkillSourceKind {
     Prompt,
     Resource,
+    /// Defined by a `:::skill` directive in the instruction; the body lives on
+    /// the meta — no server round trip, no server at all.
+    Inline,
 }
 
 /// A loaded skill body (cached by hash).
@@ -163,6 +169,7 @@ impl Catalogue {
                                 server: name.clone(),
                                 kind: SkillSourceKind::Prompt,
                                 reference: p.name.clone(),
+                                body: None,
                             },
                         };
                         if self.insert(meta) {
@@ -210,6 +217,7 @@ impl Catalogue {
                                 server: name.clone(),
                                 kind: SkillSourceKind::Resource,
                                 reference: r.uri.clone(),
+                                body: None,
                             },
                         };
                         if self.insert(meta) {
@@ -304,18 +312,26 @@ impl Catalogue {
             .get(name)
             .cloned()
             .ok_or_else(|| format!("unknown skill {name:?}"))?;
-        let server = servers(&meta.source.server).ok_or_else(|| {
-            format!(
-                "skill {name:?}: server {:?} is not connected",
-                meta.source.server
-            )
-        })?;
-        let text = match meta.source.kind {
-            SkillSourceKind::Prompt => {
-                let messages = server.get_prompt(&meta.source.reference, arguments)?;
-                prompt_messages_text(&messages)
+        let text = if meta.source.kind == SkillSourceKind::Inline {
+            meta.source
+                .body
+                .clone()
+                .ok_or_else(|| format!("inline skill {name:?} lost its body"))?
+        } else {
+            let server = servers(&meta.source.server).ok_or_else(|| {
+                format!(
+                    "skill {name:?}: server {:?} is not connected",
+                    meta.source.server
+                )
+            })?;
+            match meta.source.kind {
+                SkillSourceKind::Prompt => {
+                    let messages = server.get_prompt(&meta.source.reference, arguments)?;
+                    prompt_messages_text(&messages)
+                }
+                SkillSourceKind::Resource => server.read_resource(&meta.source.reference)?,
+                SkillSourceKind::Inline => unreachable!("handled above"),
             }
-            SkillSourceKind::Resource => server.read_resource(&meta.source.reference)?,
         };
         if text.trim().is_empty() {
             return Err(format!("skill {name:?} has an empty body"));
@@ -344,6 +360,32 @@ impl Catalogue {
     }
 
     /// A cached body by hash.
+    /// Register the instruction's `:::skill` definitions. Inline skills win a
+    /// name collision with discovered ones — the operator wrote them CLOSER to
+    /// this agent than any server did.
+    pub fn add_inline(&mut self, skills: &[crate::config::directives::InlineSkill]) -> Vec<String> {
+        let mut names = Vec::new();
+        for sk in skills {
+            self.skills.insert(
+                sk.name.clone(),
+                SkillMeta {
+                    name: sk.name.clone(),
+                    description: sk.description.clone(),
+                    when_to_use: sk.when_to_use.clone(),
+                    arguments: Vec::new(),
+                    source: SkillSourceRef {
+                        server: "instruction".into(),
+                        kind: SkillSourceKind::Inline,
+                        reference: sk.name.clone(),
+                        body: Some(sk.body.clone()),
+                    },
+                },
+            );
+            names.push(sk.name.clone());
+        }
+        names
+    }
+
     pub fn body(&self, hash: &str) -> Option<&SkillBody> {
         self.bodies.get(hash)
     }

@@ -90,7 +90,11 @@ jobs:
         with:
           # Its own workspace, so its own target dir — the cache has to be told.
           workspaces: crates/a2a-oracle -> crates/a2a-oracle/target
-      - run: cargo test --manifest-path crates/a2a-oracle/Cargo.toml
+        # One test at a time: each oracle test spawns a full daemon and talks
+        # to it over sockets with wall-clock timeouts; thirteen daemons in
+        # parallel on a two-core runner is where the read-timeout flakes came
+        # from (twice: stream_frames…, cancelling_answers…).
+      - run: cargo test --manifest-path crates/a2a-oracle/Cargo.toml -- --test-threads=1
 
   # What ships is one static binary on an empty base. That is now the claim
   # worth guarding: MCP and A2A are the official/published implementations

@@ -537,6 +537,7 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/embedding/ | the engine as a Rust library |
 | https://agentd.dev/docs/why-rust/ | the dependency posture and measured footprint |
 | https://agentd.dev/docs/pid-1/ | agentd as Linux init (PID 1) — robots, appliances, boot recipes |
+| https://agentd.dev/docs/directives/ | instruction documents: :::workflow / :::skill / :::context directives, hot reload, graceful retirement |
 | https://agentd.dev/docs/rfc-0027/ | RFC 0027 — the workflow dialect, normative |
 | https://agentd.dev/docs/rfc-0025/ | RFC 0025 — durable state and store adapters |
 | https://agentd.dev/docs/rfc-0029/ | RFC 0029 — A2A conversations, principals, commands |

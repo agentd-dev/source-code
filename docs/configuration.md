@@ -552,10 +552,12 @@ Editing the instruction and reloading (SIGHUP / `watch_config`) re-extracts:
 an embedded workflow whose body changed is **replaced** (new runs on the new
 hash, live runs finish pinned), one that disappeared is **retired** under its
 `unload:` policy. Directives are parsed **only** from operator-authored
-surfaces — never from conversation text, and (in this version) not from
-URI-fetched instructions or skill bodies; executing definitions out of less
-trusted text would be prompt injection as a feature. Nest a literal fence by
-giving the outer block more colons (`::::`).
+surfaces — never from conversation text; executing definitions out of less
+trusted text would be prompt injection as a feature.
+
+The full story — the precise grammar, the trust rule, retirement, and what
+is deliberately out — is [`directives.md`](directives.md); the normative
+contract is [RFC 0034](../rfcs/0034-instruction-documents-and-directives.md).
 
 ## 7. Duration syntax
 

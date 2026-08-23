@@ -120,6 +120,13 @@ export const DOCS = [
     blurb: "The durable DAG engine (RFC 0027) — the graph model, every node kind, durability, and worked examples.",
   },
   {
+    slug: "directives",
+    file: "docs/directives.md",
+    title: "Directives — instruction documents",
+    group: "concepts",
+    blurb: "Embed workflows, skills, and context in the instruction itself (:::type{…} blocks) — one reviewable document, hot-swapped on reload, retired gracefully.",
+  },
+  {
     slug: "node-registry",
     file: "docs/node-registry.md",
     title: "Node registry",
@@ -234,6 +241,8 @@ export const DOCS = [
   { slug: "rfc-0030", file: "rfcs/0030-config-schema-v2.md", title: "0030 · Config schema v2", group: "rfc-core" },
   { slug: "rfc-0031", file: "rfcs/0031-endpoint-authentication.md", title: "0031 · Endpoint authentication", group: "rfc-core" },
   { slug: "rfc-0032", file: "rfcs/0032-interface-and-observation-plane.md", title: "0032 · Interface & observation plane", group: "rfc-core" },
+  { slug: "rfc-0033", file: "rfcs/0033-file-store-and-instance-identity.md", title: "0033 · File store & instance identity", group: "rfc-core" },
+  { slug: "rfc-0034", file: "rfcs/0034-instruction-documents-and-directives.md", title: "0034 · Instruction documents & directives", group: "rfc-core" },
   { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "0022 · Embedding & code tools", group: "rfc-core" },
   { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "0023 · AAuth agent identity", group: "rfc-core", tag: "draft" },
   { slug: "rfc-0024", file: "rfcs/0024-evaluation-harness.md", title: "0024 · Evaluation harness", group: "rfc-core" },

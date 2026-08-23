@@ -28,6 +28,7 @@ const UNDERSTAND = [
   { href: "/docs/harness/", t: "The harness", d: "The supervisor that never talks to the model" },
   { href: "/docs/agent-loop/", t: "The agent loop", d: "How a turn is built, run, and ended" },
   { href: "/docs/workflows/", t: "Workflows", d: "Durable DAGs, triggers, and resume" },
+  { href: "/docs/directives/", t: "Directives", d: "Instructions that carry their machinery" },
   { href: "/docs/subagents/", t: "Subagents", d: "Delegation as an OS process tree" },
   { href: "/docs/why-rust/", t: "Why Rust", d: "The dependency moat, and what it buys" },
   { href: "/docs/pid-1/", t: "PID 1 — agentd as init", d: "Robots and appliances: the runtime as a Linux init" },

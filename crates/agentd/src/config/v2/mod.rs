@@ -516,6 +516,14 @@ pub struct McpServer {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Tool admission control, on the server's ADVERTISED names (before any
+    /// `ns` prefixing): with `allow`, only matching tools register; anything
+    /// matching `exclude` never registers, and exclude beats allow. Globs are
+    /// the registry's `pattern_matches` (trailing `*`).
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
     #[serde(default)]
     pub aauth: Option<bool>,
     #[serde(default)]
@@ -1758,27 +1766,40 @@ impl Settings {
                 errs.join("\n  ")
             ));
         }
-        let mut settings: Settings =
-            serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))?;
         // Colon-fence directives in the instruction (operator-authored text —
         // this is the ONLY surface extraction runs on; conversation text is
         // never parsed). `:::workflow` bodies join `workflows:` exactly as
         // inline entries — same folding, validation, hashing, retirement —
         // and the model reads the CLEANED text, where each block became a
-        // one-line note instead of machinery it might paraphrase.
-        if let Some(instr) = settings.agent.instruction.clone()
-            && !settings.agent.instruction_is_uri()
+        // one-line note instead of machinery it might paraphrase. Extraction
+        // runs BEFORE deserialization because the config-defining blocks
+        // (`:::config`/`:::mcp`/`:::stream`/`:::tools`) contribute a fragment
+        // that merges UNDER the explicit document — an instruction file alone
+        // can define the whole agent, and an explicit key still wins.
+        let mut extraction = None;
+        if let Some(instr) = doc
+            .get("agent")
+            .and_then(|a| a.get("instruction"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            && !looks_like_resource_uri(&instr)
             && instr.lines().any(|l| l.starts_with(":::"))
         {
             match crate::config::directives::extract(&instr) {
                 Ok(ex) => {
-                    settings.agent.instruction = Some(ex.cleaned);
-                    settings.agent.inline_skills = ex.skills;
                     // (`{{config.*}}` inside a block already resolved: the doc
                     // passed substitute_config_vars with the instruction in it.
                     // A nameless block is refused by parse_workflow, the one
                     // authority on that message.)
-                    settings.workflows.extend(ex.workflows);
+                    if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                        a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
+                    }
+                    if let (Some(o), Value::Object(fragment)) =
+                        (doc.as_object_mut(), ex.config.clone())
+                    {
+                        crate::config::directives::merge_missing(o, fragment, false);
+                    }
+                    extraction = Some(ex);
                 }
                 Err(errs) => {
                     return Err(format!(
@@ -1791,6 +1812,12 @@ impl Settings {
                     ));
                 }
             }
+        }
+        let mut settings: Settings =
+            serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))?;
+        if let Some(ex) = extraction {
+            settings.agent.inline_skills = ex.skills;
+            settings.workflows.extend(ex.workflows);
         }
         Ok(settings)
     }
@@ -4340,6 +4367,7 @@ mod tests {
                     "intelligence.pricing" => json!({"m": {"input_per_1k": 1.0}}),
                     "tools.overrides" => json!({"memory.get": {"server": "s", "tool": "t"}}),
                     "store.mcp" => json!({"server": "s"}),
+                    "streams" => json!({"orders": {"retention": {"max_events": 1}}}),
                     "store.http" => json!({"base_url": "https://s"}),
                     "security.aauth" => json!({"provider": "https://apd"}),
                     "lifecycle.exit_code_map" => json!({"3": 0}),
@@ -4848,6 +4876,8 @@ mod tests {
             ns: None,
             headers: BTreeMap::new(),
             tags: BTreeMap::new(),
+            allow: None,
+            exclude: Vec::new(),
             aauth: None,
             oauth: Some(McpOauth {
                 token_url: "https://auth.example/token".into(),
@@ -5101,6 +5131,52 @@ mod tests {
         assert!(s.agent.tools.code.allows("anything"));
         assert!(
             Settings::from_document(json!({"limits": {"run": {"deadline": "soon"}}}), "t").is_err()
+        );
+    }
+
+    #[test]
+    fn instruction_config_directives_define_the_agent_and_explicit_keys_win() {
+        let instr = ":::config\nlimits: {max_runs: 9}\n:::\n\
+                     :::stream{name=orders}\nretention: {max_events: 50}\n:::\n\
+                     :::mcp{name=fs}\nendpoint: \"https://fs.internal/mcp\"\nexclude: [\"delete_*\"]\n:::\n\
+                     Do the work.";
+        let s = Settings::from_document(
+            json!({"agent": {"instruction": instr}, "limits": {"max_runs": 3}}),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            s.limits.max_runs,
+            Some(3),
+            "an explicit key beats the fragment"
+        );
+        assert_eq!(
+            s.streams.get("orders").map(|c| c.max_events()),
+            Some(50),
+            "the fragment fills what the config left unsaid"
+        );
+        let srv = s
+            .mcp
+            .servers
+            .iter()
+            .find(|m| m.name == "fs")
+            .expect("declared");
+        assert_eq!(srv.endpoint, "https://fs.internal/mcp");
+        assert_eq!(srv.exclude, vec!["delete_*"]);
+        let cleaned = s.agent.instruction.as_deref().unwrap();
+        assert!(cleaned.contains("Do the work."));
+        assert!(
+            !cleaned.contains("endpoint"),
+            "machinery never reaches the model"
+        );
+        // A fragment with a bogus section is refused by the SAME deserializer
+        // that guards the config file — no parallel, laxer path.
+        assert!(
+            Settings::from_document(
+                json!({"agent": {"instruction": ":::config\nnot_a_section: 1\n:::\nx"}}),
+                "t"
+            )
+            .is_err()
         );
     }
 

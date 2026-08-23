@@ -60,7 +60,7 @@ Everything is **fail-closed**: an unknown directive name, an unclosed fence,
 or a body that does not parse is a startup refusal (exit `2`) naming the line
 and the known set — `:::worfklow` becomes an error, never silently prose.
 
-## The four directives
+## The content directives
 
 ### `:::workflow` — a definition, where the prose that explains it lives
 
@@ -109,6 +109,65 @@ Model-facing, zero machinery: the fence is removed and the body kept, wrapped
 in `<reference>` / `<example>` tags — so the model sees an unambiguous
 boundary between *what to do*, *what is true*, and *what good output looks
 like*, instead of one undifferentiated wall of prose.
+
+## The whole agent from one document
+
+Four more directives make the instruction file able to define everything a
+config file can — so `agentd --instruction-file agent.md` IS a complete
+deployment:
+
+```markdown
+You are the order desk. Every paid order is fulfilled.
+
+:::config
+store: { kind: file }
+lifecycle: { run_until: drained }
+limits: { max_runs: 20 }
+:::
+
+:::mcp{name=fs}
+endpoint: "https://fs.internal/mcp"
+allow: ["read_*", "list_*"]     # only these tools register
+exclude: ["read_secrets"]       # …and this one never does (beats allow)
+:::
+
+:::stream{name=orders}
+retention: { max_events: 10000 }
+:::
+
+:::tools
+disabled: ["exec"]
+:::
+
+:::workflow
+name: fulfil
+steps:
+  take: { kind: stream, stream: orders, subject: "order.*" }
+  act:  { kind: agent, depends_on: [take], instruction: "fulfil it" }
+  done: { kind: finish, depends_on: [act] }
+:::
+```
+
+- **`:::config`** — any v2 config fragment (a YAML mapping of sections:
+  `store`, `lifecycle`, `limits`, `intelligence`, …). Several blocks merge in
+  document order, later winning.
+- **`:::mcp{name=…}`** — one `mcp.servers[]` entry; attributes merge over the
+  body. The `allow`/`exclude` globs are real config (they work in the config
+  file too): they gate the server's **advertised** tool names at the
+  registry, and an excluded tool does not exist — not disabled, absent.
+- **`:::stream{name=…}`** — one `streams:` declaration (an empty body means
+  defaults).
+- **`:::tools`** — the `tools:` section (`disabled`, `overrides`).
+
+**Precedence:** the document's fragment merges *under* the explicit
+configuration — at every leaf a config-file key, env var, or flag beats the
+fragment. One exception in its favour: fragment `mcp.servers` entries
+*append* to the explicit list unless a server with the same name already
+exists (the instruction can add servers, never re-point a deployed one).
+There is no parallel pipeline: the merged document is deserialized,
+validated, and `--validate-config`-checked exactly as if every key had been
+written in the file — a bogus section in `:::config` is a startup error
+naming the line.
 
 ## Syntax, precisely
 

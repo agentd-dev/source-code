@@ -61,6 +61,12 @@ pub struct Extraction {
     pub workflows: Vec<Value>,
     /// `:::skill{name}` bodies for the catalogue.
     pub skills: Vec<InlineSkill>,
+    /// The config fragment the document's `:::config` / `:::mcp` /
+    /// `:::stream` / `:::tools` blocks assemble — a v2 document subtree that
+    /// merges UNDER the explicit config (an explicit key always wins), so a
+    /// single instruction file can define the whole agent while a config
+    /// file, env, or flag can still override any of it.
+    pub config: Value,
 }
 
 /// A skill defined inline — the catalogue entry plus its body, no MCP server
@@ -77,7 +83,9 @@ pub struct InlineSkill {
 
 /// The names this surface understands. Fail-closed: anything else at a fence
 /// is an error naming this set.
-const KNOWN: &[&str] = &["workflow", "skill", "context", "example"];
+const KNOWN: &[&str] = &[
+    "workflow", "skill", "context", "example", "config", "mcp", "stream", "tools",
+];
 
 /// Parse every top-level directive out of `text`. Returns the directives and
 /// the text segments between them, or every problem found.
@@ -250,6 +258,83 @@ fn parse_attrs(src: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(out)
 }
 
+/// The fragment as a mutable map, created on first use (it stays `Null` for
+/// documents that carry no config-defining blocks).
+fn frag(config: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !config.is_object() {
+        *config = Value::Object(Default::default());
+    }
+    config.as_object_mut().expect("just ensured")
+}
+
+/// A bare attribute value, typed the way YAML would read it — so
+/// `{name=fs timeout=30s aauth=true}` behaves like the equivalent body keys.
+fn attr_value(s: &str) -> Value {
+    match s {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => s
+            .parse::<i64>()
+            .map(Into::into)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+    }
+}
+
+/// Deep-merge `add` into `into`, LATER-WINS at every leaf (used between
+/// directives in one document: the second `:::config` overrides the first,
+/// like a later config file).
+fn merge_over(into: &mut serde_json::Map<String, Value>, add: serde_json::Map<String, Value>) {
+    for (k, v) in add {
+        match (into.get_mut(&k), v) {
+            (Some(Value::Object(dst)), Value::Object(src)) => merge_over(dst, src),
+            (Some(slot), v) => *slot = v,
+            (None, v) => {
+                into.insert(k, v);
+            }
+        }
+    }
+}
+
+/// Deep-merge `frag` into `doc`, DOC-WINS at every leaf — the fragment fills
+/// what the explicit config left unsaid and never overrides what it said.
+/// Lists are leaves (no splicing), with one deliberate exception:
+/// `mcp.servers` entries APPEND when no explicit server has the same name —
+/// declaring a server in the instruction must not require the config file to
+/// have none.
+pub fn merge_missing(
+    doc: &mut serde_json::Map<String, Value>,
+    frag: serde_json::Map<String, Value>,
+    at_mcp: bool,
+) {
+    for (k, v) in frag {
+        match (doc.get_mut(&k), v) {
+            (Some(Value::Array(have)), Value::Array(add)) if at_mcp && k == "servers" => {
+                let names: Vec<String> = have
+                    .iter()
+                    .filter_map(|s| s.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect();
+                for entry in add {
+                    let dup = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| names.iter().any(|h| h == n));
+                    if !dup {
+                        have.push(entry);
+                    }
+                }
+            }
+            (Some(Value::Object(dst)), Value::Object(src)) => {
+                merge_missing(dst, src, k == "mcp");
+            }
+            (Some(_), _) => {}
+            (None, v) => {
+                doc.insert(k, v);
+            }
+        }
+    }
+}
+
 /// Run extraction over an instruction-surface text: parse, interpret the
 /// known blocks, rebuild the text a model should see.
 pub fn extract(text: &str) -> Result<Extraction, Vec<String>> {
@@ -314,6 +399,121 @@ pub fn extract(text: &str) -> Result<Extraction, Vec<String>> {
                             body: d.body.clone(),
                         });
                     }
+                    // Config-defining blocks: each folds into ONE fragment that
+                    // the config layer merges UNDER the explicit document — so
+                    // an instruction file alone can define the whole agent, and
+                    // an explicit config key / env / flag still wins.
+                    "config" => match crate::config::yaml::parse(&d.body) {
+                        Ok(Value::Object(m)) => {
+                            merge_over(frag(&mut out.config), m);
+                            out.cleaned.push_str("[runtime configuration is applied]");
+                        }
+                        Ok(_) => errs.push(format!(
+                            "line {}: :::config body must be a YAML mapping of config sections",
+                            d.line
+                        )),
+                        Err(e) => errs.push(format!(
+                            "line {}: :::config body is not valid YAML: {e}",
+                            d.line
+                        )),
+                    },
+                    "mcp" => {
+                        let body = if d.body.trim().is_empty() {
+                            Ok(Value::Object(serde_json::Map::new()))
+                        } else {
+                            crate::config::yaml::parse(&d.body)
+                        };
+                        match body {
+                            Ok(Value::Object(mut m)) => {
+                                for (k, v) in &d.attrs {
+                                    m.insert(k.clone(), attr_value(v));
+                                }
+                                let Some(name) =
+                                    m.get("name").and_then(Value::as_str).map(str::to_string)
+                                else {
+                                    errs.push(format!(
+                                        "line {}: :::mcp needs a name ({{name=…}} or `name:` in the body)",
+                                        d.line
+                                    ));
+                                    continue;
+                                };
+                                out.cleaned.push_str(&format!(
+                                    "[mcp server \"{name}\" is connected; its tools are available]"
+                                ));
+                                let servers = frag(&mut out.config)
+                                    .entry("mcp")
+                                    .or_insert_with(|| Value::Object(Default::default()));
+                                if let Some(o) = servers.as_object_mut() {
+                                    o.entry("servers")
+                                        .or_insert_with(|| Value::Array(Vec::new()))
+                                        .as_array_mut()
+                                        .expect("just made")
+                                        .push(Value::Object(m));
+                                }
+                            }
+                            Ok(_) => errs.push(format!(
+                                "line {}: :::mcp body must be a YAML mapping (the mcp.servers entry)",
+                                d.line
+                            )),
+                            Err(e) => errs.push(format!(
+                                "line {}: :::mcp body is not valid YAML: {e}",
+                                d.line
+                            )),
+                        }
+                    }
+                    "stream" => {
+                        let Some(name) = d.attrs.get("name").cloned() else {
+                            errs.push(format!(
+                                "line {}: :::stream needs a name ({{name=…}})",
+                                d.line
+                            ));
+                            continue;
+                        };
+                        let body = if d.body.trim().is_empty() {
+                            Ok(Value::Object(serde_json::Map::new()))
+                        } else {
+                            crate::config::yaml::parse(&d.body)
+                        };
+                        match body {
+                            Ok(v @ Value::Object(_)) => {
+                                out.cleaned
+                                    .push_str(&format!("[event stream \"{name}\" is declared]"));
+                                let streams = frag(&mut out.config)
+                                    .entry("streams")
+                                    .or_insert_with(|| Value::Object(Default::default()));
+                                if let Some(o) = streams.as_object_mut() {
+                                    o.insert(name, v);
+                                }
+                            }
+                            Ok(_) => errs.push(format!(
+                                "line {}: :::stream body must be a YAML mapping (retention: …)",
+                                d.line
+                            )),
+                            Err(e) => errs.push(format!(
+                                "line {}: :::stream body is not valid YAML: {e}",
+                                d.line
+                            )),
+                        }
+                    }
+                    "tools" => match crate::config::yaml::parse(&d.body) {
+                        Ok(Value::Object(m)) => {
+                            out.cleaned.push_str("[tool policy is applied]");
+                            let tools = frag(&mut out.config)
+                                .entry("tools")
+                                .or_insert_with(|| Value::Object(Default::default()));
+                            if let Some(o) = tools.as_object_mut() {
+                                merge_over(o, m);
+                            }
+                        }
+                        Ok(_) => errs.push(format!(
+                            "line {}: :::tools body must be a YAML mapping (disabled/overrides)",
+                            d.line
+                        )),
+                        Err(e) => errs.push(format!(
+                            "line {}: :::tools body is not valid YAML: {e}",
+                            d.line
+                        )),
+                    },
                     // Model-facing: the fence goes, the body stays, delimited
                     // with tags a model reads unambiguously.
                     "context" | "example" => {
@@ -423,5 +623,80 @@ mod tests {
         assert_eq!(a["armed"], "true");
         assert_eq!(a["flag-2"], "7");
         assert!(parse_attrs("name=\"unterminated").is_err());
+    }
+
+    #[test]
+    fn config_blocks_fold_into_one_fragment_later_wins() {
+        let t = ":::config\nlimits: {max_runs: 5}\nstore: {kind: memory}\n:::\n\
+                 prose between\n\
+                 :::config\nlimits: {max_runs: 9}\n:::\n";
+        let e = extract(t).unwrap();
+        assert_eq!(e.config["limits"]["max_runs"], 9, "later block wins");
+        assert_eq!(e.config["store"]["kind"], "memory");
+        assert!(e.cleaned.contains("[runtime configuration is applied]"));
+        assert!(
+            !e.cleaned.contains("max_runs"),
+            "machinery never reaches the model"
+        );
+    }
+
+    #[test]
+    fn mcp_stream_and_tools_blocks_build_the_fragment() {
+        let t = ":::mcp{name=fs timeout=30s}\nendpoint: \"https://fs.internal/mcp\"\nallow: [\"read_*\", \"list_*\"]\nexclude: [\"read_secrets\"]\n:::\n\
+                 :::stream{name=orders}\nretention: {max_events: 50}\n:::\n\
+                 :::stream{name=alerts}\n:::\n\
+                 :::tools\ndisabled: [\"exec\"]\n:::\n";
+        let e = extract(t).unwrap();
+        let srv = &e.config["mcp"]["servers"][0];
+        assert_eq!(srv["name"], "fs");
+        assert_eq!(srv["timeout"], "30s", "attrs merge over the body");
+        assert_eq!(srv["allow"][0], "read_*");
+        assert_eq!(srv["exclude"][0], "read_secrets");
+        assert_eq!(e.config["streams"]["orders"]["retention"]["max_events"], 50);
+        assert!(
+            e.config["streams"]["alerts"].is_object(),
+            "empty body = defaults"
+        );
+        assert_eq!(e.config["tools"]["disabled"][0], "exec");
+        assert!(e.cleaned.contains("mcp server \"fs\""), "{}", e.cleaned);
+        assert!(e.cleaned.contains("stream \"orders\""), "{}", e.cleaned);
+    }
+
+    #[test]
+    fn the_fragment_merges_under_the_explicit_doc() {
+        let mut doc = serde_json::json!({
+            "limits": {"max_runs": 3},
+            "mcp": {"servers": [{"name": "fs", "endpoint": "https://real"}]}
+        });
+        let frag = serde_json::json!({
+            "limits": {"max_runs": 9, "step_timeout": "10s"},
+            "mcp": {"servers": [
+                {"name": "fs", "endpoint": "https://SHADOW"},
+                {"name": "gh", "endpoint": "https://gh"}
+            ]},
+            "streams": {"orders": {}}
+        });
+        merge_missing(
+            doc.as_object_mut().unwrap(),
+            frag.as_object().unwrap().clone(),
+            false,
+        );
+        assert_eq!(doc["limits"]["max_runs"], 3, "explicit config wins");
+        assert_eq!(doc["limits"]["step_timeout"], "10s", "fragment fills gaps");
+        let servers = doc["mcp"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2, "new server appends; same-name does not");
+        assert_eq!(
+            servers[0]["endpoint"], "https://real",
+            "no shadowing by name"
+        );
+        assert_eq!(servers[1]["name"], "gh");
+        assert!(doc["streams"]["orders"].is_object());
+    }
+
+    #[test]
+    fn a_nameless_mcp_or_stream_block_fails_closed() {
+        assert!(extract(":::mcp\nendpoint: \"https://x\"\n:::\n").is_err());
+        assert!(extract(":::stream\nretention: {}\n:::\n").is_err());
+        assert!(extract(":::config\n- a list\n:::\n").is_err());
     }
 }

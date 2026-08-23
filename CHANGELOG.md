@@ -9,6 +9,20 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ### Added
 
+- **The whole agent from one document** (RFC 0034 §5.1). Four config-defining
+  directives — `:::config` (any v2 fragment), `:::mcp{name=…}` (an
+  `mcp.servers[]` entry), `:::stream{name=…}`, `:::tools` — let
+  `agentd --instruction-file agent.md` define everything a config file can:
+  store, lifecycle, limits, MCP servers, streams, tool policy, workflows,
+  skills. The document's fragment merges *under* explicit config (a file
+  key, env var, or flag beats it; fragment `mcp.servers` append unless the
+  name exists), through exactly the config file's own deserialization,
+  validation, and reload partition — no parallel pipeline.
+- **Per-server MCP tool admission** — `mcp.servers[].allow` / `exclude`
+  globs gate a server's advertised tool names at the registry; exclude beats
+  allow, and a gated-out tool is absent, not disabled — nothing downstream
+  can resurrect it.
+
 - **Event streams — Phase A of RFC 0035** (agentd as an event-driven agent).
   Declare durable, named streams under `streams:`
   (`orders: {retention: {max_events, max_age}}`); the `emit` step gains a

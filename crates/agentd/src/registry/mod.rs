@@ -262,7 +262,22 @@ impl Registry {
         .collect();
         for srv in servers {
             reg.servers.push(srv.name.clone());
+            // Per-server admission control (`mcp.servers[].allow`/`exclude`),
+            // on the ADVERTISED name: a tool the operator excluded never
+            // exists here — not disabled, absent — so nothing downstream
+            // (defs, grants, overrides) can resurrect it.
+            let gate = settings.mcp.servers.iter().find(|s| s.name == srv.name);
             for t in &srv.tools {
+                if let Some(g) = gate {
+                    let allowed = g
+                        .allow
+                        .as_ref()
+                        .is_none_or(|a| a.iter().any(|p| pattern_matches(p, &t.name)));
+                    let excluded = g.exclude.iter().any(|p| pattern_matches(p, &t.name));
+                    if !allowed || excluded {
+                        continue;
+                    }
+                }
                 let profile_family = t.name.split('.').next().unwrap_or("");
                 let is_profile = reg
                     .tools
@@ -703,6 +718,33 @@ mod tests {
             cfg!(feature = "exec"),
             "enabled → available iff built with --features exec",
         );
+    }
+
+    #[test]
+    fn per_server_allow_and_exclude_gate_advertised_tools() {
+        let s = settings(json!({"mcp": {"servers": [{
+            "name": "fs", "endpoint": "https://fs.example",
+            "allow": ["read_*", "list"], "exclude": ["read_secrets"]
+        }]}}));
+        let servers = vec![ServerTools {
+            name: "fs".into(),
+            ns: None,
+            tags: vec![],
+            tools: vec![
+                tool("read_file"),
+                tool("read_secrets"),
+                tool("list"),
+                tool("delete_everything"),
+            ],
+        }];
+        let reg = Registry::build(&s, &servers).unwrap();
+        assert!(reg.get("read_file").is_some(), "matches allow");
+        assert!(reg.get("list").is_some(), "exact allow");
+        assert!(
+            reg.get("read_secrets").is_none(),
+            "exclude beats allow — the tool does not exist, not merely disabled"
+        );
+        assert!(reg.get("delete_everything").is_none(), "not in allow");
     }
 
     #[test]

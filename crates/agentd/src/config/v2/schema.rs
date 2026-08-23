@@ -296,6 +296,8 @@ fn defs_properties(
                 "ns": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "description": "tool namespace prefix (`ns.tool`)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } } },
+                "allow": { "type": "array", "items": { "type": "string" }, "description": "admit only advertised tools matching these globs" },
+                "exclude": { "type": "array", "items": { "type": "string" }, "description": "never admit advertised tools matching these globs (beats allow)" },
                 "aauth": { "type": "boolean" },
                 "oauth": { "type": "object", "additionalProperties": false, "required": ["token_url", "client_id", "client_secret"], "properties": {
                     "token_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": secret, "scope": { "type": "string" } } },

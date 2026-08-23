@@ -106,11 +106,38 @@ file, via `--instruction` / `--instruction-file`, or through env layering.
 | `skill` | Markdown | an **inline skill** (RFC 0028 §7): catalogued with `source.kind = inline`, body on the entry, no server round-trip. Attributes: `name` (required), `description`, `when`. Referenced as `@skill:<name>`; inline wins a name collision with a discovered skill. Cleaned text: `[skill "<name>" is available — reference it as @skill:<name>]`. |
 | `context` | text | kept in the cleaned document, wrapped `<reference title="…">…</reference>` — material that is true rather than imperative. |
 | `example` | text | kept, wrapped `<example>…</example>` — what good output looks like. |
+| `config` | a v2 config fragment (YAML mapping of sections) | merges into the effective configuration per §5.1. Cleaned text: `[runtime configuration is applied]`. |
+| `mcp` | an `mcp.servers[]` entry (YAML; attributes merge over it, `name` required) | declares an MCP server, `allow`/`exclude` tool globs included. Cleaned text: `[mcp server "<name>" is connected; its tools are available]`. |
+| `stream` | a stream declaration (`retention: …`; empty = defaults). `name` required | joins `streams:` (RFC 0035). Cleaned text: `[event stream "<name>" is declared]`. |
+| `tools` | the `tools:` section (`disabled` / `overrides`) | merges into tool policy. Cleaned text: `[tool policy is applied]`. |
 
 Names are a **closed set**; extending it is a spec change. Reserved for
 future registration, in intended order: `approval` (HITL policy, RFC 0032
 §14 adjacency), `memory` (idempotent durable-memory seeding), `schedule`
 (sugar over a `schedule`-start workflow).
+
+### 5.1 The config fragment — one document defines the whole agent
+
+The config-defining directives (`config`, `mcp`, `stream`, `tools`) fold
+into ONE fragment per document — a v2 subtree assembled in document order,
+later blocks overriding earlier at each leaf. The fragment then merges
+**under** the explicit configuration: at every leaf, a value from a config
+file, env var, or flag wins over the fragment, so
+`agentd --instruction-file agent.md` alone can define the whole agent —
+store, lifecycle, streams, MCP servers, tool policy, workflows — while any
+deployed override still applies. Lists are leaves (no splicing), with one
+exception: fragment `mcp.servers` entries **append** unless an explicit
+server already has that name (a name collision keeps the explicit entry —
+the instruction cannot shadow a deployed server's endpoint).
+
+The fragment is not a parallel config system: it is deserialized, validated,
+schema-checked, hot-reload-partitioned and `--validate-config`-checked by
+exactly the machinery that handles the config file, per §5's rule. A
+fragment key that is restart-only (RFC 0030 §6) answers to the same
+partition on instruction reload as it would in the file. Trust is §4,
+unchanged: config directives execute only from operator-authored instruction
+surfaces, never from conversation text, URI-fetched instructions, or skill
+bodies.
 
 ## 6. Reload semantics
 

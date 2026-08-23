@@ -1,3 +1,6 @@
 node_modules/
 .next/
 out/
+# Synced from ../skills/agentd/ by the prebuild step — the skill is canonical there.
+public/SKILL.md
+public/reference/

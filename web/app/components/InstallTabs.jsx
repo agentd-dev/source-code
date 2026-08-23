@@ -48,13 +48,13 @@ $ agentd-tui --endpoint http://127.0.0.1:8420
     id: "agent",
     label: "ai agent",
     title: "for your AI agent · paste as a prompt",
-    copy: `Install agentd on this machine: run \`curl -fsSL https://agentd.dev/install.sh | sh\` (it verifies checksums, no sudo). Then read https://agentd.dev/llms.txt and the agentd Agent Skill at https://github.com/agentd-dev/source-code/tree/main/skills/agentd, and set up an agentd config for my task.`,
+    copy: `Install agentd on this machine: run \`curl -fsSL https://agentd.dev/install.sh | sh\` (it verifies checksums, no sudo). Then read https://agentd.dev/llms.txt and the agentd Agent Skill at https://agentd.dev/SKILL.md, and set up an agentd config for my task.`,
     display: `Install agentd on this machine: run
   curl -fsSL https://agentd.dev/install.sh | sh
 (it verifies checksums, no sudo). Then read
   https://agentd.dev/llms.txt
 and the agentd Agent Skill at
-  github.com/agentd-dev/source-code · skills/agentd
+  agentd.dev/SKILL.md · the Agent Skill
 and set up an agentd config for my task.`,
   },
 ];

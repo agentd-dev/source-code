@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "cp ../skills/agentd/SKILL.md public/SKILL.md && mkdir -p public/reference && cp ../skills/agentd/reference/*.md public/reference/",
     "build": "next build",
     "start": "next start"
   },

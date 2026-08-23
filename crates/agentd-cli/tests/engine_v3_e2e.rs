@@ -331,3 +331,34 @@ fn a_workflow_referencing_an_undefined_config_var_is_refused_at_startup() {
         "the refusal names the missing var:\n{stderr}"
     );
 }
+
+#[test]
+fn a_start_whose_inputs_cannot_render_refuses_loudly_instead_of_firing_empty() {
+    // `trigger` completes, raising workflow.finished; `watcher`'s inputs
+    // mapping names a payload path that does not exist. It must NOT fire with
+    // silently-empty inputs (the old behavior) — it logs and stays quiet.
+    let steps_trigger = r#"{
+        "s": {"kind": "once"},
+        "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
+    }"#;
+    let steps_watcher = r#"{
+        "hit": {"kind": "event", "on": "workflow.finished",
+                "inputs": {"who": "{{payload.no_such_field.at_all}}"}},
+        "f": {"kind": "finish", "depends_on": ["hit"], "status": "completed"}
+    }"#;
+    let cfg = write_config(&format!(
+        "config_version: \"2\"\nagent:\n  name: loudstart\nstore:\n  kind: memory\nworkflows:\n  - name: trigger\n    steps: {steps_trigger}\n  - name: watcher\n    steps: {steps_watcher}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n"
+    ));
+    let out = run_agentd(&cfg, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    let invalid = events(&stderr, "start.inputs.invalid");
+    assert_eq!(invalid.len(), 1, "the refusal is logged once:\n{stderr}");
+    assert_eq!(invalid[0]["workflow"], "watcher", "{stderr}");
+    assert!(
+        !events(&stderr, "run.start")
+            .iter()
+            .any(|e| e["workflow"] == "watcher"),
+        "the watcher must not fire with empty inputs:\n{stderr}"
+    );
+}

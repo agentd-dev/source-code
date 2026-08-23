@@ -335,7 +335,20 @@ impl Runtime {
                     "env".into(),
                     json!({"instance": self.instance, "ts": now_ms()}),
                 );
-                crate::engine::template::render(mapping, &data).unwrap_or(json!({}))
+                match crate::engine::template::render(mapping, &data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Fail closed, loudly. This used to fall back to `{}`,
+                        // which fired the run with silently-empty inputs — a
+                        // typo in the mapping became a mystery three steps
+                        // later instead of one line here.
+                        self.log.warn(
+                            "start.inputs.invalid",
+                            json!({"workflow": workflow, "node": node, "kind": kind, "err": e}),
+                        );
+                        return;
+                    }
+                }
             }
             None => json!({}),
         };

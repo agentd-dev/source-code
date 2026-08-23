@@ -166,7 +166,12 @@ Behaviour the field names do not give away:
   window keeps the *samples*.
 - `event` fires on lifecycle events. A terminal run raises `workflow.finished`
   when it completed, `workflow.failed` when it failed, stalled, was cancelled or
-  was refused.
+  was refused. The start step's output is **wrapped**:
+  `{event: "workflow.finished", payload: {run, workflow, status}}` — so
+  downstream steps read `{{steps.<id>.output.payload.workflow}}`, while the
+  CEL `filter` sees the inner object directly (`payload.workflow == "job"`).
+  An `inputs:` mapping that fails to render (a typo'd path) refuses to fire,
+  loudly (`start.inputs.invalid`) — never silently with empty inputs.
 - `webhook` deduplicates on the `Idempotency-Key` header by default — a replay
   answers `200 duplicate` and fires no second run. `respond: sync` holds the
   response open until the run reaches a terminal state. `rate: "<burst>/<per>s"`

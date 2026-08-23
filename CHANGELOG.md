@@ -5,6 +5,63 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v2.6.0 — the instruction becomes a document
+
+Two features that make an agent something you author rather than assemble,
+plus the missing thirds of two stories v2.5 started.
+
+Crates: `agentd-core` / `agentd-cli` **2.6.0**; `agentd-mcp` 0.4.0 /
+`agentd-net` 0.4.0 unchanged. `@agentd-dev/cli` **2.6.0**;
+`ghcr.io/agentd-dev/agentd:2.6.0`.
+
+### Added
+
+- **Instruction directives** (RFC 0034, [docs](https://agentd.dev/docs/directives/)).
+  `agent.instruction` is now a specified format — prose that may embed
+  machinery in the `:::type{attrs}` colon-fence syntax: `:::workflow` bodies
+  join `workflows:` exactly as inline entries (same folding, validation,
+  hashing, pinning, retirement — and no sugar `main` loop when an instruction
+  declares its own machinery); `:::skill{name}` defines an **inline skill**
+  with no MCP server, referenced as `@skill:<name>`; `:::context` /
+  `:::example` mark text as reference or few-shot, wrapped in tags the model
+  reads unambiguously. The model always sees the *cleaned* text. Executed
+  ONLY from operator-authored surfaces — never conversation text —
+  fail-closed on unknown names, unclosed fences, bad bodies.
+- **Graceful workflow retirement.** Every way a definition leaves — reload
+  removal, replacement by a new version, `workflow.delete`, an instruction
+  edit — now takes one path: disarm + unsubscribe MCP resources nothing else
+  wants, pin the definition for live runs, stop admitting, apply the
+  workflow's own `unload: {policy: drain|cancel|detach, timeout}` (default
+  drain), and garbage-collect the pin when the last run lands
+  (`workflow.retiring` / `workflow.unloaded`).
+- **Circuit breakers on remote-effect steps** —
+  `breaker: {failures, cooldown}` on `http` / `mcp.tool` / `a2a.send` /
+  `a2a.delegate`: N consecutive failures open the circuit, further attempts
+  fail instantly without dialling (`breaker open` error prefix — route
+  fallbacks with `on_error` + `switch`), one probe per cooldown closes or
+  re-opens it. State is durable and shared by fan-out iterations; proven by
+  an e2e spanning five daemon processes.
+- **Outbound rate pacing** — `rate: "<burst>/<per>s"` on the same kinds: past
+  the burst the step *waits* on a durable timer (consuming neither an attempt
+  nor a retry) instead of failing, so fan-outs drain at the declared pace.
+  With `retry` (exponential, jittered — already shipped) the trio covers the
+  failure taxonomy: transient / outage / quota.
+- **Docs**: [Directives](https://agentd.dev/docs/directives/) and
+  [PID 1 — agentd as init](https://agentd.dev/docs/pid-1/) concept pages;
+  RFC 0034; RFC 0033 restored to the site index; the landing install panel
+  grew curl/docker/npm/AI-agent channels with a copy button.
+
+### Fixed
+
+- `workflow.delete` stranded its own live runs (definition lost mid-flight);
+  a reload leaked pinned definitions and MCP subscriptions forever; a
+  *failed* reload left the workflow registry empty. All three are what the
+  retirement path now guarantees against.
+- A start node whose `inputs:` mapping fails to render now refuses to fire,
+  loudly (`start.inputs.invalid`) — it used to fire with silently-empty
+  inputs. The `event` start's payload shape
+  (`{event, payload: {run, workflow, status}}`) is now documented.
+
 ## v2.5.1 — the answer must beat the obituary
 
 A patch on the day of 2.5.0, for a defect the release's own CI surfaced. The

@@ -215,6 +215,9 @@ pub struct Runtime {
     pub(crate) pinned: BTreeMap<String, Workflow>,
     /// Retired definitions still owning live runs (`runtime::retire`), by hash.
     pub(crate) retiring: BTreeMap<String, super::retire::Retiring>,
+    /// Definition hashes whose durable pin was written this life (one write
+    /// per version; see `retire::ensure_pin`).
+    pub(crate) pin_written: std::collections::HashSet<String>,
     /// The last payload per signal name (for `await`/`wait condition` views).
     pub(crate) recent_signals: BTreeMap<String, Value>,
     pub(crate) log: Logger,
@@ -528,9 +531,23 @@ impl Runtime {
         let mut batch = std::mem::take(&mut self.inbox_queue);
         while let Some(ev) = batch.pop_front() {
             if self.draining {
-                // Keep it durable for the next life; stop intake.
-                batch.push_front(ev);
-                break;
+                // Keep it durable for the next life; stop intake — with one
+                // exception: the start event of a `lifecycle.shutdown` deinit
+                // workflow exists to run DURING the drain, and the drain gate
+                // is waiting for it. Everything else waits for the next life.
+                let deinit = ev.kind == kinds::START_FIRED
+                    && ev.payload["workflow"]
+                        .as_str()
+                        .and_then(|n| self.workflows.get(n))
+                        .is_some_and(|w| {
+                            w.start_steps().iter().any(|s| {
+                                s.kind == "event" && s.field_str("on") == Some("lifecycle.shutdown")
+                            })
+                        });
+                if !deinit {
+                    self.inbox_queue.push_back(ev);
+                    continue;
+                }
             }
             self.counters.inbox_processed += 1;
             match ev.kind.as_str() {
@@ -914,6 +931,50 @@ impl Runtime {
             json!({"draining": true, "reason": reason}),
         );
         self.children.begin_drain(reason);
+        // Deinitialization workflows: `event {on: lifecycle.shutdown}` starts
+        // fire NOW — releasing a claimed webhook route, deregistering from a
+        // service, flushing a summary — and the drain below WAITS for exactly
+        // those runs (bounded by drain_timeout like everything else). The
+        // mirror of `once {policy: always}`, which is the init workflow.
+        self.fire_event_starts("lifecycle.shutdown", &json!({"reason": reason}));
+    }
+
+    /// Non-terminal runs of workflows that declare a `lifecycle.shutdown`
+    /// start — the runs drain must wait for. (Any of the workflow's runs
+    /// counts: an in-flight ordinary run of a deinit-capable workflow is not
+    /// distinguishable from the deinit run by the time both must finish.)
+    fn shutdown_runs_live(&self) -> usize {
+        let capable = |name: &str, hash: &str| {
+            self.definition_for_run_ref(name, hash).is_some_and(|w| {
+                w.start_steps()
+                    .iter()
+                    .any(|s| s.kind == "event" && s.field_str("on") == Some("lifecycle.shutdown"))
+            })
+        };
+        let live = self
+            .runs
+            .values()
+            .filter(|r| !r.status.is_terminal())
+            .filter(|r| capable(&r.workflow, &r.workflow_hash))
+            .count();
+        // A fired-but-not-yet-created run is still in the inbox for a tick —
+        // the gate must not slip through that window.
+        let queued = self
+            .inbox_queue
+            .iter()
+            .filter(|e| e.kind == super::events::kinds::START_FIRED)
+            .filter(|e| {
+                e.payload["workflow"]
+                    .as_str()
+                    .and_then(|n| self.workflows.get(n))
+                    .is_some_and(|w| {
+                        w.start_steps().iter().any(|s| {
+                            s.kind == "event" && s.field_str("on") == Some("lifecycle.shutdown")
+                        })
+                    })
+            })
+            .count();
+        live + queued
     }
 
     /// Decide whether to exit now. Returns the exit code when done.
@@ -932,7 +993,8 @@ impl Runtime {
             let timeout = self.settings.lifecycle.drain_timeout();
             let started = self.drain_started.unwrap_or_else(Instant::now);
             let force = crate::signals::force() || started.elapsed() >= timeout;
-            let done = self.children.drive_drain(force);
+            let done =
+                self.children.drive_drain(force) && (force || self.shutdown_runs_live() == 0);
             if done || started.elapsed() >= timeout + ABANDON_GRACE {
                 if !done {
                     self.log

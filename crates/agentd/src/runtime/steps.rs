@@ -427,6 +427,9 @@ impl Runtime {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}-{}", name, ulid::new()));
+        // The definition this run starts under survives us durably: a restart
+        // that also changed or removed the workflow still finishes this run.
+        self.ensure_pin(&w);
         let mut run = RunState::new(
             &run_id,
             &w,
@@ -555,6 +558,17 @@ impl Runtime {
     /// hash) — the current definition when unchanged, else the pinned copy a
     /// reload kept. A restored run whose definition changed underneath it has
     /// no match (`resume_policy: refuse`, RFC 0027 §9).
+    /// [`Self::definition_for_run`] by (name, hash) — for callers that hold
+    /// the run record already.
+    pub(crate) fn definition_for_run_ref(&self, workflow: &str, hash: &str) -> Option<&Workflow> {
+        if let Some(w) = self.workflows.get(workflow)
+            && w.hash == hash
+        {
+            return Some(w);
+        }
+        self.pinned.get(hash)
+    }
+
     pub(crate) fn definition_for_run(&self, run_id: &str) -> Option<Workflow> {
         let run = self.runs.get(run_id)?;
         if let Some(w) = self.workflows.get(&run.workflow)
@@ -666,10 +680,20 @@ impl Runtime {
         for id in nested {
             self.nested_advance(run_id, &id);
         }
+        // Draining stops starting new steps — with one deliberate exception:
+        // a workflow that declares a `lifecycle.shutdown` start exists to run
+        // DURING the drain (deregister the webhook, flush the summary), and
+        // the drain gate waits for it. Everything else parks where it is,
+        // checkpointed, and resumes next life.
+        let shutdown_capable = self.draining
+            && wf
+                .start_steps()
+                .iter()
+                .any(|s| s.kind == "event" && s.field_str("on") == Some("lifecycle.shutdown"));
         match next {
             Ok(Next::Ready(steps)) => {
                 for s in steps {
-                    if self.draining {
+                    if self.draining && !shutdown_capable {
                         return;
                     }
                     self.execute_step(run_id, &s);
@@ -2489,6 +2513,21 @@ impl Runtime {
         self.log.info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
         self.governor.drop_scope(&format!("run:{run_id}"));
         self.retire_sweep();
+        // Durable-pin GC for the ordinary path: when the LAST run of a
+        // definition version lands, its stored pin has no reader left. (A
+        // still-armed workflow re-pins on its next run's first start.)
+        if let Some(hash) = self.runs.get(run_id).map(|r| r.workflow_hash.clone())
+            && !self
+                .runs
+                .values()
+                .any(|r| !r.status.is_terminal() && r.workflow_hash == hash)
+        {
+            let _ = self.durable.delete(
+                crate::state::Kind::Memory,
+                &format!("{}{hash}", super::retire::PIN_PREFIX),
+            );
+            self.pin_written.remove(&hash);
+        }
         // Answer waiters (workflow.wait / run sync).
         let waiting: Vec<Target> = self
             .pending

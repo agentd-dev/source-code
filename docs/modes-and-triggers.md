@@ -76,7 +76,7 @@ workflows:
 | `schedule`  | on a clock | `cron: "0 2 * * *"`, or `every: 1h`, or `at: "02:00Z"` |
 | `subscribe` | when an MCP **resource** updates | `server`, `uri`, `debounce`, `coalesce`, `filter` |
 | `signal`    | when a named signal arrives | `name` |
-| `event`     | on a runtime event | `on: workflow_finished` \| `workflow_failed` |
+| `event`     | on a runtime event | `on: workflow.finished` \| `workflow.failed` \| `lifecycle.shutdown` |
 | `a2a`       | when an A2A message/command arrives for it | — |
 
 Start-node state (last fired, iteration, next deadline, debounce window) is
@@ -121,3 +121,41 @@ a2a:
 See [`docs/configuration.md`](configuration.md) for the full `a2a` schema and
 [RFC 0029](../rfcs/0029-a2a-conversations-principals-commands.md) for the wire contract.
 
+
+
+## Init and deinit — workflows that bracket the process
+
+Two idioms make a daemon's lifecycle itself programmable:
+
+- **Initialization** — a `once {policy: always}` start fires on every boot
+  (before `ensure`-style dedup, it is the "run this when I come up" hook).
+  The canonical use: self-registration — POST your own webhook URL to a
+  third-party service the moment the process is alive to receive calls.
+- **Deinitialization** — an `event {on: lifecycle.shutdown}` start fires when
+  the drain begins (SIGTERM/SIGINT, or a `finish {exit: true}`), and the
+  drain **waits** for that run — bounded by `drain_timeout` like everything
+  else — before the process exits. The mirror of the above: DELETE the
+  webhook registration so the third party stops calling a corpse.
+
+```yaml
+workflows:
+  - name: init
+    steps:
+      boot:     { kind: once, policy: always }
+      register: { kind: http, depends_on: [boot], method: POST,
+                  url: "{{config.service}}/webhooks", json: { url: "{{config.my_hook}}" } }
+      f:        { kind: finish, depends_on: [register] }
+  - name: deinit
+    steps:
+      bye:        { kind: event, on: lifecycle.shutdown }
+      deregister: { kind: http, depends_on: [bye], method: DELETE,
+                    url: "{{config.service}}/webhooks?url={{config.my_hook}}" }
+      f:          { kind: finish, depends_on: [deregister] }
+```
+
+Keep deinit workflows to fast, model-free steps (`http`, `mcp.tool`, data):
+the drain is simultaneously winding subagent children down, so an `agent`
+step here competes with the shutdown it is part of. Every OTHER queued start
+stays durably in the inbox for the next life — only `lifecycle.shutdown`
+runs are admitted during a drain. The event payload carries the reason:
+`{event: "lifecycle.shutdown", payload: {reason: "signal" | "exit"}}`.

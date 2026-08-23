@@ -171,10 +171,10 @@ unload: { policy: drain, timeout: 120s }   # drain (default) | cancel | detach
    live-run count) and `workflow.unloaded`.
 
 Replacement is retirement plus arrival: the new hash takes new runs
-immediately while the old hash's runs finish under their pin. Across a
-*restart* the guarantee narrows to the existing `resume_policy` (RFC 0027
-§9): pins are process state, so a restored run whose definition changed on
-disk meets the resume policy instead.
+immediately while the old hash's runs finish under their pin. Pins are
+**durable**: even a SIGKILL followed by a restart with a changed or removed
+definition resumes the run under the definition it started with — edit the
+instruction as freely as you like; work in flight finishes as authored.
 
 ## What this is deliberately not
 

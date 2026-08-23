@@ -539,6 +539,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         env: env.to_vec(),
         pinned: BTreeMap::new(),
         retiring: BTreeMap::new(),
+        pin_written: Default::default(),
         recent_signals: BTreeMap::new(),
         settings,
         log: log.clone(),
@@ -605,6 +606,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
     if restored.manifest.is_some() {
         log.info("restore.adopted", json!({"runs": rt.runs.len(), "contexts": rt.contexts.len(), "subagents": rt.subagents.len(), "timers": rt.timers.len(), "artifacts": rt.artifacts.len(), "inbox_pending": rt.inbox_queue.len(), "lost": restored.lost.len()}));
+        rt.restore_pins();
         // Audit the restore — a durable-state generation adoption (plan §3.11:
         // restore is audited; `lost` entities are recorded).
         rt.audit(audit::AuditEvent {

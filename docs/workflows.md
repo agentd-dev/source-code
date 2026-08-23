@@ -641,9 +641,12 @@ edit. All three now leave through **one path**:
 
 Replacing a definition is retirement plus arrival: the new version arms and
 takes new runs immediately, the old version's runs finish under their pinned
-hash. Across a *restart* the guarantee narrows to what `resume_policy`
-(RFC 0027 §9) already says: pins live in process memory, so a restored run
-whose definition changed on disk meets the resume policy, not the pin.
+hash. Pins are **durable**: the definition a run starts under is written to
+the store once per version, so even a SIGKILL followed by a restart with a
+*changed or removed* workflow resumes the run under the definition it started
+with (`workflow.pin_restored`), and the pin is garbage-collected when its
+last run lands. Only a store from before this mechanism falls back to the
+old refusal (`resume_policy`, RFC 0027 §9).
 
 ## Validation, and the errors you will actually hit
 

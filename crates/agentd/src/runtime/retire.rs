@@ -15,8 +15,16 @@
 //! terminal status, which also closes the old reload leak.
 
 use crate::engine::model::{UnloadPolicy, Workflow};
-use crate::state::now_ms;
+use crate::state::{Kind, now_ms};
 use serde_json::json;
+
+/// Durable definition pins, keyed by content hash (`Kind::Memory`). Written
+/// once per definition version when its first run starts; read back at
+/// restore for any non-terminal run whose definition is no longer in the
+/// registry — which is what lets a run **survive a restart that also changed
+/// or removed its workflow**, instead of being refused. Deleted when the last
+/// run of that hash reaches a terminal status.
+pub(crate) const PIN_PREFIX: &str = "_pins/";
 
 /// A retired definition still owning live runs. The policy was applied at
 /// retirement; what remains to track is only the drain bound.
@@ -28,6 +36,75 @@ pub(crate) struct Retiring {
 }
 
 impl super::reactor::Runtime {
+    /// Persist the definition a starting run will need if this process — and
+    /// possibly this configuration — is gone before the run is. One write per
+    /// definition version per process life.
+    pub(crate) fn ensure_pin(&mut self, wf: &Workflow) {
+        if !self.pin_written.insert(wf.hash.clone()) {
+            return;
+        }
+        if let Err(e) = self.durable.put(
+            Kind::Memory,
+            &format!("{PIN_PREFIX}{}", wf.hash),
+            json!({"name": wf.name, "definition": wf.definition}),
+            None,
+        ) {
+            // Non-fatal: the run still executes; only the cross-restart
+            // guarantee narrows to "definition unchanged" for this version.
+            self.log.warn(
+                "workflow.pin_fail",
+                json!({"workflow": wf.name, "hash": &wf.hash[..12.min(wf.hash.len())], "err": e.to_string()}),
+            );
+            self.pin_written.remove(&wf.hash);
+        }
+    }
+
+    /// Restore-side: for every non-terminal run whose definition is neither
+    /// current nor already pinned in memory, load the durable pin — the other
+    /// half of [`Self::ensure_pin`].
+    pub(crate) fn restore_pins(&mut self) {
+        let missing: Vec<(String, String)> = self
+            .runs
+            .values()
+            .filter(|r| !r.status.is_terminal())
+            .filter(|r| {
+                let current = self
+                    .workflows
+                    .get(&r.workflow)
+                    .is_some_and(|w| w.hash == r.workflow_hash);
+                !current && !self.pinned.contains_key(&r.workflow_hash)
+            })
+            .map(|r| (r.workflow.clone(), r.workflow_hash.clone()))
+            .collect();
+        for (name, hash) in missing {
+            let doc = self
+                .durable
+                .get(Kind::Memory, &format!("{PIN_PREFIX}{hash}"))
+                .ok()
+                .flatten()
+                .and_then(|env| env.state.get("definition").cloned());
+            match doc.map(|d| crate::engine::model::parse_workflow(&d)) {
+                Some(Ok(wf)) if wf.hash == hash => {
+                    self.log.info(
+                        "workflow.pin_restored",
+                        json!({"workflow": name, "hash": &hash[..12.min(hash.len())]}),
+                    );
+                    self.pin_written.insert(hash.clone());
+                    self.pinned.insert(hash, wf);
+                }
+                other => {
+                    // No pin (a pre-pin store) or a corrupt one: the run meets
+                    // the resume policy exactly as before this feature.
+                    self.log.warn(
+                        "workflow.pin_missing",
+                        json!({"workflow": name, "hash": &hash[..12.min(hash.len())],
+                               "err": match other { Some(Err(e)) => e.join("; "), _ => "no durable pin".into() }}),
+                    );
+                }
+            }
+        }
+    }
+
     /// Retire `wf` (already removed — or about to be — from the live
     /// registry). `reason` names the exit for the log: "reload" / "replaced" /
     /// "deleted".
@@ -165,16 +242,23 @@ impl super::reactor::Runtime {
             .filter(|r| !r.status.is_terminal())
             .map(|r| r.workflow_hash.clone())
             .collect();
-        self.pinned.retain(|hash, wf| {
-            let keep = referenced.contains(hash);
-            if !keep {
-                self.log.info(
-                    "workflow.unloaded",
-                    json!({"workflow": wf.name, "hash": &hash[..12.min(hash.len())], "live_runs": 0}),
-                );
-            }
-            keep
-        });
+        let dropped: Vec<(String, String)> = self
+            .pinned
+            .iter()
+            .filter(|(hash, _)| !referenced.contains(*hash))
+            .map(|(hash, wf)| (hash.clone(), wf.name.clone()))
+            .collect();
+        for (hash, name) in &dropped {
+            self.log.info(
+                "workflow.unloaded",
+                json!({"workflow": name, "hash": &hash[..12.min(hash.len())], "live_runs": 0}),
+            );
+            let _ = self
+                .durable
+                .delete(Kind::Memory, &format!("{PIN_PREFIX}{hash}"));
+            self.pinned.remove(hash);
+            self.pin_written.remove(hash);
+        }
         self.retiring.retain(|hash, _| referenced.contains(hash));
     }
 }

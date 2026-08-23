@@ -141,9 +141,12 @@ that dropped or changed it, `workflow.delete`, or an instruction edit:
    Telemetry: `workflow.retiring` (policy, live-run count) at the start,
    `workflow.unloaded` at the end.
 
-Pins are process state. Across a restart, a restored run whose definition
-changed on disk meets `resume_policy` (RFC 0027 §9), not the pin — restart
-already had a contract, and retirement does not widen it.
+Pins are **durable**: the definition a run starts under is persisted once
+per content hash and read back at restore for any non-terminal run whose
+definition is no longer current — a restart that also changed or removed the
+workflow still finishes the run as authored, and the pin is deleted when its
+last run reaches a terminal status. A store written before this mechanism
+falls back to `resume_policy` (RFC 0027 §9).
 
 ## 8. What this is not
 

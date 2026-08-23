@@ -683,7 +683,10 @@ pub fn service_match<'a>(
 /// `scheme://authority/path` → (scheme, authority, path). `unix:` sockets
 /// have no authority; the socket path is the authority for matching purposes.
 fn split_url(url: &str) -> Option<(String, String, String)> {
-    if let Some(rest) = url.strip_prefix("unix://").or_else(|| url.strip_prefix("unix:")) {
+    if let Some(rest) = url
+        .strip_prefix("unix://")
+        .or_else(|| url.strip_prefix("unix:"))
+    {
         return Some(("unix".into(), rest.to_string(), String::new()));
     }
     let (scheme, rest) = url.split_once("://")?;
@@ -5851,7 +5854,11 @@ mod tests {
         assert!(s.auth.is_some(), "inherited auth");
         assert_eq!(s.headers["X-Env"], "prod", "inherited headers");
         assert_eq!(s.allow.as_deref(), Some(&["charge_lookup".to_string()][..]));
-        assert_eq!(s.exclude, vec!["invoice_purge".to_string()], "exclude unions");
+        assert_eq!(
+            s.exclude,
+            vec!["invoice_purge".to_string()],
+            "exclude unions"
+        );
         assert_eq!(s.tags["*"], vec!["sensitive"], "tag floor applied");
         assert_eq!(s.ns.as_deref(), Some("fin"), "consumer-local ns kept");
     }

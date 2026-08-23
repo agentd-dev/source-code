@@ -76,22 +76,21 @@ impl Runtime {
         };
         debug_assert_eq!(t.tier, Tier::Instance);
         if t.spec.singleton
-            && let Some(s) = self.subagents.values().find(|s| {
-                s.template.as_deref() == Some(tname) && !is_terminal_status(&s.status)
-            })
+            && let Some(s) = self
+                .subagents
+                .values()
+                .find(|s| s.template.as_deref() == Some(tname) && !is_terminal_status(&s.status))
         {
             return err(format!(
                 "subagent.run refused: template '{tname}' is a singleton and '{}' is live (retire it first)",
                 s.handle
             ));
         }
-        let params = match validate_params(
-            &t.spec.params,
-            args.get("params").unwrap_or(&Value::Null),
-        ) {
-            Ok(p) => p,
-            Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
-        };
+        let params =
+            match validate_params(&t.spec.params, args.get("params").unwrap_or(&Value::Null)) {
+                Ok(p) => p,
+                Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
+            };
         let prose = fold_params(&t.cleaned, &params);
         if params_introduced_machinery(&prose) {
             return err(format!(
@@ -138,18 +137,22 @@ impl Runtime {
         // The composed document must be a bootable config NOW — a child that
         // exits 2 on its first breath is a refusal we can make synchronously.
         if let Err(e) = validate_composed(&doc) {
-            return err(format!("subagent.run: template '{tname}' composes an invalid config: {e}"));
+            return err(format!(
+                "subagent.run: template '{tname}' composes an invalid config: {e}"
+            ));
         }
         let config_path = dir.join("config.json");
         let rendered = serde_json::to_string_pretty(&doc).unwrap_or_default();
         if let Err(e) = std::fs::write(&config_path, rendered) {
-            return err(format!("subagent.run: write {}: {e}", config_path.display()));
+            return err(format!(
+                "subagent.run: write {}: {e}",
+                config_path.display()
+            ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
         }
         let retire_at = t.spec.ttl.map(|d| now_ms() + d.0.as_millis() as u64);
         let mut record = SubagentRecord {
@@ -325,8 +328,7 @@ impl Runtime {
         let mut peer = json!({"name": "parent", "endpoint": endpoint});
         if let Some(bearer) = &self.settings.a2a.bearer {
             if crate::sec::secret::has_secret_ref(&bearer.0) {
-                peer["headers"] =
-                    json!({"Authorization": format!("Bearer {}", bearer.0)});
+                peer["headers"] = json!({"Authorization": format!("Bearer {}", bearer.0)});
             } else {
                 // An inline bearer must not be written to the child's config
                 // file; over a unix listener SO_PEERCRED covers same-uid
@@ -403,10 +405,11 @@ impl Runtime {
                 });
             }
         }
-        let child = crate::supervisor::reaper::spawn_tracked_pid(&self.children.reap_sender(), || {
-            cmd.spawn()
-        })
-        .map_err(|e| e.to_string())?;
+        let child =
+            crate::supervisor::reaper::spawn_tracked_pid(&self.children.reap_sender(), || {
+                cmd.spawn()
+            })
+            .map_err(|e| e.to_string())?;
         let pid = child.id() as i32;
         // The reaper owns the exit; the std handle would only race it.
         std::mem::forget(child);
@@ -444,8 +447,10 @@ impl Runtime {
             if let Some(s) = self.subagents.get_mut(&h)
                 && let Some(pid) = s.pid
             {
-                self.log
-                    .warn("instance.kill", json!({"handle": h, "pid": pid, "note": "drain window elapsed"}));
+                self.log.warn(
+                    "instance.kill",
+                    json!({"handle": h, "pid": pid, "note": "drain window elapsed"}),
+                );
                 #[cfg(unix)]
                 unsafe {
                     libc::killpg(pid, libc::SIGKILL);
@@ -477,8 +482,10 @@ impl Runtime {
             s.retiring_since = Some(now_ms());
             s.status = "retiring".into();
             s.dirty = true;
-            self.log
-                .info("instance.retire", json!({"handle": handle, "pid": pid, "why": why}));
+            self.log.info(
+                "instance.retire",
+                json!({"handle": handle, "pid": pid, "why": why}),
+            );
             #[cfg(unix)]
             unsafe {
                 libc::killpg(pid, libc::SIGTERM);
@@ -512,7 +519,8 @@ impl Runtime {
         if let Some(s) = self.subagents.get_mut(&handle) {
             s.status = status.into();
             s.error = error;
-            s.result = Some(json!({"tier": "instance", "socket": s.socket, "config": s.config_path}));
+            s.result =
+                Some(json!({"tier": "instance", "socket": s.socket, "config": s.config_path}));
             s.updated = now_ms();
             s.dirty = true;
         }
@@ -532,11 +540,7 @@ impl Runtime {
             .subagents
             .values()
             .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
-            .filter_map(|s| {
-                s.config_path
-                    .clone()
-                    .map(|c| (s.handle.clone(), c, None))
-            })
+            .filter_map(|s| s.config_path.clone().map(|c| (s.handle.clone(), c, None)))
             .collect();
         for (handle, config, limits) in candidates {
             let path = PathBuf::from(&config);
@@ -614,7 +618,10 @@ impl Runtime {
                     }
                 })
                 .ok();
-            ToolOutcome::Ready(json!({"ok": true, "handle": handle, "delivery": "async"}), false)
+            ToolOutcome::Ready(
+                json!({"ok": true, "handle": handle, "delivery": "async"}),
+                false,
+            )
         }
         #[cfg(not(feature = "a2a"))]
         {
@@ -660,8 +667,7 @@ impl Runtime {
                 .rate
                 .clone()
                 .unwrap_or_else(|| "4/1h".into());
-            let (burst, per_s) =
-                crate::supervisor::tree::parse_rate(&rate).unwrap_or((4, 3600.0));
+            let (burst, per_s) = crate::supervisor::tree::parse_rate(&rate).unwrap_or((4, 3600.0));
             *g = Some(crate::supervisor::tree::TokenBucket::new(
                 burst,
                 f64::from(burst) / per_s,

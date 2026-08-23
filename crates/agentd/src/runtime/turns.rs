@@ -224,9 +224,8 @@ other tools come from connected MCP servers. Be concise and factual; never inven
         if waiting.is_empty() && recent.is_empty() {
             return String::new();
         }
-        let mut s = String::from(
-            "\n## Signals (durable coordination; deliver with workflow.signal)\n",
-        );
+        let mut s =
+            String::from("\n## Signals (durable coordination; deliver with workflow.signal)\n");
         for l in waiting.into_iter().chain(recent) {
             s.push_str(&l);
             s.push('\n');
@@ -259,9 +258,7 @@ other tools come from connected MCP servers. Be concise and factual; never inven
         if lines.is_empty() {
             return String::new();
         }
-        let mut s = String::from(
-            "\n## Peers (agents reachable with a2a.send / a2a.delegate)\n",
-        );
+        let mut s = String::from("\n## Peers (agents reachable with a2a.send / a2a.delegate)\n");
         for l in lines.into_iter().take(24) {
             s.push_str(&l);
             s.push('\n');
@@ -275,11 +272,13 @@ other tools come from connected MCP servers. Be concise and factual; never inven
         if self.settings.subagents.templates.is_empty() {
             return String::new();
         }
-        let mut s = String::from(
-            "\n## Subagent templates (spawn with subagent.run {template, params})\n",
-        );
+        let mut s =
+            String::from("\n## Subagent templates (spawn with subagent.run {template, params})\n");
         for (name, t) in self.settings.subagents.templates.iter().take(16) {
-            let machinery = t.instruction.lines().any(|l| l.trim_start().starts_with(":::"));
+            let machinery = t
+                .instruction
+                .lines()
+                .any(|l| l.trim_start().starts_with(":::"));
             let tier = if machinery { "instance" } else { "flat" };
             let params: Vec<String> = t
                 .params

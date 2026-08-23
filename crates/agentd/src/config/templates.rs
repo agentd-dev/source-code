@@ -50,7 +50,15 @@ pub struct CompiledTemplate {
 /// listeners and the store belong to the parent's composition; `security`
 /// would let a template relax its own gate; nested `subagents` means
 /// recursive fleets (Phase C at the earliest).
-const REFUSED_FRAGMENT_KEYS: &[&str] = &["webhooks", "interface", "subagents", "store", "security", "a2a", "lifecycle"];
+const REFUSED_FRAGMENT_KEYS: &[&str] = &[
+    "webhooks",
+    "interface",
+    "subagents",
+    "store",
+    "security",
+    "a2a",
+    "lifecycle",
+];
 
 /// Compile every declared template. Errors are aggregated (all problems, not
 /// the first) and refuse the PARENT's startup, naming the template.
@@ -136,7 +144,9 @@ fn compile_one(
             if let Some(m) = t.mode.as_deref()
                 && !matches!(m, "sync" | "async" | "detached" | "warm")
             {
-                errs.push(at(format!("mode must be sync|async|detached|warm (got '{m}')")));
+                errs.push(at(format!(
+                    "mode must be sync|async|detached|warm (got '{m}')"
+                )));
             }
         }
         Tier::Instance => {
@@ -219,7 +229,11 @@ fn compile_one(
 /// gate over the composed MCP set, closed-egress coverage. The full composed
 /// document is validated again at spawn (the child also validates at boot —
 /// defense in depth).
-fn validate_instance_machinery(name: &str, ex: &directives::Extraction, s: &Settings) -> Vec<String> {
+fn validate_instance_machinery(
+    name: &str,
+    ex: &directives::Extraction,
+    s: &Settings,
+) -> Vec<String> {
     let at = |m: String| format!("subagents.templates.{name}: {m}");
     let mut errs = Vec::new();
     if let Some(o) = ex.config.as_object() {
@@ -238,8 +252,8 @@ fn validate_instance_machinery(name: &str, ex: &directives::Extraction, s: &Sett
         if let Some(steps) = wf.get("steps").and_then(Value::as_object) {
             for (sid, step) in steps {
                 let kind = step.get("kind").and_then(Value::as_str).unwrap_or("");
-                let waits_webhook = kind == "wait"
-                    && step.get("on").and_then(Value::as_str) == Some("webhook");
+                let waits_webhook =
+                    kind == "wait" && step.get("on").and_then(Value::as_str) == Some("webhook");
                 if kind == "webhook" || waits_webhook {
                     errs.push(at(format!(
                         "workflow '{wname}' step '{sid}': instance children have no webhook listener — the parent's routes forward events as commands or signals"
@@ -263,11 +277,8 @@ fn validate_instance_machinery(name: &str, ex: &directives::Extraction, s: &Sett
                 }
                 let mut tags = Vec::new();
                 for srv in &probe.mcp.servers {
-                    if let Err(e) = v2::egress_allows(
-                        &s.services,
-                        s.security.egress,
-                        &srv.endpoint,
-                    ) {
+                    if let Err(e) = v2::egress_allows(&s.services, s.security.egress, &srv.endpoint)
+                    {
                         errs.push(at(format!("mcp server '{}': {e}", srv.name)));
                     }
                     match srv.tag_set() {
@@ -287,8 +298,7 @@ fn validate_instance_machinery(name: &str, ex: &directives::Extraction, s: &Sett
         }
     }
     if let Some(streams_v) = ex.config.get("streams")
-        && let Err(e) =
-            serde_json::from_value::<BTreeMap<String, v2::StreamCfg>>(streams_v.clone())
+        && let Err(e) = serde_json::from_value::<BTreeMap<String, v2::StreamCfg>>(streams_v.clone())
     {
         errs.push(at(format!("streams: {e}")));
     }
@@ -309,7 +319,10 @@ pub fn validate_params(
     };
     for k in given.keys() {
         if !declared.contains_key(k) {
-            return Err(format!("unknown param '{k}' (declared: {:?})", declared.keys().collect::<Vec<_>>()));
+            return Err(format!(
+                "unknown param '{k}' (declared: {:?})",
+                declared.keys().collect::<Vec<_>>()
+            ));
         }
     }
     let mut out = Map::new();
@@ -451,10 +464,9 @@ mod tests {
     use serde_json::json;
 
     fn settings_with(templates_yaml: &str) -> Settings {
-        let doc: Value = crate::config::yaml::parse(&format!(
-            "subagents:\n  templates:\n{templates_yaml}"
-        ))
-        .unwrap();
+        let doc: Value =
+            crate::config::yaml::parse(&format!("subagents:\n  templates:\n{templates_yaml}"))
+                .unwrap();
         serde_json::from_value(doc).unwrap()
     }
 
@@ -514,7 +526,11 @@ mod tests {
         );
         let got = validate_params(&declared, &json!({"id": "i-1"})).unwrap();
         assert_eq!(got["sev"], json!("low"), "default filled");
-        assert!(validate_params(&declared, &json!({})).unwrap_err().contains("missing required param 'id'"));
+        assert!(
+            validate_params(&declared, &json!({}))
+                .unwrap_err()
+                .contains("missing required param 'id'")
+        );
         assert!(
             validate_params(&declared, &json!({"id": "x", "sev": "mid"}))
                 .unwrap_err()
@@ -556,7 +572,10 @@ mod tests {
         assert!(params_introduced_machinery(&folded));
         let mut ok = Map::new();
         ok.insert("x".into(), json!("a perfectly normal value"));
-        assert!(!params_introduced_machinery(&fold_params("hello {{params.x}}", &ok)));
+        assert!(!params_introduced_machinery(&fold_params(
+            "hello {{params.x}}",
+            &ok
+        )));
     }
 
     #[test]

@@ -76,7 +76,9 @@ impl Runtime {
                                 false,
                             )
                         } else {
-                            err(format!("subagent {handle:?} is not retirable (already terminal?)"))
+                            err(format!(
+                                "subagent {handle:?} is not retirable (already terminal?)"
+                            ))
                         }
                     }
                 }
@@ -448,7 +450,10 @@ impl Runtime {
     /// Returns the args plus `(template, tier)` when a template was named.
     /// Freeform spawns pass through with defaults applied — unless
     /// `subagents.allow_freeform: false` refuses them.
-    fn resolve_spawn_args(&self, args: &Value) -> Result<(Value, Option<(String, String)>), String> {
+    fn resolve_spawn_args(
+        &self,
+        args: &Value,
+    ) -> Result<(Value, Option<(String, String)>), String> {
         use crate::config::templates as tpl;
         let defaults = self.settings.subagents.defaults.clone();
         let mut eff = args.clone();
@@ -489,11 +494,8 @@ impl Runtime {
                 compiled.keys().collect::<Vec<_>>()
             ));
         };
-        let params = tpl::validate_params(
-            &t.spec.params,
-            o.get("params").unwrap_or(&Value::Null),
-        )
-        .map_err(|e| format!("subagent.run: template '{tname}': {e}"))?;
+        let params = tpl::validate_params(&t.spec.params, o.get("params").unwrap_or(&Value::Null))
+            .map_err(|e| format!("subagent.run: template '{tname}': {e}"))?;
         let folded = tpl::fold_params(&t.cleaned, &params);
         if tpl::params_introduced_machinery(&folded) {
             return Err(format!(

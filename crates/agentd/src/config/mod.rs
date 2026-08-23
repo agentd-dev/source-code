@@ -17,11 +17,11 @@
 //! reload trigger).
 
 pub mod directives;
-pub mod templates;
 pub mod envfile;
 pub mod file;
 pub mod paths;
 pub mod prompt;
+pub mod templates;
 pub mod v2;
 #[cfg(all(unix, feature = "config-watch"))]
 pub mod watch;

@@ -257,7 +257,10 @@ impl Runtime {
                 if st.kind == "workflow"
                     && st.field_str("mode").unwrap_or("sync") != "detached"
                     && let Some(target) = st.field_str("name")
-                    && self.workflows.get(target).is_some_and(|t| t.durable == Some(false))
+                    && self
+                        .workflows
+                        .get(target)
+                        .is_some_and(|t| t.durable == Some(false))
                 {
                     self.log.warn(
                         "workflow.durability_mix",
@@ -1878,15 +1881,12 @@ impl Runtime {
                     .map(str::to_string)
                     .collect()
             });
-        let seed_list = spec
-            .get("context")
-            .and_then(Value::as_array)
-            .or_else(|| {
-                spec.get("context")
-                    .and_then(Value::as_object)
-                    .and_then(|o| o.get("seed"))
-                    .and_then(Value::as_array)
-            });
+        let seed_list = spec.get("context").and_then(Value::as_array).or_else(|| {
+            spec.get("context")
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("seed"))
+                .and_then(Value::as_array)
+        });
         if let Some(seed) = seed_list {
             for m in seed {
                 match (m["role"].as_str(), m["content"].as_str()) {
@@ -2678,9 +2678,7 @@ impl Runtime {
             // A non-durable run has nothing in the store to evict.
             let was_durable = self.runs.get(&id).is_none_or(|r| r.durable);
             self.runs.remove(&id);
-            if was_durable
-                && let Err(e) = self.durable.delete(crate::state::Kind::Run, &id)
-            {
+            if was_durable && let Err(e) = self.durable.delete(crate::state::Kind::Run, &id) {
                 self.log
                     .warn("run.evict.fail", json!({"run": id, "err": e.to_string()}));
                 continue;

@@ -154,7 +154,10 @@ pub fn contracts() -> Vec<Contract> {
         "subagent.retire",
         "subagent",
         "Begin graceful retirement of an instance-tier child (RFC 0036): it drains its own runs and exits cleanly; escalation to SIGKILL only after the drain window.",
-        obj(json!({"handle": s("The instance child's handle")}), &["handle"]),
+        obj(
+            json!({"handle": s("The instance child's handle")}),
+            &["handle"],
+        ),
         open_obj(
             json!({"ok": {"type": "boolean"}, "handle": {"type": "string"}, "status": {"type": "string"}}),
             &["ok"],

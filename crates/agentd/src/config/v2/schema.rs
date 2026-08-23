@@ -413,12 +413,15 @@ fn defs_properties(
                 "until": { "type": "string", "description": "instance tier: a signal name (templated over params) whose delivery in the child retires it" },
                 "singleton": { "type": "boolean", "description": "one live child; its A2A peer alias is the template name" },
                 "durable": { "type": "boolean", "description": "false = memory-only record (an instance child runs on a memory store; no restore-respawn); absent = the store.durability.work default" } } }));
-    m.insert("ParamSpec".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
+    m.insert(
+        "ParamSpec".to_string(),
+        json!({ "type": "object", "additionalProperties": false, "properties": {
                 "type": { "enum": ["string", "number", "integer", "boolean"] },
                 "required": { "type": "boolean" },
                 "default": {},
                 "enum": { "type": "array" },
-                "description": { "type": "string" } } }));
+                "description": { "type": "string" } } }),
+    );
     m.insert("Service".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
                 "description": "a service-catalog entry (RFC 0037 §4): connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
                 "properties": {

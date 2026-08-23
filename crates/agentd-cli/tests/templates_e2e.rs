@@ -240,5 +240,9 @@ fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
         \x20       steps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n\
         \x20       :::\n",
     );
-    assert_eq!(code, Some(2), "a listener-defining template refuses BOOT:\n{log}");
+    assert_eq!(
+        code,
+        Some(2),
+        "a listener-defining template refuses BOOT:\n{log}"
+    );
 }

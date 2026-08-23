@@ -9,7 +9,10 @@
 
 mod common;
 
-use std::process::{Child, Command, Stdio};
+#[cfg(feature = "hot-reload")]
+use std::process::Child;
+use std::process::{Command, Stdio};
+#[cfg(feature = "hot-reload")]
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -22,10 +25,14 @@ fn events(stderr: &str, name: &str) -> Vec<Value> {
         .collect()
 }
 
+// The daemon harness serves only the hot-reload tests; without that feature
+// it is dead code, and the per-feature clippy row rightly says so.
+#[cfg(feature = "hot-reload")]
 struct Daemon {
     child: Child,
     err_path: String,
 }
+#[cfg(feature = "hot-reload")]
 impl Daemon {
     fn spawn(cfg: &str) -> Daemon {
         let err_path = common::unique_path("dir-ret-daemon", "log");
@@ -60,6 +67,7 @@ impl Daemon {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP) };
     }
 }
+#[cfg(feature = "hot-reload")]
 impl Drop for Daemon {
     fn drop(&mut self) {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };

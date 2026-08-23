@@ -5,6 +5,33 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Added
+
+- **Event streams — Phase A of RFC 0035** (agentd as an event-driven agent).
+  Declare durable, named streams under `streams:`
+  (`orders: {retention: {max_events, max_age}}`); the `emit` step gains a
+  stream form (`emit: {stream, subject, data, correlation}`) that appends a
+  durable event, and the new **`stream` start** fires a run per event —
+  including events another workflow published. `subject` matches exactly or
+  by `prefix.*` glob, `filter` is CEL over the event, and `from: earliest`
+  replays the whole backlog into a consumer that did not exist when the
+  events were emitted. Offsets are durable (a restart resumes exactly where
+  it left off) and consumers dedup by event id — the emit's id is the step's
+  idempotency key, so crash-replayed publishes cannot double-fire. Naming an
+  undeclared stream is a startup error, not a runtime surprise. Spec:
+  RFC 0035 (Phases B–D — `correlate`, `wait {on: event}`, edge bindings, the
+  `_runtime` stream — remain draft).
+
+### Fixed
+
+- **An unfiltered `event` watcher no longer triggers on its own runs.** A
+  workflow with `{kind: event, on: workflow.finished}` and no filter used to
+  fire on the completion of the run it had just fired — forever. Runtime
+  events now never fire the workflow that produced them; watch yourself with
+  an explicit filter if you truly mean to.
+
 ## v2.6.0 — the instruction becomes a document
 
 Two features that make an agent something you author rather than assemble,

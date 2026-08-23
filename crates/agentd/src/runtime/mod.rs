@@ -30,6 +30,7 @@ pub mod reload;
 pub(crate) mod retire;
 pub mod starts;
 pub mod steps;
+pub(crate) mod streams;
 pub mod subagents;
 pub mod timers;
 pub mod tools;

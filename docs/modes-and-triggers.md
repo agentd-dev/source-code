@@ -7,7 +7,7 @@ decided by two independent things:
 - the process **lifecycle shape** — whether the instance is a one-shot *job* or a
   long-lived *daemon* (`lifecycle.run_until`); or
 - a workflow **start node** — a *trigger* that fires runs (`once`, `loop`,
-  `schedule`, `subscribe`, `signal`, `event`, `manual`, `a2a`).
+  `schedule`, `subscribe`, `signal`, `event`, `stream`, `manual`, `a2a`).
 
 A one-shot job and a long-lived daemon share the same inner loop, the same
 durable state model, the same turn workers, and the same tool registry — they
@@ -28,7 +28,7 @@ lifecycle:
 |---|---|---|
 | `idle`    | **job**   | no runs, turns, or pending inbox — after `idle_grace` |
 | `drained` | **daemon** | never on its own; a SIGTERM drains in-flight work then exits 0 |
-| `auto` (default) | job **unless** it has an A2A listener (`a2a.listen`) or a long-lived start node (`loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`) — then a daemon | as above, per the shape it resolves to |
+| `auto` (default) | job **unless** it has an A2A listener (`a2a.listen`) or a long-lived start node (`loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`) — then a daemon | as above, per the shape it resolves to |
 
 ```mermaid
 flowchart LR

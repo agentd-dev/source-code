@@ -176,6 +176,14 @@ fn top_level_properties(
                 "max_loaded": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1 } } }),
     );
+    m.insert(
+        "streams".to_string(),
+        json!({ "type": "object", "additionalProperties": {
+        "type": "object", "additionalProperties": false, "properties": {
+            "retention": { "type": "object", "additionalProperties": false, "properties": {
+                "max_events": { "type": "integer", "minimum": 1 },
+                "max_age": { "type": "string" } } } } } }),
+    );
     m.insert("vars".to_string(), json!({ "type": "object", "additionalProperties": true,
                 "description": "operator-defined constants; reference anywhere (and in workflows) as {{config.NAME}} — dotted paths reach nested values, unresolved references refuse startup" }));
     m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline dialect-3 definitions or {name, file|uri} references" }));

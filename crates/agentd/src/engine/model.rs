@@ -110,6 +110,14 @@ pub const KINDS: &[KindInfo] = &[
         false,
     ),
     k(
+        "stream",
+        true,
+        &["stream", "subject", "filter", "from", "inputs"],
+        &["stream"],
+        true,
+        false,
+    ),
+    k(
         "signal",
         true,
         &["name", "filter", "deliver", "inputs"],
@@ -488,7 +496,16 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "emit",
         false,
-        &["note", "audit", "metric", "value"],
+        &[
+            "note",
+            "audit",
+            "metric",
+            "value",
+            "stream",
+            "subject",
+            "data",
+            "correlation",
+        ],
         &[],
         true,
         false,
@@ -970,7 +987,7 @@ impl Workflow {
         self.start_steps().iter().any(|s| {
             matches!(
                 s.kind.as_str(),
-                "loop" | "schedule" | "subscribe" | "signal" | "event" | "a2a"
+                "loop" | "schedule" | "subscribe" | "signal" | "event" | "a2a" | "stream"
             )
         })
     }
@@ -1527,6 +1544,23 @@ fn parse_step(
                         "{at}: rate must be \"<burst>/<per>s\" (e.g. \"20/1s\")"
                     ));
                 }
+            }
+        }
+        // `emit` publishes to a stream when `stream:` is present (RFC 0035);
+        // the two addressing fields travel together or not at all.
+        "emit" => {
+            if spec.get("stream").is_some() != spec.get("subject").is_some() {
+                errs.push(format!(
+                    "{at}: a stream emit needs both `stream` and `subject`"
+                ));
+            }
+        }
+        // `stream` consumer: `from` picks the initial offset once, at arm.
+        "stream" => {
+            if let Some(f) = spec.get("from")
+                && !matches!(f.as_str(), Some("new") | Some("earliest"))
+            {
+                errs.push(format!("{at}: from must be \"new\" or \"earliest\""));
             }
         }
         // `window: {samples: N}` — deliver the last N read values as an array

@@ -70,6 +70,7 @@ matches on.
 | `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms`/`coalesce` collapse bursts; `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. |
 | `signal` | `name` | `filter` `deliver` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
 | `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
+| `stream` | `stream` | `subject` `filter` `from` `inputs` | Fires once per event on a declared stream (RFC 0035) — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits. Output is the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
 | `a2a` | — | `command` `roles` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts. `roles` narrows who may fire it. |
 | `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `rate` `idempotency` `respond` `filter` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. `rate: "<burst>/<per>s"` throttles arrivals (429 + Retry-After past it). |
 
@@ -145,7 +146,7 @@ matches on.
 | `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
 | `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |
 | `workflow.cancel` | `run` | `reason` | Cancels another `run` with a `reason`. |
-| `emit` | — | `note` `audit` `metric` `value` | Emits an internal event other workflows can start on (`kind: event`). |
+| `emit` | — | `stream` `subject` `data` `correlation` `note` `audit` `metric` `value` | With `stream`/`subject`: publishes an event to a declared stream (RFC 0035) that any workflow's `stream` start can consume — durable, replayable, exactly-once downstream (the event id is the step's idempotency key, so a crash-replayed emit dedups). Without: the older note/audit emitter. |
 
 ### Intelligence — the steps that cost tokens
 

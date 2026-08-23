@@ -36,6 +36,10 @@ pub enum Kind {
     Memory,
     Artifact,
     Timer,
+    /// One event on a named stream (RFC 0035), keyed `<stream>/e<seq>`.
+    /// Not manifest-indexed: streams keep their own head/tail counters in
+    /// [`Manifest::streams`], and events are walked by sequence, never listed.
+    Event,
     Audit,
     /// A cached endpoint credential (RFC 0031): an OAuth/OIDC/AWS/SPIFFE access +
     /// refresh token with its expiry, keyed by a hash of (endpoint, provider,
@@ -55,6 +59,7 @@ impl Kind {
             Kind::Memory => "memory",
             Kind::Artifact => "artifact",
             Kind::Timer => "timer",
+            Kind::Event => "event",
             Kind::Audit => "audit",
             Kind::Cred => "cred",
         }
@@ -63,6 +68,7 @@ impl Kind {
         Some(match s {
             "manifest" => Kind::Manifest,
             "inbox" => Kind::Inbox,
+            "event" => Kind::Event,
             "context" => Kind::Context,
             "run" => Kind::Run,
             "subagent" => Kind::Subagent,
@@ -81,7 +87,7 @@ impl Kind {
     pub fn indexed(self) -> bool {
         !matches!(
             self,
-            Kind::Manifest | Kind::Memory | Kind::Audit | Kind::Cred
+            Kind::Manifest | Kind::Memory | Kind::Audit | Kind::Cred | Kind::Event
         )
     }
 }
@@ -92,6 +98,15 @@ pub struct EntityRef {
     pub kind: String,
     pub id: String,
     pub seq: u64,
+}
+
+/// A stream's durable counters (RFC 0035).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StreamMeta {
+    /// Last appended sequence (0 = empty).
+    pub seq: u64,
+    /// Oldest retained sequence (seq+1 when empty after trims).
+    pub first: u64,
 }
 
 /// The instance manifest (RFC 0025 §3.3 `manifest`).
@@ -108,6 +123,10 @@ pub struct Manifest {
     /// Start-node state per `<workflow>.<node>` (last fired, iteration, missed).
     #[serde(default)]
     pub starts: BTreeMap<String, Value>,
+    /// Per-stream head/tail (RFC 0035): `seq` = last appended sequence,
+    /// `first` = oldest retained. Consumers walk `first..=seq` by key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub streams: BTreeMap<String, StreamMeta>,
     /// Circuit-breaker state per `<workflow>/<step>` (`runtime::breaker`):
     /// consecutive failures, open/closed, the probe claim. Durable because a
     /// breaker that forgets on restart re-learns the outage by re-hammering
@@ -964,6 +983,7 @@ impl Durable {
             updated: now_ms(),
             entities: Vec::new(),
             starts: BTreeMap::new(),
+            streams: BTreeMap::new(),
             breakers: BTreeMap::new(),
             budget: Value::Null,
             lifecycle: Value::Null,

@@ -143,6 +143,11 @@ pub struct Settings {
     /// values fold in at LOAD time, so they participate in the definition hash
     /// — a var change is a definition change, and in-flight runs stay pinned
     /// to the definition they started with.
+    /// Named durable event streams (RFC 0035 Phase A): `{name: {retention:
+    /// {max_events, max_age}}}`. A stream must be declared before an `emit`
+    /// or `stream` node may reference it — fail-closed at startup.
+    #[serde(default)]
+    pub streams: BTreeMap<String, StreamCfg>,
     pub vars: BTreeMap<String, Value>,
     pub agent: Agent,
     pub intelligence: Intelligence,
@@ -794,6 +799,32 @@ pub struct StoreFile {
     /// alternative was choosing nothing and dying mid-write.
     #[serde(default)]
     pub min_free: Option<String>,
+}
+
+/// One declared event stream (RFC 0035).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct StreamCfg {
+    pub retention: StreamRetention,
+}
+
+/// Retention: whichever bound trims first. Neither set = the 10k default —
+/// an unbounded stream on a disk the pressure system guards would be a
+/// self-inflicted shed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct StreamRetention {
+    pub max_events: Option<u64>,
+    pub max_age: Option<Dur>,
+}
+
+impl StreamCfg {
+    pub fn max_events(&self) -> u64 {
+        self.retention.max_events.unwrap_or(10_000)
+    }
+    pub fn max_age_ms(&self) -> Option<u64> {
+        self.retention.max_age.map(|d| d.0.as_millis() as u64)
+    }
 }
 
 /// The `file` store's root directory (RFC 0033 §4), first that applies:
@@ -1821,6 +1852,7 @@ pub const V2_KEYS: &[&str] = &[
     "memory",
     "context",
     "vars",
+    "streams",
 ];
 
 /// v1 (flat) top-level keys.

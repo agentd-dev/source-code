@@ -1,6 +1,6 @@
 # RFC 0035: Event streams — agentd as an event-driven agent
 
-**Status:** Draft (for discussion)
+**Status:** Phase A implemented (`streams:` config, the `emit` step's stream form, the `stream` start with durable offsets and `from: earliest` replay); Phases B–D draft
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the durable runtime (RFC 0025 — a new store kind; RFC 0027 — new nodes); unifies the admission edges of RFC 0027 §5, RFC 0029, RFC 0032 §4.
@@ -182,6 +182,50 @@ record and the stream both do.
   by workflows themselves (an agent that reacts to its own audit trail is a
   self-monitoring agent).
 
+## 5.5 The runtime's own events — the `_runtime` stream
+
+The deepest integration is the runtime narrating **itself**. agentd already
+observes everything below — most of it already has a telemetry line — but a
+log line is for humans and collectors; an event on a stream is for
+*workflows*. A read-only, opt-in `_runtime` stream turns the daemon's own
+life into something its workflows can react to, which is what makes
+initialization, REinitialization, degradation and self-healing expressible
+as ordinary consumers.
+
+One naming rule: **the subjects ARE the telemetry vocabulary** (RFC 0016's
+closed set, extended). No second naming scheme — if the log line says
+`pressure.shed`, the event's subject is `pressure.shed`, and an operator who
+knows one knows both.
+
+The taxonomy, by subsystem — with each event's *rate class*, because an
+event system that does not budget its own volume becomes its own pressure
+source (`rare` = per-boot/per-incident; `bounded` = per config/operator
+action; `flow` = per unit of work; `hot` = excluded from `_runtime` by
+default, opt-in per subject):
+
+| Subject family | Events | Rate | The consumer it exists for |
+|---|---|---|---|
+| **process** | `proc.start`, `restore.done` (generation, lost entities), `generation.fresh`, `lifecycle.drain.start` / `.done`, `lifecycle.shutdown` | rare | init/deinit workflows; a fleet agent noticing a member rebooted |
+| **config** | `config.reloaded` (changed sections), `config.rejected`, `config.restart_required`, `instruction.changed`, `workflows.changed`, `store.config_changed` | bounded | **reinitialization**: re-register the webhook when the reload changed its URL; re-brief a warm subagent when the instruction changed |
+| **definitions** | `workflow.loaded`, `.replaced`, `.retiring`, `.unloaded`, `workflow.pin_restored`, `workflow.locked` (a mutation attempt against the immutable lock — a security signal worth an alert, not just a log line) | bounded | GitOps reconcilers; security monitors |
+| **pressure & resources** | `pressure.warn` / `.shed` / `.cleared` (cause: disk\|memory, free bytes), `budget.threshold`, `budget.exhausted`, `store.degraded`, `stream.trimmed` (retention dropped unconsumed events — data loss is an event, never silent) | rare→bounded | degradation workflows: shed low-priority behaviors, flush caches, notify the fleet, page a human |
+| **capabilities** | `mcp.connected` / `.disconnected` (a server lost = a capability lost), `tools.changed`, `subscription.lost`, `intel.endpoint.down` / `.up`, `intel.all_down`, `intel.swapped` (model failover) | bounded | a robot re-homing when its motor-driver server drops; a workflow pausing itself while the model is unreachable |
+| **runs & turns** | `run.started` / `.finished` / `.failed` / `.cancelled` / `.refused`, `run.stalled`, `start.shed`, `schedule.missed` | flow | today's `event` start, generalized — with history and offsets |
+| **resilience** | `breaker.open` / `.reopen` / `.closed`, `step.retry_exhausted` | bounded | dependency-outage playbooks: switch provider, open an incident |
+| **edges (inbound)** | `webhook.received` / `.rejected` (metadata: path, principal, verdict — bodies ride the `into:` binding, not `_runtime`), `a2a.message`, `a2a.denied` (auth/role/uid refusals), `pairing.granted` / `.revoked` | flow | rate anomaly detection; security audit consumers; "a rejected webhook burst" as a wake-up |
+| **children** | `subagent.spawned` / `.finished` / `.killed`, `child.unhealthy`, `restarts.tripped` (the governor's circuit breaker) | flow | supervisors-of-supervisors; a parent agent reacting to a child's death |
+| **human** | `human.asked`, `.answered`, `.timeout`, `approval.granted` / `.denied` | bounded | escalation chains; the unanswered-approvals digest |
+| **time** | `tick.minute` / `tick.hour` / `tick.day` (coarse clock subjects), `schedule.fired` (which cron/every, for which workflow), `timer.fired` | bounded (coarse ticks) / flow | consumers that want time as *an event among events* — a `correlate` joining `order.paid` with `tick.hour` is a timeout expressed in the same algebra as everything else; sub-minute ticks are deliberately absent (that is what `schedule` and `sleep` are for) |
+| **transport** | `listener.bound` / `.lost` (a2a http(s), **unix socket**, webhook), `peer.unreachable` / `.recovered`; on a vsock-profile build (RFC 0014), the same subjects for vsock lanes | rare | init workflows that publish "I am reachable at…" only after `listener.bound`; fleet health |
+| **context & memory** | `context.compacted` (what was summarized away), `memory.written` (subject = the key: `memory.written/deploy-state`), `skills.changed` | flow / **hot** for busy keys | an agent that re-grounds after compaction; workflows reacting to a specific memory key changing — the `memory:<key>` display idea, as an event |
+
+Rules that keep this honest:
+
+- **Opt-in, subject-filtered.** `streams: {_runtime: {subjects: ["pressure.*", "config.*", "capabilities.*"]}}` — nothing is appended for subjects nobody enabled, so the default daemon writes exactly what it writes today. `hot` families require naming the subject explicitly.
+- **Metadata, not payloads.** `webhook.received` carries the envelope, never the body; `memory.written` carries the key, not the value. The data plane stays where it is; `_runtime` is the control plane's narration. Redaction rules (RFC 0012) apply unchanged.
+- **The feedback rule.** Every `_runtime` event carries `source` (the run/workflow that caused it), and an event start or stream consumer **never fires on events its own workflow caused** — the self-trigger suppression the `event` start now enforces (a watcher on `workflow.finished` looping on its own completions was a real bug, found and fixed while drafting this section). Deeper cycles (A watches B, B watches A) remain the author's responsibility; `concurrency.max_runs` and pressure are the backstops.
+- **`event` starts become sugar.** `event {on: X}` ≡ a `_runtime` consumer with `from: new` and no history — the existing node keeps working verbatim, and gains `from: earliest` replay for free where the subject is enabled.
+
 ## 6. Use cases
 
 1. **Order saga** — services `emit` domain events; `correlate` joins
@@ -206,6 +250,19 @@ record and the stream both do.
 6. **Human escalation chains** — `human.timeout` today fires one event;
    with streams, unanswered approvals accumulate in a stream a daily digest
    consumer drains.
+7. **Reinitialization** — the init/deinit story (RFC 0027 lifecycle idioms)
+   completed: a consumer of `config.reloaded` + `instruction.changed`
+   re-registers external state that depends on config (webhook URLs, peer
+   adverts) *without a restart*; `listener.bound` gates the first
+   advertisement so it never races the socket.
+8. **Degradation playbooks** — `pressure.warn` starts a cleanup workflow;
+   `pressure.shed` notifies the fleet and disables `priority: low` behavior
+   at the source; `intel.all_down` switches the robot to its model-free
+   reflex workflows until `intel.endpoint.up`.
+9. **Security reflexes** — `workflow.locked` (someone — or someTHING —
+   tried to rewrite immutable definitions) and `a2a.denied` bursts feed a
+   consumer that raises a human gate. The audit stream records; the event
+   stream *reacts*.
 
 ## 7. Non-goals and honest limits
 
@@ -248,7 +305,9 @@ record and the stream both do.
 ## 10. Open questions
 
 1. Should `signal` become sugar for a well-known `_signals` stream
-   (unifying, but changes signal's fire-and-forget cost model)?
+   (unifying, but changes signal's fire-and-forget cost model)? — §5.5
+   settles the analogous question for `event` starts (they become `_runtime`
+   sugar); `signal` likely follows once streams exist.
 2. Consumer groups (N instances sharing one offset) — or is that RFC 0019's
    claim/lease shard story wearing a new hat? (Lean: it is 0019's.)
 3. Is `correlate` a start node only, or also a mid-graph collector? (Lean:

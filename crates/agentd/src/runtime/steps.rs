@@ -232,6 +232,21 @@ impl Runtime {
                 }
             }
         }
+        // Streams are fail-closed at load: an `emit` or `stream` node naming an
+        // undeclared stream is a config error now, not a step failure later.
+        for w in self.workflows.values() {
+            for st in w.steps.values() {
+                if matches!(st.kind.as_str(), "emit" | "stream")
+                    && let Some(name) = st.field_str("stream")
+                    && !self.settings.streams.contains_key(name)
+                {
+                    errs.push(format!(
+                        "workflow {:?} step {:?}: stream {name:?} is not declared under `streams:`",
+                        w.name, st.id
+                    ));
+                }
+            }
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 
@@ -1232,6 +1247,59 @@ impl Runtime {
                 );
             }
             "emit" => {
+                // With `stream:` this is an event publish (RFC 0035); without,
+                // the older note/audit emitter. One name, addressed by fields.
+                if let Some(stream) = spec.get("stream").and_then(Value::as_str) {
+                    let stream = stream.to_string();
+                    let subject = spec
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let correlation = spec
+                        .get("correlation")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let data = spec.get("data").cloned().unwrap_or(Value::Null);
+                    // The event id IS the step's derived idempotency key: a
+                    // crash-replayed emit appends under the same id and
+                    // consumers dedup — at-least-once, house discipline.
+                    let id = crate::engine::run::idempotency_key(run_id, step_id);
+                    let source = self
+                        .runs
+                        .get(run_id)
+                        .map(|r| r.workflow.clone())
+                        .unwrap_or_default();
+                    match self.append_event(
+                        &stream,
+                        &subject,
+                        correlation.as_deref(),
+                        data,
+                        &id,
+                        &source,
+                    ) {
+                        Ok(seq) => {
+                            self.log.info(
+                                "stream.emit",
+                                json!({"run": run_id, "step": step_id, "stream": stream,
+                                       "subject": subject, "seq": seq}),
+                            );
+                            self.finish_step(
+                                run_id,
+                                step_id,
+                                StepStatus::Done,
+                                Some(json!({"id": id, "seq": seq, "stream": stream,
+                                           "subject": subject})),
+                                None,
+                                0,
+                            );
+                        }
+                        Err(e) => {
+                            self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0)
+                        }
+                    }
+                    return;
+                }
                 if let Some(n) = spec.get("note").and_then(Value::as_str) {
                     let text = format!("run {run_id}: {n}");
                     self.note_root(text);

@@ -101,7 +101,7 @@ the core set; build-gated surfaces add a few more, noted inline.
 | `mcp.connect` | `server`, `transport`, `tools` (count), `resources` (count) |
 | `mcp.connect.fail` | `server`, `transport`, `err` |
 | `mcp.disconnect` | `server`, `reason` |
-| `trigger.armed` | `kind` (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`manual`), detail |
+| `trigger.armed` | `kind` (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`/`manual`), detail |
 | `trigger.fired` | `kind`, `resource_uri?`, `route` (`spawn`/`continue`) |
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |

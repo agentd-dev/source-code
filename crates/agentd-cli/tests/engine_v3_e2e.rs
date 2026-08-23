@@ -362,3 +362,26 @@ fn a_start_whose_inputs_cannot_render_refuses_loudly_instead_of_firing_empty() {
         "the watcher must not fire with empty inputs:\n{stderr}"
     );
 }
+
+#[test]
+fn an_unfiltered_event_watcher_never_triggers_itself() {
+    // A watcher on workflow.finished with NO filter used to fire on its own
+    // completion — an infinite loop of runs. Self-trigger suppression: an
+    // event about workflow W never fires W's own event start.
+    let cfg = write_config(
+        "config_version: \"2\"\nagent:\n  name: nolooper\nstore:\n  kind: memory\nworkflows:\n  - name: seed\n    steps:\n      s: {kind: once}\n      f: {kind: finish, depends_on: [s], status: completed}\n  - name: watcher\n    steps:\n      hit: {kind: event, on: workflow.finished}\n      f: {kind: finish, depends_on: [hit], status: completed}\nlifecycle:\n  run_until: idle\n  idle_grace: 800ms\nobservability:\n  log_level: info\n",
+    );
+    let out = run_agentd(&cfg, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "idles out instead of looping:\n{stderr}"
+    );
+    let starts = events(&stderr, "run.start");
+    assert_eq!(
+        starts.len(),
+        2,
+        "seed + exactly ONE watcher fire:\n{stderr}"
+    );
+}

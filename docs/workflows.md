@@ -141,6 +141,7 @@ counts as satisfied, so a step depending on any of them still runs.
 | `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window`, `inputs` |
 | `signal` | **`name`**, `filter`, `deliver`, `inputs` |
 | `event` | **`on`**, `filter`, `inputs` |
+| `stream` | **`stream`**, `subject`, `filter`, `from`, `inputs` |
 | `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`, `inputs` |
 
 Behaviour the field names do not give away:
@@ -402,7 +403,7 @@ variable named after the step id when `writes` is absent. `mode` is
 | `finish` | `status`, `output`, `reason` |
 | `fail` | `message`, `code` |
 | `assert` | **`condition`**, `message` |
-| `emit` | `note`, `audit`, `metric`, `value` |
+| `emit` | `stream` + `subject` (together), `data`, `correlation`, `note`, `audit`, `metric`, `value` |
 | `noop` (no fields) / `checkpoint` | `name` |
 
 `finish` closes the run: it maps `status` to `completed`, `refused` or
@@ -443,7 +444,7 @@ A string beginning with `CEL:` is evaluated as a CEL expression over the same
 namespaces (`--features cel`; without it CEL fails closed). Some fields are never
 templated, because the step evaluates them itself or they are nested definitions:
 `assert.condition`, `map`/`filter`/`reduce.expr`, `iterate.while`/`until`, every
-`body` and `branches`, the `filter` on `subscribe`/`signal`/`event`,
+`body` and `branches`, the `filter` on `subscribe`/`signal`/`event`/`stream`,
 `wait.condition`, `think.check` and `switch.cases`.
 
 Outputs larger than `limits.inline_max_bytes` (default 65 536) spill into an

@@ -388,6 +388,7 @@ impl Runtime {
             self.process_inbox();
             // 6. Start nodes + runs (+ suspended waits).
             self.poll_starts();
+            self.poll_stream_starts();
             self.poll_waits();
             self.schedule_runs();
             // Inline steps (assign/map/template/switch…) complete synchronously

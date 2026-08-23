@@ -26,6 +26,13 @@ impl Runtime {
     }
 
     /// Read a start node's durable state.
+    pub(crate) fn start_state_pub(&self, workflow: &str, node: &str) -> Value {
+        self.start_state(workflow, node)
+    }
+    pub(crate) fn set_start_state_pub(&mut self, workflow: &str, node: &str, state: Value) {
+        self.set_start_state(workflow, node, state)
+    }
+
     fn start_state(&self, workflow: &str, node: &str) -> Value {
         self.durable
             .manifest()
@@ -615,6 +622,13 @@ impl Runtime {
             })
             .collect();
         for (workflow, node, spec) in matches {
+            // Self-trigger suppression: a watcher on `workflow.finished` with
+            // no (or a too-loose) filter must not fire on ITS OWN completions
+            // — that is an infinite loop of runs, not a reaction. An event
+            // about workflow W never fires W's own event start.
+            if payload.get("workflow").and_then(Value::as_str) == Some(workflow.as_str()) {
+                continue;
+            }
             if let Some(filter) = spec.get("filter").and_then(Value::as_str) {
                 let mut data = crate::engine::template::Data::new();
                 data.insert("payload".into(), payload.clone());

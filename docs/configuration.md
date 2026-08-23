@@ -120,7 +120,7 @@ RFC 0011 §5).
 | every `mcp.servers[]` has a unique non-reserved name, a valid endpoint, and parseable tags | `mcp.servers[]: a server has an empty name` · `mcp.servers[]: duplicate server name 'fs'` · `mcp server 'a': mcp endpoint must be https://host[:port][/path] (got: ftp://x)` |
 | every server reference resolves (`store.mcp.server`, `knowledge.server`, `search.server`, `skills.sources[].server`, `tools.overrides[].server`) | `store.mcp.server 'state' is not a declared MCP server` |
 | the chosen `store.kind` carries its block | `store.kind is mcp but store.mcp is not set` · `store.http needs at least 'get' and 'put' operations` · `store.file.path is empty — set a directory, or omit the field to use $AGENTD_STATE_DIR / $XDG_STATE_HOME/agentd/state` |
-| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`webhook` start node) has a durable `store` — it now **defaults** to `kind: file` (§12.3), so this only fires when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
+| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`/`webhook` start node) has a durable `store` — it now **defaults** to `kind: file` (§12.3), so this only fires when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
 | every workflow is named, unique, and has exactly one of `file` \| `uri` \| `steps` | `workflows['w'] must have exactly one of file \| uri \| steps` |
 | every inline workflow parses under the dialect-3 node registry — the *same* parse the runtime runs at startup | `workflow "w" step "s": unknown field "every" for kind "loop" (allowed: interval, delay, until, max_iterations, backoff, inputs)` |
 | an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, and a non-loopback bind authenticates its clients | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing` |
@@ -430,10 +430,11 @@ long-lived **daemon**, and what wakes it:
 | `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window` |
 | `signal` | when a named signal arrives | `name` (required), `filter`, `deliver` |
 | `event` | on a runtime event | `on` (required — e.g. `workflow_finished`), `filter` |
+| `stream` | on each event of a declared stream (RFC 0035) | `stream` (required), `subject` (exact or `prefix.*`), `filter`, `from` (`new` \| `earliest`) |
 | `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond` |
 
 The **long-lived** kinds — `loop`, `schedule`, `subscribe`, `signal`, `event`,
-`webhook` — make the instance a daemon under `run_until: auto`, and a daemon is
+`stream`, `webhook` — make the instance a daemon under `run_until: auto`, and a daemon is
 **durable**: with no `store` section it gets `kind: file` on the local filesystem
 (§12.3), and an explicit `kind: none` on a daemon is exit `2` (§2). A bare
 `a2a.listen` does the same without any start node: an inbound A2A message
@@ -816,6 +817,7 @@ each path is equally reachable from env and flags (§1.1), so
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
 | `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. |
 | `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
+| `streams` | Declared event streams (RFC 0035): `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck` (RFC 0026). |
 | `limits` | `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
 | `lifecycle` | `run_until`, `idle_grace`, `drain_timeout`, `run_id`, `exit_code_map`, `watch_config` (§6, §9). |

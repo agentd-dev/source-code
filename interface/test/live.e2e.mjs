@@ -75,7 +75,7 @@ test('live: two TS clients converge on one real daemon', { skip: !BIN }, async (
   writeFileSync(
     cfg,
     [
-      'config_version: "2"',
+      'config_version: "1"',
       'agent:',
       '  name: live-e2e',
       '  instruction: You are a test agent.',

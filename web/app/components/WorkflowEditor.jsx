@@ -33,7 +33,7 @@ import {
 import { parseConfig, serializeConfig, emptyWorkflow, layout, newStepId } from "../../lib/workflowIo";
 import { validateWorkflow, canConnect } from "../../lib/validate";
 
-const DEFAULT_DOC = { config_version: "2" };
+const DEFAULT_DOC = { config_version: "1" };
 
 // ── custom node ─────────────────────────────────────────────────────────────
 function WfNode({ id, data, selected }) {
@@ -767,7 +767,7 @@ function Editor() {
             <textarea
               value={importText}
               onChange={(e) => setImportText(e.target.value)}
-              placeholder={'paste a config_version: "2" document…'}
+              placeholder={'paste a config_version: "1" document…'}
               className="h-72 w-full rounded border border-[var(--line)] bg-[var(--bg-soft)] p-2 font-mono text-xs text-[var(--fg)]"
             />
             <div className="mt-2 flex justify-end gap-2">

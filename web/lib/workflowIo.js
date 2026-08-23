@@ -1,4 +1,4 @@
-// Convert between an agentd `config_version: "2"` document (YAML) and the
+// Convert between an agentd `config_version: "1"` document (YAML) and the
 // editor's graph model. A workflow's `steps` map becomes React Flow nodes; every
 // `depends_on` entry becomes an edge (source → target means "target depends on
 // source"). The rest of the config document is preserved verbatim so an
@@ -16,7 +16,7 @@ const uid = (p) => `${p}_${(_seq++).toString(36)}${Date.now().toString(36).slice
 export function parseConfig(text) {
   const doc = yaml.load(text) || {};
   if (typeof doc !== "object" || Array.isArray(doc)) {
-    throw new Error("config must be a YAML mapping (config_version: \"2\")");
+    throw new Error("config must be a YAML mapping (config_version: \"1\")");
   }
   const wfs = Array.isArray(doc.workflows) ? doc.workflows : [];
   const workflows = wfs.map((wf, i) => workflowToModel(wf, i));

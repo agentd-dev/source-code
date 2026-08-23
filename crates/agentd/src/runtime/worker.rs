@@ -718,12 +718,13 @@ mod tests {
     /// Start the in-process mock LLM with a playbook file; returns the client.
     fn mock_intel(playbook: &Value) -> IntelClient {
         let dir = std::env::temp_dir();
-        let n = std::process::id() as u64 * 1000
-            + std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos() as u64
-                % 1000;
+        // pid + a process-wide counter: tests run in parallel threads, and a
+        // clock-derived suffix COLLIDED under load — two tests sharing one
+        // addr file each read whichever mock announced last, and one turn
+        // got the other's playbook.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = std::process::id() as u64 * 100_000
+            + SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pb = dir.join(format!("agentd-worker-pb-{n}.json"));
         std::fs::write(&pb, playbook.to_string()).unwrap();
         let addr_file = dir.join(format!("agentd-worker-mock-{n}.addr"));

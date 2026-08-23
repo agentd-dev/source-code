@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# qa — the QA engineer. (Beacon — see README.md.)
+#
+# Two jobs: verify fixes on staging when engineering asks (A2A command,
+# request/response), and run the nightly regression sweep on a schedule —
+# filing anything it finds straight back to engineering as the same
+# `eng.bug` command support uses. One bug pipeline, three reporters.
+#
+# Trust legs: sensitive (the staging environment). No egress, no untrusted
+# input: QA reads our own product and talks only to peers.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "2"
+
+agent:
+  name: qa
+  instruction: |
+    You are Beacon's QA engineer.
+
+    You verify BEHAVIOR, not diffs: drive the product on staging through the
+    staging server's tools, reproduce what the ticket described, and say
+    plainly what you observed. "It works" needs the evidence attached.
+
+    File every defect you find — including ones nobody asked about. A flaky
+    result is a result: report it as flaky, never as passed.
+  ask_human_fallback: wait
+
+intelligence:
+  endpoints: https://api.openai.com/v1
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+  budget:
+    windows: [{ per: day, tokens: 2000000 }]
+    on_exhausted: refuse
+
+store:
+  kind: file
+  file: { path: /var/lib/agentd/startup/qa }
+
+mcp:
+  servers:
+    # A browser/API driver pointed at staging.
+    - name: staging
+      endpoint: https://mcp.staging.beacon.example/mcp
+      tags: { "*": [sensitive] }
+      auth: { kind: static, token: "{{secret:STAGING_TOKEN}}" }
+
+a2a:
+  listen: http://127.0.0.1:8443
+  peers:
+    - name: engineering
+      endpoint: http://127.0.0.1:8442
+
+interface:
+  enabled: true
+
+limits:
+  max_runs: 6
+  run: { steps: 50, tokens: 250000, deadline: 1h }
+
+workflows:
+  # ── Verify a fix on staging (engineering blocks on this answer) ───────────
+  - name: verify-fix
+    concurrency: { max_runs: 2, on_overflow: queue }
+    steps:
+      cmd:
+        kind: a2a
+        command: qa.verify
+        roles: [agent, operator]
+
+      check:
+        kind: agent
+        depends_on: cmd
+        servers: [staging]
+        instruction: |
+          Engineering asks for verification. Payload:
+          {{ steps.cmd.output.parts }}
+
+          On staging, reproduce the original defect scenario and confirm the
+          fix holds. Probe the two nearest neighboring behaviors for
+          regressions. Conclude with a verdict.
+        output_schema:
+          type: object
+          required: [verdict]
+          properties:
+            verdict: { enum: [pass, fail, flaky] }
+            evidence: { type: string }
+
+      route:
+        kind: switch
+        depends_on: check
+        on: "{{ steps.check.output.verdict }}"
+        cases: { pass: ship }
+        default: bounce
+
+      # Passed: nudge the ship gate (the CTO decides; qa only reports).
+      ship:
+        kind: a2a.send
+        depends_on: route
+        to: engineering
+        parts: |
+          Command: {"agentd": {"op": "eng.ship",
+            "verified": {{ steps.cmd.output.parts }},
+            "evidence": "{{ steps.check.output.evidence }}"}}
+
+      # Failed or flaky: the delegate's ANSWER carries the verdict back to the
+      # engineering run that is blocked on us.
+      bounce: { kind: noop, depends_on: [route] }
+
+      fin:
+        kind: finish
+        depends_on: [ship, bounce]
+        status: completed
+        output: "{{ steps.check.output }}"
+
+  # ── Nightly regression sweep ──────────────────────────────────────────────
+  - name: nightly-regression
+    steps:
+      wake: { kind: schedule, cron: "43 2 * * *", tz: UTC }
+
+      sweep:
+        kind: agent
+        depends_on: wake
+        servers: [staging]
+        instruction: |
+          Run the regression checklist against staging: signup, check
+          creation, alert firing, status-page render, billing portal load.
+          Report each as pass/fail with evidence, then list NEW defects only
+          (compare against what you already filed this week).
+        output_schema:
+          type: object
+          required: [defects]
+          properties:
+            defects:
+              type: array
+              items:
+                type: object
+                required: [summary, severity]
+                properties:
+                  summary: { type: string }
+                  severity: { enum: [low, normal, high] }
+
+      file:
+        kind: foreach
+        depends_on: sweep
+        over: "{{ steps.sweep.output.defects }}"
+        as: defect
+        batch: { size: 1, parallel: 1 }
+        body:
+          steps:
+            report:
+              kind: a2a.delegate
+              peer: engineering
+              objective: |
+                Command: {"agentd": {"op": "eng.bug",
+                  "ticket": "qa-nightly",
+                  "severity": "{{ defect.severity }}",
+                  "summary": "{{ defect.summary }}"}}
+              timeout: 10m
+              idempotency: true
+
+      fin: { kind: finish, depends_on: [file], status: completed }

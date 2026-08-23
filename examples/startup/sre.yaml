@@ -1,0 +1,262 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# sre — the on-call SRE. (Beacon — see README.md.)
+#
+# The monitoring stack posts alert webhooks. Firing alerts open an INCIDENT
+# run: diagnose through the infra server, attempt the safe remediations,
+# update the public status page, then park — durably — on a signal that the
+# matching "resolved" webhook fires. If nothing resolves within the window,
+# the CTO is woken (human step). Every incident lands on a durable stream;
+# the postmortem desk consumes it and files follow-ups with engineering.
+#
+# Trust legs: sensitive (infra) + egress (the status page is public). No
+# untrusted input: alerts come authenticated from OUR monitoring.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "2"
+
+agent:
+  name: sre
+  instruction: |
+    You are Beacon's SRE.
+
+    Diagnose before you touch: read the alert, read the dashboards, say what
+    you believe is wrong and why. Remediate with the SAFE set only — restart
+    an unhealthy service, scale a pool, roll back the last deploy. Anything
+    destructive (data, DNS, certificates) is the CTO's call: ask and wait.
+
+    The status page is customers reading during an outage: update it early,
+    in plain words, and close it honestly.
+  ask_human_fallback: wait
+
+intelligence:
+  endpoints: https://api.openai.com/v1
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+  budget:
+    windows: [{ per: day, tokens: 3000000 }]
+    on_exhausted: refuse
+
+store:
+  kind: file
+  file: { path: /var/lib/agentd/startup/sre }
+
+mcp:
+  servers:
+    # Dashboards + the safe remediation verbs (restart/scale/rollback).
+    - name: infra
+      endpoint: https://mcp.infra.beacon.example/mcp
+      tags: { "*": [sensitive] }
+      auth: { kind: static, token: "{{secret:INFRA_TOKEN}}" }
+      # The safe set, enforced at the registry — destructive verbs are absent
+      # from this instance, not merely discouraged by the instruction.
+      allow: ["get_*", "list_*", "query_*", "restart_service", "scale_pool", "rollback_deploy"]
+    - name: statuspage
+      endpoint: https://mcp.statuspage.example/mcp
+      tags: { "*": [egress] }
+      auth: { kind: static, token: "{{secret:STATUSPAGE_TOKEN}}" }
+
+webhooks:
+  listen: http://127.0.0.1:9444
+  default_auth:
+    hmac:
+      secret: "{{secret:ALERT_WEBHOOK_SECRET}}"
+      header: X-Alert-Signature
+      algo: sha256
+
+a2a:
+  listen: http://127.0.0.1:8444
+  peers:
+    - name: engineering
+      endpoint: http://127.0.0.1:8442
+
+interface:
+  enabled: true
+
+limits:
+  max_runs: 10
+  run: { steps: 50, tokens: 300000, deadline: 6h }
+
+streams:
+  incidents:
+    retention: { max_events: 2000, max_age: 2160h }
+
+workflows:
+  # ── An alert fired: open an incident ──────────────────────────────────────
+  - name: incident
+    concurrency: { max_runs: 4, on_overflow: queue }
+    steps:
+      hook:
+        kind: webhook
+        path: /alerts/firing
+        methods: POST
+        respond: { status: 202 }
+
+      alert:
+        kind: extract
+        depends_on: hook
+        input: "{{ steps.hook.output.body }}"
+        output_schema:
+          type: object
+          required: [alert_id, service, severity]
+          properties:
+            alert_id: { type: string }
+            service: { type: string }
+            severity: { enum: [warning, critical] }
+            summary: { type: string }
+
+      diagnose:
+        kind: agent
+        depends_on: alert
+        servers: [infra]
+        instruction: |
+          Alert {{ steps.alert.output.alert_id }} is firing on
+          {{ steps.alert.output.service }} ({{ steps.alert.output.severity }}):
+          {{ steps.alert.output.summary }}
+
+          Diagnose from the dashboards, then remediate with the safe verbs if
+          a safe remediation applies. State: what you saw, what you did (or
+          why nothing safe applied).
+
+      inform:
+        kind: agent
+        depends_on: diagnose
+        servers: [statuspage]
+        instruction: |
+          Post a status-page incident for {{ steps.alert.output.service }} in
+          calm, plain customer language. Diagnosis so far:
+          {{ steps.diagnose.output }}
+
+      # Durable park: the resolved webhook (below) signals this exact alert.
+      # A restart in mid-incident resumes the wait with its deadline intact.
+      # `on_error: continue` turns a timeout into `{error: …}` output, so the
+      # fork below can ROUTE on it instead of failing the incident.
+      resolved:
+        kind: wait
+        depends_on: inform
+        on: signal
+        signal: "resolved/{{ steps.alert.output.alert_id }}"
+        timeout: 45m
+        on_error: continue
+
+      # The signal payload carries alert_id; a timeout carries only `error` —
+      # so the template's default IS the timeout marker. Switch prunes the
+      # branch not taken.
+      fork:
+        kind: switch
+        depends_on: resolved
+        on: "{{ steps.resolved.output.alert_id | timeout }}"
+        cases: { timeout: page_cto }
+        default: close
+
+      close:
+        kind: agent
+        depends_on: fork
+        servers: [statuspage]
+        instruction: |
+          The alert cleared: {{ steps.resolved.output }}. Close the
+          status-page incident for {{ steps.alert.output.service }} honestly.
+
+      record:
+        kind: emit
+        depends_on: close
+        stream: incidents
+        subject: "incident.closed"
+        correlation: "{{ steps.alert.output.alert_id }}"
+        data:
+          service: "{{ steps.alert.output.service }}"
+          severity: "{{ steps.alert.output.severity }}"
+          summary: "{{ steps.alert.output.summary }}"
+          diagnosis: "{{ steps.diagnose.output }}"
+
+      fin: { kind: finish, depends_on: [record], status: completed }
+
+      # ── The escalation tail (the fork's timeout case) ──
+      page_cto:
+        kind: human
+        depends_on: fork
+        question: |
+          {{ steps.alert.output.service }} has been down 45+ minutes and my
+          safe remediations did not clear alert
+          {{ steps.alert.output.alert_id }}. Diagnosis:
+          {{ steps.diagnose.output }} — how do you want to proceed?
+        timeout: 2h
+
+      close_manual:
+        kind: agent
+        depends_on: page_cto
+        servers: [statuspage]
+        instruction: |
+          The CTO directed: {{ steps.page_cto.output }}. Update and close the
+          status-page incident for {{ steps.alert.output.service }}
+          accordingly.
+
+      record_manual:
+        kind: emit
+        depends_on: close_manual
+        stream: incidents
+        subject: "incident.escalated"
+        correlation: "{{ steps.alert.output.alert_id }}"
+        data:
+          service: "{{ steps.alert.output.service }}"
+          severity: "{{ steps.alert.output.severity }}"
+          summary: "{{ steps.alert.output.summary }}"
+          diagnosis: "{{ steps.diagnose.output }}"
+
+      fin_manual: { kind: finish, depends_on: [record_manual], status: completed }
+
+  # ── The matching all-clear: webhook → signal ──────────────────────────────
+  - name: alert-resolved
+    concurrency: { max_runs: 8 }
+    steps:
+      hook:
+        kind: webhook
+        path: /alerts/resolved
+        methods: POST
+        respond: { status: 202 }
+      wake:
+        kind: workflow.signal
+        depends_on: hook
+        name: "resolved/{{ steps.hook.output.body.alert_id }}"
+        payload: "{{ steps.hook.output.body }}"
+      fin: { kind: finish, depends_on: [wake], status: completed }
+
+  # ── The postmortem desk ───────────────────────────────────────────────────
+  # Every closed incident replays through here exactly once — even ones
+  # closed while this workflow was being edited or the process restarted.
+  - name: postmortem
+    concurrency: { max_runs: 1, on_overflow: queue }
+    steps:
+      take:
+        kind: stream
+        stream: incidents
+        subject: "incident.*"
+        from: earliest
+
+      write:
+        kind: agent
+        depends_on: take
+        servers: [infra]
+        instruction: |
+          Write a short blameless postmortem for this incident:
+          {{ steps.take.output.data }}
+          Timeline, root cause hypothesis, what remediation worked, and ONE
+          concrete engineering follow-up that would prevent recurrence.
+        output_schema:
+          type: object
+          required: [followup]
+          properties:
+            followup: { type: string }
+            postmortem: { type: string }
+
+      followup:
+        kind: a2a.delegate
+        depends_on: write
+        peer: engineering
+        objective: |
+          Command: {"agentd": {"op": "eng.bug",
+            "ticket": "postmortem-{{ steps.take.output.correlation }}",
+            "severity": "high",
+            "summary": "{{ steps.write.output.followup }}"}}
+        timeout: 10m
+        idempotency: true
+
+      fin: { kind: finish, depends_on: [followup], status: completed }

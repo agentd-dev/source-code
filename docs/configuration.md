@@ -438,9 +438,11 @@ The **long-lived** kinds — `loop`, `schedule`, `subscribe`, `signal`, `event`,
 **durable**: with no `store` section it gets `kind: file` on the local filesystem
 (§12.3), and an explicit `kind: none` on a daemon is exit `2` (§2). A bare
 `a2a.listen` does the same without any start node: an inbound A2A message
-becomes a conversation turn directly. (There is also an `a2a` *start-node* kind in the registry; the engine
-does not execute it yet, and refuses a workflow that uses one —
-`agentd --workflow-schema` reports each kind's `implemented` flag.)
+becomes a conversation turn directly. (There is also an `a2a` *start-node*
+kind: declaring `command:` on it REGISTERS an A2A command the listener
+accepts, and a matching inbound message fires a run instead of a
+conversation turn — `examples/hiring/actions.yaml` and `examples/startup/`
+are built on it.)
 
 ```yaml
 workflows:

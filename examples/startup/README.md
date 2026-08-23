@@ -1,0 +1,152 @@
+# Beacon: a software startup with two employees
+
+Beacon sells uptime monitoring to small SaaS teams. It has a CEO, a CTO, and
+**ten agentd instances doing every other job in the company**. This directory
+is the complete configuration: one YAML file per role, wired together over
+A2A, driven by third-party webhooks, paced by schedules and signals, audited
+by durable event streams — and every instance is also a colleague you can
+open a chat with.
+
+This is an EXAMPLE, not an endorsement of firing anyone: its purpose is to
+show every major agentd mechanism doing a real job in one coherent system.
+The MCP endpoints (`mcp.helpdesk.example`, …) are illustrative — point them
+at your real servers.
+
+## The org chart
+
+```mermaid
+flowchart TD
+    CEO([CEO / CTO — the humans])
+    COS[chief-of-staff<br/>standups · retros · briefs]
+    SUP[support<br/>tickets L2]
+    L1[support-l1<br/>SMS + voice]
+    BO[support-backoffice<br/>accounts + logs]
+    ENG[engineering<br/>fix → CI → ship]
+    QA[qa<br/>verify + nightly sweep]
+    SRE[sre<br/>incidents + postmortems]
+    SAL[sales<br/>deals + cadences]
+    FIN[finance<br/>invoices + dunning]
+    MKT[marketing<br/>content + outreach]
+    OUT[outbox<br/>ALL outbound mail/posts]
+
+    CEO -. chat / approvals .-> COS & SUP & ENG & SRE & SAL & FIN & MKT
+    COS --> SUP & L1 & BO & ENG & QA & SRE & SAL & FIN & MKT
+    L1 --> BO
+    L1 --> SUP
+    SUP --> ENG
+    SUP --> SAL
+    QA <--> ENG
+    SRE --> ENG
+    SAL --> FIN
+    SAL --> OUT
+    FIN --> OUT
+    MKT --> OUT
+    MKT --> SAL
+    COS --> OUT
+```
+
+## Where each mechanism earns its keep
+
+| Mechanism | Where to look |
+|---|---|
+| **Third-party webhooks** | helpdesk tickets (`support`), GitHub Actions verdicts (`engineering`), monitoring alerts firing AND resolving (`sre`), website leads + email replies (`sales`), Stripe payments (`finance`), outreach replies (`marketing`), Twilio SMS + call transcripts (`support-l1`). Every route is HMAC-authenticated. |
+| **Signals** | the incident run parks on `resolved/<alert_id>` until the all-clear webhook fires it (`sre`); each sales deal parks on `reply/<lead_id>` between cadence touches; marketing threads park on `mkt-reply/<person_id>`. A `wait {on: signal}` is durable — restarts don't lose a 10-day wait. |
+| **Workflows** | everywhere; the richest DAGs are `engineering/fix-bug` (agent → CI signal → switch → QA delegate), `finance/dunning` (delegate → durable sleep → check → switch → human gate), `sales/deal` (a month-long run per deal). |
+| **Event streams** | `support/escalations` decouples triage from follow-through; `sre/incidents` replays every incident through the postmortem desk exactly once; `finance/ledger` is the journal the monthly close reads; `outbox/sent` is the audit ledger of everything the company ever said. |
+| **MCP servers** | one per integration, tagged for trust: helpdesk, GitHub, staging, infra (with an `allow:` list of safe verbs only), status page, CRM, billing, email, social (LinkedIn/X/Instagram), web search, Twilio, the voice bridge, accounts, logs. |
+| **Conversational experience** | every instance sets `interface.enabled` — `agentd-tui --endpoint http://127.0.0.1:<port>` opens a chat with that colleague. The chief-of-staff's `cos.brief` command answers "what's happening?" with live answers from every desk. |
+| **Human-in-the-loop** | refunds (`support`), production ships (`engineering`), stuck incidents page the CTO (`sre`), >20% discounts (`sales`), write-offs (`finance`), the weekly content calendar (`marketing`). `ask_human_fallback: wait` means an unanswered gate parks durably instead of guessing. |
+
+## Voice, concretely
+
+agentd does not process audio. `support-l1` pairs with a small bridge
+service that terminates Twilio Media Streams and holds the OpenAI realtime
+voice session; agentd is the brain behind it. Mid-call, the bridge fires the
+`l1.lookup` A2A command whenever the voice model needs a fact ("what plan am
+I on?"), and `support-l1` delegates to the back office and returns one
+speakable sentence. After hangup the bridge posts the transcript webhook and
+the wrap-up workflow resolves or escalates to the ticket desk.
+
+## The trifecta discipline (why the org is shaped like this)
+
+agentd refuses to boot an instance whose servers hold all three of
+`untrusted_input` + `sensitive` + `egress` — that combination is the
+prompt-injection kill chain. The org chart IS the mitigation:
+
+| Instance | untrusted | sensitive | egress |
+|---|---|---|---|
+| support (tickets) | ✔ | — | ✔ |
+| support-l1 (SMS/voice) | ✔ | — | ✔ |
+| **support-backoffice** | — | ✔ | — |
+| engineering / qa / sre¹ | — | ✔ | ¹ |
+| sales / marketing | ✔ | ✔ | — |
+| finance | — | ✔ | — |
+| **outbox** | — | — | ✔ |
+| chief-of-staff | — | — | — |
+
+¹ sre's only egress is the public status page.
+
+Two instances exist *because* of the gate: the **back office** (the desks
+that read customer text cannot also hold accounts and logs) and the
+**outbox** (the desks that read outside-authored text cannot also hold the
+mail server). The residual risk is honest and documented in both files:
+what the back office returns does flow onward to customers, so its contract
+is minimal structured facts, never raw records — and everything the company
+sends leaves one auditable choke point that can be rate-limited, held, or
+unplugged.
+
+## Ports
+
+| Instance | A2A (chat + peers) | Webhooks |
+|---|---|---|
+| support | 8441 | 9441 |
+| engineering | 8442 | 9442 |
+| qa | 8443 | — |
+| sre | 8444 | 9444 |
+| sales | 8445 | 9445 |
+| finance | 8446 | 9446 |
+| outbox | 8447 | — |
+| chief-of-staff | 8448 | — |
+| marketing | 8449 | 9449 |
+| support-l1 | 8450 | 9450 |
+| support-backoffice | 8451 | — |
+
+## Running it
+
+Each file is one instance. Export the secrets each file names
+(`OPENAI_API_KEY` plus the per-integration tokens), then:
+
+```console
+$ for f in examples/startup/*.yaml; do agentd --config "$f" & done
+```
+
+Everything listens on loopback: third-party webhooks reach it through
+whatever tunnel or ingress you already use, and in production you would put
+the A2A mesh on `https://` with mTLS principals (see `examples/hiring/` for
+that pattern) or on `unix:///` sockets for co-located instances. State is
+durable under `/var/lib/agentd/startup/<name>` — kill any process mid-run
+and restart it; sleeps, waits, gates, and stream offsets resume.
+
+Talk to a colleague:
+
+```console
+$ agentd-tui --endpoint http://127.0.0.1:8448     # the chief of staff
+> what's happening today?
+```
+
+Every config validates against the binary:
+
+```console
+$ for f in examples/startup/*.yaml; do agentd --validate-config --config "$f" || echo "$f"; done
+```
+
+## What is deliberately simplified
+
+- The cadences are two touches; real sequences are longer but the same
+  wait-signal-switch shape.
+- `engineering` re-runs CI once on a red build; a real loop would use
+  `iterate` with a bound.
+- Instruction documents (RFC 0034) could fold each of these files into one
+  markdown file per role (`:::config` + `:::workflow` + prose); the YAML
+  form is used here because eleven files of it are easier to diff.
+- One human answers every gate. At this company, that is rather the point.

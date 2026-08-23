@@ -1,0 +1,214 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# chief-of-staff — management, as one agent. (Beacon — see README.md.)
+#
+# What replaced the managers (and HR — its reports are software): a morning
+# standup that ASKS every agent for status over A2A and mails the CEO one
+# digest; a weekly retro that looks for systemic patterns; and an on-demand
+# `cos.brief` command the CEO can fire from any A2A client for an immediate
+# state-of-the-company answer. It holds no third-party tools at all — its
+# whole world is the other agents and the outbox.
+#
+# Trust legs: none. It talks to peers and sends mail through the outbox.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "2"
+
+agent:
+  name: chief-of-staff
+  instruction: |
+    You are Beacon's chief of staff. Your reports are the other agents:
+    support, support-l1, the back office, engineering, qa, sre, sales,
+    finance, marketing, outbox.
+
+    Your product is the CEO's clarity. Compress ruthlessly: what moved, what
+    is stuck, what needs a human decision TODAY. Never soften a bad number —
+    the CEO can handle bad news and cannot handle late news. When two agents
+    are blocked on each other, say so and name the unblock.
+  ask_human_fallback: wait
+
+intelligence:
+  endpoints: https://api.openai.com/v1
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+  budget:
+    windows: [{ per: day, tokens: 800000 }]
+    on_exhausted: refuse
+
+store:
+  kind: file
+  file: { path: /var/lib/agentd/startup/chief-of-staff }
+
+a2a:
+  listen: http://127.0.0.1:8448
+  peers:
+    - name: support
+      endpoint: http://127.0.0.1:8441
+    - name: engineering
+      endpoint: http://127.0.0.1:8442
+    - name: qa
+      endpoint: http://127.0.0.1:8443
+    - name: sre
+      endpoint: http://127.0.0.1:8444
+    - name: sales
+      endpoint: http://127.0.0.1:8445
+    - name: finance
+      endpoint: http://127.0.0.1:8446
+    - name: outbox
+      endpoint: http://127.0.0.1:8447
+    - name: marketing
+      endpoint: http://127.0.0.1:8449
+    - name: support-l1
+      endpoint: http://127.0.0.1:8450
+    - name: backoffice
+      endpoint: http://127.0.0.1:8451
+
+interface:
+  enabled: true
+
+limits:
+  max_runs: 4
+  run: { steps: 60, tokens: 200000, deadline: 1h }
+
+vars:
+  team: [support, support-l1, backoffice, engineering, qa, sre, sales, finance, marketing]
+
+workflows:
+  # ── The morning standup ───────────────────────────────────────────────────
+  - name: standup
+    steps:
+      wake: { kind: schedule, cron: "51 7 * * 1-5", tz: UTC }
+
+      ask:
+        kind: foreach
+        depends_on: wake
+        over: "{{ config.team }}"
+        as: member
+        batch: { size: 7, parallel: 4 }
+        on_error: continue
+        collect: true
+        body:
+          steps:
+            status:
+              kind: a2a.delegate
+              peer: "{{ member }}"
+              objective: |
+                Standup: in five lines or fewer — what you completed since
+                yesterday, what is in flight, what is blocked and on whom,
+                and any decision you are waiting on from a human.
+              timeout: 5m
+
+      digest:
+        kind: agent
+        depends_on: ask
+        instruction: |
+          Team standup answers (an unreachable agent reports as an error —
+          that IS news, lead with it):
+          {{ steps.ask.output }}
+
+          Write the CEO's morning digest: 1) what needs a HUMAN decision
+          today, 2) blocked chains, 3) what shipped, 4) one risk nobody
+          raised. Ten lines maximum.
+
+      mail:
+        kind: a2a.delegate
+        depends_on: digest
+        peer: outbox
+        objective: |
+          Command: {"agentd": {"op": "outbox.email",
+            "to": "ceo@beacon.example",
+            "subject": "Standup — all desks",
+            "body": "{{ steps.digest.output }}",
+            "on_behalf_of": "chief-of-staff"}}
+        timeout: 10m
+        idempotency: true
+
+      fin: { kind: finish, depends_on: [mail], status: completed }
+
+  # ── The weekly retro ──────────────────────────────────────────────────────
+  - name: retro
+    steps:
+      wake: { kind: schedule, cron: "39 16 * * 5", tz: UTC }
+
+      ask:
+        kind: foreach
+        depends_on: wake
+        over: "{{ config.team }}"
+        as: member
+        batch: { size: 7, parallel: 4 }
+        on_error: continue
+        collect: true
+        body:
+          steps:
+            week:
+              kind: a2a.delegate
+              peer: "{{ member }}"
+              objective: |
+                Weekly retro: what repeatedly cost you time this week, and
+                what ONE change to your instruction, tools, or a peer's
+                behavior would have saved the most of it?
+              timeout: 5m
+
+      synth:
+        kind: agent
+        depends_on: ask
+        instruction: |
+          Retro answers: {{ steps.ask.output }}
+
+          Find the SYSTEMIC pattern — the friction two or more desks share.
+          Propose at most three concrete changes (an instruction edit, a
+          workflow change, a new gate), each with the evidence line that
+          motivates it. These are proposals for the CEO — nothing changes
+          until a human edits a config.
+
+      mail:
+        kind: a2a.delegate
+        depends_on: synth
+        peer: outbox
+        objective: |
+          Command: {"agentd": {"op": "outbox.email",
+            "to": "ceo@beacon.example",
+            "subject": "Weekly retro — proposed changes",
+            "body": "{{ steps.synth.output }}",
+            "on_behalf_of": "chief-of-staff"}}
+        timeout: 10m
+        idempotency: true
+
+      fin: { kind: finish, depends_on: [mail], status: completed }
+
+  # ── On-demand brief: the CEO asks, the company answers ────────────────────
+  - name: brief
+    steps:
+      cmd:
+        kind: a2a
+        command: cos.brief
+        roles: [user, operator]
+
+      ask:
+        kind: foreach
+        depends_on: cmd
+        over: "{{ config.team }}"
+        as: member
+        batch: { size: 7, parallel: 7 }
+        on_error: continue
+        collect: true
+        body:
+          steps:
+            now:
+              kind: a2a.delegate
+              peer: "{{ member }}"
+              objective: "Right now, in two lines: what are you doing and is anything on fire?"
+              timeout: 3m
+
+      answer:
+        kind: agent
+        depends_on: ask
+        instruction: |
+          The CEO asked: {{ steps.cmd.output.parts }}
+          Live answers from every desk: {{ steps.ask.output }}
+          Answer the CEO's question directly, using the live answers as
+          evidence. If a desk did not answer, say which.
+
+      fin:
+        kind: finish
+        depends_on: [answer]
+        status: completed
+        output: "{{ steps.answer.output }}"

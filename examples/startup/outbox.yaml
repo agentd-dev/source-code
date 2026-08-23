@@ -1,0 +1,131 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# outbox — the company's one mouth. (Beacon — see README.md.)
+#
+# Every email and social post the company sends leaves through THIS instance,
+# fired as an A2A command by sales, finance, marketing or the chief of staff.
+# The peers that compose messages read outside-authored text (tickets, leads,
+# replies) and hold internal records — giving any of THEM the mail server too
+# would assemble the lethal trifecta, and agentd would refuse to boot them.
+# Concentrating egress here instead buys three things:
+#
+#   - the trifecta stays split by CONSTRUCTION, not by promise;
+#   - one auditable ledger of everything the company ever sent (the `sent`
+#     stream, durable, replayable);
+#   - one place to rate-limit, hold, or unplug the company's voice.
+#
+# Trust legs: egress only. No sensitive stores, no untrusted feeds.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "2"
+
+agent:
+  name: outbox
+  instruction: |
+    You are Beacon's outbox — every outbound message goes through you.
+
+    You send EXACTLY what the requesting peer composed: no edits beyond
+    formatting, no additions, no messages of your own invention. Refuse and
+    report anything that asks you to mail an address outside the request, to
+    send bulk mail, or to impersonate a person.
+  ask_human_fallback: wait
+
+intelligence:
+  endpoints: https://api.openai.com/v1
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+  budget:
+    windows: [{ per: day, tokens: 300000 }]
+    on_exhausted: refuse
+
+store:
+  kind: file
+  file: { path: /var/lib/agentd/startup/outbox }
+
+mcp:
+  servers:
+    - name: email
+      endpoint: https://mcp.email.example/mcp
+      tags: { "*": [egress] }
+      auth: { kind: static, token: "{{secret:EMAIL_TOKEN}}" }
+    # One cross-posting server for the social channels marketing writes for:
+    # blog, LinkedIn, X, Instagram. The `channel` field of `outbox.post`
+    # picks the network.
+    - name: social
+      endpoint: https://mcp.social.example/mcp
+      tags: { "*": [egress] }
+      auth: { kind: static, token: "{{secret:SOCIAL_TOKEN}}" }
+
+a2a:
+  listen: http://127.0.0.1:8447
+
+interface:
+  enabled: true
+
+limits:
+  max_runs: 16
+  run: { steps: 15, tokens: 30000, deadline: 10m }
+
+# The audit ledger: one durable event per message ever sent. `agentd events`
+# (or any workflow with a `stream` start) can replay the company's entire
+# outbound history.
+streams:
+  sent:
+    retention: { max_events: 50000, max_age: 9600h }
+
+workflows:
+  - name: send-email
+    concurrency: { max_runs: 8, on_overflow: queue }
+    steps:
+      cmd:
+        kind: a2a
+        command: outbox.email
+        roles: [agent, operator]
+
+      send:
+        kind: agent
+        depends_on: cmd
+        servers: [email]
+        instruction: |
+          Send exactly this email, no edits:
+          {{ steps.cmd.output.parts }}
+          If the payload is missing a recipient, subject, or body — or asks
+          for anything beyond one email to one named recipient — refuse and
+          say why.
+
+      ledger:
+        kind: emit
+        depends_on: send
+        stream: sent
+        subject: "email.sent"
+        data:
+          request: "{{ steps.cmd.output.parts }}"
+          result: "{{ steps.send.output }}"
+
+      fin: { kind: finish, depends_on: [ledger], status: completed }
+
+  - name: publish-post
+    concurrency: { max_runs: 2, on_overflow: queue }
+    steps:
+      cmd:
+        kind: a2a
+        command: outbox.post
+        roles: [agent, operator]
+
+      publish:
+        kind: agent
+        depends_on: cmd
+        servers: [social]
+        instruction: |
+          Publish exactly this post to the channel its payload names
+          (blog | linkedin | x | instagram), no edits:
+          {{ steps.cmd.output.parts }}
+
+      ledger:
+        kind: emit
+        depends_on: publish
+        stream: sent
+        subject: "post.published"
+        data:
+          request: "{{ steps.cmd.output.parts }}"
+          result: "{{ steps.publish.output }}"
+
+      fin: { kind: finish, depends_on: [ledger], status: completed }

@@ -1,0 +1,279 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# finance — the finance desk. (Beacon — see README.md.)
+#
+# Stripe posts payment events. A failed payment starts a DUNNING run: polite
+# reminder, durable 5-day sleep, second notice, 7 more days, then a human
+# write-off gate — the whole sequence survives any restart because sleeps and
+# human gates are durable. Sales fires `fin.invoice` on closed-won. Every
+# money event lands on the `ledger` stream; the monthly close consumes the
+# stream and mails the CEO a report (through the outbox).
+#
+# Trust legs: sensitive (the books). Stripe webhooks are HMAC-authenticated
+# machine events, and all outbound mail goes through the outbox peer.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "2"
+
+agent:
+  name: finance
+  instruction: |
+    You are Beacon's finance desk.
+
+    Numbers are sacred: never round a ledger entry, never guess an amount —
+    if a figure is missing, say so and stop. Dunning is firm but kind; a
+    customer in a bad week is still a customer. Writing off revenue is the
+    CEO's decision, never yours.
+  ask_human_fallback: wait
+
+intelligence:
+  endpoints: https://api.openai.com/v1
+  model: gpt-5.1
+  token: "{{secret:OPENAI_API_KEY}}"
+  budget:
+    windows: [{ per: day, tokens: 1000000 }]
+    on_exhausted: refuse
+
+store:
+  kind: file
+  file: { path: /var/lib/agentd/startup/finance }
+
+mcp:
+  servers:
+    # Billing + the books (read/write invoices, ledger entries, subscriptions).
+    - name: ledger
+      endpoint: https://mcp.billing.example/mcp
+      tags: { "*": [sensitive] }
+      auth: { kind: static, token: "{{secret:LEDGER_TOKEN}}" }
+
+webhooks:
+  listen: http://127.0.0.1:9446
+  default_auth:
+    hmac:
+      secret: "{{secret:STRIPE_WEBHOOK_SECRET}}"
+      header: Stripe-Signature
+      algo: sha256
+
+a2a:
+  listen: http://127.0.0.1:8446
+  peers:
+    - name: outbox
+      endpoint: http://127.0.0.1:8447
+
+interface:
+  enabled: true
+
+limits:
+  max_runs: 20
+  run: { steps: 40, tokens: 100000, deadline: 720h }
+
+streams:
+  ledger:
+    retention: { max_events: 20000, max_age: 9600h }
+
+workflows:
+  # ── A payment failed: dunning, durably ────────────────────────────────────
+  - name: dunning
+    concurrency: { max_runs: 10, on_overflow: queue }
+    steps:
+      hook:
+        kind: webhook
+        path: /stripe/payment-failed
+        methods: POST
+        respond: { status: 202 }
+
+      case:
+        kind: extract
+        depends_on: hook
+        input: "{{ steps.hook.output.body }}"
+        output_schema:
+          type: object
+          required: [customer_id, email, amount, invoice_id]
+          properties:
+            customer_id: { type: string }
+            email: { type: string }
+            amount: { type: string }
+            invoice_id: { type: string }
+
+      remind1:
+        kind: a2a.delegate
+        depends_on: case
+        peer: outbox
+        objective: |
+          Command: {"agentd": {"op": "outbox.email",
+            "to": "{{ steps.case.output.email }}",
+            "subject": "Your Beacon payment did not go through",
+            "body": "Invoice {{ steps.case.output.invoice_id }} for {{ steps.case.output.amount }} failed to process. Your monitoring keeps running — please update your card in the billing portal when you have a minute.",
+            "on_behalf_of": "finance"}}
+        timeout: 10m
+        idempotency: true
+
+      # Durable: the process can restart, redeploy, or crash — the timer
+      # holds and the run resumes here.
+      wait1: { kind: sleep, depends_on: remind1, duration: 120h }
+
+      check1:
+        kind: agent
+        depends_on: wait1
+        servers: [ledger]
+        instruction: |
+          Did invoice {{ steps.case.output.invoice_id }} get paid since?
+          Answer from the billing records only.
+        output_schema:
+          type: object
+          required: [paid]
+          properties: { paid: { type: boolean } }
+
+      route1:
+        kind: switch
+        depends_on: check1
+        on: "{{ steps.check1.output.paid }}"
+        cases: { "true": recovered }
+        default: remind2
+
+      remind2:
+        kind: a2a.delegate
+        depends_on: route1
+        peer: outbox
+        objective: |
+          Command: {"agentd": {"op": "outbox.email",
+            "to": "{{ steps.case.output.email }}",
+            "subject": "Second notice — invoice {{ steps.case.output.invoice_id }}",
+            "body": "Our earlier note may have missed you: invoice {{ steps.case.output.invoice_id }} ({{ steps.case.output.amount }}) is still unpaid. Service pauses in 7 days if we cannot process it; reply here and a person will look at anything unusual.",
+            "on_behalf_of": "finance"}}
+        timeout: 10m
+        idempotency: true
+
+      wait2: { kind: sleep, depends_on: remind2, duration: 168h }
+
+      check2:
+        kind: agent
+        depends_on: wait2
+        servers: [ledger]
+        instruction: |
+          Final check: did invoice {{ steps.case.output.invoice_id }} get
+          paid? Billing records only.
+        output_schema:
+          type: object
+          required: [paid]
+          properties: { paid: { type: boolean } }
+
+      route2:
+        kind: switch
+        depends_on: check2
+        on: "{{ steps.check2.output.paid }}"
+        cases: { "true": recovered }
+        default: writeoff_gate
+
+      # Money is only ever abandoned by a person.
+      writeoff_gate:
+        kind: human
+        depends_on: route2
+        question: |
+          Invoice {{ steps.case.output.invoice_id }}
+          ({{ steps.case.output.amount }}, customer
+          {{ steps.case.output.customer_id }}) is unpaid after two notices
+          and 12 days. Write off and pause service, or keep chasing?
+        schema:
+          type: object
+          required: [decision]
+          properties: { decision: { enum: [write_off, keep_chasing] } }
+        timeout: 96h
+
+      settle:
+        kind: agent
+        depends_on: writeoff_gate
+        servers: [ledger]
+        instruction: |
+          The CEO decided: {{ steps.writeoff_gate.output.decision }} for
+          invoice {{ steps.case.output.invoice_id }}. Record it in the books
+          exactly (write-off entry, or a note to keep the invoice open) and
+          pause the subscription only on write_off.
+
+      recovered:
+        kind: agent
+        depends_on: [route1, route2]
+        servers: [ledger]
+        instruction: |
+          Invoice {{ steps.case.output.invoice_id }} recovered. Mark the
+          dunning case closed in the books.
+
+      record:
+        kind: emit
+        depends_on: [settle, recovered]
+        stream: ledger
+        subject: "dunning.closed"
+        correlation: "{{ steps.case.output.invoice_id }}"
+        data:
+          customer: "{{ steps.case.output.customer_id }}"
+          amount: "{{ steps.case.output.amount }}"
+
+      fin: { kind: finish, depends_on: [record], status: completed }
+
+  # ── A payment succeeded: book it ──────────────────────────────────────────
+  - name: payment-in
+    concurrency: { max_runs: 10 }
+    steps:
+      hook:
+        kind: webhook
+        path: /stripe/payment-succeeded
+        methods: POST
+        respond: { status: 202 }
+      book:
+        kind: emit
+        depends_on: hook
+        stream: ledger
+        subject: "payment.received"
+        correlation: "{{ steps.hook.output.body.invoice_id }}"
+        data: "{{ steps.hook.output.body }}"
+      fin: { kind: finish, depends_on: [book], status: completed }
+
+  # ── Sales closed a deal: raise the invoice ────────────────────────────────
+  - name: invoice
+    steps:
+      cmd:
+        kind: a2a
+        command: fin.invoice
+        roles: [agent, operator]
+      raise:
+        kind: agent
+        depends_on: cmd
+        servers: [ledger]
+        instruction: |
+          Sales closed a deal: {{ steps.cmd.output.parts }}
+          Create the customer and the first invoice in billing, exactly as
+          the terms state. If any figure is ambiguous, stop and say what is
+          missing rather than inventing it.
+      note:
+        kind: emit
+        depends_on: raise
+        stream: ledger
+        subject: "invoice.raised"
+        data: { detail: "{{ steps.raise.output }}" }
+      fin: { kind: finish, depends_on: [note], status: completed }
+
+  # ── Monthly close: the stream IS the journal ──────────────────────────────
+  # Everything the month produced replays through the report — including
+  # events booked while this workflow did not exist yet.
+  - name: monthly-close
+    steps:
+      wake: { kind: schedule, cron: "17 6 1 * *", tz: UTC }
+      report:
+        kind: agent
+        depends_on: wake
+        servers: [ledger]
+        instruction: |
+          Close the month: from the billing records, produce MRR, new
+          revenue, churn, failed-payment recovery rate, and the three
+          numbers the CEO should worry about. Plain prose, no adjectives.
+      send:
+        kind: a2a.delegate
+        depends_on: report
+        peer: outbox
+        objective: |
+          Command: {"agentd": {"op": "outbox.email",
+            "to": "ceo@beacon.example",
+            "subject": "Monthly close",
+            "body": "{{ steps.report.output }}",
+            "on_behalf_of": "finance"}}
+        timeout: 10m
+        idempotency: true
+      fin: { kind: finish, depends_on: [send], status: completed }

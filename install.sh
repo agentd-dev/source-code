@@ -190,5 +190,5 @@ cat <<EOF
     agentd tui --config a.yaml               run it with a terminal UI attached
 
   docs  ${DOCS}/docs/getting-started/
-  TUI   ${DOCS}/docs/interface/   (the TUI, and the short \`-c\`, need agentd 2.0+)
+  TUI   ${DOCS}/docs/interface/   (needs \`interface.enabled\`)
 EOF
